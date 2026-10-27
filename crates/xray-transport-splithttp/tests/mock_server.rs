@@ -677,12 +677,8 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
     ensure_crypto_provider();
     let (cert_pem, key_pem, cert_der) = self_signed_tls();
 
-    // 预占随机端口（TransportListener 不暴露 local_addr）。
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_addr = probe.local_addr().unwrap();
-    drop(probe);
-
     // echo dispatcher：读多少回多少（interop echo 语义的最小等价物）。
+    // 端口在 listen_splithttp 处取号（TransportListener 不暴露 local_addr）。
     let handler: ConnHandler = Arc::new(|conn| {
         tokio::spawn(async move {
             let mut conn = conn;
@@ -709,9 +705,26 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
         security_json: Some(serde_json::json!({ "cert": cert_pem, "key": key_pem })),
         ..Default::default()
     };
-    let listener = listen_splithttp(server_addr, &settings, &SocketOptions::default(), handler)
+    // TOCTOU 加固：bind(:0)→drop→listen_splithttp 再 bind 之间端口可能被
+    // 并行测试/其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换
+    // 端口重试至多 5 次。
+    let (server_addr, listener) = loop {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = probe.local_addr().unwrap();
+        drop(probe);
+        match listen_splithttp(
+            server_addr,
+            &settings,
+            &SocketOptions::default(),
+            Arc::clone(&handler),
+        )
         .await
-        .expect("listen_splithttp");
+        {
+            Ok(l) => break (server_addr, l),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("listen_splithttp: {e}"),
+        }
+    };
 
     // 客户端：rustls 信任自签证书；DefaultDialerClient rustls 分支
     // enable_http1+enable_http2 注入 [h2, http/1.1]（client.rs bd 3ze9 注释）。

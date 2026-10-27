@@ -914,13 +914,18 @@ mod tests {
     /// 完成即收割，join_handles 只保留 accept-loop 自身（恒 ≤1）。
     #[tokio::test]
     async fn repeated_scrapes_do_not_accumulate_handles() {
-        // 先 bind 再释放，拿一个大概率空闲的端口
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = probe.local_addr().unwrap();
-        drop(probe);
-
-        let server = TokioHttpServer::new();
-        server.start_http_listen(&addr.to_string(), Arc::new(ConstStats(1)), None).unwrap();
+        // TOCTOU 加固：bind(:0)→drop→start_http_listen 之间端口可能被并行测试
+        // /其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试。
+        let (addr, server) = loop {
+            let port = xray_common::testing::pick_free_ports(1).await[0];
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let server = TokioHttpServer::new();
+            match server.start_http_listen(&addr.to_string(), Arc::new(ConstStats(1)), None) {
+                Ok(()) => break (addr, server),
+                Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+                Err(e) => panic!("start_http_listen: {e}"),
+            }
+        };
 
         // 千次抓取（票验收口径）
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

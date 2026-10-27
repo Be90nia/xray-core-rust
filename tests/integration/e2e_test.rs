@@ -145,14 +145,6 @@ impl Drop for E2eTestBuilder {
 }
 // ---- Config builder helpers ----
 
-/// Pick a free port (bind then immediately drop for reuse).
-async fn pick_free_port() -> Result<u16, E2eError> {
-    let probe = TcpListener::bind("127.0.0.1:0").await?;
-    let port = probe.local_addr()?.port();
-    drop(probe);
-    Ok(port)
-}
-
 /// Build a freedom outbound (default, dials directly to echo server).
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
     BuiltOutbound {
@@ -357,26 +349,33 @@ fn make_ss_account() -> SsMemoryAccount {
 /// -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_vmess_proxy() {
-    let mut env = E2eTestBuilder::new().await.expect("echo server");
-
-    let vmess_port = pick_free_port().await.expect("free port");
     let uuid = UUID::parse(VMESS_UUID_STR).expect("uuid");
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "vmess".into(),
-            data: vmess_inbound_settings(VMESS_UUID_STR, "e2e-vmess@local"),
-        },
-        tag: "vmess-in".into(),
-        port: Some(vmess_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-
-    env = env.with_xray(&built).await.expect("start xray-core");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多
+    // 5 次（builder 持 echo server，重试时随端口整组重建）。
+    let (vmess_port, env) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vmess_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "vmess".into(),
+                data: vmess_inbound_settings(VMESS_UUID_STR, "e2e-vmess@local"),
+            },
+            tag: "vmess-in".into(),
+            port: Some(vmess_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
+        let env = E2eTestBuilder::new().await.expect("echo server");
+        match env.with_xray(&built).await {
+            Ok(env) => break (vmess_port, env),
+            Err(err) if xray_common::testing::is_addr_in_use_err(&err) => continue,
+            Err(err) => panic!("start xray-core: {err:?}"),
+        }
+    };
     assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
     let proxy_addr: std::net::SocketAddr =
@@ -388,26 +387,33 @@ async fn e2e_vmess_proxy() {
 /// -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_vless_proxy() {
-    let mut env = E2eTestBuilder::new().await.expect("echo server");
-
-    let vless_port = pick_free_port().await.expect("free port");
     let uuid = UUID::parse(VLESS_UUID_STR).expect("uuid");
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "vless".into(),
-            data: vless_inbound_settings(VLESS_UUID_STR, "e2e-vless@local"),
-        },
-        tag: "vless-in".into(),
-        port: Some(vless_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-
-    env = env.with_xray(&built).await.expect("start xray-core");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多
+    // 5 次（builder 持 echo server，重试时随端口整组重建）。
+    let (vless_port, env) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vless_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "vless".into(),
+                data: vless_inbound_settings(VLESS_UUID_STR, "e2e-vless@local"),
+            },
+            tag: "vless-in".into(),
+            port: Some(vless_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
+        let env = E2eTestBuilder::new().await.expect("echo server");
+        match env.with_xray(&built).await {
+            Ok(env) => break (vless_port, env),
+            Err(err) if xray_common::testing::is_addr_in_use_err(&err) => continue,
+            Err(err) => panic!("start xray-core: {err:?}"),
+        }
+    };
     assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
     let proxy_addr: std::net::SocketAddr =
@@ -418,26 +424,33 @@ async fn e2e_vless_proxy() {
 /// echo -> verify.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_trojan_proxy() {
-    let mut env = E2eTestBuilder::new().await.expect("echo server");
-
-    let trojan_port = pick_free_port().await.expect("free port");
     let account = TrojanMemoryAccount::new(TROJAN_PASSWORD);
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "trojan".into(),
-            data: trojan_inbound_settings(TROJAN_PASSWORD, "e2e-trojan@local"),
-        },
-        tag: "trojan-in".into(),
-        port: Some(trojan_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-
-    env = env.with_xray(&built).await.expect("start xray-core");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多
+    // 5 次（builder 持 echo server，重试时随端口整组重建）。
+    let (trojan_port, env) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let trojan_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: trojan_inbound_settings(TROJAN_PASSWORD, "e2e-trojan@local"),
+            },
+            tag: "trojan-in".into(),
+            port: Some(trojan_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
+        let env = E2eTestBuilder::new().await.expect("echo server");
+        match env.with_xray(&built).await {
+            Ok(env) => break (trojan_port, env),
+            Err(err) if xray_common::testing::is_addr_in_use_err(&err) => continue,
+            Err(err) => panic!("start xray-core: {err:?}"),
+        }
+    };
     assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
     let proxy_addr: std::net::SocketAddr =
@@ -455,22 +468,28 @@ async fn e2e_trojan_proxy() {
 /// SS inbound -> SS outbound -> echo server chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_ss_proxy() {
-    let mut env = E2eTestBuilder::new().await.expect("echo server");
-
-    let socks_port = pick_free_port().await.expect("free port");
-
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry { kind: "socks".into(), data: b"{}".to_vec() },
-        tag: "socks-in".into(),
-        port: Some(socks_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-
-    env = env.with_xray(&built).await.expect("start xray-core");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多
+    // 5 次（builder 持 echo server，重试时随端口整组重建）。
+    let (socks_port, env) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let socks_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: b"{}".to_vec() },
+            tag: "socks-in".into(),
+            port: Some(socks_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
+        let env = E2eTestBuilder::new().await.expect("echo server");
+        match env.with_xray(&built).await {
+            Ok(env) => break (socks_port, env),
+            Err(err) if xray_common::testing::is_addr_in_use_err(&err) => continue,
+            Err(err) => panic!("start xray-core: {err:?}"),
+        }
+    };
     assert!(env.instance.as_ref().is_some_and(|i| i.is_running()), "instance should be running");
 
     // Verify the full core startup path works via SOCKS5

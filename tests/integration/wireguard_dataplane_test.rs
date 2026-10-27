@@ -88,18 +88,6 @@ fn make_payload(len: usize, seed: u64) -> Vec<u8> {
     v
 }
 
-/// 绑定空闲 TCP 端口后释放探针。
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    probe.local_addr().expect("port").port()
-}
-
-/// 绑定空闲 UDP 端口后释放探针。
-async fn pick_free_udp_port() -> u16 {
-    let probe = UdpSocket::bind("127.0.0.1:0").await.expect("pick udp port");
-    probe.local_addr().expect("port").port()
-}
-
 /// 本机非回环 IPv4（UDP connect 技巧，零发包）。
 ///
 /// UDP 用例的隧道内目标地址——回环地址会被客户端 netstack 的
@@ -142,14 +130,16 @@ async fn spawn_tcp_echo() -> SocketAddr {
 }
 
 /// UDP echo。绑定 `bind_addr`（UDP 用例须 0.0.0.0 才能经非回环本机地址到达）。
-async fn spawn_udp_echo(bind_addr: &str) {
-    let sock = UdpSocket::bind(bind_addr).await.expect("bind udp echo");
+/// 返回 bind 结果（占用由调用方按 TOCTOU 重试）。
+async fn spawn_udp_echo(bind_addr: &str) -> std::io::Result<()> {
+    let sock = UdpSocket::bind(bind_addr).await?;
     tokio::spawn(async move {
         let mut buf = vec![0u8; 16 * 1024];
         while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
             let _ = sock.send_to(&buf[..n], peer).await;
         }
     });
+    Ok(())
 }
 
 // ============================================================
@@ -321,28 +311,46 @@ async fn tcp_roundtrip(port: u16, size: usize, seed: u64) -> Result<(), String> 
 async fn wg_dataplane_tcp_echo_1mb_three_concurrent() {
     init_tracing();
     let echo = spawn_tcp_echo().await;
-    let wg_port = pick_free_port().await;
-    let entry_port = pick_free_port().await;
     let (sec_c, pub_c) = wg_keypair(0x51);
     let (sec_s, pub_s) = wg_keypair(0x52);
 
-    // client 实例：dokodemo TCP → wg-out（唯一 outbound = default）
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(dokodemo_in(entry_port, "dokodemo-tcp", "10.0.0.1", 7, "tcp"));
-    client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
-    let (_inst_c, _ohm_c, handles_c) = start_full(&client_cfg).await.expect("client instance");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时整组换端口重试至多 5 次。
+    let (_wg_port, entry_port, handles_c, handles_s) = loop {
+        let ports = xray_common::testing::pick_free_ports(2).await;
+        let (wg_port, entry_port) = (ports[0], ports[1]);
 
-    // server 实例：wg-in → freedom lan（override → 真实 echo）
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(wg_inbound(
-        &sec_s,
-        &pub_c,
-        wg_port,
-        &["10.0.0.1/32"],
-        &["10.0.0.2/32"],
-    ));
-    server_cfg.outbounds.push(freedom_lan(&loopback_allow(), Some(("127.0.0.1", echo.port()))));
-    let (_inst_s, _ohm_s, handles_s) = start_full(&server_cfg).await.expect("server instance");
+        // client 实例：dokodemo TCP → wg-out（唯一 outbound = default）
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(dokodemo_in(entry_port, "dokodemo-tcp", "10.0.0.1", 7, "tcp"));
+        client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
+        let (_inst_c, _ohm_c, handles_c) = match start_full(&client_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("client instance: {e:?}"),
+        };
+
+        // server 实例：wg-in → freedom lan（override → 真实 echo）
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(wg_inbound(
+            &sec_s,
+            &pub_c,
+            wg_port,
+            &["10.0.0.1/32"],
+            &["10.0.0.2/32"],
+        ));
+        server_cfg.outbounds.push(freedom_lan(&loopback_allow(), Some(("127.0.0.1", echo.port()))));
+        let (_inst_s, _ohm_s, handles_s) = match start_full(&server_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => {
+                for h in handles_c {
+                    h.abort();
+                }
+                continue;
+            },
+            Err(e) => panic!("server instance: {e:?}"),
+        };
+        break (wg_port, entry_port, handles_c, handles_s);
+    };
 
     tokio::time::sleep(READY_DELAY).await;
 
@@ -372,31 +380,49 @@ async fn wg_dataplane_tcp_echo_1mb_three_concurrent() {
 async fn wg_dataplane_tcp_echo_1mb_inner_ipv6() {
     init_tracing();
     let echo = spawn_tcp_echo().await;
-    let wg_port = pick_free_port().await;
-    let entry_port = pick_free_port().await;
     let (sec_c, pub_c) = wg_keypair(0x61);
     let (sec_s, pub_s) = wg_keypair(0x62);
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(dokodemo_in(entry_port, "dokodemo-tcp6", "fd00::1", 7, "tcp"));
-    client_cfg.outbounds.push(wg_outbound(
-        &sec_c,
-        &pub_s,
-        wg_port,
-        &["10.0.0.2/32", "fd00::2/128"],
-    ));
-    let (_inst_c, _ohm_c, handles_c) = start_full(&client_cfg).await.expect("client instance");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时整组换端口重试至多 5 次。
+    let (_wg_port, entry_port, handles_c, handles_s) = loop {
+        let ports = xray_common::testing::pick_free_ports(2).await;
+        let (wg_port, entry_port) = (ports[0], ports[1]);
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(wg_inbound(
-        &sec_s,
-        &pub_c,
-        wg_port,
-        &["10.0.0.1/32", "fd00::1/128"],
-        &["10.0.0.2/32", "fd00::2/128"],
-    ));
-    server_cfg.outbounds.push(freedom_lan(&loopback_allow(), Some(("127.0.0.1", echo.port()))));
-    let (_inst_s, _ohm_s, handles_s) = start_full(&server_cfg).await.expect("server instance");
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(dokodemo_in(entry_port, "dokodemo-tcp6", "fd00::1", 7, "tcp"));
+        client_cfg.outbounds.push(wg_outbound(
+            &sec_c,
+            &pub_s,
+            wg_port,
+            &["10.0.0.2/32", "fd00::2/128"],
+        ));
+        let (_inst_c, _ohm_c, handles_c) = match start_full(&client_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("client instance: {e:?}"),
+        };
+
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(wg_inbound(
+            &sec_s,
+            &pub_c,
+            wg_port,
+            &["10.0.0.1/32", "fd00::1/128"],
+            &["10.0.0.2/32", "fd00::2/128"],
+        ));
+        server_cfg.outbounds.push(freedom_lan(&loopback_allow(), Some(("127.0.0.1", echo.port()))));
+        let (_inst_s, _ohm_s, handles_s) = match start_full(&server_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => {
+                for h in handles_c {
+                    h.abort();
+                }
+                continue;
+            },
+            Err(e) => panic!("server instance: {e:?}"),
+        };
+        break (wg_port, entry_port, handles_c, handles_s);
+    };
 
     tokio::time::sleep(READY_DELAY).await;
 
@@ -421,40 +447,63 @@ async fn wg_dataplane_udp_echo_1kb() {
     // 隧道内目标 = 本机非回环 IPv4 : 空闲 UDP 端口（freedom 无 override，直连）
     init_tracing();
     let lan_ip = host_lan_v4().expect("host must have a non-loopback IPv4 for the udp case");
-    let inner_port = pick_free_udp_port().await;
-    let entry_port = pick_free_port().await;
-    let wg_port = pick_free_port().await;
     let (sec_c, pub_c) = wg_keypair(0x71);
     let (sec_s, pub_s) = wg_keypair(0x72);
 
-    // 真实 UDP echo 绑 0.0.0.0（经本机 LAN IP 可达）
-    spawn_udp_echo(&format!("0.0.0.0:{inner_port}")).await;
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时整组换端口重试至多
+    // 5 次（含隧道内 UDP echo 端口的自绑）。
+    let (_inner_port, entry_port, _wg_port, handles_c, handles_s) = loop {
+        let ports = xray_common::testing::pick_free_ports(3).await;
+        let (inner_port, entry_port, wg_port) = (ports[0], ports[1], ports[2]);
 
-    // client 实例：dokodemo UDP → wg-out；隧道内目标 = {lan_ip}:{inner_port}（无 override）
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(dokodemo_in(
-        entry_port,
-        "dokodemo-udp",
-        &lan_ip.to_string(),
-        inner_port,
-        "udp",
-    ));
-    client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
-    let (_inst_c, _ohm_c, handles_c) = start_full(&client_cfg).await.expect("client instance");
+        // 真实 UDP echo 绑 0.0.0.0（经本机 LAN IP 可达）
+        if let Err(e) = spawn_udp_echo(&format!("0.0.0.0:{inner_port}")).await {
+            if xray_common::testing::is_addr_in_use_err(&e) {
+                continue;
+            }
+            panic!("bind udp echo: {e}");
+        }
 
-    // server 实例：wg-in → freedom lan（无 override，目标即真实地址）
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(wg_inbound(
-        &sec_s,
-        &pub_c,
-        wg_port,
-        &["10.0.0.1/32"],
-        &["10.0.0.2/32"],
-    ));
-    let mut allow = loopback_allow();
-    allow.push(format!("{lan_ip}/32"));
-    server_cfg.outbounds.push(freedom_lan(&allow, None));
-    let (_inst_s, _ohm_s, handles_s) = start_full(&server_cfg).await.expect("server instance");
+        // client 实例：dokodemo UDP → wg-out；隧道内目标 = {lan_ip}:{inner_port}（无 override）
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(dokodemo_in(
+            entry_port,
+            "dokodemo-udp",
+            &lan_ip.to_string(),
+            inner_port,
+            "udp",
+        ));
+        client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
+        let (_inst_c, _ohm_c, handles_c) = match start_full(&client_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("client instance: {e:?}"),
+        };
+
+        // server 实例：wg-in → freedom lan（无 override，目标即真实地址）
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(wg_inbound(
+            &sec_s,
+            &pub_c,
+            wg_port,
+            &["10.0.0.1/32"],
+            &["10.0.0.2/32"],
+        ));
+        let mut allow = loopback_allow();
+        allow.push(format!("{lan_ip}/32"));
+        server_cfg.outbounds.push(freedom_lan(&allow, None));
+        let (_inst_s, _ohm_s, handles_s) = match start_full(&server_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => {
+                for h in handles_c {
+                    h.abort();
+                }
+                continue;
+            },
+            Err(e) => panic!("server instance: {e:?}"),
+        };
+        break (inner_port, entry_port, wg_port, handles_c, handles_s);
+    };
 
     tokio::time::sleep(READY_DELAY).await;
 
@@ -500,40 +549,63 @@ async fn wg_dataplane_udp_echo_1kb() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wg_dataplane_udp_echo_loopback_override() {
     init_tracing();
-    let inner_port = pick_free_udp_port().await;
-    let entry_port = pick_free_port().await;
-    let wg_port = pick_free_port().await;
     let (sec_c, pub_c) = wg_keypair(0x81);
     let (sec_s, pub_s) = wg_keypair(0x82);
 
-    // 真实 echo 在回环（freedom override 的终点）
-    spawn_udp_echo(&format!("127.0.0.1:{inner_port}")).await;
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时整组换端口重试至多
+    // 5 次（含隧道内 UDP echo 端口的自绑）。
+    let (_inner_port, entry_port, _wg_port, handles_c, handles_s) = loop {
+        let ports = xray_common::testing::pick_free_ports(3).await;
+        let (inner_port, entry_port, wg_port) = (ports[0], ports[1], ports[2]);
 
-    // client：dokodemo UDP → wg-out；隧道内目标 = 192.0.2.1:inner_port
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(dokodemo_in(
-        entry_port,
-        "dokodemo-udp",
-        "192.0.2.1",
-        inner_port,
-        "udp",
-    ));
-    client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
-    let (_inst_c, _ohm_c, handles_c) = start_full(&client_cfg).await.expect("client instance");
+        // 真实 echo 在回环（freedom override 的终点）
+        if let Err(e) = spawn_udp_echo(&format!("127.0.0.1:{inner_port}")).await {
+            if xray_common::testing::is_addr_in_use_err(&e) {
+                continue;
+            }
+            panic!("bind udp echo: {e}");
+        }
 
-    // server：wg-in → freedom lan（override → 回环 echo）
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(wg_inbound(
-        &sec_s,
-        &pub_c,
-        wg_port,
-        &["10.0.0.1/32"],
-        &["10.0.0.2/32"],
-    ));
-    let mut allow = loopback_allow();
-    allow.push("192.0.2.1/32".to_string());
-    server_cfg.outbounds.push(freedom_lan(&allow, Some(("127.0.0.1", inner_port))));
-    let (_inst_s, _ohm_s, handles_s) = start_full(&server_cfg).await.expect("server instance");
+        // client：dokodemo UDP → wg-out；隧道内目标 = 192.0.2.1:inner_port
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(dokodemo_in(
+            entry_port,
+            "dokodemo-udp",
+            "192.0.2.1",
+            inner_port,
+            "udp",
+        ));
+        client_cfg.outbounds.push(wg_outbound(&sec_c, &pub_s, wg_port, &["10.0.0.2/32"]));
+        let (_inst_c, _ohm_c, handles_c) = match start_full(&client_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("client instance: {e:?}"),
+        };
+
+        // server：wg-in → freedom lan（override → 回环 echo）
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(wg_inbound(
+            &sec_s,
+            &pub_c,
+            wg_port,
+            &["10.0.0.1/32"],
+            &["10.0.0.2/32"],
+        ));
+        let mut allow = loopback_allow();
+        allow.push("192.0.2.1/32".to_string());
+        server_cfg.outbounds.push(freedom_lan(&allow, Some(("127.0.0.1", inner_port))));
+        let (_inst_s, _ohm_s, handles_s) = match start_full(&server_cfg).await {
+            Ok(v) => v,
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => {
+                for h in handles_c {
+                    h.abort();
+                }
+                continue;
+            },
+            Err(e) => panic!("server instance: {e:?}"),
+        };
+        break (inner_port, entry_port, wg_port, handles_c, handles_s);
+    };
 
     tokio::time::sleep(READY_DELAY).await;
 

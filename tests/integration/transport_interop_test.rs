@@ -59,11 +59,27 @@ async fn start_echo() -> std::net::SocketAddr {
     addr
 }
 
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
+/// 端口探测 TOCTOU 加固（机制同 crates/xray-core/src/functions.rs）：bind(:0)→drop
+/// →被测实例再 bind 之间端口可能被并行测试/其他进程抢占（Windows os error
+/// 10048 / Unix os error 98）——start 失败且为地址占用时整组换新端口重试至多 5 次。
+async fn start_full_retrying(
+    n_ports: usize,
+    build: impl Fn(&[u16]) -> BuiltConfig,
+) -> (
+    Vec<u16>,
+    std::sync::Arc<xray_core::Instance>,
+    std::sync::Arc<xray_app_dispatcher::default::SimpleOhm>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    for _ in 0..5 {
+        let ports = xray_common::testing::pick_free_ports(n_ports).await;
+        match start_full(&build(&ports)).await {
+            Ok((inst, ohm, handles)) => return (ports, inst, ohm, handles),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("instance start: {e:?}"),
+        }
+    }
+    panic!("instance start: EADDRINUSE persisted across 5 port retries");
 }
 
 async fn socks5_echo_round_trip(proxy_port: u16, echo_port: u16, payload: &[u8]) {
@@ -188,27 +204,34 @@ fn socks_inbound(port: u16) -> BuiltInbound {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let ws_settings: serde_json::Value = serde_json::from_str(
         r#"{"network":"ws","security":"none","wsSettings":{"path":"/vmess-ws-transport"}}"#,
     )
     .unwrap();
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-ws-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(ws_settings.clone());
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-ws server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server/client 各自独立）。
+    let (sports, _si, _so, sh) = start_full_retrying(1, |ports| {
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-ws-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(ws_settings.clone());
+        server_cfg
+    })
+    .await;
+    let vless_port = sports[0];
     tokio::time::sleep(READY_DELAY).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, ws_settings));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-ws client");
+    let (cports, _ci, _co, ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, ws_settings.clone()));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), b"hello ws").await;
@@ -223,27 +246,34 @@ async fn websocket_transport_via_vless_e2e() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let grpc_settings: serde_json::Value = serde_json::from_str(
         r#"{"network":"grpc","security":"none","grpcSettings":{"serviceName":"GunService"}}"#,
     )
     .unwrap();
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-grpc-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(grpc_settings.clone());
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-grpc server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server/client 各自独立）。
+    let (sports, _si, _so, sh) = start_full_retrying(1, |ports| {
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-grpc-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(grpc_settings.clone());
+        server_cfg
+    })
+    .await;
+    let vless_port = sports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-grpc client");
+    let (cports, _ci, _co, ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings.clone()));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), b"hello grpc").await;
@@ -258,25 +288,32 @@ async fn grpc_transport_via_vless_e2e() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kcp_transport_via_vless_e2e() {
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let kcp_settings: serde_json::Value =
         serde_json::from_str(r#"{"network":"kcp","security":"none","kcpSettings":{}}"#).unwrap();
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-kcp-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(kcp_settings.clone());
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-kcp server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server/client 各自独立）。
+    let (sports, _si, _so, sh) = start_full_retrying(1, |ports| {
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-kcp-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(kcp_settings.clone());
+        server_cfg
+    })
+    .await;
+    let vless_port = sports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, kcp_settings));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-kcp client");
+    let (cports, _ci, _co, ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, kcp_settings.clone()));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), b"hello kcp").await;
@@ -291,8 +328,6 @@ async fn kcp_transport_via_vless_e2e() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tls_transport_via_vmess_e2e() {
     let echo_addr = start_echo().await;
-    let vmess_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let (cert_pem, key_pem) =
         xray_tls::certificate::generate_self_signed_cert(&["localhost"]).expect("gen cert");
@@ -305,19 +340,28 @@ async fn tls_transport_via_vmess_e2e() {
     )
     .unwrap();
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vmess_inbound(vmess_port, "vmess-tls-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(server_tls);
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vmess-tls server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server/client 各自独立）。
+    let (sports, _si, _so, sh) = start_full_retrying(1, |ports| {
+        let vmess_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vmess_inbound(vmess_port, "vmess-tls-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(server_tls.clone());
+        server_cfg
+    })
+    .await;
+    let vmess_port = sports[0];
     tokio::time::sleep(READY_DELAY).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vmess_outbound(vmess_port, client_tls));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vmess-tls client");
+    let (cports, _ci, _co, ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vmess_outbound(vmess_port, client_tls.clone()));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), b"hello tls").await;
@@ -337,8 +381,6 @@ async fn reality_transport_via_vless_e2e() {
     use x25519_dalek::{PublicKey, StaticSecret};
 
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     // rustls ring crypto provider（REALITY watfaq fallback 路径必需）。
     ensure_crypto_provider();
@@ -369,19 +411,28 @@ async fn reality_transport_via_vless_e2e() {
     ))
     .unwrap();
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-reality-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(server_reality);
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-reality server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server/client 各自独立）。
+    let (sports, _si, _so, sh) = start_full_retrying(1, |ports| {
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-reality-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(server_reality.clone());
+        server_cfg
+    })
+    .await;
+    let vless_port = sports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, client_reality));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-reality client");
+    let (cports, _ci, _co, ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, client_reality.clone()));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), b"hello reality").await;

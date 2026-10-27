@@ -67,6 +67,11 @@ pub struct Instance {
     state_lock: parking_lot::Mutex<()>,
     /// 关闭时取消此 token，所有监听此 token 的连接/任务应主动终止。
     shutdown_token: CancellationToken,
+    /// inbound arm scope 登记表（bd a9xgp）：装配期经 `InboundRuntime` 注入
+    /// 到每个 inbound arm 的 `PluginContext`，`spawn_inbound_serve` 登记；`close`
+    /// 在 token cancel 后**逆序显式 close**（广播父闸 → `ConnScope` 级联取消
+    /// 在途连接）。
+    arm_scopes: Arc<xray_frame::ArmScopeRegistry>,
 }
 
 impl Instance {
@@ -79,6 +84,7 @@ impl Instance {
             running: false,
             state_lock: parking_lot::Mutex::new(()),
             shutdown_token: CancellationToken::new(),
+            arm_scopes: Arc::new(xray_frame::ArmScopeRegistry::new()),
         }
     }
 
@@ -318,6 +324,12 @@ impl Instance {
         &self.shutdown_token
     }
 
+    /// inbound arm scope 登记表句柄（装配期注入 `InboundRuntime` → 各 inbound
+    /// arm 的 `PluginContext`；bd a9xgp 停机级联）。
+    pub fn arm_scopes(&self) -> Arc<xray_frame::ArmScopeRegistry> {
+        Arc::clone(&self.arm_scopes)
+    }
+
     /// 关闭实例：按注册**逆序**调用所有 feature 的 `close`，聚合所有错误。
     ///
     /// 关闭后实例不可重启（与 Go 一致）。即使部分 feature close 失败，
@@ -335,6 +347,19 @@ impl Instance {
         self.running = false;
         // 取消 shutdown token，通知所有监听此 token 的连接/任务主动终止。
         self.shutdown_token.cancel();
+
+        // 停机级联（bd a9xgp）：token cancel 之后、feature stop 序列之前，逆序
+        // 显式关停全部 inbound arm scope——watch 广播父闸 → `ConnScope` 级联取消
+        // 在途连接（泵/每连接任务）；arm 内残余任务由各 arm 停机监视任务
+        // （spawn_inbound_serve 壳）有界排空（abort + 超时兜底）。幂等：裸
+        // token cancel 形态下监视任务已关过的 arm 在此重复 close 无害。
+        let closed_arms = self.arm_scopes.close_all_reverse();
+        if closed_arms > 0 {
+            tracing::info!(
+                arms = closed_arms,
+                "inbound arm scopes closed (reverse registration order), cascading to in-flight connections"
+            );
+        }
 
         #[cfg(feature = "shutdown-coordinator")]
         {

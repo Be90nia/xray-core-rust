@@ -9,7 +9,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use tokio::net::TcpListener;
 use tonic::{Request, transport::Channel};
 /// 反射客户端（tonic-reflection 0.14：类型在 `pb::v1alpha` 下）。
 use tonic_reflection::pb::v1alpha::server_reflection_client::ServerReflectionClient;
@@ -55,43 +54,47 @@ fn add_outbound_request(tag: &str, protocol: &str, settings: &str) -> AddOutboun
 /// 返回（ohm、api 地址、instance）。
 async fn start_with_api()
 -> (Arc<xray_app_dispatcher::default::SimpleOhm>, String, Arc<xray_core::Instance>) {
-    // 随机端口：先 bind :0 拿端口号再释放（与 e2e_test.rs 的端口分配惯例一致）。
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    let api_addr = format!("127.0.0.1:{port}");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (ohm, api_addr, instance) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let api_addr = format!("127.0.0.1:{}", ports[0]);
 
-    let api_cfg = ApiConfig {
-        // Go api.go:23-25 `API tag can't be empty.`：tag 必填；None → factory
-        // ConfigInvalid → 启动期致命（bd onx4 修复：不再是 StartFailed 被
-        // new_from_built 当 stub 未实现 warn+跳过 → Commander 静默不注册 →
-        // gRPC server 永不启动 → connect 恒败）。
-        tag: Some("api".to_string()),
-        listen: Some(api_addr.clone()),
-        services: Some(vec![
-            "HandlerService".to_string(),
-            "LoggerService".to_string(),
-            "ReflectionService".to_string(),
-        ]),
-    };
-    let built = BuiltConfig {
-        apps: vec![BuiltEntry {
-            kind: "api".to_string(),
-            data: serde_json::to_vec(&api_cfg).unwrap(),
-        }],
-        inbounds: vec![],
-        outbounds: vec![BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".to_string(), data: b"{}".to_vec() },
-            tag: "direct".to_string(),
-            send_through: None,
-            stream_settings_json: None,
-            proxy_settings_json: None,
-            mux_json: None,
-            target_strategy: None,
-        }],
-    };
+        let api_cfg = ApiConfig {
+            // Go api.go:23-25 `API tag can't be empty.`：tag 必填；None → factory
+            // ConfigInvalid → 启动期致命（bd onx4 修复：不再是 StartFailed 被
+            // new_from_built 当 stub 未实现 warn+跳过 → Commander 静默不注册 →
+            // gRPC server 永不启动 → connect 恒败）。
+            tag: Some("api".to_string()),
+            listen: Some(api_addr.clone()),
+            services: Some(vec![
+                "HandlerService".to_string(),
+                "LoggerService".to_string(),
+                "ReflectionService".to_string(),
+            ]),
+        };
+        let built = BuiltConfig {
+            apps: vec![BuiltEntry {
+                kind: "api".to_string(),
+                data: serde_json::to_vec(&api_cfg).unwrap(),
+            }],
+            inbounds: vec![],
+            outbounds: vec![BuiltOutbound {
+                entry: BuiltEntry { kind: "freedom".to_string(), data: b"{}".to_vec() },
+                tag: "direct".to_string(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            }],
+        };
 
-    let (instance, ohm, _handles) = start_full(&built).await.unwrap();
+        match start_full(&built).await {
+            Ok((instance, ohm, _handles)) => break (ohm, api_addr, instance),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full api instance: {e:?}"),
+        }
+    };
     (ohm, api_addr, instance)
 }
 
@@ -207,40 +210,42 @@ async fn reflection_lists_commander_services() {
 #[tokio::test]
 async fn reflection_disabled_when_not_opted_in() {
     // api cfg：无 ReflectionService
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    let api_addr = format!("127.0.0.1:{port}");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (api_addr, _instance, _ohm, _handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let api_addr = format!("127.0.0.1:{}", ports[0]);
 
-    let api_cfg = ApiConfig {
-        // 同上：tag 必填（None → factory ConfigInvalid 启动期致命，bd onx4）。
-        tag: Some("api".to_string()),
-        listen: Some(api_addr.clone()),
-        services: Some(vec![
-            "HandlerService".to_string(),
-            "LoggerService".to_string(),
-            // 注意：未声明 ReflectionService → reflection 必须禁用
-        ]),
-    };
-    let built = BuiltConfig {
-        apps: vec![BuiltEntry {
-            kind: "api".to_string(),
-            data: serde_json::to_vec(&api_cfg).unwrap(),
-        }],
-        inbounds: vec![],
-        outbounds: vec![BuiltOutbound {
-            entry: BuiltEntry { kind: "freedom".to_string(), data: b"{}".to_vec() },
-            tag: "direct".to_string(),
-            send_through: None,
-            stream_settings_json: None,
-            proxy_settings_json: None,
-            mux_json: None,
-            target_strategy: None,
-        }],
-    };
-    let (_instance, _ohm, _handles) = match xray_core::functions::start_full(&built).await {
-        Ok(v) => v,
-        Err(e) => panic!("start_full failed: {e}"),
+        let api_cfg = ApiConfig {
+            // 同上：tag 必填（None → factory ConfigInvalid 启动期致命，bd onx4）。
+            tag: Some("api".to_string()),
+            listen: Some(api_addr.clone()),
+            services: Some(vec![
+                "HandlerService".to_string(),
+                "LoggerService".to_string(),
+                // 注意：未声明 ReflectionService → reflection 必须禁用
+            ]),
+        };
+        let built = BuiltConfig {
+            apps: vec![BuiltEntry {
+                kind: "api".to_string(),
+                data: serde_json::to_vec(&api_cfg).unwrap(),
+            }],
+            inbounds: vec![],
+            outbounds: vec![BuiltOutbound {
+                entry: BuiltEntry { kind: "freedom".to_string(), data: b"{}".to_vec() },
+                tag: "direct".to_string(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            }],
+        };
+        match xray_core::functions::start_full(&built).await {
+            Ok(v) => break (api_addr, v.0, v.1, v.2),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full failed: {e}"),
+        }
     };
     let channel = connect(&api_addr).await;
     let mut reflection = ServerReflectionClient::new(channel);

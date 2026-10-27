@@ -1186,10 +1186,21 @@ mod tests {
 
     // ===== bd dnw3：services 声明集门控实际暴露面（Go api.go/Commander.Start）=====
 
-    /// 预留一个临时本地端口（bind :0 后立即释放）。
-    async fn reserve_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
+    /// TOCTOU 加固：bind(:0)→drop→`Commander::start` 之间端口可能被并行测试/
+    /// 其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试至
+    /// 多 5 次。setup 收到本次候选端口构建 Commander，返回实际端口与就绪实例。
+    async fn start_commander_retrying(setup: impl Fn(u16) -> Commander) -> (u16, Commander) {
+        use xray_features::Feature as _;
+        for _ in 0..5 {
+            let port = xray_common::testing::pick_free_ports(1).await[0];
+            let commander = setup(port);
+            match commander.start() {
+                Ok(()) => return (port, commander),
+                Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+                Err(e) => panic!("commander start: {e}"),
+            }
+        }
+        panic!("commander start: EADDRINUSE persisted across 5 port retries");
     }
 
     /// 带 deadline 退避重试的 dial。
@@ -1232,19 +1243,20 @@ mod tests {
     /// 声明 StatsService + 注入后端 → GetStats 返回真实计数（API 可达）。
     #[tokio::test]
     async fn listen_mode_exposes_declared_stats_service() {
-        use xray_features::Feature as _;
         use xray_proto::xray::app::stats::command::{
             GetStatsRequest, stats_service_client::StatsServiceClient,
         };
 
-        let port = reserve_port().await;
-        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
-        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
-            "StatsService",
-            api_services::STATS,
-        ))));
-        commander.set_stats_service(stats_backend(42));
-        commander.start().expect("commander start (listen mode)");
+        let (port, commander) = start_commander_retrying(|port| {
+            let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+            assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+                "StatsService",
+                api_services::STATS,
+            ))));
+            commander.set_stats_service(stats_backend(42));
+            commander
+        })
+        .await;
         let mut client = dial_with_retry(
             || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
             "dial commander api",
@@ -1286,17 +1298,18 @@ mod tests {
     /// 对应 Go：`services` 列表不含 statsservice 时 config.Service 无该条目。
     #[tokio::test]
     async fn listen_mode_hides_undeclared_stats_service() {
-        use xray_features::Feature as _;
         use xray_proto::xray::app::stats::command::{
             GetStatsRequest, stats_service_client::StatsServiceClient,
         };
 
-        let port = reserve_port().await;
-        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
-        // 只声明 HandlerService；stats 后端注入但不声明。
-        assert!(commander.add_service(Arc::new(HandlerServiceMarker)));
-        commander.set_stats_service(stats_backend(7));
-        commander.start().expect("commander start (listen mode)");
+        let (port, commander) = start_commander_retrying(|port| {
+            let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+            // 只声明 HandlerService；stats 后端注入但不声明。
+            assert!(commander.add_service(Arc::new(HandlerServiceMarker)));
+            commander.set_stats_service(stats_backend(7));
+            commander
+        })
+        .await;
 
         let mut client = dial_with_retry(
             || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
@@ -1318,18 +1331,19 @@ mod tests {
     /// 声明 StatsService 但后端未注入 → 同样不暴露（无后端可注册）。
     #[tokio::test]
     async fn listen_mode_declared_without_backend_not_exposed() {
-        use xray_features::Feature as _;
         use xray_proto::xray::app::stats::command::{
             GetStatsRequest, stats_service_client::StatsServiceClient,
         };
 
-        let port = reserve_port().await;
-        let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
-        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
-            "StatsService",
-            api_services::STATS,
-        ))));
-        commander.start().expect("commander start (listen mode)");
+        let (port, commander) = start_commander_retrying(|port| {
+            let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
+            assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+                "StatsService",
+                api_services::STATS,
+            ))));
+            commander
+        })
+        .await;
 
         let mut client = dial_with_retry(
             || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),

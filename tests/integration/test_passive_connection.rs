@@ -25,14 +25,6 @@ use tokio::{
 use xray_conf::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 use xray_core::functions::start_full;
 
-/// Bind a free TCP port then drop the probe.
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("port").port();
-    drop(probe);
-    port
-}
-
 /// Start a simple TCP echo server (loopback: write what you read).
 /// Returns the listener's bound port.
 async fn spawn_echo_server() -> u16 {
@@ -115,14 +107,20 @@ async fn passive_connection_dokodemo_to_echo() {
     let echo_port = spawn_echo_server().await;
 
     // 2. dokodemo inbound：rewrite → echo
-    let dokodemo_port = pick_free_port().await;
-
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(dokodemo_tcp_inbound(dokodemo_port, "127.0.0.1", echo_port));
-    built.outbounds.push(freedom_outbound("direct"));
-
-    // 3. start_full 启 xray-core
-    let (instance, _ohm, handles) = start_full(&built).await.expect("start_full");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (ports, instance, _ohm, handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let dokodemo_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(dokodemo_tcp_inbound(dokodemo_port, "127.0.0.1", echo_port));
+        built.outbounds.push(freedom_outbound("direct"));
+        match start_full(&built).await {
+            Ok((inst, ohm, h)) => break (ports, inst, ohm, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full: {e}"),
+        }
+    };
+    let dokodemo_port = ports[0];
     assert!(instance.is_running(), "instance must be running after start_full");
 
     // 4. 等 listener 就绪

@@ -29,14 +29,6 @@ use xray_core::functions::start_full;
 /// VMess 测试 UUID（与 e2e_test.rs 惯例一致）。
 const VMESS_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
 
-/// bind :0 取空闲端口再释放。
-async fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
-}
-
 /// freedom outbound（default 兜底；显式放行回环，同 e2e_test.rs 逃逸门先例）。
 fn freedom_default() -> BuiltOutbound {
     BuiltOutbound {
@@ -124,12 +116,27 @@ async fn start_pair(
     client_policy: Option<&[u8]>,
     dest_port: u16,
 ) -> (u16, Vec<tokio::task::JoinHandle<()>>) {
-    let vmess_port = pick_free_port().await;
-    let dok_port = pick_free_port().await;
-    let (_si, _soh, mut s_handles) =
-        start_full(&server_cfg(vmess_port, server_policy)).await.unwrap();
-    let (_ci, _coh, mut c_handles) =
-        start_full(&client_cfg(dok_port, vmess_port, dest_port, client_policy)).await.unwrap();
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (sports, _si, _soh, mut s_handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vmess_port = ports[0];
+        match start_full(&server_cfg(vmess_port, server_policy)).await {
+            Ok((si, soh, h)) => break (ports, si, soh, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("policy server start: {e:?}"),
+        }
+    };
+    let vmess_port = sports[0];
+    let (cports, _ci, _coh, mut c_handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let dok_port = ports[0];
+        match start_full(&client_cfg(dok_port, vmess_port, dest_port, client_policy)).await {
+            Ok((ci, coh, h)) => break (ports, ci, coh, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("policy client start: {e:?}"),
+        }
+    };
+    let dok_port = cports[0];
     tokio::time::sleep(Duration::from_millis(100)).await;
     s_handles.append(&mut c_handles);
     (dok_port, s_handles)

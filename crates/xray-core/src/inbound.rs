@@ -3099,6 +3099,9 @@ pub struct InboundRuntime {
     /// handshake 超时等 per-level 策略）。
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown: CancellationToken,
+    /// 宿主 arm scope 登记表（bd a9xgp：Instance 建一份，经本件注入各 inbound
+    /// arm 的 `PluginContext`；`Instance::close` 逆序显式关停全部 arm）。
+    arm_scopes: Arc<xray_frame::ArmScopeRegistry>,
     /// 已启动入站（tag → slot；xiuvr-3a：udf `BoundedRegistry` 承载——BTreeMap
     /// 确定序 = tag 升序，ListInbounds 顺序稳定；上界 fail-closed 不静默淘汰）。
     slots: parking_lot::RwLock<BoundedRegistry<String, InboundSlot>>,
@@ -3110,6 +3113,7 @@ impl InboundRuntime {
         ohm: Arc<SimpleOhm>,
         dispatcher: Option<Arc<xray_app_dispatcher::DefaultDispatcher>>,
         shutdown: CancellationToken,
+        arm_scopes: Arc<xray_frame::ArmScopeRegistry>,
     ) -> Self {
         let policy = dispatcher.as_ref().and_then(|d| d.policy_manager.clone());
         Self {
@@ -3117,11 +3121,17 @@ impl InboundRuntime {
             dispatcher,
             policy,
             shutdown,
+            arm_scopes,
             slots: parking_lot::RwLock::new(BoundedRegistry::new(
                 INBOUND_REGISTRY_CAP,
                 Eviction::Reject,
             )),
         }
+    }
+
+    /// 宿主 arm scope 登记表（装配期接线 inbound arm `PluginContext` 用）。
+    pub fn arm_scopes(&self) -> &Arc<xray_frame::ArmScopeRegistry> {
+        &self.arm_scopes
     }
 
     /// 启动一个 inbound 并登记（配置期与 gRPC AddInbound 共用同一路径）。
@@ -3259,21 +3269,44 @@ pub fn built_inbound_from_proto(cfg: &ProtoInboundConfig) -> Result<BuiltInbound
     })
 }
 
+/// inbound arm scope 停机排空预算（bd a9xgp）。
+///
+/// 保守默认 = 5s，对齐 xray-frame `DEFAULT_SHUTDOWN_TIMEOUT`（P0-8 拍板）与
+/// `shutdown_bridge::DEFAULT_CLOSE_TIMEOUT` 同族停机档。语义：cancel 广播后
+/// 至多等 5s 收净 arm 托管任务，超时剩余任务已被 abort 兜底（udf
+/// `FxScope::shutdown_timeout` close_and_take，零残留）——**停机永不无限等**。
+/// 排空在后台监视任务进行，不阻塞 `Instance::close` 同步段（close 只做逆序
+/// 广播，在途连接毫秒级终止）。
+const ARM_SCOPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// spawn 一个 inbound serve task，监听 shutdown_token 实现优雅关闭。
 ///
 /// token cancel 时取消 serve future（drop listener，accept 循环终止）。
-/// 对应 Go 有序关闭的"先停 accept"阶段。connection drain 留后续。
+/// 对应 Go 有序关闭的"先停 accept"阶段。
 ///
 /// W4 面 6：serve 任务本体托管 arm scope（任务记账 + in_flight + 停机级联，
 /// bd 39hko）；panic 监督语义（51d50459）逐字保留——FxScope catch_unwind 把
 /// serve future 的 panic 归一 `TaskError::Panicked`，外层壳 join 判别后 error! 留痕，
 /// listener 随 panic 的 future drop 释放，等价原 `JoinError::is_panic()` 路径。
+///
+/// bd a9xgp（停机掉在途连接）：本函数是全部 inbound arm 的**唯一构造漏斗**
+/// （arm_builders 各构造函数 + transport/unix 分支均经此 spawn），在此集中完成
+/// ①登记（arm scope 句柄入宿主登记表，`Instance::close` 逆序显式 close）与
+/// ②停机监视（token cancel → 关 arm scope 父闸广播 → `ConnScope` 级联取消
+/// 在途连接 → arm 托管任务有界排空）。
 pub(crate) fn spawn_inbound_serve(
     arm: &Arc<PluginContext>,
     tag: String,
     shutdown_token: CancellationToken,
     fut: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> JoinHandle<()> {
+    // ①登记（bd a9xgp）：arm scope 句柄入宿主登记表（装配序）；未接线 ctx
+    // （独立装配配方/测试 ctx）跳过——停机级联由 token 监视 + Drop 兜底。
+    if let Some(registry) = arm.arm_registry() {
+        registry.register(tag.as_str(), Arc::clone(arm.arm_scope()));
+    }
+    // 停机监视令牌（先于 inner 克隆：shutdown_token 本体随 inner future move）。
+    let watch_token = shutdown_token.clone();
     // 内层：serve + shutdown select —— 托管 arm scope。
     let inner = arm
         .spawn({
@@ -3293,8 +3326,8 @@ pub(crate) fn spawn_inbound_serve(
         })
         .expect("arm FxScope is never closed");
     // 外层壳：JoinHandle 外返契约（InboundRuntime → spawn_inbounds → functions.rs
-    // 消费链，改返回类型超出本波文件面）+ panic 监督（51d50459 语义保留）。
-    // 例外登记（W4 面 6）：JoinHandle 外返契约，与 tun 保留同源举证。
+    // 消费链，改返回类型超出本波文件面）+ panic 监督（51d50459 语义保留）+ 停机
+    // 监视（bd a9xgp）。例外登记（W4 面 6）：JoinHandle 外返契约，与 tun 保留同源。
     //
     // **arm scope 生命周期锚（关键）**：serve 任务本体登记在 arm scope 的
     // JoinSet 内，而 JoinSet 随 `FxScope` drop 即 abort 全部在途任务。arm
@@ -3303,20 +3336,47 @@ pub(crate) fn spawn_inbound_serve(
     // listener 随 future drop 释放 → 入站静默失效（端口不再 listen 而进程存活）。
     // 故外层壳持一份 `Arc<PluginContext>` 锚，覆盖 inner 任务存活期
     // （既有同款先例：`let _ctx = task_ctx;` 生命周期锚）。
+    //
+    // **停机监视臂（bd a9xgp）**：token cancel（实例停机 / per-inbound remove）
+    // → `ArmScope::shutdown_timeout` 关父闸 + watch 广播 → `ConnScope` 级联取消
+    // 在途连接（SS 泵等）→ arm 托管任务 abort_all + 超时兜底排空。监视与 panic
+    // 监督同壳承载，零新增任务。
     let arm_anchor = Arc::clone(arm);
     #[allow(
         clippy::disallowed_methods,
-        reason = "监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）保留，serve 任务本体已迁 arm scope"
+        reason = "监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）+ 停机级联监视（bd a9xgp）同壳承载，serve 任务本体已迁 arm scope"
     )]
     tokio::spawn(async move {
-        let _arm = arm_anchor;
-        if let Err(skeleton_infra::fx::TaskError::Panicked(_)) = inner.join().await {
-            tracing::error!(
-                tag = %tag,
-                "inbound serve task panicked — 监听已停止，该端口不再接受连接"
-            );
+        let arm = arm_anchor;
+        tokio::select! {
+            _ = watch_token.cancelled() => {
+                arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await
+                    .unwrap_or_else(|e| drain_warn(&tag, e));
+            }
+            joined = inner.join() => {
+                if let Err(skeleton_infra::fx::TaskError::Panicked(_)) = joined {
+                    tracing::error!(
+                        tag = %tag,
+                        "inbound serve task panicked — 监听已停止，该端口不再接受连接"
+                    );
+                }
+                // select! 双臂同就绪随机裁决（serve 与监视令牌同听一个 token，
+                // join 可先就绪）——join 臂胜出时停机排空必须兜底，禁把级联
+                // 押在裁决随机性上（a9xgp 修复首跑即踩中）。token 已取消 =
+                // 停机形态 → 幂等排空；token 未取消 = listener 自然终局，保留
+                // 既有「连接任务不随 listener 死亡」的 detach 语义不排空。
+                if watch_token.is_cancelled() {
+                    arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await
+                        .unwrap_or_else(|e| drain_warn(&tag, e));
+                }
+            }
         }
     })
+}
+
+/// 停机排空超时留痕（超时档已到 = 剩余任务已被 abort 兜底，仅日志面）。
+fn drain_warn(tag: &str, e: skeleton_infra::fx::TaskError) {
+    tracing::warn!(tag = %tag, error = %e, "arm scope drain timed out; residual tasks aborted");
 }
 
 /// 从 inbound streamSettings 构建 TLS acceptor（security=tls 时）。
@@ -4169,6 +4229,12 @@ pub(crate) async fn spawn_one_inbound(
     // 已删）。注册表值转发 phase 1 同一构造函数；未命中 = 未支持协议，显式 warn
     // 跳过（不静默构造）。
     if let Some(builder) = crate::arm_registry::lookup_inbound_builder(ib.entry.kind.as_str()) {
+        // bd a9xgp：宿主 arm scope 登记表注入（停机级联；api 缺省 = 独立/测试
+        // 构造，不接线，级联由 token 监视 + Drop 兜底）。
+        let mut plugin_ctx = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+        if let Some(api) = api {
+            plugin_ctx = plugin_ctx.with_arm_registry(Arc::clone(api.arm_scopes()));
+        }
         return builder(crate::arm_builders::InboundCtx {
             ib,
             ohm,
@@ -4177,7 +4243,7 @@ pub(crate) async fn spawn_one_inbound(
             addr: &addr,
             settings: &settings,
             api,
-            plugin_ctx: crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()),
+            plugin_ctx,
         })
         .await;
     }
@@ -4274,8 +4340,12 @@ async fn spawn_unix_inbound(
     use xray_transport::system_listener::listen_unix_system;
 
     // L2 能力句柄：UDS 分支与 transport 分支同源（arm_plugin_ctx 派发点构造）。
-    let plugin_ctx =
-        std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+    }
+    let plugin_ctx = std::sync::Arc::new(ctx_builder);
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
@@ -4568,8 +4638,12 @@ async fn spawn_unix_transport_inbound(
         "vless" => {
             let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
             // L2 能力句柄：与 spawn_unix_inbound 同源（arm_plugin_ctx 派发点构造）。
-            let plugin_ctx =
-                std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+            // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+            let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+            if let Some(api) = api {
+                ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+            }
+            let plugin_ctx = std::sync::Arc::new(ctx_builder);
             let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
             let options = VlessInboundOptions {
                 decryption: decryption.clone(),
@@ -4612,7 +4686,12 @@ async fn spawn_unix_transport_inbound(
         xray_transport::listener_registry::listen_unix(listen, settings, sockopt, on_conn).await?;
     tracing::info!(tag = %ib.tag, path = %listen, "transport inbound listening (unix)");
     // L2 能力句柄：监听保活任务同 transport 分支同源（arm_plugin_ctx 派发点构造）。
-    let arm_ctx = std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+    }
+    let arm_ctx = std::sync::Arc::new(ctx_builder);
     Ok(Some(spawn_inbound_serve(&arm_ctx, ib.tag.clone(), shutdown_token, async move {
         let _listener = listener;
         std::future::pending::<()>().await;
@@ -11342,6 +11421,33 @@ mod tests {
         }
     }
 
+    /// TOCTOU 加固：bind(:0)→drop→spawn_one_inbound 之间端口可能被并行测试/
+    /// 其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试至
+    /// 多 5 次。返回实际绑定端口与 serve 句柄。
+    async fn spawn_one_inbound_retrying(
+        build: impl Fn(u16) -> BuiltInbound,
+        ohm: Arc<SimpleOhm>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        for _ in 0..5 {
+            let port = xray_common::testing::pick_free_ports(1).await[0];
+            match spawn_one_inbound(
+                &build(port),
+                Arc::clone(&ohm),
+                None,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            {
+                Ok(Some(handle)) => return (port, handle),
+                Ok(None) => panic!("inbound spawn returned no handle"),
+                Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+                Err(e) => panic!("inbound spawn: {e}"),
+            }
+        }
+        panic!("inbound spawn: EADDRINUSE persisted across 5 port retries");
+    }
+
     /// bd 7wor：ss 入站 finalmask 端到端（装配注入 → accept 解伪装 → ss 握手 →
     /// dispatch）。接线前 masked 腿：服务端把 sudoku 编码字节当 ss AEAD 解，
     /// 握手永不成 → 客户端超时（红）；接线后双腿全通（绿）。masked 腿 wire
@@ -11363,29 +11469,26 @@ mod tests {
         for (i, masked) in [false, true].into_iter().enumerate() {
             // 每腿独立空闲端口（serve_ss 会顺手绑同端口 UDP relay，旧腿的
             // detached UDP task 退出前不释放，复用端口会撞 bind）。
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-
+            // TOCTOU 加固：占用时换端口重试。
             let ohm = Arc::new(SimpleOhm::new());
             let capture = Arc::new(DestCaptureDispatch { dest: parking_lot::Mutex::new(None) });
             ohm.set_default(Arc::clone(&capture) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
 
-            let ib = BuiltInbound {
-                entry: xray_conf::BuiltEntry {
-                    kind: "shadowsocks".into(),
-                    data: users_json.clone(),
+            let (port, handle) = spawn_one_inbound_retrying(
+                |port| BuiltInbound {
+                    entry: xray_conf::BuiltEntry {
+                        kind: "shadowsocks".into(),
+                        data: users_json.clone(),
+                    },
+                    tag: "ss-fm".into(),
+                    port: Some(port),
+                    listen: Some("127.0.0.1".into()),
+                    stream_settings_json: masked.then(|| stream_json.clone()),
+                    sniffing_json: None,
                 },
-                tag: "ss-fm".into(),
-                port: Some(port),
-                listen: Some("127.0.0.1".into()),
-                stream_settings_json: masked.then(|| stream_json.clone()),
-                sniffing_json: None,
-            };
-            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
-                .await
-                .unwrap()
-                .expect("ss inbound spawn");
+                ohm,
+            )
+            .await;
 
             // 客户端：tap 在 mask 链内层记 wire 字节；客户端按配置套同一条 mask。
             let raw = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -11464,30 +11567,26 @@ mod tests {
 
         for masked in [false, true] {
             // 每腿独立空闲端口（serve_ss 同端口绑 UDP relay，旧腿 detached task
-            // 退出前不释放，复用端口会撞 bind）
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-
+            // 退出前不释放，复用端口会撞 bind）。TOCTOU 加固：占用时换端口重试。
             let ohm = Arc::new(SimpleOhm::new());
             ohm.set_default(Arc::new(MarkerUdpDispatch { marker: b"ss-udp-fm" })
                 as Arc<dyn xray_app_dispatcher::DispatchHandler>);
 
-            let ib = BuiltInbound {
-                entry: xray_conf::BuiltEntry {
-                    kind: "shadowsocks".into(),
-                    data: users_json.clone(),
+            let (port, handle) = spawn_one_inbound_retrying(
+                |port| BuiltInbound {
+                    entry: xray_conf::BuiltEntry {
+                        kind: "shadowsocks".into(),
+                        data: users_json.clone(),
+                    },
+                    tag: "ss-udp-fm".into(),
+                    port: Some(port),
+                    listen: Some("127.0.0.1".into()),
+                    stream_settings_json: masked.then(|| stream_json.clone()),
+                    sniffing_json: None,
                 },
-                tag: "ss-udp-fm".into(),
-                port: Some(port),
-                listen: Some("127.0.0.1".into()),
-                stream_settings_json: masked.then(|| stream_json.clone()),
-                sniffing_json: None,
-            };
-            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
-                .await
-                .unwrap()
-                .expect("ss inbound spawn");
+                ohm,
+            )
+            .await;
             // Windows UDP：服务端 relay 未就绪时发包 → ICMP port unreachable
             // 滞留，本腿 recv 报 ConnectionReset(10054)。等 UDP relay 绑定完成。
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -11548,31 +11647,28 @@ mod tests {
         });
 
         for masked in [false, true] {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = probe.local_addr().unwrap().port();
-            drop(probe);
-
+            // TOCTOU 加固：占用时换端口重试。
             let ohm = Arc::new(SimpleOhm::new());
             ohm.set_default(Arc::new(MarkerUdpDispatch { marker: b"dokodemo-udp-fm" })
                 as Arc<dyn xray_app_dispatcher::DispatchHandler>);
 
-            let ib = BuiltInbound {
-                entry: xray_conf::BuiltEntry {
-                    kind: "dokodemo".into(),
-                    // network:"udp" → 仅 UDP relay（dispatch dest 固定 8.8.8.8:53，
-                    // marker handler 不打真实包）
-                    data: br#"{"address":"8.8.8.8","port":53,"network":"udp"}"#.to_vec(),
+            let (port, handle) = spawn_one_inbound_retrying(
+                |port| BuiltInbound {
+                    entry: xray_conf::BuiltEntry {
+                        kind: "dokodemo".into(),
+                        // network:"udp" → 仅 UDP relay（dispatch dest 固定 8.8.8.8:53，
+                        // marker handler 不打真实包）
+                        data: br#"{"address":"8.8.8.8","port":53,"network":"udp"}"#.to_vec(),
+                    },
+                    tag: "dok-udp-fm".into(),
+                    port: Some(port),
+                    listen: Some("127.0.0.1".into()),
+                    stream_settings_json: masked.then(|| stream_json.clone()),
+                    sniffing_json: None,
                 },
-                tag: "dok-udp-fm".into(),
-                port: Some(port),
-                listen: Some("127.0.0.1".into()),
-                stream_settings_json: masked.then(|| stream_json.clone()),
-                sniffing_json: None,
-            };
-            let handle = spawn_one_inbound(&ib, ohm, None, CancellationToken::new(), None)
-                .await
-                .unwrap()
-                .expect("dokodemo inbound spawn");
+                ohm,
+            )
+            .await;
 
             let raw = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let relay = std::net::SocketAddr::new(
@@ -11692,7 +11788,12 @@ mod tests {
     // ── xiuvr-3a 阶段 2：影子注册表双跑对照（零行为改变；阶段 4 删影子）──
 
     fn xiuvr3a_runtime() -> InboundRuntime {
-        InboundRuntime::new(Arc::new(SimpleOhm::new()), None, CancellationToken::new())
+        InboundRuntime::new(
+            Arc::new(SimpleOhm::new()),
+            None,
+            CancellationToken::new(),
+            Arc::new(xray_frame::ArmScopeRegistry::new()),
+        )
     }
 
     fn xiuvr3a_inbound(kind: &str, tag: &str, settings: serde_json::Value) -> BuiltInbound {

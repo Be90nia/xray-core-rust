@@ -23,13 +23,23 @@ impl StatsCollector for ConstStats {
     }
 }
 
-/// 取一个临时空闲端口：bind 127.0.0.1:0 拿系统分配的端口，drop 后让被测 server 重新 bind。
-/// 测试场景下窗口很小（localhost 无竞争），可接受。
-fn pick_port() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp");
-    let a = l.local_addr().expect("local_addr");
-    drop(l);
-    a
+/// TOCTOU 加固：bind(:0)→drop→被测 server 再 bind 之间端口可能被并行测试/
+/// 其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试至多 5 次。
+async fn start_server_retrying(
+    stats: Arc<dyn StatsCollector>,
+    obs: Option<Arc<dyn xray_app_metrics::ObservationCollector>>,
+) -> (std::net::SocketAddr, TokioHttpServer) {
+    for _ in 0..5 {
+        let port = xray_common::testing::pick_free_ports(1).await[0];
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = TokioHttpServer::new();
+        match server.start_http_listen(&addr.to_string(), Arc::clone(&stats), obs.clone()) {
+            Ok(()) => return (addr, server),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_http_listen: {e}"),
+        }
+    }
+    panic!("start_http_listen: EADDRINUSE persisted across 5 port retries");
 }
 
 async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
@@ -44,11 +54,7 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
 
 #[tokio::test]
 async fn get_metrics_returns_prometheus_exposition_format() {
-    let addr = pick_port();
-    let server = TokioHttpServer::new();
-    let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats);
-
-    server.start_http_listen(&addr.to_string(), stats, None).expect("start_http_listen");
+    let (addr, server) = start_server_retrying(Arc::new(ConstStats), None).await;
 
     // 给 accept loop 一点时间进入 select!（实际 race window 极小）
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -84,11 +90,7 @@ async fn get_metrics_returns_prometheus_exposition_format() {
 
 #[tokio::test]
 async fn get_unknown_path_returns_404() {
-    let addr = pick_port();
-    let server = TokioHttpServer::new();
-    let stats: Arc<dyn StatsCollector> = Arc::new(ConstStats);
-
-    server.start_http_listen(&addr.to_string(), stats, None).expect("start_http_listen");
+    let (addr, server) = start_server_retrying(Arc::new(ConstStats), None).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = http_get(addr, "/nope").await;
@@ -120,12 +122,7 @@ async fn get_metrics_includes_observation_when_collector_provided() {
         }
     }
 
-    let addr = pick_port();
-    let server = TokioHttpServer::new();
-    let stats: Arc<dyn StatsCollector> = Arc::new(WithObs);
-    let obs: Arc<dyn xray_app_metrics::ObservationCollector> = Arc::new(WithObs);
-
-    server.start_http_listen(&addr.to_string(), stats, Some(obs)).expect("start_http_listen");
+    let (addr, server) = start_server_retrying(Arc::new(WithObs), Some(Arc::new(WithObs))).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let resp = http_get(addr, "/metrics").await;

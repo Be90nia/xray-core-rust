@@ -34,14 +34,6 @@ const SNI: &str = "sniffed.example.com";
 /// CONNECT 隧道建立后携带的业务载荷（ClientHello 之外再带一段真实字节）。
 const PAYLOAD: &[u8] = b"sniffing e2e payload after client hello!";
 
-/// bind :0 取空闲端口再释放（与既有 e2e 测试端口分配惯例一致）。
-async fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
-}
-
 /// 标记 echo server：accept 后先写 banner，再无限回显。返回监听地址。
 async fn spawn_banner_echo(banner: &'static [u8]) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -112,47 +104,56 @@ async fn start_topology(
 ) -> (u16, Arc<xray_core::Instance>, Vec<tokio::task::JoinHandle<()>>) {
     let echo_a = spawn_banner_echo(b"-A").await;
     let echo_b = spawn_banner_echo(b"-B").await;
-    let http_port = pick_free_port().await;
-    let snif_port = pick_free_port().await;
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时整组换端口重试至多 5 次。
+    let (ports, instance, _ohm, handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(2).await;
+        let (http_port, snif_port) = (ports[0], ports[1]);
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry { kind: "http".into(), data: b"{}".to_vec() },
-        tag: "http-in".into(),
-        port: Some(http_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "dokodemo".into(),
-            // Go 原版 RewriteAddress/RewritePort 同形态：rewrite 到 127.0.0.1:443。
-            data: br#"{"address":"127.0.0.1","port":443}"#.to_vec(),
-        },
-        tag: "snif-in".into(),
-        port: Some(snif_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json,
-    });
-    built.outbounds.push(freedom_default()); // i=0 → default
-    built.outbounds.push(dokodemo_outbound("redir", snif_port));
-    built.outbounds.push(dokodemo_outbound("dom-a", echo_a.port()));
-    built.outbounds.push(dokodemo_outbound("ip-b", echo_b.port()));
-    built.apps.push(BuiltEntry {
-        kind: "routing".into(),
-        data: format!(
-            r#"{{"domainStrategy":"AsIs","rules":[
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry { kind: "http".into(), data: b"{}".to_vec() },
+            tag: "http-in".into(),
+            port: Some(http_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "dokodemo".into(),
+                // Go 原版 RewriteAddress/RewritePort 同形态：rewrite 到 127.0.0.1:443。
+                data: br#"{"address":"127.0.0.1","port":443}"#.to_vec(),
+            },
+            tag: "snif-in".into(),
+            port: Some(snif_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: sniffing_json.clone(),
+        });
+        built.outbounds.push(freedom_default()); // i=0 → default
+        built.outbounds.push(dokodemo_outbound("redir", snif_port));
+        built.outbounds.push(dokodemo_outbound("dom-a", echo_a.port()));
+        built.outbounds.push(dokodemo_outbound("ip-b", echo_b.port()));
+        built.apps.push(BuiltEntry {
+            kind: "routing".into(),
+            data: format!(
+                r#"{{"domainStrategy":"AsIs","rules":[
             {{"type":"field","inboundTag":["http-in"],"outboundTag":"redir"}},
             {{"type":"field","domain":["full:{SNI}"],"outboundTag":"dom-a"}},
             {{"type":"field","ip":["127.0.0.0/8"],"outboundTag":"ip-b"}}
         ]}}"#
-        )
-        .into_bytes(),
-    });
+            )
+            .into_bytes(),
+        });
 
-    let (instance, _ohm, handles) = start_full(&built).await.unwrap();
+        match start_full(&built).await {
+            Ok((inst, ohm, h)) => break (ports, inst, ohm, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("sniffing topology start: {e:?}"),
+        }
+    };
+    let (http_port, snif_port) = (ports[0], ports[1]);
+    let _ = snif_port; // 回注目标仅在拓扑配置内消费
     tokio::time::sleep(Duration::from_millis(100)).await;
     (http_port, instance, handles)
 }

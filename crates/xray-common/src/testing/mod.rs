@@ -31,3 +31,26 @@ where
     // 本模块是 L3 闸唯一的测试面豁免点；不要在别处复制裸 spawn。
     tokio::spawn(fut.instrument(tracing::info_span!("test_task", task)))
 }
+
+/// bind(:0)→drop→被测方再 bind 之间端口可能被并行测试/其他进程抢占（TOCTOU，
+/// Windows os error 10048 / Unix EADDRINUSE 实证）。探测 N 个**互异**空闲端口：
+/// 所有探测 listener 在取号全程存活（OS 保证组内互不重号），全部取齐后统一
+/// 释放——把竞态窗口收敛为「释放→被测方 bind」一段，由调用方按占用重试兜底。
+pub async fn pick_free_ports(n: usize) -> Vec<u16> {
+    let mut probes = Vec::with_capacity(n);
+    for _ in 0..n {
+        probes.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe bind :0"));
+    }
+    let ports = probes.iter().map(|l| l.local_addr().expect("probe local_addr").port()).collect();
+    drop(probes);
+    ports
+}
+
+/// 地址占用判定（跨平台、免本地化消息）：错误 Debug 里出现
+/// `(os error 10048)`/`(os error 98)`（Display 尾缀被格式化进错误串的形态，
+/// 如 `FeatureError::InstanceStart(String)`）或 `AddrInUse`（io::Error Debug
+/// 形态 `Os { code: 10048, kind: AddrInUse, .. }` 经 `#[from]` 透传）。
+pub fn is_addr_in_use_err(err: impl std::fmt::Debug) -> bool {
+    let s = format!("{err:?}");
+    s.contains("(os error 10048)") || s.contains("(os error 98)") || s.contains("AddrInUse")
+}

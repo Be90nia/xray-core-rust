@@ -909,8 +909,13 @@ pub(crate) fn ss_transport_on_conn(
     let hs_timeout = handshake_timeout_for(policy, 0);
     // W4 面 6：SS 泵归每连接 scope——per-conn pipeline 需 arm ctx（就地构造，
     // 与 transport listener inbound 的派发点构造同源）。
-    let plugin_ctx =
-        std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）——停机级联取消
+    // ConnScope 泵。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+    }
+    let plugin_ctx = std::sync::Arc::new(ctx_builder);
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);

@@ -52,13 +52,6 @@ async fn start_echo() -> std::net::SocketAddr {
     addr
 }
 
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
-}
-
 async fn socks5_echo_round_trip(proxy_port: u16, echo_port: u16, payload: &[u8]) {
     let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.expect("connect socks");
     sock.write_all(&[0x05, 0x01, 0x00]).await.expect("socks greet");
@@ -145,22 +138,35 @@ fn socks_inbound(port: u16) -> BuiltInbound {
 
 async fn run_grpc_e2e(grpc_settings: serde_json::Value, payload: &[u8]) {
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-grpc-mm-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(grpc_settings.clone());
-
-    let (_si, _so, sh) = start_full(&server_cfg).await.expect("vless-grpc server");
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (vless_port, _si, _so, sh) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-grpc-mm-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(grpc_settings.clone());
+        match start_full(&server_cfg).await {
+            Ok((si, so, sh)) => break (vless_port, si, so, sh),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("vless-grpc server start: {e:?}"),
+        }
+    };
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings));
-
-    let (_ci, _co, ch) = start_full(&client_cfg).await.expect("vless-grpc client");
+    let (socks_port, _ci, _co, ch) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, grpc_settings.clone()));
+        match start_full(&client_cfg).await {
+            Ok((ci, co, ch)) => break (socks_port, ci, co, ch),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("vless-grpc client start: {e:?}"),
+        }
+    };
     tokio::time::sleep(TRANSPORT_WARMUP).await;
 
     socks5_echo_round_trip(socks_port, echo_addr.port(), payload).await;

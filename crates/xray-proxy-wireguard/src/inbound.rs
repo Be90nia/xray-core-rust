@@ -782,20 +782,30 @@ mod tests {
         }
     }
 
-    async fn free_port() -> u16 {
-        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
+    /// TOCTOU 加固：bind(:0)→drop→`WireguardInboundHandler::new`（构造期绑
+    /// UDP）之间端口可能被并行测试/其他进程抢占（Windows 10048 / Unix
+    /// EADDRINUSE）——占用时换端口重试至多 5 次。返回实际端口与 handler。
+    async fn new_handler_retrying(
+        tag: &str,
+        cfg: &DeviceConfig,
+        dispatch: Arc<dyn DispatchHandler>,
+    ) -> (u16, WireguardInboundHandler) {
+        for _ in 0..5 {
+            let port = xray_common::testing::pick_free_ports(1).await[0];
+            match WireguardInboundHandler::new(tag, cfg, port, Arc::clone(&dispatch)).await {
+                Ok(h) => return (port, h),
+                Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+                Err(e) => panic!("{tag}: wg inbound construct: {e:?}"),
+            }
+        }
+        panic!("{tag}: wg inbound bind: EADDRINUSE persisted across 5 port retries");
     }
 
     #[tokio::test]
     async fn construct_inbound_handler() {
         let (dispatch, _) = make_dispatch();
         let cfg = make_config(0x66);
-        let port = free_port().await;
-        let h = WireguardInboundHandler::new("test", &cfg, port, dispatch).await;
-        assert!(h.is_ok(), "construct failed: {:?}", h.err());
+        let (_port, _h) = new_handler_retrying("test", &cfg, dispatch).await;
     }
 
     #[tokio::test]
@@ -813,10 +823,7 @@ mod tests {
     async fn start_close_lifecycle() {
         let (dispatch, _) = make_dispatch();
         let cfg = make_config(0x88);
-        let port = free_port().await;
-
-        let h =
-            WireguardInboundHandler::new("test", &cfg, port, dispatch).await.expect("construct");
+        let (port, h) = new_handler_retrying("test", &cfg, dispatch).await;
         assert_eq!(h.port(), port);
         assert_eq!(h.tag(), "test");
 
@@ -1058,23 +1065,19 @@ mod tests {
         const TUNNEL_TCP_PORT: u16 = 8080;
         let (sec_c, pub_c) = make_keypair(0x11);
         let (sec_s, pub_s) = make_keypair(0x22);
-        let udp_port = free_port().await;
 
-        // server：生产 inbound handler（new_multi driver + wg_accept_loop）
         let server_cfg = DeviceConfig {
             secret_key: sec_s,
             endpoint: vec!["10.0.0.1/32".into()],
             peers: vec![PeerConfig {
                 public_key: pub_c.clone(),
-                allowed_ips: vec!["10.0.0.2/32".into()], // 回程路由必需
+                allowed_ips: vec!["10.0.0.2/32".into()],
                 ..Default::default()
             }],
             ..Default::default()
         };
         let (dispatch, seen, access_seen) = EchoDispatch::new("wg-e2e-out", b"echo:pong");
-        let server = WireguardInboundHandler::new("wg-e2e", &server_cfg, udp_port, dispatch)
-            .await
-            .expect("server construct");
+        let (udp_port, server) = new_handler_retrying("wg-e2e", &server_cfg, dispatch).await;
         server.start().await.expect("server start");
 
         // bd ttni：AddUser（同公钥原位替换静态 peer）后，dispatch 携带
@@ -1210,7 +1213,6 @@ mod tests {
 
         let (sec_c, pub_c) = make_keypair(0x11);
         let (sec_s, pub_s) = make_keypair(0x22);
-        let udp_port = free_port().await;
 
         let server_cfg = DeviceConfig {
             secret_key: sec_s,
@@ -1223,9 +1225,7 @@ mod tests {
             ..Default::default()
         };
         let (dispatch, release) = HoldEchoDispatch::new("wg-e2e-large", &payload);
-        let server = WireguardInboundHandler::new("wg-e2e-large", &server_cfg, udp_port, dispatch)
-            .await
-            .expect("server construct");
+        let (udp_port, server) = new_handler_retrying("wg-e2e-large", &server_cfg, dispatch).await;
         server.start().await.expect("server start");
         server
             .user_registry()
@@ -1375,7 +1375,6 @@ mod tests {
 
         let (sec_c, pub_c) = make_keypair(0x33);
         let (sec_s, pub_s) = make_keypair(0x44);
-        let udp_port = free_port().await;
 
         let server_cfg = DeviceConfig {
             secret_key: sec_s,
@@ -1388,9 +1387,7 @@ mod tests {
             ..Default::default()
         };
         let (dispatch, release) = HoldEchoDispatch::new("wg-e2e-97ng", &payload);
-        let server = WireguardInboundHandler::new("wg-e2e-97ng", &server_cfg, udp_port, dispatch)
-            .await
-            .expect("server construct");
+        let (udp_port, server) = new_handler_retrying("wg-e2e-97ng", &server_cfg, dispatch).await;
         server.start().await.expect("server start");
         server
             .user_registry()

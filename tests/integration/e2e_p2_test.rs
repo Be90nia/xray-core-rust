@@ -79,10 +79,27 @@ async fn start_echo() -> std::net::SocketAddr {
     addr
 }
 
-/// Bind a free port then drop the probe.
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    probe.local_addr().expect("port").port()
+/// 端口探测 TOCTOU 加固（机制同 crates/xray-core/src/functions.rs）：bind(:0)→drop
+/// →被测实例再 bind 之间端口可能被并行测试/其他进程抢占（Windows os error
+/// 10048 / Unix os error 98）——start 失败且为地址占用时整组换新端口重试至多 5 次。
+async fn start_full_retrying(
+    n_ports: usize,
+    build: impl Fn(&[u16]) -> BuiltConfig,
+) -> (
+    Vec<u16>,
+    std::sync::Arc<xray_core::Instance>,
+    std::sync::Arc<xray_app_dispatcher::default::SimpleOhm>,
+    Vec<tokio::task::JoinHandle<()>>,
+) {
+    for _ in 0..5 {
+        let ports = xray_common::testing::pick_free_ports(n_ports).await;
+        match start_full(&build(&ports)).await {
+            Ok((inst, ohm, handles)) => return (ports, inst, ohm, handles),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("instance start: {e:?}"),
+        }
+    }
+    panic!("instance start: EADDRINUSE persisted across 5 port retries");
 }
 
 fn freedom_outbound(tag: &str) -> BuiltOutbound {
@@ -221,80 +238,85 @@ fn wg_keypair(seed: u8) -> (String, String) {
 async fn e2e_p2_wireguard_full_chain() {
     let _echo = start_echo().await;
 
-    let wg_port = pick_free_port().await;
-    let dokodemo_port = pick_free_port().await;
-
     let (sec_a, pub_a) = wg_keypair(0x11);
     let (sec_b, pub_b) = wg_keypair(0x22);
 
-    let mut built = BuiltConfig::default();
-    // Dokodemo inbound (TCP) — fixed dest = echo port (will not actually forward
-    // echo payload through WG in this assertion, but proves registration).
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "dokodemo".into(),
-            data: serde_json::json!({
-                "address": "127.0.0.1",
-                "port": wg_port,
-                "network": "tcp"
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "dokodemo-in".into(),
-        port: Some(dokodemo_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    // WireGuard inbound — receives WG UDP from peer, dispatches to default outbound.
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "wireguard".into(),
-            data: serde_json::json!({
-                "secretKey": sec_b,
-                "address": ["10.0.0.1/32"],
-                "peers": [{
-                    "publicKey": pub_a,
-                    "endpoint": format!("127.0.0.1:{wg_port}"),
-                    "allowedIps": ["10.0.0.2/32"]
-                }],
-                "port": wg_port
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "wg-in".into(),
-        port: Some(wg_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    // WireGuard outbound — client side, dials wg-in via UDP.
-    built.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "wireguard".into(),
-            data: serde_json::json!({
-                "secretKey": sec_a,
-                "address": ["10.0.0.2/32"],
-                "peers": [{
-                    "publicKey": pub_b,
-                    "endpoint": format!("127.0.0.1:{wg_port}")
-                }]
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "wg-out".into(),
-        send_through: None,
-        stream_settings_json: None,
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
+    // 端口探测 TOCTOU 加固：占用时整组换端口重试。
+    let (ports, _inst, _ohm, handles) = start_full_retrying(2, |ports| {
+        let wg_port = ports[0];
+        let dokodemo_port = ports[1];
+        let mut built = BuiltConfig::default();
+        // Dokodemo inbound (TCP) — fixed dest = echo port (will not actually forward
+        // echo payload through WG in this assertion, but proves registration).
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "dokodemo".into(),
+                data: serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": wg_port,
+                    "network": "tcp"
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "dokodemo-in".into(),
+            port: Some(dokodemo_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        // WireGuard inbound — receives WG UDP from peer, dispatches to default outbound.
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "wireguard".into(),
+                data: serde_json::json!({
+                    "secretKey": sec_b,
+                    "address": ["10.0.0.1/32"],
+                    "peers": [{
+                        "publicKey": pub_a,
+                        "endpoint": format!("127.0.0.1:{wg_port}"),
+                        "allowedIps": ["10.0.0.2/32"]
+                    }],
+                    "port": wg_port
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "wg-in".into(),
+            port: Some(wg_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        // WireGuard outbound — client side, dials wg-in via UDP.
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "wireguard".into(),
+                data: serde_json::json!({
+                    "secretKey": sec_a,
+                    "address": ["10.0.0.2/32"],
+                    "peers": [{
+                        "publicKey": pub_b,
+                        "endpoint": format!("127.0.0.1:{wg_port}")
+                    }]
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "wg-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
 
-    let (_inst, _ohm, handles) = start_full(&built).await.expect("start_full");
+        built
+    })
+    .await;
+    let (ports_a, dokodemo_port) = (ports[0], ports[1]);
+    let _ = ports_a; // wg_port 仅在实例配置内消费（握手探针见独立用例）
     tokio::time::sleep(READY_DELAY).await;
 
     // (a) Dokodemo inbound listening: TCP connect succeeds.
@@ -332,29 +354,33 @@ fn generate_cert_hash_hex(der: &[u8]) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_dokodemo_full_chain() {
     let echo_addr = start_echo().await;
-    let dokodemo_port = pick_free_port().await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试。
+    let (ports, _inst, _ohm, handles) = start_full_retrying(1, |ports| {
+        let dokodemo_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "dokodemo".into(),
+                data: serde_json::json!({
+                    "address": "127.0.0.1",
+                    "port": echo_addr.port(),
+                    "network": "tcp"
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "dokodemo-in".into(),
+            port: Some(dokodemo_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "dokodemo".into(),
-            data: serde_json::json!({
-                "address": "127.0.0.1",
-                "port": echo_addr.port(),
-                "network": "tcp"
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "dokodemo-in".into(),
-        port: Some(dokodemo_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-
-    let (_inst, _ohm, handles) = start_full(&built).await.expect("start_full");
+        built
+    })
+    .await;
+    let dokodemo_port = ports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     // Client → dokodemo (predefined dest = echo) → freedom → echo.
@@ -401,8 +427,15 @@ async fn e2e_p2_dns_core_resolution() {
 
     // (1) Mock UDP DNS server: 10.0.0.42 A record for any query.
     let expected_ip = std::net::Ipv4Addr::new(10, 0, 0, 42);
-    let dns_port = pick_free_port().await;
-    let dns_sock = UdpSocket::bind(("127.0.0.1", dns_port)).await.expect("dns sock");
+    // 端口探测 TOCTOU 加固：占用（10048/98）时换端口重试。
+    let (dns_port, dns_sock) = loop {
+        let dns_port = xray_common::testing::pick_free_ports(1).await[0];
+        match UdpSocket::bind(("127.0.0.1", dns_port)).await {
+            Ok(sock) => break (dns_port, sock),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("dns sock bind: {e}"),
+        }
+    };
     tokio::spawn(async move {
         let mut buf = [0u8; 512];
         loop {
@@ -457,23 +490,27 @@ async fn e2e_p2_dns_core_resolution() {
     // SOCKS5 inbound + freedom outbound. The DNS app config is the same shape
     // the dns_factory (xray-core/src/register.rs::dns_factory) consumes.
     let echo_addr = start_echo().await;
-    let socks_port = pick_free_port().await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试。
+    let (ports, _inst, _ohm, handles) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let dns_app_json = serde_json::json!({
+            "servers": [{
+                "address": "127.0.0.1",
+                "port": dns_port
+            }],
+            "queryStrategy": "UseIP"
+        })
+        .to_string();
 
-    let dns_app_json = serde_json::json!({
-        "servers": [{
-            "address": "127.0.0.1",
-            "port": dns_port
-        }],
-        "queryStrategy": "UseIP"
+        let mut core_cfg = BuiltConfig::default();
+        core_cfg.apps.push(BuiltEntry { kind: "dns".into(), data: dns_app_json.into_bytes() });
+        core_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
+        core_cfg.outbounds.push(freedom_outbound("direct"));
+
+        core_cfg
     })
-    .to_string();
-
-    let mut core_cfg = BuiltConfig::default();
-    core_cfg.apps.push(BuiltEntry { kind: "dns".into(), data: dns_app_json.into_bytes() });
-    core_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
-    core_cfg.outbounds.push(freedom_outbound("direct"));
-
-    let (_inst, _ohm, handles) = start_full(&core_cfg).await.expect("start_full");
+    .await;
+    let socks_port = ports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     // Confirm the DNS feature was actually registered via the factory path.
@@ -514,35 +551,39 @@ async fn e2e_p2_dns_core_resolution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_p2_wireguard_handshake_probe() {
     let _echo = start_echo().await;
-    let wg_port = pick_free_port().await;
     let (sec_a, pub_a) = wg_keypair(0x11);
     let (sec_b, pub_b) = wg_keypair(0x22);
-
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "wireguard".into(),
-            data: serde_json::json!({
-                "secretKey": sec_b,
-                "address": ["10.0.0.1/32"],
-                "peers": [{
-                    "publicKey": pub_a,
-                    "endpoint": format!("127.0.0.1:{wg_port}"),
-                    "allowedIps": ["10.0.0.2/32"]
-                }],
-                "port": wg_port
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "wg-in".into(),
-        port: Some(wg_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_outbound("direct"));
-    let (_inst, _ohm, handles) = start_full(&built).await.expect("start_full");
+    // 端口探测 TOCTOU 加固：占用时换端口重试。
+    let (ports, _inst, _ohm, handles) = start_full_retrying(1, |ports| {
+        let wg_port = ports[0];
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "wireguard".into(),
+                data: serde_json::json!({
+                    "secretKey": sec_b,
+                    "address": ["10.0.0.1/32"],
+                    "peers": [{
+                        "publicKey": pub_a,
+                        "endpoint": format!("127.0.0.1:{wg_port}"),
+                        "allowedIps": ["10.0.0.2/32"]
+                    }],
+                    "port": wg_port
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "wg-in".into(),
+            port: Some(wg_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_outbound("direct"));
+        built
+    })
+    .await;
+    let wg_port = ports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     // (b) WireGuard inbound 真实握手：boringtun `Tunnel` 构造客户端视角（sec_a, pub_b），
@@ -648,8 +689,6 @@ async fn e2e_p2_tls_utls_pinned() {
     use xray_tls::certificate::generate_self_signed_cert;
 
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     // (1) Self-signed leaf for "localhost".
     let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost"]).expect("gen leaf");
@@ -683,23 +722,32 @@ async fn e2e_p2_tls_utls_pinned() {
     ))
     .expect("client tls json");
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(
-        vless_port,
-        "vless-pinned-in",
-        "b831381d-6324-4d53-ad4f-8cda48b30811",
-    ));
-    server_cfg.outbounds.push(freedom_outbound("direct"));
-    server_cfg.inbounds[0].stream_settings_json = Some(server_tls);
-
-    let (_si, _so, _sh) = start_full(&server_cfg).await.expect("vless-tls server");
+    // 端口探测 TOCTOU 加固：占用时换端口重试（server 与 client 各自独立重试）。
+    let (sports, _si, _so, _sh) = start_full_retrying(1, |ports| {
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(
+            vless_port,
+            "vless-pinned-in",
+            "b831381d-6324-4d53-ad4f-8cda48b30811",
+        ));
+        server_cfg.outbounds.push(freedom_outbound("direct"));
+        server_cfg.inbounds[0].stream_settings_json = Some(server_tls.clone());
+        server_cfg
+    })
+    .await;
+    let vless_port = sports[0];
     tokio::time::sleep(READY_DELAY).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
-    client_cfg.outbounds.push(vless_outbound(vless_port, Some(client_tls)));
-
-    let (_ci, _co, _ch) = start_full(&client_cfg).await.expect("vless-tls client");
+    let (cports, _ci, _co, _ch) = start_full_retrying(1, |ports| {
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port, "socks-in"));
+        client_cfg.outbounds.push(vless_outbound(vless_port, Some(client_tls.clone())));
+        client_cfg
+    })
+    .await;
+    let socks_port = cports[0];
     tokio::time::sleep(READY_DELAY).await;
 
     // SOCKS5 → VLESS(TLS pinned + uTLS) → freedom → echo

@@ -48,13 +48,6 @@ use xray_proxy_vmess::{
 
 const VMESS_UUID_STR: &str = "9c8e4a2b-6f1d-4e0b-a5d8-7c9e2f3b8a01";
 
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("port").port();
-    drop(probe);
-    port
-}
-
 async fn spawn_echo_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
     let port = listener.local_addr().unwrap().port();
@@ -155,25 +148,32 @@ async fn dial_xray_two_instance_smoke() {
 
     // ---- Server: VMess inbound + freedom outbound ----
     let echo_port = spawn_echo_server().await;
-    let server_port = pick_free_port().await;
-
-    let server_built = BuiltConfig {
-        inbounds: vec![BuiltInbound {
-            entry: BuiltEntry {
-                kind: "vmess".into(),
-                data: vmess_inbound_settings(VMESS_UUID_STR, "dial-xray@server"),
-            },
-            tag: "vmess-in".into(),
-            port: Some(server_port),
-            listen: Some("127.0.0.1".into()),
-            stream_settings_json: None,
-            sniffing_json: None,
-        }],
-        outbounds: vec![freedom_outbound("direct")],
-        apps: vec![],
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (sports, server_instance, server_ohm, server_handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let server_port = ports[0];
+        let server_built = BuiltConfig {
+            inbounds: vec![BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "vmess".into(),
+                    data: vmess_inbound_settings(VMESS_UUID_STR, "dial-xray@server"),
+                },
+                tag: "vmess-in".into(),
+                port: Some(server_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            }],
+            outbounds: vec![freedom_outbound("direct")],
+            apps: vec![],
+        };
+        match start_full(&server_built).await {
+            Ok((si, soh, h)) => break (ports, si, soh, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full server: {e}"),
+        }
     };
-    let (server_instance, server_ohm, server_handles) =
-        start_full(&server_built).await.expect("start_full server");
+    let server_port = sports[0];
     assert!(server_instance.is_running(), "server instance must be running");
     assert!(
         server_ohm.get_handler("direct").is_some(),
@@ -242,25 +242,32 @@ async fn dial_xray_two_instance_smoke() {
 async fn dial_xray_vmess_body_roundtrip() {
     // ---- 与 smoke 相同的两端装配 ----
     let echo_port = spawn_echo_server().await;
-    let server_port = pick_free_port().await;
-
-    let server_built = BuiltConfig {
-        inbounds: vec![BuiltInbound {
-            entry: BuiltEntry {
-                kind: "vmess".into(),
-                data: vmess_inbound_settings(VMESS_UUID_STR, "dial-xray@server"),
-            },
-            tag: "vmess-in".into(),
-            port: Some(server_port),
-            listen: Some("127.0.0.1".into()),
-            stream_settings_json: None,
-            sniffing_json: None,
-        }],
-        outbounds: vec![freedom_outbound("direct")],
-        apps: vec![],
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (sports, _server_instance, _server_ohm, server_handles) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let server_port = ports[0];
+        let server_built = BuiltConfig {
+            inbounds: vec![BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "vmess".into(),
+                    data: vmess_inbound_settings(VMESS_UUID_STR, "dial-xray@server"),
+                },
+                tag: "vmess-in".into(),
+                port: Some(server_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            }],
+            outbounds: vec![freedom_outbound("direct")],
+            apps: vec![],
+        };
+        match start_full(&server_built).await {
+            Ok((si, soh, h)) => break (ports, si, soh, h),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full server: {e}"),
+        }
     };
-    let (_server_instance, _server_ohm, server_handles) =
-        start_full(&server_built).await.expect("start_full server");
+    let server_port = sports[0];
     wait_ready(server_port).await;
 
     let client_built = BuiltConfig {

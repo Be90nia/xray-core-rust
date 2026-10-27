@@ -66,14 +66,6 @@ const LISTENER_READY_DELAY: Duration = Duration::from_millis(100);
 // 通用测试基建
 // ============================================================
 
-/// 挑空闲端口（bind(:0) → drop）。
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("probe bind");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
-}
-
 /// 多连接 TCP echo 服务器（accept 循环，逐连接回写）。
 async fn spawn_tcp_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
@@ -128,10 +120,23 @@ fn socks_inbound(tag: &str, port: u16, data: &'static [u8]) -> BuiltInbound {
     }
 }
 
-/// 启动 xray 实例并等监听就绪。
-async fn start_xray(built: &BuiltConfig) {
-    let (_instance, _ohm, _handles) = start_full(built).await.expect("start_full");
-    tokio::time::sleep(LISTENER_READY_DELAY).await;
+/// 端口探测 TOCTOU 加固：bind(:0)→drop→被测实例再 bind 之间端口可能被并行测试/
+/// 其他进程抢占（Windows os error 10048 / Unix os error 98）——占用时换端口重试
+/// 至多 5 次。返回实际绑定端口。
+async fn start_xray_retrying(build: impl Fn(u16) -> BuiltConfig) -> u16 {
+    for _ in 0..5 {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let port = ports[0];
+        match start_full(&build(port)).await {
+            Ok(_) => {
+                tokio::time::sleep(LISTENER_READY_DELAY).await;
+                return port;
+            },
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("start_full: {e:?}"),
+        }
+    }
+    panic!("start_full kept hitting address-in-use after 5 attempts");
 }
 
 /// SOCKS5 CONNECT 客户端：no-auth 握手 → CONNECT 目标 → 写载荷 → 读回显。
@@ -364,31 +369,34 @@ fn parse_socks_udp_frame(f: &[u8]) -> Option<([u8; 4], u16, &[u8])> {
 async fn g10_http_outbound_sends_proxy_authorization_basic() {
     let echo = spawn_tcp_echo().await;
     let (proxy_port, recorded) = spawn_http_connect_proxy().await;
-    let socks_port = pick_free_port().await;
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
-    built.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "http".into(),
-            data: json!({
-                "servers": [{
-                    "address": "127.0.0.1",
-                    "port": proxy_port,
-                    "users": [{"user": "a", "pass": "b"}]
-                }]
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "http-out".into(),
-        send_through: None,
-        stream_settings_json: None,
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    start_xray(&built).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let socks_port = start_xray_retrying(|socks_port| {
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "http".into(),
+                data: json!({
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": proxy_port,
+                        "users": [{"user": "a", "pass": "b"}]
+                    }]
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "http-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        built
+    })
+    .await;
 
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
     let got = timeout(EXCHANGE_TIMEOUT, socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD))
@@ -409,22 +417,25 @@ async fn g10_http_outbound_sends_proxy_authorization_basic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g10_http_inbound_rejects_missing_or_wrong_credentials_with_407() {
     let echo = spawn_tcp_echo().await;
-    let http_port = pick_free_port().await;
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "http".into(),
-            data: json!({"accounts": [{"user": "a", "pass": "b"}]}).to_string().into_bytes(),
-        },
-        tag: "http-in".into(),
-        port: Some(http_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_allow_all("direct"));
-    start_xray(&built).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let http_port = start_xray_retrying(|http_port| {
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "http".into(),
+                data: json!({"accounts": [{"user": "a", "pass": "b"}]}).to_string().into_bytes(),
+            },
+            tag: "http-in".into(),
+            port: Some(http_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_allow_all("direct"));
+        built
+    })
+    .await;
 
     let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().expect("addr");
 
@@ -483,28 +494,32 @@ async fn g10_http_inbound_rejects_missing_or_wrong_credentials_with_407() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g14_vmess_inbound_accepts_http_header_camouflaged_stream() {
     let echo = spawn_tcp_echo().await;
-    let vmess_port = pick_free_port().await;
     let uuid = UUID::parse(VMESS_UUID_STR).expect("uuid");
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "vmess".into(),
-            data: json!({"clients": [{"id": VMESS_UUID_STR, "email": "g14@local", "level": 0}]})
-                .to_string()
-                .into_bytes(),
-        },
-        tag: "vmess-in".into(),
-        port: Some(vmess_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: Some(json!({
-            "network": "tcp",
-            "tcpSettings": {"header": {"type": "http"}}
-        })),
-        sniffing_json: None,
-    });
-    built.outbounds.push(freedom_allow_all("direct"));
-    start_xray(&built).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let vmess_port = start_xray_retrying(|vmess_port| {
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "vmess".into(),
+                data:
+                    json!({"clients": [{"id": VMESS_UUID_STR, "email": "g14@local", "level": 0}]})
+                        .to_string()
+                        .into_bytes(),
+            },
+            tag: "vmess-in".into(),
+            port: Some(vmess_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(json!({
+                "network": "tcp",
+                "tcpSettings": {"header": {"type": "http"}}
+            })),
+            sniffing_json: None,
+        });
+        built.outbounds.push(freedom_allow_all("direct"));
+        built
+    })
+    .await;
 
     // 客户端：裸 TCP → Connection → HTTP 伪装包装（客户端首写注入伪装 GET）→ vmess 会话
     let tcp =
@@ -549,28 +564,31 @@ async fn g14_vmess_inbound_accepts_http_header_camouflaged_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g16_freedom_destination_override_rewrites_socks_target() {
     let echo = spawn_tcp_echo().await;
-    let socks_port = pick_free_port().await;
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
-    built.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "freedom".into(),
-            data: json!({
-                "destinationOverride": {"server": {"address": "127.0.0.1", "port": echo.port()}},
-                "finalRules": [{"action": "allow"}]
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "direct".into(),
-        send_through: None,
-        stream_settings_json: None,
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    start_xray(&built).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let socks_port = start_xray_retrying(|socks_port| {
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "freedom".into(),
+                data: json!({
+                    "destinationOverride": {"server": {"address": "127.0.0.1", "port": echo.port()}},
+                    "finalRules": [{"action": "allow"}]
+                })
+                .to_string()
+                .into_bytes(),
+            },
+            tag: "direct".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        built
+    })
+    .await;
 
     let unroutable: SocketAddr = "203.0.113.1:1".parse().expect("test-net-3 addr");
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
@@ -595,63 +613,68 @@ async fn g15_dialer_proxy_chains_trojan_outbound_dial_via_socks_outbound() {
     let (recorder_port, recorded) = spawn_socks5_tcp_recorder().await;
 
     // 实例 A：trojan 服务器（trojan inbound + freedom → echo）
-    let trojan_port = pick_free_port().await;
-    let mut server = BuiltConfig::default();
-    server.inbounds.push(BuiltInbound {
-        entry: BuiltEntry {
-            kind: "trojan".into(),
-            data: json!({"clients": [{"password": "chain-pass-1", "email": "g15@server"}]})
-                .to_string()
-                .into_bytes(),
-        },
-        tag: "trojan-in".into(),
-        port: Some(trojan_port),
-        listen: Some("127.0.0.1".into()),
-        stream_settings_json: None,
-        sniffing_json: None,
-    });
-    server.outbounds.push(freedom_allow_all("direct"));
-    start_xray(&server).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let trojan_port = start_xray_retrying(|trojan_port| {
+        let mut server = BuiltConfig::default();
+        server.inbounds.push(BuiltInbound {
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: json!({"clients": [{"password": "chain-pass-1", "email": "g15@server"}]})
+                    .to_string()
+                    .into_bytes(),
+            },
+            tag: "trojan-in".into(),
+            port: Some(trojan_port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        });
+        server.outbounds.push(freedom_allow_all("direct"));
+        server
+    })
+    .await;
 
     // 实例 B：socks inbound → trojan outbound（dialerProxy=socks-out）→ socks outbound
-    let socks_port = pick_free_port().await;
-    let mut client = BuiltConfig::default();
-    client.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
-    client.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "trojan".into(),
-            data: json!({
-                "servers": [{
-                    "address": "127.0.0.1",
-                    "port": trojan_port,
-                    "password": "chain-pass-1"
-                }]
-            })
-            .to_string()
-            .into_bytes(),
-        },
-        tag: "chain-out".into(),
-        send_through: None,
-        stream_settings_json: Some(json!({"sockopt": {"dialerProxy": "socks-out"}})),
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    client.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: json!({"servers": [{"address": "127.0.0.1", "port": recorder_port}]})
+    let socks_port = start_xray_retrying(|socks_port| {
+        let mut client = BuiltConfig::default();
+        client.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth"}"#));
+        client.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: json!({
+                    "servers": [{
+                        "address": "127.0.0.1",
+                        "port": trojan_port,
+                        "password": "chain-pass-1"
+                    }]
+                })
                 .to_string()
                 .into_bytes(),
-        },
-        tag: "socks-out".into(),
-        send_through: None,
-        stream_settings_json: None,
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    start_xray(&client).await;
+            },
+            tag: "chain-out".into(),
+            send_through: None,
+            stream_settings_json: Some(json!({"sockopt": {"dialerProxy": "socks-out"}})),
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        client.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: json!({"servers": [{"address": "127.0.0.1", "port": recorder_port}]})
+                    .to_string()
+                    .into_bytes(),
+            },
+            tag: "socks-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        client
+    })
+    .await;
 
     let proxy_addr: SocketAddr = format!("127.0.0.1:{socks_port}").parse().expect("addr");
     let got = timeout(EXCHANGE_TIMEOUT, socks5_connect_roundtrip(proxy_addr, echo, PAYLOAD))
@@ -680,25 +703,32 @@ async fn g15_dialer_proxy_chains_trojan_outbound_dial_via_socks_outbound() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g04_socks_udp_associate_full_chain_inbound_to_outbound() {
     let (fake_socks_port, served_cmds) = spawn_socks5_udp_echo().await;
-    let socks_port = pick_free_port().await;
 
-    let mut built = BuiltConfig::default();
-    built.inbounds.push(socks_inbound("socks-in", socks_port, br#"{"auth":"noauth","udp":true}"#));
-    built.outbounds.push(BuiltOutbound {
-        entry: BuiltEntry {
-            kind: "socks".into(),
-            data: json!({"servers": [{"address": "127.0.0.1", "port": fake_socks_port}]})
-                .to_string()
-                .into_bytes(),
-        },
-        tag: "socks-out".into(),
-        send_through: None,
-        stream_settings_json: None,
-        proxy_settings_json: None,
-        mux_json: None,
-        target_strategy: None,
-    });
-    start_xray(&built).await;
+    // 端口探测 TOCTOU 加固：占用时换端口重试（见 start_xray_retrying）。
+    let socks_port = start_xray_retrying(|socks_port| {
+        let mut built = BuiltConfig::default();
+        built.inbounds.push(socks_inbound(
+            "socks-in",
+            socks_port,
+            br#"{"auth":"noauth","udp":true}"#,
+        ));
+        built.outbounds.push(BuiltOutbound {
+            entry: BuiltEntry {
+                kind: "socks".into(),
+                data: json!({"servers": [{"address": "127.0.0.1", "port": fake_socks_port}]})
+                    .to_string()
+                    .into_bytes(),
+            },
+            tag: "socks-out".into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        });
+        built
+    })
+    .await;
 
     // 1. TCP 控制连接 + no-auth 握手
     let mut ctrl =

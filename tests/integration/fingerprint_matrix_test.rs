@@ -61,13 +61,6 @@ async fn start_echo() -> std::net::SocketAddr {
     addr
 }
 
-async fn pick_free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").await.expect("pick port");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
-}
-
 /// SOCKS5 CONNECT + 回显一轮；失败返回原因（供契约钉断言，不 panic）。
 async fn try_socks5_echo(proxy_port: u16, echo_port: u16, payload: &[u8]) -> Result<(), String> {
     let attempt = async {
@@ -174,8 +167,6 @@ async fn run_reality_e2e(fingerprint: &str, payload: &[u8]) -> Result<(), String
     ensure_crypto_provider();
 
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let server_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
     let server_public = PublicKey::from(&server_secret);
@@ -193,21 +184,34 @@ async fn run_reality_e2e(fingerprint: &str, payload: &[u8]) -> Result<(), String
     ))
     .map_err(|e| format!("client reality settings: {e}"))?;
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-reality-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(server_reality);
-
-    let (_si, _so, sh) =
-        start_full(&server_cfg).await.map_err(|e| format!("reality server start: {e:?}"))?;
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (vless_port, _si, _so, sh) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-reality-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(server_reality.clone());
+        match start_full(&server_cfg).await {
+            Ok((si, so, sh)) => break (vless_port, si, so, sh),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => return Err(format!("reality server start: {e:?}")),
+        }
+    };
     tokio::time::sleep(REALITY_WARMUP).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, client_reality));
-
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| format!("reality client start: {e:?}"))?;
+    let (socks_port, _ci, _co, ch) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, client_reality.clone()));
+        match start_full(&client_cfg).await {
+            Ok((ci, co, ch)) => break (socks_port, ci, co, ch),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => return Err(format!("reality client start: {e:?}")),
+        }
+    };
     tokio::time::sleep(REALITY_WARMUP).await;
 
     let result = try_socks5_echo(socks_port, echo_addr.port(), payload).await;
@@ -223,8 +227,6 @@ async fn run_tls_e2e(fingerprint: &str, payload: &[u8]) -> Result<(), String> {
     ensure_crypto_provider();
 
     let echo_addr = start_echo().await;
-    let vless_port = pick_free_port().await;
-    let socks_port = pick_free_port().await;
 
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
         .map_err(|e| format!("gen cert: {e:?}"))?;
@@ -237,21 +239,34 @@ async fn run_tls_e2e(fingerprint: &str, payload: &[u8]) -> Result<(), String> {
     ))
     .map_err(|e| format!("client tls settings: {e}"))?;
 
-    let mut server_cfg = BuiltConfig::default();
-    server_cfg.inbounds.push(vless_inbound(vless_port, "vless-tls-in"));
-    server_cfg.outbounds.push(freedom_outbound());
-    server_cfg.inbounds[0].stream_settings_json = Some(server_tls);
-
-    let (_si, _so, sh) =
-        start_full(&server_cfg).await.map_err(|e| format!("tls server start: {e:?}"))?;
+    // 端口探测 TOCTOU 加固：占用（Windows 10048 / Unix EADDRINUSE）时换端口重试至多 5 次。
+    let (vless_port, _si, _so, sh) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let vless_port = ports[0];
+        let mut server_cfg = BuiltConfig::default();
+        server_cfg.inbounds.push(vless_inbound(vless_port, "vless-tls-in"));
+        server_cfg.outbounds.push(freedom_outbound());
+        server_cfg.inbounds[0].stream_settings_json = Some(server_tls.clone());
+        match start_full(&server_cfg).await {
+            Ok((si, so, sh)) => break (vless_port, si, so, sh),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => return Err(format!("tls server start: {e:?}")),
+        }
+    };
     tokio::time::sleep(READY_DELAY).await;
 
-    let mut client_cfg = BuiltConfig::default();
-    client_cfg.inbounds.push(socks_inbound(socks_port));
-    client_cfg.outbounds.push(vless_outbound(vless_port, client_tls));
-
-    let (_ci, _co, ch) =
-        start_full(&client_cfg).await.map_err(|e| format!("tls client start: {e:?}"))?;
+    let (socks_port, _ci, _co, ch) = loop {
+        let ports = xray_common::testing::pick_free_ports(1).await;
+        let socks_port = ports[0];
+        let mut client_cfg = BuiltConfig::default();
+        client_cfg.inbounds.push(socks_inbound(socks_port));
+        client_cfg.outbounds.push(vless_outbound(vless_port, client_tls.clone()));
+        match start_full(&client_cfg).await {
+            Ok((ci, co, ch)) => break (socks_port, ci, co, ch),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => return Err(format!("tls client start: {e:?}")),
+        }
+    };
     tokio::time::sleep(READY_DELAY).await;
 
     let result = try_socks5_echo(socks_port, echo_addr.port(), payload).await;

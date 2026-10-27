@@ -26,12 +26,23 @@ impl StatsCollector for FixedStats {
     }
 }
 
-/// 拿到一个本机空闲端口（drop 后被测 server 重新 bind 同端口）。
-fn pick_port() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp");
-    let a = l.local_addr().expect("local_addr");
-    drop(l);
-    a
+/// TOCTOU 加固：bind(:0)→drop→`Feature::start` 之间端口可能被并行测试/其他
+/// 进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试至多 5 次。
+/// decorate 收到本次候选地址构建（含 collector 装饰的）feature。
+async fn start_feature_retrying(
+    decorate: impl Fn(std::net::SocketAddr) -> MetricsFeature,
+) -> (std::net::SocketAddr, MetricsFeature) {
+    for _ in 0..5 {
+        let port = xray_common::testing::pick_free_ports(1).await[0];
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let feature = decorate(addr);
+        match feature.start() {
+            Ok(()) => return (addr, feature),
+            Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,
+            Err(e) => panic!("metrics feature start: {e}"),
+        }
+    }
+    panic!("metrics feature start: EADDRINUSE persisted across 5 port retries");
 }
 
 /// 微型 HTTP/1.1 GET 客户端：发送请求、读至 EOF，返回完整响应。
@@ -63,12 +74,12 @@ async fn settle() {
 
 #[tokio::test]
 async fn feature_start_listens_on_configured_addr_and_serves_metrics() {
-    let addr = pick_port();
-    let cfg =
-        xray_app_metrics::MetricsConfig { tag: "metrics_out".into(), listen: addr.to_string() };
-    let feature = MetricsFeature::new(cfg).with_stats_collector(Arc::new(FixedStats));
-
-    feature.start().expect("start ok");
+    let (addr, feature) = start_feature_retrying(|addr| {
+        let cfg =
+            xray_app_metrics::MetricsConfig { tag: "metrics_out".into(), listen: addr.to_string() };
+        MetricsFeature::new(cfg).with_stats_collector(Arc::new(FixedStats))
+    })
+    .await;
 
     let resp = http_get(addr, "/metrics").await;
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "expected 200 OK, got: {resp}");
@@ -89,10 +100,13 @@ async fn feature_start_listens_on_configured_addr_and_serves_metrics() {
 
 #[tokio::test]
 async fn feature_close_stops_http_listener() {
-    let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig { tag: "t".into(), listen: addr.to_string() };
-    let feature = MetricsFeature::new(cfg);
-    feature.start().expect("start ok");
+    let (addr, feature) = start_feature_retrying(|addr| {
+        MetricsFeature::new(xray_app_metrics::MetricsConfig {
+            tag: "t".into(),
+            listen: addr.to_string(),
+        })
+    })
+    .await;
     // 先确认启动后能连。
     assert!(try_connect(addr).await, "should connect before close");
 
@@ -113,10 +127,13 @@ async fn feature_start_without_listen_is_ok() {
 
 #[tokio::test]
 async fn feature_start_is_idempotent() {
-    let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig { tag: "idem".into(), listen: addr.to_string() };
-    let feature = MetricsFeature::new(cfg);
-    feature.start().expect("first start ok");
+    let (_addr, feature) = start_feature_retrying(|addr| {
+        MetricsFeature::new(xray_app_metrics::MetricsConfig {
+            tag: "idem".into(),
+            listen: addr.to_string(),
+        })
+    })
+    .await;
     feature.start().expect("second start ok (no error)");
     feature.close().expect("close ok");
 }
@@ -136,10 +153,14 @@ async fn feature_serves_metrics_with_injected_obs_collector() {
         }
     }
 
-    let addr = pick_port();
-    let cfg = xray_app_metrics::MetricsConfig { tag: "t".into(), listen: addr.to_string() };
-    let feature = MetricsFeature::new(cfg).with_obs_collector(Arc::new(WithObs));
-    feature.start().expect("start ok");
+    let (addr, feature) = start_feature_retrying(|addr| {
+        MetricsFeature::new(xray_app_metrics::MetricsConfig {
+            tag: "t".into(),
+            listen: addr.to_string(),
+        })
+        .with_obs_collector(Arc::new(WithObs))
+    })
+    .await;
 
     let resp = http_get(addr, "/metrics").await;
     assert!(resp.contains("# HELP xray_observation_extra"));
