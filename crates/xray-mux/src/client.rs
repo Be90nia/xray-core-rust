@@ -668,6 +668,11 @@ impl ClientWorker {
     async fn monitor(self: Arc<Self>) {
         let done = self.done_rx();
         // Go time.Ticker 首 tick 在 16s 后；tokio interval 首次立即触发，需偏移
+        // W4 面 3 残余登记：`interval_at` 首参是 **tokio Instant 类型位**（非"取时点"
+        // 语义）——`BudgetDeadline` 不暴露 tokio Instant（`BudgetInstant` 私有），且
+        // select 臂 ticker 改写成 deadline+pending 链会改变 missed-tick（Burst 补发）
+        // 与 done 响应语义 = 非机械替换，方案面 3 风险节明令禁止 → 保留原形态。
+        // 本 crate 的 L3 闸未禁 `tokio::time::Instant::now`（只禁 std 面）→ 无需 allow。
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + CLIENT_KEEPALIVE_INTERVAL,
             CLIENT_KEEPALIVE_INTERVAL,

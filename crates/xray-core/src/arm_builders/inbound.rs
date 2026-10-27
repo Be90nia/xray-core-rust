@@ -75,8 +75,9 @@ pub(crate) async fn build_socks_inbound(
         .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
         .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
     tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_socks5(listener, ohm, config, handshake_timeout, udp_idle, plugin_ctx).await
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        async move { serve_socks5(listener, ohm, config, handshake_timeout, udp_idle, plugin_ctx).await }
     })))
 }
 
@@ -107,17 +108,20 @@ pub(crate) async fn build_mixed_inbound(
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "mixed (socks+http) inbound listening");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_mixed(
-            listener,
-            ohm,
-            socks_cfg,
-            http_cfg,
-            Some(handshake_timeout),
-            udp_idle,
-            plugin_ctx,
-        )
-        .await
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        async move {
+            serve_mixed(
+                listener,
+                ohm,
+                socks_cfg,
+                http_cfg,
+                Some(handshake_timeout),
+                udp_idle,
+                plugin_ctx,
+            )
+            .await
+        }
     })))
 }
 
@@ -132,7 +136,7 @@ pub(crate) async fn build_vless_inbound(
     let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
     // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
     // 级 "mlkem768x25519plus.*" 字符串 → handler 级共享 ServerInstance。
-    let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
+    let decryption = build_vless_decryption(&ib.entry.data, Arc::clone(&plugin_ctx))?;
     let mut options = VlessInboundOptions {
         decryption: decryption.clone(),
         // sm80④：policy Timeouts.Handshake 下传（Go inbound.go:281-284）
@@ -155,6 +159,7 @@ pub(crate) async fn build_vless_inbound(
         let on_conn =
             vless_transport_on_conn(ib, &ohm, &settings, validator, options, bind_addr, addr)?;
         return spawn_transport_listener_inbound(
+            &plugin_ctx,
             &ib.tag,
             bind_addr,
             settings,
@@ -175,7 +180,7 @@ pub(crate) async fn build_vless_inbound(
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         let reality = parse_reality_config(&settings)?;
         tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
-        Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
             serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
         })))
     } else {
@@ -191,7 +196,7 @@ pub(crate) async fn build_vless_inbound(
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
-        Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
             serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
         })))
     }
@@ -220,6 +225,7 @@ pub(crate) async fn build_trojan_inbound(
             ib, &ohm, &policy, &settings, users, fallbacks, bind_addr, addr,
         )?;
         return spawn_transport_listener_inbound(
+            &plugin_ctx,
             &ib.tag,
             bind_addr,
             settings,
@@ -243,7 +249,7 @@ pub(crate) async fn build_trojan_inbound(
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
-        Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
             serve_reality_trojan(
                 listener,
                 ohm,
@@ -264,17 +270,20 @@ pub(crate) async fn build_trojan_inbound(
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
-        Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-            serve_trojan(
-                plugin_ctx,
-                listener,
-                ohm,
-                users,
-                fallbacks,
-                tls,
-                handshake_timeout_for(&policy, 0),
-            )
-            .await
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+            let plugin_ctx = Arc::clone(&plugin_ctx);
+            async move {
+                serve_trojan(
+                    plugin_ctx,
+                    listener,
+                    ohm,
+                    users,
+                    fallbacks,
+                    tls,
+                    handshake_timeout_for(&policy, 0),
+                )
+                .await
+            }
         })))
     }
 }
@@ -298,6 +307,7 @@ pub(crate) async fn build_vmess_inbound(
         let on_conn =
             vmess_transport_on_conn(ib, &ohm, &policy, &settings, validator, bind_addr, addr)?;
         return spawn_transport_listener_inbound(
+            &plugin_ctx,
             &ib.tag,
             bind_addr,
             settings,
@@ -315,16 +325,19 @@ pub(crate) async fn build_vmess_inbound(
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, tls = tls.is_some(), "vmess inbound listening");
-        Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-            serve_vmess(
-                plugin_ctx,
-                listener,
-                ohm,
-                validator,
-                tls,
-                handshake_timeout_for(&policy, 0),
-            )
-            .await
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+            let plugin_ctx = Arc::clone(&plugin_ctx);
+            async move {
+                serve_vmess(
+                    plugin_ctx,
+                    listener,
+                    ohm,
+                    validator,
+                    tls,
+                    handshake_timeout_for(&policy, 0),
+                )
+                .await
+            }
         })))
     }
 }
@@ -350,8 +363,11 @@ pub(crate) async fn build_http_inbound(
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "http inbound listening");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout), plugin_ctx).await
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        async move {
+            serve_http(listener, ohm, Arc::new(config), Some(handshake_timeout), plugin_ctx).await
+        }
     })))
 }
 
@@ -429,6 +445,7 @@ pub(crate) async fn build_dokodemo_inbound(
         let dest_udp = dest.clone();
         let follow_redirect = settings.follow_redirect;
         let stop = shutdown_token.clone();
+        let udp_ctx = Arc::clone(&plugin_ctx);
         // bind 提前到 spawn 之前：Go 的 dokodemo 在 handler 构造期同步
         // ListenUDP（proxy/dokodemo/dokodemo.go），端口占用属于「入站创建
         // 失败」→ 启动失败。旧形态把 bind 藏在 spawn 出去的任务里：调用方
@@ -443,7 +460,7 @@ pub(crate) async fn build_dokodemo_inbound(
         handles.push(
             fx.spawn(async move {
                 tokio::select! {
-                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, Arc::clone(&plugin_ctx)) => {
+                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, udp_ctx) => {
                         if let Err(e) = r {
                             tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                         }
@@ -462,7 +479,7 @@ pub(crate) async fn build_dokodemo_inbound(
     }
     // 合并所有 listener handle；token cancel 时 combined 被取消（本 future drop
     // → scope drop abort 子任务，listener socket 随任务体 drop 释放）。
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         let _scope = fx;
         for h in handles {
             let _ = h.join().await;
@@ -491,6 +508,7 @@ pub(crate) async fn build_shadowsocks_inbound(
         })?;
         let on_conn = ss_transport_on_conn(ib, &ohm, &policy, api, &settings, addr)?;
         return spawn_transport_listener_inbound(
+            &plugin_ctx,
             &ib.tag,
             bind_addr,
             settings,
@@ -509,16 +527,19 @@ pub(crate) async fn build_shadowsocks_inbound(
     // finalmask.udp（bd 05js，Go udp/hub.go:61-62）：同端口 UDP relay 装配
     let inbound_udp_mask = inbound_udpmask(&settings)?;
     tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_ss(
-            listener,
-            ohm,
-            inbound,
-            handshake_timeout_for(&policy, 0),
-            inbound_udp_mask,
-            plugin_ctx,
-        )
-        .await
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        async move {
+            serve_ss(
+                listener,
+                ohm,
+                inbound,
+                handshake_timeout_for(&policy, 0),
+                inbound_udp_mask,
+                plugin_ctx,
+            )
+            .await
+        }
     })))
 }
 
@@ -528,6 +549,7 @@ pub(crate) async fn build_hysteria_inbound(
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
@@ -543,7 +565,7 @@ pub(crate) async fn build_hysteria_inbound(
             .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(Arc::clone(&dispatch)))))
             .with_udp_dispatcher(Some(dispatch));
     tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
     })))
 }
@@ -553,6 +575,7 @@ pub(crate) async fn build_anytls_inbound(
     ib: &BuiltInbound,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
@@ -564,7 +587,7 @@ pub(crate) async fn build_anytls_inbound(
     // start() 是 spawn-后-返回的短方法：slot.server 持 MockServer stop_tx，
     // handler drop → serve_loop 的 sender-dropped 分支退出 → listener 关闭。
     // 留 pending 保活（同 blackhole/freedom arm），shutdown 时随 task drop 停服。
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         let _keep = handler;
         std::future::pending::<()>().await;
         Ok(())
@@ -577,6 +600,7 @@ pub(crate) async fn build_tuic_inbound(
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let dispatch = ohm
         .get_default_handler()
@@ -584,7 +608,7 @@ pub(crate) async fn build_tuic_inbound(
     let handler =
         parse_tuic_inbound_config(&ib.entry.data, addr, ib.stream_settings_json.as_ref())?
             .with_dispatch(dispatch);
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
     })))
 }
@@ -595,6 +619,7 @@ pub(crate) async fn build_naive_inbound(
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
@@ -610,7 +635,7 @@ pub(crate) async fn build_naive_inbound(
     handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
     // 保活持有（anytls 同款）：handler drop = abort accept loop 关端口，
     // shutdown 随本 task 被 token cancel 时 abort 生效。
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         let _keep = handler;
         std::future::pending::<()>().await;
         Ok(())
@@ -622,6 +647,7 @@ pub(crate) async fn build_wireguard_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let (config, listen_port) = parse_wireguard_inbound_config(&ib.entry.data)?;
     let dispatch = ohm.get_default_handler().ok_or_else(|| {
@@ -631,7 +657,7 @@ pub(crate) async fn build_wireguard_inbound(
         xray_proxy_wireguard::WireguardInboundHandler::new(&ib.tag, &config, listen_port, dispatch)
             .await
             .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
     })))
 }
@@ -657,8 +683,9 @@ pub(crate) async fn build_dns_inbound(
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     tracing::info!(tag = %ib.tag, addr = %addr, "dns inbound listening (UDP+TCP)");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
-        serve_dns(udp, tcp, inbound, plugin_ctx).await
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        async move { serve_dns(udp, tcp, inbound, plugin_ctx).await }
     })))
 }
 
@@ -688,10 +715,10 @@ pub(crate) async fn build_blackhole_inbound(
     plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let response = parse_blackhole_inbound_response(&ib.entry.data);
-    let handler = BlackholeInboundHandler::new(plugin_ctx, &ib.tag, response, addr);
+    let handler = BlackholeInboundHandler::new(Arc::clone(&plugin_ctx), &ib.tag, response, addr);
     handler.start().await.map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
     // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         std::future::pending::<()>().await;
         Ok(())
     })))
@@ -703,12 +730,13 @@ pub(crate) async fn build_freedom_inbound(
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let dest = parse_freedom_inbound_dest(&ib.entry.data)?;
     let handler = FreedomInboundHandler::new(&ib.tag, addr, dest, Arc::clone(&ohm));
     handler.start().await.map_err(|e| std::io::Error::other(format!("freedom inbound: {e}")))?;
     // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         std::future::pending::<()>().await;
         Ok(())
     })))
@@ -879,15 +907,20 @@ pub(crate) fn ss_transport_on_conn(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
+    // W4 面 6：SS 泵归每连接 scope——per-conn pipeline 需 arm ctx（就地构造，
+    // 与 transport listener inbound 的派发点构造同源）。
+    let plugin_ctx =
+        std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
+        let pipeline_ctx = Arc::clone(&plugin_ctx);
         #[allow(
             clippy::disallowed_methods,
             reason = "inbound 连接处理任务（ss/ss2022，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
         )]
         tokio::spawn(async move {
-            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
+            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout, pipeline_ctx).await;
         });
     }))
 }
@@ -990,23 +1023,41 @@ pub(crate) fn shadowsocks_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> 
 }
 
 pub(crate) fn hysteria_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_hysteria_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_hysteria_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn anytls_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_anytls_inbound(ctx.ib, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_anytls_inbound(ctx.ib, ctx.shutdown_token, ctx.addr, Arc::new(ctx.plugin_ctx)))
 }
 
 pub(crate) fn tuic_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_tuic_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_tuic_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn naive_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_naive_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_naive_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn wireguard_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_wireguard_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token))
+    Box::pin(build_wireguard_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, Arc::new(ctx.plugin_ctx)))
 }
 
 pub(crate) fn dns_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
@@ -1034,5 +1085,11 @@ pub(crate) fn blackhole_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn freedom_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_freedom_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, ctx.addr))
+    Box::pin(build_freedom_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }

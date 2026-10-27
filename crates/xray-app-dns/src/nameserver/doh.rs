@@ -22,9 +22,9 @@ use h2::client;
 use hickory_proto::rr::RecordType;
 use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
 use skeleton_infra::fx::{FxScope, ScopeClosed};
-use tokio::time::timeout_at;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
+use xray_frame::deadline::Budget;
 use xray_tls::utls::client as tls_client;
 
 use crate::{
@@ -219,35 +219,32 @@ impl DohNameServer {
 
         // bd ezrg4：兜底 deadline 在查询入口算一次（Go nameserver_doh.go:167-172
         // 绝对时刻），dial/TLS/h2/response 共享，慢握手不推出新预算。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-        )]
-        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
 
         // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
         // dispatcher.Dispatch 语义。connect_stream 内部仍按单次拨号计预算，
         // 总量由外层整查询 deadline 封顶。
-        let stream = timeout_at(
-            deadline,
-            crate::dial::connect_stream(
+        let stream = deadline
+            .timeout(crate::dial::connect_stream(
                 &self.dest,
                 self.resolver.as_ref(),
                 self.query_timeout,
                 "doh",
                 self.force_local,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            tracing::debug!(target: "xray.dns.doh", "doh: dial TIMEOUT (query deadline)");
-            DnsError::WireFormat("doh dial timeout".to_string())
-        })??;
+            ))
+            .await
+            .map_err(|_| {
+                tracing::debug!(target: "xray.dns.doh", "doh: dial TIMEOUT (query deadline)");
+                DnsError::WireFormat("doh dial timeout".to_string())
+            })??;
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
         tracing::debug!(target: "xray.dns.doh", "doh: stream connected");
         let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
-            let (h2, conn) = timeout_at(deadline, client::handshake(stream))
+            let (h2, conn) = deadline
+                .timeout(client::handshake(stream))
                 .await
                 .map_err(|_| DnsError::WireFormat("doh h2c handshake timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("doh h2c handshake: {e}")))?;
@@ -258,19 +255,18 @@ impl DohNameServer {
                 }),
             )
         } else {
-            let tls_stream = timeout_at(
-                deadline,
-                tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
-            )
-            .await
-            .map_err(|_| {
-                tracing::debug!(target: "xray.dns.doh", "doh: TLS handshake TIMEOUT");
-                DnsError::WireFormat("doh tls handshake timeout".to_string())
-            })?
-            .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
+            let tls_stream = deadline
+                .timeout(tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)))
+                .await
+                .map_err(|_| {
+                    tracing::debug!(target: "xray.dns.doh", "doh: TLS handshake TIMEOUT");
+                    DnsError::WireFormat("doh tls handshake timeout".to_string())
+                })?
+                .map_err(|e| DnsError::WireFormat(format!("doh tls handshake: {e}")))?;
             tracing::debug!(target: "xray.dns.doh", alpn = ?tls_stream.alpn_protocol(),
                 "doh: tls established");
-            let (h2, conn) = timeout_at(deadline, client::handshake(tls_stream))
+            let (h2, conn) = deadline
+                .timeout(client::handshake(tls_stream))
                 .await
                 .map_err(|_| {
                     tracing::debug!(target: "xray.dns.doh", "doh: h2 handshake TIMEOUT");
@@ -293,7 +289,8 @@ impl DohNameServer {
             .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
-        h2 = timeout_at(deadline, h2.ready())
+        h2 = deadline
+            .timeout(h2.ready())
             .await
             .map_err(|_| {
                 tracing::debug!(target: "xray.dns.doh", "doh: h2 ready TIMEOUT");
@@ -329,7 +326,8 @@ impl DohNameServer {
         tracing::debug!(target: "xray.dns.doh", "doh: body sent");
 
         // 读 HTTP 响应。
-        let response = timeout_at(deadline, resp_future)
+        let response = deadline
+            .timeout(resp_future)
             .await
             .map_err(|_| {
                 tracing::debug!(target: "xray.dns.doh", "doh: response TIMEOUT ({}ms)",
@@ -348,7 +346,7 @@ impl DohNameServer {
         let mut body = response.into_body();
         let mut buf = Vec::new();
         loop {
-            match timeout_at(deadline, body.data()).await {
+            match deadline.timeout(body.data()).await {
                 Ok(Some(chunk)) => {
                     let chunk =
                         chunk.map_err(|e| DnsError::WireFormat(format!("doh body: {e}")))?;

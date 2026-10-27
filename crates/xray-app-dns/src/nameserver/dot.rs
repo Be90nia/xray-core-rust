@@ -18,12 +18,10 @@ use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout_at,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
+use xray_frame::deadline::{Budget, BudgetDeadline};
 use xray_tls::utls::client as tls_client;
 
 use crate::{
@@ -143,29 +141,32 @@ impl DotNameServer {
     /// 内部 `connect_stream` 仍按单次拨号计 `query_timeout`，总量由外层封顶。
     async fn connect_tls(
         &self,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<xray_tls::utls::Conn<DotStream>, DnsError> {
-        let stream = timeout_at(
-            deadline,
-            crate::dial::connect_stream(
+        // W4 面 3：预算超时统一走 `BudgetDeadline::timeout`（Tokio 源 = tokio
+        // `timeout_at` 绝对截止点，与迁移前 `timeout_at(deadline, ..)` 逐点等价：
+        // 整条查询共享同一绝对时刻，慢阶段不推出新预算）。
+        //
+        // 注：本函数的 `try_query` 同胞函数因持有 `&mut Conn<DotStream>`
+        // （内含 `Box<dyn Connection>`）触发 rustc HRTB 推断限制，那里走相对
+        // 形态（见 `try_query` 内的例外登记注释）。
+        let stream = deadline
+            .timeout(crate::dial::connect_stream(
                 &self.dest,
                 self.resolver.as_ref(),
                 self.query_timeout,
                 "dot",
                 self.force_local,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            DnsError::WireFormat(format!("dot dial timeout after {:?}", self.query_timeout))
-        })??;
-        let tls = timeout_at(
-            deadline,
-            tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)),
-        )
-        .await
-        .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
-        .map_err(|e| DnsError::WireFormat(format!("dot tls handshake: {e}")))?;
+            ))
+            .await
+            .map_err(|_| {
+                DnsError::WireFormat(format!("dot dial timeout after {:?}", self.query_timeout))
+            })??;
+        let tls = deadline
+            .timeout(tls_client(stream, &self.server_name, Arc::clone(&self.tls_config)))
+            .await
+            .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("dot tls handshake: {e}")))?;
         Ok(tls)
     }
 
@@ -178,25 +179,40 @@ impl DotNameServer {
         payload: &[u8],
         req_id: u16,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
+        // W4 面 3 例外登记（本函数独用相对形态）：`BudgetDeadline::timeout` 是
+        // `async fn` + 泛型 future（匿名 future 类型），在本函数的具体化组合下
+        // 触发 rustc HRTB 推断限制（"implementation of `Connection` is not general
+        // enough"）——本函数持有 `&mut Conn<DotStream>`（内含
+        // `Box<dyn Connection>`），其 `write_all`/`read_exact` future 的
+        // 高阶生命周期约束与匿名 future 类型叠加即不可generalize。
+        // 改走既有构造形态 `xray_frame::deadline::timeout(fut, remaining)`
+        // （返回具名 `tokio::time::Timeout<F>` 类型，规避该推断限制）。
+        // 语义等价性：`remaining()` 每次调用点现算 = `绝对截止点 - now`，
+        // 故本段实际到期时刻 ≈ 同一绝对截止点（漂移 = 计算 remaining 与构造
+        // timeout 之间的纳秒级间隙），整条查询仍被同一绝对预算封顶，
+        // 慢握手不推出新预算。
         // 写长度前缀 + payload。
-        timeout_at(deadline, stream.write_all(len_be))
+        // 实测（2026-10-27 W4V5 复验）：直写 `deadline.timeout(stream.write_all(..))`
+        // 必报 `implementation of Connection is not general enough`
+        //（`Box<dyn Connection + '0>` vs `'static`），故此形态保留。
+        xray_frame::deadline::timeout(stream.write_all(len_be), deadline.remaining())
             .await
             .map_err(|_| DnsError::WireFormat("dot write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write len: {e}")))?;
-        timeout_at(deadline, stream.write_all(payload))
+        xray_frame::deadline::timeout(stream.write_all(payload), deadline.remaining())
             .await
             .map_err(|_| DnsError::WireFormat("dot write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot write payload: {e}")))?;
-        timeout_at(deadline, stream.flush())
+        xray_frame::deadline::timeout(stream.flush(), deadline.remaining())
             .await
             .map_err(|_| DnsError::WireFormat("dot flush timeout".to_string()))?
             .map_err(io_to_dns)?;
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout_at(deadline, stream.read_exact(&mut len_buf))
+        xray_frame::deadline::timeout(stream.read_exact(&mut len_buf), deadline.remaining())
             .await
             .map_err(|_| DnsError::WireFormat("dot read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read len: {e}")))?;
@@ -207,7 +223,7 @@ impl DotNameServer {
 
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
-        timeout_at(deadline, stream.read_exact(&mut buf))
+        xray_frame::deadline::timeout(stream.read_exact(&mut buf), deadline.remaining())
             .await
             .map_err(|_| DnsError::WireFormat("dot read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot read payload: {e}")))?;
@@ -224,7 +240,7 @@ impl DotNameServer {
         &self,
         fqdn: &str,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
@@ -234,7 +250,7 @@ impl DotNameServer {
 
         let mut conn_guard = self.conn.lock().await;
         if conn_guard.is_none() {
-            *conn_guard = Some(self.connect_tls(deadline).await?);
+            *conn_guard = Some(self.connect_tls(deadline.clone()).await?);
         }
 
         // 尝试在已有连接上查询，失败则丢弃重连。
@@ -245,7 +261,7 @@ impl DotNameServer {
                 &payload,
                 req_id,
                 record_type,
-                deadline,
+                deadline.clone(),
             )
             .await
         {
@@ -253,24 +269,20 @@ impl DotNameServer {
             Err(e) => {
                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
                 // 拨号/握手错误掩盖真正原因：直接返回首查错误（Go 本无重试）。
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "713x6 语义判定：tokio 虚拟钟预算剩余判定（与 timeout_at 同面，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-                )]
-                if tokio::time::Instant::now() >= deadline {
+                if deadline.is_expired() {
                     return Err(e);
                 }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
                 *conn_guard = None;
-                *conn_guard = Some(self.connect_tls(deadline).await?);
+                *conn_guard = Some(self.connect_tls(deadline.clone()).await?);
                 self.try_query(
                     conn_guard.as_mut().expect("reconnected just above"),
                     &len_be,
                     &payload,
                     req_id,
                     record_type,
-                    deadline,
+                    deadline.clone(),
                 )
                 .await
             },
@@ -289,20 +301,18 @@ impl CachedNameserver for DotNameServer {
         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
         // 入口算一次、:151 每个 req 复用；DoT 走同一 TCP 语义）——A/AAAA、
         // 拨号、TLS 握手、写、读、重试共享。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-        )]
-        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
 
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline).await {
+            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -491,7 +501,7 @@ mod tests {
             .query_once(
                 "example.com.",
                 RecordType::A,
-                tokio::time::Instant::now() + Duration::from_secs(2),
+                Budget::tokio().deadline(Duration::from_secs(2)),
             )
             .await
             .unwrap();

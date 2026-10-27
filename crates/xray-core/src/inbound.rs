@@ -1,13 +1,13 @@
-// L3 静态闸存量登记（bd a5r4j/lzzja 切片；batch2 后实盘 2026-10-27）：本文件
-// 67 处（62 tokio::spawn：生产 10 + tests 52；5 std Instant 调用位，另有 5 处
-// Instant 类型位置不计）>20 → 按分层规则挂文件级。生产 10 = mux link 4 +
-// SS 数据面泵 1 + 监控壳 2 + reality vision 2 + tun 1；
-// batch1 已迁 13 处 + batch2 已迁 6 处（UDP associate + UDS 每连接 5）生产
-// spawn → arm PluginContext（bd 39hko）。
-#![allow(
-    clippy::disallowed_methods,
-    reason = "inbound.rs 存量 67 处（62 tokio::spawn：生产 10 + tests 52；5 std Instant 调用位），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko"
-)]
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片；W4 面 3+6 后实盘 2026-10-27）：
+// **生产面已清零**——tokio::spawn 生产 2 处（监控壳外层 1 + tun 1）均已逐点
+// `#[allow]` + 理由登记；tokio::time::Instant::now 生产 0 处；std::time::Instant::now
+// 生产 1 处（ss2022 会话惰性清扫锚点，逐点登记）。
+// **测试面 52 处 tokio::spawn + 4 处 std Instant + 2 处 tokio Instant 留在
+// `mod tests` 的 inner allow**（测试计时/并发夹具不得改语义；tokio::test 自有
+// runtime，FxScope 化无生命周期收益）。
+// W4 已迁：batch1 13 处 + batch2 6 处（UDP associate + UDS 每连接 5）+ W4 8 处
+//（mux link 4 → arm scope / SS 泵 1 → conn scope / 监控壳内层 1 → arm scope /
+// reality vision 2 → redline 受控口）生产 spawn → arm PluginContext（bd 39hko）。
 //! SOCKS5 inbound listener：接收连接 → SOCKS5 握手 → dispatcher 分发。
 //!
 //! 对应 Go `app/proxyman/inbound/always.go::handle_connection` + `proxy/socks/server.go`。
@@ -46,7 +46,16 @@ use xray_conf::{BuiltConfig, BuiltInbound};
     target_os = "windows"
 ))]
 use xray_features::inbound::InboundHandler;
+// W4 面 6：budget/deadline 统一走 xray_frame::deadline::Budget（Tokio 源保 advance
+// 语义）；vision 装配 spawn 走面 5 受控入口（redline 台账，坑约束 ⑫ 调用形态治理）；
+// SS 泵归每连接 ConnScope（两级 scope 模型，方案 §2 面 6）。
 use xray_frame::PluginContext;
+// 注：redline 走 `redline::spawn_unchecked` 全路径调用形态（不 alias）——
+// `tests/redline_sites.rs` 的 CI 门按字面量核对调用集合，alias 会让本文件对门隐形。
+use xray_frame::{
+    deadline::Budget,
+    redline::{self, RedlineSite},
+};
 // zx7: mux inbound 检测
 use xray_mux::client::{MUX_COOL_ADDRESS, MUX_COOL_PORT};
 use xray_proto::xray::{
@@ -457,7 +466,11 @@ where
                 tracing::info!(
                     "socks: mux.cool destination detected, spawning mux inbound handler"
                 );
-                tokio::spawn(handle_mux_inbound_link(link, Arc::clone(handler), None));
+                // W4 面 6：carrier 与 inbound（arm）同寿命 → arm scope 托管
+                //（方案 §2 面 6：两级 scope 下 mux link 归 arm scope）。
+                plugin_ctx
+                    .spawn(handle_mux_inbound_link(link, Arc::clone(handler), None))
+                    .expect("arm FxScope is never closed");
                 return Ok(());
             }
             let _ = handler.dispatch_with_access(&dest, link, access).await;
@@ -561,15 +574,21 @@ async fn handle_udp_associate(
     let mut last_client: Option<SocketAddr> = None;
     // UDP associate 空闲时限（Go server.go:171-175 `tempUDPConn.SetTimeout(
     // plcy.Timeouts.ConnectionIdle)`）：任一方向有活动即续期。
-    let mut idle_deadline = tokio::time::Instant::now() + idle;
+    // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，pause 可推进不变）。
+    let mut idle_deadline = Budget::tokio().deadline(idle);
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(idle_deadline) => {
+            // 构造式：同体积于裸 `tokio::time::timeout`（方案面 3 + PM 2026-10-27 栈足迹回归口径：
+            // async-fn 形态在巨型 future/裸 await 测试（本函数在 tests 里被非装箱 await）内会加厚栈帧）。
+            _ = xray_frame::deadline::timeout(
+                std::future::pending::<()>(),
+                idle_deadline.remaining(),
+            ) => {
                 tracing::debug!(?idle, "socks udp relay idle timeout");
                 return Ok(());
             }
             v = relay_socket.recv_from(&mut buf) => {
-                idle_deadline = tokio::time::Instant::now() + idle;
+                idle_deadline = Budget::tokio().deadline(idle);
                 let (n, client) = match v {
                     Ok(v) => v,
                     Err(e) => {
@@ -592,7 +611,7 @@ async fn handle_udp_associate(
                 }
             }
             r = session.recv_packet() => {
-                idle_deadline = tokio::time::Instant::now() + idle;
+                idle_deadline = Budget::tokio().deadline(idle);
                 let (source, payload) = match r {
                     Ok(Some(v)) => v,
                     Ok(None) => return Ok(()), // outbound 关闭，会话结束
@@ -713,7 +732,9 @@ pub(crate) async fn serve_mixed(
                             let (reader, writer) = stream.into_link_io();
                             let link = Link::new(reader, writer);
                             if is_mux_destination(&dest) {
-                                tokio::spawn(handle_mux_inbound_link(link, handler, None));
+                                // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
+                                ctx.spawn(handle_mux_inbound_link(link, handler, None))
+                                    .expect("arm FxScope is never closed");
                             } else {
                                 let _ = handler.dispatch_with_access(&dest, link, access).await;
                             }
@@ -780,7 +801,9 @@ pub(crate) async fn serve_mixed(
                         let (reader, writer) = stream.into_link_io();
                         let link = Link::new(reader, writer);
                         if is_mux_destination(&dest) {
-                            tokio::spawn(handle_mux_inbound_link(link, handler, None));
+                            // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
+                            ctx.spawn(handle_mux_inbound_link(link, handler, None))
+                                .expect("arm FxScope is never closed");
                         } else {
                             let _ = handler.dispatch_with_access(&dest, link, access).await;
                         }
@@ -829,7 +852,7 @@ pub async fn serve_http(
         let task_ctx = Arc::clone(&plugin_ctx);
         plugin_ctx
             .spawn(async move {
-                let _ctx = task_ctx;
+                let ctx = task_ctx;
                 // Go Process 的 Start 循环：keep-alive 连接逐请求回环读请求头。
                 loop {
                     // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
@@ -883,7 +906,9 @@ pub async fn serve_http(
                         tracing::info!(
                             "http: mux.cool destination detected, spawning mux inbound handler"
                         );
-                        tokio::spawn(handle_mux_inbound_link(link, handler, None));
+                        // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
+                        ctx.spawn(handle_mux_inbound_link(link, handler, None))
+                            .expect("arm FxScope is never closed");
                         return;
                     }
                     let _ = handler.dispatch_with_access(&dest, link, access).await;
@@ -1770,7 +1795,8 @@ pub async fn serve_dokodemo_udp_on(
     // relay 的 sessions.retain，本表按 idle 时间判定，60s 对齐 Go udp
     // Dispatcher 的会话超时）。
     let mut peers: HashMap<SocketAddr, PeerSession> = HashMap::new();
-    let mut cleanup_at = tokio::time::Instant::now() + DOKODEMO_UDP_IDLE;
+    // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，pause 可推进不变）。
+    let mut cleanup_at = Budget::tokio().deadline(DOKODEMO_UDP_IDLE);
     loop {
         tokio::select! {
             pkt = hub_rx.recv() => {
@@ -1805,23 +1831,24 @@ pub async fn serve_dokodemo_udp_on(
                                 .await;
                             })
                             .expect("arm FxScope is never closed");
-                        e.insert(PeerSession {
-                            tx,
-                            last_active: tokio::time::Instant::now(),
-                        })
+                        e.insert(PeerSession { tx, last_active: Budget::tokio() })
                     }
                 };
-                entry.last_active = tokio::time::Instant::now();
+                entry.last_active = Budget::tokio();
                 if entry.tx.send((dest_override, pkt.payload)).await.is_err() {
                     tracing::debug!("dokodemo udp peer session closed; packet dropped");
                 }
             }
-            _ = tokio::time::sleep_until(cleanup_at) => {
+            // 构造式（同上：本函数在 tests 里被非装箱 await）。
+            _ = xray_frame::deadline::timeout(
+                std::future::pending::<()>(),
+                cleanup_at.remaining(),
+            ) => {
                 // 丢弃 idle / 已关会话：tx drop → peer task 退出 → link/fake socket 释放
                 peers.retain(|_, p| {
                     !p.tx.is_closed() && p.last_active.elapsed() < DOKODEMO_UDP_IDLE
                 });
-                cleanup_at = tokio::time::Instant::now() + DOKODEMO_UDP_IDLE;
+                cleanup_at = Budget::tokio().deadline(DOKODEMO_UDP_IDLE);
             }
         }
     }
@@ -1834,7 +1861,8 @@ const DOKODEMO_UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60
 struct PeerSession {
     /// 主循环 → peer task 的入站包队列 `(逐包 dest 覆盖, payload)`。
     tx: tokio::sync::mpsc::Sender<(Option<Destination>, Vec<u8>)>,
-    last_active: tokio::time::Instant,
+    /// 最近活动锚（W4 面 3：Budget = tokio Instant 预算句柄，elapsed 语义同原）。
+    last_active: Budget,
 }
 
 /// 单 peer UDP 会话任务：入站队列 → [`UdpDispatchSession`] → 响应回发本 peer。
@@ -1972,42 +2000,55 @@ async fn spawn_ss_pump<C>(
     mut ss_stream: xray_proxy_ss::stream::SSStream<C>,
     dest: Destination,
     handler: std::sync::Arc<dyn DispatchHandler>,
+    // W4 面 6：泵任务归每连接 scope（两级 scope 模型，方案 §2 面 6 步 2）。
+    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    // connection scope：scope 的 Arc 由泵任务持有（任务内持 Arc 锚，既有先例
+    // `let _ctx = Arc::clone(&plugin_ctx)` 同款）——本函数返回（dispatch 结束）
+    // 后 scope 不被提前 close，泵自然死亡（对端关/断流 break）后计数归零，
+    // Drop → close（cancel 对已终局任务无害）；arm scope close（停机）经父闸
+    // 级联取消泵任务。语义 = 原裸 spawn detach + 停机级联（面 6 收益）。
+    let conn_scope = Arc::new(plugin_ctx.conn_scope());
+    let pump_scope = Arc::clone(&conn_scope);
     // 单 task select! 串行推进：SSStream 共享 nonce 计数器不可并发持有 read/write &mut。
-    tokio::spawn(async move {
-        let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
-        let mut down_buf = vec![0u8; 8 * 1024];
-        loop {
-            tokio::select! {
-                chunk = ss_stream.read_chunk() => {
-                    match chunk {
-                        Ok(Some(plaintext)) => {
-                            if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
-                            if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
+    conn_scope
+        .spawn(async move {
+            let _scope = pump_scope;
+            let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
+            let mut down_buf = vec![0u8; 8 * 1024];
+            loop {
+                tokio::select! {
+                    chunk = ss_stream.read_chunk() => {
+                        match chunk {
+                            Ok(Some(plaintext)) => {
+                                if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
+                                if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
+                            }
+                            Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
+                            Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
                         }
-                        Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
-                        Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
                     }
-                }
-                n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
-                    match n {
-                        Ok(0) => { let _ = ss_stream.shutdown().await; break; }
-                        Ok(n) => {
-                            if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
-                            if ss_stream.flush().await.is_err() { break; }
+                    n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
+                        match n {
+                            Ok(0) => { let _ = ss_stream.shutdown().await; break; }
+                            Ok(n) => {
+                                if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
+                                if ss_stream.flush().await.is_err() { break; }
+                            }
+                            Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
                         }
-                        Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
                     }
                 }
             }
-        }
-    });
+        })
+        .expect("fresh connection scope gate is never closed");
     let (client_rd, client_wr) = tokio::io::split(client_io);
     let link = Link::new(new_reader(client_rd), new_writer(client_wr));
     let _ = handler.dispatch(&dest, link).await;
+    // 本函数返回后 scope 由泵任务的 Arc 锚维活（见上），泵退出即收账。
 }
 
 /// Legacy SS 单条 TCP 连接完整 pipeline：握手 → pump → dispatch。
@@ -2020,6 +2061,8 @@ async fn ss_legacy_pipeline<C>(
     stream: C,
     // sm80④：policy Timeouts.Handshake（Go SessionDefault 60s 同源；装配层注入）
     handshake_timeout: std::time::Duration,
+    // W4 面 6：泵任务归每连接 scope（构造宿 = 本 pipeline 的调用方 arm ctx）。
+    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2034,7 +2077,7 @@ async fn ss_legacy_pipeline<C>(
     match handshake {
         Ok((address, port, ss_stream)) => {
             let dest = Destination::new(address, Port::new(port), Network::TCP);
-            spawn_ss_pump(ss_stream, dest, handler).await;
+            spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
         },
         Err(e) => {
             tracing::debug!(error = %e, "ss inbound handshake failed");
@@ -2151,8 +2194,8 @@ pub async fn serve_ss(
         let task_ctx = Arc::clone(&plugin_ctx);
         plugin_ctx
             .spawn(async move {
-                let _ctx = task_ctx;
-                ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout).await;
+                let _ctx = Arc::clone(&task_ctx);
+                ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout, task_ctx).await;
             })
             .expect("arm FxScope is never closed");
     }
@@ -2168,12 +2211,14 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
     stream: C,
     // Legacy / Ss2022 单用户的握手限时；Multi / Relay 保持既有 DEFAULT_HANDSHAKE_TIMEOUT
     handshake_timeout: std::time::Duration,
+    // W4 面 6：泵任务归每连接 scope（构造宿 = 本 pipeline 的调用方 arm ctx）。
+    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match mode {
         SsInboundMode::Legacy(ib) => {
-            ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
+            ss_legacy_pipeline(ib, handler, stream, handshake_timeout, plugin_ctx).await;
         },
         SsInboundMode::Ss2022(ib) => {
             let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
@@ -2188,7 +2233,7 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
             };
             if let Ok((address, port, ss_stream)) = handshake {
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                spawn_ss_pump(ss_stream, dest, handler).await;
+                spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
@@ -2207,7 +2252,7 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
             };
             if let Ok((address, port, ss_stream)) = handshake {
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                spawn_ss_pump(ss_stream, dest, handler).await;
+                spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
@@ -2365,8 +2410,8 @@ async fn ss_udp_client_relay(
     let mut account: Option<xray_proxy_ss::config::MemoryAccount> = None;
     // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
     let mut enc = Vec::with_capacity(2048);
-    let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，pause 可推进不变）。
+    let mut idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
     loop {
         tokio::select! {
             item = rx.recv() => {
@@ -2376,7 +2421,7 @@ async fn ss_udp_client_relay(
                         if session.send_packet(&dest, &payload).await.is_err() {
                             break;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                        idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
                     }
                     None => break, // 主循环丢弃本 entry（会话被替换）
                 }
@@ -2397,7 +2442,7 @@ async fn ss_udp_client_relay(
                                 let _ = udp.send_to(&enc, client).await;
                             }
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                        idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
                     }
                     Ok(None) => break, // outbound 关闭，会话结束
                     Err(e) => {
@@ -2408,7 +2453,11 @@ async fn ss_udp_client_relay(
                     }
                 }
             }
-            _ = &mut idle => break, // 60s 空闲淘汰
+            // 构造式（同上：巨型 select 环）。
+            _ = xray_frame::deadline::timeout(
+                std::future::pending::<()>(),
+                idle.remaining(),
+            ) => break, // 60s 空闲淘汰
         }
     }
 }
@@ -2450,6 +2499,14 @@ pub async fn serve_ss2022_udp(
         sessions.retain(|_, tx| !tx.is_closed());
         // bd 29nk：顺带惰性清扫超龄（500s 无活动）AEAD 会话——表此前只增不删，
         // 海量 UDP 客户端下是内存泄漏；对齐 Go sing udpSessions LRU 淘汰。
+        // L3 台账（713x6 判定）：std 墙钟取时位，`serve_ss2022_udp` 无 ctx 形参
+        // （生产调用点在 legacy inbound spawn 区，收口归 bd 39hko）→ 保留 + 逐点
+        // allow 登记。面 3 迁的是 tokio 虚拟钟预算面（Budget），此处为 std 墙钟
+        // 惰性清扫锚点 = 面 2（compat clock）域，不在本波范围。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "std 墙钟取时（ss2022 会话 500s 惰性清扫锚点）：serve_ss2022_udp 无 ctx 形参，收口归 bd 39hko；面 3 迁的是 tokio 虚拟钟预算面"
+        )]
         let now = std::time::Instant::now();
         sweep_expired_ss2022_sessions(&mut server_sessions, now);
         // 1. ECB 解头 + EIH 用户识别（chacha：整包一次 XChaCha 解开， body 明文随 hdr.chacha_plain
@@ -2536,8 +2593,8 @@ async fn ss2022_udp_client_relay(
     // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
     let mut enc = Vec::with_capacity(2048);
     let mut plain = Vec::with_capacity(2048);
-    let idle = tokio::time::sleep(SS_UDP_IDLE_TIMEOUT);
-    tokio::pin!(idle);
+    // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，pause 可推进不变）。
+    let mut idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
     loop {
         tokio::select! {
             item = rx.recv() => {
@@ -2547,7 +2604,7 @@ async fn ss2022_udp_client_relay(
                         if dispatch.send_packet(&dest, &payload).await.is_err() {
                             break;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                        idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
                     }
                     None => break, // 主循环丢弃本 entry（会话被替换）
                 }
@@ -2567,7 +2624,7 @@ async fn ss2022_udp_client_relay(
                         {
                             let _ = udp.send_to(&enc, client).await;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + SS_UDP_IDLE_TIMEOUT);
+                        idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
                     }
                     Ok(None) => break, // outbound 关闭，会话结束
                     Err(e) => {
@@ -2576,7 +2633,11 @@ async fn ss2022_udp_client_relay(
                     }
                 }
             }
-            _ = &mut idle => break, // 60s 空闲淘汰
+            // 构造式（同上：巨型 select 环）。
+            _ = xray_frame::deadline::timeout(
+                std::future::pending::<()>(),
+                idle.remaining(),
+            ) => break, // 60s 空闲淘汰
         }
     }
 }
@@ -3202,35 +3263,58 @@ pub fn built_inbound_from_proto(cfg: &ProtoInboundConfig) -> Result<BuiltInbound
 ///
 /// token cancel 时取消 serve future（drop listener，accept 循环终止）。
 /// 对应 Go 有序关闭的"先停 accept"阶段。connection drain 留后续。
+///
+/// W4 面 6：serve 任务本体托管 arm scope（任务记账 + in_flight + 停机级联，
+/// bd 39hko）；panic 监督语义（51d50459）逐字保留——FxScope catch_unwind 把
+/// serve future 的 panic 归一 `TaskError::Panicked`，外层壳 join 判别后 error! 留痕，
+/// listener 随 panic 的 future drop 释放，等价原 `JoinError::is_panic()` 路径。
 pub(crate) fn spawn_inbound_serve(
+    arm: &Arc<PluginContext>,
     tag: String,
     shutdown_token: CancellationToken,
     fut: impl Future<Output = std::io::Result<()>> + Send + 'static,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        // 监控包裹：serve future panic → 该 future 持有的 listener 随 drop 释放
-        // → 端口不再 listen 而进程存活(与 bd wsiq 同类静默失效)。这里 await 内层
-        // 句柄把 panic 转成 error! 留痕(tag + 端口上下文)，不再只留一行裸 panic。
-        let tag_inner = tag.clone();
-        let inner = tokio::spawn(async move {
-            tokio::select! {
-                r = fut => {
-                    if let Err(e) = r {
-                        tracing::error!(tag = %tag_inner, error = %e, "inbound stopped");
+    // 内层：serve + shutdown select —— 托管 arm scope。
+    let inner = arm
+        .spawn({
+            let tag_inner = tag.clone();
+            async move {
+                tokio::select! {
+                    r = fut => {
+                        if let Err(e) = r {
+                            tracing::error!(tag = %tag_inner, error = %e, "inbound stopped");
+                        }
+                    }
+                    _ = shutdown_token.cancelled() => {
+                        tracing::info!(tag = %tag_inner, "inbound shutting down (graceful)");
                     }
                 }
-                _ = shutdown_token.cancelled() => {
-                    tracing::info!(tag = %tag_inner, "inbound shutting down (graceful)");
-                }
             }
-        });
-        if let Err(join_err) = inner.await {
-            if join_err.is_panic() {
-                tracing::error!(
-                    tag = %tag,
-                    "inbound serve task panicked — 监听已停止，该端口不再接受连接"
-                );
-            }
+        })
+        .expect("arm FxScope is never closed");
+    // 外层壳：JoinHandle 外返契约（InboundRuntime → spawn_inbounds → functions.rs
+    // 消费链，改返回类型超出本波文件面）+ panic 监督（51d50459 语义保留）。
+    // 例外登记（W4 面 6）：JoinHandle 外返契约，与 tun 保留同源举证。
+    //
+    // **arm scope 生命周期锚（关键）**：serve 任务本体登记在 arm scope 的
+    // JoinSet 内，而 JoinSet 随 `FxScope` drop 即 abort 全部在途任务。arm
+    // scope 的 `Arc<PluginContext>` 强引用只存在于 arm_builders 构造函数的
+    // 形参里 → 构造函数返回即销毁 → scope drop → serve 任务被立刻 abort →
+    // listener 随 future drop 释放 → 入站静默失效（端口不再 listen 而进程存活）。
+    // 故外层壳持一份 `Arc<PluginContext>` 锚，覆盖 inner 任务存活期
+    // （既有同款先例：`let _ctx = task_ctx;` 生命周期锚）。
+    let arm_anchor = Arc::clone(arm);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）保留，serve 任务本体已迁 arm scope"
+    )]
+    tokio::spawn(async move {
+        let _arm = arm_anchor;
+        if let Err(skeleton_infra::fx::TaskError::Panicked(_)) = inner.join().await {
+            tracing::error!(
+                tag = %tag,
+                "inbound serve task panicked — 监听已停止，该端口不再接受连接"
+            );
         }
     })
 }
@@ -3600,7 +3684,10 @@ pub(crate) async fn serve_reality_vless(
         // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
         // 模仿消费）；默认 rustls 路径行为不变。
         let use_btls = matches!(cfg.server_acceptor, xray_reality::ServerAcceptorSetting::Btls);
-        tokio::spawn(async move {
+        // W4 面 6 步 2 / 面 5：vision 装配任务走受控逃逸口（台账
+        // RedlineSite::VisionSpliceSpawn）；spawn 语义逐字等价，红线本体
+        //（splice 装配三件套）零改动（坑约束 ⑫）。
+        redline::spawn_unchecked(RedlineSite::VisionSpliceSpawn, async move {
             // bd e0ni/39824：vision splice 装配对齐 serve_vless 三件套——①accept
             // 后 dup 裸 TCP；②握手入口垫 RecordFramer（记录对齐读，「DIRECT 帧 +
             // 其后裸流」合流入站时裸尾留内核缓冲，不被 rustls deframer 拉走）；
@@ -3791,7 +3878,9 @@ pub(crate) async fn serve_reality_trojan(
         let max_ver = cfg.max_client_ver.clone();
         let probe_ctx = probe_ctx.clone();
         let use_btls = matches!(cfg.server_acceptor, xray_reality::ServerAcceptorSetting::Btls);
-        tokio::spawn(async move {
+        // W4 面 6 步 2 / 面 5：vision 装配任务走受控逃逸口（台账
+        // RedlineSite::VisionSpliceSpawn）；spawn 语义逐字等价，红线本体零改动。
+        redline::spawn_unchecked(RedlineSite::VisionSpliceSpawn, async move {
             let outcome = if use_btls {
                 #[cfg(not(target_os = "ios"))]
                 {
@@ -3927,6 +4016,7 @@ pub(crate) fn inbound_udpmask(
 /// 收到的已是协议解包后的明文 conn。listener 移入 pending future 保活，
 /// shutdown abort 时随 task drop。
 pub(crate) async fn spawn_transport_listener_inbound(
+    arm: &Arc<PluginContext>,
     tag: &str,
     bind_addr: SocketAddr,
     settings: xray_transport::dialer::StreamSettings,
@@ -3941,7 +4031,7 @@ pub(crate) async fn spawn_transport_listener_inbound(
     )
     .await?;
     tracing::info!(tag = %tag, addr = %bind_addr, "transport inbound listening");
-    Ok(Some(spawn_inbound_serve(tag.to_string(), shutdown_token, async move {
+    Ok(Some(spawn_inbound_serve(arm, tag.to_string(), shutdown_token, async move {
         let _listener = listener;
         std::future::pending::<()>().await;
         Ok(())
@@ -4019,6 +4109,14 @@ pub(crate) async fn spawn_one_inbound(
             .await
             .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
         tracing::info!(tag = %ib.tag, "tun inbound listening");
+        // W4 面 6 例外登记（方案 §2 面 6「不可迁残余 1」）：本函数对外**返回
+        // JoinHandle**（调用方 InboundRuntime 契约），改为 scope 托管 = 改公开
+        // 契约 + 4 平台门控臂（linux/android/freebsd/windows），收益（1 处 spawn
+        // 记账）远小于风险 → 保留裸 spawn，逐点理由登记。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留"
+        )]
         let handle = tokio::spawn(async move {
             if let Err(e) = handler.start().await {
                 tracing::error!(error = ?e, "tun inbound stopped");
@@ -4417,8 +4515,15 @@ async fn spawn_unix_inbound(
                     let task_ctx = Arc::clone(&plugin_ctx);
                     plugin_ctx
                         .spawn(async move {
-                            let _ctx = task_ctx;
-                            ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
+                            let _ctx = Arc::clone(&task_ctx);
+                            ss_legacy_pipeline(
+                                inbound,
+                                handler,
+                                conn,
+                                hs_timeout,
+                                Arc::clone(&task_ctx),
+                            )
+                            .await;
                         })
                         .expect("arm FxScope is never closed");
                 })
@@ -4427,7 +4532,7 @@ async fn spawn_unix_inbound(
         _ => unreachable!("uds protocol support checked above"),
     };
 
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, serve)))
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, serve)))
 }
 
 /// transport 协议 + unix 路径 inbound（bd lfrg 收尾）。
@@ -4506,7 +4611,9 @@ async fn spawn_unix_transport_inbound(
     let listener =
         xray_transport::listener_registry::listen_unix(listen, settings, sockopt, on_conn).await?;
     tracing::info!(tag = %ib.tag, path = %listen, "transport inbound listening (unix)");
-    Ok(Some(spawn_inbound_serve(ib.tag.clone(), shutdown_token, async move {
+    // L2 能力句柄：监听保活任务同 transport 分支同源（arm_plugin_ctx 派发点构造）。
+    let arm_ctx = std::sync::Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+    Ok(Some(spawn_inbound_serve(&arm_ctx, ib.tag.clone(), shutdown_token, async move {
         let _listener = listener;
         std::future::pending::<()>().await;
         Ok(())
@@ -5782,6 +5889,15 @@ pub(crate) fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destina
 }
 #[cfg(test)]
 mod tests {
+    // 测试面 L3 静态闸存量登记（bd a5r4j/lzzja）：本模块 52 处 tokio::spawn
+    // （并发夹具 / 端到端 pump）+ 4 处 std Instant + 2 处 tokio Instant（测试
+    // 计时与 deadline 夹具）——测试计时与并发编排不得改语义；tokio::test 自有
+    // runtime，FxScope 化无生命周期收益 → 模块级 inner allow 登记（生产面
+    // 已逐点收口，见文件头台账注释）。
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "测试面存量 52 处 tokio::spawn + 4 处 std Instant + 2 处 tokio Instant：测试计时/并发夹具不得改语义，tokio::test 自有 runtime 无 FxScope 生命周期收益"
+    )]
     use std::net::Ipv4Addr;
 
     /// 测试范式 ctx（生产注入来自装配根；仅测试面可直接构造）。
@@ -11530,11 +11646,47 @@ mod tests {
     #[tokio::test]
     async fn spawn_inbound_serve_survives_panicking_future() {
         let token = CancellationToken::new();
-        let handle = spawn_inbound_serve("panic-probe".to_string(), token, async {
-            panic!("simulated panic inside inbound serve");
-        });
+        let handle = spawn_inbound_serve(
+            &test_plugin_ctx("panic-probe"),
+            "panic-probe".to_string(),
+            token,
+            async {
+                panic!("simulated panic inside inbound serve");
+            },
+        );
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         assert!(joined.is_ok(), "serve 句柄不应挂死（panic 后必须收敛）");
+    }
+
+    /// W4 面 6 验收（方案 §6 G6 的 xray-core 半）：连接级 scope 的两条消费契约。
+    /// ①`spawn_ss_pump` 同款 Arc 锚——泵任务持 scope 克隆，宿主函数返回（局部
+    /// `Arc` 释放）后任务不得被提前 close 掉；②一个连接 scope 关闭不杀 sibling。
+    #[tokio::test]
+    async fn conn_scope_anchor_survives_host_return_and_spares_siblings() {
+        let arm = test_plugin_ctx("w4-conn-scope");
+        // ①锚语义：scope 局部句柄 drop 后任务仍在跑。
+        let scope = std::sync::Arc::new(arm.conn_scope());
+        let anchor = std::sync::Arc::clone(&scope);
+        let anchored = scope
+            .spawn(async move {
+                let _anchor = anchor;
+                std::future::pending::<()>().await;
+            })
+            .expect("连接 scope 可 spawn");
+        drop(scope);
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(!anchored.is_finished(), "宿主返回后泵任务不得被提前 close");
+
+        // ②sibling 隔离：关掉 A 的连接 scope，B 的任务不受影响。
+        let conn_a = arm.conn_scope();
+        let conn_b = arm.conn_scope();
+        let a = conn_a.spawn(std::future::pending::<()>()).expect("连接 scope 可 spawn");
+        let b = conn_b.spawn(std::future::pending::<()>()).expect("连接 scope 可 spawn");
+        conn_a.close();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(a.is_finished(), "本连接结束 → 本连接任务结束");
+        assert!(!b.is_finished(), "sibling 连接任务不得被连坐");
+        conn_b.close();
     }
 
     // ── xiuvr-3a 阶段 2：影子注册表双跑对照（零行为改变；阶段 4 删影子）──

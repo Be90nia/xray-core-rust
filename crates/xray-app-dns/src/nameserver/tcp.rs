@@ -17,11 +17,9 @@ use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout_at,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xray_common::net::{destination::Destination, port::Port};
+use xray_frame::deadline::{Budget, BudgetDeadline};
 
 use crate::{
     cache_controller::CacheController,
@@ -127,24 +125,19 @@ impl TcpNameServer {
     /// bd 2iauj：拨号在整条查询的绝对 `deadline` 内完成（Go 把 ctx 一路带到
     /// `s.dial(dnsCtx)`，nameserver_tcp.go:151/163）——`connect_stream` 内部仍按
     /// 单次拨号计 `query_timeout`，总量由外层 deadline 封顶。
-    async fn connect(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<crate::dial::DnsStream, DnsError> {
-        timeout_at(
-            deadline,
-            crate::dial::connect_stream(
+    async fn connect(&self, deadline: BudgetDeadline) -> Result<crate::dial::DnsStream, DnsError> {
+        deadline
+            .timeout(crate::dial::connect_stream(
                 &self.dest,
                 self.resolver.as_ref(),
                 self.query_timeout,
                 "tcp",
                 self.force_local,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            DnsError::WireFormat(format!("tcp dial timeout after {:?}", self.query_timeout))
-        })?
+            ))
+            .await
+            .map_err(|_| {
+                DnsError::WireFormat(format!("tcp dial timeout after {:?}", self.query_timeout))
+            })?
     }
 
     /// 在已有连接上执行单次 TCP 查询。写/读/刷新全部按整条查询的 `deadline`
@@ -156,23 +149,27 @@ impl TcpNameServer {
         payload: &[u8],
         req_id: u16,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
-        timeout_at(deadline, stream.write_all(len_be))
+        deadline
+            .timeout(stream.write_all(len_be))
             .await
             .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
-        timeout_at(deadline, stream.write_all(payload))
+        deadline
+            .timeout(stream.write_all(payload))
             .await
             .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
-        timeout_at(deadline, stream.flush())
+        deadline
+            .timeout(stream.flush())
             .await
             .map_err(|_| DnsError::WireFormat("tcp flush timeout".to_string()))?
             .map_err(io_to_dns)?;
 
         let mut len_buf = [0u8; 2];
-        timeout_at(deadline, stream.read_exact(&mut len_buf))
+        deadline
+            .timeout(stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
@@ -182,7 +179,8 @@ impl TcpNameServer {
         }
 
         let mut buf = vec![0u8; resp_len];
-        timeout_at(deadline, stream.read_exact(&mut buf))
+        deadline
+            .timeout(stream.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
@@ -199,7 +197,7 @@ impl TcpNameServer {
         &self,
         fqdn: &str,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
@@ -211,15 +209,15 @@ impl TcpNameServer {
             // 域名 NS（bd mcpo）：每查询新建流——连接池会把旧解析钉死，
             // 地址变更后新查询必须用新 IP。运行期解析在 connect() 内
             // （经路由出站交路由系统；直连兜底每查询现解析）。
-            let mut stream = self.connect(deadline).await?;
+            let mut stream = self.connect(deadline.clone()).await?;
             return self
-                .try_query(&mut stream, &len_be, &payload, req_id, record_type, deadline)
+                .try_query(&mut stream, &len_be, &payload, req_id, record_type, deadline.clone())
                 .await;
         }
 
         let mut conn_guard = self.conn.lock().await;
         if conn_guard.is_none() {
-            *conn_guard = Some(self.connect(deadline).await?);
+            *conn_guard = Some(self.connect(deadline.clone()).await?);
         }
 
         match self
@@ -229,7 +227,7 @@ impl TcpNameServer {
                 &payload,
                 req_id,
                 record_type,
-                deadline,
+                deadline.clone(),
             )
             .await
         {
@@ -237,24 +235,20 @@ impl TcpNameServer {
             Err(e) => {
                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
                 // 拨号错误掩盖真正的原因：直接返回首查错误（Go 本无重试）。
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "713x6 语义判定：tokio 虚拟钟预算剩余判定（与 timeout_at 同面，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-                )]
-                if tokio::time::Instant::now() >= deadline {
+                if deadline.is_expired() {
                     return Err(e);
                 }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
                 *conn_guard = None;
-                *conn_guard = Some(self.connect(deadline).await?);
+                *conn_guard = Some(self.connect(deadline.clone()).await?);
                 self.try_query(
                     conn_guard.as_mut().expect("reconnected just above"),
                     &len_be,
                     &payload,
                     req_id,
                     record_type,
-                    deadline,
+                    deadline.clone(),
                 )
                 .await
             },
@@ -273,20 +267,18 @@ impl CachedNameserver for TcpNameServer {
         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_tcp.go:124-129
         // 在 sendQuery 入口算 `deadline`，:151 每个 req 用同一时刻）——A/AAAA、
         // 拨号、写、读、重试共享，慢阶段不推出新预算。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-        )]
-        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
 
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline).await {
+            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -364,8 +356,8 @@ mod tests {
     }
 
     /// 测试用整条查询 deadline（等价 `send_query` 入口算出的一次性预算）。
-    fn test_deadline(timeout: Duration) -> tokio::time::Instant {
-        tokio::time::Instant::now() + timeout
+    fn test_deadline(timeout: Duration) -> BudgetDeadline {
+        Budget::tokio().deadline(timeout)
     }
 
     fn make_a_response(req_id: u16, fqdn: &str, ips: Vec<Ipv4Addr>, ttl: u32) -> Vec<u8> {

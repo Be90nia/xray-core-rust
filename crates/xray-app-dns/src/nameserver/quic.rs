@@ -23,9 +23,9 @@ use std::{
 use hickory_proto::rr::RecordType;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use skeleton_infra::fx::FxScope;
-use tokio::time::timeout_at;
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::address::Address;
+use xray_frame::deadline::{Budget, BudgetDeadline};
 
 use crate::{
     cache_controller::CacheController,
@@ -151,7 +151,7 @@ impl DoqNameServer {
         &self,
         fqdn: &str,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
@@ -172,7 +172,8 @@ impl DoqNameServer {
         let connect_fut = endpoint
             .connect(self.addr, &self.server_name)
             .map_err(|e| DnsError::WireFormat(format!("doq connect initiate: {e}")))?;
-        let conn = timeout_at(deadline, connect_fut)
+        let conn = deadline
+            .timeout(connect_fut)
             .await
             .map_err(|_| {
                 DnsError::WireFormat(format!("doq connect timeout after {:?}", self.query_timeout))
@@ -180,17 +181,20 @@ impl DoqNameServer {
             .map_err(|e| DnsError::WireFormat(format!("doq connect: {e}")))?;
 
         // open bidirectional stream。
-        let (mut send, mut recv) = timeout_at(deadline, conn.open_bi())
+        let (mut send, mut recv) = deadline
+            .timeout(conn.open_bi())
             .await
             .map_err(|_| DnsError::WireFormat("doq open_bi timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq open_bi: {e}")))?;
 
         // 写 2B 长度前缀 + payload。
-        timeout_at(deadline, send.write_all(&len_be))
+        deadline
+            .timeout(send.write_all(&len_be))
             .await
             .map_err(|_| DnsError::WireFormat("doq write len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq write len: {e}")))?;
-        timeout_at(deadline, send.write_all(&payload))
+        deadline
+            .timeout(send.write_all(&payload))
             .await
             .map_err(|_| DnsError::WireFormat("doq write payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq write payload: {e}")))?;
@@ -199,7 +203,8 @@ impl DoqNameServer {
 
         // 读 2 字节长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout_at(deadline, recv.read_exact(&mut len_buf))
+        deadline
+            .timeout(recv.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("doq read len timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq read len: {e:?}")))?;
@@ -210,7 +215,8 @@ impl DoqNameServer {
 
         // 读响应 payload。
         let mut buf = vec![0u8; resp_len];
-        timeout_at(deadline, recv.read_exact(&mut buf))
+        deadline
+            .timeout(recv.read_exact(&mut buf))
             .await
             .map_err(|_| DnsError::WireFormat("doq read payload timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("doq read payload: {e}")))?;
@@ -232,20 +238,18 @@ impl CachedNameserver for DoqNameServer {
 
         // bd 2iauj：整条查询只算一次绝对 deadline（Go nameserver_quic.go:93-98
         // 在 sendQuery 入口算 `deadline`，:119 每个 req 用同一时刻）。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-        )]
-        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
 
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline).await {
+            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -433,7 +437,7 @@ mod tests {
             .query_once(
                 "example.com.",
                 RecordType::A,
-                tokio::time::Instant::now() + Duration::from_secs(5),
+                Budget::tokio().deadline(Duration::from_secs(5)),
             )
             .await
             .unwrap();

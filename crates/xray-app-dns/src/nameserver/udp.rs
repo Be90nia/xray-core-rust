@@ -17,8 +17,9 @@ use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
-use tokio::{net::UdpSocket, time::timeout_at};
+use tokio::net::UdpSocket;
 use xray_common::net::{destination::Destination, port::Port};
+use xray_frame::deadline::{Budget, BudgetDeadline};
 
 use crate::{
     cache_controller::CacheController,
@@ -137,7 +138,7 @@ impl UdpNameServer {
         &self,
         fqdn: &str,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let wire = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
@@ -148,17 +149,20 @@ impl UdpNameServer {
         // dispatcher 语义，防 DNS 查询经路由进 proxy（bd wmdn②）。
         let dialer = if self.force_local { None } else { crate::dial::shared_dialer() };
         if let Some(dialer) = dialer {
-            let mut session = timeout_at(deadline, dialer.dial_udp(&self.dest))
+            let mut session = deadline
+                .timeout(dialer.dial_udp(&self.dest))
                 .await
                 .map_err(|_| {
                     DnsError::WireFormat(format!("udp dial timeout after {:?}", self.query_timeout))
                 })?
                 .map_err(|e| DnsError::WireFormat(format!("udp dial: {e}")))?;
-            timeout_at(deadline, session.send_packet(&self.dest, &wire))
+            deadline
+                .timeout(session.send_packet(&self.dest, &wire))
                 .await
                 .map_err(|_| DnsError::WireFormat("udp dial send timeout".to_string()))?
                 .map_err(|e| DnsError::WireFormat(format!("udp dial send: {e}")))?;
-            let resp = timeout_at(deadline, session.recv_packet())
+            let resp = deadline
+                .timeout(session.recv_packet())
                 .await
                 .map_err(|_| {
                     DnsError::WireFormat(format!(
@@ -174,19 +178,17 @@ impl UdpNameServer {
             let now = self.cache.clock().now_instant();
             let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
             if parsed.truncated {
-                return self.tcp_fallback_query(fqdn, record_type, deadline).await;
+                return self.tcp_fallback_query(fqdn, record_type, deadline.clone()).await;
             }
             return Ok(parsed_to_ip_record(&parsed, now));
         }
 
         // 直连兜底：IP 直发；域名每查询现解析（bd mcpo 运行期解析）。
-        let sock_addr = timeout_at(
-            deadline,
-            crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref()),
-        )
-        .await
-        .map_err(|_| DnsError::WireFormat("udp resolve timeout".to_string()))?
-        .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
+        let sock_addr = deadline
+            .timeout(crate::dial::resolve_dest_addr(&self.dest, self.resolver.as_ref()))
+            .await
+            .map_err(|_| DnsError::WireFormat("udp resolve timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("udp resolve: {e}")))?;
 
         // TUN 接管的 DNS 服务器：Xray 自身上游查询拒拨（Go localdns
         // client.go:99-103 同语义），防查询经 TUN 绕回自身。
@@ -198,14 +200,16 @@ impl UdpNameServer {
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
-        timeout_at(deadline, sock.send_to(&wire, sock_addr))
+        deadline
+            .timeout(sock.send_to(&wire, sock_addr))
             .await
             .map_err(|_| DnsError::WireFormat("udp send timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
 
         // 栈上收包缓冲（4 KiB）：免每查询堆分配（NF-7）。
         let mut buf = [0u8; UDP_RECV_BUF];
-        let n = timeout_at(deadline, sock.recv(&mut buf))
+        let n = deadline
+            .timeout(sock.recv(&mut buf))
             .await
             .map_err(|_| {
                 DnsError::WireFormat(format!("udp recv timeout after {:?}", self.query_timeout))
@@ -232,7 +236,7 @@ impl UdpNameServer {
         &self,
         fqdn: &str,
         record_type: RecordType,
-        deadline: tokio::time::Instant,
+        deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -245,36 +249,37 @@ impl UdpNameServer {
             .to_be_bytes();
 
         // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
-        let mut stream = timeout_at(
-            deadline,
-            crate::dial::connect_stream(
+        let mut stream = deadline
+            .timeout(crate::dial::connect_stream(
                 &self.dest,
                 self.resolver.as_ref(),
                 self.query_timeout,
                 "udp-tcp-fallback",
                 self.force_local,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            DnsError::WireFormat(format!(
-                "tcp fallback dial timeout after {:?}",
-                self.query_timeout
             ))
-        })??;
+            .await
+            .map_err(|_| {
+                DnsError::WireFormat(format!(
+                    "tcp fallback dial timeout after {:?}",
+                    self.query_timeout
+                ))
+            })??;
 
-        timeout_at(deadline, stream.write_all(&len_be))
+        deadline
+            .timeout(stream.write_all(&len_be))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback write len timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write len: {e}")))?;
-        timeout_at(deadline, stream.write_all(&payload))
+        deadline
+            .timeout(stream.write_all(&payload))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback write payload timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback write payload: {e}")))?;
 
         // 读 2B 长度前缀。
         let mut len_buf = [0u8; 2];
-        timeout_at(deadline, stream.read_exact(&mut len_buf))
+        deadline
+            .timeout(stream.read_exact(&mut len_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback read len timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read len: {e}")))?;
@@ -286,7 +291,8 @@ impl UdpNameServer {
         }
 
         let mut resp_buf = vec![0u8; resp_len];
-        timeout_at(deadline, stream.read_exact(&mut resp_buf))
+        deadline
+            .timeout(stream.read_exact(&mut resp_buf))
             .await
             .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
             .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
@@ -310,23 +316,21 @@ impl CachedNameserver for UdpNameServer {
         // bd 2iauj：整条查询只算一次绝对 deadline（Go 语义 = 上层
         // nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)` 一个时刻覆盖整条查询；
         // nameserver_udp.go:161-189 的 dispatch 与响应等待都在该预算内）。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "713x6 语义判定：tokio 虚拟钟超时预算面（timeout_at 共享绝对 deadline，pause 可推进）——Clock 契约无 tokio 面，std/tokio 禁混换故保持 tokio 取时"
-        )]
-        let deadline = tokio::time::Instant::now() + self.query_timeout;
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
 
         // 顺序发起 A/AAAA。
         // ponytail: 串行 await。真正并行需 tokio::join! 或 JoinSet，业务上串行也能完成
         // （多 1 个 RTT 的延迟换简化代码）。高并发场景可在 query_once 外层 spawn。
         if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline).await {
+            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v4 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
         }
         if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline).await {
+            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
                 Ok(rec) => outcome.rec_v6 = Some(rec),
                 Err(e) => outcome.errors.push(e),
             }
@@ -446,7 +450,7 @@ mod tests {
             .query_once(
                 "example.com.",
                 RecordType::A,
-                tokio::time::Instant::now() + Duration::from_secs(2),
+                Budget::tokio().deadline(Duration::from_secs(2)),
             )
             .await
             .unwrap();
@@ -673,7 +677,7 @@ mod tests {
             .query_once(
                 "routed.com.",
                 RecordType::A,
-                tokio::time::Instant::now() + Duration::from_secs(2),
+                Budget::tokio().deadline(Duration::from_secs(2)),
             )
             .await
             .unwrap();
