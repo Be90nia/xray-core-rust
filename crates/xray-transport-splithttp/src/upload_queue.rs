@@ -26,7 +26,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::{Result, SplitHttpError};
 
-// log-hot-path-exempt: split upload 每包 seq 失序丢弃 trace —— 数据面每包路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: split upload 每包 seq 失序丢弃 trace
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 /// 单个上传分包。对应 Go `uploadQueue.Packet`。
 #[derive(Debug, Clone)]
 pub struct Packet {
@@ -218,10 +219,11 @@ impl UploadQueue {
                                     // 4taf：迟到重复 packet（Go `seq < nextSeq` 静默丢弃自愈）。
                                     // 之前无条件 push 入堆使头位永不就位，直到 max_packets
                                     // 溢出拆会话（恶意客户端发 `seq=0` + 大流量即被打挂）。
-                                    tracing::trace!(
-                                        packet_seq = packet.seq,
-                                        next_seq = inner.next_seq,
-                                        "split upload_queue dropping stale packet"
+                                    crate::hot_log!(
+                                        tracing::Level::TRACE,
+                                        "packet_seq={} next_seq={} split upload_queue dropping stale packet",
+                                        packet.seq,
+                                        inner.next_seq
                                     );
                                     drop(packet);
                                 } else {

@@ -31,8 +31,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-// log-hot-path-exempt: PacketIoConn 每包收发队列满/关闭记录 ——
-// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: PacketIoConn 每包收发队列满/关闭记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 pub mod custom;
 pub mod fragment;
 pub mod mkcp;
@@ -551,9 +551,9 @@ impl PacketIoConn {
                     Ok(()) => {},
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         let total = dropped_driver.fetch_add(1, Ordering::Relaxed) + 1;
-                        tracing::debug!(
-                            dropped = total,
-                            "PacketIoConn recv queue full, packet dropped"
+                        crate::hot_log!(
+                            DEBUG,
+                            "dropped={total} PacketIoConn recv queue full, packet dropped"
                         );
                     },
                     Err(mpsc::error::TrySendError::Closed(_)) => break, // 读端已 drop
@@ -570,7 +570,7 @@ impl PacketIoConn {
                 // ponytail: send 失败仅记日志——Connection 写入 UDP 失败无 caller 同步点，
                 // UDP 写错误由 socket 层 NAT/ICMP 反馈呈现（Go PacketConn.WriteTo 同）。
                 if let Err(e) = worker_inner.send_to(&data, remote_addr).await {
-                    tracing::debug!(error = %e, "PacketIoConn send_to failed");
+                    crate::hot_log!(DEBUG, "error={e} PacketIoConn send_to failed");
                 }
             }
         });
@@ -658,10 +658,13 @@ impl AsyncWrite for PacketIoConn {
             Ok(()) => {},
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(dropped = total, "PacketIoConn send queue full, packet dropped");
+                crate::hot_log!(
+                    DEBUG,
+                    "dropped={total} PacketIoConn send queue full, packet dropped"
+                );
             },
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!("PacketIoConn send queue closed, packet dropped");
+                crate::hot_log!(DEBUG, "PacketIoConn send queue closed, packet dropped");
             },
         }
         std::task::Poll::Ready(Ok(n))

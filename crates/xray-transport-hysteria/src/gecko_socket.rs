@@ -49,7 +49,8 @@ use xray_transport::finalmask::{
     salamander_gecko::{GeckoConfig, GeckoConn},
 };
 
-// log-hot-path-exempt: gecko 每包收发队列满记录 —— 数据面每包路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: gecko 每包收发队列满记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 /// 发送队列容量：driver 消费不及时丢新包（QUIC 容忍），杜绝无界增长。
 /// 对齐 `finalmask::PACKET_QUEUE_CAP` 的 UDP 语义先例。
 const SEND_QUEUE_CAP: usize = 128;
@@ -169,7 +170,7 @@ fn spawn_recv_driver(
                             // finalmask PacketIoConn 有界+丢弃先例）
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 let total = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                                tracing::debug!(dropped = total, "gecko recv queue full, packet dropped");
+                                crate::hot_log!(DEBUG, "dropped={total} gecko recv queue full, packet dropped");
                             },
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
@@ -201,7 +202,7 @@ impl AsyncUdpSocket for GeckoSocket {
             // 队列满：丢包（UDP 缓冲满即丢的内核语义；QUIC 重传兜底）+ 计数
             Err(mpsc::error::TrySendError::Full(_)) => {
                 let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(dropped = total, "gecko send queue full, packet dropped");
+                crate::hot_log!(DEBUG, "dropped={total} gecko send queue full, packet dropped");
                 Ok(())
             },
             Err(mpsc::error::TrySendError::Closed(_)) => {

@@ -31,8 +31,8 @@ use super::{
     resp::Resp,
 };
 
-// log-hot-path-exempt: xdns 每包 send/编码路径错误记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
-// emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: xdns 每包 send/编码路径错误记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 const INIT_POLL_DELAY: Duration = Duration::from_millis(500);
 const MAX_POLL_DELAY: Duration = Duration::from_secs(10);
 const SEND_QUEUE_CAP: usize = 16;
@@ -324,7 +324,11 @@ async fn send_once(state: &ClientState, inner: &dyn UdpIo, p: &[u8]) -> io::Resu
         return Ok(());
     }
 
-    tracing::error!(len = p.len(), "xdns client: payload size exceeds domain capacity");
+    crate::hot_log!(
+        tracing::Level::ERROR,
+        "len={} xdns client: payload size exceeds domain capacity",
+        p.len()
+    );
     Ok(())
 }
 
@@ -360,12 +364,12 @@ async fn send_loop(
         }
 
         if let Err(e) = send_once(&state, inner.as_ref(), pkt.as_deref().unwrap_or(&[])).await {
-            tracing::debug!(error = %e, "xdns client: send failed");
+            crate::hot_log!(DEBUG, "error={e} xdns client: send failed");
         }
         // extraPoll：真实包后追加的空 poll 包
         for _ in 0..state.extra_poll {
             if let Err(e) = send_once(&state, inner.as_ref(), &[]).await {
-                tracing::debug!(error = %e, "xdns client: extra poll send failed");
+                crate::hot_log!(DEBUG, "error={e} xdns client: extra poll send failed");
             }
         }
 
@@ -380,7 +384,7 @@ impl UdpIo for XdnsConnClient {
             return Err(io::Error::other("xdns client closed"));
         }
         if buf.is_empty() || buf.len() > UDP_READ_BUF {
-            tracing::error!(len = buf.len(), "xdns client: err size");
+            crate::hot_log!(tracing::Level::ERROR, "len={} xdns client: err size", buf.len());
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "err size"));
         }
         let _ = self.write_tx.try_send(buf.to_vec());

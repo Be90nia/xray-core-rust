@@ -28,6 +28,7 @@ use socket2::{SockRef, Socket as Socket2};
 use tokio::net::TcpStream;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::dns::{DnsClient, IpOption};
+use xray_frame::deadline::Budget;
 
 use crate::{
     connection::Connection,
@@ -128,7 +129,9 @@ impl DefaultSystemDialer {
         let tokio_stream = TcpStream::from_std(std_stream)?;
         // 等待连接完成（带超时）。writable 触发 ≠ 连接成功——连接被拒/失败
         // 同样触发 writable，必须查 SO_ERROR（Go net.Dialer 内建行为）。
-        tokio::time::timeout(timeout, tokio_stream.writable())
+        Budget::tokio()
+            .deadline(timeout)
+            .timeout(tokio_stream.writable())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))??;
         if let Some(e) = SockRef::from(&tokio_stream).take_error()? {

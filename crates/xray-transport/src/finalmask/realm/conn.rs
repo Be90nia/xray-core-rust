@@ -20,6 +20,7 @@ use std::{
 use async_trait::async_trait;
 use skeleton_infra::fx::FxScope;
 use tokio::sync::{Mutex, mpsc};
+use xray_frame::deadline::Budget;
 
 use crate::finalmask::{
     UDP_SIZE, UdpIo,
@@ -388,10 +389,10 @@ async fn client_punch_loop(
     peer: Arc<tokio::sync::OnceCell<SocketAddr>>,
     port_mapping: Option<PortMapping>,
 ) {
-    let deadline = tokio::time::Instant::now() + DEFAULT_PUNCH_TIMEOUT;
+    let punch_deadline = Budget::tokio().deadline(DEFAULT_PUNCH_TIMEOUT);
     let mut ticker = tokio::time::interval(DEFAULT_PUNCH_INTERVAL);
     loop {
-        if tokio::time::Instant::now() >= deadline {
+        if punch_deadline.is_expired() {
             break;
         }
         // 发送 Hello 给所有候选 peer

@@ -21,8 +21,8 @@ use tokio::{
     sync::{Notify, mpsc},
 };
 
-// log-hot-path-exempt: UDP hub recv 循环内每包收发错误/缓存满记录 ——
-// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: UDP hub recv 循环内每包收发错误/缓存满记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 /// UDP 收包缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
 const UDP_BUFFER_SIZE: usize = 4096;
 
@@ -265,12 +265,12 @@ async fn start_recv_loop(
                         };
                         // channel 满时丢弃（与 Go default 分支一致）。
                         if tx.try_send(packet).is_err() {
-                            tracing::debug!("UDP hub cache full, dropping packet");
+                            crate::hot_log!(DEBUG, "UDP hub cache full, dropping packet");
                         }
                     }
                     Err(e) => {
                         // 对应 Go：recv 错误 → log + break。
-                        tracing::warn!(error = %e, "failed to read UDP msg");
+                        crate::hot_log!(tracing::Level::WARN, "error={e} failed to read UDP msg");
                         break;
                     }
                 }
@@ -308,11 +308,11 @@ async fn start_recv_loop_masked(
                             target: None,
                         };
                         if tx.try_send(packet).is_err() {
-                            tracing::debug!("UDP hub cache full, dropping packet");
+                            crate::hot_log!(DEBUG, "UDP hub cache full, dropping packet");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to read UDP msg");
+                        crate::hot_log!(tracing::Level::WARN, "error={e} failed to read UDP msg");
                         break;
                     }
                 }
@@ -416,7 +416,7 @@ async fn start_recv_loop_tproxy_linux(
             _ = close_notify.notified() => break,
             res = socket.readable() => {
                 if let Err(e) = res {
-                    tracing::warn!(error = %e, "udp hub readable failed");
+                    crate::hot_log!(tracing::Level::WARN, "error={e} udp hub readable failed");
                     break;
                 }
                 let mut iov = [MaybeUninitSlice::new(&mut data_buf)];
@@ -449,7 +449,7 @@ async fn start_recv_loop_tproxy_linux(
                         };
                         // channel 满时丢弃。
                         if tx.try_send(packet).is_err() {
-                            tracing::debug!("UDP hub cache full, dropping packet");
+                            crate::hot_log!(DEBUG, "UDP hub cache full, dropping packet");
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -457,7 +457,7 @@ async fn start_recv_loop_tproxy_linux(
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to recvmsg UDP");
+                        crate::hot_log!(tracing::Level::WARN, "error={e} failed to recvmsg UDP");
                         break;
                     }
                 }

@@ -52,7 +52,6 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
-use tracing::debug;
 
 use crate::{
     client::CloseSignal,
@@ -368,11 +367,9 @@ impl H3Conn {
                     )]
                     tokio::spawn(async move {
                         let accepted = accepted.await;
-                        debug!(
-                            target: "splithttp-h3",
-                            zero_rtt_accepted = accepted,
-                            %addr, %server_name,
-                            "QUIC 0-RTT outcome"
+                        crate::hot_log!(
+                            DEBUG,
+                            "zero_rtt_accepted={accepted} addr={addr} server_name={server_name} QUIC 0-RTT outcome"
                         );
                     });
                     conn
@@ -398,7 +395,10 @@ impl H3Conn {
             let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
 
-        debug!(target: "splithttp-h3", %addr, %server_name, "H3 connection established with QuicParams");
+        crate::hot_log!(
+            DEBUG,
+            "addr={addr} server_name={server_name} H3 connection established with QuicParams"
+        );
 
         Ok(Arc::new(Self {
             config,
@@ -758,12 +758,12 @@ where
                 match resp {
                     Ok(resp) if resp.status() == StatusCode::OK => {}
                     Ok(resp) => {
-                        debug!(target: "splithttp-h3", status = %resp.status(), "unexpected GET status");
+                        crate::hot_log!(DEBUG, "status={} unexpected GET status", resp.status());
                         return;
                     }
                     Err(e) => {
                         this.mark_closed();
-                        debug!(target: "splithttp-h3", error = %e, "GET recv_response failed");
+                        crate::hot_log!(DEBUG, "error={e} GET recv_response failed");
                         return;
                     }
                 }

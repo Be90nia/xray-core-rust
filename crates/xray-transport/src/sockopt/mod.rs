@@ -38,6 +38,7 @@ use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
+use xray_frame::deadline::Budget;
 /// 基础 socket 选项。对应 Go `SocketConfig` 的核心字段子集。
 ///
 /// 默认值与 Go DefaultSystemDialer 一致：
@@ -462,7 +463,9 @@ pub async fn dial_client_tcp<A>(host: A) -> std::io::Result<tokio::net::TcpStrea
 where
     A: tokio::net::ToSocketAddrs,
 {
-    tokio::time::timeout(crate::system_dialer::DEFAULT_DIAL_TIMEOUT, dial_client_tcp_inner(host))
+    Budget::tokio()
+        .deadline(crate::system_dialer::DEFAULT_DIAL_TIMEOUT)
+        .timeout(dial_client_tcp_inner(host))
         .await
         .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")))
 }

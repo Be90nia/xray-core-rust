@@ -31,6 +31,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     sync::mpsc,
 };
+use xray_frame::deadline::Budget;
 
 use super::{
     super::AsyncIo,
@@ -39,8 +40,8 @@ use super::{
     protocol,
 };
 
-// log-hot-path-exempt: xmc 伪装桥读循环内每包失败记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
-// emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: xmc 伪装桥读循环内每包失败记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 type DynIo = Box<dyn AsyncIo>;
 
 /// 共享密钥长度（AES-128 key，同时也是 IV）。
@@ -603,7 +604,7 @@ async fn handshake_phase(
         Ok::<_, io::Error>((dec_reader, ww, enc))
     };
 
-    match tokio::time::timeout(HANDSHAKE_TIMEOUT, phase).await {
+    match Budget::tokio().deadline(HANDSHAKE_TIMEOUT).timeout(phase).await {
         Ok(r) => r,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -674,7 +675,7 @@ pub(super) async fn tcp_bridge(
             match pipe_r.read(&mut buf).await {
                 Ok(0) => break,
                 Err(e) => {
-                    tracing::debug!(error = %e, "xmc bridge proxy-side read failed");
+                    crate::hot_log!(DEBUG, "error={e} xmc bridge proxy-side read failed");
                     break;
                 },
                 Ok(n) => match encode_custom_payload(local_cp_id, &buf[..n]) {
@@ -703,7 +704,7 @@ pub(super) async fn tcp_bridge(
             let (id, data) = match read_packet_async(&mut dec_reader).await {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::debug!(error = %e, "xmc packet stream read failed");
+                    crate::hot_log!(DEBUG, "error={e} xmc packet stream read failed");
                     break;
                 },
             };

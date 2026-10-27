@@ -32,7 +32,9 @@ use crate::{
     salamander_socket::UdpObfs,
 };
 
-// log-hot-path-exempt: quic 流/帧每包循环内失败记录 —— 数据面每包路径，保留原样
+// hot-log 台账纠偏（W6 实测 2026-10-27）：原登记的「quic 流/帧每包循环内失败记录」
+// 站点已由 T3.2a 收编为 crate::LOG.debug 慢路径，且实际位于流建立/关闭期
+//（accept_bi 每流级）非每包循环；本文件现零裸 tracing 站点，无 HotLog 消费
 /// quinn 双向 stream 包装为 [`QuicStream`]。
 ///
 /// quinn 的 bi stream 拆成 `SendStream` + `RecvStream` 两个独立半边，

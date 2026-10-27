@@ -55,7 +55,6 @@ use tokio::{io::AsyncRead as AsyncReadTrait, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use tower_service::Service as TowerService;
-use tracing::debug;
 pub use xray_tls::fingerprint::Fingerprint;
 use xray_tls::utls::{ConnInterface, UConn};
 use xray_transport::connection::{Connection, TcpConnection};
@@ -678,7 +677,10 @@ impl DefaultDialerClient {
         match self.client.request(Self::build_request(meta.clone())?).await {
             Ok(resp) => return Self::post_packet_finish(resp).await,
             Err(e) if is_packet_replayable(&e) => {
-                debug!(target: "splithttp", error = %e, seq = seq_str, "packet-up request failed on connection level, replaying once (GetBody)");
+                crate::hot_log!(
+                    DEBUG,
+                    "error={e} seq={seq_str} packet-up request failed on connection level, replaying once (GetBody)"
+                );
             },
             Err(e) => {
                 self.closed.store(true, Ordering::Relaxed);
@@ -805,11 +807,11 @@ fn spawn_h2_lazy_reader(
                         }
                     }
                     Ok(resp) => {
-                        debug!(target: "splithttp", status = %resp.status(), "unexpected GET status");
+                        crate::hot_log!(DEBUG, "status={} unexpected GET status", resp.status());
                     }
                     Err(e) => {
                         closed.store(true, Ordering::Relaxed);
-                        debug!(target: "splithttp", error = %e, "GET request failed");
+                        crate::hot_log!(DEBUG, "error={e} GET request failed");
                     }
                 }
             }

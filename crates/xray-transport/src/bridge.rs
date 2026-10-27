@@ -16,13 +16,16 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use xray_features::policy::TimeoutPolicy;
+use xray_frame::deadline::Budget;
 
 #[cfg(test)]
 use crate::connection::DuplexConnection;
 use crate::{connection::Connection, link::Link};
 
-// log-hot-path-exempt: splice 选择 + p7lm trace 门内每包/每 flush 记录 ——
-// 数据面泵/每包循环内的诊断留痕，LogFacade emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）：splice 选择点（每连接级）已迁
+// crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）。
+// XRAY_P7LM_TRACE 门内每包 trace（9 处）按同方案「不可迁残余 2」保留原样——
+// 它是调查通道非日志通道，改写会污染 F2F3 归因。
 /// 双向桥接两个 [`Connection`]。
 ///
 /// 内部用 [`tokio::io::split`] 拆分每个连接的读写半部，然后用
@@ -67,7 +70,7 @@ pub async fn bridge_connections_with_splice(
 ) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some((ra, rb)) = crate::splice::plan(&*a, &*b, inbound_can, outbounds_can) {
-        tracing::debug!("CopyRawConn splice");
+        crate::hot_log!(DEBUG, "CopyRawConn splice");
         crate::splice::bridge_with(ra, rb).await?;
         return Ok(());
     }
@@ -202,8 +205,10 @@ where
         // bd VISIONMAC：TLS 隧道场景须 flush+shutdown 排空滞留尾巴（同
         // bridge_link_with_stream_full down_writer 注释）；pipe 场景默认
         // 实现退化为 shutdown() EOF 信号，行为不变。
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
+        let _ = Budget::tokio()
+            .deadline(std::time::Duration::from_secs(3))
+            .timeout(writer.shutdown_flush())
+            .await;
         io::Result::Ok(())
     };
     tokio::pin!(up, down);
@@ -598,7 +603,9 @@ where
         loop {
             let mb = match window {
                 None => tokio::select! {
-                    res = tokio::time::timeout(conn_idle, reader.read_multi_buffer()) => {
+                    res = Budget::tokio()
+                        .deadline(conn_idle)
+                        .timeout(reader.read_multi_buffer()) => {
                         match res {
                             Ok(r) => r,
                             Err(_) => break,
@@ -609,9 +616,11 @@ where
                         continue;
                     }
                 },
-                Some(d) => match tokio::time::timeout(d, reader.read_multi_buffer()).await {
-                    Ok(r) => r,
-                    Err(_) => break,
+                Some(d) => {
+                    match Budget::tokio().deadline(d).timeout(reader.read_multi_buffer()).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    }
                 },
             };
             match mb {
@@ -646,8 +655,10 @@ where
         };
         // bd VISIONMAC：同 full 变体——收尾 flush+shutdown 排空 TLS 层滞留
         // 尾巴（splice 已 arm 时 VisionConn 走 raw 分支半关闭，安全）。
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
+        let _ = Budget::tokio()
+            .deadline(std::time::Duration::from_secs(3))
+            .timeout(writer.shutdown_flush())
+            .await;
         let _ = down_done_tx.send(Some(uplink_only));
         res.map(|_| ())
     };
@@ -691,23 +702,25 @@ pub async fn bridge_link_with_link(
         let mut window: Option<std::time::Duration> = None;
         loop {
             let mb = match window {
-                None => tokio::select! {
-                    // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
-                    res = tokio::time::timeout(
-                        conn_idle,
-                        a_reader.read_multi_buffer(),
-                    ) => match res {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    },
-                    _ = down_done.changed() => {
-                        window = *down_done.borrow();
-                        continue;
+                None => {
+                    let idle_dl = Budget::tokio().deadline(conn_idle);
+                    tokio::select! {
+                        // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                        res = idle_dl.timeout(a_reader.read_multi_buffer()) => match res {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        },
+                        _ = down_done.changed() => {
+                            window = *down_done.borrow();
+                            continue;
+                        }
                     }
                 },
-                Some(d) => match tokio::time::timeout(d, a_reader.read_multi_buffer()).await {
-                    Ok(r) => r,
-                    Err(_) => break,
+                Some(d) => {
+                    match Budget::tokio().deadline(d).timeout(a_reader.read_multi_buffer()).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    }
                 },
             };
             match mb {
@@ -720,7 +733,9 @@ pub async fn bridge_link_with_link(
             }
         }
         // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), b_writer.shutdown_flush())
+        let _ = Budget::tokio()
+            .deadline(std::time::Duration::from_secs(3))
+            .timeout(b_writer.shutdown_flush())
             .await;
         let _ = up_done_tx.send(Some(downlink_only));
         io::Result::Ok(())
@@ -732,23 +747,25 @@ pub async fn bridge_link_with_link(
         let mut window: Option<std::time::Duration> = None;
         loop {
             let mb = match window {
-                None => tokio::select! {
-                    // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
-                    res = tokio::time::timeout(
-                        conn_idle,
-                        b_reader.read_multi_buffer(),
-                    ) => match res {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    },
-                    _ = up_done.changed() => {
-                        window = *up_done.borrow();
-                        continue;
+                None => {
+                    let idle_dl = Budget::tokio().deadline(conn_idle);
+                    tokio::select! {
+                        // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                        res = idle_dl.timeout(b_reader.read_multi_buffer()) => match res {
+                            Ok(r) => r,
+                            Err(_) => break,
+                        },
+                        _ = up_done.changed() => {
+                            window = *up_done.borrow();
+                            continue;
+                        }
                     }
                 },
-                Some(d) => match tokio::time::timeout(d, b_reader.read_multi_buffer()).await {
-                    Ok(r) => r,
-                    Err(_) => break,
+                Some(d) => {
+                    match Budget::tokio().deadline(d).timeout(b_reader.read_multi_buffer()).await {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    }
                 },
             };
             match mb {
@@ -760,7 +777,9 @@ pub async fn bridge_link_with_link(
                 _ => break,
             }
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), a_writer.shutdown_flush())
+        let _ = Budget::tokio()
+            .deadline(std::time::Duration::from_secs(3))
+            .timeout(a_writer.shutdown_flush())
             .await;
         let _ = down_done_tx.send(Some(uplink_only));
         io::Result::Ok(())

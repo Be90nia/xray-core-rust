@@ -35,7 +35,9 @@ use xray_transport::link::Link;
 
 use crate::{PaddingReader, PaddingWriter, padding::random_padding_header};
 
-// log-hot-path-exempt: echo dispatch 伪装回显每包读循环内失败记录 —— 数据面每包路径，保留原样
+// hot-log 台账纠偏（W6 实测 2026-10-27）：原登记的「echo dispatch 每包读循环」
+// 站点实测位于下方 #[cfg(test)] mod tests 内（非生产热路径）；本 crate 生产代码
+// 零热路径日志豁免站点，未引入 HotLog 门面（面 4 消费为零，如实登记）
 /// 统一响应 body：CONNECT 200 / 404 / 407 均为空 body。
 ///
 /// hyper server 对 h2 CONNECT 强制 success 响应 body 为空（非零 content-length

@@ -33,6 +33,29 @@
 pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
     std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport", vec![]));
 
+/// 面 4 热路径日志门面（能力收敛方案 §2 面 4）：栈缓冲零分配，先过滤后格式化
+/// ——级别未命中时零格式化零堆分配。显式级别判定（订阅者兴趣），禁 env 存在性
+/// 开关（P7LM 教训：env 存在即生效的假开关）。
+pub(crate) static HOT_LOG: xray_frame::logging::HotLog =
+    xray_frame::logging::HotLog::with_target("xray_frame::transport");
+
+/// 热路径日志宏：DEBUG 走 [`xray_frame::logging::HotLog::debug_fmt`]（内部栈
+/// 缓冲）；其余级别经 [`xray_frame::logging::HotBuf`] 栈缓冲发射。字段以
+/// key=value 拼入 message（与 LOG 慢路径既有风格一致）。
+macro_rules! hot_log {
+    (DEBUG, $($arg:tt)*) => {
+        crate::HOT_LOG.debug_fmt(format_args!($($arg)*))
+    };
+    ($level:expr, $($arg:tt)*) => {
+        if crate::HOT_LOG.enabled($level) {
+            let mut buf = xray_frame::logging::HotBuf::<256>::new();
+            buf.write_fmt(format_args!($($arg)*));
+            crate::HOT_LOG.log($level, &buf);
+        }
+    };
+}
+pub(crate) use hot_log;
+
 pub mod accept_policy;
 pub mod bridge;
 pub mod cnc;

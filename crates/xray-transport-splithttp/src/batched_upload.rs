@@ -29,7 +29,6 @@
 use std::future::Future;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::debug;
 
 /// 把 pipe 累积数据按 ≤ `max_post_bytes` 切片并 POST。
 ///
@@ -65,7 +64,7 @@ where
                 },
                 Ok(n) => pending.extend_from_slice(&scratch[..n]),
                 Err(e) => {
-                    debug!(target: "splithttp", error = %e, "upload pipe read failed");
+                    crate::hot_log!(DEBUG, "error={e} upload pipe read failed");
                     return posts;
                 },
             }
@@ -81,7 +80,7 @@ where
         let chunk_len = chunk.len();
 
         if let Err(e) = post_fn(chunk).await {
-            debug!(target: "splithttp", error = %e, len = chunk_len, posts = posts, "post failed");
+            crate::hot_log!(DEBUG, "error={e} len={chunk_len} posts={posts} post failed");
             return posts;
         }
         posts += 1;

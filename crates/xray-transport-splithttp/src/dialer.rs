@@ -12,7 +12,6 @@ use tokio::io::{
     AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream,
 };
 use tokio_util::io::{ReaderStream, StreamReader};
-use tracing::debug;
 
 use crate::{
     client::{DefaultDialerClient, ReqBody, hyper_err_to_io, make_stream_body},
@@ -91,7 +90,7 @@ pub async fn dial_packet_up(
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    debug!(target: "splithttp", error = %e, "upload pipe read failed");
+                    crate::hot_log!(DEBUG, "error={e} upload pipe read failed");
                     break;
                 },
             };
@@ -104,7 +103,7 @@ pub async fn dial_packet_up(
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
-                debug!(target: "splithttp", error = %e, seq = seq, "post_packet failed, terminating upload");
+                crate::hot_log!(DEBUG, "error={e} seq={seq} post_packet failed, terminating upload");
                 break;
             }
 
@@ -318,7 +317,7 @@ pub async fn dial(
         if mode == "stream-one" { String::new() } else { config.generate_session_id() };
     let base_uri =
         build_request_url(scheme, host, &config.normalized_path(), &config.normalized_query());
-    debug!(target: "splithttp", %mode, %base_uri, "dial dispatch");
+    crate::hot_log!(DEBUG, "mode={mode} base_uri={base_uri} dial dispatch");
 
     match mode.as_str() {
         "packet-up" => {
@@ -380,7 +379,7 @@ pub async fn dial_h3_packet_up(
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    debug!(target: "splithttp-h3", error = %e, "upload pipe read failed");
+                    crate::hot_log!(DEBUG, "error={e} upload pipe read failed");
                     break;
                 },
             };
@@ -393,7 +392,7 @@ pub async fn dial_h3_packet_up(
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
-                debug!(target: "splithttp-h3", error = %e, seq = seq, "h3 post_packet failed, terminating upload");
+                crate::hot_log!(DEBUG, "error={e} seq={seq} h3 post_packet failed, terminating upload");
                 break;
             }
 
@@ -503,7 +502,7 @@ pub async fn dial_h3(
     let base_uri =
         build_request_url(scheme, host, &config.normalized_path(), &config.normalized_query());
 
-    debug!(target: "splithttp-h3", %mode, %base_uri, "dial_h3 dispatch");
+    crate::hot_log!(DEBUG, "mode={mode} base_uri={base_uri} dial_h3 dispatch");
 
     match mode.as_str() {
         "packet-up" => {
@@ -590,7 +589,7 @@ where
     )]
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            debug!(target: "splithttp", error = %e, "h2 connection driver ended");
+            crate::hot_log!(DEBUG, "error={e} h2 connection driver ended");
         }
     });
 
@@ -620,7 +619,7 @@ where
     let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
         Box::new(StreamReader::new(download_stream));
 
-    debug!(target: "splithttp", %base_uri, "REALITY stream-one established via direct h2 handshake");
+    crate::hot_log!(DEBUG, "base_uri={base_uri} REALITY stream-one established via direct h2 handshake");
 
     Ok(SplitConn::new(download_reader, pipe_client, remote_addr, local_addr))
 }

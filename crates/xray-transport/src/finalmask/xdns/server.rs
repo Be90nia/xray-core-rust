@@ -32,8 +32,8 @@ use super::{
     resp::{Resp, SendManager},
 };
 
-// log-hot-path-exempt: xdns 每包读路径错误记录 —— 数据面泵/每包循环内的诊断留痕，LogFacade
-// emit（Mutex+掩码）开销不可入热路径，保留原样
+// hot-log 归口（能力收敛方案 §2 面 4）: xdns 每包读路径错误记录
+// —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 const MAX_RESPONSE_DELAY: Duration = Duration::from_secs(1);
 const REC_QUEUE_CAP: usize = 255;
 const UDP_READ_BUF: usize = 4096;
@@ -329,7 +329,11 @@ async fn send_loop(
                 left -= il;
                 if left < 0 {
                     if ps.is_empty() {
-                        tracing::error!(len = p.len(), "xdns server: err size");
+                        crate::hot_log!(
+                            tracing::Level::ERROR,
+                            "len={} xdns server: err size",
+                            p.len()
+                        );
                     } else {
                         state.send_mgr.stash(rec.client_id, &p);
                     }
@@ -417,7 +421,7 @@ impl UdpIo for XdnsConnServer {
             return Err(io::Error::other("xdns server closed"));
         }
         if buf.is_empty() || buf.len() > UDP_READ_BUF {
-            tracing::error!(len = buf.len(), "xdns server: err size");
+            crate::hot_log!(tracing::Level::ERROR, "len={} xdns server: err size", buf.len());
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "err size"));
         }
         self.state.send_mgr.push(client_id_from_addr(&addr), buf);
