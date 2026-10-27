@@ -246,3 +246,6 @@ df -h /d                             # 昨夜收尾 89% / 55G——若再紧先 
 - 带 `fingerprint` 的配置走 **btls**（rustls fallback 死代码）→ 分配/性能测量必须先确认拓扑走哪条实现
 - 本机 `bash` 下 `taskkill //F //IM xray.exe` 被挡 → 用 `cmd /c "taskkill /F /IM xray.exe"`
 - `bd` 命令里的反引号会被 shell 吃掉 → 长文本走 heredoc 文件传参
+
+### 6.5 补充（2026-10-27 08:57，换模型前最后一条）
+`BtlsRegress`(debugger) 被 PM 在写报告前 kill（配合换模型）。**其结论未落盘**，只存在于 transcript：`history://BtlsRegress`（可读）。复工时若 `reports/audit-2026-10-27/btls-regress-rootcause.md` 不存在，先读该 transcript 的尾部拿它的进展，再决定续跑或重派——**不要从零重查**（`btls-path-audit.md` 里的已钉死事实仍有效）。
