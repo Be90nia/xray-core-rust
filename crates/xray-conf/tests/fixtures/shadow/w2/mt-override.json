@@ -1,0 +1,8 @@
+{
+  "inbounds": [
+    { "protocol": "vmess", "listen": "0.0.0.0", "port": 2000 }
+  ],
+  "outbounds": [
+    { "protocol": "blackhole" }
+  ]
+}

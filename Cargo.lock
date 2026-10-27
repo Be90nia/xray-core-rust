@@ -5983,6 +5983,7 @@ dependencies = [
  "udf-std-ext",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-geodata",
 ]
 
@@ -6721,6 +6722,7 @@ dependencies = [
  "tokio-btls",
  "tokio-rustls",
  "tracing",
+ "udf-skeleton",
  "webpki-roots 1.0.8",
  "x25519-dalek",
  "x509-parser",

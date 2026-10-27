@@ -1,0 +1,22 @@
+{
+  "log": { "loglevel": "warning", "unknownInLog": "keep-me-at-value-layer" },
+  "routing": { "domainStrategy": "AsIs" },
+  "transport": { "namen": "ws-old" },
+  "env": { "W2_A": "1" },
+  "unknownTop": { "note": "fold keeps, typed parse drops" },
+  "inbounds": [
+    {
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 1080,
+      "tag": "in-a",
+      "settings": { "auth": "noauth" },
+      "unknownEntryKey": 1
+    },
+    { "protocol": "http", "listen": "127.0.0.1", "port": 1081, "tag": "in-b" }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct", "settings": { "finalRules": [ { "action": "allow" } ] } },
+    { "protocol": "blackhole", "tag": "block" }
+  ]
+}

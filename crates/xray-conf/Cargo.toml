@@ -9,6 +9,10 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-geodata = { path = "../xray-geodata" }
+# W2 面 1（能力收敛方案 §2）：Value 级折叠切 XrayConfigLayers。依赖方向
+# xray-conf → xray-frame 无环（xray-frame 不依赖本 crate）；代价 = 生产树引入
+# tokio/bytes/xray-buf（xray-frame 经 udf-skeleton-infra）——方案已接受（启动期 crate）。
+xray-frame = { path = "../xray-frame" }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

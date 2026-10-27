@@ -1,0 +1,6 @@
+{
+  "outbounds": [
+    { "protocol": "dns", "tag": "dns-out" },
+    { "protocol": "http", "tag": "http-out" }
+  ]
+}

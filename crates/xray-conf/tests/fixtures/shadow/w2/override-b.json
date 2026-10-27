@@ -1,0 +1,13 @@
+{
+  "log": { "loglevel": "info" },
+  "transport": { "namen": "grpc-new", "extra": true },
+  "env": { "W2_B": "2" },
+  "inbounds": [
+    { "protocol": "socks", "listen": "127.0.0.1", "port": 2080, "tag": "in-a", "settings": { "auth": "password" } },
+    { "protocol": "dokodemo-door", "listen": "127.0.0.1", "port": 10086, "tag": "in-c", "settings": { "address": "127.0.0.1" } }
+  ],
+  "outbounds": [
+    { "protocol": "blackhole", "tag": "block", "settings": { "response": { "type": "none" } } },
+    { "protocol": "socks", "tag": "socks-new", "settings": { "servers": [ { "address": "127.0.0.1", "port": 9050 } ] } }
+  ]
+}

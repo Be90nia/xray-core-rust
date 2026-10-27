@@ -33,6 +33,27 @@ pub fn load_file_with_format(path: &Path, format: Format) -> Result<Config> {
     format.decode(file)
 }
 
+/// 从文件路径加载配置为 [`serde_json::Value`]（`serial::merge_configs` 折叠面
+/// 的统一取值口，W2 面 1）。
+///
+/// JSON 走 udf `std_ext::json` Value 级解码——注释容忍/strict env 语义与
+/// [`load_file`] 完全一致；YAML/TOML 先 typed 装配再转 Value（两格式解析器
+/// 留仓，能力收敛方案 §2 面 1「格式解析留仓 + 折叠入框架」分层）。错误构造
+/// 与 [`load_file`] 逐字同型，保证切换前后错误文案不变。
+pub(crate) fn load_value(path: &Path) -> Result<serde_json::Value> {
+    let format = Format::from_path(path).ok_or_else(|| {
+        ConfError::UnsupportedFormat(
+            path.extension().and_then(|e| e.to_str()).unwrap_or("<no extension>").to_owned(),
+        )
+    })?;
+    let file =
+        File::open(path).map_err(|e| ConfError::Read(format!("open {}: {e}", path.display())))?;
+    match format {
+        Format::Json => crate::json::decode_json_value(file),
+        Format::Yaml | Format::Toml => format.decode(file)?.to_json_value(),
+    }
+}
+
 /// 用指定格式从 reader 加载。
 pub fn load_reader<R: Read>(format: Format, reader: R) -> Result<Config> {
     format.decode(reader)

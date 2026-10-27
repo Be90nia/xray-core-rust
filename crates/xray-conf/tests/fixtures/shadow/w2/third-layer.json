@@ -1,0 +1,7 @@
+{
+  "log": { "loglevel": "error" },
+  "env": { "W2_C": "3" },
+  "inbounds": [
+    { "protocol": "http", "listen": "127.0.0.1", "port": 1081, "tag": "in-b", "settings": { "user": "u2" } }
+  ]
+}

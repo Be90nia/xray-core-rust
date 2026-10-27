@@ -24,9 +24,16 @@ fn json_mode() -> JsonMode {
     if xray_common::platform::use_strict_json() { JsonMode::Strict } else { JsonMode::Tolerant }
 }
 
-/// udf 解码结果装配为 [`Config`]（解码目标类型留仓）。
-fn config_from_value(value: serde_json::Value) -> Result<Config> {
+/// udf 解码结果装配为 [`Config`](crate::config::Config)（解码目标类型留仓）。
+/// W2 起 `serial::merge_configs` 折叠终态也经本口装配（面 1 单一 typed 入口）。
+pub(crate) fn config_from_value(value: serde_json::Value) -> Result<Config> {
     serde_json::from_value(value).map_err(|e| ConfError::from_json("json", e))
+}
+
+/// Value 级解码（折叠面用：typed 装配前的中间态，未知键在此存活到折叠层，
+/// 最终由 [`config_from_value`] 的 typed 解析丢弃——终态与旧 typed 路径等价）。
+pub(crate) fn decode_json_value(reader: impl Read) -> Result<serde_json::Value> {
+    json::decode(reader, json_mode()).map_err(ConfError::from)
 }
 
 /// 从 reader 解析 JSON 配置（默认容忍 // 和 /* */ 注释）。

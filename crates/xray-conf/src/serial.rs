@@ -5,9 +5,9 @@
 //! | Go（infra/conf/serial） | Rust（本模块） | 说明 |
 //! |---|---|---|
 //! | `MergeConfigFromFiles` (builder.go:24) | [`merge_config_from_files`] | 多配置合并 → JSON dump 字符串（`-dump` 输出） |
-//! | `mergeConfigs` (builder.go:36) | [`merge_configs`] | 逐文件加载，首个整体生效，其余 [`Config::override_with`] |
+//! | `mergeConfigs` (builder.go:36) | [`merge_configs`] | 逐文件取 Value 进 xray-frame [`xray_frame::config::XrayConfigLayers`] 按 [`xray_frame::config::xray_policy`] 折叠（W2 面 1；切换前为 typed `override_with` 循环，影子三路对照差异 0） |
 //! | `BuildConfig` (builder.go:61) | [`build_config`] | 合并 + `Config::build()` |
-//! | `Config.Override` (infra/conf/xray.go:411) | [`Config::override_with`] | 字段级覆盖 + in/outbound 按 tag 合并 |
+//! | `Config.Override` (infra/conf/xray.go:411) | [`Config::override_with`] | typed 面字段级覆盖 + in/outbound 按 tag 合并（Xray 语义的 Value 级同构实现已收敛到 xray-frame `xray_policy`；本 typed 版存续消费者 = xray-cli `convert pb`——Go `protobuf.go` 对应物按 reader/URL 装载，天然 typed 面合并） |
 //! | `creflect.MarshalToJson` (common/reflect/marshal.go:15) | [`Config::to_json_value`] / [`Config::to_json_string`] | 见下方格式说明 |
 //! | `DecodeJSONConfig` 等（loader.go） | `json` / `yaml` / `toml_config` 模块 | 已有实现 |
 //!
@@ -20,6 +20,11 @@
 //!
 //! 与 Go 的已知差异：Go `isNullValue`（marshal.go:60-73）额外跳过**空字符串**字段
 //! （如空 `tag`），Rust serde 保留空串字段；两侧再解析结果等价。
+//! 另一形态差（W2 影子实测，语义归属 = Go typed marshal 形态，非合并语义）：
+//! Go infra/conf 各 config 结构体的**非指针零值字段会被物化输出**（如 `dnsLog:false`、
+//! `statsUserUplink:false`），`duration.Duration` 字段物化为**纳秒整数**（如
+//! `probeInterval:10000000000`＝10s，observatory.go 的 int64 基座）；Rust Option
+//! 面缺省跳过、Value 直传保持输入形态。两侧再解析（typed 装配）终态一致。
 //!
 //! ## proto 方向（to_proto）
 //!
@@ -32,6 +37,7 @@
 use std::path::Path;
 
 use serde_json::Value;
+use xray_frame::config::{XrayConfigLayers, xray_policy};
 
 use crate::{
     built::BuiltConfig,
@@ -50,6 +56,10 @@ impl Config {
     ///   则追加到尾部，否则**前插到头部**（xray.go:478-496）。
     ///
     /// `source` 仅用于 outbound 前插/追加判定与日志，对应 Go 的 `fn` 参数。
+    ///
+    /// 存续说明（W2 面 1）：多配置**文件**装载已切 xray-frame Value 级折叠
+    /// （[`merge_configs`]）；本 typed 版保留的消费者 = xray-cli `convert pb`
+    /// （Go `protobuf.go` 对应物，按 reader/URL 装载后天然 typed 面合并）。
     pub fn override_with(&mut self, other: Config, source: &str) {
         // 标量块字段：Some 才覆盖（xray.go:414-460）。
         if other.log.is_some() {
@@ -180,24 +190,27 @@ impl Config {
     }
 }
 
-/// 加载并合并多个配置文件。对应 Go `serial.mergeConfigs`（builder.go:36-59）：
-/// 首个文件整体生效，其余经 [`Config::override_with`] 逐个覆盖。
+/// 加载并合并多个配置文件。对应 Go `serial.mergeConfigs`（builder.go:36-59）。
+///
+/// W2 面 1（能力收敛方案 §2）：逐文件经 [`crate::confloader::load_value`] 取
+/// Value 进 xray-frame [`XrayConfigLayers`]，按 [`xray_policy`]（Go
+/// `Config.Override` 语义的唯一实现点）折叠后 typed 装配。与切换前的 typed
+/// `override_with` 循环等价性由影子三路对照钉住（tests/config_file_shadow.rs
+/// W2 组，typed 域差异 0）。未知键在折叠层保留、typed 解析丢弃——终态与 Go
+/// typed 语义一致；错误文案与切换前逐字相同（`load_value` 错误构造同型）。
 pub fn merge_configs(paths: &[std::path::PathBuf]) -> Result<Config> {
-    let mut merged: Option<Config> = None;
+    if paths.is_empty() {
+        return Err(ConfError::Read("no config files to merge".into()));
+    }
+    let mut layers = XrayConfigLayers::new();
     for path in paths {
         tracing::info!(target: "xray_conf", "Reading config: {}", path.display());
-        let cfg = crate::confloader::load_file(Path::new(path)).map_err(|e| {
+        let value = crate::confloader::load_value(Path::new(path)).map_err(|e| {
             ConfError::Read(format!("failed to read config {}: {e}", path.display()))
         })?;
-        match merged.take() {
-            None => merged = Some(cfg),
-            Some(mut base) => {
-                base.override_with(cfg, &path.display().to_string());
-                merged = Some(base);
-            },
-        }
+        layers.push_value_from(value, path.display().to_string());
     }
-    merged.ok_or_else(|| ConfError::Read("no config files to merge".into()))
+    crate::json::config_from_value(layers.merge(xray_policy()))
 }
 
 /// 合并多个配置文件并序列化为 JSON dump 字符串（`xray run -dump` 输出）。

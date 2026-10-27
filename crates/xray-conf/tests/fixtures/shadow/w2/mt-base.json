@@ -1,0 +1,9 @@
+{
+  "inbounds": [
+    { "protocol": "socks", "listen": "127.0.0.1", "port": 1080, "settings": { "auth": "noauth" } },
+    { "protocol": "http", "listen": "127.0.0.1", "port": 1081, "tag": "http-in" }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "settings": { "finalRules": [ { "action": "allow" } ] } }
+  ]
+}
