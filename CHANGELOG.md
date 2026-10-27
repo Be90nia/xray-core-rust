@@ -32,6 +32,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **客户端 TLS 读缓冲池化**：`xray-buf` 读路径每次 `poll_read` 的 64KB 新分配改为池化复用（`Buffer::new_pooled` 走 128KB 层），cli **alloc/MB 9.239 → 5.085（−45%）**
 - **h2/xhttp 服务端下行发送块池化**：`tokio-util::ReaderStream` 每帧 `reserve(64KiB)` 改池化块 + `Bytes::from_owner` 归还，srv **alloc/MB 2.159 → 1.299（−0.86）**；h2 DATA 载荷双向逐字节相等
 - **XUDP 首帧/累积双拷贝清零**：`to_vec` 摊平改 `ChainCursor` 链式喂 `PacketReader`（0 拷贝），每包分配 **3 → 2**
+- **Windows 上 btls 恢复汇编**（P1）：`btls-sys` 在 Windows 无条件设 `OPENSSL_NO_ASM=YES` → BoringSSL 排除 `cpu_intel.cc` → AES-NI 探测恒 false → 协商 CHACHA20 且无汇编 → **纯 C 回退**。新增 `tools/build_boringssl_asm.py`（NASM 编带汇编的 BoringSSL + `BORING_BSSL_PATH` 预构建路线）：带 `fingerprint` 的客户端吞吐 **31.6 → 241.2 MB/s（7.6×）**，cli CPU 18.8s → 2.48s，REALITY 组 33.4 → 241.2；32/32 + interop 12/12 保持。附带修正：开汇编后协商 **TLS_AES_128_GCM_SHA256**，与 Go `crypto/tls` 偏好一致
 
 ## [26.10.11] - 2026-10-22
 

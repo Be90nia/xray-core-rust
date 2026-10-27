@@ -152,6 +152,15 @@ cargo doc --workspace --no-deps
 - **解决**：`BORING_BSSL_ASSUME_PATCHED=1` + `BORING_BSSL_SOURCE_PATH=D:/Project/Xray-core-rust/target/boringssl-patched`（**指向已打补丁树**，非主仓 out/boringssl）
 - **共享**：`python tools/inject_btls_cache.py`（CI CMakeCache 注入）
 
+### ⚠️ Windows 上 btls 无汇编 → 指纹用户慢 ~7.6×（bd jyipl，P1）
+- **根因**：`btls-sys` 的 build.rs 在 Windows 分支**无条件**设 `OPENSSL_NO_ASM=YES`（注释原文：*"not set up for cross-compiling using Visual Studio. Disable assembly support so that it at least builds."*）→ `crypto/cpu_intel.cc` 被排除 → **AES-NI/AVX2 探测恒 false** → 协商 **CHACHA20** 且 chacha 也无汇编 → **纯 C 回退** → 每 record CPU ~7-11×、客户端单核打满
+- **症状**：带 `fingerprint`（= 走 btls，即**所有真实节点**）的客户端吞吐塌到 31.6 MB/s；无指纹（rustls/ring）339.5 MB/s。**同一台机器、同一拓扑**，交叉配对定责在客户端侧 btls
+- **解决**：`python tools/build_boringssl_asm.py`（用 `D:/Project/tools/nasm.exe` 编**带汇编**的 BoringSSL，产出 `target/boringssl-asm/prebuilt/{crypto.lib,ssl.lib,include/openssl}`），构建时加 `BORING_BSSL_PATH=<该目录>`（btls-sys 走预构建路线，**跳过 cmake → 不触发 NO_ASM**）
+- **实测（vless+tcp+tls + chrome 指纹，`D:/tmp/aj0n3_ab.py`）**：31.6 → **241.2 MB/s**（best 253.0），cli CPU 18.8s → **2.48s**；REALITY 组 33.4 → **241.2**。32/32 + interop 12/12 保持
+- **副作用（正向）**：开汇编后能探测 AES-NI → 协商 **TLS_AES_128_GCM_SHA256**，与 Go `crypto/tls` 偏好一致（Go 也是 AES-NI 硬件支持则优先 AES-GCM）
+- **体检**：`python tools/build_boringssl_asm.py --check`（查 CMakeCache 无 `OPENSSL_NO_ASM` + `CMAKE_ASM_NASM_COMPILER_WORKS=1` + crypto.lib 大小）
+- **未覆盖**：CI 的 Windows 产物仍是 NO_ASM 构建（`.github/workflows/release.yml` 直走 cargo）→ 发给用户的 Windows 版仍是慢的，见 bd `jyipl` 相邻票
+
 ### vision splice 触发逻辑（雷区）
 - **历史**：d8562b56 + a427613b 双 revert
 - **禁**：池化改造**不碰** vision gate/DIRECT 切换
