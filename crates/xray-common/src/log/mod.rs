@@ -16,6 +16,7 @@ use std::{fmt, sync::Arc};
 // `log::Level`/`LevelFilter`（udf trait 签名用到），不 re-export 则宿主只能
 // 依赖 udf 仓直连（第二套依赖面）。此处只做**转发**，不新增机制。
 pub use ::log::{Level, LevelFilter};
+use skeleton::clock::{Clock, SystemClock};
 pub use skeleton_infra::logx::{Channel, ChannelSink};
 use skeleton_infra::logx::{ChannelError, ChannelRegistry};
 
@@ -87,12 +88,8 @@ pub struct Record {
 
 impl Record {
     /// 从消息创建新记录，时间戳为当前时间。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "日志时间戳 = 墙钟语义（Go 对齐）；Record::new 无 ctx 形参，时钟端口注入待 bd 39hko"
-    )]
     pub fn new(message: Message) -> Self {
-        Self { message, timestamp: std::time::SystemTime::now() }
+        Self { message, timestamp: SystemClock.now_system() }
     }
 }
 

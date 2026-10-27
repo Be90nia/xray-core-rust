@@ -16,13 +16,14 @@
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use bytes::Bytes;
 use h2::client;
 use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
 use parking_lot::Mutex;
+use skeleton::clock::{Clock, SystemClock};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_rustls::rustls::ClientConfig;
 use xray_transport::connection::TcpConnection;
@@ -102,25 +103,17 @@ pub async fn query_ech_config(
     let (name, server) = parse_ech_dns_server(config_list, server_name)?;
     let cache_key = crate::ech::ech_cache_key(&server, &name, 0);
     if let Some(rec) = GLOBAL_ECH_CACHE.lock().get(&cache_key) {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "ECH config 缓存过期判定；Clock 端口注入待 bd 39hko"
-        )]
-        if !rec.is_expired(Instant::now()) {
+        if !rec.is_expired(SystemClock.now_instant()) {
             tracing::debug!(target: "xray_tls::ech_doh", name = %name, server = %server, "ECH config cache hit");
             return Ok(rec.config.clone());
         }
     }
     let (config, ttl) = dns_query_doh(&server, &name, tls_config).await?;
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "ECH config 缓存 TTL 锚点；Clock 端口注入待 bd 39hko"
-    )]
     GLOBAL_ECH_CACHE.lock().insert(
         cache_key,
         EchConfigRecord {
             config: config.clone(),
-            expire: Some(Instant::now() + Duration::from_secs(u64::from(ttl))),
+            expire: Some(SystemClock.now_instant() + Duration::from_secs(u64::from(ttl))),
         },
     );
     Ok(config)

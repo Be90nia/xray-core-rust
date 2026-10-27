@@ -35,6 +35,8 @@ foreign-types = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# 时钟唯一源 = udf skeleton::clock（L3-5；bd 39hko W3a 底层接线）
+udf-skeleton = { path = "../udf-frame/skeleton" }
 time = { version = "0.3", default-features = false, features = ["std"] }
 rcgen = "0.13"
 x509-parser = "0.18"
