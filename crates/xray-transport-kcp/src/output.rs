@@ -8,6 +8,8 @@
 use std::{io, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
+use skeleton::clock::SystemClock;
+use std_ext::retry::{RetryError, RetryPolicy, retry};
 
 use crate::segment::Segment;
 
@@ -73,6 +75,8 @@ impl<W: UnderlyingWriter> SegmentWriter for SimpleSegmentWriter<W> {
 /// 重试写入器（对应 Go `RetryableWriter`）。
 ///
 /// 包装另一个 SegmentWriter，写入失败时按固定间隔重试 N 次（默认 5 次 100ms）。
+/// 重试编排 = udf `std_ext::retry`（R2 面 14）；末次失败后不再空睡一觉
+/// （Go 实现浪费不复制，同 `xray_transport::retry` 口径）。
 ///
 /// 注意：Go 版本用 `retry.Timed(5, 100).On(...)`，是异步阻塞重试。Rust 端的
 /// SegmentWriter 接口是同步的，因此重试是同步 sleep —— 必须在 `block_in_place`
@@ -97,17 +101,12 @@ impl RetryableWriter {
 
 impl SegmentWriter for RetryableWriter {
     fn write_segment(&self, seg: &dyn Segment) -> io::Result<()> {
-        let mut last_err: Option<io::Error> = None;
-        for _ in 0..=self.retries {
-            match self.inner.write_segment(seg) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(self.interval);
-                },
-            }
-        }
-        Err(last_err.unwrap_or_else(|| io::Error::other("retry exhausted")))
+        // udf 口径 max_attempts 含首试：retries 次「重试」= retries+1 次执行。
+        // base=max → 每次退避恒为 interval（线性饱和截平的固定间隔形）。
+        let policy = RetryPolicy::new(self.retries.saturating_add(1), self.interval, self.interval);
+        retry(|| self.inner.write_segment(seg), &policy, &SystemClock).map_err(|e| match e {
+            RetryError::Exhausted { last, .. } | RetryError::OutOfBudget { last, .. } => last,
+        })
     }
 }
 

@@ -17,6 +17,12 @@ tracing = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
+# R2 面 14（能力收敛方案 §4）：RetryableWriter 重试编排走 udf std_ext::retry
+# （固定间隔 = RetryPolicy base=max 截平形；Sleeper=SystemClock 线程阻塞，与原
+# thread::sleep 同上下文）。path 形态同各 app crate（udf-frame 仓内工作副本
+# 即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
+udf-std-ext = { path = "../udf-frame/std-ext" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
