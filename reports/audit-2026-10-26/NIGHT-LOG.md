@@ -191,4 +191,25 @@
 夜间最险时 **92%（40G）**；两次 `rm -rf target/debug/incremental` 共回收 128G。**收尾态 96G 可用 / target/debug ≈149G**（可再删，但下一会话要重建）。
 
 ---
+
+## 5. ⚠️ 收尾时挖出的 P1（2026-10-27 08:40，票 `jyipl`）
+
+**客户端带指纹路径（btls）比 rustls 慢 11×，且 HEAD 比 dist 慢 4.2×**
+
+| 对照（同机同拓扑，只切指纹） | 吞吐 |
+|---|---:|
+| rustls（无指纹） | **339.5 MB/s** |
+| btls（`fingerprint: chrome`） | 31.6 MB/s |
+| btls + reality | 33.4 MB/s |
+
+交叉配对定责：`cli=dist + srv=HEAD` → 137-154 MB/s；`cli=HEAD + srv=dist` → 30-35 MB/s ⇒ **客户端侧 btls 连接本体**（~7.5×/record CPU）。已排除：分配计数（免 stats 反而更慢）、加密、帧化（record 更碎的 dist 反而 233）、服务端、REALITY/xhttp/mlkem。
+
+**含义**：所有真实节点都带指纹 → 用户路径全在 btls 上。这解释了为何此前许多测量数字自相矛盾（不同拓扑走不同 TLS 实现）。
+
+**回退窗口修正**：`merge-base(10-13)` → `10-25` 的客户端侧 btls 改动簇；历史报告 `ab-master-vs-framework` 的 framework=157 与同代码态自测 34-36 矛盾 → **不可作 bisect 锚**。
+判据脚本：`D:/tmp/aj0n3_ab.py`（25s/轮，交替设计对冲 IDE 占核漂移）。
+
+已派 `BtlsRegress`(debugger) 走 **diff-inspect 优先、bisect 备选** 路线。
+
+---
 （每波完成后追加：时间 / 代理 / 结果 / 提交 hash / 磁盘 / 决策）
