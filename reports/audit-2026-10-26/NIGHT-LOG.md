@@ -213,3 +213,36 @@
 
 ---
 （每波完成后追加：时间 / 代理 / 结果 / 提交 hash / 磁盘 / 决策）
+
+---
+
+## 6. RESUME HERE（换模型/换会话后从这里接，2026-10-27 08:58）
+
+### 6.1 第一件事
+```bash
+cd D:/Project/Xray-core-rust
+git status --short --branch          # 应为干净（昨夜 25 提交全部 push）
+git log --oneline -3                 # 应见 84974255 / 31692d90 / 777b76cc
+export BD_IGNORE_SCHEMA_SKEW=1; bd list --status open   # 应为 9 张
+df -h /d                             # 昨夜收尾 89% / 55G——若再紧先 rm -rf target/debug/incremental
+```
+
+### 6.2 在飞状态（可能因换模型而中断）
+- **`BtlsRegress`(debugger)**：查 P1 `jyipl` 根因（客户端 btls 慢 11×/HEAD 比 dist 慢 4.2×）。若已死：
+  先看 `reports/audit-2026-10-27/btls-regress-rootcause.md` 是否已落盘；再读 `reports/audit-2026-10-27/btls-path-audit.md`（前任审计，含全部已钉死事实与排除项）；判据脚本 `D:/tmp/aj0n3_ab.py`（25s/轮，交替设计）；基线二进制 `dist/xray.exe`（**红线只读**）。
+- 其余代理均已收队，无未提交改动。
+
+### 6.3 下一步优先级（照此派）
+1. **`jyipl`（P1）**：btls 客户端回退根因 + 最小修法。所有真实节点都带指纹 → 用户路径全在 btls 上。疑点顺序：btls u_client 接线 / `tls_readbuf_size` 64KB / record 级 flush 与 read 节奏 / partial-write 配置。窗口 `merge-base(10-13)`→`10-25` 客户端 btls 改动簇；**`ab-master-vs-framework` 报告不可作 bisect 锚**。
+2. **`txmhr`（P3）**：dispatcher/splithttp/kcp 的 L3 禁令+台账补登（实测盘点，别抄票面数字；splithttp 生产 spawn 明显多于票面估的 8）。
+3. **`nn8os` 剩余**：tracing 批 2（8 个 proxy crate / ~187 站点），照 `TracingBatch1` 形态（模块级 `LazyLock<LogFacade>`；数据面循环外取引用；vision 红线保留 `event!`）。
+4. **`f17zu` 剩余**：mux link ×4（跨连接 scope 设计裁量）、SS 数据面泵、监控壳 ×2、vision ×2、tun。
+5. `39hko` / `n539c` / `lbavl` / `99ifi`：挂账/伞票，随子项推进。
+
+### 6.4 不要重犯的坑（本夜实证）
+- 子代理"我面绿"不算绿 → 契约必写"贴 `cargo check/clippy --workspace --all-targets` 完整尾部"
+- `&PluginContext` + 临时值 → FxScope/JoinSet 随 let 语句 drop → 任务刚 spawn 即 abort（生产=断流）
+- `#[allow(clippy::disallowed_macros)]` 对 proc-macro **无效** → tracing 类只能迁移
+- 带 `fingerprint` 的配置走 **btls**（rustls fallback 死代码）→ 分配/性能测量必须先确认拓扑走哪条实现
+- 本机 `bash` 下 `taskkill //F //IM xray.exe` 被挡 → 用 `cmd /c "taskkill /F /IM xray.exe"`
+- `bd` 命令里的反引号会被 shell 吃掉 → 长文本走 heredoc 文件传参
