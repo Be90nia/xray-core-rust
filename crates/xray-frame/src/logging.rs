@@ -24,7 +24,10 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use skeleton_infra::logx::mask_secrets;
@@ -177,6 +180,9 @@ pub fn init_from_env(
 //
 // **零分配论证（防回归，改本段前先读）**：
 // 1. **级别判定在格式化之前** → 未命中级别时零成本（连格式化都不发生）。
+// 1b. **判定与 metadata 缓存读全程无锁**（bd 9doy9）：级别上限存 `AtomicU8`
+//    （Relaxed 单变量开关），metadata 走 `OnceLock` 一次性整表——快路径零锁
+//    零分配，锁竞争面不存在。
 // 2. **格式化写入调用方栈上的 [`HotBuf`]** → 零堆分配（`[u8; N]` 定长栈阵）。
 // 3. **掩码**：热路径默认无密钥（`mask_secrets` 需 `String` 分配）→ 热路径门面
 //    **不接掩码表**；有密钥时调用方退回 [`LogFacade::emit`] 慢路径（安全 > 微优化）。
@@ -261,16 +267,26 @@ impl<const N: usize> fmt::Write for HotBuf<N> {
 pub struct HotLog {
     /// 分发 target（`Metadata<'static>` 要求 `&'static str`）。
     target: &'static str,
-    /// 本地级别上限（低于此级别直接过滤，零成本）。
-    max_level: tracing::level_filters::LevelFilter,
-    /// 按 level 缓存的分发元数据（每门面 ≤5 份，有界）。
+    /// 本地级别上限（存 filter 序数，无锁读）。
+    ///
+    /// `Relaxed` 理由：单变量独立开关，不借它发布任何其他内存（store 端无
+    /// 伴随写入需要被 load 端看见）；「level 变更后后续判断立即生效」由原子
+    /// 变量的修改可见性保证——store 之后同变量的 load 读到的必然是新值。
+    max_level: AtomicU8,
+    /// 按 level 缓存的分发元数据（一次性整表 5 份，读路径无锁）。
     ///
     /// `'static` 来源说明（例外，非疏漏）：`tracing::Event::new` 要求
     /// `&'static Metadata<'static>`，运行期 target 的元数据无编译期静态件可挂
-    /// → 只能 `'static` 化。本门面按 (门面, level) 各缓存一份，**泄漏量有界**
-    /// （≤5 × 门面数，与门面数成正比，非无界增长）；与同文件既有
-    /// [`LogFacade::metadata_for`] 同款做法。
-    metas: Mutex<[Option<&'static tracing::Metadata<'static>>; 5]>,
+    /// → 只能 `'static` 化。本门面按 (门面, level) 各缓存一份，**泄漏量有界**：
+    /// 稳态 = 5 × 门面数；首次填充竞态时败者构造的副本整体丢弃（引用数组
+    /// drop 不回收泄漏件）→ 上界 5 × (1 + 首填并发线程数) × 门面数，仍与门面
+    /// 数成正比、非无界增长；与同文件既有 [`LogFacade::metadata_for`] 同款做法。
+    ///
+    /// 无锁论证：快路径 [`OnceLock::get`] 是单次原子 load；泄漏件的发布同步
+    /// 由 std 内部 Release/Acquire 完成（填充完成后才置 COMPLETE，读方看到的
+    /// 必然是完整构造的 Metadata），读方不持任何锁（bd 9doy9：原 Mutex 每次
+    /// 查缓存加解锁是热路径固定开销，锁竞争下塌缩）。
+    metas: OnceLock<[&'static tracing::Metadata<'static>; 5]>,
 }
 
 impl HotLog {
@@ -278,8 +294,8 @@ impl HotLog {
     pub const fn with_target(target: &'static str) -> Self {
         Self {
             target,
-            max_level: tracing::level_filters::LevelFilter::TRACE,
-            metas: Mutex::new([None; 5]),
+            max_level: AtomicU8::new(level_filter_rank(tracing::level_filters::LevelFilter::TRACE)),
+            metas: OnceLock::new(),
         }
     }
 
@@ -293,8 +309,10 @@ impl HotLog {
     }
 
     /// 本地级别上限（默认 TRACE = 不本地过滤，只由订阅者兴趣决定）。
-    pub fn with_max_level(mut self, level: tracing::level_filters::LevelFilter) -> Self {
-        self.max_level = level;
+    pub fn with_max_level(self, level: tracing::level_filters::LevelFilter) -> Self {
+        // Relaxed：见 max_level 字段注释——单变量独立开关，store 后续 load
+        // 立即可见（原子变量修改可见性），无伴随数据需同步。
+        self.max_level.store(level_filter_rank(level), Ordering::Relaxed);
         self
     }
 
@@ -307,7 +325,8 @@ impl HotLog {
     pub fn level_allows(&self, level: tracing::Level) -> bool {
         // 序号口径：level 序号 ERROR=0..TRACE=4；filter 序号 OFF=0..TRACE=5
         // （filter 比同级别大 1）→ `level_rank < filter_rank` 即"级别不放行"。
-        level_rank(level) < level_filter_rank(self.max_level)
+        // Relaxed：见 max_level 字段注释。
+        level_rank(level) < self.max_level.load(Ordering::Relaxed)
     }
 
     /// 订阅者是否对该级别感兴趣（本地上限 + 订阅者兴趣）。
@@ -352,26 +371,35 @@ impl HotLog {
         });
     }
 
-    /// 按 level 取（并缓存）分发元数据；每门面 ≤5 份，有界。
+    /// 按 level 取（并缓存）分发元数据；一次性整表 5 份，读路径无锁。
     fn metadata_for(&self, level: tracing::Level) -> &'static tracing::Metadata<'static> {
         let key = level_rank(level) as usize;
-        let mut metas = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let slot = metas.get_mut(key).expect("level rank 落在 0..5");
-        if slot.is_none() {
+        // 快路径：OnceLock::get 单次原子 load（发布同步论证见 metas 字段注释）。
+        if let Some(metas) = self.metas.get() {
+            return metas[key];
+        }
+        // 慢路径：首次填充整表；竞态败者的副本整体丢弃（泄漏上界见字段注释）。
+        self.metas.get_or_init(|| Self::build_metas(self.target))[key]
+    }
+
+    /// 整表构造 5 份按 level 泄漏的分发元数据（target 同源，内容不可变）。
+    fn build_metas(target: &'static str) -> [&'static tracing::Metadata<'static>; 5] {
+        std::array::from_fn(|rank| {
             let fields =
                 tracing::field::FieldSet::new(&["message"], tracing::callsite::Identifier(&ANCHOR));
-            *slot = Some(Box::leak(Box::new(tracing::Metadata::new(
-                "xray_frame_hot_emit",
-                self.target,
-                level,
-                None,
-                None,
-                None,
-                fields,
-                tracing::metadata::Kind::EVENT,
-            ))));
-        }
-        slot.expect("metadata slot filled above")
+            let meta: &'static tracing::Metadata<'static> =
+                Box::leak(Box::new(tracing::Metadata::new(
+                    "xray_frame_hot_emit",
+                    target,
+                    level_from_rank(rank),
+                    None,
+                    None,
+                    None,
+                    fields,
+                    tracing::metadata::Kind::EVENT,
+                )));
+            meta
+        })
     }
 }
 
@@ -387,7 +415,7 @@ fn level_rank(level: tracing::Level) -> u8 {
 }
 
 /// 级别过滤上限的序号（`OFF` = 0 = 全过滤）。
-fn level_filter_rank(level: tracing::level_filters::LevelFilter) -> u8 {
+const fn level_filter_rank(level: tracing::level_filters::LevelFilter) -> u8 {
     match level {
         tracing::level_filters::LevelFilter::OFF => 0,
         tracing::level_filters::LevelFilter::ERROR => 1,
@@ -395,5 +423,16 @@ fn level_filter_rank(level: tracing::level_filters::LevelFilter) -> u8 {
         tracing::level_filters::LevelFilter::INFO => 3,
         tracing::level_filters::LevelFilter::DEBUG => 4,
         tracing::level_filters::LevelFilter::TRACE => 5,
+    }
+}
+
+/// 序号反查级别（`build_metas` 整表构造用；序号口径同 [`level_rank`]）。
+fn level_from_rank(rank: usize) -> tracing::Level {
+    match rank {
+        0 => tracing::Level::ERROR,
+        1 => tracing::Level::WARN,
+        2 => tracing::Level::INFO,
+        3 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
     }
 }

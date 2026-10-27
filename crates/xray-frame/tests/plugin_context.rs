@@ -9,11 +9,12 @@ use skeleton::{
     clock::{MockClock, SystemClock},
     config::{ConfigError, ConfigPort, EnvSource, MockEnv},
 };
-use skeleton_infra::fx::{FxScope, ScopeClosed};
+use skeleton_infra::fx::ScopeClosed;
 use xray_frame::{
     context::{PluginContext, derive_fingerprint},
     error::PluginError,
     logging::LogFacade,
+    scope::ArmScope,
 };
 
 const FIXED_ADDR: &str = "127.0.0.1:10808";
@@ -22,7 +23,7 @@ const FIXED_ADDR: &str = "127.0.0.1:10808";
 fn ctx_at(plugin: &'static str, config: serde_json::Value) -> PluginContext {
     PluginContext::new(
         plugin,
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         Arc::new(SystemClock),
         derive_fingerprint(Some(FIXED_ADDR)),
         Arc::new(MockEnv::new()),
@@ -41,7 +42,7 @@ async fn spawn_joins_value_through_scope() {
 
 #[tokio::test]
 async fn spawn_after_close_is_scope_closed() {
-    let fx = Arc::new(FxScope::new());
+    let fx = ArmScope::new();
     fx.close();
     let ctx = PluginContext::new(
         "stub",
@@ -149,7 +150,7 @@ fn load_config_section_overrides_env_and_env_backfills() {
     );
     let ctx = PluginContext::new(
         "freedom",
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         Arc::new(SystemClock),
         derive_fingerprint(Some(FIXED_ADDR)),
         env,
@@ -183,7 +184,7 @@ fn conn_id_monotonic_under_mock_clock_and_fixed_fingerprint() {
     let clock = Arc::new(MockClock::new());
     let ctx = PluginContext::new(
         "stub",
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         clock.clone(),
         derive_fingerprint(Some(FIXED_ADDR)),
         Arc::new(MockEnv::new()),

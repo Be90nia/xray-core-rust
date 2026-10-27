@@ -104,7 +104,7 @@ pub fn build_plugins_from_config(
             }
             let mut ctx = PluginContext::new(
                 plugin.name(),
-                Arc::new(skeleton_infra::fx::FxScope::new()),
+                crate::scope::ArmScope::new(),
                 Arc::new(SystemClock),
                 derive_fingerprint(None),
                 Arc::new(StdEnv),

@@ -85,7 +85,7 @@ pub use reload::{
     ConfigChange, ConfigReloadListener, ConfigSource, ReloadError, ReloadTx, Swap, clean, swap_all,
     swap_one,
 };
-pub use scope::ConnScope;
+pub use scope::{ArmScope, ArmScopeRegistry, ConnScope};
 
 #[cfg(test)]
 mod wiring_smoke_tests {

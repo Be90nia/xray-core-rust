@@ -78,7 +78,6 @@ use skeleton::{
     config::StdEnv,
     pool::PoolMetrics,
 };
-use skeleton_infra::fx::FxScope;
 
 use crate::{
     context::PluginContext,
@@ -86,6 +85,7 @@ use crate::{
     logging::LogFacade,
     plugin::{Plugin, PluginContract},
     pool::{BufferPool, ManagedBufferPool},
+    scope::ArmScope,
 };
 
 /// 夹具默认指纹（确定性拍板）：counter 基址 = `(0xC0FFEE >> 13) & 0xFFF` =
@@ -129,7 +129,7 @@ pub fn contract_test_context_with(
 ) -> PluginContext {
     PluginContext::new(
         plugin_name,
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         clock,
         fingerprint,
         Arc::new(StdEnv),

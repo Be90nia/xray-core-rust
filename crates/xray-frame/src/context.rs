@@ -18,10 +18,12 @@ use skeleton::{
     clock::{Clock, SystemClock},
     config::{ConfigError, ConfigPort, EnvError, EnvSource, StdEnv},
 };
-use skeleton_infra::fx::{CancelToken, FxScope, ScopeClosed, Spawned};
+use skeleton_infra::fx::{CancelToken, ScopeClosed, Spawned};
 use std_ext::{hash::stable64, id::IdGen};
 
-use crate::{audit::AuditHandle, error::PluginError, logging::LogFacade, pool::BufferPool};
+use crate::{
+    audit::AuditHandle, error::PluginError, logging::LogFacade, pool::BufferPool, scope::ArmScope,
+};
 
 /// 进程指纹派生（PM 拍板 2026-10-23）：有主监听地址 → `stable64(地址串)`；
 /// 无地址 → `stable64(pid-启动时刻纳秒)`。指纹需进程内唯一且可复现
@@ -97,7 +99,9 @@ pub struct PluginContext {
     /// 当前装配插件（段路由键 / handler 登记归属标注）。
     plugin_name: &'static str,
     /// 共享托管 scope（拓扑：装配根建一份，Arc 注入；close/shutdown 留装配根）。
-    fx: Arc<FxScope>,
+    /// arm 级关闭信号中枢（[`ArmScope`]，内嵌 udf `FxScope`）：`close` 同步段
+    /// 内关闸 + `watch` 广播，conn scope 级联取消事件化（bd mzput，去 20ms 轮询）。
+    fx: Arc<ArmScope>,
     clock: Arc<dyn Clock>,
     /// conn_id 生成器（同指纹单权威：同毫秒 4096 配额 fail-closed，udf id.rs）。
     ids: IdGen,
@@ -115,6 +119,11 @@ pub struct PluginContext {
     audit: Arc<AuditHandle>,
     /// 擦除登记表（原型 xray-core/src/instance.rs:60 feature_typed）。
     handlers: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    /// arm scope 登记表（宿主停机编排面，bd a9xgp）：宿主经
+    /// [`Self::with_arm_registry`] 接线后，spawn 宿主（xray-core
+    /// `spawn_inbound_serve`）按装配序登记本 ctx 的 scope，宿主 `close` 逆序
+    /// 显式关停。`None` = 未接线（独立装配配方/测试 ctx；停机级联由 Drop 兜底）。
+    arm_registry: Option<Arc<crate::scope::ArmScopeRegistry>>,
 }
 
 impl PluginContext {
@@ -131,7 +140,7 @@ impl PluginContext {
     )]
     pub fn new(
         plugin_name: &'static str,
-        fx: Arc<FxScope>,
+        fx: Arc<ArmScope>,
         clock: Arc<dyn Clock>,
         fingerprint: u64,
         env: Arc<dyn EnvSource>,
@@ -150,6 +159,7 @@ impl PluginContext {
             pool: None,
             audit,
             handlers: HashMap::new(),
+            arm_registry: None,
         }
     }
 
@@ -164,7 +174,7 @@ impl PluginContext {
     pub fn for_plugin(plugin_name: &'static str) -> Self {
         Self::new(
             plugin_name,
-            Arc::new(FxScope::new()),
+            ArmScope::new(),
             Arc::new(SystemClock),
             derive_fingerprint(None),
             Arc::new(StdEnv),
@@ -189,7 +199,7 @@ impl PluginContext {
 
     /// 取消令牌观察面（Clone = 同一取消态；任务内携带判停）。
     pub fn token(&self) -> CancelToken {
-        self.fx.token()
+        self.fx.fx().token()
     }
 
     // ── 两级 scope（面 6）：连接级子 scope ──
@@ -202,6 +212,25 @@ impl PluginContext {
     /// **只加不改**：本方法为新增面（既有 `spawn` / `token` 语义零变化）。
     pub fn conn_scope(&self) -> crate::scope::ConnScope {
         crate::scope::ConnScope::child_of(&self.fx)
+    }
+
+    // ── 停机编排（bd a9xgp）：arm scope 登记表接线与观察面 ──
+    /// 接线宿主 arm scope 登记表（装配期一次；**只加不改**，`new` 签名零变化）。
+    /// 接线后 spawn 宿主把本 ctx 的 scope 登记进表，宿主停机逆序显式关停。
+    pub fn with_arm_registry(mut self, registry: Arc<crate::scope::ArmScopeRegistry>) -> Self {
+        self.arm_registry = Some(registry);
+        self
+    }
+
+    /// 已接线的登记表（`None` = 未接线，停机级联由 Drop 兜底）。
+    pub fn arm_registry(&self) -> Option<&Arc<crate::scope::ArmScopeRegistry>> {
+        self.arm_registry.as_ref()
+    }
+
+    /// 本 ctx 的 arm scope 句柄（宿主停机监视/登记用；能力仍受 L2 约束——
+    /// 返回的是共享句柄，close/shutdown 权在宿主编排面，插件拿不到）。
+    pub fn arm_scope(&self) -> &Arc<ArmScope> {
+        &self.fx
     }
 
     // ── 超时（能力②；坑约束 2 唯一入口）──
@@ -356,7 +385,7 @@ mod tests {
     fn ctx_at(plugin: &'static str, config: serde_json::Value) -> PluginContext {
         PluginContext::new(
             plugin,
-            Arc::new(FxScope::new()),
+            ArmScope::new(),
             Arc::new(SystemClock),
             derive_fingerprint(Some(FIXED_ADDR)),
             Arc::new(MockEnv::new()),
@@ -414,7 +443,7 @@ mod tests {
     ) -> PluginContext {
         PluginContext::new(
             plugin,
-            Arc::new(FxScope::new()),
+            ArmScope::new(),
             Arc::new(SystemClock),
             derive_fingerprint(Some(FIXED_ADDR)),
             Arc::new(env),
@@ -476,7 +505,7 @@ mod tests {
 
         let ctx = PluginContext::new(
             "stub",
-            Arc::new(FxScope::new()),
+            ArmScope::new(),
             Arc::clone(&clock) as Arc<dyn Clock>,
             derive_fingerprint(Some(FIXED_ADDR)),
             Arc::new(MockEnv::new()),

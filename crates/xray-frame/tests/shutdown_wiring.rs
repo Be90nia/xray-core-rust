@@ -149,7 +149,7 @@ fn ctx_factory() -> impl Fn(&Arc<dyn Plugin>) -> Result<PluginContext, PluginErr
     |plugin: &Arc<dyn Plugin>| {
         Ok(PluginContext::new(
             plugin.name(),
-            Arc::new(skeleton_infra::fx::FxScope::new()),
+            xray_frame::scope::ArmScope::new(),
             Arc::new(SystemClock),
             derive_fingerprint(Some(FIXED_ADDR)),
             Arc::new(MockEnv::new()),

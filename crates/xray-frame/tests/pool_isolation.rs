@@ -13,10 +13,9 @@
 use std::sync::Arc;
 
 use skeleton::{clock::SystemClock, config::MockEnv, pool::PoolResizeError};
-use skeleton_infra::fx::FxScope;
 use xray_frame::{
     BufferPool, ManagedBufferPool, PluginContext, PoolError, XrayBufPool, derive_fingerprint,
-    logging::LogFacade,
+    logging::LogFacade, scope::ArmScope,
 };
 
 // ── 红线隔离①：接缝不改写 xray-buf 分配行为（同参等容）─────────────────
@@ -111,7 +110,7 @@ fn drop_and_explicit_release_both_return_exactly_once() {
 fn unwired_ctx() -> PluginContext {
     PluginContext::new(
         "pool-isolation",
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         Arc::new(SystemClock),
         derive_fingerprint(Some("127.0.0.1:10808")),
         Arc::new(MockEnv::new()),

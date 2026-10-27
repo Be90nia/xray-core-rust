@@ -183,7 +183,7 @@ async fn two_plugins_end_to_end_register_build_start_shutdown() {
         ],
         "停机序必须 = 逆启动序"
     );
-    expect_idle(&fx);
+    expect_idle(fx.fx());
 }
 
 /// 用例②：shutdown 报告 is_clean()——已启动链全 Stopped；未启动链 = 空报告
@@ -264,7 +264,7 @@ async fn build_phase_failure_fails_visible_without_half_start() {
     let fx = Arc::clone(fw.scope());
     let report = fw.shutdown().await;
     assert!(report.is_clean(), "失败链 coordinator 无注册闭包，报告空且干净");
-    expect_idle(&fx);
+    expect_idle(fx.fx());
 }
 
 /// 用例④：装配期缺依赖 / 成环 → `build()` 即 Err（start_order 装配期校验），

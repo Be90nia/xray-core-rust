@@ -23,9 +23,8 @@ use std::{
 };
 
 use skeleton::{clock::SystemClock, config::StdEnv};
-use skeleton_infra::{
-    fx::FxScope,
-    shutdown::{ComponentOutcome, OutcomeKind, ShutdownCoordinator, ShutdownReport},
+use skeleton_infra::shutdown::{
+    ComponentOutcome, OutcomeKind, ShutdownCoordinator, ShutdownReport,
 };
 
 use crate::{
@@ -36,6 +35,7 @@ use crate::{
     logging::LogFacade,
     plugin::Plugin,
     registry::PluginRegistry,
+    scope::ArmScope,
 };
 
 /// `FrameworkOptions::shutdown_timeout = None` 时的默认停机超时（P0-8 拍板数字）。
@@ -59,7 +59,7 @@ pub struct FrameworkOptions {
 pub struct Framework {
     registry: PluginRegistry,
     coordinator: Arc<ShutdownCoordinator>,
-    fx: Arc<FxScope>,
+    fx: Arc<ArmScope>,
     shutdown_timeout: Duration,
     /// 启动账本：`None` = 未启动 / 启动失败已回滚（无半启动态外泄的观察锚）。
     started: Option<StartedPlugins>,
@@ -86,7 +86,9 @@ impl Framework {
     }
 
     /// 共享托管 scope（宿主/测试用；不进插件——L2 能力只经 ctx 句柄集）。
-    pub fn scope(&self) -> &Arc<FxScope> {
+    /// arm 级关闭信号中枢：宿主**必须经 `close()` 关停**（裸 `FxScope::close`
+    /// 无级联广播，见 [`ArmScope`]）。
+    pub fn scope(&self) -> &Arc<ArmScope> {
         &self.fx
     }
 
@@ -147,7 +149,7 @@ impl Framework {
 /// `Framework::builder(opts)?.register(a)?.register(b)?.build()?`。
 pub struct FrameworkBuilder {
     registry: PluginRegistry,
-    fx: Arc<FxScope>,
+    fx: Arc<ArmScope>,
     coordinator: Arc<ShutdownCoordinator>,
     fingerprint: u64,
     shutdown_timeout: Duration,
@@ -164,7 +166,7 @@ impl FrameworkBuilder {
         let shutdown_timeout = opts.shutdown_timeout.unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT);
         Ok(Self {
             registry: PluginRegistry::new(opts.registry_cap)?,
-            fx: Arc::new(FxScope::new()),
+            fx: ArmScope::new(),
             coordinator: Arc::new(
                 ShutdownCoordinator::new().with_default_timeout(shutdown_timeout),
             ),

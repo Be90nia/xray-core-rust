@@ -28,11 +28,11 @@ use skeleton::{
     clock::{MockClock, SystemClock},
     config::MockEnv,
 };
-use skeleton_infra::fx::FxScope;
 use xray_frame::{
     context::{PluginContext, derive_fingerprint},
     logging::LogFacade,
     observe::{ObserveFields, Stage, emit},
+    scope::ArmScope,
 };
 
 const SECRET: &str = "sup3rsecret";
@@ -73,7 +73,7 @@ fn capture(buf: SharedBuf) -> tracing::subscriber::DefaultGuard {
 fn ctx_with(plugin: &'static str, secrets: Vec<Arc<str>>) -> PluginContext {
     PluginContext::new(
         plugin,
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         Arc::new(SystemClock),
         derive_fingerprint(Some("127.0.0.1:10808")),
         Arc::new(MockEnv::new()),
@@ -90,7 +90,7 @@ fn ten_k_concurrent_conn_ids_unique_and_nonzero() {
     clock.advance(Duration::from_millis(1));
     let ctx = PluginContext::new(
         "observe-test",
-        Arc::new(FxScope::new()),
+        ArmScope::new(),
         clock.clone(),
         ISOLATED_FP,
         Arc::new(MockEnv::new()),
