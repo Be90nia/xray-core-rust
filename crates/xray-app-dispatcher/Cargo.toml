@@ -12,6 +12,11 @@ xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 xray-xudp = { path = "../xray-xudp" }
+# C 面 R1a（能力收敛方案 §10.1）：SimpleOhm 的 tag→handler 注册表走 udf
+# skeleton_infra::memgov::BoundedRegistry（fail-closed insert + 升序确定序 iter）。
+# memgov 纯 std 零三方增量；不拖 runtime/pool 默认档（口径同 xray-core）。
+# path 形态同各 app crate（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov"] }
 thiserror.workspace = true
 tokio.workspace = true
 rand = { workspace = true }

@@ -17,6 +17,7 @@
 
 use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc};
 
+use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use xray_buf::multi::MultiBuffer;
 
 use crate::{error::DispatcherError, sniffer::SniffResult};
@@ -2031,18 +2032,51 @@ impl DialBridge {
 
 // ========== SimpleOhm：简单 OutboundHandlerManager ==========
 
-/// 简单的 [`OutboundHandlerManager`]：`RwLock<HashMap>` + default。
+/// tagged 表容量上界（udf `BoundedRegistry` 要求构造期给界）。
+///
+/// Go `outbound.Manager` 是无界 map；本件必须有界，故取远超真实配置规模的阈值当
+/// **故障护栏**：超限 = 配置病，`insert` 走 `Eviction::Reject` 并显式记错
+/// （fail-closed，禁静默丢 handler）。
+const MAX_TAGGED_HANDLERS: usize = 4096;
+
+/// tag → handler 注册表（udf `BoundedRegistry`：fail-closed insert + 升序确定序 iter）。
+type HandlerRegistry = BoundedRegistry<String, Arc<dyn DispatchHandler>>;
+
+/// 空注册表：`Reject` 策略 + [`MAX_TAGGED_HANDLERS`] 上界。
+fn new_handler_registry() -> HandlerRegistry {
+    BoundedRegistry::new(MAX_TAGGED_HANDLERS, Eviction::Reject)
+}
+
+/// 单表插入 = upsert（同 tag 覆盖，len 不变）；超限显式记错，不静默丢 handler。
+fn insert_handler(reg: &mut HandlerRegistry, tag: &str, handler: Arc<dyn DispatchHandler>) {
+    if let Err(e) = reg.insert(tag.to_string(), handler) {
+        tracing::error!(tag, %e, "outbound handler registry full: handler not registered");
+    }
+}
+
+/// 浅拷贝注册表（udf `BoundedRegistry` 未派生 `Clone`）：共享 handler，tag 复制。
+fn copy_handler_registry(src: &HandlerRegistry) -> HandlerRegistry {
+    let mut out = new_handler_registry();
+    for (tag, handler) in src.iter() {
+        let inserted = out.insert(tag.clone(), Arc::clone(handler));
+        // 同上界 ⇒ 源 len ≤ max，Reject 分支不可达。
+        debug_assert!(inserted.is_ok(), "copy into same-capacity registry cannot reject");
+    }
+    out
+}
+
+/// 简单的 [`OutboundHandlerManager`]：udf `BoundedRegistry` + default。
 ///
 /// 用于测试和简单场景。**生产环境的出站表就是本类型**（`xray-app-proxyman`
 /// 无 `OutboundManager` 类型，grep 0 命中；其 `TcpWorker`/`UdpWorker` 生产零消费）。
 pub struct SimpleOhm {
     default: parking_lot::RwLock<Option<Arc<dyn DispatchHandler>>>,
-    tagged: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
+    tagged: parking_lot::RwLock<HandlerRegistry>,
     /// S4 出站选择面（**实例级**影子表）：与 `tagged` 同源于 `add`/`remove`，
     /// 经 [`OutboundHandlerManager::select_handler`] 供 dispatch_link 解析。
     /// 进程级全局表会让多 Instance/多测试同名 tag 互踩（实测
     /// integration_sniffing 成对互串），故归属实例。
-    shadow: parking_lot::RwLock<std::collections::HashMap<String, Arc<dyn DispatchHandler>>>,
+    shadow: parking_lot::RwLock<HandlerRegistry>,
 }
 
 impl SimpleOhm {
@@ -2050,8 +2084,8 @@ impl SimpleOhm {
     pub fn new() -> Self {
         Self {
             default: parking_lot::RwLock::new(None),
-            tagged: parking_lot::RwLock::new(std::collections::HashMap::new()),
-            shadow: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            tagged: parking_lot::RwLock::new(new_handler_registry()),
+            shadow: parking_lot::RwLock::new(new_handler_registry()),
         }
     }
 
@@ -2070,8 +2104,8 @@ impl SimpleOhm {
     pub fn snapshot(&self) -> SimpleOhm {
         Self {
             default: parking_lot::RwLock::new(self.default.read().clone()),
-            tagged: parking_lot::RwLock::new(self.tagged.read().clone()),
-            shadow: parking_lot::RwLock::new(self.shadow.read().clone()),
+            tagged: parking_lot::RwLock::new(copy_handler_registry(&self.tagged.read())),
+            shadow: parking_lot::RwLock::new(copy_handler_registry(&self.shadow.read())),
         }
     }
 
@@ -2082,18 +2116,20 @@ impl SimpleOhm {
         // S3/S4：影子选择面与生产注册同源派生（同一次 add 调用），无第二套清单。
         // 顺序契约：先影子后旧表——影子是生产选择面，先入可保证「生产可见性」
         // 不晚于旧表（错序会出现「旧表有、生产拒」的瞬时回归）。
-        self.shadow.write().insert(tag.to_string(), Arc::clone(&handler));
-        self.tagged.write().insert(tag.to_string(), handler);
+        insert_handler(&mut self.shadow.write(), tag, Arc::clone(&handler));
+        insert_handler(&mut self.tagged.write(), tag, handler);
     }
 
     /// 移除 tag 对应的 handler。对应 Go `outbound.Manager.RemoveHandler`：
     /// default handler 的 tag 与之相同时 default 一并清空。
     /// 返回 tag 是否存在（不存在 = no-op，由调用方决定是否报错）。
     pub fn remove(&self, tag: &str) -> bool {
-        let Some(_old) = self.tagged.write().remove(tag) else {
+        let key = tag.to_string();
+        let existed = self.tagged.write().remove(&key).is_some();
+        if !existed {
             return false;
-        };
-        self.shadow.write().remove(tag);
+        }
+        self.shadow.write().remove(&key);
         let default_matches = self.default.read().as_ref().is_some_and(|h| h.tag() == tag);
         if default_matches {
             *self.default.write() = None;
@@ -2103,20 +2139,21 @@ impl SimpleOhm {
 
     /// 列出全部 tagged handler 的 tag（动态 AddOutbound/ListOutbounds 用）。
     pub fn list_tags(&self) -> Vec<String> {
-        self.tagged.read().keys().cloned().collect()
+        // udf 注册表迭代恒升序（HashMap 时代为任意序）；调用方无顺序依赖。
+        self.tagged.read().iter().map(|(tag, _)| tag.clone()).collect()
     }
 
     /// 测试/巡检面：**只**写实例影子表（绕过 `add` 的旧表同步）——
     /// 用于证明选择面读影子且不回落旧表（见 select_face 无兜底测试）。
     #[cfg(test)]
     pub(crate) fn shadow_insert_only(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
-        self.shadow.write().insert(tag.to_string(), handler);
+        insert_handler(&mut self.shadow.write(), tag, handler);
     }
 
     /// 测试/巡检面：**只**删实例影子表（旧表保持不动），用途同上。
     #[cfg(test)]
     pub(crate) fn shadow_remove_only(&self, tag: &str) -> bool {
-        self.shadow.write().remove(tag).is_some()
+        self.shadow.write().remove(&tag.to_string()).is_some()
     }
 }
 
@@ -2134,7 +2171,9 @@ impl Default for SimpleOhm {
 
 impl OutboundHandlerManager for SimpleOhm {
     fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        self.tagged.read().get(tag).cloned()
+        // udf `get(&K)` 无 `Borrow<Q>` 泛型 ⇒ String 键需一次短串分配（HashMap 时代
+        // `get(&str)` 零分配）。频次=每 dispatch 一次量级，非每包；上游加泛型后回落。
+        self.tagged.read().get(&tag.to_string()).cloned()
     }
 
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
@@ -2142,7 +2181,7 @@ impl OutboundHandlerManager for SimpleOhm {
     }
 
     fn select_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        self.shadow.read().get(tag).cloned()
+        self.shadow.read().get(&tag.to_string()).cloned()
     }
 }
 
