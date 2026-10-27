@@ -192,6 +192,18 @@ impl PluginContext {
         self.fx.token()
     }
 
+    // ── 两级 scope（面 6）：连接级子 scope ──
+    /// 连接级子 scope（arm scope = 本 ctx 的共享 scope → connection scope）。
+    ///
+    /// 语义：父（arm）scope 关闸 → 本 scope 级联取消 → 本 scope 的任务结束；
+    /// 本 scope 关闭不影响父与其他连接（两级模型让 mux link 这类**跨连接**
+    /// 任务可归 arm scope、每连接任务归 connection scope）。
+    ///
+    /// **只加不改**：本方法为新增面（既有 `spawn` / `token` 语义零变化）。
+    pub fn conn_scope(&self) -> crate::scope::ConnScope {
+        crate::scope::ConnScope::child_of(&self.fx)
+    }
+
     // ── 超时（能力②；坑约束 2 唯一入口）──
     /// `tokio::time::timeout` 包装；禁裸 sleep 由 P0-6 L3 拦。
     /// 返回具体类型 `Timeout<F>`（不借 `self`，任务可 'static 移交）。

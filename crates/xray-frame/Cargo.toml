@@ -31,6 +31,10 @@ xray-buf = { path = "../xray-buf" }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# 面 3 预算面验收（G2）：`#[tokio::test(start_paused = true)]` + `tokio::time::advance`
+# 的虚拟推进语义必须可测 → tokio 的 `test-util` feature（tokio `full` 不含它）。
+# 仅测试构建生效（dev-dependencies 不进生产依赖树）。
+tokio = { workspace = true, features = ["test-util"] }
 # pool_isolation：裸 xray_buf 同参对照 + PluginContext 组装配方
 #（FxScope/Clock/MockEnv）+ 配置字面量。
 xray-buf = { path = "../xray-buf" }

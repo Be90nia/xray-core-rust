@@ -162,3 +162,238 @@ pub fn init_from_env(
 ) -> Result<(), skeleton_infra::logx::AlreadyInit> {
     skeleton_infra::logx::init_tracing_from_env(default_level)
 }
+
+// =========================================================================
+// 热路径门面（面 4 · 能力收敛方案 §2 面 4）：栈缓冲零分配
+// =========================================================================
+//
+// 派生三段式（ADR-1）：
+// - **udf 基件**：`skeleton_infra::logx::{ChannelRegistry, ChannelSink}`（三通道 分发 + 默认静默 +
+//   丢弃计数）、`logx::mask_secrets`（掩码）。
+// - **派生方式**：**组合包装**（udf 分发件 + 调用方栈缓冲）+ 新类型 （[`HotBuf`] /
+//   [`HotLog`]）。udf `ChannelSink` 已是 trait，**不再扩 trait**。
+// - **主仓消费**：transport 热路径豁免点（bridge / record_framer / finalmask / udp hub / splithttp
+//   upload_queue 等）与裸 `debug!` 点。
+//
+// **零分配论证（防回归，改本段前先读）**：
+// 1. **级别判定在格式化之前** → 未命中级别时零成本（连格式化都不发生）。
+// 2. **格式化写入调用方栈上的 [`HotBuf`]** → 零堆分配（`[u8; N]` 定长栈阵）。
+// 3. **掩码**：热路径默认无密钥（`mask_secrets` 需 `String` 分配）→ 热路径门面
+//    **不接掩码表**；有密钥时调用方退回 [`LogFacade::emit`] 慢路径（安全 > 微优化）。
+// 4. **metadata 缓存复用**：每门面 ≤5 份（按 level 索引的定长数组，非 HashMap），
+//    有界；首次构造泄漏一份（`Box::leak`），之后零分配。
+// 5. **每包不得 clone 门面** → 调用点取 `&*STATIC`（静态门面，`static` 构造）。
+
+/// 栈上固定容量缓冲（零堆分配；溢出截断并计数）。
+///
+/// 写入语义：能放下则整段写入；放不下则写入**能放下的最长前缀**（按字符
+/// 边界切，避免切碎多字节字符），置 [`truncated`](Self::truncated) 标记并停止
+/// 后续写入。
+pub struct HotBuf<const N: usize = 256> {
+    buf: [u8; N],
+    len: usize,
+    truncated: bool,
+}
+
+impl<const N: usize> HotBuf<N> {
+    /// 新建空缓冲（栈上定长，零堆分配）。
+    pub const fn new() -> Self {
+        Self { buf: [0u8; N], len: 0, truncated: false }
+    }
+
+    /// 借用格式化写入（零堆分配）；溢出时截断并置标记。
+    pub fn write_fmt(&mut self, args: fmt::Arguments) -> &mut Self {
+        // 写失败（溢出）已由 `truncated` 记录，此处吞掉 `fmt::Error`（不是错误
+        // 通道：截断是可观测的降级，不是失败）。
+        let _ = fmt::Write::write_fmt(self, args);
+        self
+    }
+
+    /// 缓冲内容（始终合法 UTF-8——写入单元是完整 `&str` 或其字符边界前缀）。
+    pub fn as_str(&self) -> &str {
+        // 写入面保证只写合法 UTF-8 字节；`from_utf8` 失败即内部不变量被破坏
+        // （fail-visible，不静默替换字符）。
+        std::str::from_utf8(&self.buf[..self.len]).expect("HotBuf 只写合法 UTF-8 字节")
+    }
+
+    /// 是否发生过截断。
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// 复位（复用缓冲，避免重新构造）。
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.truncated = false;
+    }
+}
+
+impl<const N: usize> Default for HotBuf<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> fmt::Write for HotBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let remaining = N.saturating_sub(self.len);
+        if s.len() <= remaining {
+            self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+            self.len += s.len();
+            return Ok(());
+        }
+        // 截断：写入能放下的最长前缀（字符边界内切，避免切碎多字节字符）。
+        let mut end = remaining.min(s.len());
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.buf[self.len..self.len + end].copy_from_slice(&s.as_bytes()[..end]);
+        self.len += end;
+        self.truncated = true;
+        Err(fmt::Error)
+    }
+}
+
+/// 热路径日志门面（静态持有；**每包不得 clone**，取 `&*STATIC` 借用）。
+///
+/// 目标 = 调用方给定的 target（域规范 `xray_frame::<域>`，或红线站点保留的
+/// 原 target）。
+pub struct HotLog {
+    /// 分发 target（`Metadata<'static>` 要求 `&'static str`）。
+    target: &'static str,
+    /// 本地级别上限（低于此级别直接过滤，零成本）。
+    max_level: tracing::level_filters::LevelFilter,
+    /// 按 level 缓存的分发元数据（每门面 ≤5 份，有界）。
+    ///
+    /// `'static` 来源说明（例外，非疏漏）：`tracing::Event::new` 要求
+    /// `&'static Metadata<'static>`，运行期 target 的元数据无编译期静态件可挂
+    /// → 只能 `'static` 化。本门面按 (门面, level) 各缓存一份，**泄漏量有界**
+    /// （≤5 × 门面数，与门面数成正比，非无界增长）；与同文件既有
+    /// [`LogFacade::metadata_for`] 同款做法。
+    metas: Mutex<[Option<&'static tracing::Metadata<'static>>; 5]>,
+}
+
+impl HotLog {
+    /// 静态构造（target 直接给定 → 可用于 `static HOT_LOG: HotLog = ...`）。
+    pub const fn with_target(target: &'static str) -> Self {
+        Self {
+            target,
+            max_level: tracing::level_filters::LevelFilter::TRACE,
+            metas: Mutex::new([None; 5]),
+        }
+    }
+
+    /// 域构造（target = 调用方给定的域字面量，如 `"xray_frame::transport"`）。
+    ///
+    /// target 必须是**调用方持有的 `'static` 字面量**（禁运行期拼接 + 泄漏：
+    /// `tracing::Metadata` 的 target 契约是 `&'static str`，运行期拼 target 只能
+    /// 靠泄漏制造 `'static` → 本门面改要求字面量，零泄漏）。
+    pub fn new(target: &'static str) -> Self {
+        Self::with_target(target)
+    }
+
+    /// 本地级别上限（默认 TRACE = 不本地过滤，只由订阅者兴趣决定）。
+    pub fn with_max_level(mut self, level: tracing::level_filters::LevelFilter) -> Self {
+        self.max_level = level;
+        self
+    }
+
+    /// 分发 target（只读）。
+    pub fn target(&self) -> &'static str {
+        self.target
+    }
+
+    /// 级别是否放行（本地上限判定；**在格式化之前**调用 → 未命中零成本）。
+    pub fn level_allows(&self, level: tracing::Level) -> bool {
+        // 序号口径：level 序号 ERROR=0..TRACE=4；filter 序号 OFF=0..TRACE=5
+        // （filter 比同级别大 1）→ `level_rank < filter_rank` 即"级别不放行"。
+        level_rank(level) < level_filter_rank(self.max_level)
+    }
+
+    /// 订阅者是否对该级别感兴趣（本地上限 + 订阅者兴趣）。
+    ///
+    /// 调用方据此**先过滤后格式化**：未命中时连 [`HotBuf::write_fmt`] 都不发生
+    /// → 零分配。
+    pub fn enabled(&self, level: tracing::Level) -> bool {
+        if !self.level_allows(level) {
+            return false;
+        }
+        let metadata = self.metadata_for(level);
+        tracing::dispatcher::get_default(|dispatch| dispatch.enabled(metadata))
+    }
+
+    /// 发射（复用缓存 metadata；消息取自栈缓冲 → 零堆分配）。
+    pub fn log<const N: usize>(&self, level: tracing::Level, buf: &HotBuf<N>) {
+        if !self.enabled(level) {
+            return;
+        }
+        self.emit(level, buf.as_str());
+    }
+
+    /// 便捷发射：内部临时栈缓冲（常量栈空间，非每包分配）。
+    pub fn debug_fmt(&self, args: fmt::Arguments) {
+        if !self.enabled(tracing::Level::DEBUG) {
+            return;
+        }
+        let mut buf = HotBuf::<256>::new();
+        buf.write_fmt(args);
+        self.emit(tracing::Level::DEBUG, buf.as_str());
+    }
+
+    /// 内部分发（消息已是 `&str`，零分配）。
+    fn emit(&self, level: tracing::Level, message: &str) {
+        let metadata = self.metadata_for(level);
+        let field =
+            metadata.fields().field("message").expect("message field declared in hot log metadata");
+        let values = [(&field, Some(&message as &dyn tracing::field::Value))];
+        let valueset = metadata.fields().value_set(&values);
+        tracing::dispatcher::get_default(|dispatch| {
+            dispatch.event(&tracing::Event::new(metadata, &valueset));
+        });
+    }
+
+    /// 按 level 取（并缓存）分发元数据；每门面 ≤5 份，有界。
+    fn metadata_for(&self, level: tracing::Level) -> &'static tracing::Metadata<'static> {
+        let key = level_rank(level) as usize;
+        let mut metas = self.metas.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = metas.get_mut(key).expect("level rank 落在 0..5");
+        if slot.is_none() {
+            let fields =
+                tracing::field::FieldSet::new(&["message"], tracing::callsite::Identifier(&ANCHOR));
+            *slot = Some(Box::leak(Box::new(tracing::Metadata::new(
+                "xray_frame_hot_emit",
+                self.target,
+                level,
+                None,
+                None,
+                None,
+                fields,
+                tracing::metadata::Kind::EVENT,
+            ))));
+        }
+        slot.expect("metadata slot filled above")
+    }
+}
+
+/// 级别序号（显式枚举，不依赖 `tracing::Level` 的 `Ord` 语义）。
+fn level_rank(level: tracing::Level) -> u8 {
+    match level {
+        tracing::Level::ERROR => 0,
+        tracing::Level::WARN => 1,
+        tracing::Level::INFO => 2,
+        tracing::Level::DEBUG => 3,
+        tracing::Level::TRACE => 4,
+    }
+}
+
+/// 级别过滤上限的序号（`OFF` = 0 = 全过滤）。
+fn level_filter_rank(level: tracing::level_filters::LevelFilter) -> u8 {
+    match level {
+        tracing::level_filters::LevelFilter::OFF => 0,
+        tracing::level_filters::LevelFilter::ERROR => 1,
+        tracing::level_filters::LevelFilter::WARN => 2,
+        tracing::level_filters::LevelFilter::INFO => 3,
+        tracing::level_filters::LevelFilter::DEBUG => 4,
+        tracing::level_filters::LevelFilter::TRACE => 5,
+    }
+}

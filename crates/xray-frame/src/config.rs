@@ -19,6 +19,7 @@ use skeleton::{
     clock::SystemClock,
     config::{ConfigError, StdEnv},
 };
+use std_ext::json::JsonMode;
 
 use crate::{
     assembly::guarded_build,
@@ -118,6 +119,334 @@ pub fn build_plugins_from_config(
         }
     }
     Ok(built)
+}
+
+// =========================================================================
+// 配置装配面（面 1 · 能力收敛方案 §2 面 1）：Xray 语义折叠
+// =========================================================================
+//
+// 派生三段式（ADR-1）：
+// - **udf 基件**：`std_ext::json::{decode, decode_str, decode_slice}` + `JsonMode` （注释容忍 /
+//   strict 双模 + 64MiB 上限 + 行列位置错误）；
+//   `skeleton_infra::config::ConfigFile<C>`（层序列的"分层装载"观念）。
+// - **派生方式**：**组合包装 + 新类型**。**不包装 `ConfigFile::merge_over`**——
+//   其"数组整体替换"是**刻意设计**（fail-visible），与 Xray 的 tag 数组合并
+//   语义互斥；包装即语义冲突。本件复用 udf 的**解码件**与**层序观念**，折叠 实现自建（Xray
+//   语义属派生层职责）。
+// - **主仓消费**：`crates/xray-conf/src/serial.rs`（`merge_configs`）单点调用； YAML/TOML/JSON5
+//   **解析器**留 xray-conf（第三方依赖 + Go 格式判定）， 但解成 `Value` 后经
+//   [`XrayConfigLayers::push_value`] 进同一折叠语义。
+
+/// 折叠策略：哪些键整体替换、哪些键键级合并、哪些数组按 tag 合并。
+#[derive(Debug, Clone, Copy)]
+pub struct MergePolicy {
+    /// 整体替换键（块级配置：后层出现即整体覆盖前层）。
+    pub block_replace_keys: &'static [&'static str],
+    /// 键级合并键（两侧皆为对象时逐键合并，后层同键覆盖）。
+    pub map_merge_keys: &'static [&'static str],
+    /// tag 感知数组合并规格。
+    pub tag_arrays: &'static [TagArraySpec],
+}
+
+/// tag 感知数组合并规格（键 + tag 字段名 + 未命中策略）。
+#[derive(Debug, Clone, Copy)]
+pub struct TagArraySpec {
+    /// 数组键（如 `"inbounds"` / `"outbounds"`）。
+    pub key: &'static str,
+    /// tag 字段名（Xray = `"tag"`）。
+    pub tag_key: &'static str,
+    /// 未命中 tag 时的处置。
+    pub unmatched: UnmatchedPolicy,
+}
+
+/// 未命中 tag 的处置策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnmatchedPolicy {
+    /// 追加到尾部（Xray inbound 语义）。
+    Append,
+    /// 前插到头部（收集后整体前插）。
+    Prepend,
+    /// 前插到头部；但来源名（source）含指定子串时改为追加到尾部
+    /// （Xray outbound 的 `source` 含 `"tail"` 语义）。
+    PrependUnlessSourceContains(&'static str),
+}
+
+/// Xray 合并语义常量（派生层持有 Xray 语义 = 允许）。
+///
+/// 键清单对齐 Go `infra/conf.Config.Override`（xray.go:410-497）+ 本仓
+/// `crates/xray-conf/src/serial.rs` 的 typed 覆盖面：`log`/`routing`/`dns`/
+/// `transport`/`policy`/`api`/`metrics`/`stats`/`reverse`/`fakeDns`/
+/// `observatory`/`burstObservatory`/`version`/`geodata` 为块级整体替换；
+/// `env` 为键级合并；`inbounds`/`outbounds` 为 tag 感知数组合并。
+static XRAY_POLICY: MergePolicy = MergePolicy {
+    block_replace_keys: &[
+        "log",
+        "routing",
+        "dns",
+        "transport",
+        "policy",
+        "api",
+        "metrics",
+        "stats",
+        "reverse",
+        "fakeDns",
+        "observatory",
+        "burstObservatory",
+        "version",
+        "geodata",
+    ],
+    map_merge_keys: &["env"],
+    tag_arrays: &[
+        TagArraySpec { key: "inbounds", tag_key: "tag", unmatched: UnmatchedPolicy::Append },
+        TagArraySpec {
+            key: "outbounds",
+            tag_key: "tag",
+            unmatched: UnmatchedPolicy::PrependUnlessSourceContains("tail"),
+        },
+    ],
+};
+
+/// Xray 合并策略（主仓只调本函数，不另持一份语义清单）。
+pub fn xray_policy() -> &'static MergePolicy {
+    &XRAY_POLICY
+}
+
+/// 层错误（文件级归属 + 行列位置；主仓侧映射到既有 `ConfError::Parse`，
+/// **错误文案逐字不变**）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLayerError {
+    /// 文件读取失败。
+    Read {
+        /// 源文件路径。
+        path: String,
+        /// 失败原因。
+        message: String,
+    },
+    /// 解码失败（udf `std_ext::json` 口径：行列位置 + 原因）。
+    Parse {
+        /// 源文件路径。
+        path: String,
+        /// 行号（1 起；无位置语义为 0）。
+        line: u32,
+        /// 列号（1 起；无位置语义为 0）。
+        column: u32,
+        /// 失败原因。
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ConfigLayerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, message } => write!(f, "read config {path}: {message}"),
+            Self::Parse { path, line, column, message } => {
+                write!(f, "parse config {path}:{line}:{column}: {message}")
+            },
+        }
+    }
+}
+
+impl std::error::Error for ConfigLayerError {}
+
+/// 一层配置（值 + 来源名）。
+#[derive(Debug, Clone)]
+struct ConfigLayer {
+    /// 来源名（文件路径 / 远程配置标识；`source` 判定用）。
+    source: String,
+    /// 该层的值。
+    value: serde_json::Value,
+}
+
+/// 层序列：低→高，与 udf `ConfigFile` 的折叠序一致（Xray 语义 = Go 多 `-c`
+/// 文件的覆盖序）。
+#[derive(Debug, Clone, Default)]
+pub struct XrayConfigLayers {
+    layers: Vec<ConfigLayer>,
+}
+
+impl XrayConfigLayers {
+    /// 空层链。
+    pub fn new() -> Self {
+        Self { layers: Vec::new() }
+    }
+
+    /// 注入已解析层（远程配置 / 测试替身；来源名 = 空串 → outbound 未命中
+    /// 走"前插"分支）。
+    pub fn push_value(&mut self, value: serde_json::Value) -> &mut Self {
+        self.push_value_from(value, "")
+    }
+
+    /// 注入已解析层 + 来源名（来源名参与 outbound 的 `"tail"` 判定）。
+    pub fn push_value_from(
+        &mut self,
+        value: serde_json::Value,
+        source: impl Into<String>,
+    ) -> &mut Self {
+        self.layers.push(ConfigLayer { source: source.into(), value });
+        self
+    }
+
+    /// 读文件 + 解码（udf `std_ext::json`：注释容忍/strict 由 mode 定；
+    /// 64MiB 上限；行列位置错误）。
+    pub fn push_file(
+        &mut self,
+        path: &std::path::Path,
+        mode: JsonMode,
+    ) -> Result<&mut Self, ConfigLayerError> {
+        let file = std::fs::File::open(path).map_err(|e| ConfigLayerError::Read {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        let value = std_ext::json::decode(file, mode).map_err(|e| ConfigLayerError::Parse {
+            path: path.display().to_string(),
+            line: e.line,
+            column: e.column,
+            message: e.message,
+        })?;
+        self.push_value_from(value, path.display().to_string());
+        Ok(self)
+    }
+
+    /// 层数。
+    pub fn len(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// 空层链。
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty()
+    }
+
+    /// 按策略折叠出最终值（**Xray 语义在此唯一实现**）。
+    pub fn merge(&self, policy: &MergePolicy) -> serde_json::Value {
+        let mut acc = serde_json::Value::Object(serde_json::Map::new());
+        for layer in &self.layers {
+            fold_layer(&mut acc, &layer.value, &layer.source, policy);
+        }
+        acc
+    }
+}
+
+/// 一层折叠进累加值（层内键序 = JSON 对象序）。
+fn fold_layer(
+    acc: &mut serde_json::Value,
+    incoming: &serde_json::Value,
+    source: &str,
+    policy: &MergePolicy,
+) {
+    let Some(incoming_obj) = incoming.as_object() else {
+        // 非对象层 = 整体替换（顶层不是对象的配置形态，Xray 无此语义 → 交给
+        // 调用方前置校验）。
+        *acc = incoming.clone();
+        return;
+    };
+    if !acc.is_object() {
+        *acc = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(acc_obj) = acc.as_object_mut() else {
+        return;
+    };
+    for (key, value) in incoming_obj {
+        if policy.block_replace_keys.contains(&key.as_str()) {
+            acc_obj.insert(key.clone(), value.clone());
+            continue;
+        }
+        if policy.map_merge_keys.contains(&key.as_str()) {
+            merge_map_value(acc_obj, key, value);
+            continue;
+        }
+        if let Some(spec) = policy.tag_arrays.iter().find(|spec| spec.key == key)
+            && value.is_array()
+        {
+            merge_tag_array(acc_obj, key, value, spec, source);
+            continue;
+        }
+        // 其余键：后层整体替换（默认）。
+        acc_obj.insert(key.clone(), value.clone());
+    }
+}
+
+/// 键级合并（两侧皆为对象 → 逐键合并；否则整体替换）。
+fn merge_map_value(
+    acc: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    let Some(incoming) = value.as_object() else {
+        acc.insert(key.to_owned(), value.clone());
+        return;
+    };
+    let merged = match acc.get_mut(key).and_then(|v| v.as_object_mut()) {
+        Some(existing) => {
+            for (k, v) in incoming {
+                existing.insert(k.clone(), v.clone());
+            }
+            serde_json::Value::Object(existing.clone())
+        },
+        None => serde_json::Value::Object(incoming.clone()),
+    };
+    acc.insert(key.to_owned(), merged);
+}
+
+/// tag 感知数组合并（对齐 Go `Config.Override` 的 inbound/outbound 半边）。
+///
+/// 语义（逐条对齐 Go xray.go:462-496）：
+/// - tag 命中 → **原地替换**该条目；
+/// - 未命中 → 按 [`UnmatchedPolicy`] 处置：`Append` 立即追加到尾部； `Prepend` /
+///   `PrependUnlessSourceContains` 收集后**整体前插到头部** （Go 的 `prepends.append(&mut
+///   self.outbound_configs)` 同款）； `PrependUnlessSourceContains` 在来源名含指定子串（如
+///   `"tail"`）时改为 立即追加到尾部。
+/// - 缺 tag 字段的条目视同 tag = `""`（Go 的零值语义）。
+fn merge_tag_array(
+    acc: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    incoming: &serde_json::Value,
+    spec: &TagArraySpec,
+    source: &str,
+) {
+    let Some(items) = incoming.as_array() else {
+        acc.insert(key.to_owned(), incoming.clone());
+        return;
+    };
+    let mut prepends: Vec<serde_json::Value> = Vec::new();
+    {
+        let Some(list) = acc.get_mut(key).and_then(|v| v.as_array_mut()) else {
+            // 底层无此数组 → 视作空基线（全部条目按未命中处置）。
+            let mut list: Vec<serde_json::Value> = Vec::new();
+            for item in items {
+                list.push(item.clone());
+            }
+            acc.insert(key.to_owned(), serde_json::Value::Array(list));
+            return;
+        };
+        for item in items {
+            let tag = tag_of(item, spec.tag_key);
+            match list.iter().position(|c| tag_of(c, spec.tag_key) == tag) {
+                Some(idx) => list[idx] = item.clone(),
+                None => match spec.unmatched {
+                    UnmatchedPolicy::Append => list.push(item.clone()),
+                    UnmatchedPolicy::Prepend => prepends.push(item.clone()),
+                    UnmatchedPolicy::PrependUnlessSourceContains(needle) => {
+                        if source.to_ascii_lowercase().contains(needle) {
+                            list.push(item.clone());
+                        } else {
+                            prepends.push(item.clone());
+                        }
+                    },
+                },
+            }
+        }
+    }
+    if !prepends.is_empty() {
+        let list = acc.get_mut(key).and_then(|v| v.as_array_mut()).expect("array inserted above");
+        prepends.append(list);
+        *list = prepends;
+    }
+}
+
+/// 条目的 tag 值（缺字段 = 空串 = Go 零值语义）。
+fn tag_of(item: &serde_json::Value, tag_key: &str) -> String {
+    item.get(tag_key).and_then(|v| v.as_str()).unwrap_or_default().to_owned()
 }
 
 #[cfg(test)]

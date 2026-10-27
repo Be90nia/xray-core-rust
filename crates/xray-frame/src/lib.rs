@@ -26,6 +26,9 @@ pub mod audit;
 // L2 能力句柄（context）+ 装配日志唯一入口（logging）+ 插件注册表（registry）+
 // 生命周期三相编排（lifecycle）+ 装配组合根（assembly）。
 pub mod assembly;
+// 进程级能力入口（面 2 · 能力收敛方案 §2 面 2）：ctx 结构性不可达站点的
+// 唯一受管入口（CompatCaps + 一次性 install + 兜底 = 迁移前行为）。
+pub mod compat;
 // P3-2 per-plugin 配置段路由（坑约束 7）：PluginConfig::section 无实例段路由 +
 // build_plugins_from_config 配置驱动选择性 build。
 pub mod config;
@@ -33,7 +36,8 @@ pub mod config;
 // 最小辅助面；宏经 #[macro_export] 挂根。
 pub mod context;
 pub mod contract_assert;
-// P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）。
+// P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）+ 预算面
+// （面 3：Budget/BudgetDeadline 双源预算句柄，保 tokio 虚拟推进语义）。
 pub mod deadline;
 // P3-1 S1 旁路查表面（dispatcher 中央 match 臂退役的查表骨架，契约 §P3-1）。
 pub mod dispatch;
@@ -48,25 +52,40 @@ pub mod registry;
 // P1-6 配置热更回滚语义件（Stage/ReloadTx/swap_all + ConfigReloadListener）。
 // 本件 Stage 与 observe::Stage 同名不同型：观测枚举挂根，本件的走 reload:: 路径。
 pub mod reload;
+// 红线受控入口（面 5 · 能力收敛方案 §2 面 5）：红线站点穷举登记 +
+// 受控执行入口（spawn_unchecked / event）+ 台账（CI 门核对调用集合）。
+pub mod redline;
+// 两级 scope 模型（面 6 · 能力收敛方案 §2 面 6）：arm scope → connection
+// scope（表达 mux link 的跨连接生命周期）。
+pub mod scope;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
 pub use audit::{AuditHandle, AuditRecord, DEFAULT_AUDIT_RING_CAP};
-pub use config::{PluginConfig, build_plugins_from_config};
+pub use compat::{CompatAlreadyInstalled, CompatCaps, CompatGuard};
+pub use config::{
+    ConfigLayerError, MergePolicy, PluginConfig, TagArraySpec, UnmatchedPolicy, XrayConfigLayers,
+    build_plugins_from_config, xray_policy,
+};
 pub use context::{PluginContext, derive_fingerprint};
-pub use deadline::{DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline, with_deadline};
+pub use deadline::{
+    Budget, BudgetDeadline, BudgetSource, DEFAULT_LIMIT, HandshakeDeadline, IdleDeadline,
+    with_deadline,
+};
 pub use dispatch::{HandlerCapability, Lookup, lookup};
 pub use error::{LifecyclePhase, PluginError};
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
-pub use logging::{LogFacade, init_from_env};
+pub use logging::{HotBuf, HotLog, LogFacade, init_from_env};
 pub use observe::{ObserveFields, ObserveSink, Stage, emit};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
 pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
+pub use redline::{RedlineSite, SITES};
 pub use registry::PluginRegistry;
 // reload::Stage 不挂根（与 observe::Stage 撞名），走 xray_frame::reload::Stage。
 pub use reload::{
     ConfigChange, ConfigReloadListener, ConfigSource, ReloadError, ReloadTx, Swap, clean, swap_all,
     swap_one,
 };
+pub use scope::ConnScope;
 
 #[cfg(test)]
 mod wiring_smoke_tests {
