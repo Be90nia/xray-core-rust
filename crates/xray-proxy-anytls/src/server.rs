@@ -12,7 +12,10 @@
 //!
 //! 见 bd Xray-core-rust-dax。
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, LazyLock},
+};
 
 use anytls::{
     AsyncReadWrite,
@@ -27,16 +30,23 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use tracing::debug;
 use xray_app_dispatcher::DispatchHandler;
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::{
     net::{address::Address as XAddress, destination::Destination, network::Network, port::Port},
     padding::validate_padding_len,
 };
+use xray_frame::LogFacade;
 use xray_transport::link::Link;
 
 use crate::{error::Result, socks::SocksAddr};
+
+/// mock server 诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目
+/// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶
+/// 三形态实测无效），迁移为唯一关红路径。域 = "anytls"，target
+/// `xray_frame::anytls` + mask_secrets。只在握手/认证/桥接错误与超时分支发射
+/// （mock 面，非逐包稳态；pump 循环外取一次引用，坑约束⑫）。
+static SERVER_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytls", vec![]));
 
 /// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -180,25 +190,25 @@ async fn handle_conn(
     let tcp_std = match tcp.into_std() {
         Ok(s) => s,
         Err(e) => {
-            debug!("anytls mock server: tcp into_std failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: tcp into_std failed: {e}"));
             return;
         },
     };
     let kill_sock = match tcp_std.try_clone() {
         Ok(s) => s,
         Err(e) => {
-            debug!("anytls mock server: tcp try_clone failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: tcp try_clone failed: {e}"));
             return;
         },
     };
     if let Err(e) = tcp_std.set_nonblocking(true) {
-        debug!("anytls mock server: tcp set_nonblocking failed: {e}");
+        SERVER_LOG.debug(format!("anytls mock server: tcp set_nonblocking failed: {e}"));
         return;
     }
     let tcp = match TcpStream::from_std(tcp_std) {
         Ok(s) => s,
         Err(e) => {
-            debug!("anytls mock server: tcp from_std failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: tcp from_std failed: {e}"));
             return;
         },
     };
@@ -216,15 +226,15 @@ async fn handle_conn(
         match tokio::time::timeout_at(handshake_deadline, tls_acceptor.accept(tcp)).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
-                debug!("anytls mock server TLS accept failed: {e}");
+                SERVER_LOG.debug(format!("anytls mock server TLS accept failed: {e}"));
                 return;
             },
             Err(_) => {
-                debug!(
+                SERVER_LOG.debug(format!(
                     "anytls mock server: handshake timeout after {:?}, closing silent \
                      connection (TLS accept)",
                     handshake_timeout()
-                );
+                ));
                 return;
             },
         };
@@ -239,7 +249,7 @@ async fn handle_conn(
             Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls auth head timeout"))
         })
     {
-        debug!("anytls mock server: read auth head failed: {e}");
+        SERVER_LOG.debug(format!("anytls mock server: read auth head failed: {e}"));
         return;
     }
     if let Some(expected) = expected_password_sha256 {
@@ -247,16 +257,16 @@ async fn handle_conn(
         let mismatch =
             auth_head[..32].iter().zip(expected.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
         if mismatch != 0 {
-            debug!("anytls mock server: auth rejected (password mismatch)");
+            SERVER_LOG.debug("anytls mock server: auth rejected (password mismatch)");
             return;
         }
     }
     let padding0_len = u16::from_be_bytes([auth_head[32], auth_head[33]]) as usize;
     if validate_padding_len(padding0_len as u64, MAX_PADDING0_LEN as u64).is_err() {
-        debug!(
+        SERVER_LOG.debug(format!(
             "anytls mock server: auth rejected (padding0_len {padding0_len} > max \
              {MAX_PADDING0_LEN})"
-        );
+        ));
         return;
     }
     if padding0_len > 0 {
@@ -267,7 +277,7 @@ async fn handle_conn(
                 Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls padding0 timeout"))
             })
         {
-            debug!("anytls mock server: read padding0 failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: read padding0 failed: {e}"));
             return;
         }
     }
@@ -295,11 +305,11 @@ async fn handle_conn(
         {
             Ok(s) => s,
             Err(_) => {
-                debug!(
+                SERVER_LOG.debug(format!(
                     "anytls mock server: handshake timeout after {:?}, closing silent \
                      connection (session setup)",
                     handshake_timeout()
-                );
+                ));
                 return;
             },
         },
@@ -308,7 +318,7 @@ async fn handle_conn(
         .await
         .unwrap_or_else(|_| Err(std::io::Error::other("anytls ensure_started timeout")))
     {
-        debug!("anytls mock server: session ensure_started failed: {e}");
+        SERVER_LOG.debug(format!("anytls mock server: session ensure_started failed: {e}"));
         return;
     }
     // spawn run 循环——主循环结束后 session 自然清理
@@ -335,27 +345,25 @@ async fn handle_session(
     let n = match tokio::time::timeout_at(first_packet_deadline, session.read(&mut buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
-            debug!("anytls mock server: read socks5 target failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: read socks5 target failed: {e}"));
             return;
         },
         Err(_) => {
-            debug!(
-                "anytls mock server: first packet timeout, closing silent connection \
-                 (deadline elapsed)"
-            );
+            SERVER_LOG
+                .debug("anytls mock server: first packet timeout, closing silent connection (deadline elapsed)");
             finish_session(&session, kill_tx).await;
             return;
         },
     };
     if n == 0 {
-        debug!("anytls mock server: empty first read");
+        SERVER_LOG.debug("anytls mock server: empty first read");
         return;
     }
 
     let (target, consumed) = match SocksAddr::decode(&buf[..n]) {
         Ok(v) => v,
         Err(e) => {
-            debug!("anytls mock server: decode socks5 failed: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: decode socks5 failed: {e}"));
             return;
         },
     };
@@ -389,20 +397,21 @@ async fn handle_session(
         let mut outbound = match TcpStream::connect(&target_str).await {
             Ok(s) => s,
             Err(e) => {
-                debug!("anytls mock server: dial target {target_str} failed: {e}");
+                SERVER_LOG
+                    .debug(format!("anytls mock server: dial target {target_str} failed: {e}"));
                 return;
             },
         };
 
         if n > consumed {
             if let Err(e) = outbound.write_all(&buf[consumed..n]).await {
-                debug!("anytls mock server: forward extra failed: {e}");
+                SERVER_LOG.debug(format!("anytls mock server: forward extra failed: {e}"));
                 return;
             }
         }
 
         if let Err(e) = bridge(session.clone(), outbound).await {
-            debug!("anytls mock server: bridge ended: {e}");
+            SERVER_LOG.debug(format!("anytls mock server: bridge ended: {e}"));
         }
         finish_session(&session, kill_tx).await;
     }
@@ -436,6 +445,7 @@ fn socks_to_destination(addr: &SocksAddr) -> Destination {
 ///
 /// 与 client.rs::pump_stream 同一模式：任何一端 EOF/出错都终止。
 async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) {
+    let log = &*SERVER_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let session_down = session.clone();
     let down = async move {
@@ -449,7 +459,7 @@ async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) 
                     }
                 },
                 Err(e) => {
-                    debug!("pump session→duplex read: {e}");
+                    log.debug(format!("pump session→duplex read: {e}"));
                     break;
                 },
             }
@@ -467,7 +477,7 @@ async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) 
                     }
                 },
                 Err(e) => {
-                    debug!("pump duplex→session read: {e}");
+                    log.debug(format!("pump duplex→session read: {e}"));
                     break;
                 },
             }

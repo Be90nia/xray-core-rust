@@ -16,18 +16,26 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU16, Ordering},
     },
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::time::Duration;
+use xray_frame::LogFacade;
 
 use crate::{
     error::{Result, TuicError},
     protocol::{Packet, VERSION, address::Address, command::type_code, packet::MAX_PACKET_PAYLOAD},
 };
+
+/// uni 响应泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具
+/// 链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "tuic"，target `xray_frame::tuic` +
+/// mask_secrets。只在泵关闭/响应未配对/帧解析错误分支发射；泵循环外取一次
+/// 引用（坑约束⑫热路径零每包开销）。
+static UDP_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// 默认 UDP 响应等待时长（mock server 等待 UDP echo）。
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,11 +81,12 @@ impl UniRespRouter {
             reason = "热路径豁免（B6 t975）：每帧泵——per-connection uni-stream 响应路由（accept_uni 循环），数据面热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
         )]
         tokio::spawn(async move {
+            let log = &*UDP_LOG;
             loop {
                 let mut uni = match conn.accept_uni().await {
                     Ok(u) => u,
                     Err(e) => {
-                        tracing::debug!("tuic uni resp router closed: {e:?}");
+                        log.debug(format!("tuic uni resp router closed: {e:?}"));
                         break;
                     },
                 };
@@ -89,15 +98,14 @@ impl UniRespRouter {
                                 let _ = tx.send(pkt);
                             },
                             None => {
-                                tracing::debug!(
+                                log.debug(format!(
                                     "tuic: unmatched udp resp assoc={} pkt={}",
-                                    pkt.assoc_id,
-                                    pkt.pkt_id
-                                );
+                                    pkt.assoc_id, pkt.pkt_id
+                                ));
                             },
                         }
                     },
-                    Err(e) => tracing::debug!("tuic: uni resp stream parse: {e:?}"),
+                    Err(e) => log.debug(format!("tuic: uni resp stream parse: {e:?}")),
                 }
             }
         });

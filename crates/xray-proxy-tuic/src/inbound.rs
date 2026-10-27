@@ -6,7 +6,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -17,6 +17,7 @@ use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 
 use crate::{
     client::{CongestionControl, apply_congestion_to_transport, apply_default_windows},
@@ -30,6 +31,13 @@ use crate::{
         read_frame_from_recv, relay_to_tcp,
     },
 };
+
+/// 入站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "tuic"，target `xray_frame::tuic` +
+/// mask_secrets。只在 listen/close/连接错误/datagram·bi 帧解析错误分支发射
+/// （连接级/错误分支，非逐包稳态）。
+static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// TUIC inbound 配置。
 #[derive(Debug, Clone)]
@@ -215,11 +223,7 @@ impl InboundHandler for TuicInboundHandler {
             .map_err(|e| InboundError::ListenError(format!("tuic local_addr: {e}")))?;
 
         self.local_port.store(local_addr.port(), std::sync::atomic::Ordering::SeqCst);
-        tracing::info!(
-            tag = %self.tag,
-            addr = %local_addr,
-            "tuic inbound listening"
-        );
+        INBOUND_LOG.info(format!("tuic inbound listening tag={} addr={}", self.tag, local_addr));
 
         let uuid = self.config.uuid;
         let password = self.config.password.clone();
@@ -246,7 +250,8 @@ impl InboundHandler for TuicInboundHandler {
                     if let Err(e) =
                         handle_connection(incoming, uuid, &pwd, dispatch, &fx_task).await
                     {
-                        tracing::debug!(tag = %t, error = ?e, "tuic inbound connection error");
+                        INBOUND_LOG
+                            .debug(format!("tuic inbound connection error tag={t} error={e:?}"));
                     }
                 })
                 .expect("internal FxScope is never closed");
@@ -265,7 +270,7 @@ impl InboundHandler for TuicInboundHandler {
         if let Some(s) = slot {
             s.endpoint.close(0u32.into(), b"");
             s._accept_task.abort();
-            tracing::info!(tag = %self.tag, "tuic inbound closed");
+            INBOUND_LOG.info(format!("tuic inbound closed tag={}", self.tag));
         }
         Ok(())
     }
@@ -333,7 +338,7 @@ async fn handle_connection(
                 match dg {
                     Ok(dg) => handle_datagram(&dg, &conn, &mut udp_table),
                     Err(e) => {
-                        tracing::debug!("tuic inbound: datagram read: {e:?}");
+                        INBOUND_LOG.debug(format!("tuic inbound: datagram read: {e:?}"));
                         break;
                     }
                 }
@@ -349,14 +354,15 @@ async fn handle_connection(
 /// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
 /// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
 fn handle_datagram(dg: &bytes::Bytes, conn: &quinn::Connection, table: &mut UdpAssocTable) {
+    let log = &*INBOUND_LOG;
     let mut cursor = &dg[..];
     match crate::protocol::parse_header(&mut cursor) {
         Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
             Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
-            Err(e) => tracing::debug!("tuic inbound: datagram packet parse: {e:?}"),
+            Err(e) => log.debug(format!("tuic inbound: datagram packet parse: {e:?}")),
         },
         Ok(_) => {}, // Heartbeat 可走 datagram（spec），保活语义无需处理
-        Err(e) => tracing::debug!("tuic inbound: datagram header: {e:?}"),
+        Err(e) => log.debug(format!("tuic inbound: datagram header: {e:?}")),
     }
 }
 
@@ -387,12 +393,12 @@ async fn handle_bi_frame(
                         })
                         .expect("internal FxScope is never closed");
                 } else {
-                    tracing::warn!("tuic inbound: unsupported addr: {addr:?}");
+                    INBOUND_LOG.warn(format!("tuic inbound: unsupported addr: {addr:?}"));
                 }
             } else {
                 // mock/直连路径（loopback 测试用）
                 let Some(target) = addr_to_socket_addr(&addr) else {
-                    tracing::warn!("tuic inbound: addr not ip literal: {addr:?}");
+                    INBOUND_LOG.warn(format!("tuic inbound: addr not ip literal: {addr:?}"));
                     return;
                 };
                 let fx_relay = Arc::clone(fx);
@@ -400,7 +406,7 @@ async fn handle_bi_frame(
                     .spawn(async move {
                         if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
                         {
-                            tracing::debug!("tuic relay {target}: {e:?}");
+                            INBOUND_LOG.debug(format!("tuic relay {target}: {e:?}"));
                         }
                     })
                     .expect("internal FxScope is never closed");
@@ -409,7 +415,7 @@ async fn handle_bi_frame(
         Ok((_, _, _)) => {},
         Err(e) => {
             // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
-            tracing::debug!("tuic inbound: bi frame skipped/invalid: {e:?}");
+            INBOUND_LOG.debug(format!("tuic inbound: bi frame skipped/invalid: {e:?}"));
         },
     }
 }

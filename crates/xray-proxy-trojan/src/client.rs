@@ -8,22 +8,28 @@
 //! 2. `write_request_header` 写 Trojan 请求头
 //! 3. 桥接 `link`（入站）↔ `server_conn`（出站）双向数据
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
-use tracing::debug;
 use xray_app_proxyman::{
     error::ProxymanError,
     outbound::proxy_outbound::{OutboundDialer, ProxyOutbound},
 };
 use xray_common::{net::network::Network as XrayNetwork, session::Session};
+use xray_frame::LogFacade;
 use xray_transport::{bridge::bridge_link_with_stream_full_default, link::Link};
 
 use crate::{
     config::MemoryAccount,
     protocol::{Network as TrojanNetwork, write_request_header},
 };
+
+/// 出站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "trojan"，target `xray_frame::trojan` +
+/// mask_secrets。只在拨号成功事件发射（连接级，非逐包热路径）。
+static CLIENT_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("trojan", vec![]));
 /// Trojan 出站客户端。
 ///
 /// 持有账户信息，实现 [`ProxyOutbound`] trait。
@@ -82,12 +88,9 @@ impl ProxyOutbound for TrojanClient {
             .await
             .map_err(|e| ProxymanError::Other(format!("trojan write header: {e}")))?;
 
-        debug!(
-            tag = "trojan_client",
-            dest = %dest,
-            network = ?network,
-            "trojan outbound connected"
-        );
+        CLIENT_LOG.debug(format!(
+            "trojan outbound connected tag=trojan_client dest={dest} network={network:?}"
+        ));
 
         // 4. 双向桥接：link.reader/writer ↔ server_conn
         bridge_link_with_stream_full_default(link, server_conn)

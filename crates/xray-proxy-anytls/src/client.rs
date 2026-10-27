@@ -12,7 +12,10 @@
 //!
 //! 协议参考：[anytls-go protocol.md](https://github.com/anytls/anytls-go)。
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use anytls::{
     AsyncReadWrite, DialOutFunc,
@@ -26,10 +29,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream
 use tokio_rustls::TlsConnector;
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT;
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::sockopt::SocketOptions;
 
 use crate::{error::Result, socks::SocksAddr};
+
+/// 出站泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "anytls"，target `xray_frame::anytls` +
+/// mask_secrets。只在 pump 错误分支发射；pump 循环外取一次引用（坑约束⑫
+/// 热路径零每包开销）。
+static CLIENT_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytls", vec![]));
 
 /// `host:port` → Destination：IP 字面量直取，其余按域名（解析下沉 dial_system）。
 /// IPv6 必须用 `[..]:port` 完整括号形态；裸 IPv6（无括号）与单边括号一律
@@ -304,6 +314,7 @@ impl AsyncWrite for AnytlsConn {
 ///
 /// 任何一端 EOF 或出错都终止。
 async fn pump_stream(session: Arc<anytls::proxy::session::Session>, server_io: DuplexStream) {
+    let log = &*CLIENT_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let session_clone = session.clone();
     let down = async move {
@@ -313,12 +324,12 @@ async fn pump_stream(session: Arc<anytls::proxy::session::Session>, server_io: D
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = wr.write_all(&buf[..n]).await {
-                        tracing::debug!("pump session→duplex write error: {e}");
+                        log.debug(format!("pump session→duplex write error: {e}"));
                         break;
                     }
                 },
                 Err(e) => {
-                    tracing::debug!("pump session→duplex read error: {e}");
+                    log.debug(format!("pump session→duplex read error: {e}"));
                     break;
                 },
             }
@@ -332,12 +343,12 @@ async fn pump_stream(session: Arc<anytls::proxy::session::Session>, server_io: D
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = session.write(&buf[..n]).await {
-                        tracing::debug!("pump duplex→session write error: {e}");
+                        log.debug(format!("pump duplex→session write error: {e}"));
                         break;
                     }
                 },
                 Err(e) => {
-                    tracing::debug!("pump duplex→session read error: {e}");
+                    log.debug(format!("pump duplex→session read error: {e}"));
                     break;
                 },
             }

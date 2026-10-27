@@ -18,12 +18,15 @@
 //! [`StaticAuthValidator`] 做简单字符串匹配（config.auth == 客户端 auth 头），
 //! [`MultiUserValidator`] 支持多用户动态增删，对应 Go `account.Validator`。
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, LazyLock},
+};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use tracing::info;
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 use xray_transport_hysteria::{
     conn::{InterConn, InterStreamConn},
     hub::{
@@ -36,6 +39,13 @@ use crate::{
     config::{HysteriaConfig, HysteriaInboundConfig, MultiUserValidator},
     error::Result,
 };
+
+/// 入站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "hysteria"，target `xray_frame::hysteria` +
+/// mask_secrets。只在 listener 启停/流错误/UDP 会话错误分支发射（连接级/
+/// 错误分支，非逐包稳态；udp dispatch 泵循环外取一次引用，坑约束⑫）。
+static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("hysteria", vec![]));
 
 /// TCP 流量调度器 trait（对应 Go `routing.Dispatcher`）。
 ///
@@ -279,11 +289,8 @@ impl InboundHandler for HysteriaInboundHandler {
             Arc::new(move |stream: Arc<InterStreamConn>| {
                 let remote = stream.remote_addr();
                 let local = stream.local_addr();
-                tracing::debug!(
-                    local = %local,
-                    remote = %remote,
-                    "hysteria inbound new stream"
-                );
+                INBOUND_LOG
+                    .debug(format!("hysteria inbound new stream local={local} remote={remote}"));
                 // 若有 dispatcher，spawn TCP 处理任务
                 if let Some(ref disp) = dispatcher {
                     let disp = Arc::clone(disp);
@@ -292,7 +299,8 @@ impl InboundHandler for HysteriaInboundHandler {
                     // 组件自持 FxScope 记账（B6）：TCP 会话任务，scope drop 兜底 abort。
                     fx.spawn(async move {
                         if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
-                            tracing::warn!(error = %e, "hysteria inbound tcp stream error");
+                            INBOUND_LOG
+                                .warn(format!("hysteria inbound tcp stream error error={e}"));
                         }
                     })
                     .expect("internal FxScope is never closed");
@@ -311,7 +319,8 @@ impl InboundHandler for HysteriaInboundHandler {
                     // 组件自持 FxScope 记账（B6）：UDP 会话任务，scope drop 兜底 abort。
                     fx.spawn(async move {
                         if let Err(e) = handle_udp_session(sess, disp).await {
-                            tracing::warn!(error = %e, "hysteria inbound udp session error");
+                            INBOUND_LOG
+                                .warn(format!("hysteria inbound udp session error error={e}"));
                         }
                     })
                     .expect("internal FxScope is never closed");
@@ -351,7 +360,7 @@ impl InboundHandler for HysteriaInboundHandler {
         let accept_task = fx
             .spawn(async move {
                 listener_clone.start(quic_clone).await;
-                info!(tag = %tag, "hysteria inbound listener started");
+                INBOUND_LOG.info(format!("hysteria inbound listener started tag={tag}"));
             })
             .expect("internal FxScope is never closed");
 
@@ -367,7 +376,7 @@ impl InboundHandler for HysteriaInboundHandler {
             // 不能在 async_trait 的 Send 上下文中调用。直接关 quic_listener（其 close 是 Send），
             // HysteriaListener Arc drop 时自动清理内部状态。
             let _ = s.quic_listener.close().await;
-            info!(tag = %self.tag, "hysteria inbound closed");
+            INBOUND_LOG.info(format!("hysteria inbound closed tag={}", self.tag));
         }
         Ok(())
     }
@@ -404,11 +413,11 @@ async fn handle_tcp_stream(
         let mut cursor = std::io::Cursor::new(&buf);
         match read_tcp_request(&mut cursor) {
             Ok(addr) => {
-                tracing::info!(
-                    remote = %stream.remote_addr(),
-                    dest = %addr,
-                    "hysteria inbound tcp request"
-                );
+                INBOUND_LOG.info(format!(
+                    "hysteria inbound tcp request remote={} dest={}",
+                    stream.remote_addr(),
+                    addr
+                ));
                 // 写 TCP 响应（ok=true, 无消息）
                 let mut resp_buf = Vec::new();
                 write_tcp_response(&mut resp_buf, true, "")?;
@@ -454,6 +463,7 @@ async fn handle_udp_session(
     sess: Arc<InterConn>,
     dispatcher: Arc<dyn xray_app_dispatcher::DispatchHandler>,
 ) -> std::io::Result<()> {
+    let log = &*INBOUND_LOG;
     use xray_app_dispatcher::UdpDispatchSession;
 
     use crate::protocol::{Defragger, UdpMessage};
@@ -507,7 +517,10 @@ async fn handle_udp_session(
                     Err(e) => {
                         // qyn8：recv 错误结束会话（Go read 错误语义），
                         // continue 与滞留坏帧构成忙旋
-                        tracing::debug!(error = %e, remote = %sess.remote_addr(), "hysteria udp dispatch recv");
+                        log.debug(format!(
+                            "hysteria udp dispatch recv error={e} remote={}",
+                            sess.remote_addr()
+                        ));
                         break;
                     }
                 }

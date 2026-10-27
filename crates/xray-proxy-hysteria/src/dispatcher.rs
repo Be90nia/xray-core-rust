@@ -7,7 +7,7 @@ use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 
@@ -18,7 +18,7 @@ use tokio::{
 };
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::connection::Connection;
 use xray_transport_hysteria::{
     conn::{InterConn, InterStreamConn},
@@ -31,6 +31,13 @@ use crate::{
     config::HysteriaConfig,
     protocol::{Defragger, UdpMessage},
 };
+
+/// 出站泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "hysteria"，target `xray_frame::hysteria` +
+/// mask_secrets。只在拨号失败/pump 错误分支发射；pump 循环外取一次引用
+/// （坑约束⑫热路径零每包开销）。
+static DISPATCH_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("hysteria", vec![]));
 
 /// Hysteria duplex 缓冲（与 tuic 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -115,6 +122,7 @@ impl HysteriaConnection {
 }
 
 async fn pump_hysteria_stream(stream: Arc<InterStreamConn>, server_io: DuplexStream) {
+    let log = &*DISPATCH_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let stream_down = Arc::clone(&stream);
 
@@ -126,12 +134,12 @@ async fn pump_hysteria_stream(stream: Arc<InterStreamConn>, server_io: DuplexStr
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = stream.write(&buf[..n]).await {
-                        tracing::debug!("hysteria pump up write error: {e}");
+                        log.debug(format!("hysteria pump up write error: {e}"));
                         break;
                     }
                 },
                 Err(e) => {
-                    tracing::debug!("hysteria pump up read error: {e}");
+                    log.debug(format!("hysteria pump up read error: {e}"));
                     break;
                 },
             }
@@ -147,12 +155,12 @@ async fn pump_hysteria_stream(stream: Arc<InterStreamConn>, server_io: DuplexStr
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = wr.write_all(&buf[..n]).await {
-                        tracing::debug!("hysteria pump down write error: {e}");
+                        log.debug(format!("hysteria pump down write error: {e}"));
                         break;
                     }
                 },
                 Err(e) => {
-                    tracing::debug!("hysteria pump down read error: {e}");
+                    log.debug(format!("hysteria pump down read error: {e}"));
                     break;
                 },
             }
@@ -174,6 +182,7 @@ async fn pump_hysteria_udp(
     server_io: DuplexStream,
     default_dest: Destination,
 ) {
+    let log = &*DISPATCH_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
     let default_addr = dest_net_addr(&default_dest);
     let up_conn = Arc::clone(&conn);
@@ -191,7 +200,7 @@ async fn pump_hysteria_udp(
                 match parse_and_forward(&up_conn, &mut accum, &default_addr, &mut wire).await {
                     Ok(made) => progress = made,
                     Err(e) => {
-                        tracing::debug!("hysteria udp up forward error: {e}");
+                        log.debug(format!("hysteria udp up forward error: {e}"));
                         return;
                     },
                 }
@@ -200,7 +209,7 @@ async fn pump_hysteria_udp(
                 Ok(0) => return, // link EOF
                 Ok(n) => accum.extend_from_slice(&buf[..n]),
                 Err(e) => {
-                    tracing::debug!("hysteria udp up read error: {e}");
+                    log.debug(format!("hysteria udp up read error: {e}"));
                     return;
                 },
             }
@@ -220,7 +229,7 @@ async fn pump_hysteria_udp(
             let n = match conn.read(&mut buf).await {
                 Ok(n) => n,
                 Err(e) => {
-                    tracing::debug!("hysteria udp down read error: {e}");
+                    log.debug(format!("hysteria udp down read error: {e}"));
                     break;
                 },
             };
@@ -300,7 +309,7 @@ async fn parse_and_forward(
             if let Err(e) = write_udp_message(conn, &msg, wire).await {
                 // 对齐 Go UDPWriter（client.go:209-223）：DatagramTooLarge 属可恢复
                 // 错误——丢弃本包继续（UDP 语义），不杀 relay 会话。
-                tracing::debug!("hysteria udp up forward error: {e}");
+                DISPATCH_LOG.debug(format!("hysteria udp up forward error: {e}"));
             }
             Ok(true)
         },
@@ -432,7 +441,11 @@ pub fn make_hysteria_dial_fn(
                         Ok(stream) => Ok(Box::new(HysteriaConnection::from_stream(&ctx, stream))
                             as Box<dyn Connection>),
                         Err(e) => {
-                            tracing::warn!(server = %server_addr_str, target = ?dest.address(), "hysteria tcp dial failed: {e}");
+                            DISPATCH_LOG.warn(format!(
+                                "hysteria tcp dial failed: {e} server={server_addr_str} \
+                                 target={:?}",
+                                dest.address()
+                            ));
                             Err(format!("hysteria tcp dial: {e}"))
                         },
                     }
@@ -443,7 +456,9 @@ pub fn make_hysteria_dial_fn(
                         Ok(conn) => Ok(Box::new(HysteriaConnection::from_udp(&ctx, conn, dest))
                             as Box<dyn Connection>),
                         Err(e) => {
-                            tracing::warn!(server = %server_addr_str, "hysteria udp dial failed: {e}");
+                            DISPATCH_LOG.warn(format!(
+                                "hysteria udp dial failed: {e} server={server_addr_str}"
+                            ));
                             Err(format!("hysteria udp dial: {e}"))
                         },
                     }

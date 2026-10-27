@@ -18,7 +18,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -27,13 +27,20 @@ use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address as XrayAddress, destination::Destination};
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::connection::Connection;
 
 use crate::{
     client::{TuicClient, TuicConn},
     protocol::Address,
 };
+
+/// 出站泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "tuic"，target `xray_frame::tuic` +
+/// mask_secrets。只在拨号失败/pump 错误分支发射；pump 循环外取一次引用
+/// （坑约束⑫热路径零每包开销）。
+static DISPATCH_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// TUIC duplex 缓冲（与 anytls 一致：64 KiB）。
 const DUPLEX_BUF_SIZE: usize = 64 * 1024;
@@ -187,18 +194,19 @@ pub fn make_dial_fn_lazy(
                     Ok::<Arc<TuicClient>, String>(c)
                 })
                 .await
-                .inspect_err(
-                    |e| tracing::warn!(server = %server_addr_log, "tuic client init failed: {e}"),
-                )?;
+                .inspect_err(|e| {
+                    DISPATCH_LOG
+                        .warn(format!("tuic client init failed: {e} server={server_addr_log}"))
+                })?;
             let conn =
                 match tokio::time::timeout(Duration::from_secs(30), c.dial(addr.clone())).await {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => {
-                        tracing::warn!(target = ?addr, "tuic dial failed: {e}");
+                        DISPATCH_LOG.warn(format!("tuic dial failed: {e} target={addr:?}"));
                         return Err(format!("tuic dial: {e}"));
                     },
                     Err(_) => {
-                        tracing::warn!(target = ?addr, "tuic dial timed out");
+                        DISPATCH_LOG.warn(format!("tuic dial timed out target={addr:?}"));
                         return Err("tuic dial: timed out".to_string());
                     },
                 };
@@ -231,6 +239,7 @@ async fn pump_streams(
     mut recv: quinn::RecvStream,
     server_io: DuplexStream,
 ) {
+    let log = &*DISPATCH_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
 
     // up: duplex rd → quinn send（数据从本地 outbound 写向 TUIC 服务端）
@@ -241,12 +250,12 @@ async fn pump_streams(
                 Ok(0) => break,
                 Ok(n) => {
                     if let Err(e) = send.write_all(&buf[..n]).await {
-                        tracing::debug!("tuic pump up send error: {e}");
+                        log.debug(format!("tuic pump up send error: {e}"));
                         break;
                     }
                 },
                 Err(e) => {
-                    tracing::debug!("tuic pump up read error: {e}");
+                    log.debug(format!("tuic pump up read error: {e}"));
                     break;
                 },
             }
@@ -265,13 +274,13 @@ async fn pump_streams(
                         continue;
                     }
                     if let Err(e) = wr.write_all(&buf[..n]).await {
-                        tracing::debug!("tuic pump down write error: {e}");
+                        log.debug(format!("tuic pump down write error: {e}"));
                         break;
                     }
                 },
                 Ok(None) => break, // stream ended
                 Err(e) => {
-                    tracing::debug!("tuic pump down read error: {e}");
+                    log.debug(format!("tuic pump down read error: {e}"));
                     break;
                 },
             }

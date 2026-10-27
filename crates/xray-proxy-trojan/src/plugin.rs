@@ -21,11 +21,11 @@
 //! ——按 CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，留主仓最近消费方；
 //! 无提炼候选。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use xray_common::errors::removed_feature_message;
 use xray_frame::{
-    ClauseId, Lifecycle, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
+    ClauseId, Lifecycle, LogFacade, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
 };
 
 use crate::{
@@ -34,6 +34,12 @@ use crate::{
     server::TrojanServer,
     validator::{MemoryUser, Validator},
 };
+
+/// 配置解析诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具
+/// 链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
+/// 实测无效），迁移为唯一关红路径。域 = "trojan"，target `xray_frame::trojan` +
+/// mask_secrets。只在配置解析告警分支发射（装配冷路径）。
+static PLUGIN_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("trojan", vec![]));
 
 /// 通用条款适用子集（trojan 12 条全适用，差异表 §2.2 第 3 行：有密码认证 →
 /// 1/11 适用；有握手 → 2 适用；缓冲/任务/停机/配置/错误/有界/日志/热路径照常）。
@@ -184,14 +190,15 @@ fn parse_users(settings: &serde_json::Value) -> Validator {
             // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
             // 同规生产：warn + 忽略该字段继续建用户。
             if flow_removed_warning(c) {
-                tracing::warn!("{}", removed_feature_message("Flow for Trojan", ""));
+                PLUGIN_LOG.warn(removed_feature_message("Flow for Trojan", ""));
             }
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("");
             let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let user = MemoryUser::new(email, level, MemoryAccount::new(password));
             if let Err(e) = validator.add(user) {
-                tracing::warn!(error = %e, "skip duplicate user during trojan inbound init");
+                PLUGIN_LOG
+                    .warn(format!("skip duplicate user during trojan inbound init error={e}"));
             }
         }
     }

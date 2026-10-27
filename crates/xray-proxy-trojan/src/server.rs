@@ -16,7 +16,7 @@
 use std::{
     collections::HashMap,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 
@@ -26,13 +26,13 @@ use tokio::{
     net::TcpListener,
     sync::Mutex,
 };
-use tracing::{debug, info, warn};
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::net::{
     address::Address, destination::Destination, network::Network as CommonNetwork, port::Port,
 };
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
@@ -40,6 +40,13 @@ use crate::{
     protocol::{CRLF, Network, addr_type, parse_udp_packet_stream, write_udp_packet},
     validator::{MemoryUser, Validator},
 };
+
+/// 入站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "trojan"，target `xray_frame::trojan` +
+/// mask_secrets。只在 accept/握手/fallback 控制面与 UDP relay 错误分支发射；
+/// udp relay 泵循环外取一次引用（坑约束⑫热路径零每包开销）。
+static SERVER_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("trojan", vec![]));
 
 /// 包装流，记录所有读取字节用于 fallback 回放。
 struct RecordingStream<S> {
@@ -147,7 +154,7 @@ impl InboundHandler for TrojanServer {
         let bound = listener
             .local_addr()
             .map_err(|e| InboundError::ListenError(format!("local_addr: {e}")))?;
-        info!(tag = %self.tag, addr = %bound, "Trojan server started");
+        SERVER_LOG.info(format!("Trojan server started tag={} addr={bound}", self.tag));
 
         let tag = self.tag.clone();
         let validator = self.validator.clone();
@@ -180,18 +187,17 @@ impl InboundHandler for TrojanServer {
                                 .await
                                 {
                                 Ok((network, addr, port, user)) => {
-                                    debug!(
-                                        tag = %tag,
-                                        peer = %peer,
-                                        network = ?network,
-                                        dest_addr = ?addr,
-                                        dest_port = port,
-                                        user = %user.email,
-                                        "Trojan handshake succeeded"
-                                    );
+                                    SERVER_LOG.debug(format!(
+                                        "Trojan handshake succeeded tag={tag} peer={peer} \
+                                         network={network:?} dest_addr={addr:?} dest_port={port} \
+                                         user={}",
+                                        user.email
+                                    ));
                                 },
                                 Err(e) => {
-                                    warn!(tag = %tag, peer = %peer, error = %e, "Trojan handshake failed");
+                                    SERVER_LOG.warn(format!(
+                                        "Trojan handshake failed tag={tag} peer={peer} error={e}"
+                                    ));
                                     if let Some(fb_policy) = &fallbacks {
                                         // ponytail: SNI/ALPN/path 来自 TLS
                                         // 层，当前未接线，用空字符串通配匹配
@@ -205,7 +211,9 @@ impl InboundHandler for TrojanServer {
                                             )
                                             .await
                                             {
-                                                warn!(tag = %tag, peer = %peer, error = %e, "fallback failed");
+                                                SERVER_LOG.warn(format!(
+                                                    "fallback failed tag={tag} peer={peer} error={e}"
+                                                ));
                                             }
                                         }
                                     }
@@ -215,7 +223,7 @@ impl InboundHandler for TrojanServer {
                             .expect("internal FxScope is never closed");
                         },
                         Err(e) => {
-                            warn!(tag = %tag, error = %e, "accept failed");
+                            SERVER_LOG.warn(format!("accept failed tag={tag} error={e}"));
                             break;
                         },
                     }
@@ -230,7 +238,7 @@ impl InboundHandler for TrojanServer {
     async fn close(&self) -> std::result::Result<(), InboundError> {
         if let Some((_listener, handle)) = self.slot.lock().await.take() {
             handle.abort();
-            info!(tag = %self.tag, "Trojan server closed");
+            SERVER_LOG.info(format!("Trojan server closed tag={}", self.tag));
         }
         Ok(())
     }
@@ -471,15 +479,15 @@ pub async fn serve_trojan(
     let validator = Arc::new(Validator::new());
     for (_, user) in users {
         if let Err(e) = validator.add(user) {
-            warn!(error = %e, "skip duplicate user during serve_trojan init");
+            SERVER_LOG.warn(format!("skip duplicate user during serve_trojan init error={e}"));
         }
     }
 
-    info!(
-        addr = %listener.local_addr()?,
-        users = validator.get_key_count(),
-        "trojan inbound listening"
-    );
+    SERVER_LOG.info(format!(
+        "trojan inbound listening addr={} users={}",
+        listener.local_addr()?,
+        validator.get_key_count()
+    ));
 
     let local = listener.local_addr()?;
     // tcpSettings.header 伪装头（Go hub.go:85-95 authConfig；TLS 解包后应用）。
@@ -489,7 +497,7 @@ pub async fn serve_trojan(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "trojan accept failed");
+                SERVER_LOG.warn(format!("trojan accept failed error={e}"));
                 continue;
             },
         };
@@ -534,7 +542,7 @@ pub async fn serve_trojan(
                         )
                         .await;
                     },
-                    Err(e) => warn!(error = %e, "trojan TLS accept failed"),
+                    Err(e) => SERVER_LOG.warn(format!("trojan TLS accept failed error={e}")),
                 }
             } else {
                 let recorder = RecordingStream {
@@ -611,14 +619,15 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     match trojan_server_handshake(&mut recorder, &validator, handshake_timeout).await {
         Ok((network, addr, port, user)) => {
             if matches!(network, Network::Udp) {
-                debug!(peer = %peer, user = %user.email, "trojan UDP relay start");
+                SERVER_LOG.debug(format!("trojan UDP relay start peer={peer} user={}", user.email));
                 handle_trojan_udp_relay(recorder.inner, handler).await;
                 return;
             }
             let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
             let (read_half, write_half) = tokio::io::split(recorder.inner);
             let link = Link::new(new_reader(read_half), new_writer(write_half));
-            debug!(peer = %peer, user = %user.email, dest = %dest, "trojan dispatching");
+            SERVER_LOG
+                .debug(format!("trojan dispatching peer={peer} user={} dest={dest}", user.email));
             // per-user stats（Go trojan/inbound 认证后 ctx 带 user 语义）：
             // from=客户端源地址，email/level=认证用户。
             let access = xray_app_dispatcher::AccessContext {
@@ -630,16 +639,20 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             let _ = handler.dispatch_with_access(&dest, link, access).await;
         },
         Err(e) => {
-            warn!(peer = %peer, error = %e, "trojan handshake failed");
+            SERVER_LOG.warn(format!("trojan handshake failed peer={peer} error={e}"));
             if let Some(fb_policy) = &fb_policy {
                 let path = xray_transport::fallback::extract_path_from_first_bytes(&recorder.buf)
                     .unwrap_or("");
                 if let Some(fb) = fb_policy.decide(&tls_name, &tls_alpn, path) {
-                    info!(peer = %peer, dest = %fb.dest, xver = fb.xver, name = %tls_name, alpn = %tls_alpn, path, "trojan fallback");
+                    SERVER_LOG.info(format!(
+                        "trojan fallback peer={peer} dest={} xver={} name={tls_name} \
+                         alpn={tls_alpn} path={path}",
+                        fb.dest, fb.xver
+                    ));
                     if let Err(e) =
                         do_fallback(recorder, &fb.dest, fb.xver as u8, peer, local).await
                     {
-                        warn!(peer = %peer, error = %e, "fallback failed");
+                        SERVER_LOG.warn(format!("fallback failed peer={peer} error={e}"));
                     }
                 }
             }
@@ -663,6 +676,7 @@ async fn handle_trojan_udp_relay<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let log = &*SERVER_LOG;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     let mut session = xray_app_dispatcher::UdpDispatchSession::new(handler);
     let mut buf: Vec<u8> = Vec::with_capacity(16_384);
@@ -683,12 +697,14 @@ async fn handle_trojan_udp_relay<S>(
                             consumed += used;
                             let dest = Destination::new(addr, Port::new(port), CommonNetwork::UDP);
                             if let Err(e) = session.send_packet(&dest, payload).await {
-                                warn!(error = %e, dest = %dest, "trojan udp send_packet failed");
+                                log.warn(format!(
+                                    "trojan udp send_packet failed error={e} dest={dest}"
+                                ));
                             }
                         }
                         Ok(None) => break, // 数据不足，继续读
                         Err(e) => {
-                            warn!(error = %e, "trojan udp parse fatal, aborting relay");
+                            log.warn(format!("trojan udp parse fatal, aborting relay error={e}"));
                             fatal = true;
                             break;
                         }

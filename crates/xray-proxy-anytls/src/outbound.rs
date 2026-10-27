@@ -9,7 +9,7 @@
 //! 3. 调 `AnytlsClient::dial` 建立 TLS 连接 + 写 SOCKS5 目标
 //! 4. 返回 `Ok(())`（与 hysteria 一致，连接对象由 dispatcher 通过 DialBridge 获取）
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use xray_common::{
@@ -17,12 +17,19 @@ use xray_common::{
     session::Session,
 };
 use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_frame::LogFacade;
 
 use crate::{
     client::{AnytlsClient, ClientConfig},
     error::Result,
     socks::SocksAddr,
 };
+
+/// 出站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "anytls"，target `xray_frame::anytls` +
+/// mask_secrets。只在拨号成功事件发射（连接级，非逐包热路径）。
+static OUTBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytls", vec![]));
 
 /// AnyTLS 出站 Handler。
 ///
@@ -78,11 +85,10 @@ impl OutboundHandler for AnytlsOutboundHandler {
             .await
             .map_err(|e| OutboundError::ConnectionFailed(format!("anytls dial: {e}")))?;
 
-        tracing::debug!(
-            tag = %self.tag,
-            dest = %destination,
-            "anytls outbound stream established"
-        );
+        OUTBOUND_LOG.debug(format!(
+            "anytls outbound stream established tag={} dest={}",
+            self.tag, destination
+        ));
         Ok(())
     }
 

@@ -16,7 +16,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU16, Ordering},
     },
 };
@@ -24,11 +24,17 @@ use std::{
 use async_trait::async_trait;
 use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::sync::Mutex;
-use tracing::info;
 use xray_app_dispatcher::DispatchHandler;
 use xray_features::inbound::{InboundError, InboundHandler};
+use xray_frame::LogFacade;
 
 use crate::server::AnytlsMockServer;
+
+/// 入站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "anytls"，target `xray_frame::anytls` +
+/// mask_secrets。只在 listener 启停事件发射（连接级，非逐包热路径）。
+static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytls", vec![]));
 
 /// AnyTLS 入站 Handler。
 ///
@@ -129,7 +135,8 @@ impl InboundHandler for AnytlsInboundHandler {
             .spawn(async move {
                 // 该任务仅保持存活，实际 serve 逻辑在 MockServer 内部
                 // close 时通过 stop_tx 触发退出
-                info!(tag = %tag, addr = %local_addr, "anytls inbound listener started");
+                INBOUND_LOG
+                    .info(format!("anytls inbound listener started tag={tag} addr={local_addr}"));
                 // 永远等待，直到 task 被 abort
                 std::future::pending::<()>().await;
             })
@@ -145,7 +152,7 @@ impl InboundHandler for AnytlsInboundHandler {
             s._accept_task.abort();
             s.server.stop().await;
             self.local_port.store(0, Ordering::SeqCst);
-            info!(tag = %self.tag, "anytls inbound closed");
+            INBOUND_LOG.info(format!("anytls inbound closed tag={}", self.tag));
         }
         Ok(())
     }

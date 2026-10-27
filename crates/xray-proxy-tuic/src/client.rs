@@ -19,12 +19,13 @@
 
 use std::{
     net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use bytes::{BufMut, BytesMut};
 use skeleton_infra::fx::{FxScope, Spawned};
 use uuid::Uuid;
+use xray_frame::LogFacade;
 
 use crate::{
     error::{Result, TuicError},
@@ -35,6 +36,12 @@ use crate::{
     },
     udp::{TuicUdpAssoc, UniRespRouter},
 };
+
+/// 客户端诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "tuic"，target `xray_frame::tuic` +
+/// mask_secrets。只在心跳停止/拥塞回落告警分支发射（非逐包热路径）。
+static CLIENT_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// 拥塞控制算法（官方 tuic-client `congestion_control`）。
 ///
@@ -373,7 +380,7 @@ impl TuicClient {
                 loop {
                     tokio::time::sleep(period).await;
                     if let Err(e) = client.heartbeat().await {
-                        tracing::debug!("tuic heartbeat stopped: {e}");
+                        CLIENT_LOG.debug(format!("tuic heartbeat stopped: {e}"));
                         break;
                     }
                 }
@@ -449,7 +456,7 @@ pub(crate) fn apply_congestion_to_transport(
             None
         },
         CongestionControl::NewReno => {
-            tracing::warn!("tuic: quinn has no NewReno, falling back to CUBIC");
+            CLIENT_LOG.warn("tuic: quinn has no NewReno, falling back to CUBIC");
             transport.congestion_controller_factory(Arc::new(
                 quinn_proto::congestion::CubicConfig::default(),
             ));
@@ -464,7 +471,7 @@ pub(crate) fn apply_congestion_to_transport(
         CongestionControl::HysteriaBrutal => {
             let slot = cc::install_swappable_cc(transport);
             if brutal_up_bps == 0 {
-                tracing::warn!("tuic: hysteria_brutal without brutal_up_bps, falling back to BBR");
+                CLIENT_LOG.warn("tuic: hysteria_brutal without brutal_up_bps, falling back to BBR");
                 cc::apply_bbr(&slot, cc::bbr::Profile::Standard);
             } else {
                 cc::apply_brutal(&slot, brutal_up_bps, false);

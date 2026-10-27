@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
@@ -22,6 +22,7 @@ use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
 use xray_common::net::{address::Address as XAddress, destination::Destination, port::Port};
+use xray_frame::LogFacade;
 
 use crate::{
     error::{Result, TuicError},
@@ -31,6 +32,14 @@ use crate::{
     },
     udp::{quinn_read_exact_err, read_packet_payload},
 };
+
+/// mock server 诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目
+/// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶
+/// 三形态实测无效），迁移为唯一关红路径。域 = "tuic"，target 为
+/// `xray_frame::tuic`，emit 过 mask_secrets。只在连接/relay/解析错误与 UDP
+/// 丢包分支发射（mock 面，非生产 server；udp_assoc 泵循环外取一次引用，
+/// 坑约束⑫热路径零每包开销）。
+static SERVER_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// 自签证书产物（仅 mock 用）。
 struct TlsCert {
@@ -149,7 +158,7 @@ impl TuicMockServer {
             self.fx
                 .spawn(async move {
                     if let Err(e) = handle_connection(incoming, uuid, &pwd, &fx_task).await {
-                        tracing::warn!("tuic mock server connection error: {e:?}");
+                        SERVER_LOG.warn(format!("tuic mock server connection error: {e:?}"));
                     }
                 })
                 .expect("internal FxScope is never closed");
@@ -213,7 +222,7 @@ async fn handle_connection(
                 match dg {
                     Ok(dg) => handle_datagram(&dg, &conn, &mut udp_table),
                     Err(e) => {
-                        tracing::debug!("tuic server: datagram read: {e:?}");
+                        SERVER_LOG.debug(format!("tuic server: datagram read: {e:?}"));
                         break;
                     }
                 }
@@ -229,14 +238,15 @@ async fn handle_connection(
 /// spec：datagram 承载完整命令帧（VER + TYPE + 负载）；Packet 路由到
 /// assoc 会话并以 datagram 模式回写，Heartbeat 等保活命令忽略。
 fn handle_datagram(dg: &bytes::Bytes, conn: &quinn::Connection, table: &mut UdpAssocTable) {
+    let log = &*SERVER_LOG;
     let mut cursor = &dg[..];
     match crate::protocol::parse_header(&mut cursor) {
         Ok(t) if t == type_code::PACKET => match Packet::read_payload(&mut cursor) {
             Ok(pkt) => table.handle_packet(pkt, ReplySink::Dgram(conn.clone())),
-            Err(e) => tracing::debug!("tuic server: datagram packet parse: {e:?}"),
+            Err(e) => log.debug(format!("tuic server: datagram packet parse: {e:?}")),
         },
         Ok(_) => {}, // Heartbeat 可走 datagram（spec），保活语义无需处理
-        Err(e) => tracing::debug!("tuic server: datagram header: {e:?}"),
+        Err(e) => log.debug(format!("tuic server: datagram header: {e:?}")),
     }
 }
 
@@ -251,7 +261,7 @@ async fn handle_bi_frame(
     match read_frame_from_recv(recv_bi, 256).await {
         Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
             let Some(target) = addr_to_socket_addr(&addr) else {
-                tracing::warn!("tuic server: addr not ip literal: {addr:?}");
+                SERVER_LOG.warn(format!("tuic server: addr not ip literal: {addr:?}"));
                 return;
             };
             // B6（bd t975）：per-flow relay 任务经组件自持 scope 托管。
@@ -259,7 +269,7 @@ async fn handle_bi_frame(
             fx_relay
                 .spawn(async move {
                     if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
-                        tracing::debug!("tuic relay {target}: {e:?}");
+                        SERVER_LOG.debug(format!("tuic relay {target}: {e:?}"));
                     }
                 })
                 .expect("internal FxScope is never closed");
@@ -267,7 +277,7 @@ async fn handle_bi_frame(
         Ok((_, _, _)) => {},
         Err(e) => {
             // bi 收到 Packet（TYPE 0x02）等非 Connect 帧落此路径，忽略（spec，票 d1zr）
-            tracing::debug!("tuic server: bi frame skipped/invalid: {e:?}");
+            SERVER_LOG.debug(format!("tuic server: bi frame skipped/invalid: {e:?}"));
         },
     }
 }
@@ -346,7 +356,7 @@ pub(crate) async fn handle_incoming_uni(
             // 路由进 assoc 会话，响应由会话 task open_uni 回写（票 d1zr）
             udp_table.handle_packet(pkt, ReplySink::Uni(conn.clone()));
         },
-        Err(e) => tracing::debug!("{ctx}: uni stream read: {e:?}"),
+        Err(e) => SERVER_LOG.debug(format!("{ctx}: uni stream read: {e:?}")),
     }
 }
 
@@ -487,7 +497,9 @@ impl UdpAssocTable {
                     // 等待其他片
                 },
                 Err(e) => {
-                    tracing::debug!("tuic udp relay: fragment assemble error assoc={assoc}: {e:?}");
+                    SERVER_LOG.debug(format!(
+                        "tuic udp relay: fragment assemble error assoc={assoc}: {e:?}"
+                    ));
                 },
             }
             return;
@@ -498,7 +510,7 @@ impl UdpAssocTable {
     /// 内部：把（完整）Packet 投递到 assoc 会话。
     fn route_packet(&mut self, pkt: Packet, sink: ReplySink) {
         let Some(dest) = tuic_addr_to_udp_dest(&pkt.addr) else {
-            tracing::warn!("tuic udp relay: packet without target addr");
+            SERVER_LOG.warn("tuic udp relay: packet without target addr");
             return;
         };
         let assoc_id = pkt.assoc_id;
@@ -514,7 +526,7 @@ impl UdpAssocTable {
             tx
         });
         if tx.try_send(item).is_err() {
-            tracing::debug!("tuic udp assoc {assoc_id} backlogged, dropping packet");
+            SERVER_LOG.debug(format!("tuic udp assoc {assoc_id} backlogged, dropping packet"));
         }
     }
 
@@ -551,10 +563,11 @@ async fn udp_assoc_task(
     reason = "tokio 虚拟钟预算面：idle 睡眠 reset 与 sleep 同钟族（713x6：tokio 一律不迁）"
 )]
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
+    let log = &*SERVER_LOG;
     let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!("tuic udp assoc {assoc_id} bind: {e:?}");
+            log.debug(format!("tuic udp assoc {assoc_id} bind: {e:?}"));
             return;
         },
     };
@@ -572,10 +585,10 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                         cur_pkt_id = pkt_id;
                         if let Some(target) = resolve_udp_dest(&dest).await {
                             if let Err(e) = udp.send_to(&payload, target).await {
-                                tracing::debug!("tuic udp assoc {assoc_id} send: {e:?}");
+                                log.debug(format!("tuic udp assoc {assoc_id} send: {e:?}"));
                             }
                         } else {
-                            tracing::debug!("tuic udp assoc {assoc_id} resolve failed: {dest:?}");
+                            log.debug(format!("tuic udp assoc {assoc_id} resolve failed: {dest:?}"));
                         }
                         idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
                     }
@@ -593,13 +606,13 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                                 Bytes::copy_from_slice(&resp_buf[..n]),
                             );
                             if let Err(e) = s.write_packet(&pkt).await {
-                                tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
+                                log.debug(format!("tuic udp assoc {assoc_id} reply: {e:?}"));
                             }
                         }
                         idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
                     }
                     Err(e) => {
-                        tracing::debug!("tuic udp assoc {assoc_id} recv: {e:?}");
+                        log.debug(format!("tuic udp assoc {assoc_id} recv: {e:?}"));
                         break;
                     }
                 }
@@ -622,6 +635,7 @@ async fn udp_assoc_dispatch(
     dispatcher: Arc<dyn DispatchHandler>,
     mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>,
 ) {
+    let log = &*SERVER_LOG;
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut sink: Option<ReplySink> = None;
     let mut cur_pkt_id: u16 = 0;
@@ -635,7 +649,7 @@ async fn udp_assoc_dispatch(
                         sink = Some(s);
                         cur_pkt_id = pkt_id;
                         if let Err(e) = session.send_packet(&dest, &payload).await {
-                            tracing::debug!("tuic udp assoc {assoc_id} dispatch send: {e:?}");
+                            log.debug(format!("tuic udp assoc {assoc_id} dispatch send: {e:?}"));
                             break;
                         }
                         idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
@@ -655,7 +669,7 @@ async fn udp_assoc_dispatch(
                                 Bytes::from(payload),
                             );
                             if let Err(e) = s.write_packet(&pkt).await {
-                                tracing::debug!("tuic udp assoc {assoc_id} reply: {e:?}");
+                                log.debug(format!("tuic udp assoc {assoc_id} reply: {e:?}"));
                             }
                         }
                         idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
@@ -664,7 +678,7 @@ async fn udp_assoc_dispatch(
                     Err(e) => {
                         // qyn8：recv 错误结束会话（Go read 错误语义），
                         // continue 与滞留坏帧构成忙旋
-                        tracing::debug!("tuic udp assoc {assoc_id} dispatch recv: {e:?}");
+                        log.debug(format!("tuic udp assoc {assoc_id} dispatch recv: {e:?}"));
                         break;
                     }
                 }

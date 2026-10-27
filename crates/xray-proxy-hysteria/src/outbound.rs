@@ -16,7 +16,10 @@
 //! Connection ↔ Link 桥接送后续切片。目标地址编码由 transport 层 InterStreamConn
 //! 的 client_first 前缀处理。
 
-use std::{net::ToSocketAddrs, sync::Arc};
+use std::{
+    net::ToSocketAddrs,
+    sync::{Arc, LazyLock},
+};
 
 use async_trait::async_trait;
 use xray_common::{
@@ -24,12 +27,19 @@ use xray_common::{
     session::Session,
 };
 use xray_features::outbound::{OutboundError, OutboundHandler};
+use xray_frame::LogFacade;
 use xray_transport_hysteria::{
     dialer::{ClientManager, DialDestination, HysteriaTransport},
     proto_config::Config as ProtoConfig,
 };
 
 use crate::{config::HysteriaConfig, error::Result};
+
+/// 出站诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
+/// `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态实测
+/// 无效），迁移为唯一关红路径。域 = "hysteria"，target `xray_frame::hysteria` +
+/// mask_secrets。只在通道建立成功事件发射（连接级，非逐包热路径）。
+static OUTBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("hysteria", vec![]));
 
 /// Hysteria 出站 Handler。
 ///
@@ -104,22 +114,20 @@ impl OutboundHandler for HysteriaOutboundHandler {
                     .tcp(destination.address(), destination.port())
                     .await
                     .map_err(|e| OutboundError::ConnectionFailed(format!("hysteria tcp: {e}")))?;
-                tracing::debug!(
-                    tag = %self.tag,
-                    dest = %destination,
-                    "hysteria outbound TCP stream established"
-                );
+                OUTBOUND_LOG.debug(format!(
+                    "hysteria outbound TCP stream established tag={} dest={}",
+                    self.tag, destination
+                ));
             },
             Network::UDP => {
                 client
                     .udp()
                     .await
                     .map_err(|e| OutboundError::ConnectionFailed(format!("hysteria udp: {e}")))?;
-                tracing::debug!(
-                    tag = %self.tag,
-                    dest = %destination,
-                    "hysteria outbound UDP session established"
-                );
+                OUTBOUND_LOG.debug(format!(
+                    "hysteria outbound UDP session established tag={} dest={}",
+                    self.tag, destination
+                ));
             },
             Network::Unix => {
                 return Err(OutboundError::ConnectionFailed(
