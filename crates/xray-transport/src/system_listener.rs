@@ -793,25 +793,22 @@ fn log_peer_credentials(stream: &UnixStream) {
             )
         };
         if ret == 0 {
-            tracing::debug!(
-                pid = cred.pid,
-                uid = cred.uid,
-                gid = cred.gid,
-                "uds peer credentials (SO_PEERCRED)"
-            );
+            crate::LOG.debug(format!(
+                "pid={} uid={} gid={} uds peer credentials (SO_PEERCRED)",
+                cred.pid, cred.uid, cred.gid
+            ));
         } else {
-            tracing::debug!(
-                error = %io::Error::last_os_error(),
-                "uds peer credentials unavailable: SO_PEERCRED getsockopt failed"
-            );
+            crate::LOG.debug(format!(
+                "error={} uds peer credentials unavailable: SO_PEERCRED getsockopt failed",
+                io::Error::last_os_error()
+            ));
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = stream;
-        tracing::debug!(
-            "uds peer credentials unavailable: SO_PEERCRED not supported on this platform"
-        );
+        crate::LOG
+            .debug("uds peer credentials unavailable: SO_PEERCRED not supported on this platform");
     }
 }
 
@@ -873,13 +870,13 @@ impl UnixListener {
                 }
                 if perm.is_none() {
                     let mode_str = format!("{mode:o}");
-                    tracing::info!(
-                        path = %socket_path.display(),
-                        mode = %mode_str,
-                        "uds socket permission defaulted to owner-only (Go default \
+                    crate::LOG.info(format!(
+                        "path={} mode={} uds socket permission defaulted to owner-only (Go default \
                          0777&~umask is too permissive); append ',mode' (e.g. \
-                         /path,0755) to allow other local users, at your own risk"
-                    );
+                         /path,0755) to allow other local users, at your own risk",
+                        socket_path.display(),
+                        mode_str
+                    ));
                 }
 
                 Ok(Self { inner, sockopt, controllers: Vec::new(), _locker: Some(lk) })

@@ -390,7 +390,10 @@ fn spawn_recv_task(
                 Err(e) => {
                     // Go recv4/recv6 对真实读错误同样 `LogErrorInner` 后退出（连接随之不可用）；
                     // 畸形帧由平台层丢帧继续，走不到这里——无日志退出 = 后续包静默丢光（jhktt）
-                    tracing::warn!(error = %e, is_client, "xicmp: raw socket recv failed, closing");
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} is_client={is_client} xicmp: raw socket recv failed, closing"
+                    );
                     return;
                 },
             };

@@ -181,11 +181,9 @@ fn v6_unavailable() -> io::Error {
 /// v6 打开失败 → 降级 v4-only（偏差见模块文档），但必须留运行时痕迹：降级后 v6 目标
 /// 100% 丢包，无痕迹时操作者只能从 v6 send 的 [`v6_unavailable`] 反推（bd zww2b）。
 fn degrade_v6(role: &str, err: &io::Error) -> (Option<IcmpSock>, bool) {
-    tracing::warn!(
-        error = %err,
-        role,
-        "xicmp: IPv6 socket unavailable, degrading to IPv4-only; IPv6 destinations will fail"
-    );
+    crate::LOG.warn(format!(
+        "error={err} role={role} xicmp: IPv6 socket unavailable, degrading to IPv4-only; IPv6 destinations will fail"
+    ));
     (None, false)
 }
 
@@ -293,9 +291,9 @@ mod sys {
                                 None => {
                                     // 坏 IP 头 = 整帧丢弃、continue（Go ParseMessage 出错即
                                     // continue；上抛 Err 会让 recv 任务退出 = 连接静默死）
-                                    tracing::debug!(
-                                        bytes = n,
-                                        "xicmp: dropped frame with malformed IPv4 header"
+                                    crate::hot_log!(
+                                        DEBUG,
+                                        "bytes={n} xicmp: dropped frame with malformed IPv4 header"
                                     );
                                     continue;
                                 },
@@ -419,9 +417,9 @@ mod sys {
                             Some(p) => p,
                             None => {
                                 // 与 unix 同语义（Go ParseMessage 出错即 continue）：丢弃本帧
-                                tracing::debug!(
-                                    bytes = n,
-                                    "xicmp: dropped frame with malformed IPv4 header"
+                                crate::hot_log!(
+                                    DEBUG,
+                                    "bytes={n} xicmp: dropped frame with malformed IPv4 header"
                                 );
                                 continue;
                             },
