@@ -341,6 +341,14 @@ impl Instance {
     /// 非 clean 行走 general 通道 warn；关 = 旧逆序循环（无超时/无隔离）。
     pub fn close(&mut self) -> Result<()> {
         let _guard = self.state_lock.lock();
+        // bd krogs：先摘装配期写入的两个进程级全局 dialer 槽（DNS 共享 dialer 由
+        // `functions.rs` 注入、DialerProxy 钩子由 `outbound.rs::register_outbounds`
+        // 注入），再停任务——两槽存的是 `Arc`，摘掉的只是全局那份引用，在途持有者
+        // 各持自己的 clone，不会被抽走；不摘则已关闭实例的 dispatcher 与整张出站表
+        // 被全局钉住，跨实例串扰且任务不随实例关闭而止。幂等：重复 close 再摘一次无害。
+        xray_app_dns::dial::set_shared_dialer(None);
+        xray_transport::system_dialer::clear_dialer_proxy_hook();
+
         if !self.running {
             return Ok(());
         }
@@ -829,6 +837,140 @@ mod tests {
         let mut inst = Instance::new();
         ensure_essential_features(&mut inst);
         assert!(inst.get_feature::<xray_features::dns::DefaultDnsFeature>().is_some());
+    }
+
+    /// bd krogs：实例关闭必须摘掉装配期写入的两个进程级全局 dialer 槽。
+    mod global_dialer_slots {
+        use std::{
+            future::Future,
+            io,
+            pin::Pin,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+        };
+
+        use xray_app_dns::dial::{DnsStream, QueryDialer, UdpPacketSession};
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
+        use xray_transport::{
+            connection::Connection, sockopt::SocketOptions, system_dialer::dial_system,
+        };
+
+        use super::{CountingFeature, Instance};
+
+        /// 惰性假 DNS 拨号器：本测试只关心槽内引用身份，从不真拨号。
+        struct InertDialer;
+
+        impl QueryDialer for InertDialer {
+            fn dial_tcp(
+                &self,
+                _dest: &Destination,
+            ) -> Pin<Box<dyn Future<Output = io::Result<DnsStream>> + Send + '_>> {
+                Box::pin(async { Err(io::Error::other("inert dialer")) })
+            }
+
+            fn dial_udp(
+                &self,
+                _dest: &Destination,
+            ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn UdpPacketSession>>> + Send + '_>>
+            {
+                Box::pin(async { Err(io::Error::other("inert dialer")) })
+            }
+        }
+
+        /// 装一个「记录被触达次数」的 DialerProxy 钩子，返回计数句柄。
+        fn install_counting_hook() -> Arc<AtomicUsize> {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&calls);
+            xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
+                move |_tag: &str, _dest: &Destination| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Err::<Box<dyn Connection>, io::Error>(io::Error::other(
+                            "stale hook from a closed instance was reached",
+                        ))
+                    })
+                },
+            ));
+            calls
+        }
+
+        /// 走一次 dialerProxy 拨号：只会命中全局钩子，或直接报「无 outbound manager」。
+        async fn probe_dialer_proxy() {
+            let sockopt = SocketOptions {
+                dialer_proxy: "krogs-closed-instance".into(),
+                ..Default::default()
+            };
+            let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1));
+            let _ = dial_system(&dest, &sockopt).await;
+        }
+
+        fn instance_with_one_feature() -> Instance {
+            let mut inst = Instance::new();
+            inst.add_feature(Arc::new(CountingFeature {
+                name: "krogs",
+                start_count: Arc::new(AtomicUsize::new(0)),
+                close_count: Arc::new(AtomicUsize::new(0)),
+                start_fails: false,
+            }))
+            .expect("add feature");
+            inst
+        }
+
+        /// 断言「本实例装配的槽值已从全局摘除」。
+        ///
+        /// 用引用身份而非绝对空态：两槽是进程级全局，本测试二进制里
+        /// `functions.rs` 的 start_full 测试与 `outbound.rs` 的 register_outbounds
+        /// 测试会在并行线程改写它们——他测写入不改变本结论，绝对空态断言反而假红。
+        fn assert_dialer_slot_released(ours: &Arc<dyn QueryDialer>, who: &str) {
+            if let Some(installed) = xray_app_dns::dial::shared_dialer() {
+                assert!(
+                    !Arc::ptr_eq(&installed, ours),
+                    "{who} close 后其 DNS 共享 dialer 仍被全局槽钉住"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn close_releases_process_global_dialer_slots() {
+            // 实例 A：模拟装配期写入两槽（生产写点 functions.rs set_shared_dialer /
+            // outbound.rs register_outbounds → set_dialer_proxy_hook）后关闭。
+            let a_dialer: Arc<dyn QueryDialer> = Arc::new(InertDialer);
+            xray_app_dns::dial::set_shared_dialer(Some(Arc::clone(&a_dialer)));
+            let a_hook_calls = install_counting_hook();
+
+            let mut a = instance_with_one_feature();
+            a.start().expect("instance A starts");
+            a.close().expect("instance A closes");
+            a.close().expect("close 幂等：重复关闭仍 Ok");
+
+            assert_dialer_slot_released(&a_dialer, "A");
+            probe_dialer_proxy().await;
+            assert_eq!(
+                a_hook_calls.load(Ordering::SeqCst),
+                0,
+                "A close 后其 DialerProxy 钩子仍可被拨号触达（全局槽未摘）"
+            );
+
+            // 实例 B：A 摘槽后新建实例装配自己的值，close 同样必须摘除——
+            // A 的残留既不遮蔽 B 的写入，也不被 B 继承。
+            let b_dialer: Arc<dyn QueryDialer> = Arc::new(InertDialer);
+            xray_app_dns::dial::set_shared_dialer(Some(Arc::clone(&b_dialer)));
+            let b_hook_calls = install_counting_hook();
+
+            let mut b = instance_with_one_feature();
+            b.start().expect("instance B starts");
+            b.close().expect("instance B closes");
+
+            assert_dialer_slot_released(&b_dialer, "B");
+            probe_dialer_proxy().await;
+            assert_eq!(
+                b_hook_calls.load(Ordering::SeqCst),
+                0,
+                "B close 后其 DialerProxy 钩子仍可被拨号触达（全局槽未摘）"
+            );
+        }
     }
 }
 

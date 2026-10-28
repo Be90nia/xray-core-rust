@@ -544,7 +544,7 @@ pub fn set_dialer_proxy_hook(hook: DialerProxyHook) {
     *DIALER_PROXY_HOOK.write() = Some(hook);
 }
 
-/// 清除钩子（测试隔离用）。
+/// 清除钩子（`Instance::close` 停机时摘除全局引用；测试隔离同用）。
 pub fn clear_dialer_proxy_hook() {
     *DIALER_PROXY_HOOK.write() = None;
 }
