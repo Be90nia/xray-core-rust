@@ -4346,6 +4346,10 @@ async fn spawn_unix_inbound(
         ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
     }
     let plugin_ctx = std::sync::Arc::new(ctx_builder);
+    // 各协议 arm 的 `move` 闭包会把 plugin_ctx 搬走；末尾 spawn_inbound_serve
+    // 仍需一句柄（同一 PluginContext 实例）→ 提前留一份克隆
+    // （E0382：Unix 构建红点，Windows 编译不到本函数故本地不复现）。
+    let serve_ctx = Arc::clone(&plugin_ctx);
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
@@ -4602,7 +4606,7 @@ async fn spawn_unix_inbound(
         _ => unreachable!("uds protocol support checked above"),
     };
 
-    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, serve)))
+    Ok(Some(spawn_inbound_serve(&serve_ctx, ib.tag.clone(), shutdown_token, serve)))
 }
 
 /// transport 协议 + unix 路径 inbound（bd lfrg 收尾）。
