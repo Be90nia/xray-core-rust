@@ -128,13 +128,19 @@ index 2653ef5..f10ff7a 100644
 | run | commit | 结论 | 说明 |
 |---|---|---|---|
 | `40619856068` **Interop** | `6505b538` | ✅ **success（全 job 绿）** | `Workspace lib tests` ✓ + `Interop tests (54)` ✓ + 两平台（ubuntu-24.04 / macos-14）✓ —— 栈溢出红点已实证消除 |
-| `40619856083` CI | `6505b538` | 部分绿 | Docs ✓ / Clippy ✓ / Build(linux) ✓ / Build(darwin) ✓ / Test(windows,tun) ✓ / Format ✓ / Proto Gate ✓ / Asset Gate ✓ / Security ✓；Windows 构建 ✗（第二层根因：cp1252 编码崩 print，已在 `fd1a258e` 修，**因上游闸未能复验**）；Test 当时仍在跑 |
+| `40619856083` CI | `6505b538` | 部分绿 | Docs ✓ / Clippy ✓ / Build(linux) ✓ / Build(darwin) ✓ / Test(windows,tun) ✓ / Format ✓ / Proto Gate ✓ / Asset Gate ✓ / Security ✓；**Test job 的 `cargo test --workspace`（第 9 步，即原栈溢出红点所在步）✓ success**，`--release` 步（第 10 步）交班时仍在跑；Windows 构建 ✗（第二层根因：cp1252 编码崩 print，已在 `fd1a258e` 修，**因上游闸未能复验**） |
 | `40624114479` CI | `fd1a258e` | ✗（上游闸，非本仓代码） | 12 job 秒红，统一报 `udf-frame a9a3974a… 上游 CI 有红项——按双向依赖模型闸门拒绝消费` |
 | `40619154187` Interop | `e6f9d74d` | ✗（栈溢出，修复前） | 基线对照 |
 
 - 绿了的 Interop run URL：https://github.com/Be90nia/xray-core-rust/actions/runs/40619856068
+- CI 部分绿 run（Test 第 9 步 `cargo test --workspace` success）：https://github.com/Be90nia/xray-core-rust/actions/runs/40619856083
 - CI run URL（待上游闸解除后复跑）：https://github.com/Be90nia/xray-core-rust/actions/runs/40624114479
 - 基线红项 run：CI `40616781734`、Interop `40616781761`（任务书给的 `40604957959` / `40614689574` 在 API 上 404，不存在）。
+
+### 4.3 附：本仓侧可核对的「图谱/沉淀」
+
+- 图谱（codebase-memory）：本仓项目键 `D-Project-Xray-core-rust`，`index_status` 显示**仓内已有 2440 文件未索引**（pre-existing 滞后，非本次改动造成）；`index_repository` 只有 full/moderate/fast 仓级模式、无文件级增量，跑仓级重索引会重写 `.codebase-memory/graph.db.zst`、与并发审计代理争用，故本轮未跑（越界 + 风险）。
+- 通用经验已沉淀 3 条到全局规则（非项目化）：`github-actions.md`（VS 2026 runner 镜像 → cmake 生成器名失效）、`common-windows.md`（Python print 中文崩在 cp1252 代码页 → 构建假红）、`rust-pitfalls.md`（async fn 大栈数组把 future 撑大 → 构造期临时量击穿 2MiB 栈）。
 
 ## 六、5 维自评
 
