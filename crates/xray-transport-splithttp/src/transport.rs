@@ -11,6 +11,7 @@
 //! 本文件把 hub handler 接到 h3/TCP 两种监听形态上。
 
 use std::{
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
@@ -821,13 +822,15 @@ async fn listen_h3(
     crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（QUIC accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
-    )]
-    let _accept_task = tokio::spawn(async move {
+    // accept 循环托管（bd x2ywg）：panic 后 endpoint clone 仍留在 listener 句柄里，
+    // UDP 端口保持绑定但永不 accept——监听的死必须留痕（accept_policy 铁律 3）。
+    spawn_supervised_h3_accept(local, async move {
         while let Some(incoming) = endpoint.accept().await {
             let ctx = Arc::clone(&ctx);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务，FxScope 迁移收口见 bd 39hko"
+            )]
             tokio::spawn(async move {
                 let conn = match incoming.await {
                     Ok(c) => c,
@@ -838,6 +841,24 @@ async fn listen_h3(
         }
     });
     Ok(Box::new(SplithttpListener { local, tcp_abort: None, h3_endpoint: Some(listener_endpoint) }))
+}
+
+/// H3 accept 循环 spawn + 意外退出监督（bd x2ywg）。
+///
+/// 循环唯一合法退出是 listener `close()`（endpoint 关闭 → `accept` 返回 `None`）；
+/// panic 则监听静默消失——endpoint 的另一 clone 留在 `SplithttpListener` 里，
+/// UDP 端口仍绑定但永不 accept（`accept_policy` 铁律 3：意外退出必须 `error!` 留痕）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层；QUIC accept 循环 + 其意外退出监控，FxScope 迁移收口见 bd 39hko"
+)]
+fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> + Send + 'static) {
+    let accept_task = tokio::spawn(body);
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "splithttp-h3",
+        local.to_string(),
+        accept_task,
+    ));
 }
 
 /// 单个 QUIC 连接：h3 server handshake → accept 请求循环。
@@ -1101,6 +1122,85 @@ mod tests {
     };
 
     use super::*;
+
+    /// 捕获日志 (级别, message)：xray-transport-splithttp 无 tracing-subscriber
+    /// dev-dep（不动 Cargo.toml），手写最小 Subscriber 足够断言留痕。
+    struct CaptureLogs(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureLogs {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MsgVisitor(String);
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0.push_str(value);
+                    }
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            let mut v = MsgVisitor(String::new());
+            event.record(&mut v);
+            let line = format!("{} {}", event.metadata().level(), v.0);
+            self.0.lock().expect("log capture lock").push(line);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// x2ywg 判别器：H3 accept 循环 panic 后必须 error! 留痕（否则 endpoint clone
+    /// 留在 listener 里 = 端口仍绑、永不 accept、零线索）。删掉
+    /// [`spawn_supervised_h3_accept`] 里的 `supervise_accept_loop` → 本测试红。
+    #[tokio::test]
+    async fn h3_accept_loop_panic_is_reported() {
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        let addr: SocketAddr = "127.0.0.1:8443".parse().expect("addr");
+        spawn_supervised_h3_accept(addr, async { panic!("h3 accept loop exploded") });
+        // 监督 task 与被监督 task 的调度次序不确定：墙钟截止轮询等到监控落日志
+        // （取时走 clock 端口，裸 Instant::now 被 lint 禁）
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
+        loop {
+            if !logs.lock().expect("log capture lock").is_empty() {
+                break;
+            }
+            assert!(
+                xray_frame::compat::clock().now_instant() < deadline,
+                "accept 循环 panic 无任何日志 = 静默死亡（端口仍绑、永不 accept）"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let got = logs.lock().expect("log capture lock");
+        assert!(
+            got.iter().any(|m| m.contains("ERROR")
+                && m.contains("splithttp-h3")
+                && m.contains("127.0.0.1:8443")
+                && m.contains("h3 accept loop exploded")),
+            "意外退出必须 error 级留痕（含 tag/local/panic 摘要），实际: {got:?}"
+        );
+    }
 
     /// 服务端 h2 keep-alive PING 接线（wp9o 形态：hyper server http2 Builder
     /// 无配置 getter——断言常量值 + setter 链可调用；不 serve）。

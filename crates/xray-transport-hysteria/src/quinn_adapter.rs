@@ -16,6 +16,7 @@
 //! Cargo.toml 启用。`connection.send_datagram` / `read_datagram` 才可用。
 
 use std::{
+    future::Future,
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
@@ -430,6 +431,28 @@ impl QuinnListenerFactory {
     }
 }
 
+/// QUIC accept 循环 spawn + 意外退出监督（bd x2ywg）。
+///
+/// 循环唯一合法退出是 listener `close()`（endpoint 关闭 → `accept` 返回 `None`）；
+/// panic 则监听静默消失——endpoint 的另一 clone 留在 listener 句柄里，UDP 端口
+/// 仍绑定但永不 accept，且无任何日志（`accept_policy` 铁律 3：意外退出必须
+/// `error!` 留痕）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "数据面连接任务（hysteria QUIC accept 泵）+ 其意外退出监控；迁 FxScope 待 bd 39hko"
+)]
+fn spawn_supervised_accept_loop(
+    local: SocketAddr,
+    body: impl Future<Output = ()> + Send + 'static,
+) {
+    let accept_task = tokio::spawn(body);
+    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
+        "hysteria-quic",
+        local.to_string(),
+        accept_task,
+    ));
+}
+
 impl HysteriaListenerFactory for QuinnListenerFactory {
     fn listen(
         &self,
@@ -504,12 +527,9 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // None，循环自然退出。 CC：每连接独立 slot（quinn 无 post-handshake 换 CC
             // API，用 accept_with 给每个 incoming 配带独立 swappable factory 的
             // transport config）。
+            let local = endpoint.local_addr().unwrap_or(bind_addr);
             let ep = endpoint.clone();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39hko"
-            )]
-            tokio::spawn(async move {
+            spawn_supervised_accept_loop(local, async move {
                 while let Some(incoming) = ep.accept().await {
                     let validator = validator.clone();
                     let on_new_conn = on_new_conn.clone();
@@ -1144,6 +1164,85 @@ mod masq_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 捕获日志 (级别, message)：xray-transport-hysteria 无 tracing-subscriber
+    /// dev-dep（不动 Cargo.toml），手写最小 Subscriber 足够断言留痕。
+    struct CaptureLogs(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureLogs {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _a: &tracing::span::Id, _b: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct MsgVisitor(String);
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0.push_str(value);
+                    }
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            let mut v = MsgVisitor(String::new());
+            event.record(&mut v);
+            let line = format!("{} {}", event.metadata().level(), v.0);
+            self.0.lock().expect("log capture lock").push(line);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// x2ywg 判别器：QUIC accept 循环 panic 后必须 error! 留痕（否则 endpoint
+    /// clone 留在 listener 里 = 端口仍绑、永不 accept、零线索）。删掉
+    /// [`spawn_supervised_accept_loop`] 里的 `supervise_accept_loop` → 本测试红。
+    #[tokio::test]
+    async fn quic_accept_loop_panic_is_reported() {
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(CaptureLogs(std::sync::Arc::clone(&logs)));
+        let addr: SocketAddr = "127.0.0.1:9527".parse().expect("addr");
+        spawn_supervised_accept_loop(addr, async { panic!("hysteria accept loop exploded") });
+        // 监督 task 与被监督 task 的调度次序不确定：墙钟截止轮询等到监控落日志
+        // （取时走 clock 端口，裸 Instant::now 被 lint 禁）
+        let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
+        loop {
+            if !logs.lock().expect("log capture lock").is_empty() {
+                break;
+            }
+            assert!(
+                xray_frame::compat::clock().now_instant() < deadline,
+                "accept 循环 panic 无任何日志 = 静默死亡（端口仍绑、永不 accept）"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let got = logs.lock().expect("log capture lock");
+        assert!(
+            got.iter().any(|m| m.contains("ERROR")
+                && m.contains("hysteria-quic")
+                && m.contains("127.0.0.1:9527")
+                && m.contains("hysteria accept loop exploded")),
+            "意外退出必须 error 级留痕（含 tag/local/panic 摘要），实际: {got:?}"
+        );
+    }
 
     /// 确保 rustls CryptoProvider 在并行测试中只初始化一次
     fn ensure_crypto_provider() {
