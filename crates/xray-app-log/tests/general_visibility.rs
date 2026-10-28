@@ -168,3 +168,41 @@ fn unknown_level_gate_shows_warning_hides_info() {
     assert!(text.contains("[test] unknown-gated warning"), "Unknown 门应按 Warning 放行: {text}");
     assert!(!text.contains("[test] unknown-gated info"), "Unknown 门应滤掉 info: {text}");
 }
+
+/// 装配纪律回归（udf 通道契约：先 `register` 后 `set_level`）：sink 注册那一刻的
+/// `level()` 只是槽位初值，**此后每次换级都必须同步写回槽位**——emit 门读的是
+/// 槽位原子而非 `ChannelSink::level()`。免重注换激活期（进程级槽位不注销）是本
+/// 仓库唯一形态，故门随每次 `install` 换向必须逐次生效：Info 门放行 info，换
+/// Warning 门后同一进程内立刻滤掉 info、仍放行 warning。
+#[test]
+fn each_activation_installs_its_own_gate() {
+    let _serial = serial();
+    let buf = capture();
+    buf.clear();
+
+    let info_instance = LogInstance::new(LogConfig {
+        error_log_type: LogType::Console,
+        error_log_level: SeverityLevel::Info,
+        ..LogConfig::default()
+    })
+    .expect("default mask parses");
+    info_instance.start(&registry()).expect("console handler: start Ok");
+    xray_common::log::info("[test] info-gate info");
+    info_instance.close();
+    let text = buf.text();
+    assert!(text.contains("[test] info-gate info"), "Info 门应放行 info: {text}");
+
+    let warn_instance = LogInstance::new(LogConfig {
+        error_log_type: LogType::Console,
+        error_log_level: SeverityLevel::Warning,
+        ..LogConfig::default()
+    })
+    .expect("default mask parses");
+    warn_instance.start(&registry()).expect("console handler: start Ok");
+    xray_common::log::info("[test] warn-gate info");
+    xray_common::log::warning("[test] warn-gate warn");
+    warn_instance.close();
+    let text = buf.text();
+    assert!(text.contains("[test] warn-gate warn"), "Warn 门应放行 warning: {text}");
+    assert!(!text.contains("[test] warn-gate info"), "Warn 门应滤掉 info: {text}");
+}

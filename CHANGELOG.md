@@ -33,6 +33,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **通用 general 日志全族被静默滤空**（夜间实证，非 flake）：udf `ChannelRegistry` 的级别门只在 `register()` 时按 `sink.level()` 播种一次，而全局 general 壳注册那一刻恒为 `Off` → `xray_common::log::{debug,info,warning,error}` 全族（**生产同样**）被槽位原子永久滤掉；全仓 `set_level(` 调用者 0 处。修：`GlobalGeneralSink::install()` 在「自己持有槽位」时同步 `channels().set_level(...)`（关闭传 `Off`），新增 `each_activation_installs_its_own_gate` 回归
+- **HTTP 明文代理请求被 CDN 判「未完成」→ 图标全灰**（bd `os438`）：`handle_plain_http` 请求转发完成后立刻 `up_w.shutdown()`（FIN），CDN 收到「请求后立即 FIN」直接关连接不回响应，内核合成 503。修：半关推迟到 `relay_response_phase` 之后（Go `handlePlainHTTP` 语义，wire 不变）；同批对齐 1xx 透传、Host 头拒收、请求阶段失败分流 503/断链（`x23tr`/`g3mvq`/`e0gos`），对拍与 Go 相同面 29→37、差异 8→2
+- **hysteria 出站私有 `insecure` 键绕过证书校验**（bd `qp0ya`）：改走仓库唯一 TLS 入口 `build_client_config`（私有键按未知键忽略 = 校验恒开，对齐 Go `allowInsecure` 硬错语义）；dist interop 脚本改用 `pinnedPeerCertSha256`
+- **xhttp packet-up 上行被钉在 `chunk/RTT`**（bd `bnd8n`）：每 POST 等完整 200 OK 才发下块 → 天花板 ~40Mbps。改 Go 式流水线（JoinSet + Semaphore(4) 限在飞，单 POST 上限回到 `scMaxEachPostBytes`），包序/失败终止语义保持
+- **慢 peer 下用户态内存无界增长**（bd `f0j08` + `sp1gi`）：xmc 与 udphop 的 `unbounded_channel` 两泵解耦改为有界 1 + `.send().await` 背压
+- **SOCKS5 UDP ASSOCIATE 不校验来源**（bd `wq16g`，安全）：接入 `TempUdpRelay`（该实现此前不在 mod 树、从未编译），非客户端源帧一律丢弃；真机 e2e 修前可注入/劫持
+- **实例关闭不摘进程级全局 dialer 槽**（bd `krogs`）：`Instance::close` 在早返回前摘 `set_shared_dialer(None)` + `clear_dialer_proxy_hook()`
+- **分配站点归因跨 `.await` 失真**（bd `a65px`）：线程局部标记跨线程丢失并残留（`buf_read` 假占 cli 侧 96%）。新增未来域 `alloc_site::scope(site, fut)`；受控流量实测 cli `buf_read` 96.2%→10.1%、srv 59.6%→3.0%
+- **定时器 tick 语义与 Go 分叉**（bd `eokz7`）：20 处 `tokio::time::interval` 漏设 `MissedTickBehavior`（tokio 默认 Burst 补发，Go ticker 丢 tick 不补发）→ 统一 `Skip`
+- **裸 `tracing::*!` 绕过掩码 / `policy.system.buffer` 死配置 / dialer keepalive 符号语义**（bd `kyy50`）：落盘前统一过 `MaskingMakeWriter`；`system.buffer` 改装配期 fail-visible 拒启；keepalive 对齐 Go `system_dialer.go:105-126`
+- **hysteria QUIC 与 splithttp h3 的 accept 循环无监督**（bd `x2ywg`）：panic 后端口仍绑定但永不 accept（静默僵尸）→ 接入 `accept_policy::supervise_accept_loop`
+- **`framework-assembly` 特性路径丢失 freedom 默认 BlockPrivate 兜底**（bd `v787x`）：补 `inbound_default_rules` 注入
+- **geodata 资产名可路径穿越**（bd `20aie` S-06）：接入 `validate_local_name`（Go `filepath.IsLocal` 等价）
+- **DNS 上游查询失败零日志**（bd `lvjw1`）/ **SOCKS 认证失败回显攻击者可控用户名**（bd `b6tt6`）/ **mixed 入站漏 SOCKS4**（bd `971x5`）
+- **spawn 台账收口**（bd `f17zu` + `hj3jf`）：无 reason 站点 9→0，丢 JoinHandle 99→94（5 处迁 `spawn_detached`），悬置表述 99 处清零
+- **udf 上游 API 漂移致 CI 全红**（bd `mtg4x`）：适配 `FxScope::spawn`→`spawn_tracked`（85 处/42 文件，含 2 处 `cfg(unix)` 块）、`udf-std-ext` 开 `json` feature、`EffectId::new/get` 封口
+
 - **P1 停机不掐在途连接**（bd `a9xgp`）：`shutdown_token().cancel()` 与 `Instance::close()` 原先只停 accept 层——实测在途长连接在 cancel 后 2s 内仍以 8MB/s 中继 1.29–1.54MB，`close()` 1.3ms 返回后继续回传 1.25MB。根因：`ArmScope::close()` 全仓零调用点 + `child_of` 监视任务持父 Arc 锚 → 级联在停机形态下结构性不可达。修：`xray-frame::ArmScopeRegistry`（装配序 Vec + 逆序 close，登记点收敛到 `spawn_inbound_serve` 唯一漏斗，表属主 `Instance`）+ serve 壳双臂 select（token cancel → `ArmScope::shutdown_timeout(5s)`：广播 → ConnScope 级联 → `abort_all` + 有界排空）。**闸门测试 `shutdown_token_cancel_terminates_inflight_long_connection` 3/3 绿（0.03–0.04s 终止，修复前永不终止）**；过程中修掉一个真竞态（`select!` 双臂随机裁决会跳过级联，join 臂改为 token 已取消时兜底排空）
 - **测试端口探测 TOCTOU**（53 处 `crates/` + 约 55 处 `tests/`）：`bind(:0) → drop → 被测方再绑` 在窗口期被并行测试抢走（全量 `--workspace` 下确定性偶发 `os error 10048`）。统一收口为 `xray_common::testing::{pick_free_ports(n), is_addr_in_use_err}` + 换端口重试；**顺带修掉真 bug——旧 helper 用 `"in use"` 字符串匹配，中文 Windows 错误文本是「只允许使用一次」→ 永不命中**。断言零改动、零新增 sleep
 - **栈足迹回归**（W5 发现，W4 扩面复核）：`BudgetDeadline::timeout`（**async-fn 形态**）在巨型 future 内加厚栈帧 → `vmess_inbound_udp_relay_e2e` 确定性 `STATUS_STACK_OVERFLOW`（HEAD 版 PASS，三步单变量取证）；改**构造式** `deadline::timeout(fut, remaining())`（具名 `Timeout<F>`，与裸调用同体积）；vmess 3 + vless 5 + core UDP relay 4 处统一。框架结论：**构造式 = 默认正确形态，async-fn = 便利形态有栈代价**

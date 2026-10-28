@@ -9,7 +9,7 @@ use std::{
     io::Write,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -614,6 +614,9 @@ struct GlobalGeneralSink {
     outlets: RwLock<Arc<Vec<Arc<dyn LogHandler>>>>,
     /// 等级门（`error_log_level` 口径；registry 侧滤，不计丢弃）。
     level: RwLock<log::LevelFilter>,
+    /// 槽位所有权：`register_channel` 成功者才同步槽位级别门；他处（如测试的
+    /// 自建 capture sink）占用 General 槽时禁改写他人的门。
+    owns_slot: AtomicBool,
 }
 
 impl GlobalGeneralSink {
@@ -621,6 +624,7 @@ impl GlobalGeneralSink {
         Arc::new(Self {
             outlets: RwLock::new(Arc::new(Vec::new())),
             level: RwLock::new(log::LevelFilter::Off),
+            owns_slot: AtomicBool::new(false),
         })
     }
 
@@ -628,6 +632,12 @@ impl GlobalGeneralSink {
     fn install(&self, outlets: Vec<Arc<dyn LogHandler>>, level: log::LevelFilter) {
         *self.level.write() = level;
         *self.outlets.write() = Arc::new(outlets);
+        // udf 通道契约「先 register 后 set_level」：槽位级别只在 register 时读一次
+        // sink 初值（本壳注册那一刻恒为 `new()` 的 Off），而 emit 门读的是槽位
+        // 原子、不是 `Self::level()`——不同步写回则散装 general 全族被永久滤空。
+        if self.owns_slot.load(Relaxed) {
+            xray_common::log::channels().set_level(Channel::General, level);
+        }
     }
 }
 
@@ -662,6 +672,8 @@ static GLOBAL_GENERAL_SINK: std::sync::LazyLock<Arc<GlobalGeneralSink>> =
             at_warning(&LogError::HandlerCreate(format!(
                 "global general sink register failed: {e}"
             )));
+        } else {
+            sink.owns_slot.store(true, Relaxed);
         }
         sink
     });
