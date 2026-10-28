@@ -91,7 +91,7 @@ impl SessionHistory {
         // pub new/with_ttl 契约 + 全部测试构造点（测试面不动），故留台账。
         #[allow(
             clippy::disallowed_methods,
-            reason = "SessionHistory 纯数据结构无 ctx 注入面；过期判定的单调钟读数（713x6 台账：结构性不可达）"
+            reason = "SessionHistory 纯数据结构无 ctx 注入面；过期判定的单调钟读数（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
         )]
         let now = Instant::now();
         if inner.len() >= RETAIN_THRESHOLD {

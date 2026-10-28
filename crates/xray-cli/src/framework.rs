@@ -1107,10 +1107,11 @@ mod tests {
         });
     }
 
-    /// 失败记账：未迁移族（shadowsocks）出站条目 → 桥转换逐条计数失败（不静默
-    /// 覆盖、不伪造成功）；入站面照常（InboundDispatchHandler tag 面不依赖族）。
+    /// 失败记账：族转换失败（ss 出站族在场但未 build → `built_outbound` fail-visible）
+    /// → 桥逐条计数失败（不静默覆盖、不伪造成功）；入站面照常
+    /// （InboundDispatchHandler tag 面不依赖族）。
     #[test]
-    fn bridge_fill_counts_failures_for_unmigrated_family() {
+    fn bridge_fill_counts_failures_for_failed_family_conversion() {
         let mut built = xray_conf::BuiltConfig::default();
         built.outbounds.push(outbound_entry("shadowsocks", "ss-out", b"{}"));
         built.inbounds.push(BuiltInbound {
@@ -1123,8 +1124,8 @@ mod tests {
         });
 
         let plan = derive_families(&built);
-        assert_eq!(plan.families.len(), 1, "only socks has a plugin family");
-        assert_eq!(plan.unregistered, vec!["shadowsocks".to_string()]);
+        assert_eq!(plan.families.len(), 2, "shadowsocks outbound + socks inbound derived");
+        assert!(plan.unregistered.is_empty(), "unregistered: {:?}", plan.unregistered);
 
         let dispatcher = Arc::new(DefaultDispatcher::new());
         let fill = fill_bridge(&built, &plan.families, &dispatcher);
@@ -1132,8 +1133,8 @@ mod tests {
         assert_eq!(fill.failed.len(), 1);
         assert_eq!(fill.failed[0].0, "ss-out");
         assert!(
-            fill.failed[0].1.contains("shadowsocks"),
-            "failure reason must name the family: {}",
+            fill.failed[0].1.contains("not built"),
+            "failure reason must name the cause: {}",
             fill.failed[0].1
         );
         assert!(fill.bridge.get("socks-in").is_some());

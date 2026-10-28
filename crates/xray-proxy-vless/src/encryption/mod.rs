@@ -434,7 +434,7 @@ impl ClientInstance {
                 // Clock 需改 pub init 契约 + 测试构造点（测试面不动）。
                 #[allow(
                     clippy::disallowed_methods,
-                    reason = "0-RTT ticket TTL 判定；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达）"
+                    reason = "0-RTT ticket TTL 判定；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
                 )]
                 if Instant::now() < expire && pfs_key.len() == 64 {
                     let iv_and_relays_len = 16 + self.relays_length;
@@ -635,7 +635,7 @@ impl ClientInstance {
                 .map_err(|_| VlessError::Other("ticket plaintext not 16 bytes".into()))?;
             #[allow(
                 clippy::disallowed_methods,
-                reason = "0-RTT ticket expire 写入；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达）"
+                reason = "0-RTT ticket expire 写入；ClientInstance 纯协议结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
             )]
             let expire = Instant::now() + std::time::Duration::from_secs(server_seconds as u64);
             // 单写锁原子更新三字段（原三把写锁各自持放，读者可观察到中间态）

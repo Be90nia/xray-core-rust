@@ -190,7 +190,7 @@ impl QuinnConnectionPool {
         // 无 PluginContext 注入面，迁 Clock 需改 pub 池构造契约。
         #[allow(
             clippy::disallowed_methods,
-            reason = "池条目建链时戳；纯结构无 ctx 注入面（713x6 台账：结构性不可达）"
+            reason = "池条目建链时戳；纯结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
         )]
         let pooled = PooledConnection {
             conn,

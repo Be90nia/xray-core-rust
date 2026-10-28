@@ -1,4 +1,5 @@
-#![allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr)] // 仅测试诊断（tap2/tap3/chop 现场打印），生产路径无 print
+// 仅测试诊断（tap2/tap3/chop 现场打印）；生产面裸 print/tracing 宏 0 处，豁免面收窄到 cfg(test)
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
 //! XTLS-Vision 连接包装（对应 Go `proxy/proxy.go` 的 VisionReader/VisionWriter）。
 //!
 //! 在 [`CommonConn`]（AEAD 加密层）之上提供 Vision padding：

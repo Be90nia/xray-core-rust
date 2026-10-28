@@ -1990,7 +1990,10 @@ mod tests {
                                 }
                                 req_bytes.fetch_add(mb.len(), Ordering::Relaxed);
                                 // XUDP 首帧需连续字节（P1 收口点，同 dispatcher EchoHandler）
-                                #[allow(clippy::disallowed_methods)]
+                                #[allow(
+                                    clippy::disallowed_methods,
+                                    reason = "XUDP 首帧需连续字节（协议缝）：扁平化后随单次写入交池化 MultiBuffer，非热路径逐块拷贝"
+                                )]
                                 let bytes = mb.to_vec();
                                 let mut out = xray_buf::multi::MultiBuffer::new();
                                 out.merge_bytes(&bytes);

@@ -35,7 +35,7 @@ impl PreConnEntry {
     /// 无 PluginContext 注入面，迁 Clock 需改 pub 结构契约。
     #[allow(
         clippy::disallowed_methods,
-        reason = "预连接条目建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）"
+        reason = "预连接条目建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
     )]
     fn new(seq: u64) -> Self {
         Self { created_at: Instant::now(), seq }
@@ -198,7 +198,7 @@ impl PreConnectPool {
     /// 对应 Go `ConnExpire` 定时器逻辑。
     #[allow(
         clippy::disallowed_methods,
-        reason = "过期清理的单调钟读数；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）"
+        reason = "过期清理的单调钟读数；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
     )]
     pub fn gc_expired(&self) -> usize {
         let now = Instant::now();

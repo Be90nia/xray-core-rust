@@ -590,7 +590,7 @@ impl AuthIDDecoderHolder {
             // `TimedUserValidator::new()` 无 PluginContext 注入面。
             #[allow(
                 clippy::disallowed_methods,
-                reason = "VMess 协议时间戳窗校验 wire 语义；纯结构无 ctx 注入面（713x6 台账：结构性不可达）"
+                reason = "VMess 协议时间戳窗校验 wire 语义；纯结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
             )]
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

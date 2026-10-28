@@ -33,7 +33,7 @@ impl ReverseConnState {
     #[must_use]
     #[allow(
         clippy::disallowed_methods,
-        reason = "反向隧道建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达）"
+        reason = "反向隧道建链时戳；纯逻辑模块无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
     )]
     pub fn new() -> Self {
         Self { active: true, established_at: Instant::now() }

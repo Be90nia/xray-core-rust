@@ -40,7 +40,10 @@ impl<T: Hash + Eq + Clone + Send + Sync> MapFilter<T, SystemClock> {
     /// 豁免理由：缺省路径的 `Instant::now()` 就是 `SystemClock::now_instant()` 的
     /// std 直通（同值同语义，见 `with_clock` 注入面），调换只会多一层泛型实例化；
     /// 热路径取时已全部走 `clock` 端口，测试期由 `MockClock` 冻结。
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "缺省路径 Instant::now = SystemClock::now_instant() 的 std 直通（同值同语义）；热路径取时已全走 clock 端口，测试经 with_clock 注入 MockClock"
+    )]
     #[must_use]
     pub fn new(interval_secs: u64) -> Self {
         Self {

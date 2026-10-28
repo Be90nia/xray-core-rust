@@ -160,7 +160,7 @@ impl ClientSession {
         // sealVMessAEADHeader time.Now() 对齐）；encoding 层纯 codec 无 ctx。
         #[allow(
             clippy::disallowed_methods,
-            reason = "VMess AEAD seal 时间戳 wire 字段；encoding 纯 codec 无 ctx 注入面（713x6 台账：结构性不可达）"
+            reason = "VMess AEAD seal 时间戳 wire 字段；encoding 纯 codec 无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
         )]
         let now =
             SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
