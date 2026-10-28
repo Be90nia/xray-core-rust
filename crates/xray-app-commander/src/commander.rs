@@ -597,7 +597,7 @@ impl Commander {
                 // 闸关不可达：内部 scope 无 close 调用（停机走 close() 的 handle.abort）。
                 let handle = self
                     .fx
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         if let Err(e) = router
                             .serve_with_incoming(
                                 tonic::codegen::tokio_stream::wrappers::UnixListenerStream::new(
