@@ -260,7 +260,7 @@ impl TcpUnixHubListener {
         let close_notify = Arc::new(Notify::new());
         let fx = Arc::new(FxScope::new());
         let loop_task = fx
-            .spawn(keep_accepting_unix(
+            .spawn_tracked(keep_accepting_unix(
                 inner,
                 path.to_string(),
                 add_conn,
@@ -268,7 +268,7 @@ impl TcpUnixHubListener {
             ))
             .expect("internal FxScope is never closed");
         // 意外退出监控（同 tcp 循环）：panic 静默杀监听——error! 兜底发声。
-        fx.spawn(supervise_accept_loop("tcp-unix", path.to_string(), loop_task.join()))
+        fx.spawn_tracked(supervise_accept_loop("tcp-unix", path.to_string(), loop_task.join()))
             .expect("internal FxScope is never closed");
         Ok(Self { close_notify, fx })
     }
