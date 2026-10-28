@@ -72,7 +72,7 @@ const MAX_INFLIGHT_POSTS: usize = 4;
 /// # 上行泵（Go `dialer.go:475-537` 等价物）
 ///
 /// `pipe.read` → 一块（≤ `sc_max_each_post_bytes`）→ 独立任务投递，最多
-/// [`MAX_INFLIGHT_POSTS`] 个在飞。seq 按投递顺序单调递增；乱序到达由服务端上传队列
+/// `MAX_INFLIGHT_POSTS` 个在飞。seq 按投递顺序单调递增；乱序到达由服务端上传队列
 /// （`scMaxBufferedPosts`）按 seq 重排，因此并发投递不改 wire 语义。
 ///
 /// # 简化点（vs Go 原版）
@@ -80,7 +80,7 @@ const MAX_INFLIGHT_POSTS: usize = 4;
 /// - **不做 upload_writer 大小限制**：直接 read pipe（Go 用 `pipe.WithSizeLimit` 强制 maxUploadSize
 ///   上限）；本实现由读缓冲长度封顶。
 /// - **背压用 in-flight 上限近似**：Go 对 `DefaultDialerClient` 只等请求字节写完（不等响应）， Rust
-///   侧 hyper `Full` body 无此回执——取值依据见 [`MAX_INFLIGHT_POSTS`]。
+///   侧 hyper `Full` body 无此回执——取值依据见 `MAX_INFLIGHT_POSTS`。
 ///
 /// # 参数
 ///

@@ -102,7 +102,7 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     /// 只读缓冲交出时返回 `Some`（h2/h3 等"数据到达即 `Bytes` 所有权"的传输）。
     ///
     /// 桥层拿到后跳过 AsyncRead → 池化缓冲的一次全量 memcpy
-    /// （[`xray_buf::Buffer::from_bytes_frozen`] 零拷贝接管所有权）。
+    /// （[`xray_buf::buffer::Buffer::from_bytes_frozen`] 零拷贝接管所有权）。
     ///
     /// 缺省 `None`：**包装层不得转发**——TLS/AEAD/vision 等层的数据不是
     /// "到达即可交付的明文"，直接透传会让上层读到密文/带协议头的字节。

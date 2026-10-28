@@ -684,7 +684,7 @@ async fn read_response_head(
 /// 4. `Content-Length: 0`（CL == 0 且状态允许 body）追加在排序头之后；
 /// 5. 空行结束头块。
 ///
-/// [`content_length`] 即 Go 的 `response.ContentLength`：`Some(n)`（>= 0）→
+/// `content_length` 即 Go 的 `response.ContentLength`：`Some(n)`（>= 0）→
 /// keep-alive 三头；`None`（-1，长度未知）→ close 语义。
 #[must_use]
 pub fn serialize_go_response_head(

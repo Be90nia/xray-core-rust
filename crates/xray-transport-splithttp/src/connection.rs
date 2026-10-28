@@ -71,7 +71,7 @@ impl<R, W> SplitConn<R, W> {
 
     /// 挂上下行零拷贝读腿（[`DownloadBody`] 的 `Reader` 视图）。
     ///
-    /// 桥层经 [`Connection::frozen_reader`] 取走后，下行直接吃 `Bytes`
+    /// 桥层经 [`xray_transport::connection::Connection::frozen_reader`] 取走后，下行直接吃 `Bytes`
     /// （`Buffer::from_bytes_frozen`），不再经 AsyncRead 拷进池化缓冲。
     pub fn set_frozen_reader(&self, reader: Box<dyn xray_buf::io::Reader>) {
         *self.frozen.lock() = Some(reader);
@@ -192,7 +192,7 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for MutexReader<R> {
 
 // ===== 下行 Bytes 流双视图（bd oarfu：h2/h3 body 零拷贝下行） =====
 
-/// 下行 Bytes 流的共享状态：`AsyncRead` 拷贝视图与零拷贝 [`Reader`] 视图共用。
+/// 下行 Bytes 流的共享状态：`AsyncRead` 拷贝视图与零拷贝 [`xray_buf::io::Reader`] 视图共用。
 struct BodyState<S> {
     stream: S,
     /// 已从流取出、尚未被消费的块。
@@ -209,7 +209,7 @@ pub struct BodyReader<S> {
     shared: Arc<BodyShared<S>>,
 }
 
-/// 下行流的**零拷贝** [`Reader`] 视图（`Connection::frozen_reader` 热路径）：
+/// 下行流的**零拷贝** [`xray_buf::io::Reader`] 视图（`Connection::frozen_reader` 热路径）：
 /// 每块 `Bytes` 直接包成 [`Buffer::from_bytes_frozen`]，无 memcpy、无池化分配。
 pub struct FrozenBodyReader<S> {
     shared: Arc<BodyShared<S>>,
@@ -314,7 +314,7 @@ impl<S: Stream<Item = io::Result<Bytes>> + Unpin + Send> xray_buf::io::Reader
 /// 下载流读端的双视图（[`crate::client::DefaultDialerClient::open_stream`] 返回）。
 ///
 /// - `copy`：`AsyncRead` 拷贝视图（`Connection::poll_read`，兜底/包装层用）；
-/// - `frozen`：零拷贝 [`Reader`] 视图（`Connection::frozen_reader`，桥层热路径用）。
+/// - `frozen`：零拷贝 [`xray_buf::io::Reader`] 视图（`Connection::frozen_reader`，桥层热路径用）。
 pub struct DownloadBody {
     /// 拷贝视图。
     pub copy: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
