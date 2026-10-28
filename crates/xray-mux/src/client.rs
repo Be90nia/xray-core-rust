@@ -667,6 +667,10 @@ impl ClientWorker {
     /// 对应 Go `monitor`（client.go:226-244）：
     /// - done → 关闭全部 session（carrier 管道由 factory 任务中断）
     /// - tick → 无会话且空闲 → 关闭 worker
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "interval_at 首参是 tokio Instant 类型位（非取时语义）：BudgetDeadline 不外露 tokio Instant，改写 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义；本 crate 无 ctx.clock() 注入面 → 待 Budget 补 timer-arm 面后迁"
+    )]
     async fn monitor(self: Arc<Self>) {
         let done = self.done_rx();
         // Go time.Ticker 首 tick 在 16s 后；tokio interval 首次立即触发，需偏移
@@ -674,7 +678,7 @@ impl ClientWorker {
         // 语义）——`BudgetDeadline` 不暴露 tokio Instant（`BudgetInstant` 私有），且
         // select 臂 ticker 改写成 deadline+pending 链会改变 missed-tick（Burst 补发）
         // 与 done 响应语义 = 非机械替换，方案面 3 风险节明令禁止 → 保留原形态。
-        // 本 crate 的 L3 闸未禁 `tokio::time::Instant::now`（只禁 std 面）→ 无需 allow。
+        // D8 起 L3 闸已禁 `tokio::time::Instant::now` → 本站由本项 allow 登记。
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + CLIENT_KEEPALIVE_INTERVAL,
             CLIENT_KEEPALIVE_INTERVAL,

@@ -17,4 +17,6 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "裸 spawn 逃逸 FxScope 生命周期记账（坑约束 #5）：一律走 FxScope/PluginContext::spawn；存量调用按分层登记；托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，否则逐点登记显式脱管）" },
     { path = "std::thread::spawn", reason = "裸线程逃逸托管与停机编排（坑约束 #5/#6）：确需 OS 线程的场景逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
     { path = "std::time::Instant::now", reason = "裸时钟源不可注入（时钟唯一源 = skeleton::clock::{Clock, SystemClock, MockClock}）：取时走 clock 端口，测试期才能冻结时间线" },
+    { path = "tokio::time::Instant::now", reason = "时钟唯一源 = skeleton::clock::{Clock}：ctx 可达走 ctx.clock()，不可达走 xray_frame::compat::clock()；tokio 虚拟钟预算面与 std 面禁混换，确需保留时逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记（D8 补齐）" },
+    { path = "std::time::SystemTime::now", reason = "时钟唯一源 = skeleton::clock::{Clock}：ctx 可达走 ctx.clock()，不可达走 xray_frame::compat::clock()；裸挂钟不可注入，取时走 clock.now_system()，确需保留时逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记（D8 补齐）" },
 ]

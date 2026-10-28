@@ -360,6 +360,10 @@ fn parse_post_handshake_record_lens(mut data: &[u8]) -> Vec<u32> {
 ///   [`parse_post_handshake_record_lens`] 解析。
 ///
 /// `None` = TCP/握手/克隆失败（对齐 Go 直接 return，由 spawn 层 defer 存空列表）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "读窗 deadline 必须与 timeout_at 同面（tokio Instant）；本探测是启动期独立任务，无 ctx.clock() 注入面且探测窗口不应被 mock 冻结 → 待 Budget 补 timer-arm 面后迁"
+)]
 async fn detect_one_record_lens_inner(
     dest: &str,
     server_name: &str,

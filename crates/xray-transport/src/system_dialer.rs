@@ -197,6 +197,10 @@ impl SystemDialer for DefaultSystemDialer {
 /// - 双栈时两族并发，回退族 [`FALLBACK_DELAY`] 后启动；主族先失败则回退族立即 启动（Go
 ///   `fallbackTimer.Reset(0)`）——某族地址静默丢包不再拖死整次拨号。
 /// - 全部失败时错误含每个尝试过的地址（[`all_addresses_failed`]）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "整次拨号预算锚点必须是 tokio::time::Instant（下游 dial_serial/dial_parallel 的 timeout 面与 tokio 虚拟钟对齐）；本 crate 无 ctx.clock() 注入面，compat::clock 只出 std Instant 面 → 待 Dialer 接 Clock 端口后迁"
+)]
 async fn dial_first_reachable(
     src: Option<SocketAddr>,
     addrs: &[SocketAddr],
@@ -241,6 +245,10 @@ where
 }
 
 /// 单族地址顺序拨号（Go `dialSerial`，net/dial.go:659-694）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "分片 deadline 与剩余预算取时必须是 tokio::time::Instant（与 dial_first_reachable 传入的 deadline 同面）；本 crate 无 ctx.clock() 注入面，compat::clock 只出 std Instant 面 → 待 Dialer 接 Clock 端口后迁"
+)]
 async fn dial_serial<F, Fut>(
     attempt: &F,
     addrs: &[SocketAddr],

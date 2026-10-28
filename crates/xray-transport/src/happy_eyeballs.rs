@@ -73,6 +73,10 @@ pub async fn tcp_race_dial(
 ///   task abort 直接关闭
 ///
 /// `make_attempt(idx)` 返回第 `idx` 个地址的拨号 future（被 spawn，需 `'static`）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "Sleep::reset 只收 tokio::time::Instant（deadline::Budget 刻意不外露绝对时刻）；tokio 虚拟钟面无法用 xray_frame::compat::clock（std Instant 面）取时，本 crate 亦无 ctx.clock() 注入面 → 待 Budget 补 timer-arm 面后迁"
+)]
 async fn race_dial<T, F, Fut>(
     addrs: &[SocketAddr],
     try_delay: Duration,

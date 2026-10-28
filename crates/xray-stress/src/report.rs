@@ -234,6 +234,10 @@ pub fn render_summary(
 }
 
 /// 时间戳（Unix 秒；不引 chrono，summary 只需可排序的完成时刻）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "报告完成时刻必须是真实挂钟（压测产物时间线要可跨进程排序）；本 crate 是独立 bin，无 ctx.clock() 注入面亦未接 compat::clock → 待压测工具接 Clock 端口后迁"
+)]
 fn unix_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

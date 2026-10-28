@@ -84,6 +84,10 @@ impl Sampler {
     /// 采样一次并追加 CSV。`elapsed` 为本次 run 已进行秒数。
     /// `drain=true` 时行标签写 `__drain__`（负载已停、基础设施保留的观察窗），
     /// 且不入 `samples_rss`——负载期泄漏判定不得被 drain 回落稀释。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "CSV 行时间戳是落盘产物的真实墙钟（跨机对账用；mock 钟会破时间线）；本 crate 是独立 bin，无 ctx.clock() 注入面亦未接 compat::clock → 待压测工具接 Clock 端口后迁"
+    )]
     pub fn sample_once(
         &mut self,
         elapsed: f64,

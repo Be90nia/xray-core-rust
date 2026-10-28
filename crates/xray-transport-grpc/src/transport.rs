@@ -261,6 +261,10 @@ async fn connect_once(
 /// Go dial.go:93-101 `ConnectParams` 退避延迟：BaseDelay(500ms) × Multiplier(1.5)^n
 /// 封顶 MaxDelay(19s)，再乘 (1 + Jitter(0.2) × (2×rand−1)) ∈ [0.8, 1.2]
 /// （grpc-go `backoff.Backoff` 顺序：先封顶后加抖动）。n=0 为首次失败后的延迟。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "抖动源刻意取真实挂钟纳秒（只为打散重连风暴，mock 钟会把抖动钉成常量 → 重连尖峰回归）；本函数无 ctx.clock() 注入面 → 待 grpc 拨号接 Clock 端口后迁"
+)]
 fn grpc_backoff_delay(attempt: u32) -> std::time::Duration {
     const BASE_DELAY: f64 = 0.5;
     const MULTIPLIER: f64 = 1.5;

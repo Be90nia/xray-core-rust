@@ -136,6 +136,10 @@ impl ActivityTimer {
     ///
     /// 每次收到活动通知会重置超时计时。
     /// 此方法应在一个独立的 tokio 任务中运行。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "sleep_until 的 deadline 必须是 tokio 虚拟钟 Instant（Clock 只出 std Instant，tokio::time::sleep_until 不接受 std 面；本 crate 无 PluginContext 注入面）→ 保留裸 tokio 锚点，待 tokio 面 Clock 桥接落地后迁"
+    )]
     pub async fn run(&self) {
         // Sliding window：每轮循环读当前 timeout（可被 set_timeout 重置），
         // 用 sleep_until 到 deadline。性能开销可忽略（每轮一次 sleep）。

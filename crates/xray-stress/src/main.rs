@@ -60,6 +60,10 @@ struct Args {
     drain_secs: u64,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "压测 run_id 需要真实挂钟（跨进程/跨机对账的唯一键；mock 钟会撞名）；本 crate 是独立 bin，无 ctx.clock() 注入面亦未接 compat::clock → 待压测工具接 Clock 端口后迁"
+)]
 fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()

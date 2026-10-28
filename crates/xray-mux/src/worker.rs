@@ -211,7 +211,7 @@ impl ServerWorker {
         let closed = Arc::clone(&self.closed);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（JoinHandle 返回给调用方托管）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "常驻监控任务（JoinHandle 返回给调用方托管）+ interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改写 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
@@ -219,7 +219,7 @@ impl ServerWorker {
             // "取时点"语义）——`BudgetDeadline` 不暴露 tokio Instant（`BudgetInstant`
             // 私有），且 select 臂 ticker 改写成 deadline+pending 链会改变 missed-tick
             //（Burst 补发）与 done 响应语义 = 非机械替换，方案面 3 风险节明令禁止 →
-            // 保留原形态。本 crate 的 L3 闸未禁 `tokio::time::Instant::now` → 无需 allow。
+            // 保留原形态。D8 起 L3 闸已禁 `tokio::time::Instant::now` → 由本项 allow 登记。
             let mut ticker = tokio::time::interval_at(
                 tokio::time::Instant::now() + SERVER_MONITOR_INTERVAL,
                 SERVER_MONITOR_INTERVAL,

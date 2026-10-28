@@ -204,6 +204,10 @@ impl RealityHooks for BtlsRealityHooks {
     ///
     /// 对应 Go `reality.go:141-175`（`hello.SessionId` 构造 + AEAD Seal +
     /// `copy(hello.Raw[39:], hello.SessionId)`）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "REALITY session_id 的 timestamp 是握手 wire 值（服务端 ±30s 重放窗校验），必须真实挂钟；本回调在 BoringSSL 拦截层，拿不到 ctx.clock()，compat::clock 亦未覆盖 handshake 面 → 待 reality 时钟注入面落地后迁"
+    )]
     fn rewrite_client_hello(&self, ssl: &SslRef, record: &mut [u8]) -> io::Result<()> {
         let mut off = 0usize;
         while off + 5 <= record.len() {
@@ -269,6 +273,10 @@ impl RealityHooks for BtlsRealityHooks {
     ///
     /// `msg` = 完整 handshake message（type(1)+len(3)+body，无 record 头），
     /// 字段偏移与 record body 相同：random=6..38、sid_len=38、sid=39..71。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "同 rewrite_client_hello：session_id timestamp 是握手 wire 值（服务端 ±30s 重放窗），BoringSSL transcript 回调内无 ctx.clock() 且 compat::clock 未覆盖 handshake 面 → 待 reality 时钟注入面落地后迁"
+    )]
     fn rewrite_client_hello_msg(
         &self,
         ssl_ptr: xray_tls::btls_reality::RealitySslPtr,
