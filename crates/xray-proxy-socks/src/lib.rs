@@ -22,6 +22,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod plugin;
 pub mod protocol;
+pub mod relay;
 pub mod server;
 pub mod udp;
 

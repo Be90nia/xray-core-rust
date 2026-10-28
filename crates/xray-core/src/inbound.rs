@@ -73,6 +73,7 @@ use xray_proxy_http::server::{
 use xray_proxy_socks::{
     ServerConfig,
     protocol::{Host, SocksAddr, decode_udp_packet, encode_udp_packet},
+    relay::TempUdpRelay,
     server::{SocksRequest, socks_handshake},
 };
 use xray_proxy_ss::config::MemoryAccount as SsConfigMemoryAccount;
@@ -412,13 +413,15 @@ where
             // UDP relay：spawn pump，保持 TCP 控制连接直到客户端断开
             // handler 是 &Arc 引用，spawn 的 future 需 'static —— spawn 前 clone
             let udp_handler = Arc::clone(handler);
+            // 来源过滤（bd wq16g）：只接受客户端地址，其余来源丢弃
+            let relay = temp_udp_relay(relay_socket, peer);
             // scope 生命周期锚：relay 任务存活期间 arm scope 不 drop（裸 spawn
             // detach 语义等价；Spawned::abort 保持控制连接断开即终止 relay）
             let relay_ctx = Arc::clone(&plugin_ctx);
             let relay = plugin_ctx
                 .spawn(async move {
                     let _ctx = relay_ctx;
-                    let _ = handle_udp_associate(relay_socket, udp_handler, udp_idle).await;
+                    let _ = handle_udp_associate(relay, udp_handler, udp_idle).await;
                 })
                 .expect("arm FxScope is never closed");
             // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
@@ -557,14 +560,28 @@ fn destination_to_socks_addr(dest: &Destination) -> SocksAddr {
     SocksAddr { host, port: dest.port().value() }
 }
 
+/// ASSOCIATE 的 relay socket → 带来源过滤的 [`TempUdpRelay`]。
+///
+/// Go `protocol.go:211-219` 两条分支：请求地址为域名/未指定 IP → (TCP 对端 IP,
+/// 端口 0，首包锁定)；否则 (请求 IP, 请求端口)。`SocksRequest::UdpAssociate` 只
+/// 带 BND 地址、不带请求地址，故此处固定走第一条分支——同一台机器的其它源端口
+/// 由首包锁定后同样被拒（bd wq16g）。
+fn temp_udp_relay(relay_socket: UdpSocket, peer: SocketAddr) -> TempUdpRelay {
+    TempUdpRelay::new(relay_socket, SocketAddr::new(peer.ip().to_canonical(), 0))
+}
+
 /// SOCKS5 UDP ASSOCIATE relay pump。
 ///
 /// 对应 Go `proxy/socks/server.go::handleUDPPayload`。所有数据报经
 /// [`UdpDispatchSession`] 走 dispatcher（routing 规则选 outbound），域名目标
 /// 原样透传由 outbound 解析。当客户端 TCP 控制连接关闭时，调用方 abort 本
 /// task 终止 relay。
+///
+/// 收包/回包走 [`TempUdpRelay`]（对齐 Go `TempUDPConn`）：来源不匹配的数据报
+/// 在 `recv_filtered` 内被丢弃，响应固定回发 expected 地址——任意主机发一个
+/// SOCKS5 UDP 帧即可注入/劫持的口子由此关闭（bd wq16g）。
 async fn handle_udp_associate(
-    relay_socket: UdpSocket,
+    relay: TempUdpRelay,
     handler: Arc<dyn DispatchHandler>,
     idle: std::time::Duration,
 ) -> std::io::Result<()> {
@@ -572,8 +589,6 @@ async fn handle_udp_associate(
     // 收包缓冲走堆（栈数组会把本 future 撑到 64KiB，构造期在调用方 poll 栈上留
     // 同尺寸临时量 → 击穿 2MiB 线程栈；与全仓 UDP 缓冲的 vec! 形态同款）。
     let mut buf = vec![0u8; 65535];
-    // 最近一个客户端地址：响应可能晚于请求到达，跨循环迭代记忆
-    let mut last_client: Option<SocketAddr> = None;
     // UDP associate 空闲时限（Go server.go:171-175 `tempUDPConn.SetTimeout(
     // plcy.Timeouts.ConnectionIdle)`）：任一方向有活动即续期。
     // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，pause 可推进不变）。
@@ -589,16 +604,16 @@ async fn handle_udp_associate(
                 tracing::debug!(?idle, "socks udp relay idle timeout");
                 return Ok(());
             }
-            v = relay_socket.recv_from(&mut buf[..]) => {
-                idle_deadline = Budget::tokio().deadline(idle);
-                let (n, client) = match v {
-                    Ok(v) => v,
+            v = relay.recv_filtered(&mut buf[..]) => {
+                let n = match v {
+                    Ok(n) => n,
                     Err(e) => {
                         tracing::debug!(error = %e, "socks udp relay recv failed");
                         continue;
                     }
                 };
-                last_client = Some(client);
+                // 只在被接受的数据报上续期（对齐 Go：被丢弃的来源不 c.Timer.Update()）
+                idle_deadline = Budget::tokio().deadline(idle);
                 // 解码 SOCKS5 UDP 请求帧 → (目标地址, payload)
                 let (dest_addr, payload) = match decode_udp_packet(&buf[..n]) {
                     Ok(v) => v,
@@ -624,10 +639,9 @@ async fn handle_udp_associate(
                         return Ok(());
                     }
                 };
-                let Some(client) = last_client else { continue };
-                // 编码响应帧（BND.ADDR = 响应来源地址），发回客户端
+                // 编码响应帧（BND.ADDR = 响应来源地址），回发 expected（客户端）
                 let resp = encode_udp_packet(&destination_to_socks_addr(&source), &payload);
-                if relay_socket.send_to(&resp, client).await.is_err() {
+                if relay.send_to_expected(&resp).await.is_err() {
                     tracing::debug!("socks udp send_to client failed");
                 }
             }
@@ -748,11 +762,12 @@ pub(crate) async fn serve_mixed(
                             // inbound 的 handle_connection UDP 分支与 Go server.go UDP
                             // 语义——此前丢弃 relay socket = 假成功，bd csya）
                             let udp_handler = Arc::clone(&handler);
+                            // 来源过滤（bd wq16g）：只接受客户端地址，其余来源丢弃
+                            let temp_udp = temp_udp_relay(relay_socket, peer);
                             let relay = ctx
                                 .spawn(async move {
                                     let _ =
-                                        handle_udp_associate(relay_socket, udp_handler, udp_idle)
-                                            .await;
+                                        handle_udp_associate(temp_udp, udp_handler, udp_idle).await;
                                 })
                                 .expect("arm FxScope is never closed");
                             // 控制连接 EOF/错误（客户端关闭）即终止 relay
@@ -9770,12 +9785,14 @@ mod tests {
         let relay_addr = relay.local_addr().unwrap();
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"via-dispatch" });
+        // 客户端先 bind：expected 取客户端地址（来源过滤，bd wq16g）
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = TempUdpRelay::new(relay, client.local_addr().unwrap());
         tokio::spawn(async move {
             let _ = handle_udp_associate(relay, handler, std::time::Duration::from_secs(300)).await;
         });
 
         // 客户端 → relay socket：SOCKS5 UDP 请求帧（目标仅作路由地址，不打真实包）
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = SocksAddr { host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
         client.send_to(&encode_udp_packet(&target, b"ping"), relay_addr).await.unwrap();
 
@@ -9790,6 +9807,134 @@ mod tests {
         assert_eq!(payload, b"via-dispatch");
     }
 
+    /// wq16g 夹具：每收一帧原样回显（来源 = 请求 target），用来观测某数据报
+    /// 是否真的被 relay 放行到 dispatch。
+    #[derive(Debug)]
+    struct EchoUdpDispatch;
+
+    impl xray_app_dispatcher::DispatchHandler for EchoUdpDispatch {
+        fn tag(&self) -> &str {
+            "echo-udp-dispatch"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            let source = Destination::udp(dest.address().clone(), dest.port());
+            Box::pin(async move {
+                let Link { mut reader, mut writer, .. } = link;
+                while let Ok(mb) = reader.read_multi_buffer().await {
+                    let flat = mb.to_vec();
+                    let mut cursor = std::io::Cursor::new(&flat[..]);
+                    let mut pr = xray_xudp::packet::PacketReader::new(&mut cursor);
+                    while let Ok(Some(pkt)) = pr.read_packet() {
+                        let (data, _) = pkt.into_parts();
+                        let mut frame = Vec::with_capacity(data.len() + 64);
+                        let mut pw = xray_xudp::packet::PacketWriter::new(
+                            &mut frame,
+                            source.clone(),
+                            [0u8; 8],
+                        );
+                        let _ = pw.write_packet(&data);
+                        drop(pw);
+                        let mut mb = xray_buf::multi::MultiBuffer::new();
+                        mb.merge_bytes(&frame);
+                        let _ = writer.write_multi_buffer(mb).await;
+                    }
+                }
+            })
+        }
+    }
+
+    /// 读一个 relay 回发的 SOCKS5 UDP 响应帧的 payload（5s 上限）。
+    async fn recv_relay_payload(sock: &UdpSocket) -> Vec<u8> {
+        let mut rbuf = [0u8; 1500];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut rbuf))
+                .await
+                .expect("relay response within 5s")
+                .unwrap();
+        decode_udp_packet(&rbuf[..n]).unwrap().1.to_vec()
+    }
+
+    /// 静默观察窗：窗口内收到任何数据报即判定「被转发」。
+    const DROP_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// 断言 `sock` 在 [`DROP_WINDOW`] 内收不到任何数据报。
+    async fn assert_dropped(sock: &UdpSocket, why: &str) {
+        let mut rbuf = [0u8; 1500];
+        let got = tokio::time::timeout(DROP_WINDOW, sock.recv_from(&mut rbuf)).await;
+        assert!(got.is_err(), "{why}");
+    }
+
+    fn udp_test_frame(payload: &[u8]) -> Vec<u8> {
+        let target = SocksAddr { host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
+        encode_udp_packet(&target, payload)
+    }
+
+    /// wq16g：relay 只接受客户端源**端口**——同 IP 不同端口的冒充帧必须被丢弃
+    /// （不转发到 dispatch，也不改写 expected）。
+    ///
+    /// 判别器：冒充包若被放行，dispatch 会回显并把结果发给 expected（客户端）
+    /// 或 last_client（冒充方，修前语义），两侧都能观测到——两个方向都断言为空。
+    #[tokio::test]
+    async fn socks_udp_associate_drops_foreign_source_port() {
+        let relay_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let impostor = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_ne!(client.local_addr().unwrap(), impostor.local_addr().unwrap());
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(EchoUdpDispatch);
+        let relay = TempUdpRelay::new(relay_sock, client.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_secs(300)).await;
+        });
+
+        // 1. 合法来源：转发 + 回显
+        client.send_to(&udp_test_frame(b"legit-1"), relay_addr).await.unwrap();
+        assert_eq!(recv_relay_payload(&client).await, b"legit-1");
+
+        // 2. 冒充来源（同 IP、别的端口）：不得转发（两侧都收不到回显）
+        impostor.send_to(&udp_test_frame(b"evil"), relay_addr).await.unwrap();
+        assert_dropped(&impostor, "foreign source port must not receive relay responses").await;
+        assert_dropped(&client, "foreign frame must not be forwarded to dispatch (no echo)").await;
+
+        // 3. expected 未被冒充包改写：客户端仍能正常往返
+        client.send_to(&udp_test_frame(b"legit-2"), relay_addr).await.unwrap();
+        assert_eq!(recv_relay_payload(&client).await, b"legit-2");
+    }
+
+    /// wq16g：来源**IP** 不匹配（不同主机）的帧即使最先到达也不得被接受，
+    /// 更不能抢占 expected 的端口锁定（生产装配 `temp_udp_relay` 的同款路径：
+    /// expected = TCP 对端 IP + 端口 0，首包锁定）。
+    #[tokio::test]
+    async fn socks_udp_associate_drops_foreign_ip_before_port_lock() {
+        let relay_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_sock.local_addr().unwrap();
+        // 冒充主机在同机另一个回环 IP（127.0.0.2 ≠ 127.0.0.1）
+        let impostor = match UdpSocket::bind(("127.0.0.2", 0)).await {
+            Ok(s) => s,
+            Err(_) => UdpSocket::bind(("127.0.0.3", 0)).await.expect("bind 127.0.0.2/3"),
+        };
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(EchoUdpDispatch);
+        // 生产形态：expected = 客户端 IP + 端口 0
+        let relay = temp_udp_relay(relay_sock, "127.0.0.1:9".parse().unwrap());
+        tokio::spawn(async move {
+            let _ = handle_udp_associate(relay, handler, std::time::Duration::from_secs(300)).await;
+        });
+
+        // 1. 冒充包先到：丢弃，且不得锁定端口
+        impostor.send_to(&udp_test_frame(b"evil"), relay_addr).await.unwrap();
+        assert_dropped(&impostor, "foreign source ip must be dropped").await;
+
+        // 2. 合法客户端随后发：正常往返（端口由首包锁定）
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&udp_test_frame(b"legit"), relay_addr).await.unwrap();
+        assert_eq!(recv_relay_payload(&client).await, b"legit");
+    }
+
     /// UDP associate 空闲时限（Go server.go:171-175 SetTimeout(ConnectionIdle)）：
     /// 静默 relay 在 idle 到期后自行退出（task 结束）；活动续期——每次收发包
     /// 重置 deadline，持续活动下不退出。
@@ -9799,6 +9944,7 @@ mod tests {
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(MarkerUdpDispatch { marker: b"idle" });
         let task = tokio::spawn(async move {
+            let relay = TempUdpRelay::new(relay, "127.0.0.1:0".parse().unwrap());
             let _ =
                 handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
         });
@@ -9843,11 +9989,12 @@ mod tests {
         let relay_addr = relay.local_addr().unwrap();
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
             Arc::new(KeepLinkDispatch { keepers: Arc::new(parking_lot::Mutex::new(Vec::new())) });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay = TempUdpRelay::new(relay, client.local_addr().unwrap());
         let task = tokio::spawn(async move {
             let _ =
                 handle_udp_associate(relay, handler, std::time::Duration::from_millis(150)).await;
         });
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let target = SocksAddr { host: Host::Ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), port: 53 };
         let t0 = std::time::Instant::now();
         while t0.elapsed() < std::time::Duration::from_millis(400) {

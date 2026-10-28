@@ -14,6 +14,7 @@
 //! expected 地址。
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
@@ -29,17 +30,14 @@ pub struct TempUdpRelay {
 impl TempUdpRelay {
     /// 从已绑定的 UDP socket + expectedRemote 构造。
     pub fn new(socket: UdpSocket, expected: SocketAddr) -> Self {
-        Self {
-            socket,
-            expected: Mutex::new(expected),
-        }
+        Self { socket, expected: Mutex::new(expected) }
     }
 
     /// 按 Go `handshake5`（protocol.go:211-219）语义计算 expectedRemote。
     ///
     /// - 请求地址为域名或未指定 IP → (peer IP, 0)；
-    /// - 否则 → (请求 IP, 请求端口)；peer 未知时回退未指定地址（近乎全拒，
-    ///   对齐 Go `expectedRemote.IP == nil` 时 `Equal` 恒 false 的丢弃语义）。
+    /// - 否则 → (请求 IP, 请求端口)；peer 未知时回退未指定地址（近乎全拒， 对齐 Go
+    ///   `expectedRemote.IP == nil` 时 `Equal` 恒 false 的丢弃语义）。
     pub fn expected_remote(
         request_host: &Host,
         request_port: u16,
@@ -47,7 +45,9 @@ impl TempUdpRelay {
     ) -> SocketAddr {
         let unspec = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         match request_host {
-            Host::Domain(_) => SocketAddr::new(peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 0),
+            Host::Domain(_) => {
+                SocketAddr::new(peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 0)
+            },
             Host::Ipv4(ip) if ip.is_unspecified() => unspec.max_peer(peer_ip),
             Host::Ipv6(ip) if ip.is_unspecified() => unspec.max_peer(peer_ip),
             Host::Ipv4(ip) => SocketAddr::new(IpAddr::V4(*ip), request_port),
@@ -92,7 +92,7 @@ impl TempUdpRelay {
         match self.socket.send_to(data, addr).await {
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                 self.socket.send_to(data, addr).await
-            }
+            },
             r => r,
         }
     }
@@ -136,7 +136,11 @@ mod tests {
     #[test]
     fn expected_remote_domain_falls_back_to_peer() {
         let peer: IpAddr = "10.1.2.3".parse().unwrap();
-        let e = TempUdpRelay::expected_remote(&Host::Domain("cdn.example.com".into()), 9999, Some(peer));
+        let e = TempUdpRelay::expected_remote(
+            &Host::Domain("cdn.example.com".into()),
+            9999,
+            Some(peer),
+        );
         assert_eq!(e.ip(), peer);
         assert_eq!(e.port(), 0); // 域名 → 端口待首包锁定
     }
@@ -144,7 +148,8 @@ mod tests {
     #[test]
     fn expected_remote_ip_keeps_request_port() {
         let ip: std::net::Ipv4Addr = "8.8.8.8".parse().unwrap();
-        let e = TempUdpRelay::expected_remote(&Host::Ipv4(ip), 5353, Some("10.0.0.1".parse().unwrap()));
+        let e =
+            TempUdpRelay::expected_remote(&Host::Ipv4(ip), 5353, Some("10.0.0.1".parse().unwrap()));
         assert_eq!(e.ip(), IpAddr::from(ip));
         assert_eq!(e.port(), 5353);
     }
@@ -152,7 +157,11 @@ mod tests {
     #[test]
     fn expected_remote_unspecified_ip_uses_peer() {
         let peer: IpAddr = "192.168.1.7".parse().unwrap();
-        let e = TempUdpRelay::expected_remote(&Host::Ipv4(std::net::Ipv4Addr::UNSPECIFIED), 0, Some(peer));
+        let e = TempUdpRelay::expected_remote(
+            &Host::Ipv4(std::net::Ipv4Addr::UNSPECIFIED),
+            0,
+            Some(peer),
+        );
         assert_eq!(e.ip(), peer);
         assert_eq!(e.port(), 0);
     }
@@ -174,19 +183,21 @@ mod tests {
         // 2. 合法客户端包 → 通过
         client.send_to(b"hello", relay.local_addr().unwrap()).await.unwrap();
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
-            .await
-            .expect("relay should accept legit packet")
-            .unwrap();
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
+                .await
+                .expect("relay should accept legit packet")
+                .unwrap();
         assert_eq!(&buf[..n], b"hello");
 
         // 3. 冒名者继续被过滤；合法来源可继续通信
         impostor.send_to(b"evil2", relay.local_addr().unwrap()).await.unwrap();
         client.send_to(b"second", relay.local_addr().unwrap()).await.unwrap();
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
-            .await
-            .expect("relay should accept second legit packet")
-            .unwrap();
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
+                .await
+                .expect("relay should accept second legit packet")
+                .unwrap();
         assert_eq!(&buf[..n], b"second");
 
         // 4. send_to_expected 落到 expected（client）地址
@@ -211,10 +222,11 @@ mod tests {
         impostor.send_to(b"evil", relay.local_addr().unwrap()).await.unwrap();
         client.send_to(b"first", relay.local_addr().unwrap()).await.unwrap();
         let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
-            .await
-            .expect("first matching source should be accepted")
-            .unwrap();
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
+                .await
+                .expect("first matching source should be accepted")
+                .unwrap();
         assert_eq!(&buf[..n], b"first");
         // 锁定后 expected = client 实际地址
         assert_eq!(*relay.expected(), client.local_addr().unwrap());
