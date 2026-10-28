@@ -135,6 +135,8 @@ fn arm_lookup_inbound_table_is_complete() {
         ("vmess", entries::vmess_entry),
         ("http", entries::http_entry),
         ("dokodemo", entries::dokodemo_entry),
+        // Go 注册名（同臂别名键）：配置按 Go 文档写 `dokodemo-door` 必须命中。
+        ("dokodemo-door", entries::dokodemo_entry),
         ("shadowsocks", entries::shadowsocks_entry),
         ("hysteria", entries::hysteria_entry),
         ("hysteria2", entries::hysteria_entry),

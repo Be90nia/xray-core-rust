@@ -205,11 +205,22 @@ fn parse_settings_section(section: &serde_json::Value) -> Result<Config, PluginE
             .collect::<Result<Vec<_>, PluginError>>()?,
         None => Vec::new(),
     };
-    let fragment = settings.get("fragment").map(parse_fragment);
+    let fragment = match settings.get("fragment") {
+        Some(f) => Some(
+            Fragment::from_json(f)
+                .map_err(|e| PluginError::Other(e.to_string().into()))?,
+        ),
+        None => None,
+    };
     let noises: Vec<Noise> = settings
         .get("noises")
         .and_then(|n| n.as_array())
-        .map(|arr| arr.iter().map(parse_noise).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|n| Noise::from_json(n).map_err(|e| PluginError::Other(e.to_string().into())))
+                .collect::<Result<Vec<_>, PluginError>>()
+        })
+        .transpose()?
         .unwrap_or_default();
     Ok(Config {
         domain_strategy: domain_strategy as i32,
@@ -241,39 +252,6 @@ fn parse_domain_strategy(s: &str) -> Result<DomainStrategy, PluginError> {
             return Err(PluginError::Other(format!("unsupported domain strategy: {s}").into()));
         },
     })
-}
-
-/// 解析 fragment 子对象（同规 xray-core `parse_freedom_fragment`：camelCase
-/// 键、缺省 0、`packets` 单键同喂 from/to）。
-fn parse_fragment(v: &serde_json::Value) -> Fragment {
-    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    Fragment {
-        packets_from: g("packets"),
-        packets_to: g("packets"),
-        length_min: g("lengthMin"),
-        length_max: g("lengthMax"),
-        interval_min: g("intervalMin"),
-        interval_max: g("intervalMax"),
-        max_split_min: g("maxSplitMin"),
-        max_split_max: g("maxSplitMax"),
-    }
-}
-
-/// 解析单个 noise 子对象（同规 xray-core `parse_freedom_noise`：`packet`
-/// "rand"/缺省 → 空包占位，否则按字节收）。
-fn parse_noise(v: &serde_json::Value) -> Noise {
-    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    Noise {
-        length_min: g("lengthMin"),
-        length_max: g("lengthMax"),
-        delay_min: g("delayMin"),
-        delay_max: g("delayMax"),
-        packet: match v.get("packet").and_then(|x| x.as_str()) {
-            Some("rand") | None => Vec::new(),
-            Some(s) => s.as_bytes().to_vec(),
-        },
-        apply_to: String::new(),
-    }
 }
 
 #[cfg(test)]

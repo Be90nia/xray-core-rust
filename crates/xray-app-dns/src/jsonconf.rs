@@ -49,9 +49,13 @@ pub struct DnsAppConfig {
     pub tag: Option<String>,
     #[serde(rename = "queryStrategy")]
     pub query_strategy: Option<String>,
-    /// 禁用 fallback（所有 nameserver 都失败时不再兜底）。
+    /// 禁用 fallback（所有 nameserver 都失败时不再兜底）。Go tag
+    /// `disableFallback`（infra/conf/dns.go），此前缺 rename → camelCase 配
+    /// 置被静默忽略（照旧兜底）；snake 形态保留为别名。
+    #[serde(rename = "disableFallback", alias = "disable_fallback")]
     pub disable_fallback: Option<bool>,
-    /// 命中匹配后禁用 fallback。
+    /// 命中匹配后禁用 fallback。Go tag `disableFallbackIfMatch`。
+    #[serde(rename = "disableFallbackIfMatch", alias = "disable_fallback_if_match")]
     pub disable_fallback_if_match: Option<bool>,
     /// 禁用 DNS 缓存。对应 Go `disableCache`。
     #[serde(rename = "disableCache")]

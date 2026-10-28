@@ -171,7 +171,7 @@ use xray_common::net::{
 use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
 use xray_proto::xray::common::geodata::ip_rule;
 
-use crate::error::Result;
+use crate::error::{FreedomError, Result};
 
 /// RuleAction 枚举。对应 proto `RuleAction`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -255,6 +255,210 @@ pub struct Noise {
     pub delay_max: u64,
     pub packet: Vec<u8>,
     pub apply_to: String,
+}
+
+/// 配置无效（带 Go 对齐文案）。
+fn invalid(msg: impl Into<String>) -> FreedomError {
+    FreedomError::InvalidConfig(msg.into())
+}
+
+/// 方言键的数值直取（历史形态 `lengthMin`/`lengthMax` 等）。
+fn dialect(v: &serde_json::Value, k: &str) -> u64 {
+    v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+/// Go `ParseRangeString`（infra/conf/common.go:355-390）：`"10"` / `"10-20"` /
+/// `"-1919--810"`（负号开头按第二个连字符切分）/ `""`→`(0,0)` / 非法 `None`。
+fn parse_range_string(s: &str) -> Option<(i64, i64)> {
+    if let Ok(v) = s.parse::<i64>() {
+        return Some((v, v));
+    }
+    if s.is_empty() {
+        return Some((0, 0));
+    }
+    let pair = match s.strip_prefix('-') {
+        Some(rest) => rest.split_once('-').map(|(a, b)| (format!("-{a}"), b.to_string())),
+        None => s.split_once('-').map(|(a, b)| (a.to_string(), b.to_string())),
+    };
+    let (left, right) = pair?;
+    Some((left.parse().ok()?, right.parse().ok()?))
+}
+
+/// Go `Int32Range` 键（infra/conf/common.go:315-332）：`"1-2"` 字符串或纯整数。
+///
+/// Go 允许负值作哨兵，但 fragment/noises 的用量全为非负——此处硬错，否则负值
+/// 会 cast 成巨大 `u64`，分片/噪声静默退化成「一次发完」。
+fn json_range(v: &serde_json::Value) -> Result<(u64, u64)> {
+    match v {
+        serde_json::Value::String(s) => range_from_str(s),
+        serde_json::Value::Number(n) => {
+            let x = n.as_i64().ok_or_else(|| invalid("Invalid integer range: not an integer"))?;
+            non_negative(x, x)
+        },
+        _ => Err(invalid(
+            "Invalid integer range, expected either string of form \"1-2\" or plain integer.",
+        )),
+    }
+}
+
+/// `ParseRangeString` 的字符串形态 + 非负校验。
+fn range_from_str(s: &str) -> Result<(u64, u64)> {
+    let (from, to) = parse_range_string(s.trim()).ok_or_else(|| {
+        invalid(format!(
+            "Invalid integer range, expected either string of form \"1-2\" or plain integer: {s}"
+        ))
+    })?;
+    non_negative(from, to)
+}
+
+fn non_negative(from: i64, to: i64) -> Result<(u64, u64)> {
+    match (u64::try_from(from), u64::try_from(to)) {
+        (Ok(a), Ok(b)) => Ok((a, b)),
+        _ => Err(invalid("Invalid integer range: negative value")),
+    }
+}
+
+/// Go `fragment.packets`（freedom.go:93-116）：`"tlshello"`→`(0,1)`、`""`/缺键
+/// →`(0,0)`（全包分片）、区间字符串、方言纯整数。
+fn packets_range(v: Option<&serde_json::Value>) -> Result<(u64, u64)> {
+    match v {
+        None => Ok((0, 0)),
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "tlshello" => Ok((0, 1)),
+            "" => Ok((0, 0)),
+            other => {
+                let (from, to) = range_from_str(other)?;
+                if from == 0 {
+                    return Err(invalid("PacketsFrom can't be 0"));
+                }
+                Ok((from, to))
+            },
+        },
+        Some(serde_json::Value::Number(n)) => {
+            let x = n
+                .as_u64()
+                .ok_or_else(|| invalid("Invalid PacketsFrom: expected non-negative integer"))?;
+            Ok((x, x))
+        },
+        Some(_) => Err(invalid("Invalid PacketsFrom: expected string or integer")),
+    }
+}
+
+impl Fragment {
+    /// 解析 freedom `fragment` 子对象（Go `infra/conf/freedom.go:92-142` Build）。
+    ///
+    /// Go 键形（`packets`/`length`/`interval`/`maxSplit`）为权威；缺 `length`
+    /// 时回退本仓历史方言（`lengthMin`/`lengthMax` 数值直给，`interval` 可缺省）。
+    /// 两个消费方（xray-core 生产解析与 framework 插件段解析）共用本实现。
+    pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        let (packets_from, packets_to) = packets_range(v.get("packets"))?;
+        let Some(length) = v.get("length") else {
+            let (length_min, length_max) = (dialect(v, "lengthMin"), dialect(v, "lengthMax"));
+            if length_min == 0 {
+                return Err(invalid("Length can't be empty"));
+            }
+            return Ok(Self {
+                packets_from,
+                packets_to,
+                length_min,
+                length_max,
+                interval_min: dialect(v, "intervalMin"),
+                interval_max: dialect(v, "intervalMax"),
+                max_split_min: dialect(v, "maxSplitMin"),
+                max_split_max: dialect(v, "maxSplitMax"),
+            });
+        };
+        let (length_min, length_max) = json_range(length)?;
+        if length_min == 0 {
+            return Err(invalid("LengthMin can't be 0"));
+        }
+        let interval = v.get("interval").ok_or_else(|| invalid("Interval can't be empty"))?;
+        let (interval_min, interval_max) = json_range(interval)?;
+        let (max_split_min, max_split_max) = match v.get("maxSplit") {
+            Some(m) => json_range(m)?,
+            None => (0, 0),
+        };
+        Ok(Self {
+            packets_from,
+            packets_to,
+            length_min,
+            length_max,
+            interval_min,
+            interval_max,
+            max_split_min,
+            max_split_max,
+        })
+    }
+}
+
+impl Noise {
+    /// 解析单个 freedom `noises[]` 元素（Go `infra/conf/freedom.go:217-262`
+    /// `ParseNoise`）：`type` ∈ {rand,str,hex,base64}，`delay` 为 Int32Range，
+    /// `applyTo` ∈ {ip,ipv4,ipv6}（含 ""/"all" → "ip"）。
+    ///
+    /// 无 `type` 键 = 本仓历史方言：`packet:"rand"` 或给了 `lengthMin/Max` 时按
+    /// rand 取长度区间，否则按字面字节；`delay` 可用 `delayMin/delayMax`。
+    pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+        let packet_raw = v.get("packet").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        let (length_min, length_max, packet) = match ty.as_str() {
+            "rand" => {
+                let (a, b) = range_from_str(&packet_raw)
+                    .map_err(|_| invalid(format!("invalid value for rand Length: {packet_raw}")))?;
+                if a == 0 {
+                    return Err(invalid("rand lengthMin or lengthMax cannot be 0"));
+                }
+                (a, b, Vec::new())
+            },
+            "str" => (0, 0, packet_raw.into_bytes()),
+            "hex" => (0, 0, hex::decode(&packet_raw).map_err(|e| invalid(format!("Invalid hex string: {e}")))?),
+            "base64" => (0, 0, decode_base64(&packet_raw)?),
+            "" => {
+                let (a, b) = (dialect(v, "lengthMin"), dialect(v, "lengthMax"));
+                if packet_raw == "rand" || a != 0 || b != 0 {
+                    (a, b, Vec::new())
+                } else {
+                    (0, 0, packet_raw.into_bytes())
+                }
+            },
+            other => {
+                return Err(invalid(format!(
+                    "Invalid packet, only rand/str/hex/base64 are supported: {other}"
+                )));
+            },
+        };
+        let (delay_min, delay_max) = match v.get("delay") {
+            Some(d) => json_range(d)?,
+            None => (dialect(v, "delayMin"), dialect(v, "delayMax")),
+        };
+        let apply_to = match v.get("applyTo").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+            "" | "ip" | "all" => "ip",
+            "ipv4" => "ipv4",
+            "ipv6" => "ipv6",
+            other => {
+                return Err(invalid(format!(
+                    "Invalid applyTo, only ip/ipv4/ipv6 are supported: {other}"
+                )));
+            },
+        };
+        Ok(Self {
+            length_min,
+            length_max,
+            delay_min,
+            delay_max,
+            packet,
+            apply_to: apply_to.to_string(),
+        })
+    }
+}
+
+/// Go `base64.RawURLEncoding` + `+`→`-`/`/`→`_`/`=` 去除（freedom.go:242-247）。
+fn decode_base64(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let cleaned = s.replace('+', "-").replace('/', "_").replace('=', "");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cleaned)
+        .map_err(|e| invalid(format!("Invalid base64 string: {e}")))
 }
 
 /// 最终规则配置。对应 proto `FinalRuleConfig`。
@@ -951,6 +1155,93 @@ pub fn block_delay(rule: &FinalRule) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== fragment / noises JSON 解析（Go infra/conf/freedom.go） =====
+
+    #[test]
+    fn fragment_go_keys_tlshello_and_range() {
+        let f = Fragment::from_json(&serde_json::json!({
+            "packets": "tlshello", "length": "100-200", "interval": "10-20"
+        }))
+        .expect("go 键形");
+        assert_eq!((f.packets_from, f.packets_to), (0, 1), "tlshello");
+        assert_eq!((f.length_min, f.length_max), (100, 200));
+        assert_eq!((f.interval_min, f.interval_max), (10, 20));
+        assert_eq!((f.max_split_min, f.max_split_max), (0, 0), "maxSplit 可缺省");
+
+        let f = Fragment::from_json(&serde_json::json!({
+            "packets": "1-3", "length": "10-20", "interval": "1-2", "maxSplit": 2
+        }))
+        .expect("区间键形");
+        assert_eq!((f.packets_from, f.packets_to), (1, 3));
+        assert_eq!((f.max_split_min, f.max_split_max), (2, 2));
+    }
+
+    #[test]
+    fn fragment_go_keys_errors_match_go() {
+        let e = Fragment::from_json(&serde_json::json!({"packets": "1-3", "interval": "1-2"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("Length can't be empty"), "{e}");
+
+        let e = Fragment::from_json(&serde_json::json!({"packets": "1-3", "length": "10-20"}))
+            .unwrap_err();
+        assert!(e.to_string().contains("Interval can't be empty"), "{e}");
+
+        let e = Fragment::from_json(&serde_json::json!({"packets": "0-3", "length": "1-2", "interval": 1}))
+            .unwrap_err();
+        assert!(e.to_string().contains("PacketsFrom can't be 0"), "{e}");
+    }
+
+    #[test]
+    fn fragment_dialect_keys_still_parse() {
+        // 存量方言（lengthMin/lengthMax 直给，interval 可缺省）。
+        let f = Fragment::from_json(&serde_json::json!({"lengthMin": 10, "lengthMax": 20}))
+            .expect("方言键形");
+        assert_eq!((f.packets_from, f.packets_to), (0, 0), "全包分片");
+        assert_eq!((f.length_min, f.length_max), (10, 20));
+        assert_eq!((f.interval_min, f.interval_max), (0, 0));
+    }
+
+    #[test]
+    fn noise_four_types_and_apply_to() {
+        let n = Noise::from_json(&serde_json::json!({"type": "rand", "packet": "10-20"}))
+            .expect("rand");
+        assert_eq!((n.length_min, n.length_max), (10, 20));
+        assert!(n.packet.is_empty());
+        assert_eq!(n.apply_to, "ip", "缺省 applyTo = ip");
+
+        let n = Noise::from_json(&serde_json::json!({"type": "str", "packet": " AA "}))
+            .expect("str");
+        assert_eq!(n.packet, b"AA", "packet 两端空白按 Go TrimSpace 去掉");
+
+        let n = Noise::from_json(&serde_json::json!({"type": "hex", "packet": "0aff"}))
+            .expect("hex");
+        assert_eq!(n.packet, vec![0x0a, 0xff]);
+
+        let n = Noise::from_json(&serde_json::json!({"type": "base64", "packet": "-_8"}))
+            .expect("base64");
+        assert_eq!(n.packet, vec![0xfb, 0xff]);
+
+        let n = Noise::from_json(&serde_json::json!({
+            "type": "str", "packet": "AA", "delay": "400-500", "applyTo": "IPv6"
+        }))
+        .expect("delay + applyTo");
+        assert_eq!((n.delay_min, n.delay_max), (400, 500));
+        assert_eq!(n.apply_to, "ipv6");
+
+        let e = Noise::from_json(&serde_json::json!({"type": "bogus", "packet": "x"})).unwrap_err();
+        assert!(e.to_string().contains("only rand/str/hex/base64"), "{e}");
+        let e = Noise::from_json(&serde_json::json!({"type": "str", "applyTo": "ipv5"})).unwrap_err();
+        assert!(e.to_string().contains("only ip/ipv4/ipv6"), "{e}");
+    }
+
+    #[test]
+    fn noise_dialect_keys_still_parse() {
+        let n = Noise::from_json(&serde_json::json!({"packet": "rand", "delayMin": 1})).expect("方言");
+        assert!(n.packet.is_empty());
+        assert_eq!(n.delay_min, 1);
+    }
+
 
     // ===== RuleAction =====
 

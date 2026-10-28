@@ -1117,8 +1117,6 @@ pub(crate) fn build_hysteria_tls_config(
 /// （对齐 Go `FreedomConfig.Build` 解码期拒启），空 settings 走缺省。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
 pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig> {
-    #[allow(unused_imports)] // 存量清零批次
-    use xray_proxy_freedom::{DomainStrategy, Fragment, Noise};
     if data.iter().all(|b| b.is_ascii_whitespace()) {
         return Ok(FreedomConfig::default());
     }
@@ -1139,14 +1137,27 @@ pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig
         Some(s) => parse_freedom_domain_strategy(s)?,
         None => DomainStrategy::AsIs,
     };
-    #[allow(unused_variables)] // 存量清零批次
-    let fragment = v.get("fragment").and_then(parse_freedom_fragment);
-    #[allow(unused_variables)] // 存量清零批次
-    let noises: Vec<Noise> = v
-        .get("noises")
-        .and_then(|n| n.as_array())
-        .map(|arr| arr.iter().filter_map(parse_freedom_noise).collect())
-        .unwrap_or_default();
+    // fragment / noises：Go `infra/conf/freedom.go:92-142` + `:217-262` 语义
+    // （原为「解析后丢默认值」——配了不生效的静默失效；两条都是抗审查特性，
+    // 静默失效比拒启危险）。解析收敛在 freedom crate 的 `Fragment::from_json`
+    // / `Noise::from_json`，与 framework 插件段解析同一份代码。
+    let fragment = match v.get("fragment") {
+        Some(f) => Some(
+            Fragment::from_json(f)
+                .map_err(|e| std::io::Error::other(format!("freedom fragment: {e}")))?,
+        ),
+        None => None,
+    };
+    let noises: Vec<Noise> = match v.get("noises").and_then(|n| n.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .map(|n| {
+                Noise::from_json(n)
+                    .map_err(|e| std::io::Error::other(format!("freedom noises: {e}")))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
     // destinationOverride / proxyProtocol / finalRules（Go FreedomConfig json 键，
     // freedom.go:19-29；解析在 freedom crate `from_json`，Go 语义对齐）
     let destination_override =
@@ -1173,7 +1184,8 @@ pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig
         proxy_protocol,
         user_level,
         final_rules,
-        ..Default::default()
+        fragment,
+        noises,
     })
 }
 
@@ -1336,37 +1348,6 @@ pub(crate) fn wrap_dial_with_target_strategy(
                 },
             }
         })
-    })
-}
-
-/// 解析 fragment 子对象。
-fn parse_freedom_fragment(v: &serde_json::Value) -> Option<Fragment> {
-    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    Some(Fragment {
-        packets_from: g("packets"),
-        packets_to: g("packets"),
-        length_min: g("lengthMin"),
-        length_max: g("lengthMax"),
-        interval_min: g("intervalMin"),
-        interval_max: g("intervalMax"),
-        max_split_min: g("maxSplitMin"),
-        max_split_max: g("maxSplitMax"),
-    })
-}
-
-/// 解析单个 noise 子对象。
-fn parse_freedom_noise(v: &serde_json::Value) -> Option<Noise> {
-    let g = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-    Some(Noise {
-        length_min: g("lengthMin"),
-        length_max: g("lengthMax"),
-        delay_min: g("delayMin"),
-        delay_max: g("delayMax"),
-        packet: match v.get("packet").and_then(|x| x.as_str()) {
-            Some("rand") | None => Vec::new(),
-            Some(s) => s.as_bytes().to_vec(),
-        },
-        apply_to: String::new(),
     })
 }
 

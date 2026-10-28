@@ -179,10 +179,10 @@ fn freedom_parity_target_strategy_priority() {
 }
 
 #[test]
-fn freedom_known_divergence_fragment_noises() {
-    // 已知差异（有意，插件注释明示「收敛属 P3 入口收口」）：fragment/noises
-    // 两键 core 面 parse-then-drop（产物字段 Default），插件面接全。共有字段
-    // 仍逐项相等；差异字段两侧各钉各的值 = 差异证据。
+fn freedom_parity_fragment_noises() {
+    // 收敛后 core 与插件面共用 `Fragment::from_json` / `Noise::from_json`
+    // （原为 core 面 parse-then-drop 的已知差异，2026-10-28 接线修掉）。
+    // 方言键形（lengthMin/lengthMax、packet:"rand" + delayMin/delayMax）保留。
     let settings = json!({
         "domainStrategy": "AsIs",
         "fragment": {"lengthMin": 10, "lengthMax": 20},
@@ -198,18 +198,13 @@ fn freedom_known_divergence_fragment_noises() {
     .expect("plugin build");
     assert_eq!(built, ["freedom"]);
     let plugin_cfg = plugin.built_config().expect("built");
-    // 共有字段相等。
-    assert_eq!(plugin_cfg.domain_strategy, core.domain_strategy);
-    assert_eq!(plugin_cfg.destination_override, core.destination_override);
-    assert_eq!(plugin_cfg.user_level, core.user_level);
-    assert_eq!(plugin_cfg.proxy_protocol, core.proxy_protocol);
-    assert_eq!(plugin_cfg.final_rules, core.final_rules);
-    // 差异字段：core drop（Default），plugin 接全。
-    assert_eq!(core.fragment, None);
-    assert!(core.noises.is_empty());
-    let fragment = plugin_cfg.fragment.clone().expect("plugin parsed fragment");
+    assert_eq!(plugin_cfg, &core, "core ↔ plugin 两路解析必须逐字段相同");
+    let fragment = core.fragment.clone().expect("fragment 接线进 FreedomConfig");
     assert_eq!((fragment.length_min, fragment.length_max), (10, 20));
-    assert_eq!(plugin_cfg.noises.len(), 1);
+    assert_eq!(core.noises.len(), 1);
+    assert!(core.noises[0].packet.is_empty(), "rand → 空包占位");
+    assert_eq!((core.noises[0].delay_min, core.noises[0].delay_max), (1, 2));
+    assert_eq!(core.noises[0].apply_to, "ip", "applyTo 缺省 = ip（Go defaults）");
 }
 
 // ── blackhole：core `parse_blackhole_response` ↔ BlackholePlugin::build ──

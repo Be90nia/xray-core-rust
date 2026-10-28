@@ -130,6 +130,10 @@ pub(crate) static INBOUND_CTORS: &[(&str, InboundBuilder)] = &[
     ("inbound:trojan", inbound::trojan_entry),
     ("inbound:vmess", inbound::vmess_entry),
     ("inbound:http", inbound::http_entry),
+    // Go 注册名是 `dokodemo-door`（infra/conf/dokodemo.go + proxy/dokodemo 的
+    // ProtocolName），配置按 Go 文档写 `dokodemo-door`——只留 `dokodemo` 键会
+    // 使整条入站落到「未支持协议」被静默跳过；两个键都收。
+    ("inbound:dokodemo-door", inbound::dokodemo_entry),
     ("inbound:dokodemo", inbound::dokodemo_entry),
     ("inbound:shadowsocks", inbound::shadowsocks_entry),
     // 原 match 臂为 `"hysteria" | "hysteria2"` 双键——数据源同样双键指向同一适配器，
