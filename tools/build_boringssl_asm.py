@@ -99,6 +99,29 @@ def run(cmd: list[str], **kw) -> None:
     subprocess.run(cmd, check=True, **kw)
 
 
+# VS 生成器随 runner 镜像变：windows-2025-vs2026 只装 VS 2026（cmake 生成器
+# "Visual Studio 18 2026"，cmake ≥4.2 才有），钉死 17 2022 会报
+# "could not find any instance of Visual Studio"。逐个试，配通即止。
+VS_GENERATORS = ("Visual Studio 18 2026", "Visual Studio 17 2022")
+
+
+def configure(src: Path, build: Path, nasm: Path) -> None:
+    """cmake 配置 BoringSSL：VS 生成器候选逐个试（最后一个 = cmake 默认生成器）。"""
+    candidates = [["-G", gen, "-A", "x64"] for gen in VS_GENERATORS] + [["-A", "x64"]]
+    for gen_args in candidates:
+        shutil.rmtree(build, ignore_errors=True)
+        try:
+            run([
+                "cmake", "-S", str(src), "-B", str(build),
+                *gen_args,
+                f"-DCMAKE_ASM_NASM_COMPILER={nasm}",
+            ])
+            return
+        except subprocess.CalledProcessError:
+            print(f"[warn] 生成器 {gen_args or '默认'} 不可用，换下一个", file=sys.stderr)
+    raise SystemExit("[FAIL] 所有 VS 生成器候选都配不通（见上方 cmake 报错）")
+
+
 def health(src: Path | None = None, dest: Path | None = None) -> int:
     """体检：源树 / NASM / 缓存里的 NO_ASM 标志。返回退出码。"""
     src = src or SRC
@@ -168,11 +191,7 @@ def main() -> int:
 
     build = dest.parent / "build"
     build.parent.mkdir(parents=True, exist_ok=True)
-    run([
-        "cmake", "-S", str(src), "-B", str(build),
-        "-G", "Visual Studio 17 2022", "-A", "x64",
-        f"-DCMAKE_ASM_NASM_COMPILER={nasm}",
-    ])
+    configure(src, build, nasm)
     run(["cmake", "--build", str(build), "--config", "Release", "--parallel", str(args.jobs)])
 
     dest.mkdir(parents=True, exist_ok=True)

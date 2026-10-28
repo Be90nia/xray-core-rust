@@ -49,6 +49,9 @@ struct Inner {
     resp: DuplexStream,
     /// 响应方向半帧累积缓冲。
     accum: Vec<u8>,
+    /// 响应读缓冲（会话期常驻：栈数组会把本 future 撑到 64KiB，构造期在调用方
+    /// poll 栈上留同尺寸临时量 → 击穿 2MiB 线程栈；常驻还省掉每包一次分配）。
+    buf: Vec<u8>,
     /// 首帧 GlobalID（随机 8 字节，对应 Go xudp）。
     global_id: [u8; 8],
     /// 是否已发送 New 帧。
@@ -141,12 +144,11 @@ impl UdpDispatchSession {
                     },
                 }
             }
-            let mut buf = [0u8; MAX_DATAGRAM];
-            let n = inner.resp.read(&mut buf).await?;
+            let n = inner.resp.read(&mut inner.buf[..]).await?;
             if n == 0 {
                 return Ok(None); // outbound 关闭
             }
-            inner.accum.extend_from_slice(&buf[..n]);
+            inner.accum.extend_from_slice(&inner.buf[..n]);
         }
     }
 
@@ -169,6 +171,7 @@ impl UdpDispatchSession {
             req: req_local,
             resp: resp_local,
             accum: Vec::new(),
+            buf: vec![0u8; MAX_DATAGRAM],
             global_id: rand::random(),
             new_sent: false,
         });
