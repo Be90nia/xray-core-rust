@@ -13,6 +13,12 @@ pub enum HttpProxyError {
     #[error("invalid http request: {0}")]
     InvalidRequest(String),
 
+    /// 协议层拒收（Go `http.ReadRequest` 失败语义）：**断链且不回任何响应**
+    /// ——Go `Process` 读请求失败即 `return error`，连接直接关闭（不写 400）。
+    /// 与 [`HttpProxyError::InvalidRequest`] 的区别就在"是否回 400"。
+    #[error("http protocol error: {0}")]
+    Protocol(String),
+
     /// 认证失败（用户名/密码不匹配，或缺少 Proxy-Authorization header）。
     #[error("authentication failed: {0}")]
     AuthFailed(String),

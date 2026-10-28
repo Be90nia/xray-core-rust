@@ -67,8 +67,8 @@ use xray_proxy_dns::{Config as DnsConfig, DnsInbound, DnsOutbound, Handler as Dn
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::{
-    HandshakeResult, HttpVersion, build_forwarded_request, extract_request_path,
-    http_server_handshake,
+    HandshakeResult, build_forwarded_request, extract_request_path, http_server_handshake,
+    request_keep_alive, resolve_request_host, serialize_go_response_head,
 };
 use xray_proxy_socks::{
     ServerConfig,
@@ -714,8 +714,10 @@ pub(crate) async fn serve_mixed(
                 if n == 0 {
                     return;
                 }
-                if sniff[0] == 0x05 {
-                    // SOCKS5 路径（握手与 sniff/http 段共用同一限时）
+                if sniff[0] == 0x05 || sniff[0] == 0x04 {
+                    // SOCKS 路径（0x05 = SOCKS5 / 0x04 = SOCKS4；握手与 sniff/http
+                    // 段共用同一限时）。版本分派在库层 `socks_handshake` 内按首字节
+                    // 完成（Go `handshake4`/`handshake5` 同款），此处只做入口分流。
                     let hs_fut = socks_handshake(&mut stream, &socks_cfg);
                     let hs = match handshake_timeout {
                         Some(d) => match tokio::time::timeout(d, hs_fut).await {
@@ -1028,33 +1030,6 @@ fn parse_content_length_value(value: &str) -> Result<u64, ()> {
     }
 }
 
-/// 客户端是否宣告关闭：Connection / Proxy-Connection 任一含 `close` token
-/// （RFC 7230 §6.6 connection-token，逗号分隔）。已宣告 close 就必须收尾关闭，
-/// 即便响应本身可定界。
-fn wants_close(headers: &HashMap<String, Vec<String>>) -> bool {
-    ["connection", "proxy-connection"].iter().any(|key| {
-        headers.get(*key).is_some_and(|vals| {
-            vals.iter().any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close")))
-        })
-    })
-}
-
-/// 客户端侧持久连接缺省值（RFC 7230 §A.1，对齐 Go `http` 服务端语义）：
-/// HTTP/1.1 缺省 keep-alive；HTTP/1.0 缺省 close——仅当请求显式带
-/// `Connection/Proxy-Connection: keep-alive` token（`wants_close` 同款
-/// token 解析）才续连。
-fn client_wants_keep_alive(headers: &HashMap<String, Vec<String>>, version: HttpVersion) -> bool {
-    match version {
-        HttpVersion::H11 => true,
-        HttpVersion::H10 => ["connection", "proxy-connection"].iter().any(|key| {
-            headers.get(*key).is_some_and(|vals| {
-                vals.iter()
-                    .any(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("keep-alive")))
-            })
-        }),
-    }
-}
-
 /// plain HTTP 读上游响应失败/响应头非法的 503（对齐 Go handlePlainHTTP 503 分支：
 /// Close=true + 双 close 头 + Content-Length 0；字节与 xray-proxy-http server.rs
 /// 同名常量一致）。
@@ -1093,10 +1068,11 @@ async fn handle_plain_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    use tokio::io::AsyncWriteExt;
     use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
 
     // 1. 转发请求构建（绝对 URL → 相对 path，移除 hop-by-hop headers，强制 close）
-    let (body_plan, forward_headers) = match plan_request_framing(&hs.headers) {
+    let (body_plan, mut forward_headers) = match plan_request_framing(&hs.headers) {
         Ok(plan) => plan,
         Err(()) => {
             tracing::debug!("http: malformed Content-Length/Transfer-Encoding, closing connection");
@@ -1104,6 +1080,11 @@ where
         },
     };
     let path = extract_request_path(&hs.target);
+    // Go `handlePlainHTTP`：`request.Host = request.URL.Host`（绝对 URI 的 host
+    // 优先，origin-form 时即 Host 头）→ 转发请求的 Host 头用同一个值。
+    if let Some(host) = resolve_request_host(&hs.target, &forward_headers) {
+        forward_headers.insert("host".into(), vec![host]);
+    }
     let request_head = build_forwarded_request(&hs.method, &path, &forward_headers);
 
     // 2. 创建 pipe 对，dispatch：生产 DefaultDispatcher::dispatch_link 内部 spawn
@@ -1119,31 +1100,59 @@ where
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
     // 3. requestDone：头 + 请求体边界精确转发
-    let req_ok =
-        forward_request_phase(&mut client_read, &mut up_w, &request_head, body_plan).await.is_ok();
-    // 上游写向收尾（错误路径也关——pipe Writer 裸 drop 不传播 EOF 到 dispatch 桥）；
-    // EOF → dispatch 桥关闭目标写半部，上游按 connection: close 响应完即关。
-    up_w.shutdown();
-    if !req_ok {
-        return PlainOutcome::Close;
+    if let Err(e) =
+        forward_request_phase(&mut client_read, &mut up_w, &request_head, body_plan).await
+    {
+        // 错误路径也要关上游写向（pipe Writer 裸 drop 不传播 EOF 到 dispatch 桥）。
+        up_w.shutdown();
+        return match e {
+            // 客户端侧读失败（body 长度不符 / 客户端断开）→ Go `http.ReadRequest`
+            // 失败语义：断链不回响应。
+            RequestForwardError::Client(err) => {
+                tracing::debug!(error = %err, "http: client request read failed, closing connection");
+                PlainOutcome::Close
+            },
+            // 上游侧写失败（上游已断开 / 拨号失败）→ Go `responseDone` 失败语义：
+            // 回 503（Go 的请求写进缓冲区成功，失败发生在读响应阶段）。
+            RequestForwardError::Upstream(err) => {
+                tracing::debug!(error = %err, "http: upstream write failed, replying 503");
+                let _ = client_write.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
+                PlainOutcome::Close
+            },
+        };
     }
 
-    // 4. responseDone
-    relay_response_phase(&mut dn_r, &mut client_write, hs).await
+    // 4. responseDone —— 上游写侧的半关**推迟到响应阶段结束之后**（Go `handlePlainHTTP` 写完
+    //    request 不半关；`defer common.Close(link.Writer)` 在响应读完后才关）。请求发完立刻
+    //    `shutdown(SHUT_WR)` 会让不少 CDN 判 "请求未完成"直接关连接不回响应（bd os438：微信图床
+    //    503）。
+    let outcome = relay_response_phase(&mut dn_r, &mut client_write, hs).await;
+    up_w.shutdown();
+    outcome
+}
+
+/// 请求转发阶段的失败来源（决定回 503 还是断链）。
+#[derive(Debug)]
+enum RequestForwardError {
+    /// 客户端侧读失败（请求体长度不符 / 客户端中途断开）。
+    Client(std::io::Error),
+    /// 上游侧写失败（上游已关闭 / 拨号失败）。
+    Upstream(std::io::Error),
 }
 
 /// 上行阶段：转发请求头 + 请求体（CL 定长 / chunked 逐帧，到边界即止）。
-/// 客户端中途断开/帧错位 → Err。
+/// 客户端中途断开/帧错位 → [`RequestForwardError::Client`]；上游写失败 →
+/// [`RequestForwardError::Upstream`]（两者处置不同：断链 vs 503）。
 async fn forward_request_phase<R>(
     client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
     request_head: &[u8],
     body_plan: RequestBodyPlan,
-) -> std::io::Result<()>
+) -> Result<(), RequestForwardError>
 where
     R: AsyncRead + Unpin,
 {
-    pipe_write_all(up_w, request_head).await?;
+    pipe_write_all(up_w, request_head).await.map_err(RequestForwardError::Upstream)?;
     match body_plan {
         RequestBodyPlan::None => {},
         RequestBodyPlan::Length(n) => relay_exact_request_body(client_read, up_w, n).await?,
@@ -1165,6 +1174,8 @@ where
 {
     use tokio::io::AsyncWriteExt;
     let Some(head) = read_response_head(dn_r, client_write).await else {
+        // Go `responseDone` err 分支：读响应失败（上游拨号失败/断流/头非法）→ 503。
+        tracing::debug!(target = %hs.target, "http: no usable upstream response, replying 503");
         let _ = client_write.write_all(RESPONSE_SERVICE_UNAVAILABLE).await;
         return PlainOutcome::Close;
     };
@@ -1195,23 +1206,45 @@ where
     let bodyless = hs.method == "HEAD" || head.code == 204 || head.code == 304;
     let cl_ok = content_length.is_none_or(|n| head.leftover.len() as u64 <= n);
     let reusable = !chunked && cl_ok && (bodyless || content_length.is_some());
-    let keep_alive = reusable
-        && !wants_close(&hs.headers)
-        && client_wants_keep_alive(&hs.headers, hs.http_version);
-    if client_write.write_all(&serialize_response_head(&head, keep_alive, chunked)).await.is_err() {
+    // Go `response.ContentLength`（readTransfer/fixLength 语义）：chunked → -1；
+    // HEAD → 声明的 CL（无则 0）；204/304 → 0；其余 → 声明的 CL（无则 -1）。
+    // `>= 0` ⇔ Go 回 keep-alive 三头且 `response.Close = false`。
+    let effective_cl: Option<u64> = if chunked {
+        None
+    } else if bodyless {
+        Some(if hs.method == "HEAD" { content_length.unwrap_or(0) } else { 0 })
+    } else {
+        content_length
+    };
+    // 响应头的连接语义只看**响应自身**（Go `response.ContentLength >= 0` →
+    // keep-alive 三头），与请求的 Connection 头无关。
+    let response_keep_alive = reusable;
+    // 客户端连接复用（Go `Process`）：只要请求带 `Proxy-Connection: keep-alive`
+    // 且响应可定界（Go `result == errWaitAnother`）就回循环读下一请求
+    // ——Go 实测：同时带 `Connection: close` 也照样复用（Go 只看 Proxy-Connection）。
+    let reuse_connection = response_keep_alive && request_keep_alive(&hs.headers);
+    let head_bytes = serialize_go_response_head(
+        &head.status_line,
+        head.code,
+        &head.headers,
+        effective_cl,
+        chunked,
+    );
+    if client_write.write_all(&head_bytes).await.is_err() {
         return PlainOutcome::Close;
     }
 
     let body_ok = if bodyless {
         true
-    } else if let (true, Some(n), false) = (keep_alive, content_length, chunked) {
+    } else if let (false, Some(n)) = (chunked, content_length) {
+        // CL 定界：精确转发 n 字节（Go `response.Body` = LimitReader(r, n)）
         copy_exact_n_from_pipe(dn_r, client_write, n, head.leftover).await.is_ok()
     } else {
         // chunked / close 定界：转发头已带 connection: close，上游回完即关，
         // 透传到断流为止（chunked 帧原样到达，客户端按 transfer-encoding 解析）
         copy_until_eof_from_pipe(dn_r, client_write, head.leftover).await.is_ok()
     };
-    if body_ok && keep_alive { PlainOutcome::NextRequest } else { PlainOutcome::Close }
+    if body_ok && reuse_connection { PlainOutcome::NextRequest } else { PlainOutcome::Close }
 }
 
 /// 从客户端定长转发 n 字节请求体到上游 pipe。提前 EOF → Err（静默截断不可接受）。
@@ -1219,7 +1252,7 @@ async fn relay_exact_request_body<R>(
     client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
     mut remaining: u64,
-) -> std::io::Result<()>
+) -> Result<(), RequestForwardError>
 where
     R: AsyncRead + Unpin,
 {
@@ -1227,14 +1260,14 @@ where
     let mut buf = [0u8; 8192];
     while remaining > 0 {
         let want = buf.len().min(remaining as usize);
-        let read = client_read.read(&mut buf[..want]).await?;
+        let read = client_read.read(&mut buf[..want]).await.map_err(RequestForwardError::Client)?;
         if read == 0 {
-            return Err(std::io::Error::new(
+            return Err(RequestForwardError::Client(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "client closed mid request body",
-            ));
+            )));
         }
-        pipe_write_all(up_w, &buf[..read]).await?;
+        pipe_write_all(up_w, &buf[..read]).await.map_err(RequestForwardError::Upstream)?;
         remaining -= read as u64;
     }
     Ok(())
@@ -1246,25 +1279,31 @@ where
 async fn relay_chunked_request_body<R>(
     client_read: &mut R,
     up_w: &mut xray_buf::pipe::Writer,
-) -> std::io::Result<()>
+) -> Result<(), RequestForwardError>
 where
     R: AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
     loop {
-        let size_line = read_client_line(client_read).await?;
+        let size_line = read_client_line(client_read).await.map_err(RequestForwardError::Client)?;
         let size = u64::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
             .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed chunk size")
+                RequestForwardError::Client(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "malformed chunk size",
+                ))
             })?;
-        pipe_write_all(up_w, size_line.as_bytes()).await?;
-        pipe_write_all(up_w, b"\r\n").await?;
+        pipe_write_all(up_w, size_line.as_bytes()).await.map_err(RequestForwardError::Upstream)?;
+        pipe_write_all(up_w, b"\r\n").await.map_err(RequestForwardError::Upstream)?;
         if size == 0 {
             // trailer 段透传到空行
             loop {
-                let line = read_client_line(client_read).await?;
-                pipe_write_all(up_w, line.as_bytes()).await?;
-                pipe_write_all(up_w, b"\r\n").await?;
+                let line =
+                    read_client_line(client_read).await.map_err(RequestForwardError::Client)?;
+                pipe_write_all(up_w, line.as_bytes())
+                    .await
+                    .map_err(RequestForwardError::Upstream)?;
+                pipe_write_all(up_w, b"\r\n").await.map_err(RequestForwardError::Upstream)?;
                 if line.is_empty() {
                     return Ok(());
                 }
@@ -1272,8 +1311,8 @@ where
         }
         relay_exact_request_body(client_read, up_w, size).await?;
         let mut crlf = [0u8; 2];
-        client_read.read_exact(&mut crlf).await?;
-        pipe_write_all(up_w, &crlf).await?;
+        client_read.read_exact(&mut crlf).await.map_err(RequestForwardError::Client)?;
+        pipe_write_all(up_w, &crlf).await.map_err(RequestForwardError::Upstream)?;
     }
 }
 
@@ -1372,48 +1411,6 @@ where
             _ => return None, // 零字节断流 / pipe 中断
         }
     }
-}
-
-/// 回写响应头序列化：hop-by-hop 头移除 + chunked 时删除 content-length
-/// （RFC 9112 §6.3 / Go `fixLength` 的 `header.Del("Content-Length")`，防把
-/// CL + TE 并存转发给客户端）后按 keep_alive 改写连接语义头
-/// （对齐 Go `RemoveHopByHopHeaders` + `response.Header.Set` 三头/`response.Close`；
-/// 字节格式与 xray-proxy-http server.rs `serialize_response_head` 同款）。
-fn serialize_response_head(head: &ResponseHead, keep_alive: bool, chunked: bool) -> Vec<u8> {
-    const HOP_BY_HOP: &[&str] = &[
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailers",
-        "upgrade",
-    ];
-    let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(head.status_line.as_bytes());
-    buf.extend_from_slice(b"\r\n");
-    for (key, values) in &head.headers {
-        if HOP_BY_HOP.contains(&key.as_str()) || (chunked && key == "content-length") {
-            continue;
-        }
-        for value in values {
-            buf.extend_from_slice(key.as_bytes());
-            buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
-            buf.extend_from_slice(b"\r\n");
-        }
-    }
-    if keep_alive {
-        buf.extend_from_slice(
-            b"proxy-connection: keep-alive\r\n\
-              connection: keep-alive\r\n\
-              keep-alive: timeout=60\r\n\r\n",
-        );
-    } else {
-        buf.extend_from_slice(b"connection: close\r\nproxy-connection: close\r\n\r\n");
-    }
-    buf
 }
 
 /// 101 头块原样回写（不过滤 hop-by-hop、不改连接语义头）：`Upgrade` 与
@@ -8681,6 +8678,283 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
     }
 
+    /// bd os438：请求发完**不得**立刻 half-close 上游写侧（`shutdown(SHUT_WR)`）。
+    /// 微信图床等 CDN 把"请求未完成 + FIN"判为拒回 → 零字节响应 → 我们合成 503。
+    /// 上游在回响应前先探一次 EOF：收到 FIN 即说明代理提前半关。
+    #[tokio::test]
+    async fn plain_http_does_not_half_close_upstream_before_response() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let saw_eof = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_eof);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut acc = Vec::new();
+            while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut b = [0u8; 4096];
+                match sock.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => acc.extend_from_slice(&b[..n]),
+                }
+            }
+            // 探 EOF：代理若已 half-close（FIN），read 立即返回 0；未半关则挂起
+            // → 300ms 超时（窗口 ≥ 100ms，判定不依赖竞态：FIN 要么已到要么没到）。
+            let mut probe = [0u8; 16];
+            if let Ok(Ok(0)) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), sock.read(&mut probe))
+                    .await
+            {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let _ = sock.shutdown().await;
+        });
+
+        let proxy_addr = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            upstream_addr.port(),
+            upstream_addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let (status, _head, body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"ok");
+        assert!(
+            !saw_eof.load(Ordering::SeqCst),
+            "proxy must not half-close upstream before the response (bd os438)"
+        );
+    }
+
+    /// bd x23tr：上游先回 1xx 中间响应再回最终响应 → 1xx 原样透传后**继续读**
+    /// 最终响应（Go `readResponseAndHandle100Continue`）。本测同时锁定 Go
+    /// v26.10.17 的最终响应字节布局（Content-Length 先写 + 其余头 canonical
+    /// 排序 + keep-alive 三头）。
+    #[tokio::test]
+    async fn plain_http_1xx_then_final_response_matches_go_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut acc = Vec::new();
+            while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut b = [0u8; 4096];
+                match sock.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => acc.extend_from_slice(&b[..n]),
+                }
+            }
+            let _ = sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").await;
+            let _ = sock.shutdown().await;
+        });
+
+        let proxy_addr = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            upstream_addr.port(),
+            upstream_addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("response within 5s")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&buf),
+            "HTTP/1.1 100 Continue\r\n\r\n\
+             HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\
+             Connection: keep-alive\r\nKeep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\nhello"
+        );
+    }
+
+    /// bd g3mvq：重复 Host 头必须拒收（Go `http.ReadRequest`："too many Host
+    /// headers" → 读请求失败 → **断链不回响应**）。重复 Host 是请求走私面
+    /// （首个 Host 决定路由、第二个到达上游）。
+    #[tokio::test]
+    async fn plain_http_duplicate_host_header_is_rejected_without_response() {
+        let proxy_addr = spawn_http_proxy_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                b"GET http://127.0.0.1:1/x HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\
+                  Host: evil.example\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("close within 5s")
+            .unwrap();
+        assert!(
+            buf.is_empty(),
+            "duplicate Host must be rejected without any response, got: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
+
+    /// Go `Process`：客户端连接复用 = 请求带 `Proxy-Connection: keep-alive`
+    /// 且响应可定界；未宣告则响应后即关连接（Go v26.10.17 实测）。
+    #[tokio::test]
+    async fn plain_http_without_proxy_keep_alive_closes_after_response() {
+        let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            upstream.port(),
+            upstream.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let (status, _head, _body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200);
+        let mut trailing = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut trailing))
+            .await
+            .expect("EOF within 5s")
+            .unwrap();
+        assert!(
+            trailing.is_empty(),
+            "connection must close after the response without Proxy-Connection: keep-alive (Go parity), got {trailing:?}"
+        );
+    }
+
+    /// bd e0gos：上游不可达（拨号失败 / 上游读端已关）→ 回 **503**（Go
+    /// `responseDone` 失败语义），不是断链（Go 的请求写进缓冲区成功，失败
+    /// 发生在读响应阶段 → 503）。
+    #[tokio::test]
+    async fn plain_http_upstream_gone_returns_503() {
+        struct DeadUpstreamDispatch;
+        impl std::fmt::Debug for DeadUpstreamDispatch {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("DeadUpstreamDispatch")
+            }
+        }
+        impl xray_app_dispatcher::DispatchHandler for DeadUpstreamDispatch {
+            fn tag(&self) -> &str {
+                "dead-upstream"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                Box::pin(async move {
+                    // 上游不可达 = 链路两端立即消失（生产里 dial 失败后 dispatch 桥
+                    // 就是丢 link）：下行零字节断流 → 代理必须回 503，不能挂住。
+                    let xray_transport::link::Link { reader, writer } = link;
+                    writer.shutdown();
+                    drop(reader);
+                })
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        let hs = HandshakeResult {
+            dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
+            method: "GET".into(),
+            target: "http://1.2.3.4/".into(),
+            http_version: xray_proxy_http::server::HttpVersion::H11,
+            headers: HashMap::new(),
+        };
+        tokio::spawn(async move {
+            handle_plain_http(
+                &mut server,
+                &hs,
+                Arc::new(DeadUpstreamDispatch),
+                xray_app_dispatcher::AccessContext::default(),
+            )
+            .await;
+        });
+
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("503 within 5s")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
+    }
+
+    /// bd e0gos：空 Host 头 + 绝对 URI → Go 用 URI 的 host（`request.Host =
+    /// request.URL.Host`）→ 正常转发 200；不是断链。
+    #[tokio::test]
+    async fn plain_http_empty_host_header_uses_absolute_uri_host() {
+        let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let req = format!("GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost:\r\n\r\n", upstream.port());
+        client.write_all(req.as_bytes()).await.unwrap();
+        let (status, _head, _body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "empty Host header must fall back to the absolute URI host");
+    }
+
+    /// bd e0gos：绝对 URI 的 host 决定**路由**与转发的 Host 头（Go
+    /// `request.Host = request.URL.Host`）——客户端给的 Host 头不参与选路
+    /// （否则是请求走私面）。
+    #[tokio::test]
+    async fn plain_http_absolute_uri_host_wins_over_host_header() {
+        let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        // Host 头指向关闭端口（19999），URI 指向真实上游 → 必须按 URI 路由 → 200
+        let req = format!(
+            "GET http://127.0.0.1:{}/x HTTP/1.1\r\nHost: 127.0.0.1:19999\r\n\r\n",
+            upstream.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let (status, _head, _body) = read_http_response_for_test(&mut client).await;
+        assert_eq!(status, 200, "absolute URI host must win over the Host header");
+    }
+
+    /// bd 971x5：mixed 入站的 1 字节分流必须认 SOCKS4（0x04）——库层
+    /// `socks_handshake` 已实现 `handshake4`（Go `handshake4` 同款），此前
+    /// mixed 分流只有 0x05 / ASCII 两支 → SOCKS4 直接复位。
+    #[tokio::test]
+    async fn mixed_socks4_connect_is_accepted() {
+        let (upstream, _conns) = spawn_http_upstream_for_test().await;
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_mixed(
+            listener,
+            ohm,
+            Arc::new(ServerConfig::default()),
+            Arc::new(HttpServerConfig::default()),
+            Some(std::time::Duration::from_secs(5)),
+            std::time::Duration::from_secs(300),
+            test_plugin_ctx("mixed"),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // SOCKS4 CONNECT：VER=0x04 CMD=0x01 DSTPORT(2BE) DSTIP(4) USERID\0
+        let port = upstream.port().to_be_bytes();
+        client.write_all(&[0x04, 0x01, port[0], port[1], 127, 0, 0, 1, 0x00]).await.unwrap();
+        let mut reply = [0u8; 8];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("SOCKS4 reply within 5s")
+            .unwrap();
+        assert_eq!(reply[0], 0x00, "SOCKS4 reply VN must be 0");
+        assert_eq!(reply[1], 90, "SOCKS4 CONNECT must be granted (rep=90)");
+    }
+
     /// ft58 S1 测试桩：按 dest 真实拨号上游，双向桥接 link ↔ 上游连接。
     /// 桥接在后台任务跑（对齐生产 dispatch_link 立即返回）；EOF 方向传播必须
     /// 显式 shutdown（pipe Writer 裸 drop 不传播关闭）。
@@ -9014,87 +9288,95 @@ mod tests {
         addr
     }
 
-    /// F5（bd 8q0d）表驱动：请求 HTTP 版本 × 客户端 Connection 头 → 响应连接
-    /// 语义头与续连行为。RFC 7230 §A.1：1.0 缺省 close（仅显式 keep-alive 续），
-    /// 1.1 缺省 keep-alive（close token 收尾）。1.0 无头是修复目标——此前误发
-    /// `connection: keep-alive` 并续连。
+    /// 连接语义以 Go v26.10.17 实测为基准（探针
+    /// `reports/audit-2026-10-28/tmp/http_keepalive_ref.py`，同一份 mixed+freedom
+    /// 配置跑 Go 内核）：响应头**恒**回 keep-alive 三头（Go `ContentLength >= 0`
+    /// 分支，与请求的任何连接头、HTTP 版本无关）；连接复用**只看**请求的
+    /// `Proxy-Connection: keep-alive`（Go `Process`）——`Connection:` 头与 1.0/1.1
+    /// 版本均不参与（bd g3mvq：此前按 RFC 版本分叉与 Go 反向，1.1 无头被错误续连
+    /// 且第二个响应被拼进首个 body）。
     #[tokio::test]
-    async fn http_version_aware_keep_alive_table() {
+    async fn http_connection_semantics_match_go_26_10_17() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         struct Case {
             name: &'static str,
             version: &'static str,
-            conn_header: Option<&'static str>,
-            expect_keep_alive_head: bool,
+            extra: &'static str,
             expect_reuse: bool,
         }
         let cases = [
+            Case { name: "1.1-无连接头", version: "HTTP/1.1", extra: "", expect_reuse: false },
             Case {
-                name: "1.0-no-conn",
-                version: "HTTP/1.0",
-                conn_header: None,
-                expect_keep_alive_head: false,
+                name: "1.1-Connection: close",
+                version: "HTTP/1.1",
+                extra: "Connection: close\r\n",
                 expect_reuse: false,
             },
             Case {
-                name: "1.0-keep-alive",
-                version: "HTTP/1.0",
-                conn_header: Some("keep-alive"),
-                expect_keep_alive_head: true,
-                expect_reuse: true,
-            },
-            Case {
-                name: "1.1-no-conn",
+                name: "1.1-Connection: keep-alive",
                 version: "HTTP/1.1",
-                conn_header: None,
-                expect_keep_alive_head: true,
-                expect_reuse: true,
-            },
-            Case {
-                name: "1.1-close",
-                version: "HTTP/1.1",
-                conn_header: Some("close"),
-                expect_keep_alive_head: false,
+                extra: "Connection: keep-alive\r\n",
                 expect_reuse: false,
+            },
+            Case {
+                name: "1.1-Proxy-Connection: keep-alive",
+                version: "HTTP/1.1",
+                extra: "Proxy-Connection: keep-alive\r\n",
+                expect_reuse: true,
+            },
+            Case {
+                // Go 只看 Proxy-Connection：Connection: close 不取消复用
+                name: "1.1-close+Proxy-Connection: keep-alive",
+                version: "HTTP/1.1",
+                extra: "Connection: close\r\nProxy-Connection: keep-alive\r\n",
+                expect_reuse: true,
+            },
+            Case { name: "1.0-无连接头", version: "HTTP/1.0", extra: "", expect_reuse: false },
+            Case {
+                name: "1.0-Proxy-Connection: keep-alive",
+                version: "HTTP/1.0",
+                extra: "Proxy-Connection: keep-alive\r\n",
+                expect_reuse: true,
             },
         ];
         for case in cases {
             let (proxy, upstream, _conns) = spawn_http_proxy_harness_for_test().await;
             let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
             let base = format!("http://127.0.0.1:{}/", upstream.port());
-            let conn_line =
-                case.conn_header.map(|v| format!("Connection: {v}\r\n")).unwrap_or_default();
             let req = format!(
-                "GET {base}f5 {}\r\nHost: 127.0.0.1:{}\r\n{conn_line}\r\n",
+                "GET {base}f5 {}\r\nHost: 127.0.0.1:{}\r\n{}\r\n",
                 case.version,
-                upstream.port()
+                upstream.port(),
+                case.extra
             );
             client.write_all(req.as_bytes()).await.unwrap();
 
             let (status, head, body) = read_http_response_for_test(&mut client).await;
             assert_eq!(status, 200, "[{}]", case.name);
             assert_eq!(body, b"/f5", "[{}]", case.name);
-            if case.expect_keep_alive_head {
-                assert!(head.contains("connection: keep-alive\r\n"), "[{}] {head}", case.name);
-                assert!(!head.contains("connection: close"), "[{}] {head}", case.name);
-            } else {
-                assert!(head.contains("connection: close\r\n"), "[{}] {head}", case.name);
-                assert!(!head.contains("connection: keep-alive"), "[{}] {head}", case.name);
-            }
+            // Go 实测逐字节布局（响应头不受请求连接头/版本影响）
+            assert_eq!(
+                head,
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\
+                 Keep-Alive: timeout=60\r\nProxy-Connection: keep-alive",
+                "[{}]",
+                case.name
+            );
 
             if case.expect_reuse {
                 let second = format!(
-                    "GET {base}f5-second {}\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    "GET {base}f5-second {}\r\nHost: 127.0.0.1:{}\r\n{}\r\n",
                     case.version,
-                    upstream.port()
+                    upstream.port(),
+                    case.extra
                 );
                 client.write_all(second.as_bytes()).await.unwrap();
                 let (status2, _head2, body2) = read_http_response_for_test(&mut client).await;
                 assert_eq!(status2, 200, "[{}]", case.name);
                 assert_eq!(body2, b"/f5-second", "[{}]", case.name);
             } else {
-                // close 案例响应后服务端收尾关闭（graceful drain 后 FIN）→ EOF
+                // Go：未宣告 Proxy-Connection: keep-alive → 响应后即断（graceful drain 后 FIN）
                 let mut eof = [0u8; 64];
                 let n =
                     tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut eof))
@@ -9107,8 +9389,9 @@ mod tests {
     }
 
     /// ft58 S1：同一客户端连接上连续两个 plain HTTP 代理请求均成功且回包正确
-    /// （keep-alive 复用；改动前每请求即关连接，第二请求必 EOF）；第三个请求带
-    /// `Connection: close` → 响应后服务端收尾关闭（EOF 干净）。
+    /// （keep-alive 复用，Go 语义 = 请求带 `Proxy-Connection: keep-alive`；
+    /// 改动前每请求即关连接，第二请求必 EOF）；第三个请求不带该头（带
+    /// `Connection: close`）→ 响应后服务端收尾关闭（EOF 干净）。
     #[tokio::test]
     async fn http_keep_alive_reuses_connection_between_requests() {
         let (proxy, upstream, upstream_conns) = spawn_http_proxy_harness_for_test().await;
@@ -9118,8 +9401,11 @@ mod tests {
 
         client
             .write_all(
-                format!("GET {base}first HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET {base}first HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+                     Proxy-Connection: keep-alive\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -9130,8 +9416,11 @@ mod tests {
         // 同一连接第二请求（改动前此处 EOF/断链）
         client
             .write_all(
-                format!("GET {base}second HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET {base}second HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+                     Proxy-Connection: keep-alive\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
@@ -9139,7 +9428,7 @@ mod tests {
         assert_eq!(status, 200, "second request: {head}");
         assert_eq!(body, b"/second");
 
-        // 客户端 close token → 响应可读且随后干净 EOF
+        // 未宣告 proxy keep-alive → 响应可读且随后干净 EOF
         client
             .write_all(
                 format!("GET {base}third HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nConnection: close\r\n\r\n")
@@ -9150,14 +9439,10 @@ mod tests {
         let (status, head, body) = read_http_response_for_test(&mut client).await;
         assert_eq!(status, 200, "third request: {head}");
         assert_eq!(body, b"/third");
-        assert!(
-            head.to_ascii_lowercase().contains("connection: close"),
-            "close token must be honored in response headers: {head}"
-        );
         let mut rest = Vec::new();
         tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut rest))
             .await
-            .expect("server must close after client close token")
+            .expect("server must close after a request without Proxy-Connection: keep-alive")
             .unwrap();
         assert!(rest.is_empty(), "no extra bytes after close: {rest:?}");
 
@@ -9199,8 +9484,11 @@ mod tests {
         for path in ["first", "second"] {
             client
                 .write_all(
-                    format!("GET {base}{path} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n")
-                        .as_bytes(),
+                    format!(
+                        "GET {base}{path} HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+                         Proxy-Connection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
@@ -9220,11 +9508,14 @@ mod tests {
         let base = format!("http://127.0.0.1:{upstream_port}/");
         let payload = "hello-proxy-body";
         let post = format!(
-            "POST {base}upload HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST {base}upload HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+             Proxy-Connection: keep-alive\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
-        let get =
-            format!("GET {base}after-post HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n");
+        let get = format!(
+            "GET {base}after-post HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+             Proxy-Connection: keep-alive\r\n\r\n"
+        );
         client.write_all(format!("{post}{get}").as_bytes()).await.unwrap();
 
         let (status, head, body) = read_http_response_for_test(&mut client).await;
@@ -9246,10 +9537,13 @@ mod tests {
         let base = format!("http://127.0.0.1:{upstream_port}/");
         // 7 字节 + 2 字节两帧（非整缓冲对齐），终止块带空 trailer
         let post = format!(
-            "POST {base}chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchunk-1\r\n2\r\nd!\r\n0\r\n\r\n"
+            "POST {base}chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+             Proxy-Connection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nchunk-1\r\n2\r\nd!\r\n0\r\n\r\n"
         );
-        let get =
-            format!("GET {base}after-chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n");
+        let get = format!(
+            "GET {base}after-chunked HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\
+             Proxy-Connection: keep-alive\r\n\r\n"
+        );
         client.write_all(format!("{post}{get}").as_bytes()).await.unwrap();
 
         let (status, head, body) = read_http_response_for_test(&mut client).await;

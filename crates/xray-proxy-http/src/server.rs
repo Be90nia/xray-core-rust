@@ -65,7 +65,8 @@ pub struct HandshakeResult {
     pub method: String,
     /// 请求行 target 字段（CONNECT = `host:port`，plain HTTP = 绝对 URL 或路径）。
     pub target: String,
-    /// 请求行版本段（keep-alive 判定按版本分叉，RFC 7230 §A.1）。
+    /// 请求行版本段（HTTP/1.0 侧剥除 Transfer-Encoding 等按版本分叉，
+    /// Go net/http transfer.go `parseTransferEncoding`）。
     pub http_version: HttpVersion,
     /// 解析出的 headers（key 全小写）。同名多值保留（对齐 Go `http.Header`
     /// `map[string][]string`——双 Cookie 等逐行转发，不折叠丢失）。
@@ -454,9 +455,10 @@ async fn handle_plain_http(
     }
     let req_body_len = parse_content_length(&hs.headers)?;
 
-    // Go: request.Host = request.URL.Host（绝对 URI 时覆盖 Host 头）
-    if let Some(host) = extract_url_host(&hs.target) {
-        hs.headers.insert("host".into(), vec![host.to_string()]);
+    // Go `handlePlainHTTP`：`request.Host = request.URL.Host`（绝对 URI 的 host
+    // 优先，origin-form 时即 Host 头）→ 转发请求的 Host 头用同一个值。
+    if let Some(host) = resolve_request_host(&hs.target, &hs.headers) {
+        hs.headers.insert("host".into(), vec![host]);
     }
     let path = extract_request_path(&hs.target);
 
@@ -499,11 +501,28 @@ async fn handle_plain_http(
     // HEAD / 204 / 304：有长度声明但无 body（Go http.ReadResponse 语义——
     // HEAD 无 CL 头时 ContentLength 也按 0 处理，仍走 keep-alive 分支）
     let bodyless = hs.method == "HEAD" || resp.code == 204 || resp.code == 304;
+    // Go `response.ContentLength`（readTransfer/fixLength 语义）：chunked → -1；
+    // HEAD → 声明的 CL（无则 0）；204/304 → 0；其余 → 声明的 CL（无则 -1）。
+    // `>= 0` ⇔ Go 的 keep-alive 三头 + `response.Close = false`。
+    let effective_cl: Option<u64> = if chunked_resp {
+        None
+    } else if bodyless {
+        Some(if hs.method == "HEAD" { declared_len.unwrap_or(0) } else { 0 })
+    } else {
+        declared_len
+    };
+    let keep_alive = effective_cl.is_some();
 
-    if !chunked_resp && (bodyless || declared_len.is_some()) {
+    if keep_alive {
         // Go: response.ContentLength >= 0 → keep-alive 三头 + Close=false，
         // result 保持 errWaitAnother
-        let head = serialize_response_head(&resp, true);
+        let head = serialize_go_response_head(
+            &resp.status_line,
+            resp.code,
+            &resp.headers,
+            effective_cl,
+            chunked_resp,
+        );
         client.write_all(&head).await?;
         let body_len = if bodyless { 0 } else { declared_len.unwrap_or(0) };
         copy_exact_n(&mut upstream, client, body_len).await?;
@@ -511,7 +530,13 @@ async fn handle_plain_http(
     }
 
     // Go: response.Close = true; result = nil —— chunked / close-delimited 不循环
-    let head = serialize_response_head(&resp, false);
+    let head = serialize_go_response_head(
+        &resp.status_line,
+        resp.code,
+        &resp.headers,
+        effective_cl,
+        chunked_resp,
+    );
     client.write_all(&head).await?;
     if !bodyless {
         if chunked_resp {
@@ -545,7 +570,8 @@ fn parse_content_length(headers: &HashMap<String, Vec<String>>) -> Result<Option
 /// 客户端请求是否要求代理级 keep-alive。
 ///
 /// 对应 Go `Process`：`TrimSpace(ToLower(Get("Proxy-Connection"))) == "keep-alive"`。
-fn request_keep_alive(headers: &HashMap<String, Vec<String>>) -> bool {
+#[must_use]
+pub fn request_keep_alive(headers: &HashMap<String, Vec<String>>) -> bool {
     headers
         .get("proxy-connection")
         .and_then(|vals| vals.first())
@@ -556,11 +582,39 @@ fn request_keep_alive(headers: &HashMap<String, Vec<String>>) -> bool {
 ///
 /// 仅 `http://`/`https://` 前缀（absolute-form）有 authority；origin-form /
 /// authority-form 返回 `None`（等价 Go `request.URL.Host == ""`）。
+/// scheme 大小写不敏感（Go `url.Parse` 会把 scheme 归一为小写）。
 fn extract_url_host(target: &str) -> Option<&str> {
-    let after_scheme =
-        target.strip_prefix("http://").or_else(|| target.strip_prefix("https://"))?;
+    let lower = target.get(..target.len().min(8))?.to_ascii_lowercase();
+    let after_scheme = if lower.starts_with("http://") {
+        target.get(7..)?
+    } else if lower.starts_with("https://") {
+        target.get(8..)?
+    } else {
+        return None;
+    };
     let authority = after_scheme.split('/').next().unwrap_or_default();
     (!authority.is_empty()).then_some(authority)
+}
+
+/// 请求目标 host（Go `http.ReadRequest` + `Process` 语义）。
+///
+/// Go：`request.Host = request.URL.Host`，URL 的 host 为空时才取 Host 头
+/// （net/http/request.go:1149）——即**绝对 URI 的 host 决定路由**，客户端给的
+/// Host 头只在 origin-form 时生效（空 Host 头 → 无 host → Go 报
+/// "malformed proxy host" 断链）。重复 Host 已在读头阶段拒收。
+#[must_use]
+pub fn resolve_request_host(
+    target: &str,
+    headers: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    if let Some(host) = extract_url_host(target) {
+        return Some(host.to_string());
+    }
+    headers
+        .get("host")
+        .and_then(|vals| vals.first())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// 上游响应头（解析结果）。
@@ -617,17 +671,77 @@ async fn read_response_head(
     }
 }
 
-/// 序列化回写给客户端的响应头：hop-by-hop 头移除后按 keep-alive 分支改写
-/// 连接性头（对齐 Go `RemoveHopByHopHeaders` + `response.Header.Set` 三头/
-/// `response.Close`）。
-fn serialize_response_head(resp: &ResponseHead, keep_alive: bool) -> Vec<u8> {
+/// Go `http.Response.Write` 的响应头字节布局（Go v26.10.17 实测逐字节对齐）。
+///
+/// Go 的写出顺序（net/http/response.go:296-330 + transfer.go:278-330）：
+/// 1. 状态行 + CRLF；
+/// 2. `transferWriter.writeHeader`：`Close` 时先写 `Connection: close` （hop-by-hop 已移除 → map
+///    内无 Connection token → 必写），随后 `Content-Length: N`（CL > 0）或 `Transfer-Encoding:
+///    chunked`；
+/// 3. 其余响应头：`Header.WriteSubset` 语义——canonical 名 + 按名排序 + 逐值成行 （排除
+///    Content-Length / Transfer-Encoding / Trailer 与 hop-by-hop）； keep-alive
+///    分支的三个连接头也在此集合内（Go `Header.Set` 后参与排序）；
+/// 4. `Content-Length: 0`（CL == 0 且状态允许 body）追加在排序头之后；
+/// 5. 空行结束头块。
+///
+/// [`content_length`] 即 Go 的 `response.ContentLength`：`Some(n)`（>= 0）→
+/// keep-alive 三头；`None`（-1，长度未知）→ close 语义。
+#[must_use]
+pub fn serialize_go_response_head(
+    status_line: &str,
+    code: u16,
+    headers: &HashMap<String, Vec<String>>,
+    content_length: Option<u64>,
+    chunked: bool,
+) -> Vec<u8> {
+    /// Go `RemoveHopByHopHeaders` 的头名集合（小写形态）。
+    /// 注意 `trailer` 是 Go 侧拼写，与请求侧 `HOP_BY_HOP_HEADERS` 的 `trailers` 不同源，勿合并。
+    const GO_HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+
     let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(resp.status_line.as_bytes());
+    buf.extend_from_slice(status_line.as_bytes());
     buf.extend_from_slice(b"\r\n");
-    for (key, values) in &resp.headers {
-        if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
-            continue;
-        }
+    // Go：ContentLength < 0 → response.Close = true → 先写 "Connection: close"。
+    let keep_alive = content_length.is_some();
+    if !keep_alive {
+        buf.extend_from_slice(b"Connection: close\r\n");
+    }
+    // Go：CL > 0 → transferWriter 先写 Content-Length；chunked → Transfer-Encoding。
+    let mut sent_content_length = false;
+    if chunked {
+        buf.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if let Some(n) = content_length.filter(|n| *n > 0) {
+        buf.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
+        sent_content_length = true;
+    }
+    // 其余响应头：canonical 名 + 排序（Go `Header.WriteSubset`）。
+    let mut entries: Vec<(String, Vec<&str>)> = headers
+        .iter()
+        .filter(|(key, _)| {
+            !GO_HOP_BY_HOP.contains(&key.as_str())
+                && !matches!(key.as_str(), "content-length" | "transfer-encoding" | "trailer")
+        })
+        .map(|(key, values)| {
+            (canonical_header_key(key), values.iter().map(String::as_str).collect())
+        })
+        .collect();
+    if keep_alive {
+        entries.push(("Connection".into(), vec!["keep-alive"]));
+        entries.push(("Keep-Alive".into(), vec!["timeout=60"]));
+        entries.push(("Proxy-Connection".into(), vec!["keep-alive"]));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, values) in entries {
         for value in values {
             buf.extend_from_slice(key.as_bytes());
             buf.extend_from_slice(b": ");
@@ -635,16 +749,36 @@ fn serialize_response_head(resp: &ResponseHead, keep_alive: bool) -> Vec<u8> {
             buf.extend_from_slice(b"\r\n");
         }
     }
-    if keep_alive {
-        buf.extend_from_slice(
-            b"proxy-connection: keep-alive\r\n\
-              connection: keep-alive\r\n\
-              keep-alive: timeout=60\r\n\r\n",
-        );
-    } else {
-        buf.extend_from_slice(b"connection: close\r\nproxy-connection: close\r\n\r\n");
+    // Go `Response.Write` 尾段：CL == 0 且状态允许 body → 追加 "Content-Length: 0"。
+    if !chunked && !sent_content_length && content_length == Some(0) && body_allowed(code) {
+        buf.extend_from_slice(b"Content-Length: 0\r\n");
     }
+    buf.extend_from_slice(b"\r\n");
     buf
+}
+
+/// 状态码是否允许 body（Go `bodyAllowedForStatus`：1xx / 204 / 304 不允许）。
+fn body_allowed(code: u16) -> bool {
+    !(code / 100 == 1 || code == 204 || code == 304)
+}
+
+/// 头名 canonical 化（Go `textproto.CanonicalMIMEHeaderKey`）：首字母与
+/// `-` 后的字母大写，其余小写。
+fn canonical_header_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper = true;
+    for ch in key.chars() {
+        if ch == '-' {
+            out.push('-');
+            upper = true;
+        } else if upper {
+            out.extend(ch.to_uppercase());
+            upper = false;
+        } else {
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
 }
 
 /// 定长透传 `n` 字节（请求/响应 body）。上游提前 EOF → 错误（静默截断不可接受）。
@@ -731,14 +865,11 @@ pub async fn http_server_handshake<RW>(
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // 1+2. 读请求行 + headers；协议格式错 → 400 后关连接；
-    // EOF（客户端正常关闭）不写 400 直接断
+    // 1+2. 读请求行 + headers；协议格式错 → **断链不回响应**（Go
+    // `http.ReadRequest` 失败 → `Process` 直接 return error → 连接关闭，Go 不写
+    // 400）；EOF（客户端正常关闭）同样直接断。
     let (method, target, http_version, headers) = match read_request_head(stream).await {
         Ok(head) => head,
-        Err(e @ HttpProxyError::InvalidRequest(_)) => {
-            let _ = stream.write_all(RESPONSE_BAD_REQUEST).await;
-            return Err(e);
-        },
         Err(e) => return Err(e),
     };
 
@@ -760,16 +891,24 @@ where
         }
     }
 
-    // 4. 解析 dest
+    // 4. 解析 dest（Go `Process`：`defaultPort = 80`，`strings.EqualFold(URL.Scheme, "https")` →
+    //    443；`host = request.Host`，而 `http.ReadRequest` 令 `request.Host` = 绝对 URI 的 host
+    //    优先、其次 Host 头——即 **URL 的 host 决定路由**，客户端给的 Host 头不参与选路（重复 Host
+    //    已在读头阶段拒收））。
+    let default_port =
+        if target.get(..8).is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://")) {
+            443
+        } else {
+            80
+        };
     let dest = if method == "CONNECT" {
-        parse_host_port(&target, 443)?
+        // CONNECT 的 target 是 authority-form：`http.ReadRequest` 把它包成
+        // `http://host:port` 再剥掉 scheme → URL.Host = authority → 同一条规则。
+        parse_host_port(&target, default_port)?
     } else {
-        // 普通 HTTP 代理从 Host header 提取 dest
-        let host = headers
-            .get("host")
-            .and_then(|vals| vals.first())
-            .ok_or_else(|| HttpProxyError::InvalidRequest("missing Host header".into()))?;
-        parse_host_port(host, 80)?
+        let host = resolve_request_host(&target, &headers)
+            .ok_or_else(|| HttpProxyError::Protocol("missing Host header".into()))?;
+        parse_host_port(&host, default_port)?
     };
     // 4.5 透明代理检查（对应 Go handlePlainHTTP proxy/http/server.go:209：
     // `!AllowTransparent && request.URL.Host == ""` → 400 Bad Request）。
@@ -792,7 +931,8 @@ where
 /// 读请求行 + headers（握手第 1-2 步）。
 ///
 /// 返回 (method 大写, target, 请求行版本, headers)；EOF/超长行/超行数/malformed 请求行
-/// 统一报 [`HttpProxyError::InvalidRequest`]（或 IO 错），由调用方决定 400。
+/// 统一报 [`HttpProxyError::Protocol`]（或 [`HttpProxyError::Io`]），**不回任何响应**
+/// ——对齐 Go `http.ReadRequest` 失败后 `Process` 直接断链。
 async fn read_request_head<RW>(
     stream: &mut RW,
 ) -> Result<(String, String, HttpVersion, HashMap<String, Vec<String>>)>
@@ -803,9 +943,7 @@ where
     let request_line = read_http_line(stream).await?;
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 3 {
-        return Err(HttpProxyError::InvalidRequest(format!(
-            "malformed request line: {request_line:?}"
-        )));
+        return Err(HttpProxyError::Protocol(format!("malformed request line: {request_line:?}")));
     }
     let method = parts[0].to_ascii_uppercase();
     let target = parts[1].to_string();
@@ -822,13 +960,19 @@ where
         }
         header_lines += 1;
         if header_lines > MAX_HTTP_HEADER_LINES {
-            return Err(HttpProxyError::InvalidRequest(format!(
+            return Err(HttpProxyError::Protocol(format!(
                 "too many HTTP header lines (>{MAX_HTTP_HEADER_LINES})"
             )));
         }
         if let Some((k, v)) = line.split_once(':') {
             headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
         }
+    }
+    // Go `http.ReadRequest`（net/http/request.go:1138）：多个 Host 头 → 报
+    // "too many Host headers" → ReadRequest 失败 → 上层断链（不回响应）。
+    // 重复 Host 是请求走私面（首个 Host 决定路由、第二个到达上游），必须拒。
+    if headers.get("host").is_some_and(|values| values.len() > 1) {
+        return Err(HttpProxyError::Protocol("too many Host headers".into()));
     }
     Ok((method, target, http_version, headers))
 }
@@ -865,14 +1009,13 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
         if !prev_was_cr {
             buf.push(byte[0]);
             if buf.len() > MAX_HTTP_LINE_BYTES {
-                return Err(HttpProxyError::InvalidRequest(format!(
+                return Err(HttpProxyError::Protocol(format!(
                     "http header line exceeds {MAX_HTTP_LINE_BYTES} bytes"
                 )));
             }
         }
     }
-    String::from_utf8(buf)
-        .map_err(|e| HttpProxyError::InvalidRequest(format!("non-utf8 header: {e}")))
+    String::from_utf8(buf).map_err(|e| HttpProxyError::Protocol(format!("non-utf8 header: {e}")))
 }
 
 /// 解析 `host:port` 字符串为 [`Destination`]。无端口时用 `default_port`。
@@ -1047,31 +1190,63 @@ mod tests {
     }
 
     #[test]
-    fn serialize_response_head_keep_alive_branch() {
+    fn serialize_go_response_head_keep_alive_branch_matches_go_bytes() {
         let mut headers: HashMap<String, Vec<String>> = HashMap::new();
         headers.insert("content-type".into(), vec!["text/plain".into()]);
+        headers.insert("content-length".into(), vec!["17".into()]);
         headers.insert("connection".into(), vec!["close".into()]); // hop-by-hop，必被移除
-        let resp = ResponseHead { status_line: "HTTP/1.1 200 OK".into(), code: 200, headers };
-        let out = String::from_utf8(serialize_response_head(&resp, true)).unwrap();
-        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
-        assert!(out.contains("content-type: text/plain\r\n"), "{out}");
-        assert!(!out.contains("connection: close"), "old hop-by-hop must go: {out}");
-        assert!(out.contains("proxy-connection: keep-alive\r\n"), "{out}");
-        assert!(out.contains("connection: keep-alive\r\n"), "{out}");
-        assert!(out.contains("keep-alive: timeout=60\r\n"), "{out}");
+        let out = String::from_utf8(serialize_go_response_head(
+            "HTTP/1.1 200 OK",
+            200,
+            &headers,
+            Some(17),
+            false,
+        ))
+        .unwrap();
+        // Go v26.10.17 实测布局：Content-Length 由 transferWriter 先写，其余头
+        // canonical + 排序（Header.WriteSubset），keep-alive 三头参与排序。
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: 17\r\n\
+             Connection: keep-alive\r\n\
+             Content-Type: text/plain\r\n\
+             Keep-Alive: timeout=60\r\n\
+             Proxy-Connection: keep-alive\r\n\r\n"
+        );
     }
 
     #[test]
-    fn serialize_response_head_close_branch() {
-        let resp = ResponseHead {
-            status_line: "HTTP/1.1 200 OK".into(),
-            code: 200,
-            headers: HashMap::new(),
-        };
-        let out = String::from_utf8(serialize_response_head(&resp, false)).unwrap();
-        assert!(out.contains("connection: close\r\n"), "{out}");
-        assert!(out.contains("proxy-connection: close\r\n"), "{out}");
-        assert!(!out.contains("keep-alive"), "{out}");
+    fn serialize_go_response_head_close_branch_matches_go_bytes() {
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        headers.insert("content-type".into(), vec!["text/plain".into()]);
+        let out = String::from_utf8(serialize_go_response_head(
+            "HTTP/1.1 200 OK",
+            200,
+            &headers,
+            None,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(out, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n");
+    }
+
+    #[test]
+    fn serialize_go_response_head_chunked_matches_go_bytes() {
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        headers.insert("transfer-encoding".into(), vec!["chunked".into()]);
+        let out = String::from_utf8(serialize_go_response_head(
+            "HTTP/1.1 200 OK",
+            200,
+            &headers,
+            None,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            out,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+        );
     }
 
     // ===== TCP 端到端 handshake 测试 =====
@@ -1191,11 +1366,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_connect_default_port_443() {
+    async fn handshake_connect_default_port_80() {
+        // Go `net/http/request.go:1118-1130`：CONNECT 的 authority 被包成
+        // `http://<authority>` 解析后**清空 scheme** → xray `Process` 的
+        // `defaultPort = 80`（只有 `URL.Scheme == "https"` 才是 443）。
         let req = b"CONNECT example.com HTTP/1.1\r\n\r\n";
         let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
         let hs = result.unwrap();
-        assert_eq!(hs.dest.port().value(), 443);
+        assert_eq!(hs.dest.port().value(), 80);
     }
 
     #[tokio::test]
@@ -1545,16 +1723,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_request_400_then_close() {
-        // 头解析失败 → 400 → 关连接。
+    async fn malformed_request_closes_without_response() {
+        // Go 语义（`http.ReadRequest` 失败 → `Process` 直接 return error）：
+        // **不回任何响应**，直接关连接（差分矩阵 A31/A32 实测 Go = EMPTY）。
         let (_server, port) = start_server(ServerConfig::default()).await;
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(b"GARBAGE\r\n\r\n").await.unwrap();
-        let resp = tokio::time::timeout(Duration::from_secs(5), read_response_head(&mut client))
-            .await
-            .expect("400 response timeout");
-        assert!(resp.contains("400"), "got: {resp}");
-        assert_eq!(read_eof(&mut client).await, 0, "connection must close after 400");
+        assert_eq!(
+            read_eof(&mut client).await,
+            0,
+            "malformed request must close silently (no 400)"
+        );
     }
 
     // ===== plain HTTP TE 语义（Go net/http transfer.go parseTransferEncoding）=====
