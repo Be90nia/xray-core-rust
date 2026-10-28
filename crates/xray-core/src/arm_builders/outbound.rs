@@ -360,6 +360,7 @@ pub(crate) fn build_hysteria_outbound(
     let tls_config = build_hysteria_tls_config(
         &stream_settings.security,
         stream_settings.security_json.as_ref(),
+        &server_name,
     )
     .map_err(|e| format!("hysteria streamSettings: {e}"))?;
     let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(

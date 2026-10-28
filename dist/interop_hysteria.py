@@ -57,12 +57,14 @@ def build_client_outbound(client_bin, P):
                 "settings": {"version": 2, "address": "127.0.0.1", "port": P},
                 "streamSettings": hy_stream_go_cli()}
     # Rust client: auth 在 servers[0]。Go dialer.go:327-330 语义：无 security=tls
-    # 硬错拒启（2026-10-20 起 Rust 对齐），自签证书显式 insecure 信任。
+    # 硬错拒启（2026-10-20 起 Rust 对齐）；自签证书走 Go 同款 pin（私有键 insecure
+    # 已删除，bd qp0ya）。
     return {"protocol": "hysteria",
             "settings": {"servers": [{"address": "127.0.0.1", "port": P, "auth": AUTH}]},
             "streamSettings": {"network": "hysteria", "security": "tls",
                                "hysteriaSettings": {"version": 2},
-                               "tlsSettings": {"serverName": "localhost", "insecure": True}}}
+                               "tlsSettings": {"serverName": "localhost",
+                                               "pinnedPeerCertSha256": PIN}}}
 
 
 def kill():

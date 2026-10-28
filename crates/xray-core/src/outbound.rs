@@ -1080,31 +1080,29 @@ pub(crate) fn parse_trojan_config(
 ///
 /// 对齐 Go `transport/internet/hysteria/dialer.go:327-330 Dial`：TLS 配置完全来自
 /// streamSettings（`tls.ConfigFromStreamSettings`），`security != "tls"` 时配置为
-/// nil → 硬错。`insecure: true` 显式跳过校验（用户信任决策）；缺省走 webpki-roots
-/// 真实验证（此前恒 NoVerifier 不校验，自签/中间人不可察觉）。
+/// nil → 硬错；`tlsSettings` 走与其他传输同一入口
+/// [`xray_tls::client_config::build_client_config`]（缺省 webpki-roots 真实验证，
+/// pcs / vcn / 自定义根按 Go 字段名生效）。
+///
+/// bd qp0ya：Rust 私有键 `insecure` 已删——它会关掉证书校验，绕过 Go 在
+/// `PostProcessConfigureFile` 对 `allowInsecure` 的硬错语义。该键现在按未知键
+/// 忽略（校验恒开）。
 pub(crate) fn build_hysteria_tls_config(
     security: &str,
     tls_json: Option<&serde_json::Value>,
+    server_name: &str,
 ) -> std::result::Result<rustls::ClientConfig, String> {
     if !security.eq_ignore_ascii_case("tls") {
         return Err(format!(
             "security must be \"tls\" (Go: tls config is nil), got \"{security}\""
         ));
     }
-    let insecure =
-        tls_json.and_then(|v| v.get("insecure")).and_then(|v| v.as_bool()).unwrap_or(false);
-    xray_common::ensure_default_crypto_provider();
-    if insecure {
-        Ok(rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth())
-    } else {
-        let root_store = rustls::RootCertStore {
-            #[allow(clippy::iter_cloned_collect)] // 存量清零批次
-            roots: webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect(),
-        };
-        Ok(rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth())
+    let built = xray_tls::client_config::build_client_config("tls", tls_json, server_name)
+        .map_err(|e| format!("tlsSettings: {e}"))?;
+    match built {
+        Some(cfg) => Ok((*cfg).clone()),
+        // security 已是 "tls"，build_client_config 恒返回 Some（防御式拒绝而非 panic）。
+        None => Err("tlsSettings: no tls config built".to_string()),
     }
 }
 
@@ -1596,8 +1594,24 @@ async fn handle_ip_query(
         Err(xray_app_dns::error::DnsError::RCodeError(rc)) => {
             Some(xray_proxy_dns::build_dns_response(&header, &question, rc as u8))
         },
-        // Go dns.go:334-337：其余错误静默（rCode 0 + ips 空 + 非 EmptyResponse）。
-        Ok((_, _)) | Err(_) => None,
+        // Go dns.go:334-337：rCode 0 + ips 空 + 非 EmptyResponse → 留痕后不回包。
+        // Go 用 `errors.LogInfoInner(ctx, err, "ip query")`（Info 级）；此处取
+        // warning：现场默认 loglevel 下 Info 不可见（bd lvjw1 的症状即"零日志"）。
+        Ok((_, _)) => {
+            xray_common::log::warning(format!(
+                "ip query: empty answer for {} (qType {})",
+                question.name, question.q_type
+            ));
+            None
+        },
+        Err(e) => {
+            // 错误分类不丢：DnsError 的 Display 逐字带出（RecordNotFound/超时/上游异常）。
+            xray_common::log::warning(format!(
+                "ip query: {} (qType {}): {e}",
+                question.name, question.q_type
+            ));
+            None
+        },
     }
 }
 
@@ -3162,6 +3176,8 @@ impl From<String> for BuildError {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+
     use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
     use xray_conf::{BuiltConfig, BuiltEntry, BuiltOutbound};
 
@@ -4022,16 +4038,92 @@ mod tests {
 
     /// x2ci：hysteria 出站 TLS 配置按 streamSettings（Go dialer.go:327-330）。
     #[test]
-    fn build_hysteria_tls_config_validates_security_and_insecure() {
+    fn build_hysteria_tls_config_validates_security() {
         // security 非 tls → 硬错（Go "tls config is nil"），缺失/未知值同拒。
-        assert!(build_hysteria_tls_config("", None).is_err());
-        assert!(build_hysteria_tls_config("reality", None).is_err());
-        assert!(build_hysteria_tls_config("xtls", None).is_err());
-        // security=tls：缺省走 webpki 真实验证；insecure=true 显式跳过。
-        let tls_json: serde_json::Value = serde_json::from_str(r#"{"insecure": true}"#).unwrap();
-        assert!(build_hysteria_tls_config("tls", Some(&tls_json)).is_ok());
-        assert!(build_hysteria_tls_config("tls", None).is_ok());
-        assert!(build_hysteria_tls_config("TLS", None).is_ok(), "大小写归一对齐 Go ToLower");
+        assert!(build_hysteria_tls_config("", None, "a.com").is_err());
+        assert!(build_hysteria_tls_config("reality", None, "a.com").is_err());
+        assert!(build_hysteria_tls_config("xtls", None, "a.com").is_err());
+        assert!(build_hysteria_tls_config("tls", None, "a.com").is_ok());
+        assert!(
+            build_hysteria_tls_config("TLS", None, "a.com").is_ok(),
+            "大小写归一对齐 Go ToLower"
+        );
+    }
+
+    /// bd qp0ya 判别器：`tlsSettings` 上的 Rust 私有键 `insecure` 不再关闭证书验证。
+    ///
+    /// 修前该键 → `NoVerifier`（自签证书握手成功）；修后按未知键忽略，握手必须以
+    /// 证书校验失败告终（Go 对应字段 `allowInsecure` 已在 conf 层硬错移除）。
+    #[tokio::test]
+    async fn hysteria_private_insecure_key_no_longer_disables_cert_verification() {
+        use rustls::pki_types::ServerName;
+
+        // 自签证书服务端（inbound 既有 helper，SAN = localhost）。
+        let (acceptor, _pw) =
+            crate::inbound::parse_anytls_tls_acceptor(b"{}").expect("self-signed acceptor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+
+        let tls_json = serde_json::json!({ "insecure": true, "serverName": "localhost" });
+        let cfg = build_hysteria_tls_config("tls", Some(&tls_json), "localhost")
+            .expect("security=tls 构造成功");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let sni = ServerName::try_from("localhost").expect("sni");
+        let err = match connector.connect(sni, tcp).await {
+            Ok(_) => panic!("私有键 insecure 不得关闭证书验证：自签证书握手竟然成功"),
+            Err(e) => e,
+        };
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("certificate"), "必须是证书校验失败，实得: {err}");
+        server.await.expect("server task");
+    }
+
+    /// bd qp0ya 配套：删私有键不等于封死自签节点——Go 语义的
+    /// `disableSystemRoot` + `certificates[]`（Go `loadSelfCertPool`）仍放行，
+    /// 与 interop 脚本 Go 侧 `pinnedPeerCertSha256` 走同一 streamSettings 入口。
+    #[tokio::test]
+    async fn hysteria_self_signed_trusted_via_custom_root_certificate() {
+        use rustls::pki_types::{PrivateKeyDer, ServerName};
+
+        xray_common::ensure_default_crypto_provider();
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+        let cert = params.self_signed(&key_pair).expect("self signed");
+        let server_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivateKeyDer::try_from(key_pair.serialize_der()).expect("key der"),
+            )
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+
+        let tls_json = serde_json::json!({
+            "serverName": "localhost",
+            "disableSystemRoot": true,
+            "certificates": [{ "certificate": cert.pem() }],
+        });
+        let cfg = build_hysteria_tls_config("tls", Some(&tls_json), "localhost")
+            .expect("security=tls 构造成功");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let sni = ServerName::try_from("localhost").expect("sni");
+        let _stream = connector.connect(sni, tcp).await.expect("自定义信任根必须放行自签证书");
+        server.await.expect("server task");
     }
 
     /// vrll①③：settings JSON 坏 / 未知 strategy / finalRules 单条非法 →
@@ -5501,12 +5593,22 @@ mod tests {
     fn make_fakedns_service(client_tag: &str) -> Arc<xray_app_dns::server::DnsService> {
         use xray_app_dns::{
             fakedns::Holder,
-            nameserver::{Client, NameServerConfig, Server, fakedns::FakeDnsServer},
+            nameserver::{Server, fakedns::FakeDnsServer},
         };
 
-        let ns = NameServerConfig { tag: client_tag.to_string(), ..Default::default() };
         let fake: Box<dyn Server> = Box::new(FakeDnsServer::new(Holder::new_default().unwrap()));
-        let client = Client::new(ns, xray_app_dns::config::IpOption::all(), fake).unwrap();
+        make_dns_service(client_tag, fake)
+    }
+
+    /// DnsService 单一上游 `server`（其余固定：UseIp / 串行查询 / 无静态 hosts）。
+    fn make_dns_service(
+        client_tag: &str,
+        server: Box<dyn xray_app_dns::nameserver::Server>,
+    ) -> Arc<xray_app_dns::server::DnsService> {
+        use xray_app_dns::nameserver::{Client, NameServerConfig};
+
+        let ns = NameServerConfig { tag: client_tag.to_string(), ..Default::default() };
+        let client = Client::new(ns, xray_app_dns::config::IpOption::all(), server).unwrap();
         Arc::new(xray_app_dns::server::DnsService::new(xray_app_dns::server::DnsServiceConfig {
             client_ip: Vec::new(),
             query_strategy: xray_app_dns::config::QueryStrategy::UseIp,
@@ -5523,6 +5625,90 @@ mod tests {
             domain_matcher: None,
             matcher_infos: Vec::new(),
         }))
+    }
+
+    /// 恒失败的上游 nameserver（bd lvjw1：非 EmptyResponse/RCodeError 失败）。
+    struct FailingNameServer;
+
+    impl xray_app_dns::nameserver::Server for FailingNameServer {
+        fn name(&self) -> &str {
+            "failing-upstream"
+        }
+
+        fn is_disable_cache(&self) -> bool {
+            false
+        }
+
+        fn query_ip<'a>(
+            &'a self,
+            _domain: &'a str,
+            _option: xray_app_dns::config::IpOption,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = std::result::Result<
+                            (Vec<std::net::IpAddr>, u32),
+                            xray_app_dns::error::DnsError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Err(xray_app_dns::error::DnsError::RecordNotFound) })
+        }
+    }
+
+    /// 捕获 general 通道落样（bd lvjw1 留痕断言）。
+    struct GeneralCaptureSink {
+        lines: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl xray_common::log::ChannelSink for GeneralCaptureSink {
+        fn channel(&self) -> xray_common::log::Channel {
+            xray_common::log::Channel::General
+        }
+
+        fn level(&self) -> xray_common::log::LevelFilter {
+            xray_common::log::LevelFilter::Trace
+        }
+
+        fn write(&self, _level: xray_common::log::Level, _target: &str, message: &str) {
+            self.lines.lock().push(message.to_string());
+        }
+
+        fn dropped_lines(&self) -> u64 {
+            0
+        }
+    }
+
+    /// bd lvjw1：hijack 的上游查询失败必须留痕（Go dns.go:334-337 `LogInfoInner`）。
+    ///
+    /// 修前 `Ok((_, _)) | Err(_) => None` 全程零日志，现场只见 DNS 无响应直到超时。
+    ///
+    /// 落样断言依赖全局 General 槽——整包联跑时该槽可能已被生产 sink（app-log，
+    /// 任一 `Instance::start` 装表）占用，此时只有行为断言生效；单跑本测试即得
+    /// 完整留样断言：`cargo test -p xray-core --lib hijack_ip_query_failure_is_logged`。
+    #[tokio::test]
+    async fn hijack_ip_query_failure_is_logged() {
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let own_sink = xray_common::log::register_channel(Arc::new(GeneralCaptureSink {
+            lines: Arc::clone(&lines),
+        }))
+        .is_ok();
+
+        let svc = make_dns_service("failing-upstream", Box::new(FailingNameServer));
+        let query = dns_make_query(0x1234, "failing.example.com", 1);
+        assert!(handle_ip_query(&query, &svc).await.is_none(), "失败路径仍不回包（Go 语义不变）");
+
+        if !own_sink {
+            eprintln!("General 槽已被生产 sink 占用：留样断言需单跑本测试（见函数文档）");
+            return;
+        }
+        let seen: Vec<String> =
+            lines.lock().iter().filter(|line| line.contains("ip query:")).cloned().collect();
+        assert_eq!(seen.len(), 1, "失败必须留痕恰一条: {seen:?}");
+        assert!(seen[0].contains("failing.example.com"), "告警要带域名: {}", seen[0]);
+        assert!(seen[0].contains("record not found"), "错误分类不丢: {}", seen[0]);
     }
 
     /// dispatch bridge 并返回 (up_writer, dn_reader)。
