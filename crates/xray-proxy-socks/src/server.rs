@@ -1026,7 +1026,7 @@ mod tests {
         client.read_exact(&mut auth_resp).await.unwrap();
         assert_eq!(auth_resp, [0x01, 0xFF]);
 
-        let err = server.await.unwrap().err().expect("auth must fail for wrong password");
+        let err = server.await.unwrap().expect_err("auth must fail for wrong password");
         // 日志侧 `error = %e` 取 Display：渲染结果含换行/控制字符即可伪造行
         let rendered = err.to_string();
         assert!(
