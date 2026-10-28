@@ -487,10 +487,9 @@ where
     stream.write_all(&[0x01, if success { 0x00 } else { 0xFF }]).await?;
 
     if !success {
-        return Err(SocksError::AuthFailed(format!(
-            "invalid credentials for user: {}",
-            username_str
-        )));
+        // b6tt6：固定串，不回显用户名——用户名是攻击者可控字节，含换行即可在
+        // 上层 `error = %e` 落盘时伪造整行日志。Go protocol.go:130 同款不回显。
+        return Err(SocksError::AuthFailed("invalid username or password".into()));
     }
     Ok(())
 }
@@ -992,6 +991,52 @@ mod tests {
 
         let result = server.await.unwrap();
         assert!(matches!(result.unwrap(), SocksRequest::TcpConnect(_)));
+    }
+
+    /// b6tt6：认证失败不得回显攻击者可控用户名——上层 `error = %e` 落盘时，
+    /// 含换行的用户名可伪造整行日志。端到端走真实 TcpStream + 真实握手。
+    #[tokio::test]
+    async fn auth_failure_error_does_not_echo_username() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = ServerConfig { auth_type: AuthType::Password, ..Default::default() };
+        config.accounts.insert("u".into(), "p".into());
+
+        let server = xray_common::testing::spawn(
+            "auth-failure-error-does-not-echo-username-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_PASSWORD]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp[1], AUTH_PASSWORD);
+
+        // 用户名含 LF / CR / ESC（伪造日志行 + 终端转义），密码错 → 认证失败
+        let user = b"admin\nINFO forged line\r\x1b[31m";
+        let mut auth = vec![0x01, user.len() as u8];
+        auth.extend_from_slice(user);
+        auth.extend_from_slice(&[1, b'x']);
+        client.write_all(&auth).await.unwrap();
+        let mut auth_resp = [0u8; 2];
+        client.read_exact(&mut auth_resp).await.unwrap();
+        assert_eq!(auth_resp, [0x01, 0xFF]);
+
+        let err = server.await.unwrap().err().expect("auth must fail for wrong password");
+        // 日志侧 `error = %e` 取 Display：渲染结果含换行/控制字符即可伪造行
+        let rendered = err.to_string();
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "auth error must not embed control chars (log injection): {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("forged line"),
+            "auth error must not echo attacker-controlled username: {rendered:?}"
+        );
     }
 
     #[tokio::test]
