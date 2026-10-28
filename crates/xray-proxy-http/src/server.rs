@@ -711,14 +711,14 @@ pub fn serialize_go_response_head(
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(status_line.as_bytes());
     buf.extend_from_slice(b"\r\n");
-    // Go：ContentLength < 0 → response.Close = true → 先写 "Connection: close"。
-    // 同时 Go `proxy/http/server.go:218-219`（写响应前）与 `:294-295`（非 keep-alive
-    // 分支）都会 `Set("Proxy-Connection", "close")`——两个头必须成对出现，缺
-    // Proxy-Connection 会让「代理语义」客户端判定 keep-alive 继续复用死连接。
+    // Go：ContentLength < 0 → response.Close = true → 只由 transferWriter 写
+    // "Connection: close"（**不发 Proxy-Connection**——Go 仅在 400/503 错误路径
+    // `proxy/http/server.go:218-219` / `:294-295` 才成对置位）。实测取证：
+    // Go 26.10.17 二进制在 chunked 上游下响应头恰为 `Connection: close` +
+    // `Transfer-Encoding: chunked`。
     let keep_alive = content_length.is_some();
     if !keep_alive {
         buf.extend_from_slice(b"Connection: close\r\n");
-        buf.extend_from_slice(b"Proxy-Connection: close\r\n");
     }
     // Go：CL > 0 → transferWriter 先写 Content-Length；chunked → Transfer-Encoding。
     let mut sent_content_length = false;

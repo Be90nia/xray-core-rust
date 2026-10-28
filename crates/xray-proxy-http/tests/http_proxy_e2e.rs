@@ -459,7 +459,12 @@ async fn plain_http_chunked_response_no_loop_close_e2e() {
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert!(resp.to_lowercase().contains("transfer-encoding: chunked"), "{resp}");
     assert!(resp.to_lowercase().contains("connection: close"), "{resp}");
-    assert!(resp.to_lowercase().contains("proxy-connection: close"), "{resp}");
+    // Go 26.10.17 二进制实测（`D:/tmp/probe_chunked.py` 同场景）：chunked 上游
+    // （Transfer-Encoding、无 Content-Length）时 Go 的 `handlePlainHTTP` 只置
+    // `response.Close = true`（server.go:276-279），由 transferWriter 写
+    // `Connection: close`；`Proxy-Connection` **只在 400/503 错误路径**成对下发
+    // （server.go:218-219 / :294-295）。原断言要求该头属非 Go 行为，已按实测改判。
+    assert!(!resp.to_lowercase().contains("proxy-connection"), "{resp}");
     assert!(resp.contains("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"), "chunk frames: {resp}");
 }
 
