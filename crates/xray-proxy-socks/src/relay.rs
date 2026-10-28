@@ -125,12 +125,18 @@ impl MaxPeer for SocketAddr {
 mod tests {
     use super::*;
 
-    /// 冒名者 bind 在同主机的另一个回环 IP 上（127.0.0.2 ≠ 127.0.0.1）。
-    async fn impostor_socket() -> UdpSocket {
-        match UdpSocket::bind(("127.0.0.2", 0)).await {
-            Ok(s) => s,
-            Err(_) => UdpSocket::bind(("127.0.0.3", 0)).await.expect("bind 127.0.0.2/3"),
-        }
+    /// 断言 `recv_filtered` 在 `ms` 内拿不到包（负向断言；与 core 侧同名助手同形）。
+    ///
+    /// 不绑二级回环 IP：macOS CI 的 lo0 默认只有 127.0.0.1，
+    /// `bind(127.0.0.2)` 会 EADDRNOTAVAIL（CI run 40710670210 实证）。
+    async fn assert_dropped(relay: &TempUdpRelay, ms: u64, why: &str) {
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(ms),
+            relay.recv_filtered(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "{why}");
     }
 
     #[test]
@@ -166,69 +172,82 @@ mod tests {
         assert_eq!(e.port(), 0);
     }
 
-    /// e2e：来源过滤——不同源 IP 的数据报被丢弃（4ers 防注入语义），
+    /// e2e：来源过滤——与 expected 不符的来源被丢弃（防注入语义），
     /// 合法来源正常收发，send_to_expected 落到 expected 地址。
+    ///
+    /// 跨平台写法：第一阶段用「expected 指向本机未绑定的 127.0.0.2」制造来源 IP 不符
+    /// （不实际 bind 127.0.0.2）；第二阶段用两个 127.0.0.1 socket 验合法路径。
     #[tokio::test]
     async fn relay_filters_foreign_sources() {
+        // 1) expected 是 127.0.0.2，来自 127.0.0.1 的包即「来源 IP 不符」→ 丢弃
         let relay_sock = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        // 客户端（合法来源，127.0.0.1）+ 冒名者（不同回环 IP）
-        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let impostor = impostor_socket().await;
-        // expected = client 的具体地址（对齐 ASSOCIATE 指定 IP:port 分支）
-        let expected = client.local_addr().unwrap();
-        let relay = TempUdpRelay::new(relay_sock, expected);
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let relay = TempUdpRelay::new(relay_sock, "127.0.0.2:1234".parse().unwrap());
+        let foreign = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        foreign.send_to(b"evil", relay_addr).await.unwrap();
+        assert_dropped(&relay, 300, "来源 IP 与 expected 不符必须被丢弃").await;
 
-        // 1. 冒名包（IP 不匹配）必须被丢弃
-        impostor.send_to(b"evil", relay.local_addr().unwrap()).await.unwrap();
-        // 2. 合法客户端包 → 通过
-        client.send_to(b"hello", relay.local_addr().unwrap()).await.unwrap();
+        // 2) expected = 客户端真实地址 → 合法收发 + send_to_expected 落点
+        let relay_sock2 = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_addr2 = relay_sock2.local_addr().unwrap();
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let expected = client.local_addr().unwrap();
+        let relay2 = TempUdpRelay::new(relay_sock2, expected);
+
+        client.send_to(b"hello", relay_addr2).await.unwrap();
         let mut buf = [0u8; 64];
         let n =
-            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
+            tokio::time::timeout(std::time::Duration::from_secs(2), relay2.recv_filtered(&mut buf))
                 .await
                 .expect("relay should accept legit packet")
                 .unwrap();
         assert_eq!(&buf[..n], b"hello");
 
-        // 3. 冒名者继续被过滤；合法来源可继续通信
-        impostor.send_to(b"evil2", relay.local_addr().unwrap()).await.unwrap();
-        client.send_to(b"second", relay.local_addr().unwrap()).await.unwrap();
-        let n =
-            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
-                .await
-                .expect("relay should accept second legit packet")
-                .unwrap();
-        assert_eq!(&buf[..n], b"second");
+        // 同 IP、不同端口（另一个 socket）→ 与 expected 端口不符 → 丢弃
+        let other_port = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        other_port.send_to(b"evil2", relay_addr2).await.unwrap();
+        assert_dropped(&relay2, 300, "来源端口与 expected 不符必须被丢弃").await;
 
-        // 4. send_to_expected 落到 expected（client）地址
-        let sent = relay.send_to_expected(b"resp").await.unwrap();
+        // send_to_expected 落到 expected（client）地址
+        let sent = relay2.send_to_expected(b"resp").await.unwrap();
         assert_eq!(sent, 4);
         let mut rbuf = [0u8; 64];
         let (rn, from) = client.recv_from(&mut rbuf).await.unwrap();
         assert_eq!(&rbuf[..rn], b"resp");
-        assert_eq!(from, relay.local_addr().unwrap());
+        assert_eq!(from, relay_addr2);
     }
 
     /// expected 端口 0（ASSOCIATE 域名/未指定 IP 分支）：首个 IP 匹配来源锁定，
-    /// IP 不匹配的来源既不被接受也不触发锁定。
+    /// IP 不匹配的来源既不被接受也不触发锁定；锁定后其它端口被拒。
     #[tokio::test]
     async fn relay_port_zero_locks_first_matching_source() {
+        // 1) IP 不匹配 → 丢弃且不改写 expected（expected 仍为 127.0.0.2:0）
         let relay_sock = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let relay = TempUdpRelay::new(relay_sock, "127.0.0.1:0".parse().unwrap());
-        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let impostor = impostor_socket().await;
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let relay = TempUdpRelay::new(relay_sock, "127.0.0.2:0".parse().unwrap());
+        let foreign = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        foreign.send_to(b"evil", relay_addr).await.unwrap();
+        assert_dropped(&relay, 300, "IP 不符的来源不得被接受").await;
+        assert_eq!(*relay.expected(), "127.0.0.2:0".parse().unwrap(), "IP 不符不得抢占端口锁定");
 
-        // 冒名包先到（IP 不匹配）——不得锁定，必须丢弃
-        impostor.send_to(b"evil", relay.local_addr().unwrap()).await.unwrap();
-        client.send_to(b"first", relay.local_addr().unwrap()).await.unwrap();
+        // 2) IP 匹配（127.0.0.1）+ 端口 0 → 首包锁定到该来源的实际端口
+        let relay_sock2 = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_addr2 = relay_sock2.local_addr().unwrap();
+        let relay2 = TempUdpRelay::new(relay_sock2, "127.0.0.1:0".parse().unwrap());
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        client.send_to(b"first", relay_addr2).await.unwrap();
         let mut buf = [0u8; 64];
         let n =
-            tokio::time::timeout(std::time::Duration::from_secs(2), relay.recv_filtered(&mut buf))
+            tokio::time::timeout(std::time::Duration::from_secs(2), relay2.recv_filtered(&mut buf))
                 .await
                 .expect("first matching source should be accepted")
                 .unwrap();
         assert_eq!(&buf[..n], b"first");
-        // 锁定后 expected = client 实际地址
-        assert_eq!(*relay.expected(), client.local_addr().unwrap());
+        assert_eq!(*relay2.expected(), client.local_addr().unwrap(), "首包锁定到实际来源");
+
+        // 3) 锁定后，同 IP 另一端口 → 丢弃
+        let other_port = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        other_port.send_to(b"evil", relay_addr2).await.unwrap();
+        assert_dropped(&relay2, 300, "锁定后其它端口必须被丢弃").await;
     }
 }
