@@ -25,7 +25,7 @@ use std::{
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use socket2::{SockRef, Socket as Socket2};
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time::Instant};
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_features::dns::{DnsClient, IpOption};
 use xray_frame::deadline::Budget;
@@ -38,8 +38,16 @@ use crate::{
     },
 };
 
-/// TCP 拨号超时（与 Go DefaultSystemDialer 一致：16 秒）。
+/// TCP 拨号超时（与 Go DefaultSystemDialer 一致：16 秒）。Go 语义是**整次拨号**
+/// 的预算（`net.Dialer.Timeout` → ctx deadline，system_dialer.go:118），多地址时
+/// 按 `partial_deadline` 分片，不是每地址各 16s。
 pub const DEFAULT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(16);
+
+/// 双栈拨号里回退族的启动延迟（Go `net.Dialer.FallbackDelay` 默认值，net/dial.go:291-297）。
+const FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// 单地址分片 deadline 的下限（Go `saneMinimum`，net/dial.go:280）。
+const PARTIAL_DIAL_MIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 系统拨号器 trait。对应 Go `SystemDialer` interface。
 ///
@@ -180,40 +188,181 @@ impl SystemDialer for DefaultSystemDialer {
     }
 }
 
-/// 多地址顺序拨号（Go `net.Dialer` 的地址回退语义）：首个失败换下一个，
-/// 全部失败返回最后一个错误。`src`/`sockopt` 在每次尝试都生效。
+/// 多地址拨号入口。语义对齐 Go `net.Dialer.DialContext`（net/dial.go:659-694
+/// `dialSerial` + :585-655 `dialParallel`）：
+///
+/// - **整次拨号共享** [`DEFAULT_DIAL_TIMEOUT`] 预算（Go `dialer.Timeout` 是 ctx
+///   deadline，不是每地址各一份）——多地址不再出现 `N × 16s`。
+/// - 同族地址顺序尝试，每地址分片 deadline = 剩余/剩余数（[`partial_deadline`]）。
+/// - 双栈时两族并发，回退族 [`FALLBACK_DELAY`] 后启动；主族先失败则回退族立即 启动（Go
+///   `fallbackTimer.Reset(0)`）——某族地址静默丢包不再拖死整次拨号。
+/// - 全部失败时错误含每个尝试过的地址（[`all_addresses_failed`]）。
 async fn dial_first_reachable(
     src: Option<SocketAddr>,
     addrs: &[SocketAddr],
     sockopt: &SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
-    let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no address to dial");
-    for &addr in addrs {
-        let stream = match DefaultSystemDialer::dial_tcp_raw(
-            src,
-            addr,
-            DEFAULT_DIAL_TIMEOUT,
-            sockopt.bind_if_index,
-            false,
-        )
-        .await
-        {
-            Ok(stream) => stream,
-            Err(e) => {
-                last_err = e;
-                continue;
-            },
-        };
-        // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。配置错误不换地址重试。
-        let std_stream = stream.into_std()?;
-        let socket = Socket2::from(std_stream);
-        apply_outbound_socket_options(&socket, sockopt, Some(addr))?;
-        let tokio_stream = TcpStream::from_std(socket.into())?;
-        return Ok(
-            Box::new(crate::connection::TcpConnection::new(tokio_stream)) as Box<dyn Connection>
-        );
+    let (addr, stream) =
+        dial_addr_list(addrs, Instant::now() + DEFAULT_DIAL_TIMEOUT, |addr, budget| {
+            DefaultSystemDialer::dial_tcp_raw(src, addr, budget, sockopt.bind_if_index, false)
+        })
+        .await?;
+    // 应用 sockopt（TCP_NODELAY + SO_KEEPALIVE）。配置错误不换地址重试。
+    let std_stream = stream.into_std()?;
+    let socket = Socket2::from(std_stream);
+    apply_outbound_socket_options(&socket, sockopt, Some(addr))?;
+    let tokio_stream = TcpStream::from_std(socket.into())?;
+    Ok(Box::new(crate::connection::TcpConnection::new(tokio_stream)) as Box<dyn Connection>)
+}
+
+/// 地址列表拨号：按族分组后走 [`dial_serial`] 或 [`dial_parallel`]。
+///
+/// `attempt` 是单地址拨号接缝（生产传 [`DefaultSystemDialer::dial_tcp_raw`]，
+/// 测试传可控假拨号以钉住超时分布）。成功返回 `(胜出地址, 连接)`。
+async fn dial_addr_list<F, Fut>(
+    addrs: &[SocketAddr],
+    deadline: Instant,
+    attempt: F,
+) -> io::Result<(SocketAddr, TcpStream)>
+where
+    F: Fn(SocketAddr, std::time::Duration) -> Fut,
+    Fut: Future<Output = io::Result<TcpStream>>,
+{
+    let Some(&first) = addrs.first() else {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no address to dial"));
+    };
+    // Go `addrList.forResolve`：首地址所属族为主族，另一族为回退族。
+    let (primaries, fallbacks): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.iter().copied().partition(|a| a.is_ipv4() == first.is_ipv4());
+    if fallbacks.is_empty() {
+        return dial_serial(&attempt, &primaries, deadline).await;
     }
-    Err(last_err)
+    dial_parallel(&attempt, &primaries, &fallbacks, deadline).await
+}
+
+/// 单族地址顺序拨号（Go `dialSerial`，net/dial.go:659-694）。
+async fn dial_serial<F, Fut>(
+    attempt: &F,
+    addrs: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<(SocketAddr, TcpStream)>
+where
+    F: Fn(SocketAddr, std::time::Duration) -> Fut,
+    Fut: Future<Output = io::Result<TcpStream>>,
+{
+    let mut tried: Vec<(SocketAddr, io::Error)> = Vec::with_capacity(addrs.len());
+    for (i, &addr) in addrs.iter().enumerate() {
+        let Ok(partial) = partial_deadline(Instant::now(), deadline, addrs.len() - i) else {
+            // 预算耗尽：余下地址不再尝试（Go dialSerial 同：errTimeout 即 break），
+            // 但要留痕——否则"试过哪些"在日志里不可见。
+            crate::LOG.debug(format!(
+                "tried={} skipped={} dial budget exhausted, remaining addresses untried",
+                i,
+                addrs.len() - i
+            ));
+            break;
+        };
+        let budget = partial.saturating_duration_since(Instant::now());
+        // 外层 timeout：接缝实现自己不守时也保证单地址吃不满整个预算。
+        match tokio::time::timeout(budget, attempt(addr, budget)).await {
+            Ok(Ok(stream)) => return Ok((addr, stream)),
+            Ok(Err(e)) => {
+                crate::LOG.debug(format!("addr={addr} error={e} dial attempt failed"));
+                tried.push((addr, e));
+            },
+            Err(_) => tried.push((addr, io::Error::new(io::ErrorKind::TimedOut, "dial timeout"))),
+        }
+    }
+    Err(all_addresses_failed(&tried))
+}
+
+/// 双族并发拨号（Go `dialParallel`，net/dial.go:585-655）：首个成功的胜出，
+/// 另一族随 future drop 取消（Go `primaryCancel`/`fallbackCancel`）。
+async fn dial_parallel<F, Fut>(
+    attempt: &F,
+    primaries: &[SocketAddr],
+    fallbacks: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<(SocketAddr, TcpStream)>
+where
+    F: Fn(SocketAddr, std::time::Duration) -> Fut,
+    Fut: Future<Output = io::Result<TcpStream>>,
+{
+    let primary = dial_serial(attempt, primaries, deadline);
+    let fallback = dial_serial(attempt, fallbacks, deadline);
+    tokio::pin!(primary, fallback);
+    let delay = tokio::time::sleep(FALLBACK_DELAY);
+    tokio::pin!(delay);
+
+    let mut primary_err: Option<io::Error> = None;
+    let mut fallback_err: Option<io::Error> = None;
+    let mut primary_done = false;
+    let mut fallback_started = false;
+    let mut fallback_done = false;
+    loop {
+        tokio::select! {
+            r = &mut primary, if !primary_done => {
+                primary_done = true;
+                match r {
+                    Ok(conn) => return Ok(conn),
+                    // Go net/dial.go:643-648：主族在回退计时器触发前失败 →
+                    // 回退族立即启动（对齐 `fallbackTimer.Reset(0)`）。
+                    Err(e) => {
+                        primary_err = Some(e);
+                        fallback_started = true;
+                    },
+                }
+            },
+            () = &mut delay, if !fallback_started => fallback_started = true,
+            r = &mut fallback, if fallback_started && !fallback_done => {
+                fallback_done = true;
+                match r {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => fallback_err = Some(e),
+                }
+            },
+        }
+        if primary_done && fallback_done {
+            return Err(match (primary_err.take(), fallback_err.take()) {
+                // Go 返回主族错误（dial.go:651）；回退族细节追加保留可观测性。
+                (Some(p), Some(f)) => {
+                    io::Error::new(p.kind(), format!("{p}; fallback family: {f}"))
+                },
+                (Some(p), None) => p,
+                (None, Some(f)) => f,
+                (None, None) => io::Error::other("both address families failed without error"),
+            });
+        }
+    }
+}
+
+/// 单地址分片 deadline（Go `partialDeadline`，net/dial.go:269-288）：剩余预算按
+/// 剩余地址数均分，不足 [`PARTIAL_DIAL_MIN`] 时取 2s（剩余本身更少则用剩余）。
+fn partial_deadline(
+    now: Instant,
+    deadline: Instant,
+    addrs_remaining: usize,
+) -> io::Result<Instant> {
+    let remaining = deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "dial timeout"));
+    }
+    let share = remaining / u32::try_from(addrs_remaining).unwrap_or(u32::MAX);
+    let share = if share < PARTIAL_DIAL_MIN { remaining.min(PARTIAL_DIAL_MIN) } else { share };
+    Ok((now + share).min(deadline))
+}
+
+/// 全部地址失败：留首个错误的 kind（Go 用 firstErr，错误类别最相关），消息里列出
+/// **每个尝试过的地址**与其错误。
+fn all_addresses_failed(tried: &[(SocketAddr, io::Error)]) -> io::Error {
+    let Some((_, first)) = tried.first() else {
+        return io::Error::new(io::ErrorKind::TimedOut, "dial timeout");
+    };
+    let detail: Vec<String> = tried.iter().map(|(addr, e)| format!("{addr}: {e}")).collect();
+    io::Error::new(
+        first.kind(),
+        format!("all {} address(es) failed: {}", tried.len(), detail.join("; ")),
+    )
 }
 
 /// 全局 effective system dialer。对应 Go `effectiveSystemDialer`。
@@ -897,6 +1046,103 @@ mod tests {
             .expect("second address should connect after first refused");
         assert_eq!(conn.remote_addr().unwrap(), Some(good));
         accept_task.await.unwrap().unwrap();
+    }
+
+    /// T1（Go `dialParallel`，net/dial.go:585-655）：首地址静默丢包（connect 永不
+    /// 返回）→ 另一族 [`FALLBACK_DELAY`] 后启动并胜出，整次拨号 < 3s。旧实现
+    /// 每地址独占 16s，这里要等满 16s 才轮到第二个地址。
+    #[tokio::test]
+    async fn blackholed_first_addr_falls_through_fast() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        // 静默丢包地址（v6 文档网段）：假拨号永不返回，不依赖本机路由/防火墙行为。
+        let blackhole: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let started = Instant::now();
+        let (addr, stream) = dial_addr_list(
+            &[blackhole, good],
+            Instant::now() + DEFAULT_DIAL_TIMEOUT,
+            |addr, _budget| async move {
+                if addr == blackhole {
+                    return std::future::pending::<io::Result<TcpStream>>().await;
+                }
+                DefaultSystemDialer::dial_tcp_raw(None, addr, DEFAULT_DIAL_TIMEOUT, 0, false).await
+            },
+        )
+        .await
+        .expect("reachable family should win while blackholed addr hangs");
+        let elapsed = started.elapsed();
+        assert_eq!(addr, good);
+        drop(stream);
+        assert!(elapsed < std::time::Duration::from_secs(3), "dial took {elapsed:?}, want < 3s");
+        accept_task.await.unwrap().unwrap();
+    }
+
+    /// T1b（Go `partialDeadline`，net/dial.go:269-288）：同族多地址共享总预算，
+    /// 首地址吃不满整个人 deadline（3s / 2 地址 = 1.5s），超时后立即推进。
+    #[tokio::test]
+    async fn blackholed_addr_does_not_eat_whole_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = listener.local_addr().unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 任务")]
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let blackhole: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let budget = std::time::Duration::from_secs(3);
+        let started = Instant::now();
+        let (addr, stream) =
+            dial_addr_list(&[blackhole, good], Instant::now() + budget, |addr, _| async move {
+                if addr == blackhole {
+                    return std::future::pending::<io::Result<TcpStream>>().await;
+                }
+                DefaultSystemDialer::dial_tcp_raw(None, addr, DEFAULT_DIAL_TIMEOUT, 0, false).await
+            })
+            .await
+            .expect("second same-family address should connect");
+        let elapsed = started.elapsed();
+        assert_eq!(addr, good);
+        drop(stream);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1400),
+            "首地址未被分片超时截断: {elapsed:?}"
+        );
+        assert!(elapsed < budget, "整体超出预算: {elapsed:?}");
+        accept_task.await.unwrap().unwrap();
+    }
+
+    /// T2：全部地址失败时错误串含**每个尝试过的地址**（可观测性）。
+    #[tokio::test]
+    async fn all_addresses_failed_error_lists_every_addr() {
+        // 两个 bind 后立即释放的端口（无人监听 → connection refused）。
+        let closed = || {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let addrs = [closed(), closed()];
+        assert_ne!(addrs[0], addrs[1]);
+        let err = match dial_first_reachable(None, &addrs, &SocketOptions::default()).await {
+            Ok(_) => panic!("both addresses are dead"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        for addr in addrs {
+            assert!(msg.contains(&addr.to_string()), "missing {addr} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn partial_deadline_shares_remaining_budget() {
+        use std::time::Duration;
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(16);
+        assert_eq!(partial_deadline(now, deadline, 4).unwrap(), now + Duration::from_secs(4));
+        // 均分值低于 2s 下限 → 取下限
+        assert_eq!(partial_deadline(now, deadline, 16).unwrap(), now + Duration::from_secs(2));
+        // 剩余本身不足下限 → 用剩余
+        let near = now + Duration::from_secs(1);
+        assert_eq!(partial_deadline(now, near, 4).unwrap(), near);
+        // 预算已耗尽 → 报超时（不再尝试）
+        assert!(partial_deadline(deadline, deadline, 1).is_err());
     }
 
     #[tokio::test]

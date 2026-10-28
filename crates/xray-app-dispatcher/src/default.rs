@@ -1937,7 +1937,9 @@ impl DispatchHandler for DialBridge {
                     }
                 },
                 Err(e) => {
-                    tracing::error!(tag = %tag, "dial failed: {e}");
+                    // dest 必须进日志：dial 失败的真实目标是定位"哪个端点被黑"的唯一线索
+                    // （无路由/IPv6 与 SYN 静默丢弃是两族错，缺 dest 就只能靠 accepted 行配对猜）。
+                    tracing::error!(tag = %tag, dest = %dest, "dial failed: {e}");
                     // 拨号失败也必须关下行：pipe Writer 的 drop 不传播 close，
                     // 对端 reader 会永远挂在 wait_close（批次 A 503 兜底实测挂死）。
                     link.writer.shutdown();

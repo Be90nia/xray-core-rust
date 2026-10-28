@@ -5346,6 +5346,156 @@ mod tests {
         echo_task.abort();
     }
 
+    /// 出站级 mux TCP 经 vmess 入站终止（生产 `vmess mux command not yet
+    /// supported` 拒连的修复路径）：MuxBridge carrier（目标 v1.mux.cool）经
+    /// vmess 出站 → vmess 入站 decode 后按 dest dispatch → MuxCarrierHandler
+    /// 交 ServerWorker 解帧 → 子会话 → freedom → TCP echo。两个并发子流复用
+    /// 单 carrier。
+    #[tokio::test]
+    async fn integration_outbound_mux_tcp_via_vmess_inbound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // 1. TCP echo server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = echo_listener.accept().await else { break };
+                let (mut r, mut w) = sock.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        // 2. carrier 计数 forwarder：client mux worker → server vmess 的每条 TCP
+        //    连接在此过路计数（复用断言的观测点）
+        let fwd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fwd_port = fwd_listener.local_addr().unwrap().port();
+        let carrier_count = Arc::new(AtomicUsize::new(0));
+
+        // 3. 服务端：vmess inbound（carrier 按 v1.mux.cool dest 终止 mux）+ freedom
+        let (server_ports, _si, _so, sh) = start_full_retrying_eaddrinuse(1, |ports| {
+            let server_port = ports[0];
+            let mut server_cfg = BuiltConfig::default();
+            server_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "vmess".into(),
+                    data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}]}"#
+                        .to_vec(),
+                },
+                tag: "vmess-in".into(),
+                port: Some(server_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            server_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "freedom".into(),
+                    data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
+                },
+                tag: "direct".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            });
+            server_cfg
+        })
+        .await;
+        let server_port = server_ports[0];
+        let count = Arc::clone(&carrier_count);
+        let fwd_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut down, _)) = fwd_listener.accept().await else { break };
+                count.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", server_port)).await else {
+                    break;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. 客户端：socks inbound + vmess outbound（出站级 mux.enabled，concurrency 8）
+        let (cports, _ci, _co, ch) = start_full_retrying_eaddrinuse(1, |ports| {
+            let client_port = ports[0];
+            let mut client_cfg = BuiltConfig::default();
+            client_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+                tag: "socks-in".into(),
+                port: Some(client_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            client_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "vmess".into(),
+                    data: format!(r#"{{"vnext":[{{"address":"127.0.0.1","port":{fwd_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","security":"auto"}}]}}]}}"#).into_bytes(),
+                },
+                tag: "proxy".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+                target_strategy: None,
+            });
+            client_cfg
+        })
+        .await;
+        let client_port = cports[0];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 5. 2 条并发 TCP 子流 → 同一 mux worker/carrier
+        let echo_ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let payload = format!("vmess-mux-echo-{i}");
+            handles.push(tokio::spawn(async move {
+                let mut c = TcpStream::connect(("127.0.0.1", client_port))
+                    .await
+                    .expect("connect client socks");
+                c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+                let mut m = [0u8; 2];
+                c.read_exact(&mut m).await.unwrap();
+                assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+                let mut req = vec![0x05, 0x01, 0x00, 0x01];
+                req.extend_from_slice(&echo_ip);
+                req.extend_from_slice(&echo_addr.port().to_be_bytes());
+                c.write_all(&req).await.unwrap();
+                let mut rep = [0u8; 10];
+                c.read_exact(&mut rep).await.unwrap();
+                assert_eq!(rep[1], 0x00, "socks connect via vmess mux carrier success");
+                c.write_all(payload.as_bytes()).await.unwrap();
+                let mut buf = vec![0u8; payload.len()];
+                c.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, payload.as_bytes(), "echo roundtrip via vmess mux carrier");
+            }));
+        }
+        for h in handles {
+            h.await.expect("client task join");
+        }
+
+        // 6. 复用断言：2 个子流只建立 1 条 carrier TCP 连接
+        assert_eq!(
+            carrier_count.load(Ordering::SeqCst),
+            1,
+            "2 mux sessions must reuse a single vmess carrier connection"
+        );
+
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+        fwd_task.abort();
+        echo_task.abort();
+    }
+
     /// 出站级 mux TCP 经 vless 入站终止（bd raw0）：MuxBridge carrier（目标
     /// v1.mux.cool）经 vless 出站 → vless 入站 decode 后按 destination dispatch
     /// → MuxCarrierHandler（Go always.go:89 mux.NewServer 装饰器语义）交

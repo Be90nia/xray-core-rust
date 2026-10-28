@@ -5,7 +5,8 @@
 //! TCP accept → decode_request_header_async → RequestHeader → Destination →
 //! body chunk pump（duplex + 双向 AEAD 加解密）→ `DispatchHandler::dispatch(dest, link)`。
 //!
-//! 不含：TLS 包装（raw TCP）、UDP/Mux 命令（warn 跳过）、XUDP。
+//! 不含：TLS 包装（raw TCP）、XUDP。Mux command 与 TCP 同路径（dest 恒
+//! `v1.mux.cool:0`，carrier 由上层 MuxCarrierHandler 接管）。
 
 use std::sync::Arc;
 
@@ -128,7 +129,7 @@ const PUMP_BUF: usize = 8192;
 ///
 /// 绑定 `listener` 监听，每个连接 spawn 独立 task：
 /// 1. `decode_request_header_async` 解析 VMess 请求头（含 AuthID + AEAD 解密 + 反重放）
-/// 2. TCP 命令的 address+port → `Destination`；UDP/Mux warn 跳过
+/// 2. TCP 命令读 address+port → `Destination`；Mux 命令 dest 恒 `v1.mux.cool:0`
 /// 3. `encode_response_header_async` 发送响应头（客户端收到后开始 body 流）
 /// 4. body chunk pump：duplex 桥接，客户端→server 方向解密 chunks 为明文交给 dispatch， dispatch
 ///    回的明文按 chunk 格式加密发回客户端
@@ -294,11 +295,10 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         },
     };
 
-    // 2. TCP/UDP 走完整数据路径；Mux 暂 warn 跳过（zx7 在 xray-core 层另行处理）。
-    if header.command == Command::Mux {
-        crate::VMESS_LOG.warn("vmess mux command not yet supported, closing connection");
-        return Ok(());
-    }
+    // 2. TCP/UDP/Mux 同走数据路径。Mux command 无地址字段，decode 已把 dest 钉为
+    //    `v1.mux.cool:0`（Go encoding/server.go:207-211）——carrier 拦截不在本层， 由上层
+    //    MuxCarrierHandler（Go proxyman always.go:89 `mux.NewServer`）按 dest 域名接管，与 vless
+    //    入站同构。
 
     // 3. 构造 SizeParser（支持 AUTHENTICATED_LENGTH / CHUNK_MASKING / Plain 三条路径）
     let req_key = session.request_body_key;
@@ -896,6 +896,105 @@ mod tests {
     #[tokio::test]
     async fn vmess_inbound_to_freedom_outbound_e2e_chacha20poly1305() {
         run_vmess_e2e(SecurityType::Chacha20Poly1305).await;
+    }
+
+    /// 回归（生产 30 分钟 199 次 `vmess mux command not yet supported`）：Mux
+    /// command 不再被拒。Go 语义（encoding/server.go:207-211）：Mux 头无地址字段，
+    /// dest 恒 `v1.mux.cool:0`；carrier 拦截在上层 dispatcher 装饰器
+    /// （proxyman always.go:89 `mux.NewServer` = 本仓 `MuxCarrierHandler`），
+    /// 故入站只需像 TCP 一样把 link 交出去。
+    #[tokio::test]
+    async fn vmess_inbound_mux_command_dispatches_carrier() {
+        use xray_buf::io::{Reader as _, Writer as _};
+
+        /// 一次性 echo probe：记录 dispatch 的 dest，回写收到的字节后关写半边。
+        #[derive(Debug)]
+        struct CarrierProbe {
+            seen: Arc<parking_lot::Mutex<Option<Destination>>>,
+        }
+        impl DispatchHandler for CarrierProbe {
+            fn tag(&self) -> &str {
+                "mux-carrier-probe"
+            }
+
+            fn dispatch(
+                &self,
+                dest: &Destination,
+                link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                let seen = Arc::clone(&self.seen);
+                let dest = dest.clone();
+                Box::pin(async move {
+                    *seen.lock() = Some(dest);
+                    let mut reader = link.reader;
+                    let mut writer = link.writer;
+                    if let Ok(mb) = reader.read_multi_buffer().await {
+                        if !mb.is_empty() {
+                            let _ = writer.write_multi_buffer(mb).await;
+                        }
+                    }
+                    writer.shutdown();
+                })
+            }
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(CarrierProbe { seen: Arc::clone(&seen) }));
+
+        let (validator, cmd_key) = make_validator_with_user();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vmess_addr = vmess_listener.local_addr().unwrap();
+        xray_common::testing::spawn("vmess-inbound-mux-command", async move {
+            let _ = serve_vmess(
+                test_ctx(),
+                vmess_listener,
+                ohm,
+                validator,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
+        let client_session = ClientSession::new();
+        let dest = Destination::tcp(Address::new_domain("v1.mux.cool"), Port::new(0));
+        let header = RequestHeader::new(VERSION, Command::Mux, dest, SecurityType::Aes128Gcm);
+        let sealed_header =
+            client_session.encode_request_header(&header, &cmd_key).expect("encode header");
+        client.write_all(&sealed_header).await.unwrap();
+
+        // 响应头到达 = Mux 连接被接受（修复前此处 EOF）。
+        client_session
+            .decode_response_header_async(&mut client)
+            .await
+            .expect("mux command must not be rejected before response header");
+
+        // carrier 链路双向可用：body chunk 明文进 probe、回显经 response chunk 返回。
+        let payload = b"vmess mux carrier probe payload";
+        client_session
+            .encode_request_body_async(&header, payload, &mut client)
+            .await
+            .expect("encode request body");
+        let response = client_session
+            .decode_response_body_async(&header, &mut client)
+            .await
+            .expect("decode response body");
+        assert_eq!(response, payload, "carrier link must round-trip body bytes");
+
+        let dest = seen.lock().clone().expect("mux connection must reach dispatch");
+        assert_eq!(
+            dest.address().as_domain(),
+            Some("v1.mux.cool"),
+            "Go server.go:209 fixes the carrier domain"
+        );
+        assert_eq!(dest.port().value(), 0, "Mux command carries no port (Go server.go:210)");
     }
 
     /// 无效用户（validator 中不存在）→ server drain（Go 语义等满 60s handshake
