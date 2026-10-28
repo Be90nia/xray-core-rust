@@ -46,16 +46,13 @@ use bytes::{Buf, Bytes};
 use futures_util::{Future, Stream, StreamExt};
 use http::{Method, StatusCode, request::Request};
 use rustls::ClientConfig as RustlsClientConfig;
-use tokio::{
-    io::AsyncRead as AsyncReadTrait,
-    sync::{Mutex, mpsc},
-};
+use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::StreamReader;
 
 use crate::{
     client::CloseSignal,
     config::{Config, RequestMeta},
+    connection::{DownloadBody, download_body},
     error::{Result, SplitHttpError},
 };
 
@@ -315,7 +312,10 @@ impl H3Conn {
         sockopt: &xray_transport::sockopt::SocketOptions,
     ) -> Result<Arc<Self>> {
         // QUIC 客户端构造期一次性 ALPN 配置（冷路径，非数据面分块拷贝）
-        #[allow(clippy::disallowed_methods)] // ALPN 冷路径一次性构造，非数据面热路径
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "ALPN 冷路径一次性构造（每 endpoint 一次），非数据面热路径"
+        )]
         let alpn_h3 = b"h3".to_vec();
         tls.alpn_protocols = vec![alpn_h3];
         // 0-RTT 前置：进程级共享票缓存 + enable_early_data + **同一语义配置复用
@@ -516,7 +516,7 @@ impl H3Conn {
         session_id: &str,
         body: Option<Vec<u8>>,
         close: Option<CloseSignal>,
-    ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
+    ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
         let meta = self.config.build_stream_request_meta(base_uri, session_id, body.clone())?;
         let req = Self::build_h3_request(&meta)?;
         let has_body = body.is_some();
@@ -577,7 +577,7 @@ impl H3Conn {
         session_id: &str,
         body_stream: S,
         upload_only: bool,
-    ) -> Result<(Option<Box<dyn AsyncReadTrait + Send + Unpin>>, SocketAddr, SocketAddr)>
+    ) -> Result<(Option<DownloadBody>, SocketAddr, SocketAddr)>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
     {
@@ -668,10 +668,7 @@ impl H3Conn {
         if upload_only {
             return Ok((None, remote, local));
         }
-        let reader: Box<dyn AsyncReadTrait + Send + Unpin> = Box::new(
-            tokio_util::io::StreamReader::new(tokio_stream::wrappers::ReceiverStream::new(data_rx)),
-        );
-        Ok((Some(reader), remote, local))
+        Ok((Some(download_body(ReceiverStream::new(data_rx))), remote, local))
     }
 }
 
@@ -685,9 +682,7 @@ impl H3Conn {
 ///
 /// 必须用 channel 是因为 h3 `RequestStream` 的 `send_data`/`recv_data` 都需 `&mut self`，
 /// 不能拆分到两个 task（spawn 单向接收任务 + 主任务发送是安全的）。
-fn spawn_h3_recv_reader<S, B>(
-    mut stream: h3::client::RequestStream<S, B>,
-) -> Box<dyn AsyncReadTrait + Send + Unpin>
+fn spawn_h3_recv_reader<S, B>(mut stream: h3::client::RequestStream<S, B>) -> DownloadBody
 where
     h3::client::RequestStream<S, B>: Send,
     S: h3::quic::RecvStream + 'static,
@@ -716,8 +711,7 @@ where
             }
         }
     });
-    let reader = StreamReader::new(ReceiverStream::new(rx));
-    Box::new(reader)
+    download_body(ReceiverStream::new(rx))
 }
 
 /// stream-down GET 的 lazy 读端（对齐 Go `WaitReadCloser` 语义）。
@@ -734,7 +728,7 @@ fn spawn_h3_lazy_reader<S, B>(
     this: std::sync::Arc<H3Conn>,
     mut stream: h3::client::RequestStream<S, B>,
     close: Option<CloseSignal>,
-) -> Box<dyn AsyncReadTrait + Send + Unpin>
+) -> DownloadBody
 where
     h3::client::RequestStream<S, B>: Send,
     S: h3::quic::RecvStream + Send + 'static,
@@ -795,7 +789,7 @@ where
             }
         }
     });
-    Box::new(StreamReader::new(ReceiverStream::new(rx)))
+    download_body(ReceiverStream::new(rx))
 }
 
 #[cfg(test)]

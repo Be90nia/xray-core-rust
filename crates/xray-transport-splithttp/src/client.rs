@@ -51,9 +51,8 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
 use rustls::{ClientConfig as RustlsClientConfig, pki_types::ServerName};
-use tokio::{io::AsyncRead as AsyncReadTrait, sync::mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::io::StreamReader;
 use tower_service::Service as TowerService;
 pub use xray_tls::fingerprint::Fingerprint;
 use xray_tls::utls::{ConnInterface, UConn};
@@ -61,6 +60,7 @@ use xray_transport::connection::{Connection, TcpConnection};
 
 use crate::{
     config::{Config, RequestMeta},
+    connection::{DownloadBody, download_body},
     error::{Result, SplitHttpError},
 };
 
@@ -536,7 +536,7 @@ impl DefaultDialerClient {
         session_id: &str,
         body: Option<Vec<u8>>,
         close: Option<CloseSignal>,
-    ) -> Result<(Box<dyn AsyncReadTrait + Send + Unpin>, SocketAddr, SocketAddr)> {
+    ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
         let is_get = body.is_none();
         let meta = self.config.build_stream_request_meta(base_uri, session_id, body)?;
         let req = Self::build_request(meta)?;
@@ -576,7 +576,7 @@ impl DefaultDialerClient {
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
         let stream = BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io);
-        Ok((Box::new(StreamReader::new(stream)), remote, local))
+        Ok((download_body(stream), remote, local))
     }
 
     /// 打开 streaming 上传流（stream-up / stream-one mode）。
@@ -597,7 +597,7 @@ impl DefaultDialerClient {
         session_id: &str,
         body_stream: S,
         upload_only: bool,
-    ) -> Result<(Option<BodyDataStream<hyper::body::Incoming>>, SocketAddr, SocketAddr)>
+    ) -> Result<(Option<DownloadBody>, SocketAddr, SocketAddr)>
     where
         S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
     {
@@ -662,7 +662,11 @@ impl DefaultDialerClient {
                 let _ = resp.into_body().collect().await;
                 return Err(SplitHttpError::BadStatus(status.as_u16()));
             }
-            Ok((Some(BodyDataStream::new(resp.into_body())), remote, local))
+            Ok((
+                Some(download_body(BodyDataStream::new(resp.into_body()).map_err(hyper_err_to_io))),
+                remote,
+                local,
+            ))
         }
     }
 
@@ -804,7 +808,7 @@ fn spawn_h2_lazy_reader(
     client: HyperClient,
     req: Request<ReqBody>,
     close: Option<CloseSignal>,
-) -> Box<dyn AsyncReadTrait + Send + Unpin> {
+) -> DownloadBody {
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
     let mut close_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match close {
         Some(rx) => Box::pin(async move {
@@ -855,7 +859,7 @@ fn spawn_h2_lazy_reader(
             }
         }
     });
-    Box::new(StreamReader::new(ReceiverStream::new(rx)))
+    download_body(ReceiverStream::new(rx))
 }
 
 #[cfg(test)]

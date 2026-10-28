@@ -98,6 +98,20 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         0
     }
 
+    /// 下行零拷贝读腿钩子（bd oarfu）：连接能直接把收到的 `Bytes` 块作为
+    /// 只读缓冲交出时返回 `Some`（h2/h3 等"数据到达即 `Bytes` 所有权"的传输）。
+    ///
+    /// 桥层拿到后跳过 AsyncRead → 池化缓冲的一次全量 memcpy
+    /// （[`xray_buf::Buffer::from_bytes_frozen`] 零拷贝接管所有权）。
+    ///
+    /// 缺省 `None`：**包装层不得转发**——TLS/AEAD/vision 等层的数据不是
+    /// "到达即可交付的明文"，直接透传会让上层读到密文/带协议头的字节。
+    /// 同一次连接的读腿只由一方消费：本方法取走视图后，AsyncRead 侧仍保有
+    /// 完整功能（实现方共享底层流），不会出现静默 EOF 形态。
+    fn frozen_reader(&mut self) -> Option<Box<dyn xray_buf::io::Reader>> {
+        None
+    }
+
     /// 下行多缓冲聚合读的 poll 钩子（bd 2o9l，对应 Go ReadVReader 的
     /// `syscall.RawConn` 通道）。TCP 实现覆写为真 readv——一次系统调用
     /// （Unix `readv(2)` / Windows `WSARecv`）把数据分散填入多个 iovec；
@@ -500,6 +514,11 @@ impl Connection for Box<dyn Connection> {
     fn tls_readbuf_size(&self) -> usize {
         // Box 透传：装箱的 TLS 连接（UConn 等）信号到达桥层（F3）。
         (**self).tls_readbuf_size()
+    }
+
+    fn frozen_reader(&mut self) -> Option<Box<dyn xray_buf::io::Reader>> {
+        // Box 透传：装箱的 h2/h3 连接（splithttp SplitConn 等）零拷贝读腿到达桥层。
+        (**self).frozen_reader()
     }
 
     fn poll_read_multi(

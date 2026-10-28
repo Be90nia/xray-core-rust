@@ -4,12 +4,14 @@
 //! 和 `DecodeResponseHeader`。
 
 use std::{
+    future::Future,
     io,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use xray_buf::{io as buf_io, multi::MultiBuffer};
 use xray_common::{net::address::Address, uuid::UUID};
 use xray_proto::xray::proxy::vless::encoding::Addons;
 
@@ -206,6 +208,76 @@ where
     }
 }
 
+/// 零拷贝读腿的响应头剥离器（bd oarfu）。
+///
+/// 内层连接能直接交出 `Bytes` 块时（h2/h3 body），桥层下行读不走 AsyncRead
+/// ——那会把每块拷进池化缓冲。本类型在**原位**切掉
+/// `[version][addon_len][addons]`：头部字节随首个 MultiBuffer 到达后
+/// `split_bytes` 丢弃（Buffer 级零拷贝），余下块直接交付上层。
+struct HeaderStripReader {
+    inner: Box<dyn buf_io::Reader>,
+    expected_version: u8,
+    /// 头部未剥完时累积的字节；剥完后恒为空。
+    pending: MultiBuffer,
+    /// 头部长度（`2 + addon_len`），首块到达后才确定（addon_len 在字节流里）。
+    head_len: Option<usize>,
+    /// 头部已剥完。
+    done: bool,
+}
+
+impl HeaderStripReader {
+    /// 从内层取一块并入 `pending`；空块 = EOF（头部不完整 → 截断报错）。
+    async fn pull(&mut self) -> buf_io::Result<()> {
+        let mb = self.inner.read_multi_buffer().await?;
+        if mb.is_empty() {
+            return Err(buf_io::Error::ReadError("vless response header: early eof".into()));
+        }
+        self.pending.merge(mb);
+        Ok(())
+    }
+}
+
+impl buf_io::Reader for HeaderStripReader {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = buf_io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            while !self.done {
+                match self.head_len {
+                    None => {
+                        if self.pending.len() < 2 {
+                            self.pull().await?;
+                            continue;
+                        }
+                        let mut two = [0u8; 2];
+                        self.pending.copy_to_slice(0, &mut two);
+                        if two[0] != self.expected_version {
+                            return Err(buf_io::Error::ReadError(format!(
+                                "vless response version mismatch: expected {} got {}",
+                                self.expected_version, two[0]
+                            )));
+                        }
+                        self.head_len = Some(2 + two[1] as usize);
+                    },
+                    Some(need) => {
+                        if self.pending.len() < need {
+                            self.pull().await?;
+                            continue;
+                        }
+                        // 头部就地丢弃：`split_bytes` 返回**前缀**（头部），余下留在 pending。
+                        let _header = self.pending.split_bytes(need);
+                        self.done = true;
+                    },
+                }
+            }
+            if self.pending.is_empty() {
+                return self.inner.read_multi_buffer().await;
+            }
+            Ok(std::mem::replace(&mut self.pending, MultiBuffer::new()))
+        })
+    }
+}
+
 impl<C> xray_transport::connection::Connection for ResponseHeaderReader<C>
 where
     C: xray_transport::connection::Connection,
@@ -227,6 +299,22 @@ where
         // F3：穿透响应头缓冲层透传 TLS 栈信号（vision 由外层 VisionConn 不
         // 转发兜底，读批边界语义不变）。
         self.inner.tls_readbuf_size()
+    }
+
+    fn frozen_reader(&mut self) -> Option<Box<dyn buf_io::Reader>> {
+        // 仅当响应头尚未被 AsyncRead 路径消费过（桥层建桥时取，此前无人读过）
+        // 才能叠加剥离器；vision/ENC 等改写数据的包装层不转发本钩子，天然排除。
+        if self.done || !self.head.is_empty() {
+            return None;
+        }
+        let inner = self.inner.frozen_reader()?;
+        Some(Box::new(HeaderStripReader {
+            inner,
+            expected_version: self.expected_version,
+            pending: MultiBuffer::new(),
+            head_len: None,
+            done: false,
+        }))
     }
 }
 
@@ -257,6 +345,75 @@ mod tests {
         encoding::{VERSION, empty_addons, server::decode_request_header},
         validator::{MemoryUser, MemoryValidator, Validator},
     };
+
+    /// 按预置分块吐字节的假零拷贝读腿（块间不给新数据即 EOF）。
+    struct ChunkReader {
+        chunks: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    impl ChunkReader {
+        fn new(chunks: Vec<&[u8]>) -> Self {
+            Self { chunks: chunks.into_iter().map(<[u8]>::to_vec).collect::<Vec<_>>().into_iter() }
+        }
+    }
+
+    impl buf_io::Reader for ChunkReader {
+        fn read_multi_buffer(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = buf_io::Result<MultiBuffer>> + Send + '_>> {
+            let next = self.chunks.next();
+            Box::pin(async move {
+                Ok(match next {
+                    Some(c) => MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(c)),
+                    None => MultiBuffer::new(),
+                })
+            })
+        }
+    }
+
+    fn strip_reader(chunks: Vec<&[u8]>) -> HeaderStripReader {
+        HeaderStripReader {
+            inner: Box::new(ChunkReader::new(chunks)),
+            expected_version: VERSION,
+            pending: MultiBuffer::new(),
+            head_len: None,
+            done: false,
+        }
+    }
+
+    /// bd oarfu：零拷贝读腿必须剥掉响应头（`MultiBuffer::split_bytes` 返回前缀，
+    /// 写反了就会把头部当数据吐给上层 → 下行错位）。
+    #[tokio::test]
+    async fn header_strip_reader_drops_header_keeps_payload() {
+        use xray_buf::io::Reader as _;
+
+        let mut r = strip_reader(vec![b"\x00\x00HTTP/1.1 200 OK\r\n"]);
+        let mb = r.read_multi_buffer().await.expect("read ok");
+        assert_eq!(mb.to_vec(), b"HTTP/1.1 200 OK\r\n");
+        assert!(
+            r.read_multi_buffer().await.expect("eof ok").is_empty(),
+            "流尽须以空 MultiBuffer 报 EOF"
+        );
+    }
+
+    /// 头部被分块切开（1 字节 + 余下）仍须正确剥掉，后续块不受影响。
+    #[tokio::test]
+    async fn header_strip_reader_handles_split_header() {
+        use xray_buf::io::Reader as _;
+
+        let mut r = strip_reader(vec![b"\x00", b"\x00AB", b"CD"]);
+        assert_eq!(r.read_multi_buffer().await.expect("read ok").to_vec(), b"AB");
+        assert_eq!(r.read_multi_buffer().await.expect("read ok").to_vec(), b"CD");
+    }
+
+    /// 头部未读完就 EOF = 截断，必须报错（不得静默当 EOF）。
+    #[tokio::test]
+    async fn header_strip_reader_reports_truncated_header() {
+        use xray_buf::io::Reader as _;
+
+        let mut r = strip_reader(vec![b"\x00"]);
+        assert!(r.read_multi_buffer().await.is_err(), "头部截断必须报错");
+    }
 
     fn make_user_and_validator() -> (UUID, MemoryValidator) {
         let uuid = UUID::new();

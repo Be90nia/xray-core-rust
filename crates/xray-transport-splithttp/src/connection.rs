@@ -18,14 +18,19 @@
 //! 转换后满足 `Connection` bound。
 
 use std::{
+    future::{Future, poll_fn},
     io,
     net::SocketAddr,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_stream::Stream;
+use xray_buf::{buffer::Buffer, multi::MultiBuffer};
 
 /// SplitHTTP 客户端连接（reader/writer + addr 元数据）。
 ///
@@ -45,13 +50,31 @@ pub struct SplitConn<R, W> {
     /// 关闭回调（packet-up mode 用于 `xmuxClient.OpenUsage -= 1` 等清理）。
     /// 包在 `Mutex` 内允许 `Drop` 时 take 调用。
     on_close: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
+    /// 下行零拷贝读腿（bd oarfu）：`Connection::frozen_reader` 取走一次。
+    /// `Box<dyn Reader>` 只 `Send` 不 `Sync`，故包在 `Mutex` 内保持 `SplitConn: Sync`。
+    frozen: Mutex<Option<Box<dyn xray_buf::io::Reader>>>,
 }
 
 impl<R, W> SplitConn<R, W> {
     /// 构造新 `SplitConn`。
     #[must_use]
     pub fn new(reader: R, writer: W, remote: SocketAddr, local: SocketAddr) -> Self {
-        Self { reader, writer, remote_addr: remote, local_addr: local, on_close: Mutex::new(None) }
+        Self {
+            reader,
+            writer,
+            remote_addr: remote,
+            local_addr: local,
+            on_close: Mutex::new(None),
+            frozen: Mutex::new(None),
+        }
+    }
+
+    /// 挂上下行零拷贝读腿（[`DownloadBody`] 的 `Reader` 视图）。
+    ///
+    /// 桥层经 [`Connection::frozen_reader`] 取走后，下行直接吃 `Bytes`
+    /// （`Buffer::from_bytes_frozen`），不再经 AsyncRead 拷进池化缓冲。
+    pub fn set_frozen_reader(&self, reader: Box<dyn xray_buf::io::Reader>) {
+        *self.frozen.lock() = Some(reader);
     }
 
     /// 设置关闭回调（ [`Drop`] 时调用一次）。对应 Go `splitConn.onClose` 字段。
@@ -91,6 +114,7 @@ impl<R, W> SplitConn<R, W> {
             remote_addr: this.remote_addr,
             local_addr: this.local_addr,
             on_close: Mutex::new(on_close),
+            frozen: Mutex::new(this.frozen.lock().take()),
         }
     }
 }
@@ -166,6 +190,167 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for MutexReader<R> {
     }
 }
 
+// ===== 下行 Bytes 流双视图（bd oarfu：h2/h3 body 零拷贝下行） =====
+
+/// 下行 Bytes 流的共享状态：`AsyncRead` 拷贝视图与零拷贝 [`Reader`] 视图共用。
+struct BodyState<S> {
+    stream: S,
+    /// 已从流取出、尚未被消费的块。
+    pending: Bytes,
+    eof: bool,
+}
+
+struct BodyShared<S> {
+    state: Mutex<BodyState<S>>,
+}
+
+/// 下行流的 `AsyncRead` **拷贝**视图（`Connection::poll_read` 兜底路径）。
+pub struct BodyReader<S> {
+    shared: Arc<BodyShared<S>>,
+}
+
+/// 下行流的**零拷贝** [`Reader`] 视图（`Connection::frozen_reader` 热路径）：
+/// 每块 `Bytes` 直接包成 [`Buffer::from_bytes_frozen`]，无 memcpy、无池化分配。
+pub struct FrozenBodyReader<S> {
+    shared: Arc<BodyShared<S>>,
+}
+
+/// 由同一 `Stream<Item = io::Result<Bytes>>` 构造双视图。
+///
+/// 两视图共享一个 `Arc<Mutex<_>>`：同一连接的读腿实际只有一方在跑（桥层优先
+/// 取零拷贝视图），另一方保留完整功能——不会出现「取走一边、另一边静默 EOF」
+/// 的数据丢失形态。锁只在本函数内短持（不跨 poll 持锁），无竞态窗口。
+pub fn body_views<S>(stream: S) -> (BodyReader<S>, FrozenBodyReader<S>)
+where
+    S: Stream<Item = io::Result<Bytes>>,
+{
+    let shared = Arc::new(BodyShared {
+        state: Mutex::new(BodyState { stream, pending: Bytes::new(), eof: false }),
+    });
+    (BodyReader { shared: Arc::clone(&shared) }, FrozenBodyReader { shared })
+}
+
+/// 取下一块进 `pending`。`Ready(Ok(()))` = 有新块或已 EOF（调用方读
+/// `pending`/`eof` 判定），`Pending` = 流未就绪。
+fn poll_next_chunk<S: Stream<Item = io::Result<Bytes>> + Unpin>(
+    st: &mut BodyState<S>,
+    cx: &mut Context<'_>,
+) -> Poll<io::Result<()>> {
+    if st.eof {
+        return Poll::Ready(Ok(()));
+    }
+    match Pin::new(&mut st.stream).poll_next(cx) {
+        Poll::Ready(Some(Ok(chunk))) => {
+            st.pending = chunk;
+            Poll::Ready(Ok(()))
+        },
+        Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+        Poll::Ready(None) => {
+            st.eof = true;
+            Poll::Ready(Ok(()))
+        },
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+impl<S: Stream<Item = io::Result<Bytes>> + Unpin> AsyncRead for BodyReader<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut st = self.shared.state.lock();
+        loop {
+            if !st.pending.is_empty() {
+                let n = st.pending.len().min(buf.remaining());
+                buf.put_slice(&st.pending[..n]);
+                let _ = st.pending.split_to(n);
+                return Poll::Ready(Ok(()));
+            }
+            if st.eof || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            std::task::ready!(poll_next_chunk(&mut st, cx))?;
+        }
+    }
+}
+
+impl<S: Stream<Item = io::Result<Bytes>> + Unpin + Send> FrozenBodyReader<S> {
+    fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<xray_buf::io::Result<MultiBuffer>> {
+        let mut st = self.shared.state.lock();
+        loop {
+            if !st.pending.is_empty() {
+                let chunk = std::mem::take(&mut st.pending);
+                return Poll::Ready(Ok(MultiBuffer::from_buffer(Buffer::from_bytes_frozen(chunk))));
+            }
+            if st.eof {
+                // 空 MultiBuffer = EOF（xray-buf 约定）。
+                return Poll::Ready(Ok(MultiBuffer::new()));
+            }
+            std::task::ready!(
+                poll_next_chunk(&mut st, cx).map_err(|e| xray_buf::io::classify_io_error(e, true))
+            )?;
+        }
+    }
+}
+
+impl<S: Stream<Item = io::Result<Bytes>> + Unpin + Send> xray_buf::io::Reader
+    for FrozenBodyReader<S>
+{
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(poll_fn(move |cx| self.poll_chunk(cx)))
+    }
+
+    fn poll_read_multi_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<xray_buf::io::Result<MultiBuffer>> {
+        self.poll_chunk(cx)
+    }
+}
+
+/// 下载流读端的双视图（[`crate::client::DefaultDialerClient::open_stream`] 返回）。
+///
+/// - `copy`：`AsyncRead` 拷贝视图（`Connection::poll_read`，兜底/包装层用）；
+/// - `frozen`：零拷贝 [`Reader`] 视图（`Connection::frozen_reader`，桥层热路径用）。
+pub struct DownloadBody {
+    /// 拷贝视图。
+    pub copy: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    /// 零拷贝视图。
+    pub frozen: Box<dyn xray_buf::io::Reader>,
+}
+
+/// `Bytes` 流 → [`DownloadBody`]。
+pub fn download_body<S>(stream: S) -> DownloadBody
+where
+    S: Stream<Item = io::Result<Bytes>> + Send + Unpin + 'static,
+{
+    let (copy, frozen) = body_views(stream);
+    DownloadBody { copy: Box::new(copy), frozen: Box::new(frozen) }
+}
+
+impl DownloadBody {
+    /// 拆成（拷贝视图, 零拷贝视图）。
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn xray_buf::io::Reader>) {
+        (self.copy, self.frozen)
+    }
+}
+
+impl AsyncRead for DownloadBody {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.copy).poll_read(cx, buf)
+    }
+}
+
 // ===== Connection impl for Sync-compatible SplitConn =====
 
 impl<R: AsyncRead + Send + Sync + Unpin, W: AsyncWrite + Send + Sync + Unpin>
@@ -177,6 +362,12 @@ impl<R: AsyncRead + Send + Sync + Unpin, W: AsyncWrite + Send + Sync + Unpin>
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(Some(self.local_addr))
+    }
+
+    fn frozen_reader(&mut self) -> Option<Box<dyn xray_buf::io::Reader>> {
+        // 下行 body 是 h2/h3 数据帧的 Bytes 所有权：交出零拷贝视图（bd oarfu）。
+        // 取走后 AsyncRead 侧仍可用（两视图共享底层流）。
+        self.frozen.lock().take()
     }
 }
 
@@ -209,6 +400,45 @@ mod tests {
         let mut rbuf = [0u8; 6];
         server.read_exact(&mut rbuf).await.unwrap();
         assert_eq!(&rbuf, b"upload");
+    }
+
+    /// bd oarfu：零拷贝视图必须直接引用源 `Bytes`（同指针），而不是拷进池化缓冲。
+    #[tokio::test]
+    async fn frozen_view_shares_source_bytes() {
+        use bytes::Bytes;
+        use xray_buf::io::Reader as _;
+
+        let chunk = Bytes::from_static(b"zero-copy-payload");
+        let src_ptr = chunk.as_ptr();
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(chunk)]);
+        let (_copy, mut frozen) = body_views(stream);
+
+        let mb = frozen.read_multi_buffer().await.expect("read ok");
+        let buf = mb.iter().next().expect("单块 MultiBuffer");
+        assert_eq!(buf.bytes(), b"zero-copy-payload");
+        assert_eq!(buf.bytes().as_ptr(), src_ptr, "交付缓冲必须与源 Bytes 同指针（零拷贝）");
+        assert!(
+            frozen.read_multi_buffer().await.expect("eof ok").is_empty(),
+            "流尽须以空 MultiBuffer 报 EOF"
+        );
+    }
+
+    /// 拷贝视图与零拷贝视图共享同一底层流：取走零拷贝视图后 AsyncRead 侧仍可用。
+    #[tokio::test]
+    async fn copy_view_still_works_after_frozen_view_created() {
+        use bytes::Bytes;
+        use xray_buf::io::Reader as _;
+
+        let (mut copy, mut frozen) =
+            body_views(futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                Bytes::from_static(b"abcdef"),
+            )]));
+        let mut buf = [0u8; 3];
+        tokio::io::AsyncReadExt::read_exact(&mut copy, &mut buf).await.unwrap();
+        assert_eq!(&buf, b"abc");
+        // 剩余 3 字节归零拷贝视图（同一共享缓冲游标）——证明两视图不打架、不丢数据。
+        let mb = frozen.read_multi_buffer().await.expect("read ok");
+        assert_eq!(mb.to_vec(), b"def");
     }
 
     #[tokio::test]

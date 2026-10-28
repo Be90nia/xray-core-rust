@@ -13,12 +13,12 @@ use tokio::{
     sync::Semaphore,
     task::JoinSet,
 };
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 
 use crate::{
     client::{DefaultDialerClient, ReqBody, hyper_err_to_io, make_stream_body},
     config::{Config, RangeConfig},
-    connection::SplitConn,
+    connection::{DownloadBody, SplitConn},
     error::{Result, SplitHttpError},
     h3_client::H3Conn,
 };
@@ -30,6 +30,22 @@ use crate::{
 ///
 /// 用 `Box<dyn AsyncRead + Send + Unpin>` 避免复杂的具体类型名。
 pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, DuplexStream>;
+
+/// 用下载流双视图构造 [`SplitConn`]（bd oarfu：同时挂上零拷贝下行读腿）。
+///
+/// 拷贝视图进 `reader`（`Connection::poll_read` 兜底），零拷贝视图进
+/// [`SplitConn::set_frozen_reader`]（桥层优先取用，省掉一次全量 memcpy）。
+fn conn_with_download(
+    body: DownloadBody,
+    writer: DuplexStream,
+    remote: SocketAddr,
+    local: SocketAddr,
+) -> PacketUpConn {
+    let (copy, frozen) = body.into_parts();
+    let conn = SplitConn::new(copy, writer, remote, local);
+    conn.set_frozen_reader(frozen);
+    conn
+}
 
 /// packet-up 上行 in-flight POST 上限（背压门）。
 ///
@@ -89,7 +105,7 @@ pub async fn dial_packet_up(
     // 处理（h1 关 TCP / h2 RST_STREAM），服务端据此清理会话与桥接链（Go
     // `splitConn.onClose` 语义）。缺失此传播 = 服务端全链永挂（bd s10 fd 泄漏）。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, remote, local) =
+    let (download_body, remote, local) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     // 2. 创建上传 pipe（buffer 略大于 max_post 以吸收短期 burst）
@@ -182,7 +198,7 @@ pub async fn dial_packet_up(
         }
     });
 
-    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
     conn.set_on_close(move || {
         let _ = close_tx.send(());
     });
@@ -219,10 +235,10 @@ pub async fn dial_stream_up(
 
     // 3. 独立 GET 下载流（close 信号同 dial_packet_up——断连传播终止 GET）
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, _, _) =
+    let (download_body, _, _) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
-    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
     conn.set_on_close(move || {
         let _ = close_tx.send(());
     });
@@ -255,18 +271,13 @@ pub async fn dial_stream_one(
 
     let (response_opt, remote, local) =
         client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
-    let response_body = response_opt.ok_or_else(|| {
+    let download_body = response_opt.ok_or_else(|| {
         crate::error::SplitHttpError::Hyper(
             "stream-one upload_only=false must return response stream".into(),
         )
     })?;
 
-    // 3. 响应流作为下载流
-    let response_stream = response_body.map_err(hyper_err_to_io);
-    let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
-        Box::new(StreamReader::new(response_stream));
-
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    Ok(conn_with_download(download_body, pipe_client, remote, local))
 }
 // ===== 切片 F: dial() 统一入口 + dispatch 辅助函数 =====
 
@@ -418,7 +429,7 @@ pub async fn dial_h3_packet_up(
 ) -> Result<PacketUpConn> {
     // 1. GET 下载流（close 信号 + 连接级关闭见下方 on_close 注释）。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, remote, local) =
+    let (download_body, remote, local) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
     // 2. 创建上传 pipe
@@ -476,7 +487,7 @@ pub async fn dial_h3_packet_up(
         }
     });
 
-    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
     // 连接关闭：终止 GET 下载流 + 显式关闭 QUIC 连接（H3Conn 与 QUIC 连接一一
     // 对应，对齐 Go dialer.go:229-231 AfterFunc 的 `tr.Close(); pktConn.Close()`）
     // ——客户端 UDP fd 立即释放，服务端 QUIC 连接立即终结，不等 30s idle timeout
@@ -507,10 +518,10 @@ pub async fn dial_h3_stream_up(
 
     // 3. 独立 GET 下载（close 信号同 dial_h3_packet_up——断连传播 + 连接级关闭）
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_reader, _, _) =
+    let (download_body, _, _) =
         client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
 
-    let conn = SplitConn::new(download_reader, pipe_client, remote, local);
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
     let h3_for_close = Arc::clone(&client);
     conn.set_on_close(move || {
         h3_for_close.close();
@@ -538,11 +549,11 @@ pub async fn dial_h3_stream_one(
     // 2. POST upload + GET download（upload_only=false）
     let (dl_opt, remote, local) =
         client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
-    let download_reader = dl_opt.ok_or_else(|| {
+    let download_body = dl_opt.ok_or_else(|| {
         SplitHttpError::Hyper("h3 stream-one upload_only=false must return download stream".into())
     })?;
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote, local))
+    Ok(conn_with_download(download_body, pipe_client, remote, local))
 }
 
 /// H3 统一拨号入口。
@@ -684,15 +695,14 @@ where
     }
     let resp_body = resp.into_body();
     let download_stream = http_body_util::BodyDataStream::new(resp_body).map_err(hyper_err_to_io);
-    let download_reader: Box<dyn AsyncReadTrait + Send + Unpin> =
-        Box::new(StreamReader::new(download_stream));
+    let download_body = crate::connection::download_body(download_stream);
 
     crate::hot_log!(
         DEBUG,
         "base_uri={base_uri} REALITY stream-one established via direct h2 handshake"
     );
 
-    Ok(SplitConn::new(download_reader, pipe_client, remote_addr, local_addr))
+    Ok(conn_with_download(download_body, pipe_client, remote_addr, local_addr))
 }
 
 #[cfg(test)]

@@ -335,7 +335,7 @@ async fn read_downlink(
 /// dispatcher 取出的 per-user Policy 不生效）。
 pub async fn bridge_link_with_stream_full<S>(
     link: Link,
-    stream: S,
+    mut stream: S,
     policy: &TimeoutPolicy,
 ) -> io::Result<()>
 where
@@ -367,15 +367,20 @@ where
         .then(|| stream.raw_tcp_clone())
         .flatten()
         .map(new_readv_reader_whole);
+    // bd oarfu：连接能直接交出收到的 Bytes 块时（h2/h3 body 面）走零拷贝读腿——
+    // 省掉 AsyncRead → 池化 8KB 缓冲的一次全量 memcpy（Buffer::from_bytes_frozen）。
+    // 必须在 split 前取；包装层（TLS/AEAD/vision）不转发即自动回退下方拷贝路径。
+    let frozen = stream.frozen_reader();
     // F3：rustls 客户端 TLS 流读缓冲放大（Connection::tls_readbuf_size，
     // 缺省 0 = 池化 8KB 不变；btls SSL_read 单 record 零收益，vision/reality
     // 包装层不转发即保持批边界语义）。
     let tls_readbuf = stream.tls_readbuf_size();
     let (s_read_half, mut s_write) = tokio::io::split(stream);
-    let mut s_read: Box<dyn Reader> = match (s_read_dup, tls_readbuf) {
-        (Some(r), _) => r,
-        (None, 0) => new_reader(s_read_half),
-        (None, cap) => xray_buf::io::new_reader_with_capacity(s_read_half, cap),
+    let mut s_read: Box<dyn Reader> = match (frozen, s_read_dup, tls_readbuf) {
+        (Some(r), _, _) => r,
+        (None, Some(r), _) => r,
+        (None, None, 0) => new_reader(s_read_half),
+        (None, None, cap) => xray_buf::io::new_reader_with_capacity(s_read_half, cap),
     };
 
     // 512KiB bounded mpsc ×2：容量按条目计（Go pipe 按字节软限，这里
@@ -1171,6 +1176,93 @@ mod tests {
             response,
             "stranded sendable bytes must reach the wire at teardown"
         );
+    }
+
+    /// bd oarfu：连接暴露零拷贝读腿时，下行必须走它而不是 AsyncRead 拷贝路径。
+    ///
+    /// 两条腿吐不同内容（AsyncRead 侧 "copied-downlink"，零拷贝侧
+    /// "frozen-downlink"），sink 收到的内容即判定走了哪条——也防回档到
+    /// 「钩子接了但桥层没消费」。
+    #[tokio::test]
+    async fn bridge_full_prefers_frozen_reader() {
+        use std::{
+            net::SocketAddr,
+            task::{Context, Poll},
+        };
+
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+        use xray_buf::io::Writer as _;
+
+        use crate::link::Link;
+
+        /// AsyncRead 吐固定串（拷贝路径数据），写向丢弃。
+        struct FrozenConn {
+            copy_data: &'static [u8],
+            pos: usize,
+        }
+        impl AsyncRead for FrozenConn {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let rest = &self.copy_data[self.pos..];
+                if rest.is_empty() {
+                    return Poll::Ready(Ok(())); // EOF
+                }
+                let n = rest.len().min(buf.remaining());
+                buf.put_slice(&rest[..n]);
+                self.pos += n;
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl AsyncWrite for FrozenConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for FrozenConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn frozen_reader(&mut self) -> Option<Box<dyn xray_buf::io::Reader>> {
+                Some(xray_buf::io::new_reader(std::io::Cursor::new(b"frozen-downlink".to_vec())))
+            }
+        }
+
+        let stream = FrozenConn { copy_data: b"copied-downlink", pos: 0 };
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (sink, mut sink_peer) = tokio::io::duplex(64);
+        let link = Link::new(Box::new(up_r), xray_buf::io::new_writer(sink));
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(link, stream));
+        up_w.shutdown(); // 上行立即 EOF，桥只剩下行
+
+        let mut got = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sink_peer.read_to_end(&mut got),
+        )
+        .await;
+        let _ = bridge.await;
+        assert_eq!(got, b"frozen-downlink", "下行必须走零拷贝读腿，而非 AsyncRead 拷贝路径");
     }
 
     #[tokio::test]
