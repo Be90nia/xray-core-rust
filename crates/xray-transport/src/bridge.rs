@@ -602,18 +602,21 @@ where
         let mut window: Option<std::time::Duration> = None;
         loop {
             let mb = match window {
-                None => tokio::select! {
-                    res = Budget::tokio()
-                        .deadline(conn_idle)
-                        .timeout(reader.read_multi_buffer()) => {
-                        match res {
-                            Ok(r) => r,
-                            Err(_) => break,
+                None => {
+                    // 预算先绑定具名局部：`Budget::tokio()` 是临时值，
+                    // 在 select! 内其借用会跨越 await（E0716：Linux 构建红点）。
+                    let idle_dl = Budget::tokio().deadline(conn_idle);
+                    tokio::select! {
+                        res = idle_dl.timeout(reader.read_multi_buffer()) => {
+                            match res {
+                                Ok(r) => r,
+                                Err(_) => break,
+                            }
                         }
-                    }
-                    _ = down_done.changed() => {
-                        window = *down_done.borrow();
-                        continue;
+                        _ = down_done.changed() => {
+                            window = *down_done.borrow();
+                            continue;
+                        }
                     }
                 },
                 Some(d) => {
