@@ -712,9 +712,13 @@ pub fn serialize_go_response_head(
     buf.extend_from_slice(status_line.as_bytes());
     buf.extend_from_slice(b"\r\n");
     // Go：ContentLength < 0 → response.Close = true → 先写 "Connection: close"。
+    // 同时 Go `proxy/http/server.go:218-219`（写响应前）与 `:294-295`（非 keep-alive
+    // 分支）都会 `Set("Proxy-Connection", "close")`——两个头必须成对出现，缺
+    // Proxy-Connection 会让「代理语义」客户端判定 keep-alive 继续复用死连接。
     let keep_alive = content_length.is_some();
     if !keep_alive {
         buf.extend_from_slice(b"Connection: close\r\n");
+        buf.extend_from_slice(b"Proxy-Connection: close\r\n");
     }
     // Go：CL > 0 → transferWriter 先写 Content-Length；chunked → Transfer-Encoding。
     let mut sent_content_length = false;
