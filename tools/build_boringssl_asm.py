@@ -160,6 +160,14 @@ def health(src: Path | None = None, dest: Path | None = None) -> int:
 
 
 def main() -> int:
+    # Windows 控制台默认 ANSI 代码页（cp1252/cp437）：脚本里带中文的 print 会
+    # UnicodeEncodeError 直接崩掉整个构建（CI 里 stdout 编码 = 代码页）。强制
+    # UTF-8 输出 + 替换兜底，保证日志可读且不因编码中断构建。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # 非 TextIOWrapper（被重定向到别处）
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--check", action="store_true", help="只体检，不编译")
     ap.add_argument("--jobs", type=int, default=14, help="并行编译作业数")
