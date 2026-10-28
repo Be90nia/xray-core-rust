@@ -247,9 +247,21 @@ impl PluginContext {
         &self.clock
     }
 
-    /// conn_id 统一标识源（坑约束 3）。
+    /// 标识能力句柄（模型 §4 表 `ctx.ids()`）：udf `IdGen` 本体，进程级单权威
+    /// （同指纹共享计数器——跨句柄、跨插件严格递增，坑约束 3「禁自造 id 生成
+    /// 器」）。
+    ///
+    /// 能力受限：句柄上只有生成面，**构造权不在插件**（指纹 + 钟由装配根
+    /// 注入；`IdGen::new` 的自选指纹形态属 L3 禁令面）。取值入口二选一：
+    /// [`Self::next_conn_id`]（u128，连接面惯例）或本句柄的 `r#gen()`
+    /// （值类型 / 字符串面）。
+    pub fn ids(&self) -> &IdGen {
+        &self.ids
+    }
+
+    /// conn_id 统一标识源（坑约束 3）：`ids()` 句柄的 u128 便捷面。
     pub fn next_conn_id(&self) -> u128 {
-        self.ids.r#gen().as_u128()
+        self.ids().r#gen().as_u128()
     }
 
     // ── 日志（能力⑤；P0-7 实体）──
@@ -532,5 +544,52 @@ mod tests {
         let events = audit.take_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].message, "via-ctx");
+    }
+
+    /// 标识能力柄（nn8os W2 2a 验收①）：`ctx.ids()` 可构造 + 语义断言——
+    /// 非零 / 唯一 / 严格递增（同毫秒 counter 前进、跨毫秒时间序），且
+    /// `next_conn_id()` 与之同一权威（不是第二套生成器）。
+    ///
+    /// 独占指纹常量：udf `IdGen` 按指纹进程级共享权威（同指纹跨句柄递增），
+    /// 用独立指纹与并行测试的时间线隔离；`0x4000 >> 13 & 0xFFF = 2` →
+    /// 同毫秒配额 4094，本测连发量远小于此。
+    #[test]
+    fn ids_handle_is_single_authority_monotonic_and_unique() {
+        const ISOLATED_FP: u64 = 0x4000;
+
+        let clock = Arc::new(MockClock::new());
+        // 推进 1ms：首调即走跨毫秒臂（counter 重置为基址），避开 GenState 初值
+        // 与挂钟 ms=0 重合的同毫秒配额面。
+        clock.advance(Duration::from_millis(1));
+        let make_ctx = |plugin: &'static str| {
+            PluginContext::new(
+                plugin,
+                ArmScope::new(),
+                Arc::clone(&clock) as Arc<dyn Clock>,
+                ISOLATED_FP,
+                Arc::new(MockEnv::new()),
+                json!({}),
+                LogFacade::new(plugin, vec![]),
+                Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
+            )
+        };
+
+        let ctx = make_ctx("stub");
+        let mut seen: Vec<u128> = (0..16).map(|_| ctx.ids().r#gen().as_u128()).collect();
+        // 同一权威：句柄面与 u128 便捷面交替取值仍严格递增。
+        seen.push(ctx.next_conn_id());
+        seen.push(ctx.ids().r#gen().as_u128());
+        // 跨毫秒：时间戳字段前进，序列仍严格递增。
+        clock.advance(Duration::from_millis(1));
+        seen.push(ctx.next_conn_id());
+
+        assert!(seen.iter().all(|id| *id != 0), "id 不得为零：{seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "同指纹单权威必须严格递增：{seen:?}");
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "id 必须唯一：{seen:?}");
+
+        // 同指纹的第二个 ctx = 同一权威（udf 注册表语义，非各造各的计数器）。
+        let sibling = make_ctx("stub-2");
+        assert!(*seen.last().expect("seen 非空") < sibling.next_conn_id(), "同指纹跨 ctx 严格递增");
     }
 }

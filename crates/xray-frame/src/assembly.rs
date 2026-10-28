@@ -34,6 +34,7 @@ use crate::{
     lifecycle::{StartedPlugins, bring_up},
     logging::LogFacade,
     plugin::Plugin,
+    pool::BufferPool,
     registry::PluginRegistry,
     scope::ArmScope,
 };
@@ -159,6 +160,9 @@ pub struct FrameworkBuilder {
     config_root: serde_json::Value,
     /// 装配根审计环（nn8os 2a：全插件事件落同一环，`plugin` 字段标注归属）。
     audit: Arc<AuditHandle>,
+    /// 装配根缓冲池（nn8os W2 2a：`with_pool` 注入，各插件 ctx 共享同一池；
+    /// 缺省 `None` = 未接线 → 插件取 `ctx.pool()` fail-visible）。
+    pool: Option<Arc<dyn BufferPool>>,
 }
 
 impl FrameworkBuilder {
@@ -175,6 +179,7 @@ impl FrameworkBuilder {
             ctxs: HashMap::new(),
             config_root: serde_json::json!({}),
             audit: Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
+            pool: None,
         })
     }
 
@@ -183,6 +188,15 @@ impl FrameworkBuilder {
     #[must_use]
     pub fn with_config(mut self, config_root: serde_json::Value) -> Self {
         self.config_root = config_root;
+        self
+    }
+
+    /// 注入装配根缓冲池（L2 缓冲柄 `ctx.pool()` 的装配接线点，坑约束 4/9）：
+    /// build 期写进每个插件 ctx（`set_pool`），全插件共享同一池、同一份账本。
+    /// 缺省不注入 → 插件取池即 fail-visible（装配门 L5，`PluginContext::pool`）。
+    #[must_use]
+    pub fn with_pool(mut self, pool: Arc<dyn BufferPool>) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -211,6 +225,7 @@ impl FrameworkBuilder {
             fingerprint: _,
             config_root: _,
             audit: _,
+            pool: _,
         } = self;
         Ok(Framework {
             registry,
@@ -225,7 +240,7 @@ impl FrameworkBuilder {
     /// ctx 构造（每插件一份；log 域约定 = 插件名；配置根经 `with_config` 注入，
     /// 缺省空对象——真实配置文件接入归 P3-2，段路由此刻走注入面）。
     fn new_ctx(&self, plugin_name: &'static str) -> PluginContext {
-        PluginContext::new(
+        let mut ctx = PluginContext::new(
             plugin_name,
             Arc::clone(&self.fx),
             Arc::new(SystemClock),
@@ -234,7 +249,11 @@ impl FrameworkBuilder {
             self.config_root.clone(),
             LogFacade::new(plugin_name, vec![]),
             Arc::clone(&self.audit),
-        )
+        );
+        if let Some(pool) = &self.pool {
+            ctx.set_pool(Arc::clone(pool));
+        }
+        ctx
     }
 }
 
@@ -334,5 +353,82 @@ mod tests {
             .find(|o| o.name == "fx_drain")
             .expect("fx drain outcome must be reported");
         assert_eq!(row.kind, OutcomeKind::TimedOut);
+    }
+
+    /// L2 缓冲柄的装配注入面（nn8os W2 2a）：`with_pool` 未调 → 插件取
+    /// `ctx.pool()` 时装配期 fail-visible（panic 被 build 装甲转 `Err`，不静默
+    /// 放行）；接线后同一插件 build 成功并真取到池。
+    #[test]
+    fn assembler_wires_pool_capability_into_plugin_ctx() {
+        use crate::{
+            plugin::{Lifecycle, PluginContract},
+            pool::{ManagedBufferPool, XrayBufPool},
+        };
+
+        struct NoopLifecycleImpl;
+
+        impl Lifecycle for NoopLifecycleImpl {
+            fn init(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+                Ok(())
+            }
+
+            fn start(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+                Ok(())
+            }
+
+            fn stop(&self) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        static PROBE_LIFECYCLE: NoopLifecycleImpl = NoopLifecycleImpl;
+        static PROBE_CONTRACT: PluginContract =
+            PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
+
+        struct PoolProbe;
+
+        impl Plugin for PoolProbe {
+            fn name(&self) -> &'static str {
+                "pool-probe"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn contract(&self) -> &PluginContract {
+                &PROBE_CONTRACT
+            }
+
+            fn lifecycle(&self) -> &dyn Lifecycle {
+                &PROBE_LIFECYCLE
+            }
+
+            fn build(&self, ctx: &mut PluginContext) -> Result<(), PluginError> {
+                // 未接线 → `pool()` panic → 装甲转 Err（装配期 fail-visible）。
+                drop(ctx.pool().acquire(64).expect("pool wired by assembler"));
+                Ok(())
+            }
+        }
+
+        let unwired = match Framework::builder(opts(4, None))
+            .expect("cap 4")
+            .register(Arc::new(PoolProbe))
+            .expect("register")
+            .build()
+        {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("未接线的 pool 必须在装配期 fail-visible"),
+        };
+        assert!(unwired.contains("pool capability not wired"), "{unwired}");
+
+        let fw = Framework::builder(opts(4, None))
+            .expect("cap 4")
+            .with_pool(Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8)))
+            .register(Arc::new(PoolProbe))
+            .expect("register")
+            .build()
+            .expect("pool wired → build 成功");
+        assert!(!fw.is_running(), "build 后仍未启动");
     }
 }
