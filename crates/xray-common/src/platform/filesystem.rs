@@ -80,7 +80,10 @@ fn asset_file_location(file: &str) -> io::Result<(PathBuf, fs::Metadata)> {
 /// 元素不含 `.`/`..`/空（`//`）、非绝对路径；
 /// Windows 下额外拒绝盘符（`C:` / `C:\`）、UNC（`\\server\share`）
 /// 与 `NUL` 设备名（Go `filepath.isWindowsNulName`）。
-fn validate_local_name(file: &str) -> io::Result<()> {
+///
+/// 对 geodata 下载器公开：Go `downloadOne` 经 `filesystem.ResolveAsset`
+/// 间接吃到该校验，Rust 侧下载器资产目录可注入，需在同一处显式调用。
+pub fn validate_local_name(file: &str) -> io::Result<()> {
     let reject =
         || io::Error::new(io::ErrorKind::InvalidInput, "asset path must stay in asset directory");
     if file.is_empty() || file == "." {

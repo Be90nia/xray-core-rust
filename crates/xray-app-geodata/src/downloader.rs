@@ -3,9 +3,13 @@
 //! 对应 Go `app/geodata/download.go` 的 `downloader` + `idleConn` + `http.Client`。
 //! HTTP fetch 与 dispatcher dial 全部留 trait 注入，避免绑定 hyper/reqwest。
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use skeleton::clock::{Clock, SystemClock};
+use xray_common::platform::filesystem::validate_local_name;
 
 use crate::{
     config::GeodataAsset,
@@ -22,6 +26,18 @@ pub trait AssetDownloader: Send + Sync {
     ///
     /// 对应 Go `filesystem.ResolveAsset(asset.File)`。
     fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError>;
+}
+
+/// 解析资产名为 `dir` 内的路径，先过 Go `filepath.IsLocal` 等价守卫。
+///
+/// Go `downloadOne` 经 `filesystem.ResolveAsset` 间接做该校验；Rust 侧资产目录可注入，
+/// 所以在拼接点显式调用（`bd 20aie` S-06 路径穿越面），拒绝即 fail-visible 报错。
+fn resolve_under_dir(dir: &Path, file: &str) -> Result<PathBuf, GeodataError> {
+    if file.is_empty() {
+        return Err(GeodataError::InvalidFilePath("empty asset file".into()));
+    }
+    validate_local_name(file).map_err(|e| GeodataError::InvalidFilePath(format!("{file}: {e}")))?;
+    Ok(dir.join(file))
 }
 
 /// 默认实现：用 std HTTP（实际上层应注入 reqwest/hyper 实现）。
@@ -49,10 +65,7 @@ impl AssetDownloader for DefaultAssetDownloader {
     }
 
     fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
-        if file.is_empty() {
-            return Err(GeodataError::InvalidFilePath("empty asset file".into()));
-        }
-        Ok(self.asset_dir.join(file))
+        resolve_under_dir(&self.asset_dir, file)
     }
 }
 
@@ -367,10 +380,7 @@ impl AssetDownloader for RealAssetDownloader {
     }
 
     fn resolve_target(&self, file: &str) -> Result<PathBuf, GeodataError> {
-        if file.is_empty() {
-            return Err(GeodataError::InvalidFilePath("empty asset file".into()));
-        }
-        Ok(self.asset_dir.join(file))
+        resolve_under_dir(&self.asset_dir, file)
     }
 }
 /// 共享 HTTP/1.1 响应解析与 body 落盘逻辑。
@@ -703,6 +713,37 @@ mod tests {
     fn default_downloader_resolve_target_rejects_empty() {
         let d = DefaultAssetDownloader::with_temp_dir();
         assert!(d.resolve_target("").is_err());
+    }
+
+    /// S-06（bd 20aie）：资产名必须局限在资产目录内，穿越名 fail-visible 报错。
+    #[test]
+    fn resolve_target_rejects_path_traversal() {
+        let d = DefaultAssetDownloader::new(PathBuf::from("/var/geo"));
+        for bad in ["../etc/passwd", "a/../../b", "/abs/path", "./rel", ".", "geo//double"] {
+            let err = d.resolve_target(bad).unwrap_err();
+            assert!(matches!(err, GeodataError::InvalidFilePath(_)), "应报 InvalidFilePath: {bad}");
+            let msg = err.to_string();
+            assert!(msg.contains(bad), "错误信息应含违规名 {bad}: {msg}");
+        }
+    }
+
+    /// Windows 专属越界形态：盘符、盘符相对、UNC、NUL 设备名。
+    #[cfg(windows)]
+    #[test]
+    fn resolve_target_rejects_windows_absolute_names() {
+        let d = DefaultAssetDownloader::new(PathBuf::from("C:\\geo"));
+        for bad in ["C:\\x", "C:x", "\\\\server\\share\\x", "NUL"] {
+            assert!(d.resolve_target(bad).is_err(), "应拒绝: {bad}");
+        }
+    }
+
+    /// 生产下载器（`RealAssetDownloader`）走同一守卫。
+    #[test]
+    fn real_downloader_resolve_target_applies_is_local() {
+        let d = RealAssetDownloader::new(PathBuf::from("/var/geo"));
+        assert!(d.resolve_target("../etc/passwd").is_err());
+        let ok = d.resolve_target("ip.dat").unwrap();
+        assert_eq!(ok, PathBuf::from("/var/geo/ip.dat"));
     }
 
     #[test]
