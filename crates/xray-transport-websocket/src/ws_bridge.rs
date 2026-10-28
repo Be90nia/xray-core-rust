@@ -314,6 +314,8 @@ where
         )]
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(period);
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // 跳过首次立即 tick（对齐 Go time.Sleep 先睡后 ping）。
             interval.tick().await;
             loop {

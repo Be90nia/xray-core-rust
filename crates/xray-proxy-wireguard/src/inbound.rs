@@ -274,6 +274,8 @@ async fn wg_accept_loop(
     fx: Arc<FxScope>,
 ) {
     let mut timer = interval(Duration::from_millis(ACCEPT_POLL_MS));
+    // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     crate::WG_LOG.debug("wg accept loop started");
 
     // 内层 UDP 转发（票 z7ya）：per-源会话表 + 空闲清扫（Go udp forwarder 语义，
@@ -286,6 +288,8 @@ async fn wg_accept_loop(
     fx_sweep
         .spawn_tracked(async move {
             let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             tick.tick().await; // 跳过首个立即 tick（启动时全为新）
             loop {
                 tick.tick().await;
@@ -605,6 +609,8 @@ impl WgTcpRelay {
     /// 运行中继循环直到 socket 关闭或出错。
     async fn run(mut self) {
         let mut timer = tokio::time::interval(Duration::from_millis(RELAY_POLL_MS));
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await; // 消掉首次立即触发
 
         loop {

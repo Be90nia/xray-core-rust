@@ -887,6 +887,8 @@ impl ServerInstance {
             // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
             ctx.spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 interval.tick().await; // 首次 tick 立即返回，跳过
                 loop {
                     interval.tick().await;

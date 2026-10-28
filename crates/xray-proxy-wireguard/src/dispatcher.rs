@@ -120,6 +120,8 @@ impl TcpRelay {
     async fn run(mut self) {
         let poll_interval = Duration::from_millis(RELAY_POLL_MS);
         let mut timer = tokio::time::interval(poll_interval);
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // 消掉首次立即触发
         timer.tick().await;
 
@@ -240,6 +242,8 @@ impl UdpRelay {
     async fn run(mut self) {
         let poll_interval = Duration::from_millis(RELAY_POLL_MS);
         let mut timer = tokio::time::interval(poll_interval);
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await;
 
         loop {

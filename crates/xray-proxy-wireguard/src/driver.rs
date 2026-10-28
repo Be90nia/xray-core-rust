@@ -577,6 +577,8 @@ impl WgDriver {
         }
 
         let mut timer = interval(TIMER_INTERVAL);
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_keepalive = xray_frame::compat::clock().now_instant();
         let keepalive_interval =
             self.peer(0).and_then(|p| p.with_tunnel(|t| t.keepalive_interval()));

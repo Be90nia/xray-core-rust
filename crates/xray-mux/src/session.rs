@@ -699,6 +699,8 @@ impl XUDPManager {
             .fx
             .spawn_tracked(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
+                // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
                     #[allow(

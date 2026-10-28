@@ -465,6 +465,8 @@ fn spawn_gc_task(state: Arc<Mutex<GeckoState>>, scope: &FxScope) -> Spawned<()> 
     scope
         .spawn_tracked(async move {
             let mut interval = tokio::time::interval(GECKO_GC_INTERVAL);
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await; // 跳过立即触发的首次
             loop {
                 interval.tick().await;

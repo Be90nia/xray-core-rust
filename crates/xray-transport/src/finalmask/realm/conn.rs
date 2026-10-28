@@ -391,6 +391,8 @@ async fn client_punch_loop(
 ) {
     let punch_deadline = Budget::tokio().deadline(DEFAULT_PUNCH_TIMEOUT);
     let mut ticker = tokio::time::interval(DEFAULT_PUNCH_INTERVAL);
+    // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if punch_deadline.is_expired() {
             break;
@@ -589,6 +591,8 @@ async fn heartbeat_loop(
 ) {
     let interval = Duration::from_secs(ttl_secs.max(1) / 2).max(Duration::from_secs(1));
     let mut ticker = tokio::time::interval(interval);
+    // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
         if cancel.load(Ordering::Acquire) {

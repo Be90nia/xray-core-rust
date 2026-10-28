@@ -649,6 +649,8 @@ async fn tun_driver_loop(
     dispatch: Arc<dyn DispatchHandler>,
 ) {
     let mut timer = interval(POLL_INTERVAL);
+    // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 读侧批量缓冲（票 ukh8）：Linux 一次 syscall 出一批，其他平台单包。
     let mut rx = RxPackets::new(&device);
 
@@ -902,6 +904,8 @@ fn now_nanos() -> i64 {
 fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // 跳过首 tick（首次运行时所有 entry 都很新）
         tick.tick().await;
         loop {
@@ -1225,6 +1229,8 @@ impl TunTcpRelay {
     /// 运行中继循环直到 socket 关闭或出错。
     async fn run(mut self) {
         let mut timer = tokio::time::interval(Duration::from_millis(RELAY_POLL_MS));
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await; // 消掉首次立即触发
 
         loop {

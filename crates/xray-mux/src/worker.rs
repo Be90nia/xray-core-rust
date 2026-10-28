@@ -224,6 +224,8 @@ impl ServerWorker {
                 tokio::time::Instant::now() + SERVER_MONITOR_INTERVAL,
                 SERVER_MONITOR_INTERVAL,
             );
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 // tick 前快照（Go :126-127，容忍 tick 间隙分配-释放竞态）
                 let check_size = session_manager.size().await;

@@ -313,6 +313,8 @@ impl CacheController {
         let ctrl = Arc::clone(self);
         let spawned = fx.spawn_tracked(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await; // 跳过首次立即触发
             loop {
                 ticker.tick().await;

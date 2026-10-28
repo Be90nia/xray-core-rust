@@ -776,6 +776,8 @@ impl UdpSessionManager {
         )]
         let clean_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 let to_close = {

@@ -677,6 +677,8 @@ impl ClientWorker {
             tokio::time::Instant::now() + CLIENT_KEEPALIVE_INTERVAL,
             CLIENT_KEEPALIVE_INTERVAL,
         );
+        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             // tick 前快照（Go :230-231，容忍 tick 间隙分配-释放的竞态语义）
             let check_size = self.session_manager.size().await;
