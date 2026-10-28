@@ -159,7 +159,7 @@ impl XdnsConnServer {
         tokio::spawn(dr_loop(state.clone(), dr_rx, closed.clone()));
         // 闸关不可达：内部 scope 无 close 调用（分片维护管理任务随 scope 收口）。
         this.fx
-            .spawn(maintain_loop(frag, send_mgr, closed))
+            .spawn_tracked(maintain_loop(frag, send_mgr, closed))
             .expect("internal FxScope is never closed");
 
         Ok(this)

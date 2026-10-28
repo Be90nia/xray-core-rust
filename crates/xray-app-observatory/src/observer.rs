@@ -259,7 +259,7 @@ impl Observer {
         let fx = Arc::clone(&self.fx);
         let clock = Arc::clone(&self.clock);
         // 闸关不可达：内部 scope 无 close 调用（停机走 cancel_rx 协作退出）。
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             let mut cancel_rx = cancel_rx;
             let mut fail_streak: u32 = 0;
             loop {

@@ -285,7 +285,7 @@ impl DohNameServer {
         // 后才被 close 的竞态窗）拒新：连接驱动随之丢弃，本次查询按错误收场，
         // 不裸 spawn、不 panic。
         let _spawned = fx
-            .spawn(h2_conn)
+            .spawn_tracked(h2_conn)
             .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。

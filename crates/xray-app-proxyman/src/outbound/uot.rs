@@ -233,11 +233,12 @@ impl UotServerConn {
         let fx = Arc::new(FxScope::new());
         // pump_input: 从 server_r 读帧 → UDP send_to
         let pump_input = fx
-            .spawn(pump_input(server_r, udp_a, version))
+            .spawn_tracked(pump_input(server_r, udp_a, version))
             .expect("internal FxScope is never closed");
         // pump_output: 从 UDP recv_from → 写帧到 server_w
-        let pump_output =
-            fx.spawn(pump_output(server_w, udp_b)).expect("internal FxScope is never closed");
+        let pump_output = fx
+            .spawn_tracked(pump_output(server_w, udp_b))
+            .expect("internal FxScope is never closed");
 
         let conn: Box<dyn Connection> = Box::new(DuplexConnection::new(client_io));
         Ok((conn, Self { fx, _pump_input: pump_input, _pump_output: pump_output }))

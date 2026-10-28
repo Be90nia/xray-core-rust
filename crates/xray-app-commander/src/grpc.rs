@@ -593,7 +593,7 @@ impl ProtoRoutingService for RoutingServiceImpl {
         // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
         // 闸关不可达：内部 scope 无 close 调用（泵随订阅流结束自终止）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 while let Some(msg) = sub.recv().await {
                     let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
                         let _ = tx

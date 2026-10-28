@@ -132,7 +132,7 @@ impl UdpHopConn {
         let fx = Arc::new(FxScope::new());
         if shared.local || shared.remote {
             let s = Arc::clone(&shared);
-            fx.spawn(async move {
+            fx.spawn_tracked(async move {
                 loop {
                     // Go RandBetween(from>to 时交换)；校验保证 >=5，.max(0) 防 i64 负值转 u64。
                     let (lo, hi) =

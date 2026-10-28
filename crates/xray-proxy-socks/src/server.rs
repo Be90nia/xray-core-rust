@@ -125,7 +125,7 @@ impl InboundHandler for SocksServer {
         // 借用冲突（E0505）。
         let fx_conns = Arc::clone(&fx);
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     match listener_clone.accept().await {
                         Ok((mut stream, peer)) => {
@@ -133,7 +133,7 @@ impl InboundHandler for SocksServer {
                             let config = config.clone();
                             let fx = Arc::clone(&fx_conns);
                             let log = log.clone();
-                            fx.spawn(async move {
+                            fx.spawn_tracked(async move {
                                 match socks_handshake(&mut stream, &config).await {
                                     Ok(addr) => {
                                         log.info(format!(

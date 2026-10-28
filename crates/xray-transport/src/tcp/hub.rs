@@ -68,7 +68,7 @@ impl TcpHubListener {
         // 编程错误（realm/conn.rs 同形）。
         let fx = Arc::new(FxScope::new());
         let loop_task = fx
-            .spawn(keep_accepting(
+            .spawn_tracked(keep_accepting(
                 inner,
                 local,
                 add_conn,
@@ -79,7 +79,7 @@ impl TcpHubListener {
             .expect("internal FxScope is never closed");
         // 意外退出监控：循环只应经 close_notify 分支退出；panic 会静默杀掉
         // 监听（端口不再 listen 而进程存活），error! 兜底发声。
-        fx.spawn(supervise_accept_loop("tcp", local.to_string(), loop_task.join()))
+        fx.spawn_tracked(supervise_accept_loop("tcp", local.to_string(), loop_task.join()))
             .expect("internal FxScope is never closed");
         Ok(Self { local, close_notify, fx })
     }

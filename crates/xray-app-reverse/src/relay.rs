@@ -78,7 +78,7 @@ impl YamuxBridge {
         let (open_tx, open_rx) = mpsc::channel(64);
         // 闸关不可达：内部 scope 无 close 调用（驱动随 open_tx 关闭自退）。
         let fx = Arc::new(FxScope::new());
-        fx.spawn(drive_bridge(conn, open_rx)).expect("internal FxScope is never closed");
+        fx.spawn_tracked(drive_bridge(conn, open_rx)).expect("internal FxScope is never closed");
         Ok(Self { open_tx, fx })
     }
 

@@ -15,7 +15,7 @@ publish = false
 [dependencies]
 udf-skeleton = { path = "../udf-frame/skeleton" }
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log"] }
-udf-std-ext = { path = "../udf-frame/std-ext" }
+udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -311,7 +311,7 @@ impl CacheController {
             return;
         }
         let ctrl = Arc::clone(self);
-        let spawned = fx.spawn(async move {
+        let spawned = fx.spawn_tracked(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // 跳过首次立即触发
             loop {

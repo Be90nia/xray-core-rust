@@ -188,7 +188,7 @@ impl PortalWorker {
         let c = Arc::clone(&client);
         let fx = Arc::new(FxScope::new());
         // 闸关不可达：内部 scope 无 close 调用（任务随控制会话结束自终止）。
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             c.dispatch(&dest, MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) }).await;
         })
         .expect("internal FxScope is never closed");
@@ -210,7 +210,7 @@ impl PortalWorker {
 
         let hb_worker = Arc::clone(&worker);
         // 闸关不可达：内部 scope 无 close 调用（心跳 Execute 出错即停）。
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             loop {
                 tokio::time::sleep(PORTAL_HEARTBEAT_INTERVAL).await;
                 if hb_worker.heartbeat().await.is_err() {
@@ -404,7 +404,7 @@ impl BridgeWorker {
         let frame_server = Arc::clone(&server);
         // 闸关不可达：内部 scope 无 close 调用（循环随 carrier EOF 自终止）。
         me.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
                 monitor_h.abort();
@@ -555,7 +555,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         // 任务结束 drop → up_r EOF → mux session 收尾。
         // 闸关不可达：内部 scope 无 close 调用（任务随控制流 EOF 自终止）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 Self::handle_internal_conn(me, Box::new(dn_r)).await;
                 drop(up_w);
             })
@@ -585,7 +585,7 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let dispatcher = Arc::clone(&self.dispatcher);
         // 闸关不可达：内部 scope 无 close 调用（错误留痕后任务自终止）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 if let Err(e) = dispatcher
                     .dispatch_link_inbound(
                         &dest,

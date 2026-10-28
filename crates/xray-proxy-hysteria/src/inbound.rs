@@ -297,7 +297,7 @@ impl InboundHandler for HysteriaInboundHandler {
                     let stream_clone = Arc::clone(&stream);
                     let fx = Arc::clone(&fx_closures);
                     // 组件自持 FxScope 记账（B6）：TCP 会话任务，scope drop 兜底 abort。
-                    fx.spawn(async move {
+                    fx.spawn_tracked(async move {
                         if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
                             INBOUND_LOG
                                 .warn(format!("hysteria inbound tcp stream error error={e}"));
@@ -317,7 +317,7 @@ impl InboundHandler for HysteriaInboundHandler {
                     let disp = Arc::clone(&disp);
                     let fx = Arc::clone(&fx_closures);
                     // 组件自持 FxScope 记账（B6）：UDP 会话任务，scope drop 兜底 abort。
-                    fx.spawn(async move {
+                    fx.spawn_tracked(async move {
                         if let Err(e) = handle_udp_session(sess, disp).await {
                             INBOUND_LOG
                                 .warn(format!("hysteria inbound udp session error error={e}"));
@@ -358,7 +358,7 @@ impl InboundHandler for HysteriaInboundHandler {
         let fx = Arc::clone(&self.fx);
         // 组件自持 FxScope 记账（B6）：accept 任务，close() 仍显式 abort 语义。
         let accept_task = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 listener_clone.start(quic_clone).await;
                 INBOUND_LOG.info(format!("hysteria inbound listener started tag={tag}"));
             })

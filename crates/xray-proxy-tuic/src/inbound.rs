@@ -246,7 +246,7 @@ impl InboundHandler for TuicInboundHandler {
                 let t = tag.clone();
                 let dispatch = dispatch.clone();
                 let fx_task = Arc::clone(&fx);
-                fx.spawn(async move {
+                fx.spawn_tracked(async move {
                     if let Err(e) =
                         handle_connection(incoming, uuid, &pwd, dispatch, &fx_task).await
                     {
@@ -257,7 +257,8 @@ impl InboundHandler for TuicInboundHandler {
                 .expect("internal FxScope is never closed");
             }
         };
-        let accept_task = self.fx.spawn(accept_loop).expect("internal FxScope is never closed");
+        let accept_task =
+            self.fx.spawn_tracked(accept_loop).expect("internal FxScope is never closed");
 
         let mut slot = self.slot.lock().await;
         *slot = Some(InboundSlot { endpoint, _accept_task: accept_task });
@@ -388,7 +389,7 @@ async fn handle_bi_frame(
                     // B6（bd t975）：per-flow dispatch 任务经组件 scope 托管。
                     let fx_flow = Arc::clone(fx);
                     fx_flow
-                        .spawn(async move {
+                        .spawn_tracked(async move {
                             let _ = handler.dispatch(&dest, link).await;
                         })
                         .expect("internal FxScope is never closed");
@@ -403,7 +404,7 @@ async fn handle_bi_frame(
                 };
                 let fx_relay = Arc::clone(fx);
                 fx_relay
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
                         {
                             INBOUND_LOG.debug(format!("tuic relay {target}: {e:?}"));

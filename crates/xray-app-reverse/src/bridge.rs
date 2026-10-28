@@ -335,7 +335,7 @@ impl Bridge for RuntimeBridge {
         let workers = std::sync::Arc::clone(&self.workers);
         // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(BRIDGE_MONITOR_INTERVAL) => {}
@@ -436,7 +436,7 @@ impl Portal for RuntimePortal {
         let picker = std::sync::Arc::clone(&self.picker);
         // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(PICKER_CLEANUP_INTERVAL) => {}

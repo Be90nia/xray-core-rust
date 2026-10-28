@@ -74,7 +74,7 @@ impl DnsInbound {
         let run_timer = Arc::clone(&timer);
         let ticker = self
             .fx
-            .spawn(async move { run_timer.run().await })
+            .spawn_tracked(async move { run_timer.run().await })
             .expect("internal FxScope is never closed");
         let result = async {
             loop {

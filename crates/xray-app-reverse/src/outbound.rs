@@ -166,7 +166,7 @@ impl PortalOutbound {
         let inbound = reverse_mux_inbound(access);
         // 闸关不可达：内部 scope 无 close 调用（任务随 dispatch 会话结束自终止）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 worker
                     .client()
                     .dispatch_with_source(

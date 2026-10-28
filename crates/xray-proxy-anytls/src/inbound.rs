@@ -132,7 +132,7 @@ impl InboundHandler for AnytlsInboundHandler {
         // spawn 一个 keep-alive 任务，持有 server 句柄直到 close 被调用
         let accept_task = self
             .fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 // 该任务仅保持存活，实际 serve 逻辑在 MockServer 内部
                 // close 时通过 stop_tx 触发退出
                 INBOUND_LOG

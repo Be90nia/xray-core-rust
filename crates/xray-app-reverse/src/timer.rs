@@ -58,7 +58,7 @@ impl InactivityTimer {
         let fx = Arc::new(FxScope::new());
         let run_inner = Arc::clone(&inner);
         // 闸关不可达：内部 scope 无 close 调用（停机走 stop_rx 协作退出）。
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             // sliding window：deadline = 最近一次 update + 当前 timeout
             loop {
                 let timeout = *run_inner.timeout.read();

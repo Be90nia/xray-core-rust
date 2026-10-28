@@ -92,8 +92,8 @@ mod wiring_smoke_tests {
     /// A 类直用①：契约层效果句柄可构造（零依赖词汇继承可见）。
     #[test]
     fn udf_contract_vocabulary_inherited() {
-        let id = super::EffectId(42);
-        assert_eq!(id.0, 42);
+        let id = super::EffectId::new(42);
+        assert_eq!(id.get(), 42);
     }
 
     /// A 类直用②：池化契约（skeleton::pool::PoolManaged，零依赖）+ udf 随附

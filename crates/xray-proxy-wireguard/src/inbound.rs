@@ -197,7 +197,7 @@ impl WireguardInboundHandler {
                 _ = wg_accept_loop(netstack, registry, dispatch, fx) => {}
             }
         };
-        let handle = self.fx.spawn(main_task).expect("internal FxScope is never closed");
+        let handle = self.fx.spawn_tracked(main_task).expect("internal FxScope is never closed");
         *self.join.lock() = Some(handle);
         crate::WG_LOG
             .info(format!("wireguard inbound started tag={} port={}", self.tag, self.port));
@@ -284,7 +284,7 @@ async fn wg_accept_loop(
     // B6（bd t975）：sweep 定时任务经组件自持 scope 托管（与 accept loop 同生命周期）。
     let fx_sweep = Arc::clone(&fx);
     fx_sweep
-        .spawn(async move {
+        .spawn_tracked(async move {
             let mut tick = interval(Duration::from_secs(WG_UDP_SWEEP_SECS));
             tick.tick().await; // 跳过首个立即 tick（启动时全为新）
             loop {
@@ -344,7 +344,7 @@ async fn wg_accept_loop(
             };
             // spawn 中继 task（smoltcp socket ↔ duplex）——组件自持 FxScope
             // 记账（B6 t975），scope drop 兜底 abort。
-            fx.spawn(relay.run()).expect("internal FxScope is never closed");
+            fx.spawn_tracked(relay.run()).expect("internal FxScope is never closed");
 
             // spawn dispatch（link → outbound），挂 per-user 上下文
             // （Go server.go:352-364：GetUserByAddr(隧道内源) →
@@ -367,7 +367,7 @@ async fn wg_accept_loop(
             // B6（bd t975）：per-conn dispatch 任务经组件自持 scope 托管。
             let fx_dispatch = Arc::clone(&fx);
             fx_dispatch
-                .spawn(async move {
+                .spawn_tracked(async move {
                     dispatch.dispatch_with_access(&dest, link, access).await;
                 })
                 .expect("internal FxScope is never closed");
@@ -490,7 +490,7 @@ fn forward_wg_udp_datagram(
     let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
     // 组件自持 FxScope 记账（B6 t975）：UDP 快路 per-源会话任务（首包路径 spawn，
     // Go udp forwarder 语义），scope drop 兜底 abort。
-    fx.spawn(run_wg_udp_session(
+    fx.spawn_tracked(run_wg_udp_session(
         Arc::clone(dispatch),
         cmd_rx,
         Arc::clone(netstack),

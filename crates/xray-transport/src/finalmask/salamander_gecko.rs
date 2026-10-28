@@ -463,7 +463,7 @@ fn evict_oldest(state: &mut GeckoState) {
 fn spawn_gc_task(state: Arc<Mutex<GeckoState>>, scope: &FxScope) -> Spawned<()> {
     // 闸关不可达：scope 归 GeckoConn 独占，无 close 调用（abort 走 gc_abort）。
     scope
-        .spawn(async move {
+        .spawn_tracked(async move {
             let mut interval = tokio::time::interval(GECKO_GC_INTERVAL);
             interval.tick().await; // 跳过立即触发的首次
             loop {

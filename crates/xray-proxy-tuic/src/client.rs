@@ -376,7 +376,7 @@ impl TuicClient {
     pub fn start_heartbeat(self: &Arc<Self>, period: std::time::Duration) -> Spawned<()> {
         let client = Arc::clone(self);
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     tokio::time::sleep(period).await;
                     if let Err(e) = client.heartbeat().await {

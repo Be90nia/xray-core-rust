@@ -91,7 +91,7 @@ impl Shared {
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.fx.spawn(fut).expect("internal FxScope is never closed")
+        self.fx.spawn_tracked(fut).expect("internal FxScope is never closed")
     }
 
     /// dispatcher 是否应退出。

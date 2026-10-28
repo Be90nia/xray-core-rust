@@ -120,7 +120,7 @@ impl AnytlsMockServer {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let fx = Arc::new(FxScope::new());
         let join = fx
-            .spawn(serve_loop(
+            .spawn_tracked(serve_loop(
                 listener,
                 tls_acceptor,
                 dispatch,
@@ -156,7 +156,7 @@ async fn serve_loop(
                 let dispatch = dispatch.clone();
                 // 预制克隆传入 handle_conn：避免参数 move 与 spawn 接收者借用冲突（E0505）
                 let fx_conn = Arc::clone(&fx);
-                fx.spawn(handle_conn(
+                fx.spawn_tracked(handle_conn(
                     tcp,
                     tls_acceptor,
                     dispatch,
@@ -213,7 +213,7 @@ async fn handle_conn(
         },
     };
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
-    fx.spawn(async move {
+    fx.spawn_tracked(async move {
         if kill_rx.await.is_ok() {
             let _ = kill_sock.shutdown(std::net::Shutdown::Both);
         }
@@ -293,7 +293,7 @@ async fn handle_conn(
         let fx = Arc::clone(&fx_session);
         // fx 按 Arc 值移交（'static future；内部再借引用会随闭包局部悬垂）
         let fx_task = Arc::clone(&fx);
-        fx.spawn(handle_session(fx_task, session, dispatch, kill_tx, handshake_deadline))
+        fx.spawn_tracked(handle_session(fx_task, session, dispatch, kill_tx, handshake_deadline))
             .expect("internal FxScope is never closed");
     });
     let session = Arc::new(
@@ -323,7 +323,7 @@ async fn handle_conn(
     }
     // spawn run 循环——主循环结束后 session 自然清理
     let session_run = session.clone();
-    fx.spawn(async move {
+    fx.spawn_tracked(async move {
         let _ = session_run.run().await;
     })
     .expect("internal FxScope is never closed");
@@ -378,7 +378,7 @@ async fn handle_session(
         let (rd_half, wr_half) = tokio::io::split(client_io);
         // 组件自持 FxScope 记账（B6，app 家族同款）：session pump 随 handler
         // drop 兜底 abort；dispatch 关闭 writer 时 pump 亦随 duplex EOF 退出。
-        fx.spawn(pump_session_to_duplex(session.clone(), server_io))
+        fx.spawn_tracked(pump_session_to_duplex(session.clone(), server_io))
             .expect("internal FxScope is never closed");
         let reader = new_reader(InitialedReader::new(buf[consumed..n].to_vec(), rd_half));
         let writer = new_writer(wr_half);

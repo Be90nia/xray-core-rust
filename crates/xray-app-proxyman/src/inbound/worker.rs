@@ -325,7 +325,7 @@ impl TcpWorker {
         if self.closed.load(Ordering::SeqCst) {
             // 闸关不可达：内部 scope 无 close 调用（closed 走本短路，不关 scope）。
             // closed 短路：返回立即结束的占位句柄（无实际任务体）。
-            return self.fx.spawn(async {}).expect("internal FxScope is never closed");
+            return self.fx.spawn_tracked(async {}).expect("internal FxScope is never closed");
         }
 
         let tag = self.tag.clone();
@@ -352,7 +352,7 @@ impl TcpWorker {
         let timer_loop = Arc::clone(&activity_timer);
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 timer_loop.run().await;
             })
             .expect("internal FxScope is never closed");
@@ -367,7 +367,7 @@ impl TcpWorker {
 
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let inbound_conn = InboundConn::Tcp(tracked);
                 tokio::select! {
                     result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
@@ -655,7 +655,7 @@ impl UdpWorker {
         let close_notify = Arc::clone(&self.close_notify);
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let inbound_conn = InboundConn::Udp(session);
                 tokio::select! {
                     r = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher) => {
@@ -677,7 +677,7 @@ impl UdpWorker {
             let close_notify = Arc::clone(&self.close_notify);
             // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
             self.fx
-                .spawn(async move {
+                .spawn_tracked(async move {
                     let mut outbound_rx = outbound_rx;
                     loop {
                         tokio::select! {
@@ -772,7 +772,7 @@ impl Worker for UdpWorker {
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
         let recv_handle = self
             .fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     tokio::select! {
                         packet = rx.recv() => {
@@ -797,7 +797,7 @@ impl Worker for UdpWorker {
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
         let cleanup_handle = self
             .fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     tokio::select! {

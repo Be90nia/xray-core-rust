@@ -156,7 +156,7 @@ impl TuicMockServer {
             let pwd = password.clone();
             let fx_task = Arc::clone(&fx);
             self.fx
-                .spawn(async move {
+                .spawn_tracked(async move {
                     if let Err(e) = handle_connection(incoming, uuid, &pwd, &fx_task).await {
                         SERVER_LOG.warn(format!("tuic mock server connection error: {e:?}"));
                     }
@@ -267,7 +267,7 @@ async fn handle_bi_frame(
             // B6（bd t975）：per-flow relay 任务经组件自持 scope 托管。
             let fx_relay = Arc::clone(fx);
             fx_relay
-                .spawn(async move {
+                .spawn_tracked(async move {
                     if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
                         SERVER_LOG.debug(format!("tuic relay {target}: {e:?}"));
                     }
@@ -521,7 +521,7 @@ impl UdpAssocTable {
             let dispatcher = self.dispatcher.clone();
             // B6（bd t975）：per-assoc 会话任务经组件自持 scope 托管。
             self.fx
-                .spawn(udp_assoc_task(assoc_id, dispatcher, rx))
+                .spawn_tracked(udp_assoc_task(assoc_id, dispatcher, rx))
                 .expect("internal FxScope is never closed");
             tx
         });

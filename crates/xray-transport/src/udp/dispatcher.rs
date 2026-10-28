@@ -106,7 +106,7 @@ impl UdpDispatcher {
         let entries_clone = Arc::clone(&entries);
         // 闸关不可达：内部 scope 无 close 调用（停机走 close/超时清理循环自终止）。
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 Self::cleanup_loop(entries_clone).await;
             })
             .expect("internal FxScope is never closed");

@@ -214,7 +214,7 @@ fn spawn_session(
     // `Arc::ptr_eq` 防 close→新建同名 dest 后被旧 timer 误删（移除前 ptr 比对）。
     // 闸关不可达：scope 归 UdpRelay 独占，无 close 调用（停机走 close/timer 自回收）。
     let timer = scope
-        .spawn(async move {
+        .spawn_tracked(async move {
             loop {
                 let since = last_refresh.lock().elapsed();
                 if since >= idle_timeout {

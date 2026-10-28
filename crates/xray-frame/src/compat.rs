@@ -181,7 +181,7 @@ pub fn spawn<T>(fut: impl Future<Output = T> + Send + 'static) -> Result<Spawned
 where
     T: Send + 'static,
 {
-    spawn_scope().spawn(fut)
+    spawn_scope().spawn_tracked(fut)
 }
 
 #[cfg(test)]

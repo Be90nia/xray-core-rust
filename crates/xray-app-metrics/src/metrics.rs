@@ -455,7 +455,7 @@ impl MetricsHttpServer for TokioHttpServer {
         let fx = Arc::clone(&self.inner.fx);
         // 闸关不可达：内部 scope 无 close 调用（停机走 Notify + join 排空）。
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（join_next 分支），
                 // 不再 push 到共享 Vec——否则句柄簿记随抓取次数线性增长（票 fu4y）。
                 let mut conn_tasks = tokio::task::JoinSet::new();
@@ -493,7 +493,7 @@ impl MetricsHttpServer for TokioHttpServer {
         let fx = Arc::clone(&self.inner.fx);
         // 闸关不可达：内部 scope 无 close 调用（停机走 Notify + join 排空）。
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 // 每连接 task 由本 task 内的 JoinSet 持有：完成即收割（票 fu4y）
                 let mut conn_tasks = tokio::task::JoinSet::new();
                 loop {

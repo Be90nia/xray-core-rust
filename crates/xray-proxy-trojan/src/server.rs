@@ -166,7 +166,7 @@ impl InboundHandler for TrojanServer {
         // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
         let fx_conns = Arc::clone(&fx);
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     match listener_clone.accept().await {
                         Ok((stream, peer)) => {
@@ -174,7 +174,7 @@ impl InboundHandler for TrojanServer {
                             let validator = validator.clone();
                             let fallbacks = fallbacks.clone();
                             let fx = Arc::clone(&fx_conns);
-                            fx.spawn(async move {
+                            fx.spawn_tracked(async move {
                                 let mut recorder = RecordingStream {
                                     inner: stream,
                                     buf: Vec::with_capacity(256),

@@ -263,7 +263,7 @@ fn spawn_preconn_workers(
     for _ in 0..count {
         let config = Arc::clone(&config);
         let pool = Arc::clone(&pool);
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             loop {
                 match dial_server_conn(&config).await {
                     Ok(conn) => {

@@ -697,7 +697,7 @@ impl XUDPManager {
         // 闸关不可达：内部 scope 无 close 调用（Drop 显式 abort 清理任务）。
         let handle = self
             .fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
@@ -728,7 +728,7 @@ impl XUDPManager {
                     };
                     for (xudp, _id) in expired {
                         // 闸关不可达：同上（中断子任务随 scope 收口）。
-                        fx.spawn(async move {
+                        fx.spawn_tracked(async move {
                             xudp.interrupt().await;
                         })
                         .expect("internal FxScope is never closed");

@@ -157,7 +157,7 @@ impl UdpHub {
 
         // Spawn recv 循环。
         let recv_orig_dest = hub.recv_orig_dest;
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             match io {
                 Some(io) => {
                     start_recv_loop_masked(&io, tx, close_notify).await;

@@ -230,14 +230,14 @@ impl InboundHandler for HttpServer {
         // 任务内日志只持克隆门面（spawn 的 future 不得借用 self；socks 同款）。
         let log = self.log.clone();
         let handle = fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     match listener_clone.accept().await {
                         Ok((stream, peer)) => {
                             let tag = tag.clone();
                             let config = config.clone();
                             let fx = Arc::clone(&fx_conns);
-                            fx.spawn(async move {
+                            fx.spawn_tracked(async move {
                                 handle_connection(stream, config, tag, peer).await;
                             })
                             .expect("internal FxScope is never closed");

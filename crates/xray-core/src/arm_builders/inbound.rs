@@ -421,7 +421,7 @@ pub(crate) async fn build_dokodemo_inbound(
         let stop = shutdown_token.clone();
         let tcp_ctx = Arc::clone(&plugin_ctx);
         handles.push(
-            fx.spawn(async move {
+            fx.spawn_tracked(async move {
                 tokio::select! {
                     r = serve_dokodemo(listener, ohm_tcp, opts, tcp_ctx) => {
                         if let Err(e) = r {
@@ -458,7 +458,7 @@ pub(crate) async fn build_dokodemo_inbound(
         )
         .await?;
         handles.push(
-            fx.spawn(async move {
+            fx.spawn_tracked(async move {
                 tokio::select! {
                     r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, udp_ctx) => {
                         if let Err(e) = r {

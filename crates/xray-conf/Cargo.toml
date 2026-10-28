@@ -20,7 +20,7 @@ serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-udf-std-ext = { path = "../udf-frame/std-ext" }
+udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
 
 [dev-dependencies]
 # 3c 影子比对（票 xiuvr）：skeleton_infra::config::ConfigFile 对照旧装载路径。

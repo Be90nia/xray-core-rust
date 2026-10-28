@@ -201,7 +201,7 @@ impl BurstObserver {
         let executor_for_loop = executor.clone();
         let fx = Arc::clone(&self.fx);
         // 闸关不可达：内部 scope 无 close 调用（停机走 shutdown_rx 协作退出）。
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             let mut shutdown_rx = shutdown_rx;
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

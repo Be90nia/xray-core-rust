@@ -92,7 +92,7 @@ impl InboundHandler for FreedomInboundHandler {
         let fx = Arc::clone(&self.fx);
         // 预制克隆源：避免 async move 块自捕获 fx 与 spawn 接收者借用冲突（E0505）。
         let fx_conns = Arc::clone(&fx);
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             loop {
                 let (stream, _peer) = match listener.accept().await {
                     Ok(v) => v,
@@ -105,7 +105,7 @@ impl InboundHandler for FreedomInboundHandler {
                 let handler = Arc::clone(&handler);
                 let dest = dest.clone();
                 let fx = Arc::clone(&fx_conns);
-                fx.spawn(async move {
+                fx.spawn_tracked(async move {
                     use xray_buf::io::{new_reader, new_writer};
                     use xray_transport::link::Link;
                     let (read_half, write_half) = tokio::io::split(stream);

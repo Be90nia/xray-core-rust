@@ -70,7 +70,7 @@ impl ArmScope {
     where
         T: Send + 'static,
     {
-        self.fx.spawn(fut)
+        self.fx.spawn_tracked(fut)
     }
 
     /// accepting 闸读侧（true = 已关）。
@@ -140,7 +140,7 @@ impl ConnScope {
         // 任务自身了结（不泄漏 in_flight 计数）。
         scope
             .fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let _parent = parent;
                 tokio::select! {
                     // biased：取消优先裁决（本 scope 先关 → 监视任务立即了结）。
@@ -167,7 +167,7 @@ impl ConnScope {
         T: Send + 'static,
     {
         let token = self.token.clone();
-        self.fx.spawn(async move { token.run_until_cancelled(fut).await })
+        self.fx.spawn_tracked(async move { token.run_until_cancelled(fut).await })
     }
 
     /// 取消令牌观察面（任务内携带判停）。

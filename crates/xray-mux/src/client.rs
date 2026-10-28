@@ -233,7 +233,7 @@ impl IncrementalWorkerPicker {
         let workers = Arc::downgrade(&self.workers);
         // 闸关不可达：内部 scope 无 close 调用（task 持 Weak，picker drop 后自退出）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 loop {
                     tokio::time::sleep(PICKER_CLEANUP_INTERVAL).await;
                     let Some(workers) = workers.upgrade() else {
@@ -322,7 +322,7 @@ impl ClientWorker {
         // 闸关不可达：内部 scope 无 close 调用（停机走 worker.close 协作面）。
         worker
             .fx
-            .spawn(async move { w.monitor().await })
+            .spawn_tracked(async move { w.monitor().await })
             .expect("internal FxScope is never closed");
 
         worker
@@ -866,7 +866,7 @@ impl ClientWorkerFactory for DialingWorkerFactory {
         let w = Arc::clone(&worker);
         // 闸关不可达：内部 scope 无 close 调用（任务随 carrier 断开/worker 关闭自终止）。
         self.fx
-            .spawn(async move {
+            .spawn_tracked(async move {
                 let done = w.done_rx();
                 tokio::select! {
                     // carrier 结束（underlying.dispatch 返回）→ Go client.go:164 c.Close()

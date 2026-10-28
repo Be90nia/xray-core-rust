@@ -512,7 +512,7 @@ impl WgDriver {
         };
         let handle = self
             .fx
-            .spawn(main_task)
+            .spawn_tracked(main_task)
             .map_err(|e| WgError::Driver(format!("wg driver scope closed: {e}")))?;
         Ok(handle)
     }
@@ -555,7 +555,7 @@ impl WgDriver {
                 // driver 自持 FxScope（B6 t975）：主循环内部任务同 scope 记账，
                 // scope drop（driver 释放）兜底 abort。
                 self.fx
-                    .spawn(async move {
+                    .spawn_tracked(async move {
                         direct_read_loop(sock, tx, &mut shut).await;
                     })
                     .expect("driver scope is never closed (self-owned)");
@@ -570,7 +570,7 @@ impl WgDriver {
             let shut = shut_rx.clone();
             // driver 自持 FxScope（B6 t975）：worker 池同 scope 记账。
             self.fx
-                .spawn(async move {
+                .spawn_tracked(async move {
                     driver.worker_loop(rx, shut).await;
                 })
                 .expect("driver scope is never closed (self-owned)");

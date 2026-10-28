@@ -295,7 +295,7 @@ pub fn pull<S: CachedNameserver + 'static>(server: Arc<S>, fqdn: String, option:
     let server_name = cache.name.clone();
     let spawned = fx.map(|fx| {
         let task_fqdn = fqdn.clone();
-        fx.spawn(async move {
+        fx.spawn_tracked(async move {
             let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &task_fqdn, option))
                 .await;
         })
