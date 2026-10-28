@@ -73,6 +73,15 @@ impl Udpmask for UdphopConfig {
     }
 }
 
+/// 收包队列深度（bd sp1gi）。
+///
+/// Go `udpHopConn.readCh` 是**无缓冲** `chan packet`（`udphop/conn.go:90`）：`recv`
+/// 协程在 `readCh <- packet` 上阻塞直到 `ReadFrom` 取走，即用户态同时最多一包在途。
+/// tokio 有界 mpsc 最小容量 1 → 「一包排队 + 一包在途」≈ 2×`UDP_SIZE` 上界：
+/// 应用读慢时收包泵阻塞在 send、不再 drain socket，内核缓冲满后由内核丢包（与 Go
+/// 同款背压），用户态内存不随收包速率增长。
+const READ_QUEUE_DEPTH: usize = 1;
+
 /// 单个活跃 socket + 其收包转发任务（对应 Go 每个 dial 出的 conn 一个 recv 协程）。
 struct HopSocket {
     io: Arc<dyn UdpIo>,
@@ -91,7 +100,7 @@ struct HopCore {
 /// hop 任务与 UdpIo 实现共享的状态 + 配置快照。
 struct HopShared {
     core: Mutex<HopCore>,
-    tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+    tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     local: bool,
     remote: bool,
     remote_once: bool,
@@ -104,7 +113,7 @@ struct HopShared {
 /// udphop 连接（对应 Go `udpHopConn`，client-only）。
 pub struct UdpHopConn {
     shared: Arc<HopShared>,
-    rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
     /// hop 周期任务唯一托管口（坑约束 5）。scope 归 conn 独占、无 close 调用；
     /// Drop 随 conn 释放 abort（与原「存储 JoinHandle + Drop abort」等价收口）。
     #[allow(dead_code)]
@@ -113,7 +122,7 @@ pub struct UdpHopConn {
 
 impl UdpHopConn {
     fn new(raw: Box<dyn UdpIo>, cfg: &UdphopConfig) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(READ_QUEUE_DEPTH);
         let raw: Arc<dyn UdpIo> = Arc::from(raw);
         let cur = HopSocket { recv_task: spawn_forwarder(Arc::clone(&raw), tx.clone()), io: raw };
         let shared = Arc::new(HopShared {
@@ -259,11 +268,9 @@ async fn bind_unspecified(target: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 /// 单 socket 收包转发任务：所有包推入共享队列（对应 Go recv 协程 + readCh）。
+/// 队列满即阻塞 send（Go 在无缓冲 `readCh` 上阻塞同构，背压见 [`READ_QUEUE_DEPTH`]）；
 /// Err 退出 = 该 socket 被丢弃/关闭（每跳常规拆线），对应 Go recv 的 closed 分支。
-fn spawn_forwarder(
-    io: Arc<dyn UdpIo>,
-    tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
-) -> JoinHandle<()> {
+fn spawn_forwarder(io: Arc<dyn UdpIo>, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) -> JoinHandle<()> {
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面泵任务（socket 收包转发）；迁 FxScope 待 bd 39hko"
@@ -271,7 +278,11 @@ fn spawn_forwarder(
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];
         while let Ok((n, addr)) = io.recv_from(&mut buf).await {
-            if tx.send((buf[..n].to_vec(), addr)).is_err() {
+            // shortcut: 每包一次堆分配（Go 用 sync.Pool 复用 UDPSize 缓冲）。
+            // `UdpIo::recv_from(&mut [u8])` 要求拷进 caller 缓冲，中间持有物只能
+            // 是自有缓冲；条数已被队列深度限住（有界），去掉分配需引入回收入口。
+            let pkt = buf[..n].to_vec();
+            if tx.send((pkt, addr)).await.is_err() {
                 break; // 接收端已关闭（连接丢弃）
             }
         }
@@ -484,5 +495,69 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), roundtrip)
             .await
             .expect("udphop remoteOnce roundtrip should complete well under 10s");
+    }
+
+    /// 高速灌入 + 应用不读：收包泵必须被有界队列阻塞，用户态只留一包（bd sp1gi）。
+    ///
+    /// 判别器：假 `UdpIo` 即时无限产出（等价内核缓冲永不满），无界队列下计数器会
+    /// 一路涨到 `LIMIT`；有界队列下收包泵停在 send 上，计数停在绝对上界 2。
+    #[tokio::test]
+    async fn slow_consumer_bounds_read_queue() {
+        use std::{
+            future,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        struct FloodIo {
+            yielded: Arc<AtomicUsize>,
+            limit: usize,
+            addr: SocketAddr,
+        }
+
+        #[async_trait]
+        impl UdpIo for FloodIo {
+            async fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                if self.yielded.fetch_add(1, Ordering::Relaxed) >= self.limit {
+                    // 模拟 socket 不再产出：永久挂起（无界实现的兜底上限）。
+                    future::pending::<()>().await;
+                }
+                tokio::task::yield_now().await; // 无 IO 的假 socket 必须让出执行权
+                let n = 64.min(buf.len());
+                buf[..n].fill(0xAB);
+                Ok((n, self.addr))
+            }
+
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                Ok(self.addr)
+            }
+        }
+
+        const LIMIT: usize = 10_000;
+        let yielded = Arc::new(AtomicUsize::new(0));
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let io: Arc<dyn UdpIo> =
+            Arc::new(FloodIo { yielded: Arc::clone(&yielded), limit: LIMIT, addr });
+        let (tx, mut rx) = mpsc::channel(READ_QUEUE_DEPTH);
+        let task = spawn_forwarder(io, tx.clone());
+
+        // 应用侧（rx）刻意不读，只放收包泵跑一会。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let taken = yielded.load(Ordering::Relaxed);
+        // 绝对上界（不随实现常量放大）：一包排队 + 一包卡在 send 上 = 2。
+        assert!(
+            taken <= 2,
+            "慢消费者下收包泵必须被阻塞：已取 {taken} 包（上界 2，无界兜底上限 {LIMIT}）"
+        );
+        assert_eq!(tx.max_capacity(), READ_QUEUE_DEPTH, "队列深度必须是有界常量");
+        let mut queued = 0usize;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert!((1..=2).contains(&queued), "用户态排队包数超界（≤2）: {queued}");
+        task.abort();
     }
 }

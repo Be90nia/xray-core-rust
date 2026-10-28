@@ -61,6 +61,20 @@ const PACKET_CHANNEL: &str = "xmc:data";
 const MAX_PACKET_DATA: usize = 24 * 1024;
 const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(15);
 
+/// 编码泵 → 加密写泵队列深度（bd f0j08）。
+///
+/// Go `packetStream.Write` 在 `writeMu` 下**同步**写（`packet_stream.go:103-127`），
+/// 队列深度为 0、一次只有一包在途；tokio 有界 mpsc 最小容量 1，等价「一包在途 +
+/// 一包排队」= 每连接最多 2×24KiB 用户态缓冲。队列满时编码泵阻塞在
+/// [`mpsc::Sender::send`]，其上游 `pipe_r.read` 随即停读 → DuplexStream 8KiB
+/// 缓冲填满 → 代理写方 `write_all` 阻塞（背压传导），慢 peer 下不再堆积。
+const PIPE_QUEUE_DEPTH: usize = 1;
+
+/// 数据面发送队列（深度与理由见 [`PIPE_QUEUE_DEPTH`]）。
+fn packet_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    mpsc::channel(PIPE_QUEUE_DEPTH)
+}
+
 /// nextState=1 status 探测的伪装应答原文（vanilla 26.1.2 服务端原文，对应 Go
 /// `server.go` `statusResponse`——单包主动探测不可区分 vanilla MC）。
 const STATUS_RESPONSE: &str = r#"{"description":"A Minecraft Server","players":{"max":20,"online":0},"version":{"name":"26.1.2","protocol":775},"enforcesSecureChat":true}"#;
@@ -613,6 +627,33 @@ async fn handshake_phase(
     }
 }
 
+/// pipe → raw 分块编码泵：代理字节读出，≤24KiB 分块装进 xmc:data custom payload
+/// 包（对应 Go packetStream.Write）。队列满即阻塞读（背压，见 [`PIPE_QUEUE_DEPTH`]）。
+async fn run_encode_pump<R: AsyncRead + Unpin>(
+    mut pipe_r: R,
+    tx: mpsc::Sender<Vec<u8>>,
+    local_cp_id: i32,
+) {
+    let mut buf = vec![0u8; MAX_PACKET_DATA];
+    loop {
+        match pipe_r.read(&mut buf).await {
+            Ok(0) => break,
+            Err(e) => {
+                crate::hot_log!(DEBUG, "error={e} xmc bridge proxy-side read failed");
+                break;
+            },
+            Ok(n) => match encode_custom_payload(local_cp_id, &buf[..n]) {
+                Ok(pkt) => {
+                    if tx.send(pkt).await.is_err() {
+                        break;
+                    }
+                },
+                Err(_) => break,
+            },
+        }
+    }
+}
+
 /// TCP bridge task：握手 + padding（2 分钟 deadline），随后进入 packetStream 数据面。
 pub(super) async fn tcp_bridge(
     raw: DynIo,
@@ -631,7 +672,7 @@ pub(super) async fn tcp_bridge(
         },
     };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = packet_channel();
 
     // 唯一写者任务：明文 MC 包字节 → CFB8 加密 → raw（对应 Go cryptoStream 写侧）。
     #[allow(
@@ -659,7 +700,7 @@ pub(super) async fn tcp_bridge(
         CONFIGURATION_SERVERBOUND_CUSTOM_PAYLOAD
     };
 
-    let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
+    let (pipe_r, mut pipe_w) = tokio::io::split(pipe);
 
     // pipe → raw：代理字节读出，≤24KiB 分块装进 xmc:data custom payload 包
     // （对应 Go packetStream.Write）。
@@ -670,24 +711,7 @@ pub(super) async fn tcp_bridge(
         reason = "数据面泵任务（pipe→raw 分块编码泵）；迁 FxScope 待 bd 39hko"
     )]
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_PACKET_DATA];
-        loop {
-            match pipe_r.read(&mut buf).await {
-                Ok(0) => break,
-                Err(e) => {
-                    crate::hot_log!(DEBUG, "error={e} xmc bridge proxy-side read failed");
-                    break;
-                },
-                Ok(n) => match encode_custom_payload(local_cp_id, &buf[..n]) {
-                    Ok(pkt) => {
-                        if tx_data.send(pkt).is_err() {
-                            break;
-                        }
-                    },
-                    Err(_) => break,
-                },
-            }
-        }
+        run_encode_pump(pipe_r, tx_data, local_cp_id).await;
     });
 
     // raw → pipe：解密读 MC 包循环，xmc:data payload 写回 pipe（对应 Go
@@ -725,10 +749,11 @@ pub(super) async fn tcp_bridge(
                     break;
                 }
             } else if id == CONFIGURATION_KEEP_ALIVE && is_client {
-                // 客户端收到 keep alive 原样回写（对应 Go packetStream.Read 回显）。
+                // 客户端收到 keep alive 原样回写（对应 Go packetStream.Read 回显；
+                // 队列满时等待，与 Go 在 writeMu 上阻塞同构）。
                 match encode_packet(CONFIGURATION_KEEP_ALIVE, &data) {
                     Ok(pkt) => {
-                        if tx.send(pkt).is_err() {
+                        if tx.send(pkt).await.is_err() {
                             break;
                         }
                     },
@@ -756,7 +781,7 @@ pub(super) async fn tcp_bridge(
                 }
                 match encode_packet(CONFIGURATION_KEEP_ALIVE, &p) {
                     Ok(pkt) => {
-                        if tx.send(pkt).is_err() {
+                        if tx.send(pkt).await.is_err() {
                             break;
                         }
                     },
@@ -848,9 +873,10 @@ mod tests {
             .expect("full pipeline should complete well under 2 minutes");
     }
 
-    /// 写方向不饿死（bd hjkf 同族复核）：xmc 数据面本就是「每方向各自独立 task +
-    /// 无界通道」，app 不读时回程只堆在回程 task 里，不传染写方向——无需改造成
-    /// fragment 的 spawn 形态。阶梯 16K/64K/256K/512K 写-后-读。
+    /// 写方向不饿死（bd hjkf 同族复核）：xmc 数据面是「每方向各自独立 task +
+    /// 写方向有界队列（深度见 [`PIPE_QUEUE_DEPTH`]）」，app 不读时回程只堆在回程
+    /// task 里，不传染写方向——无需改造成 fragment 的 spawn 形态。阶梯
+    /// 16K/64K/256K/512K 写-后-读。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_side_survives_unread_echo_ladder() {
         let config = test_config();
@@ -881,6 +907,41 @@ mod tests {
                 .expect("echo read ok");
             assert_eq!(got, payload, "{size}B: echo corrupted");
         }
+    }
+
+    /// 慢 peer（下游不读）时编码泵被背压阻塞、用户态缓冲有界（bd f0j08）。
+    ///
+    /// 判别器：无界队列会把 1MiB 全吞进队列（`write_all` 不阻塞即返回）；有界队列
+    /// 只容 ~2 包在途，其余字节留在 pipe 里 → `write_all` 必须阻塞。
+    #[tokio::test]
+    async fn encode_pump_backpressures_on_slow_consumer() {
+        let (mut pipe_w, pipe_r) = tokio::io::duplex(UDP_SIZE * 2);
+        let (tx, mut rx) = packet_channel();
+        #[allow(clippy::disallowed_methods, reason = "测试：xmc 编码泵任务")]
+        let pump = tokio::spawn(run_encode_pump(
+            pipe_r,
+            tx.clone(),
+            CONFIGURATION_SERVERBOUND_CUSTOM_PAYLOAD,
+        ));
+
+        // 下游永不读：1MiB 远超 pipe 缓冲（2×UDP_SIZE）+ 队列容量。
+        let payload = vec![0u8; 1 << 20];
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(300), pipe_w.write_all(&payload)).await;
+        assert!(
+            blocked.is_err(),
+            "慢 peer 下 writer 必须被阻塞（有界队列背压）；实际无阻塞吞下 1MiB"
+        );
+
+        assert_eq!(tx.max_capacity(), PIPE_QUEUE_DEPTH, "队列深度必须是有界常量");
+        assert_eq!(tx.capacity(), 0, "队列应已饱和（无可再塞槽位）");
+        let mut queued = 0usize;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        // 绝对上界（不随实现常量放大）：一包排队 + 一包在途 = 2。
+        assert!((1..=2).contains(&queued), "用户态排队包数超界（≤2）：{queued}");
+        pump.abort();
     }
 
     /// 恒时比较语义锁：相等 true / 等长异字节 false / 长度不等 false（对应 Go
