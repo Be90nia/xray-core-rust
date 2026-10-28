@@ -5,14 +5,20 @@
 //! # 门控
 //!
 //! `ENABLED`（私有）由 xray-cli `alloc_stats::init()` 按 `XRAY_ALLOC_STATS_SITES` 置位。
-//! 未启用时 `enter` 直通（不触碰 TLS、不返回需恢复的守卫），alloc 钩子在
-//! COUNTING 分支短路——默认零记账开销（对齐 alloc_stats 直通纪律）。
+//! 未启用时 `enter` 直通（不触碰 TLS、不返回需恢复的守卫）、`scope` 只多一层
+//! no-op 守卫，alloc 钩子在 COUNTING 分支短路——默认零记账开销（对齐 alloc_stats
+//! 直通纪律）。
 //!
-//! # 线程局部语义（限制）
+//! # 线程局部语义 与 `scope`（未来域）
 //!
-//! 站点标记是**线程局部**的：async 任务跨 `.await`/跨线程移动后标记不跟随，
-//! 只归集守卫存活期间在当前线程上的同步分配。写路径（poll_write/poll_next）
-//! 是无 `.await` 的 poll 段，语义精确成立；跨线程聚合归"未标记"桶。
+//! [`enter`] 的标记是**线程局部**的，只在同一个 poll 段内成立（`poll_read`/
+//! `poll_write` 这类同步 poll 函数用它是精确的）。跨 `.await` 用 [`enter`] 则
+//! 标记留在取值时的线程：任务被调度到别的线程续跑后站点丢失（分配归"未标记"），
+//! 且原线程留下永久残留——bd a65px 实证：桥层 `read_downlink` 的 `BUF_READ`
+//! 因此把 cli 侧 99.8% 的分配吃掉，站点分布是假的。
+//!
+//! 跨 `.await` 一律用 [`scope`]：站点随 future 走，每次 poll 现取现放，跨线程
+//! 续跑仍归对站点，poll 之间不驻留线程局部。
 //!
 //! # udf 判定
 // udf-promotion-candidate: 提炼条件=零 xray 具体类型（本文件已满足：纯进程级
@@ -20,6 +26,8 @@
 
 use std::{
     cell::Cell,
+    future::{Future, poll_fn},
+    pin::pin,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -119,7 +127,7 @@ impl Drop for SiteGuard {
     }
 }
 
-/// 进入站点作用域。典型用法（poll 段内，无 `.await`）：
+/// 进入站点作用域。仅限**同一个 poll 段**（无 `.await`）：
 ///
 /// ```ignore
 /// fn poll_write(...) {
@@ -135,9 +143,40 @@ pub fn enter(site: u8) -> SiteGuard {
     SiteGuard(Some(prev))
 }
 
+/// 未来域站点作用域：站点在**每次 poll 期间**生效（bd a65px）。
+///
+/// [`enter`] 的标记是线程局部的，跨 `.await` 会把标记留在取值时的线程——tokio
+/// 把任务挂到别的线程续跑后站点丢失，原线程则永久残留。本函数把站点带进
+/// future 的 poll 段：每次 poll 现取现放，跨线程续跑仍归对站点，poll 之间无线程
+/// 局部驻留。
+///
+/// 用法（守卫需要覆盖 `.await` 时一律用它）：
+///
+/// ```ignore
+/// async fn read_downlink(r: &mut dyn Reader) -> Result<MultiBuffer> {
+///     xray_common::alloc_site::scope(BUF_READ, r.read_multi_buffer()).await
+/// }
+/// ```
+///
+/// 单次、不跨 `.await` 的 poll 段（`poll_read`/`poll_write` 等）仍用 [`enter`]：
+/// 少一层包装，且守卫随 poll 调用自然复原。
+pub async fn scope<F: Future>(site: u8, fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    // 守卫在闭包内取放：poll 返回（含 panic 展开）即复原，不跨 poll 边界留存。
+    poll_fn(move |cx| {
+        let _g = enter(site);
+        fut.as_mut().poll(cx)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        pin::Pin,
+        sync::Mutex,
+        task::{Context, Poll, Waker},
+    };
 
     use super::*;
 
@@ -217,5 +256,82 @@ mod tests {
         );
         // NONE 位恒不记账。
         assert_eq!(after[NONE as usize].n, 0);
+    }
+
+    /// 让出点：首次 poll 返回 Pending 并自唤醒，再次 poll 通过。
+    ///
+    /// 手动 poll（不经 tokio）以便把"续跑线程"钉死在别的线程——这是 tokio
+    /// 把 Pending 任务挂到其他 worker 的等价复现，且不带调度随机性。
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut(); // YieldOnce: Unpin（bool）
+            if this.0 {
+                return Poll::Ready(());
+            }
+            this.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    /// 模型化统计分配器钩子（与 xray-cli `StatsAlloc::alloc` 同形）：读当前
+    /// 线程站点 → 记到该站点。迁移线程上读到 NONE 就是站点丢失。
+    fn alloc_like_hook() {
+        let site = current();
+        if site != NONE {
+            record(site, 1, 0);
+        }
+    }
+
+    /// bd a65px 回归：两个并发任务各带不同站点、途中让出、再换线程续跑。
+    /// 两处断言都是判别式——旧写法（`enter` 后 `.await`）都会红：
+    /// ①poll 之间原线程残留标记（后续同线程分配被串到该站点）；
+    /// ②续跑线程上站点丢失（`current()` 读到 NONE，归因静默丢弃）。
+    #[test]
+    fn scope_keeps_sites_apart_across_threads() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _on = EnabledGuard::set();
+        let before = snapshot();
+
+        let mut a = std::pin::pin!(scope(TLS_WRITE, async {
+            alloc_like_hook();
+            YieldOnce(false).await;
+            alloc_like_hook();
+        }));
+        let mut b = std::pin::pin!(scope(XHTTP_SRV_SEND, async {
+            alloc_like_hook();
+            YieldOnce(false).await;
+            alloc_like_hook();
+        }));
+
+        let mut cx = Context::from_waker(Waker::noop());
+
+        // 线程 1：两任务各 poll 一次，都停在让出点。
+        assert!(a.as_mut().poll(&mut cx).is_pending());
+        assert!(b.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(current(), NONE, "poll 之间不得残留站点标记");
+
+        // 线程 2：两任务迁到这里续跑完（模拟 tokio 任务换 worker）。
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                // Context 非 Send，须在续跑线程本地构造。
+                let mut cx = Context::from_waker(Waker::noop());
+                assert_eq!(current(), NONE, "续跑线程起始无站点标记");
+                assert!(a.as_mut().poll(&mut cx).is_ready());
+                assert_eq!(current(), NONE, "poll 结束后不得残留站点标记");
+                assert!(b.as_mut().poll(&mut cx).is_ready());
+                assert_eq!(current(), NONE, "poll 结束后不得残留站点标记");
+            });
+        });
+
+        // 归因计数不串：两站点各 2 次，一次都没落到"未标记"桶。
+        let after = snapshot();
+        assert_eq!(after[TLS_WRITE as usize].n, before[TLS_WRITE as usize].n + 2);
+        assert_eq!(after[XHTTP_SRV_SEND as usize].n, before[XHTTP_SRV_SEND as usize].n + 2);
+        assert_eq!(after[NONE as usize].n, before[NONE as usize].n);
     }
 }
