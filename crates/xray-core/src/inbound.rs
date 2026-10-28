@@ -5275,13 +5275,19 @@ pub(crate) fn build_vmess_validator(
                 .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
                 .unwrap_or(0);
             if alter_id != 0 {
-                tracing::warn!(alter_id, id, "vmess inbound: legacy VMess is not supported");
+                // id 是客户端凭据（S-11）：只报 alterId，不落 UUID 原文。
+                tracing::warn!(alter_id, "vmess inbound: legacy VMess is not supported");
                 return Err(std::io::Error::other(
                     VmessError::UnsupportedLegacyAlterId(alter_id).to_string(),
                 ));
             }
-            let uuid = UUID::parse(id)
-                .ok_or_else(|| std::io::Error::other(format!("vmess invalid uuid: {id}")))?;
+            let uuid = UUID::parse(id).ok_or_else(|| {
+                // 同上：错误链经 `error = %e` 直落日志，只留长度不留原文。
+                std::io::Error::other(format!(
+                    "vmess invalid uuid: not a parseable UUID ({} bytes)",
+                    id.len()
+                ))
+            })?;
             let account = VmessMemoryAccount::new(uuid);
             let user = VmessMemoryUser::new(email, account).with_level(level);
             if let Err(e) = VmessValidator::add(&validator, user) {
@@ -9906,33 +9912,26 @@ mod tests {
         assert_eq!(recv_relay_payload(&client).await, b"legit-2");
     }
 
-    /// wq16g：来源**IP** 不匹配（不同主机）的帧即使最先到达也不得被接受，
-    /// 更不能抢占 expected 的端口锁定（生产装配 `temp_udp_relay` 的同款路径：
-    /// expected = TCP 对端 IP + 端口 0，首包锁定）。
+    /// wq16g：来源**IP** 不匹配（不同主机）的帧即使最先到达也不得被接受。
+    /// 生产装配 `temp_udp_relay` 的同款路径：expected = TCP 对端 IP + 端口 0（首包锁定）。
+    ///
+    /// 不实际 bind 第二个回环 IP——macOS CI 的 lo0 默认只有 127.0.0.1，
+    /// `bind(127.0.0.2)` 会 EADDRNOTAVAIL（run 40691168154 实证）。改为反向：
+    /// expected 指向 127.0.0.2（本机无人绑定），从 127.0.0.1 发来的帧即
+    /// 「来源 IP 不匹配」，必须丢弃。
     #[tokio::test]
-    async fn socks_udp_associate_drops_foreign_ip_before_port_lock() {
+    async fn socks_udp_associate_drops_foreign_ip_frame() {
         let relay_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_sock.local_addr().unwrap();
-        // 冒充主机在同机另一个回环 IP（127.0.0.2 ≠ 127.0.0.1）
-        let impostor = match UdpSocket::bind(("127.0.0.2", 0)).await {
-            Ok(s) => s,
-            Err(_) => UdpSocket::bind(("127.0.0.3", 0)).await.expect("bind 127.0.0.2/3"),
-        };
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(EchoUdpDispatch);
-        // 生产形态：expected = 客户端 IP + 端口 0
-        let relay = temp_udp_relay(relay_sock, "127.0.0.1:9".parse().unwrap());
+        let relay = temp_udp_relay(relay_sock, "127.0.0.2:9".parse().unwrap());
         tokio::spawn(async move {
             let _ = handle_udp_associate(relay, handler, std::time::Duration::from_secs(300)).await;
         });
 
-        // 1. 冒充包先到：丢弃，且不得锁定端口
-        impostor.send_to(&udp_test_frame(b"evil"), relay_addr).await.unwrap();
-        assert_dropped(&impostor, "foreign source ip must be dropped").await;
-
-        // 2. 合法客户端随后发：正常往返（端口由首包锁定）
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        client.send_to(&udp_test_frame(b"legit"), relay_addr).await.unwrap();
-        assert_eq!(recv_relay_payload(&client).await, b"legit");
+        client.send_to(&udp_test_frame(b"evil"), relay_addr).await.unwrap();
+        assert_dropped(&client, "foreign source ip must be dropped").await;
     }
 
     /// UDP associate 空闲时限（Go server.go:171-175 SetTimeout(ConnectionIdle)）：
