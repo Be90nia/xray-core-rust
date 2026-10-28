@@ -38,6 +38,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **栈足迹回归**（W5 发现，W4 扩面复核）：`BudgetDeadline::timeout`（**async-fn 形态**）在巨型 future 内加厚栈帧 → `vmess_inbound_udp_relay_e2e` 确定性 `STATUS_STACK_OVERFLOW`（HEAD 版 PASS，三步单变量取证）；改**构造式** `deadline::timeout(fut, remaining())`（具名 `Timeout<F>`，与裸调用同体积）；vmess 3 + vless 5 + core UDP relay 4 处统一。框架结论：**构造式 = 默认正确形态，async-fn = 便利形态有栈代价**
 - **红线门对别名隐形**：受控入口若用 `use ... as` 别名调用，字面量扫描门得到空集合直接放过（整个文件对门不可见）→ 改全路径调用
 - **W6 fmt 漏跑**（`5baf33cd`）：PM 验收漏跑 fmt 门导致已入库文件带 3 处 rustfmt 差异（CI fmt 会红），补修
+- **三处静默失效**（bd `kyy50`）：①生产 `tracing` 订阅者此前是裸 `fmt()`——`mask_secrets` 只在 udf `ChannelRegistry::emit` 一处生效，裸 `tracing::*!`（`inbound.rs` 单文件 629 处匹配）连同 `LogFacade`（secrets 表为空）/`HotLog` 的 tracing 通道全部**绕过掩码**；改为 `MaskingMakeWriter` 逐行掩码 + `xray_common::log::set_secrets` 一次写两处（通道表与 tracing 快照同源），`log::mask_text` 空表零分配透传。②`SystemPolicy.buffer` 在 Go proto 中不存在、全仓无消费点（"gRPC 设了静默无效"）：`Manager::new` 装配期拒启并指明受支持的 `levels.<n>.bufferSize`。③`tcpKeepAliveIdle/-Interval` 负值被 `as_u64()` 吞成 `None`（关 keepalive 的配置静默变成 45s 默认探测）：改有符号解析——任一为负 = 关 keepalive（Go `Enable=false`），符号相反 = 装配期硬错（Go `system_dialer.go:111`）。附带修掉 vmess legacy 告警/错误链里的 UUID 原文（S-11）
 - `Cargo.lock` 漏带（`073870b5`）：C-R2 的 kcp 依赖边未随 commit 入库，补齐（干净检出可构建）
 
 ### Docs

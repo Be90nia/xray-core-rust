@@ -263,6 +263,16 @@ impl StreamSettings {
                 }
             }
         }
+        // Go system_dialer.go:111 / system_listener.go:93：idle×interval<0 硬错
+        // （一个关、一个开是自相矛盾配置）。负值本身合法=关 keepalive（bd kyy50）。
+        let ka_idle = obj.get("tcpKeepAliveIdle").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ka_interval = obj.get("tcpKeepAliveInterval").and_then(|v| v.as_i64()).unwrap_or(0);
+        if ka_idle != 0 && ka_interval != 0 && (ka_idle < 0) != (ka_interval < 0) {
+            return Err(std::io::Error::other(format!(
+                "sockopt: invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: \
+                 {ka_idle} {ka_interval}"
+            )));
+        }
         Ok(())
     }
 
@@ -293,11 +303,24 @@ impl StreamSettings {
         if let Some(v) = obj.get("tcpFastOpen") {
             opts.tcp_fast_open = v.as_bool().unwrap_or_else(|| v.as_i64().is_some_and(|n| n > 0));
         }
-        if let Some(v) = obj.get("tcpKeepAliveInterval").and_then(|v| v.as_u64()) {
-            opts.tcp_keepalive_interval = std::time::Duration::from_secs(v);
-        }
-        if let Some(v) = obj.get("tcpKeepAliveIdle").and_then(|v| v.as_u64()) {
-            opts.tcp_keepalive_idle = std::time::Duration::from_secs(v);
+        // Go system_dialer.go:110-125：idle/interval 任一为负 = 关闭 keepalive
+        // （Chrome 45s 缺省不套用，`keepAliveConfig.Enable=false`）；两者符号相反
+        // = Go 硬错，装配期 [`Self::validate_sockopt_json`] 已拒。此前用
+        // `as_u64()` 把 -1 静默吞成 None，"关 keepalive" 的配置变成什么都不做
+        // （bd kyy50），保底仍是 45s 探测。
+        let ka_idle = obj.get("tcpKeepAliveIdle").and_then(|v| v.as_i64());
+        let ka_interval = obj.get("tcpKeepAliveInterval").and_then(|v| v.as_i64());
+        if ka_idle.is_some_and(|v| v < 0) || ka_interval.is_some_and(|v| v < 0) {
+            // 双零 = `set_keepalive_config` 直接 no-op，即 Go `Enable: false`。
+            opts.tcp_keepalive_idle = std::time::Duration::ZERO;
+            opts.tcp_keepalive_interval = std::time::Duration::ZERO;
+        } else {
+            if let Some(v) = ka_idle {
+                opts.tcp_keepalive_idle = std::time::Duration::from_secs(v as u64);
+            }
+            if let Some(v) = ka_interval {
+                opts.tcp_keepalive_interval = std::time::Duration::from_secs(v as u64);
+            }
         }
         // MPTCP（bd 6tl，Go `SocketConfig.TcpMptcp` 字段 19，JSON `tcpMptcp`）。
         if let Some(v) = obj.get("tcpMptcp").and_then(|v| v.as_bool()) {
@@ -846,6 +869,51 @@ mod transport_cache_tests {
             let mut s = StreamSettings::tcp();
             s.sockopt_json = Some(serde_json::json!({ "tcpFastOpen": off }));
             assert!(!s.socket_options().tcp_fast_open, "tfo={off} must disable");
+        }
+    }
+
+    /// bd kyy50：Go `tcpKeepAliveIdle/-Interval < 0` = 关闭 keepalive
+    /// （system_dialer.go:114-117 `Enable=false`）。此前 `as_u64()` 把 -1 静默吞成
+    /// None → 配置变成"什么都不做"，仍按 Chrome 45s 缺省探测。修后两字段归零
+    /// （[`set_keepalive_config`] 双零直接 no-op = 不设 SO_KEEPALIVE）。
+    #[test]
+    fn socket_options_negative_keepalive_disables_keepalive() {
+        use super::StreamSettings;
+        for json in [
+            serde_json::json!({ "tcpKeepAliveIdle": -1 }),
+            serde_json::json!({ "tcpKeepAliveInterval": -1 }),
+            serde_json::json!({ "tcpKeepAliveIdle": -1, "tcpKeepAliveInterval": 0 }),
+            serde_json::json!({ "tcpKeepAliveIdle": -1, "tcpKeepAliveInterval": -1 }),
+        ] {
+            let mut s = StreamSettings::tcp();
+            s.sockopt_json = Some(json.clone());
+            // 纯负/零组合不是 Go 的硬错面（idle×interval==0）。
+            StreamSettings::validate_sockopt_json(s.sockopt_json.as_ref())
+                .expect("negative-or-zero keepalive is legal");
+            let o = s.socket_options();
+            assert_eq!(o.tcp_keepalive_idle, std::time::Duration::ZERO, "json={json}");
+            assert_eq!(o.tcp_keepalive_interval, std::time::Duration::ZERO, "json={json}");
+        }
+    }
+
+    /// bd kyy50：Go `system_dialer.go:111` idle×interval<0 硬错（一关一开自相矛盾）。
+    #[test]
+    fn validate_sockopt_json_rejects_mixed_sign_keepalive() {
+        use super::StreamSettings;
+        for json in [
+            serde_json::json!({ "tcpKeepAliveIdle": -1, "tcpKeepAliveInterval": 30 }),
+            serde_json::json!({ "tcpKeepAliveIdle": 30, "tcpKeepAliveInterval": -1 }),
+        ] {
+            let err = StreamSettings::validate_sockopt_json(Some(&json))
+                .expect_err("mixed-sign keepalive must reject");
+            assert!(err.to_string().contains("TcpKeepAliveIdle"), "json={json} err={err}");
+        }
+        for json in [
+            serde_json::json!({ "tcpKeepAliveIdle": -1, "tcpKeepAliveInterval": 0 }),
+            serde_json::json!({ "tcpKeepAliveIdle": -1, "tcpKeepAliveInterval": -1 }),
+            serde_json::json!({ "tcpKeepAliveIdle": 60, "tcpKeepAliveInterval": 30 }),
+        ] {
+            StreamSettings::validate_sockopt_json(Some(&json)).expect("legal keepalive combo");
         }
     }
 

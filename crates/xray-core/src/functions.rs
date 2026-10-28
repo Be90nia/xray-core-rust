@@ -143,9 +143,9 @@ static INSTALLED_SECRETS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::
 /// 装配期凭据注入日志掩码表（T1.5）。
 ///
 /// 把配置里四族凭据（vmess/vless id、trojan password、ss method+password）
-/// 装进 udf 通道注册表的掩码表——`ChannelRegistry::set_secrets` 是掩码唯一布点
-/// （emit 写前统一过 `mask_secrets`）。装表后，任何经通道落样的日志行中的凭据
-/// 原文都被打码。
+/// 装进掩码表（`xray_common::log::set_secrets` 一次写 udf 通道表与 tracing
+/// 快照两处）。装表后，通道 emit 与裸 `tracing::*!` 两条输出面的凭据原文都
+/// 被打码（bd kyy50：此前只覆盖通道 emit）。
 ///
 /// **只影响日志输出**：不改任何 settings 值，转发路径零影响（掩码表是日志侧
 /// 的旁路数据，与协议解析/转发无关）。
@@ -160,7 +160,7 @@ fn install_secret_masking(built: &xray_conf::BuiltConfig) {
             installed.push(secret);
         }
     }
-    xray_common::log::channels().set_secrets(installed.clone());
+    xray_common::log::set_secrets(installed.clone());
 }
 
 /// 从已构建的 `BuiltConfig` 启动新实例。

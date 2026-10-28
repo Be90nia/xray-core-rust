@@ -37,14 +37,91 @@ use crate::error::{CliError, Result};
 /// 9tk4：`default_directive` 由配置 `log.loglevel` 推导（见 `loglevel_directive`），
 /// 使直连 tracing 日志受 loglevel 单一事实源门控；工具子命令传固定 "info"。
 pub fn init_tracing(default_directive: &str) {
+    let _ = tracing::subscriber::set_global_default(build_subscriber(
+        default_directive,
+        std::io::stderr,
+    ));
+}
+
+/// 生产订阅者构造（writer 泛型：测试沿用同一条装配代码）。
+///
+/// 落盘前统一过掩码 writer：bd kyy50（S-10）——裸 `tracing::*!` 事件
+/// （含 `LogFacade` / `HotLog` 的 tracing 通道）不经 udf
+/// `ChannelRegistry::emit`，此前完全绕过掩码。
+fn build_subscriber<W>(default_directive: &str, writer: W) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
+{
     use tracing_subscriber::{EnvFilter, fmt};
-    let _ = fmt()
+    fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive)),
         )
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(MaskingMakeWriter::new(writer))
+        .finish()
+}
+
+/// 掩码 writer 工厂：包装任意 `tracing_subscriber::fmt::MakeWriter`，令每行
+/// 落盘前过掩码表。
+struct MaskingMakeWriter<M>(M);
+
+impl<M> MaskingMakeWriter<M> {
+    fn new(inner: M) -> Self {
+        Self(inner)
+    }
+}
+
+impl<'a, M> tracing_subscriber::fmt::MakeWriter<'a> for MaskingMakeWriter<M>
+where
+    M: tracing_subscriber::fmt::MakeWriter<'a>,
+{
+    type Writer = MaskingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        MaskingWriter { inner: self.0.make_writer(), pending: Vec::new() }
+    }
+}
+
+/// 逐行掩码的 writer：整行成型（遇 `\n`）后才替换，避免一次事件被拆成多次
+/// `write` 时半掩；无换行尾巴在 [`Drop`] 兜底落盘。
+struct MaskingWriter<W: std::io::Write> {
+    inner: W,
+    pending: Vec<u8>,
+}
+
+impl<W: std::io::Write> MaskingWriter<W> {
+    fn flush_pending(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let text = String::from_utf8_lossy(&pending);
+        self.inner.write_all(xray_common::log::mask_text(&text).as_bytes())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for MaskingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        while let Some(pos) = self.pending.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&line);
+            self.inner.write_all(xray_common::log::mask_text(&text).as_bytes())?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_pending()?;
+        self.inner.flush()
+    }
+}
+
+impl<W: std::io::Write> Drop for MaskingWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.flush_pending();
+    }
 }
 
 /// 配置 `log.loglevel` → tracing EnvFilter 指令。
@@ -423,9 +500,59 @@ fn dump_config(args: &RunArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
 
     use super::*;
+
+    /// 内存 writer：把落样收进共享缓冲（`make_writer` 每事件新建，故共享 Arc）。
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Sink {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// bd kyy50（S-10）：裸 `tracing::*!` 事件在生产订阅者上必须过掩码表。
+    /// 修前红：`build_subscriber` 直连裸 writer，密钥原文逐字落 stderr。
+    #[test]
+    fn tracing_events_are_masked_on_production_subscriber() {
+        const SECRET: &str = "kyy50-trace-secret";
+        let sink = Sink::default();
+        let subscriber = build_subscriber("warn", sink.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        xray_common::log::set_secrets(vec![SECRET.to_string()]);
+        tracing::warn!(credential = SECRET, "inbound auth failed");
+        xray_common::log::set_secrets(Vec::new());
+
+        let out = sink.contents();
+        assert!(!out.contains(SECRET), "密钥原文落 stderr：{out}");
+        assert!(out.contains("***"), "掩码未生效：{out}");
+    }
 
     #[test]
     fn has_config_extension_known() {

@@ -144,10 +144,14 @@ impl GeneralLogger {
         let creator = Arc::clone(&self.creator);
         let inner = Arc::clone(&self.inner);
         let dropped = Arc::clone(&self.dropped);
-        // 豁免理由：日志 writer 后台任务——本 crate 是 udf logx 通道 sink 的实现层，
-        // 不依赖 xray-frame（禁环），拿不到 PluginContext/FxScope；托管性由
-        // GeneralLoggerGuard 持有 JoinHandle 等价兑现（停机即 abort）。
-        #[allow(clippy::disallowed_methods)]
+        // 托管裁决（bd hj3jf）：日志 writer 后台任务是**托管**形态——句柄存
+        // `g.handle`，由 `GeneralLoggerGuard` drop 时 abort（停机即停写）。
+        // 本 crate 是 udf logx 通道 sink 的实现层，不依赖 xray-frame（禁环），
+        // 拿不到 PluginContext/FxScope → 用 JoinHandle 自持兑现同一托管语义。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "托管：句柄存 GeneralLoggerGuard（drop 即 abort），等价 FxScope 记账；本 crate 不依赖 xray-frame（禁环）故无 PluginContext 可穿（bd hj3jf）"
+        )]
         let handle = tokio::spawn(async move {
             run_loop(creator, inner, dropped, rx).await;
         });

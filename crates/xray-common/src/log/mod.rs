@@ -113,6 +113,29 @@ pub fn channels() -> &'static ChannelRegistry {
     &CHANNELS
 }
 
+/// 掩码表快照：与 udf 通道表同源（[`set_secrets`] 一次写两处），供**不经通道**
+/// 的输出面复用同一份表——生产 `tracing` 订阅者（`xray-cli::init_tracing`）用它
+/// 掩码裸 `tracing::*!` 事件。bd kyy50（S-10）：udf `ChannelRegistry::emit` 此前
+/// 是掩码唯一布点，裸 tracing 事件全部绕过。
+static SECRETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// 装载密钥掩码表（替换语义，与 udf `ChannelRegistry::set_secrets` 一致）：
+/// 同时写 udf 通道表（通道 emit 路径）与本模块快照（tracing 路径）。
+pub fn set_secrets(secrets: Vec<String>) {
+    CHANNELS.set_secrets(secrets.clone());
+    *SECRETS.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = secrets;
+}
+
+/// 按当前掩码表打码一段文本（命中子串 → `***`）；空表原样透传且零分配。
+pub fn mask_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let secrets = SECRETS.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if secrets.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    std::borrow::Cow::Owned(skeleton_infra::logx::mask_secrets(text, &refs))
+}
+
 /// 注册全局通道 sink（同通道二次注册 = Err，fail-visible，原 sink 不动）。
 pub fn register_channel(sink: Arc<dyn ChannelSink>) -> Result<(), ChannelError> {
     let is_general = sink.channel() == Channel::General;
@@ -200,6 +223,18 @@ mod tests {
     fn test_severity_display() {
         assert_eq!(format!("{}", Severity::Debug), "debug");
         assert_eq!(format!("{}", Severity::Error), "error");
+    }
+
+    /// bd kyy50（S-10）：掩码表快照与 udf 通道表同源，供 tracing 输出面复用。
+    #[test]
+    fn mask_text_follows_secret_table() {
+        assert!(matches!(mask_text("plain"), std::borrow::Cow::Borrowed(_)), "空表必须零分配透传");
+        set_secrets(vec!["kyy50-secret".to_string()]);
+        assert_eq!(mask_text("token=kyy50-secret end"), "token=*** end");
+        // 一次 set_secrets 同时写两处：udf 通道表也拿到同一份
+        assert_eq!(mask_text("kyy50-secret"), "***");
+        set_secrets(Vec::new());
+        assert_eq!(mask_text("token=kyy50-secret end"), "token=kyy50-secret end");
     }
 
     #[test]
