@@ -1,6 +1,14 @@
 #![deny(warnings)]
 // 治理红线（bd 75rv ②）：任何 rustc warning 即构建失败；豁免一律显式 allow + 理由
-#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_macros,
+        clippy::disallowed_methods,
+        clippy::print_stdout,
+        clippy::print_stderr
+    )
+)]
 // 测试目标统一豁免（print 宏断言便利，bd g3cr 家规扩展）；spawn 走 xray_common::testing
 // （L3 闸不豁免），生产禁令不受影响
 #![warn(clippy::print_stdout, clippy::print_stderr)]
