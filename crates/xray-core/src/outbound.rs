@@ -133,6 +133,28 @@ impl xray_app_dispatcher::OutboundHandlerManager for OhmRef {
         unsafe { &*self.inner }.get_default_handler()
     }
 }
+
+/// freedom 默认 final rule 的入站选择表：inbound tag → 协议名 → [`DefaultRuleType`]。
+///
+/// 对应 Go `getDefaultFinalRule(inbound.Name)`（freedom.go:154-174）；无匹配协议
+/// 的入站不入表（= 无默认规则）。生产注册与 `framework-assembly` 装配共用本表
+/// （两条路径各自的副本会漂移——v787x：框架路径曾漏注入）。
+///
+/// [`DefaultRuleType`]: xray_proxy_freedom::DefaultRuleType
+#[must_use]
+pub fn inbound_default_rules(
+    built: &BuiltConfig,
+) -> std::collections::HashMap<String, xray_proxy_freedom::DefaultRuleType> {
+    built
+        .inbounds
+        .iter()
+        .filter_map(|ib| {
+            xray_proxy_freedom::get_default_rule_type(&ib.entry.kind)
+                .map(|rule| (ib.tag.clone(), rule))
+        })
+        .collect()
+}
+
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
 /// 遍历 `built.outbounds`，按协议名创建 DialBridge 注册到 `ohm`。
@@ -163,19 +185,8 @@ pub fn register_outbounds(
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
-    // freedom 默认 final rule 的入站选择（Go getDefaultFinalRule(inbound.Name) :154-169）：
-    // inbound tag → 协议名 → DefaultRuleType。无匹配协议的入站不入表（= 无默认规则）。
-    let inbound_default_rules: std::collections::HashMap<
-        String,
-        xray_proxy_freedom::DefaultRuleType,
-    > = built
-        .inbounds
-        .iter()
-        .filter_map(|ib| {
-            xray_proxy_freedom::get_default_rule_type(&ib.entry.kind)
-                .map(|rule| (ib.tag.clone(), rule))
-        })
-        .collect();
+    // freedom 默认 final rule 的入站选择（Go getDefaultFinalRule(inbound.Name) :154-169）。
+    let inbound_default_rules = inbound_default_rules(built);
     #[allow(unused_variables)] // 存量清零批次
     for (i, ob) in built.outbounds.iter().enumerate() {
         match try_build_handler(

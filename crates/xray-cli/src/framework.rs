@@ -379,11 +379,14 @@ where
 /// destinationOverride/proxyProtocol/domainStrategy/sockopt/bd 7p1m RCVBUF）+
 /// [`FreedomDispatchBridge`]（dispatch 路径语义：finalRules Block 检查、noises、
 /// UDP relay 策略）+ 生产同款 splice 标记（Go freedom.go:260）。
-fn freedom_family() -> RegisteredFamily {
+fn freedom_family(
+    inbound_rules: &HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+) -> RegisteredFamily {
     let plugin = Arc::new(FreedomPlugin::default());
     let p = Arc::clone(&plugin);
     let chain_slot: ChainSlot = Arc::new(Mutex::new(Vec::new()));
     let slots = Arc::clone(&chain_slot);
+    let inbound_rules = inbound_rules.clone();
     RegisteredFamily {
         protocol: "freedom",
         unhandled: PLUGIN_SEAM_UNHANDLED,
@@ -397,9 +400,11 @@ fn freedom_family() -> RegisteredFamily {
             ));
             dial_bridge.set_splice_outbound(true);
             let chain_tag = proxy_chain_tag(ob);
-            // 链上 freedom 非最终出站：finalRules 不构建（配了则 warn），Go
-            // freedom.go:193-198 + 生产 build_freedom_outbound 同款（生产同文本）。
-            let final_rules = if chain_tag.is_some() {
+            // 链上 freedom 非最终出站：finalRules 与入站默认规则都不注入（配了
+            // finalRules 则 warn），Go freedom.go:193-198 + 生产
+            // build_freedom_outbound 同款。
+            let uses_dialer_proxy = chain_tag.is_some();
+            let final_rules = if uses_dialer_proxy {
                 if !cfg.final_rules.is_empty() {
                     crate::LOG.warn(format!(
                         "framework: freedom tag={:?}: The \"finalRules\" setting is ignored when \
@@ -430,6 +435,14 @@ fn freedom_family() -> RegisteredFamily {
             .with_destination_override(cfg.destination_override.clone())
             .with_domain_strategy(cfg.domain_strategy)
             .with_final_rules(final_rules);
+            // Go 默认 BlockPrivate 兜底（私网/环回/169.254 元数据，Go
+            // freedom.go:154-174 getDefaultFinalRule(inbound.Name)）；生产
+            // build_freedom_outbound 同款注入，此前框架路径漏注入 = SSRF 面。
+            let handler = if uses_dialer_proxy {
+                handler
+            } else {
+                handler.with_inbound_default_rules(inbound_rules.clone())
+            };
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         })),
         plugin,
@@ -449,7 +462,10 @@ fn blackhole_family() -> RegisteredFamily {
         loopback_slot: None,
         chain_slot: None,
         outbound: Some(Arc::new(move |ob| {
-            let handler = p.dispatch_handler(&ob.tag).map_err(|e| e.to_string())?;
+            // 能力句柄随 ctx 注入（nn8os 2b：日志/spawn 只经 ctx）——与 freedom 族
+            // 同款族级自持 ctx。
+            let ctx = Arc::new(PluginContext::for_plugin("blackhole"));
+            let handler = p.dispatch_handler(ctx, &ob.tag).map_err(|e| e.to_string())?;
             Ok(Arc::new(handler) as Arc<dyn DispatchHandler>)
         })),
         plugin,
@@ -488,7 +504,10 @@ fn loopback_family() -> RegisteredFamily {
 /// 配置引用集（禁硬编码清单）；目录未覆盖 = 未迁移（shadowsocks）/未知族 →
 /// [`derive_families`] 记账不注册。族名与 xray-conf `BuiltEntry.kind` /
 /// `Config::to_json_value()` 的 `protocol` 字段逐字对齐（插件 `name()` 同源）。
-fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
+fn family_catalog(
+    protocol: &str,
+    inbound_rules: &HashMap<String, xray_proxy_freedom::DefaultRuleType>,
+) -> Option<RegisteredFamily> {
     let family = match protocol {
         // 入站面 + xray-core 单出站构建（客户端解析在 xray-core 内部）。
         "socks" => core_outbound_family::<SocksPlugin>("socks"),
@@ -503,7 +522,7 @@ fn family_catalog(protocol: &str) -> Option<RegisteredFamily> {
         // 纯入站协议（无出站形态；xray-core 出站构造表键为 "dokodemo"，与配置
         // protocol 名 "dokodemo-door" 不同源，故不走单出站构建）。
         "dokodemo-door" => inbound_only::<DokodemoPlugin>("dokodemo-door"),
-        "freedom" => freedom_family(),
+        "freedom" => freedom_family(inbound_rules),
         "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p, stream| {
             let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
             // 接缝暂自持 for_plugin ctx（族级单实例）；P3 装配接线时改传装配根 ctx。
@@ -541,13 +560,16 @@ struct FamilyPlan {
 /// 配置引用集，禁硬编码清单。
 fn derive_families(built: &BuiltConfig) -> FamilyPlan {
     let mut plan = FamilyPlan { families: Vec::new(), unregistered: Vec::new() };
+    // 生产同源表（xray-core `register_outbounds` 同一函数）：freedom 的默认
+    // BlockPrivate 兜底按入站协议名生效。
+    let inbound_rules = xray_core::outbound::inbound_default_rules(built);
     let push_family = |kind: &str, plan: &mut FamilyPlan| {
         if plan.families.iter().any(|f| f.protocol == kind)
             || plan.unregistered.iter().any(|u| u == kind)
         {
             return;
         }
-        match family_catalog(kind) {
+        match family_catalog(kind, &inbound_rules) {
             Some(family) => plan.families.push(family),
             None => plan.unregistered.push(kind.to_string()),
         }
@@ -986,6 +1008,105 @@ mod tests {
         });
     }
 
+    /// v787x：`framework-assembly` 路径的 freedom 必须保留 Go 默认 BlockPrivate 兜底
+    /// （Go freedom.go:154-174 `getDefaultFinalRule(inbound.Name)`；与生产
+    /// `register_outbounds` 同一张表）。判别力：目标 = 本机 127.0.0.1 真实监听器，
+    /// 一旦被拨号计数必 > 0。阶段 1（vless 入站 → BlockPrivate）零拨号；阶段 2
+    /// （socks 入站不在 Go 表）正常拨号 1 次——正控证明观察手段看得见拨号，故阶段 1
+    /// 的 0 是真阻断而非假阴。修前（漏注入）阶段 1 计数 = 1，必红。
+    #[test]
+    fn framework_freedom_blocks_private_targets_for_default_rule_inbounds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use xray_buf::io::Writer as _; // pipe Writer::shutdown（drain EOF）
+
+        let (built, root, plan) = plan_from_json(
+            r#"{
+            "inbounds": [
+                {"protocol": "vless", "tag": "vless-in", "listen": "127.0.0.1", "port": 12840, "settings": {"decryption": "none"}},
+                {"protocol": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": 12841, "settings": {}}
+            ],
+            "outbounds": [{"protocol": "freedom", "tag": "freedom-out", "settings": {}}]
+        }"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // 环回目标监听器：被拨号即计数 1，并立即关闭（freedom 侧随即 EOF）。
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = listener.local_addr().unwrap();
+            let dials = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&dials);
+            let accept = tokio::spawn(async move {
+                while let Ok((sock, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(sock);
+                }
+            });
+
+            let mut framework = assemble(root, &plan.families).expect("assemble");
+            framework.bring_up().expect("bring_up");
+            let dispatcher = Arc::new(DefaultDispatcher::new());
+            let fill = fill_bridge(&built, &plan.families, &dispatcher);
+            assert!(fill.failed.is_empty(), "unexpected conversion failures: {:?}", fill.failed);
+            let handler = Arc::clone(fill.bridge.get("freedom-out").expect("freedom-out handler"));
+
+            let dest = xray_common::net::destination::Destination::tcp(
+                target.ip().into(),
+                xray_common::net::port::Port::new(target.port()),
+            );
+            // xray-buf pipe 无 Drop 关闭：返回 up_w 供显式 shutdown（drain 才有 EOF）。
+            let new_link = || {
+                let (up_r, up_w) = xray_buf::pipe::new();
+                let (dn_r, dn_w) = xray_buf::pipe::new();
+                (
+                    xray_transport::link::Link::new(
+                        Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                        Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+                    ),
+                    up_w,
+                    dn_r,
+                )
+            };
+            let access = |inbound_tag: &str| xray_app_dispatcher::AccessContext {
+                inbound_tag: inbound_tag.to_string(),
+                ..Default::default()
+            };
+
+            // 阶段 1：vless 入站 → 默认 BlockPrivate 命中 127.0.0.1 → 黑洞，零拨号。
+            let (link, up_w, _dn_r) = new_link();
+            let blocked =
+                tokio::spawn(handler.dispatch_with_access(&dest, link, access("vless-in")));
+            up_w.shutdown();
+            tokio::time::timeout(std::time::Duration::from_secs(5), blocked)
+                .await
+                .expect("blocked dispatch must converge on link EOF")
+                .expect("blocked dispatch must not panic");
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                0,
+                "vless 入站的环回目标必须被 Go 默认 BlockPrivate 规则阻断（零拨号）"
+            );
+
+            // 阶段 2：socks 入站不在 Go 默认表 → 无默认规则 → 正常拨号（正控）。
+            let (link, _up_w, _dn_r) = new_link();
+            let dialed =
+                tokio::spawn(handler.dispatch_with_access(&dest, link, access("socks-in")));
+            tokio::time::timeout(std::time::Duration::from_secs(5), dialed)
+                .await
+                .expect("dial dispatch must converge on peer close")
+                .expect("dial dispatch must not panic");
+            assert_eq!(
+                dials.load(Ordering::SeqCst),
+                1,
+                "socks 入站无默认规则，必须真的拨到目标（正控）"
+            );
+
+            accept.abort();
+            let report = framework.shutdown().await;
+            assert!(report.is_clean(), "shutdown unclean: {report:?}");
+        });
+    }
+
     /// 失败记账：未迁移族（shadowsocks）出站条目 → 桥转换逐条计数失败（不静默
     /// 覆盖、不伪造成功）；入站面照常（InboundDispatchHandler tag 面不依赖族）。
     #[test]
@@ -1081,7 +1202,7 @@ mod tests {
         let _enter = runtime.enter();
         let dispatcher = Arc::new(DefaultDispatcher::new());
         for (protocol, settings, stream, expected) in cases {
-            let family = family_catalog(protocol).expect("family catalog entry");
+            let family = family_catalog(protocol, &HashMap::new()).expect("family catalog entry");
             let tag = format!("{protocol}-out");
             let mut built = xray_conf::BuiltConfig::default();
             let mut ob = outbound_entry(protocol, &tag, settings.as_bytes());
@@ -1128,9 +1249,9 @@ mod tests {
     /// 丢参）；blackhole/loopback 生产同样忽略这些面（无拨号腿），故不拒。
     #[test]
     fn guard_facets_follow_family_capability_table() {
-        let plugin_seam = family_catalog("vless").expect("vless family");
-        let core_route = family_catalog("trojan").expect("trojan family");
-        let ignoring = family_catalog("blackhole").expect("blackhole family");
+        let plugin_seam = family_catalog("vless", &HashMap::new()).expect("vless family");
+        let core_route = family_catalog("trojan", &HashMap::new()).expect("trojan family");
+        let ignoring = family_catalog("blackhole", &HashMap::new()).expect("blackhole family");
 
         let with = |f: fn(&mut BuiltOutbound)| {
             let mut ob = outbound_entry("x", "entry", b"{}");
@@ -1248,7 +1369,7 @@ mod tests {
     /// 点；sockopt 兄弟键覆盖在场同拒（同机制，与覆盖无关）。
     #[test]
     fn dialer_proxy_stays_guarded_with_hook_reason() {
-        let vless = family_catalog("vless").expect("vless family");
+        let vless = family_catalog("vless", &HashMap::new()).expect("vless family");
         let mut ob = outbound_entry("vless", "vless-out", b"{}");
         ob.stream_settings_json =
             Some(serde_json::json!({"sockopt": {"dialerProxy": "hop", "mark": 42}}));
@@ -1261,7 +1382,7 @@ mod tests {
     /// 与 tag，框架无法 late-bind，理由点名丢参。
     #[test]
     fn core_single_family_proxy_chain_tag_stays_guarded() {
-        let trojan = family_catalog("trojan").expect("trojan family");
+        let trojan = family_catalog("trojan", &HashMap::new()).expect("trojan family");
         let mut ob = outbound_entry("trojan", "trojan-out", b"{}");
         ob.proxy_settings_json = Some(serde_json::json!({"tag": "hop"}));
         let err = guard_outbound_entry(&ob, &trojan)
