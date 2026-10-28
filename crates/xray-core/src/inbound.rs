@@ -569,7 +569,9 @@ async fn handle_udp_associate(
     idle: std::time::Duration,
 ) -> std::io::Result<()> {
     let mut session = UdpDispatchSession::new(handler);
-    let mut buf = [0u8; 65535];
+    // 收包缓冲走堆（栈数组会把本 future 撑到 64KiB，构造期在调用方 poll 栈上留
+    // 同尺寸临时量 → 击穿 2MiB 线程栈；与全仓 UDP 缓冲的 vec! 形态同款）。
+    let mut buf = vec![0u8; 65535];
     // 最近一个客户端地址：响应可能晚于请求到达，跨循环迭代记忆
     let mut last_client: Option<SocketAddr> = None;
     // UDP associate 空闲时限（Go server.go:171-175 `tempUDPConn.SetTimeout(
@@ -587,7 +589,7 @@ async fn handle_udp_associate(
                 tracing::debug!(?idle, "socks udp relay idle timeout");
                 return Ok(());
             }
-            v = relay_socket.recv_from(&mut buf) => {
+            v = relay_socket.recv_from(&mut buf[..]) => {
                 idle_deadline = Budget::tokio().deadline(idle);
                 let (n, client) = match v {
                     Ok(v) => v,

@@ -10,8 +10,8 @@
 //!   逆启动序，同步快收：只发关闭信号不等排空，否则停机被拖成串行 等待）→ ③
 //!   `fx.shutdown_timeout(d)`（在途 abort + 排空，剩余集 Drop=abort 兜底零残留）。
 //! - **Context 单一权威**：每插件一个 ctx，build 期构造并经 `build(ctx)` 变更后 原样交
-//!   init/start（handler 登记不丢）；裸 [`FxScope`] 不进插件（L2 能力只经 ctx 句柄集），`scope()`
-//!   供宿主/测试。
+//!   init/start（handler 登记不丢）；裸 [`FxScope`](skeleton_infra::fx::FxScope) 不进插件（L2
+//!   能力只经 ctx 句柄集），`scope()` 供宿主/测试。
 //! - 坑约束 #6（停机链唯一出口 = [`Framework::shutdown`]）、#12（组合根只动
 //!   装配层，数据面零接触）。
 

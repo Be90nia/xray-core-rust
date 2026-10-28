@@ -192,7 +192,7 @@ impl Config {
 
 /// 加载并合并多个配置文件。对应 Go `serial.mergeConfigs`（builder.go:36-59）。
 ///
-/// W2 面 1（能力收敛方案 §2）：逐文件经 [`crate::confloader::load_value`] 取
+/// W2 面 1（能力收敛方案 §2）：逐文件经 `crate::confloader::load_value` 取
 /// Value 进 xray-frame [`XrayConfigLayers`]，按 [`xray_policy`]（Go
 /// `Config.Override` 语义的唯一实现点）折叠后 typed 装配。与切换前的 typed
 /// `override_with` 循环等价性由影子三路对照钉住（tests/config_file_shadow.rs
