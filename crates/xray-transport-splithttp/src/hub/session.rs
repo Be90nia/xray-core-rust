@@ -95,7 +95,7 @@ impl SessionMap {
         let session_clone = Arc::clone(&session);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；会话 30s 未 GET 即 reap 定时任务（Go hub.go:86-88），FxScope 迁移收口见 bd 39hko"
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；会话 30s 未 GET 即 reap 定时任务（Go hub.go:86-88）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             tokio::select! {

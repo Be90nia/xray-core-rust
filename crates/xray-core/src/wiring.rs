@@ -475,7 +475,7 @@ impl MuxCarrierHandler {
         if is_mux_carrier(dest) {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面 mux carrier 连接任务（每 carrier）；迁 FxScope 待 bd 39hko"
+                reason = "数据面 mux carrier 连接任务（每 carrier）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(crate::inbound::handle_mux_inbound_link(
                 link,

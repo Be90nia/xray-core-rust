@@ -541,7 +541,7 @@ impl PacketIoConn {
         let dropped_driver = Arc::clone(&dropped);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（PacketIo recv 有界队列泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面泵任务（PacketIo recv 有界队列泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
@@ -563,7 +563,7 @@ impl PacketIoConn {
         let worker_inner = Arc::clone(&inner);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（PacketIo send 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面泵任务（PacketIo send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let worker = tokio::spawn(async move {
             while let Some(data) = snd_rx.recv().await {

@@ -197,7 +197,7 @@ fn spawn_ws_accept_loop(
     let log_ident = ident.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（ws accept 泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（ws accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_loop_handle = tokio::spawn(async move {
         let ident = log_ident;
@@ -244,7 +244,7 @@ fn spawn_ws_accept_loop(
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 
@@ -396,7 +396,7 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
     let key = key.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（池预连接补拨）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（池预连接补拨）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         if !pool.begin_preconnect(&key).await {

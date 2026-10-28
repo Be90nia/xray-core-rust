@@ -79,7 +79,7 @@ impl Tcpmask for Config {
         let config = self.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（xmc client bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（xmc client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(conn::tcp_bridge(raw, server, true, config));
         Ok(Box::new(client))
@@ -90,7 +90,7 @@ impl Tcpmask for Config {
         let config = self.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（xmc server bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（xmc server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(conn::tcp_bridge(raw, server, false, config));
         Ok(Box::new(client))

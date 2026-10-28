@@ -253,7 +253,7 @@ async fn listen_tcp(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -277,7 +277,7 @@ async fn listen_tcp(
     // 意外退出监控：循环只应经 close() 的 abort 句柄退出；panic 会静默杀掉监听。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务，FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp",
@@ -352,7 +352,7 @@ pub async fn listen_unix_splithttp(
     let log_ident = path.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务），FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -373,7 +373,7 @@ pub async fn listen_unix_splithttp(
     let abort = accept_task.abort_handle();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务，FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-unix",
@@ -829,7 +829,7 @@ async fn listen_h3(
             let ctx = Arc::clone(&ctx);
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务，FxScope 迁移收口见 bd 39hko"
+                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 let conn = match incoming.await {
@@ -848,12 +848,16 @@ async fn listen_h3(
 /// 循环唯一合法退出是 listener `close()`（endpoint 关闭 → `accept` 返回 `None`）；
 /// panic 则监听静默消失——endpoint 的另一 clone 留在 `SplithttpListener` 里，
 /// UDP 端口仍绑定但永不 accept（`accept_policy` 铁律 3：意外退出必须 `error!` 留痕）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层；QUIC accept 循环 + 其意外退出监控，FxScope 迁移收口见 bd 39hko"
-)]
 fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> + Send + 'static) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面 QUIC accept 泵（splithttp h3 listener）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 endpoint close，句柄仅作监控入参（bd hj3jf）"
+    )]
     let accept_task = tokio::spawn(body);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf）"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-h3",
         local.to_string(),
@@ -874,7 +878,7 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
         let peer = conn.remote_address();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务），FxScope 迁移收口见 bd 39hko"
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
@@ -995,7 +999,7 @@ impl HubConnHandler for ConnHandlerAdapter {
         (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler），FxScope 迁移收口见 bd 39hko"
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let ServerConn { reader: mut up, writer: mut down, .. } = conn;

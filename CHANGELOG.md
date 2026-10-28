@@ -58,6 +58,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - 配置解析收敛：`xray-conf/src/json.rs` 降为 Xray 语义薄壳（实体机制上浮 udf `std_ext::json`，主仓随版受益）；日志分发收敛为 `logx::ChannelRegistry` 单入口（旧 `HANDLERS` 无差别扇出 + tracing 双写删除）
 - 测试面 spawn 纳入 L3 闸：`xray_common::testing::spawn` 单入口，14+ crate `src/**` 测试面裸 spawn 收口（约 159 处）+ 18 个 `tests/*.rs` 60 处迁移
 - **生产裸 `tokio::spawn` 收口（FxScope 托管）**：10 个 `xray-proxy-*` 裸 spawn 清零（余 3 处红线/冻结面登台账）；`xray-transport` 129 处、`xray-core`/`xray-common`/`xray-tls` 时钟面 38 处全量分类（可迁者已迁，其余逐点台账 + `clippy.toml` 禁令）
+- **裸 spawn 台账收口（bd `f17zu`+`hj3jf`）**：生产裸 `tokio::spawn` **137 → 132**、丢 JoinHandle **99 → 94**、无 `reason` **9 → 0**；5 处迁上游显式脱管口 `FxScope::spawn_detached`（mux carrier/上行泵 2 + xdns recv/send/dr 泵 3），94 处丢句柄逐点裁决（托管 / 脱管 + 寿命归属写入 `reason`）；14 处保留粗粒度 allow 全部举证（分层规则 >20 处/文件 10、表达式位无法挂属性 4）；55 个 crate 的 `clippy.toml` 台账表述同步；复核脚本 `reports/audit-2026-10-28/spawn_ledger.py`（可复跑）
 - **生产 `Instant::now` 收口（`ctx.clock`）**：`xray-app-*` 26 处迁移（geodata 证书校验时钟口子收紧）；16 个 `xray-proxy-*` 时钟面全量分类（净迁 2 + 台账 35）
 - **inbound 注册表升 `BoundedRegistry`**：`InboundRuntime` 由 `RwLock<Vec>` 线性扫改为 fail-closed 有界注册表（查找 O(n)→O(log n)，删影子双轨）；双写对照 175 次比较差异 0
 

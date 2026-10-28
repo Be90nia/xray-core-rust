@@ -63,7 +63,7 @@ impl Tcpmask for FragmentConfig {
         let config = self.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（fragment client bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（fragment client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(fragment_bridge(raw, server, config, false));
         Ok(Box::new(client))
@@ -74,7 +74,7 @@ impl Tcpmask for FragmentConfig {
         let config = self.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（fragment server bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（fragment server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(fragment_bridge(raw, server, config, true));
         Ok(Box::new(client))
@@ -97,7 +97,7 @@ async fn fragment_bridge(
     let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（inner↔pipe 回程拷贝）；迁 FxScope 待 bd 39hko"
+        reason = "数据面泵任务（inner↔pipe 回程拷贝）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let back = tokio::spawn(async move {
         // 读侧结束/出错 → 关掉 pipe 写侧，让对端读到 EOF（错误按流结束传播）。

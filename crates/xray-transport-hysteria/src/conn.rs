@@ -772,7 +772,7 @@ impl UdpSessionManager {
         let clean_inner = Arc::clone(&self.inner);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（UDP idle 会话清理循环）；迁 FxScope 待 bd 39hko"
+            reason = "常驻监控任务（UDP idle 会话清理循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let clean_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
@@ -816,7 +816,7 @@ impl UdpSessionManager {
         let run_remote = remote;
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（QUIC datagram 接收泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（QUIC datagram 接收泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let run_handle = tokio::spawn(async move {
             loop {

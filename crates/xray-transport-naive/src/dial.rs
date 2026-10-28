@@ -94,7 +94,7 @@ pub async fn dial_naive(
     // h2 连接驱动：hyper 的 conn future 必须被持续 poll（后台任务 1）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（h2 conn driver）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（h2 conn driver）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -124,7 +124,7 @@ pub async fn dial_naive(
     // 优雅关闭整条 h2 连接（graceful GOAWAY 会终止活跃 CONNECT 流）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（h2 SendRequest 保活）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（h2 SendRequest 保活）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let _keep_alive = sender;

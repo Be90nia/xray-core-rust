@@ -437,15 +437,19 @@ impl QuinnListenerFactory {
 /// panic 则监听静默消失——endpoint 的另一 clone 留在 listener 句柄里，UDP 端口
 /// 仍绑定但永不 accept，且无任何日志（`accept_policy` 铁律 3：意外退出必须
 /// `error!` 留痕）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "数据面连接任务（hysteria QUIC accept 泵）+ 其意外退出监控；迁 FxScope 待 bd 39hko"
-)]
 fn spawn_supervised_accept_loop(
     local: SocketAddr,
     body: impl Future<Output = ()> + Send + 'static,
 ) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面 QUIC accept 泵（hysteria listener）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 listener close，句柄仅作监控入参（bd hj3jf）"
+    )]
     let accept_task = tokio::spawn(body);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf）"
+    )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria-quic",
         local.to_string(),
@@ -542,7 +546,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                     server_config.transport_config(Arc::new(tc));
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "数据面连接任务（每 QUIC conn 认证+服务）；迁 FxScope 待 bd 39hko"
+                        reason = "数据面连接任务（每 QUIC conn 认证+服务）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
                     )]
                     tokio::spawn(async move {
                         match incoming.accept_with(Arc::new(server_config)) {
@@ -903,7 +907,7 @@ async fn h3_auth(
                     let hold_conn = conn.clone();
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；迁 FxScope 待 bd 39hko"
+                        reason = "数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
                     )]
                     tokio::spawn(async move {
                         let _held = h3_server;
@@ -985,7 +989,7 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                         let h = handler.clone();
                         #[allow(
                             clippy::disallowed_methods,
-                            reason = "数据面连接任务（h3 请求 resolver 泵）；迁 FxScope 待 bd 39hko"
+                            reason = "数据面连接任务（h3 请求 resolver 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
                         )]
                         tokio::spawn(async move {
                             let (req, mut stream) = match resolver.resolve_request().await {

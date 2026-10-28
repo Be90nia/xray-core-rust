@@ -161,7 +161,7 @@ impl UdpDispatchSession {
         let dispatcher = Arc::clone(&self.dispatcher);
         #[allow(
             clippy::disallowed_methods,
-            reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务，FxScope 迁移收口见 bd 39hko"
+            reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             dispatcher.dispatch(&udp_dest, link).await;

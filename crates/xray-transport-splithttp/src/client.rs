@@ -739,7 +739,7 @@ pub(crate) fn hyper_err_to_io(e: hyper::Error) -> std::io::Error {
 fn spawn_upload_body_drain(body: hyper::body::Incoming) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；stream-up 上传响应体后台丢弃任务，FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；stream-up 上传响应体后台丢弃任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let mut body = body;
@@ -814,7 +814,7 @@ fn spawn_h2_lazy_reader(
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；h2 懒读任务（GET 响应头 + body 流转发），FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；h2 懒读任务（GET 响应头 + body 流转发）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         tokio::select! {

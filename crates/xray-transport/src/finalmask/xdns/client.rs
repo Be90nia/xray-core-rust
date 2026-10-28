@@ -125,12 +125,12 @@ impl XdnsConnClient {
 
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（xdns client recv 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面泵任务（xdns client recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(recv_loop(state.clone(), inner.clone(), closed.clone(), read_tx, poll_tx));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（xdns client send 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面泵任务（xdns client send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(send_loop(state.clone(), inner, closed.clone(), write_rx, poll_rx));
 

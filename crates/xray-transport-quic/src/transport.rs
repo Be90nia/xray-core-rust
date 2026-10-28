@@ -155,7 +155,7 @@ pub async fn listen(
     let listener_endpoint = endpoint.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（QUIC accept 泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（QUIC accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         loop {
@@ -166,7 +166,7 @@ pub async fn listen(
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每连接 stream 泵）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（每连接 stream 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 let conn = match incoming.await {
@@ -213,7 +213,7 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面桥接 copy 泵（quinn↔DuplexStream）；迁 FxScope 待 bd 39hko"
+            reason = "数据面桥接 copy 泵（quinn↔DuplexStream）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);

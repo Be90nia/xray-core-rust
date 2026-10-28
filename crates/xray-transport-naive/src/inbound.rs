@@ -168,7 +168,7 @@ impl InboundHandler for NaiveInboundHandler {
         let dispatch = self.dispatch.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（naive accept 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（naive accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let accept_task = tokio::spawn(async move {
             loop {
@@ -179,7 +179,7 @@ impl InboundHandler for NaiveInboundHandler {
                         let dispatch = dispatch.clone();
                         #[allow(
                             clippy::disallowed_methods,
-                            reason = "数据面连接任务（每连接 TLS/处理）；迁 FxScope 待 bd 39hko"
+                            reason = "数据面连接任务（每连接 TLS/处理）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
                         )]
                         tokio::spawn(async move {
                             let tls = match acceptor.accept(tcp).await {
@@ -289,7 +289,7 @@ async fn handle_request(
         Some(dispatch) => {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（h2 tunnel dispatch）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（h2 tunnel dispatch）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 let upgraded = match upgrade.await {
@@ -310,7 +310,7 @@ async fn handle_request(
         None => {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（无 dispatch 时 mock relay）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（无 dispatch 时 mock relay）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(relay_mock_direct(host.clone(), port, upgrade, padded));
         },

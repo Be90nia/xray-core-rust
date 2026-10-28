@@ -105,7 +105,7 @@ impl Tcpmask for Config {
         let state = Arc::new(state::StateStore::new(self.state_ttl));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（tcpmask client bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（tcpmask client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(tcp::bridge(raw, server, true, tcp_cfg, state));
         Ok(Box::new(client))
@@ -117,7 +117,7 @@ impl Tcpmask for Config {
         let state = Arc::new(state::StateStore::new(self.state_ttl));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（tcpmask server bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（tcpmask server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(tcp::bridge(raw, server, false, tcp_cfg, state));
         Ok(Box::new(client))

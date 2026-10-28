@@ -311,12 +311,13 @@ impl ClientWorker {
         });
 
         let w = Arc::clone(&worker);
-        // 数据面泵热路径豁免（约束⑫）：carrier 读循环不加托管口。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）：carrier 读循环泵，FxScope 记账会落每 chunk 开销"
-        )]
-        tokio::spawn(async move { w.fetch_output(BufferedReader::new(link.reader)).await });
+        // 数据面泵：走显式脱管口（bd hj3jf）——任务自持 `Arc<ClientWorker>`，
+        // 托管进同一 scope 只会让每 carrier 的条目滞留（上游无 drain），且寿命
+        // 本就等于 carrier 连接（读循环 EOF 自终）。
+        worker
+            .fx
+            .spawn_detached(async move { w.fetch_output(BufferedReader::new(link.reader)).await })
+            .expect("internal FxScope is never closed");
 
         let w = Arc::clone(&worker);
         // 闸关不可达：内部 scope 无 close 调用（停机走 worker.close 协作面）。
@@ -452,13 +453,14 @@ impl ClientWorker {
         let s = Arc::clone(&session);
         let writer_slot = Arc::clone(&self.link_writer);
         let target = dest.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面连接任务（fetch_input 泵）；迁 FxScope 待 bd 39hko"
-        )]
-        tokio::spawn(
-            async move { Self::fetch_input(s, target, writer_slot, global_id, inbound).await },
-        );
+        // 显式脱管（bd hj3jf）：上行泵每会话一条，寿命由 session 输入 EOF 决定；
+        // 托管记账会让条目随会话数在 worker scope 内滞留（上游无 drain）。
+        // 闸关不可达：内部 scope 无 close 调用（停机走 worker.close 协作面）。
+        self.fx
+            .spawn_detached(async move {
+                Self::fetch_input(s, target, writer_slot, global_id, inbound).await
+            })
+            .expect("internal FxScope is never closed");
 
         wait_done(session.done_receiver()).await;
         true

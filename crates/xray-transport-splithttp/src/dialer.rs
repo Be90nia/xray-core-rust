@@ -75,7 +75,7 @@ const MAX_INFLIGHT_POSTS: usize = 4;
 /// - `sc_min_posts_interval_ms`: 两次 POST 最小间隔（毫秒；0 表示不限）
 #[allow(
     clippy::disallowed_methods,
-    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；本 fn 的 3 处为 packet-up 上传泵的 spawn 与 POST 间隔墙钟取时（Go dialer.go:511 `time.Since(lastWrite)` 语义），FxScope 迁移收口见 bd 39hko"
+    reason = "墙钟取时：POST 间隔判定（Go dialer.go:511 `time.Since(lastWrite)`，本 fn 2 处）；spawn 站点已逐点登记（bd f17zu）"
 )]
 pub async fn dial_packet_up(
     client: Arc<DefaultDialerClient>,
@@ -99,6 +99,10 @@ pub async fn dial_packet_up(
     // 3. spawn 后台上行泵：读 pipe → 并发 POST packet（seq 单调，见 MAX_INFLIGHT_POSTS）
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面上传泵（packet-up pipe→并发 POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
+    )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         // 单缓冲：整条连接只分配一次读缓冲；chunk 按实际长度拷出，交互小包不背
@@ -403,7 +407,7 @@ pub async fn dial(
 /// 4. 返回 [`PacketUpConn`]
 #[allow(
     clippy::disallowed_methods,
-    reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；本 fn 的 3 处为 H3 packet-up 上传泵的 spawn 与 POST 间隔墙钟取时（Go dialer.go:511 `time.Since(lastWrite)` 语义），FxScope 迁移收口见 bd 39hko"
+    reason = "墙钟取时：POST 间隔判定（Go dialer.go:511 `time.Since(lastWrite)`，本 fn 2 处）；spawn 站点已逐点登记（bd f17zu）"
 )]
 pub async fn dial_h3_packet_up(
     client: Arc<H3Conn>,
@@ -425,6 +429,10 @@ pub async fn dial_h3_packet_up(
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
     let client_for_task = Arc::clone(&client);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面上传泵（H3 packet-up pipe→POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
+    )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         // 池化语义单缓冲：split().freeze() 摘出整块所有权转移给 POST body，
@@ -645,7 +653,7 @@ where
     // spawn conn driver（必须，否则 h2 连接不动）
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动），FxScope 迁移收口见 bd 39hko"
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         if let Err(e) = conn.await {

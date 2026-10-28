@@ -217,7 +217,7 @@ async fn listen_httpupgrade(
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（httpupgrade accept 泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（httpupgrade accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -261,7 +261,7 @@ async fn listen_httpupgrade(
     // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade",
@@ -307,7 +307,7 @@ async fn listen_unix_httpupgrade(
     let log_ident = path.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地登记时漏）"
+        reason = "unix accept 泵（httpupgrade）；显式脱管：托管无收益（ctx 不可达），寿命随 listener close（句柄存 abort 由 listener 终结），cfg(unix) 本机不可编译故无逐点复核（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -336,7 +336,7 @@ async fn listen_unix_httpupgrade(
     let abort = accept_task.abort_handle();
     #[allow(
         clippy::disallowed_methods,
-        reason = "待迁 FxScope（39hko/W5）：unix 监听路径（Windows 不编译，本地登记时漏）"
+        reason = "unix accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf 裁定）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade-unix",

@@ -860,7 +860,7 @@ mod entity_tests {
         let monitor_h = server.spawn_monitor(link_writer.clone());
         #[allow(
             clippy::disallowed_methods,
-            reason = "server 帧处理循环（process_frame 至 EOF）；FxScope 未接线（T3.1b 登记）"
+            reason = "server 帧处理循环（process_frame 至 EOF）；测试夹具显式脱管：寿命随本测试的链路对象（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             while let Ok(true) = server.process_frame(&mut reader, &link_writer).await {}

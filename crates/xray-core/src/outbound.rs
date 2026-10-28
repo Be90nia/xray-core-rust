@@ -1,8 +1,10 @@
-// L3 静态闸存量登记（bd a5r4j/lzzja 切片）：本文件 31 处（29 tokio::spawn + 2 Instant）>20 →
-// 按分层规则挂文件级；FxScope/Clock 迁移收口 bd 39hko。
+// L3 静态闸存量登记（bd a5r4j/lzzja 切片 / f17zu）：本文件 31 处（29 tokio::spawn +
+// 2 Instant）>20 → 按 clippy.toml 分层规则挂文件级（含 reason）。
+// 托管裁决（bd hj3jf）：文件内 spawn 两态并存——句柄返回调用方的由调用方托管，
+// 其余显式脱管（寿命随所属连接/请求对象）；Clock 注入收口见 bd 39hko。
 #![allow(
     clippy::disallowed_methods,
-    reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std Instant），>20 处/文件按分层规则挂文件级，迁移收口见 bd 39hko"
+    reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std Instant），>20 处/文件按 clippy.toml 分层规则挂文件级；spawn 站点裁决两态（句柄外返=调用方托管 / 其余显式脱管，寿命随所属连接或请求对象），Clock 注入收口见 bd 39hko（bd hj3jf 裁定）"
 )]
 //! Outbound handler 注册：从 BuiltConfig 构建 DialBridge 注册到 SimpleOhm。
 //!

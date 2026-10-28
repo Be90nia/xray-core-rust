@@ -228,7 +228,7 @@ impl UdpHopPacketConn {
         let pool_for_recv = Arc::clone(&pool);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（UDP hop recv 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（UDP hop recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let recv_handle = tokio::spawn(async move {
             recv_loop(conn_for_recv, recv_tx_clone, pool_for_recv).await;
@@ -240,7 +240,7 @@ impl UdpHopPacketConn {
         let pool_for_hop = Arc::clone(&pool);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（UDP hop 换口循环）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（UDP hop 换口循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let hop_handle = tokio::spawn(async move {
             hop_loop(hop_inner, hop_recv_tx, pool_for_hop).await;
@@ -455,7 +455,7 @@ async fn hop_once(
     let pool_for_recv = Arc::clone(pool);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（换口后新 recv 泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（换口后新 recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         recv_loop(conn_for_recv, tx, pool_for_recv).await;

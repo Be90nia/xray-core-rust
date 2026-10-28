@@ -294,7 +294,7 @@ async fn authenticate_via_h3(
     // 保活+推进，直到连接关闭（poll_close 返回）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（h3 driver 保活）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（h3 driver 保活）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let driver_task = tokio::spawn(async move {
         use std::future::poll_fn;

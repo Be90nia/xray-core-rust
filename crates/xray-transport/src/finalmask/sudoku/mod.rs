@@ -87,7 +87,7 @@ impl Tcpmask for SudokuConfig {
         // Client：pipe→inner 走 pure 编码，inner→pipe 走 packed 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（sudoku client bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（sudoku client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, true));
         Ok(Box::new(client))
@@ -99,7 +99,7 @@ impl Tcpmask for SudokuConfig {
         // Server：pipe→inner 走 packed 编码，inner→pipe 走 pure 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（sudoku server bridge）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（sudoku server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, false));
         Ok(Box::new(client))
@@ -134,7 +134,7 @@ async fn tcp_bridge(
     let layouts: Vec<Layout> = tables.iter().map(|t| t.layout.clone()).collect();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（inner→pipe 解码方向）；迁 FxScope 待 bd 39hko"
+        reason = "数据面泵任务（inner→pipe 解码方向）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let back = tokio::spawn(async move {
         let mut packed_dec = PackedDecoder::default();

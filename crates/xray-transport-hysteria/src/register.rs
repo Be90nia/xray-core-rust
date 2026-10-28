@@ -121,7 +121,7 @@ async fn listen_hysteria(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（hysteria accept 泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（hysteria accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
@@ -150,7 +150,7 @@ async fn listen_hysteria(
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每 QUIC conn 桥接）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（每 QUIC conn 桥接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 accept_hysteria_conn(conn, h).await;
@@ -162,7 +162,7 @@ async fn listen_hysteria(
     // error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；迁 FxScope 待 bd 39hko"
+        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria",
@@ -229,7 +229,7 @@ impl TransportListener for HysteriaTransportListener {
         let l = self.listener.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "停机桥接任务（同步 close 桥 async ep.close）；迁 FxScope 待 bd 39hko"
+            reason = "停机桥接任务（同步 close 桥 async ep.close）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let _ = l.close().await;

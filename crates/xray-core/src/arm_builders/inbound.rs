@@ -775,7 +775,7 @@ pub(crate) fn vless_transport_on_conn(
         let options = options.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（vless fallback，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+            reason = "inbound 连接处理任务（vless fallback，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -830,7 +830,7 @@ pub(crate) fn trojan_transport_on_conn(
         let fb_policy = fallbacks.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（trojan fallback，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+            reason = "inbound 连接处理任务（trojan fallback，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -874,7 +874,7 @@ pub(crate) fn vmess_transport_on_conn(
         let history = Arc::clone(&history);
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（vmess，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+            reason = "inbound 连接处理任务（vmess，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -922,7 +922,7 @@ pub(crate) fn ss_transport_on_conn(
         let pipeline_ctx = Arc::clone(&plugin_ctx);
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（ss/ss2022，每连接）；FxScope 完工 JoinSet 条目无收割 API 会无界累积，待 udf 扩 drain 后迁（bd 39hko）"
+            reason = "inbound 连接处理任务（ss/ss2022，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout, pipeline_ctx).await;

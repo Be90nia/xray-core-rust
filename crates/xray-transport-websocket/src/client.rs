@@ -316,7 +316,7 @@ impl AsyncWrite for DelayDialConn {
     // joining 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（首写触发拨号 joining）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（首写触发拨号 joining，句柄存 joining 由 DelayDialConn 终结）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 赋值语句位挂不了属性（E0658）故挂 fn 位（bd hj3jf）"
     )]
     fn poll_write(
         mut self: Pin<&mut Self>,

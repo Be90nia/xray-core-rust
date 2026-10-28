@@ -57,7 +57,7 @@ where
 #[allow(clippy::type_complexity)] // 返回类型即 spawn 句柄形态
 #[allow(
     clippy::disallowed_methods,
-    reason = "常驻基础设施任务（metrics gRPC server，句柄返回调用方托管）；迁 FxScope 待 bd 39hko"
+    reason = "常驻基础设施任务（metrics gRPC server，句柄返回调用方托管）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
 )]
 pub fn spawn_grpc<F>(
     addr: &str,

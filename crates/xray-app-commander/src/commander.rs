@@ -1122,7 +1122,7 @@ mod tests {
         );
         #[allow(
             clippy::disallowed_methods,
-            reason = "dispatch 与调用方解耦的后台投递（Go dispatch goroutine 直译）；FxScope 未接线（T3.1b 登记）"
+            reason = "dispatch 与调用方解耦的后台投递（Go dispatch goroutine 直译）；显式脱管是设计：投递不等结果，寿命随该 gRPC 会话的 duplex 链路（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             handler.dispatch(&dest, link).await;

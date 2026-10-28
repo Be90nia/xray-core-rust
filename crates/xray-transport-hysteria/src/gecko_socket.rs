@@ -130,7 +130,7 @@ impl GeckoSocket {
 fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Bytes, SocketAddr)>) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（Gecko 发送 driver）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（Gecko 发送 driver）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         while let Some((buf, addr)) = send_rx.recv().await {
@@ -153,7 +153,7 @@ fn spawn_recv_driver(
 ) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（Gecko 接收 driver）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（Gecko 接收 driver）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];

@@ -88,7 +88,7 @@ impl Dispatcher for DispatchHandlerAdapter {
         let dest_clone = dest.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（每连接 dispatch 泵）；迁 FxScope 待 bd 39hko"
+            reason = "数据面连接任务（每连接 dispatch 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             handler.dispatch(&dest_clone, dispatch_link).await;
@@ -211,7 +211,7 @@ impl ServerWorker {
         let closed = Arc::clone(&self.closed);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（JoinHandle 返回给调用方托管）；迁 FxScope 待 bd 39hko"
+            reason = "常驻监控任务（JoinHandle 返回给调用方托管）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
@@ -304,7 +304,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -402,7 +402,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -461,7 +461,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；迁 FxScope 待 bd 39hko"
+            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;

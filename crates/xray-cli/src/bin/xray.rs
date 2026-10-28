@@ -298,7 +298,7 @@ fn max_blocking_threads() -> usize {
 fn spawn_blocking_pool_monitor() {
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（HC-1 路线 B blocking 池水位采样）；迁 FxScope 待 bd 39hko"
+        reason = "常驻监控任务（HC-1 路线 B blocking 池水位采样）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));

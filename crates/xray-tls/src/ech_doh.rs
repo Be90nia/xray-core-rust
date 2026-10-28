@@ -243,7 +243,7 @@ where
         .map_err(|e| TlsError::EchApply(format!("ECH DoH h2 handshake: {e}")))?;
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（DoH h2 conn driver）；迁 FxScope 待 bd 39hko"
+        reason = "数据面连接任务（DoH h2 conn driver）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let _ = conn.await;

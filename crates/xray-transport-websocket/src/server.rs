@@ -308,7 +308,7 @@ impl WsListener {
             // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(Self::serve_h2_reject(tls_stream, self.configs.clone()));
             return Err(WsError::HandshakeFailed("http/2 request rejected".into()));

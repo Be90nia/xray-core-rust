@@ -304,7 +304,7 @@ pub fn detect_max_useless_records(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（REALITY 探测，后台填充探测表）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（REALITY 探测，后台填充探测表）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 if let Some(tier) = detect_one(&dest_c, &sni_c, alpn).await {
@@ -436,7 +436,7 @@ pub fn detect_post_handshake_record_lens(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（record lens 探测，后台填充）；迁 FxScope 待 bd 39hko"
+                reason = "数据面连接任务（record lens 探测，后台填充）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
                 let lens = timeout(

@@ -169,7 +169,7 @@ where
         let cb = Arc::clone(&on_stream);
         #[allow(
             clippy::disallowed_methods,
-            reason = "portal yamux 服务端会话 accept；FxScope 未接线（T3.1b 登记）"
+            reason = "portal yamux 服务端会话 accept；显式脱管：serve_portal 无形参可载 PluginContext（自由函数），寿命随 bridge TCP 连接（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             tracing::debug!(peer = %peer, "portal bridge connected");
@@ -198,7 +198,7 @@ where
                 let cb = Arc::clone(&on_stream);
                 #[allow(
                     clippy::disallowed_methods,
-                    reason = "portal 子流回调派发（on_stream 回调）；FxScope 未接线（T3.1b 登记）"
+                    reason = "portal 子流回调派发（on_stream 回调）；显式脱管：寿命随 yamux 子流（驱动退出即回调结束），ctx 不可达（bd hj3jf 裁定）"
                 )]
                 tokio::spawn(async move {
                     cb(stream.compat()).await;

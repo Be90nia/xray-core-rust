@@ -677,7 +677,7 @@ pub(super) async fn tcp_bridge(
     // 唯一写者任务：明文 MC 包字节 → CFB8 加密 → raw（对应 Go cryptoStream 写侧）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（xmc 加密写泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面泵任务（xmc 加密写泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let mut ww = ww;
@@ -708,7 +708,7 @@ pub(super) async fn tcp_bridge(
     let tx_ka = tx.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（pipe→raw 分块编码泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面泵任务（pipe→raw 分块编码泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         run_encode_pump(pipe_r, tx_data, local_cp_id).await;
@@ -720,7 +720,7 @@ pub(super) async fn tcp_bridge(
     let tx_read = tx;
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（raw→pipe 解密读泵）；迁 FxScope 待 bd 39hko"
+        reason = "数据面泵任务（raw→pipe 解密读泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     tokio::spawn(async move {
         let tx = tx_read;
@@ -767,7 +767,7 @@ pub(super) async fn tcp_bridge(
     if !is_client {
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（xmc server keepalive 循环）；迁 FxScope 待 bd 39hko"
+            reason = "常驻监控任务（xmc server keepalive 循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
             let tx = tx_ka;
