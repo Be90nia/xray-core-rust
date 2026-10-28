@@ -150,6 +150,126 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
     server_task.abort();
 }
 
+/// 上行并发判别器（bd bnd8n）：多个 packet-up POST 必须同时在飞。
+///
+/// 修前实现每 POST `await` 完整 200 OK 才读下一块 → 服务端 200ms 延迟窗口内
+/// in-flight 恒 1（本例必红）。并发投递（Go dialer.go:517 每 chunk 一个
+/// goroutine）下应为多个。同一夹具顺带验证：并发乱序到达时按 seq 重排仍能
+/// 还原写入字节序（服务端 uploadQueue 语义）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_up_posts_run_concurrently_and_keep_seq_order() {
+    const POST_DELAY: Duration = Duration::from_millis(200);
+    const CHUNK: usize = 512;
+    const CHUNKS: usize = 4;
+
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak_in_flight = Arc::new(AtomicUsize::new(0));
+    let recorded: Arc<std::sync::Mutex<Vec<(u64, Vec<u8>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let (if_srv, peak_srv, rec_srv) = (in_flight.clone(), peak_in_flight.clone(), recorded.clone());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { break };
+            let io = TokioIo::new(stream);
+            let (in_flight, peak, recorded) = (if_srv.clone(), peak_srv.clone(), rec_srv.clone());
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let (in_flight, peak, recorded) =
+                        (in_flight.clone(), peak.clone(), recorded.clone());
+                    async move {
+                        if req.method() != Method::POST {
+                            return Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from_static(b"dl")))
+                                    .unwrap(),
+                            );
+                        }
+                        // seq 默认 placement = path（`/{session}/{seq}`）
+                        let seq: u64 = req
+                            .uri()
+                            .path()
+                            .rsplit('/')
+                            .next()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap();
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        recorded.lock().unwrap().push((seq, body.to_vec()));
+                        // 响应延迟 = "等 200 OK" 窗口：串行实现此窗口内 in-flight 恒 1
+                        tokio::time::sleep(POST_DELAY).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::new()))
+                            .unwrap())
+                    }
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+
+    let config = Arc::new(Config {
+        host: format!("127.0.0.1:{}", addr.port()),
+        path: "/".into(),
+        ..Default::default()
+    });
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+        None,
+    ));
+    let mut conn = dial_packet_up(
+        client,
+        format!("http://127.0.0.1:{}/", addr.port()),
+        "conc-sess".into(),
+        CHUNK,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .unwrap();
+
+    let payload: Vec<u8> = (0..(CHUNK * CHUNKS)).map(|i| i as u8).collect();
+    conn.write_all(&payload).await.unwrap();
+
+    // 等 POST 全部落地（服务端每 POST 延迟 POST_DELAY）
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while recorded.lock().unwrap().len() * CHUNK < payload.len()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let peak = peak_in_flight.load(Ordering::SeqCst);
+    assert!(peak >= 2, "packet-up POST 必须并发在飞：peak in-flight = {peak}（串行实现恒 1）");
+
+    let mut pairs = recorded.lock().unwrap().clone();
+    assert!(pairs.len() >= CHUNKS, "expected >= {CHUNKS} POSTs, got {}", pairs.len());
+    let bytes: usize = pairs.iter().map(|(_, b)| b.len()).sum();
+    assert_eq!(bytes, payload.len(), "上行字节总数必须守恒");
+
+    pairs.sort_by_key(|(seq, _)| *seq);
+    let seqs: Vec<u64> = pairs.iter().map(|(seq, _)| *seq).collect();
+    let expected_seqs: Vec<u64> = (0..pairs.len() as u64).collect();
+    assert_eq!(seqs, expected_seqs, "seq 必须自 0 起单调无洞");
+    let reassembled: Vec<u8> = pairs.iter().flat_map(|(_, b)| b.iter().copied()).collect();
+    assert_eq!(reassembled, payload, "按 seq 重排后字节序必须与写入一致");
+
+    drop(conn);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.abort();
+}
+
 #[tokio::test]
 async fn post_packet_returns_bad_status_on_500() {
     ensure_crypto_provider();

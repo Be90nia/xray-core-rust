@@ -8,8 +8,10 @@ use futures_util::TryStreamExt;
 use http::StatusCode;
 use hyper::client::conn::http2;
 use hyper_util::rt::TokioExecutor;
-use tokio::io::{
-    AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream,
+use tokio::{
+    io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream},
+    sync::Semaphore,
+    task::JoinSet,
 };
 use tokio_util::io::{ReaderStream, StreamReader};
 
@@ -29,6 +31,19 @@ use crate::{
 /// 用 `Box<dyn AsyncRead + Send + Unpin>` 避免复杂的具体类型名。
 pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, DuplexStream>;
 
+/// packet-up 上行 in-flight POST 上限（背压门）。
+///
+/// Go `dialer.go:517` 每个 chunk 起一个 goroutine 投递，主循环对 `DefaultDialerClient`
+/// 只 `<-wroteRequest.Wait()`（`dialer.go:533-535`：等请求字节写完，**不等** 200 OK），
+/// 所以 Go 的上行是流水线式的——吞吐由写带宽决定，而非 `maxEachPostBytes / RTT`
+/// （bd bnd8n：修前 Rust 每 POST `await` 完整 200 OK，上行天花板 = chunk / RTT）。
+///
+/// Rust 侧 hyper `Full<Bytes>` body 没有"请求字节已写完"的回执可等，改用固定
+/// in-flight 上限近似该流水线：稳态在途数据 = N × chunk，4 × 1MB 覆盖 150ms RTT 下
+/// ~213Mbps 的带宽时延积（高于实测 ws / httpupgrade 参照 73 / 67.5Mbps）；同时给出
+/// 每个连接的 POST 内存上界（每在飞 POST 最多持有一个 chunk）。
+const MAX_INFLIGHT_POSTS: usize = 4;
+
 /// packet-up mode 端到端拨号。
 ///
 /// 翻译自 Go `dialer.go::Dial` 的 packet-up 分支：
@@ -38,13 +53,18 @@ pub type PacketUpConn = SplitConn<Box<dyn AsyncReadTrait + Send + Unpin>, Duplex
 /// 3. spawn 后台任务：循环读 pipe → POST packet
 /// 4. 返回 [`PacketUpConn`]（reader=下载流，writer=pipe 写端）
 ///
+/// # 上行泵（Go `dialer.go:475-537` 等价物）
+///
+/// `pipe.read` → 一块（≤ `sc_max_each_post_bytes`）→ 独立任务投递，最多
+/// [`MAX_INFLIGHT_POSTS`] 个在飞。seq 按投递顺序单调递增；乱序到达由服务端上传队列
+/// （`scMaxBufferedPosts`）按 seq 重排，因此并发投递不改 wire 语义。
+///
 /// # 简化点（vs Go 原版）
 ///
-/// - **不做 batching**：每次 POST = 一次 `pipe.read()` 的内容（Go 用 `MultiBuffer` 合并多个 `Write`
-///   为单 POST，本切片保留单 read → 单 POST 的 1:1 映射）。 后续切片 E（xmux）一起优化。
-/// - **不做 sc_min_posts_interval_ms 真随机**：固定 sleep 该值（Go 是范围随机）。
 /// - **不做 upload_writer 大小限制**：直接 read pipe（Go 用 `pipe.WithSizeLimit` 强制 maxUploadSize
-///   上限）。maxUploadSize 仅作为 POST 切片阈值。
+///   上限）；本实现由读缓冲长度封顶。
+/// - **背压用 in-flight 上限近似**：Go 对 `DefaultDialerClient` 只等请求字节写完（不等响应）， Rust
+///   侧 hyper `Full` body 无此回执——取值依据见 [`MAX_INFLIGHT_POSTS`]。
 ///
 /// # 参数
 ///
@@ -76,17 +96,42 @@ pub async fn dial_packet_up(
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
     let (pipe_client, mut pipe_server) = tokio::io::duplex(pipe_buf);
 
-    // 3. spawn 后台 POST 任务：循环读 pipe → POST packet
+    // 3. spawn 后台上行泵：读 pipe → 并发 POST packet（seq 单调，见 MAX_INFLIGHT_POSTS）
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        // 池化语义单缓冲：split().freeze() 摘出整块所有权转移给 POST body，
-        // 容量跨 chunk 复用（免逐 chunk to_vec 分配+拷贝）
-        let mut read_buf = bytes::BytesMut::with_capacity(sc_max_each_post_bytes);
+        // 单缓冲：整条连接只分配一次读缓冲；chunk 按实际长度拷出，交互小包不背
+        // max_post 的分配账（数据面分配纪律见本 crate clippy.toml）。
+        let mut buf = vec![0u8; sc_max_each_post_bytes.max(1)];
+        let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_POSTS));
+        let mut posts: JoinSet<Result<()>> = JoinSet::new();
         let mut last_write = std::time::Instant::now();
-        loop {
-            let n = match pipe_server.read_buf(&mut read_buf).await {
+        'pump: loop {
+            // 收割已完成的 POST（完成即释放名额）：任一失败终止上传
+            // （Go dialer.go:528-529 `uploadPipeReader.Interrupt()`）。
+            while let Some(joined) = posts.try_join_next() {
+                match joined {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => {
+                        crate::hot_log!(DEBUG, "error={e} post_packet failed, terminating upload");
+                        break 'pump;
+                    },
+                    Err(e) => {
+                        crate::hot_log!(DEBUG, "error={e} upload post task join failed");
+                        break 'pump;
+                    },
+                }
+            }
+
+            // 背压门：在飞满则等一个 POST 完成再读下一块
+            let Ok(permit) = in_flight.clone().acquire_owned().await else {
+                // 唯一 Arc 在本任务内，永不 close()；保守终止上传
+                crate::hot_log!(DEBUG, "in-flight semaphore closed, terminating packet-up upload");
+                break;
+            };
+
+            let n = match pipe_server.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
@@ -94,25 +139,13 @@ pub async fn dial_packet_up(
                     break;
                 },
             };
-            let payload = read_buf.split().freeze();
-            debug_assert_eq!(n, payload.len());
+
+            let payload = bytes::Bytes::copy_from_slice(&buf[..n]);
             let seq_str = seq.to_string();
             seq += 1;
 
-            if let Err(e) = client
-                .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
-                .await
-            {
-                crate::hot_log!(
-                    DEBUG,
-                    "error={e} seq={seq} post_packet failed, terminating upload"
-                );
-                break;
-            }
-
-            // H11：Go dialer.go:511 每次 POST 后 sleep `scMinPostsIntervalMs.rand()`
-            // 毫秒（减去已耗时间）；此前恒 sleep `from`。saturating_sub 对齐
-            // Go 的 `- time.Since(lastWrite)`（本轮耗时抵扣，不足不睡）。
+            // H11：Go dialer.go:506-508 投递**前** sleep `scMinPostsIntervalMs.rand()`
+            // 毫秒（减去距上次投递的耗时）；此前恒 sleep `from` 且置于 POST 之后。
             if sc_min_posts_interval_ms.from > 0 {
                 let elapsed = last_write.elapsed().as_millis() as u64;
                 let delay = (sc_min_posts_interval_ms.rand() as u64).saturating_sub(elapsed);
@@ -121,6 +154,27 @@ pub async fn dial_packet_up(
                 }
             }
             last_write = std::time::Instant::now();
+
+            let client = Arc::clone(&client);
+            let base_uri = base_uri_for_task.clone();
+            let session_id = session_id_for_task.clone();
+            posts.spawn(async move {
+                let _permit = permit;
+                client.post_packet(&base_uri, &session_id, &seq_str, payload).await
+            });
+        }
+
+        // pipe EOF（连接关闭）或上传失败：等在飞 POST 收尾再退出，不中途丢弃。
+        while let Some(joined) = posts.join_next().await {
+            match joined {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => {
+                    crate::hot_log!(DEBUG, "error={e} post_packet failed while draining upload");
+                },
+                Err(e) => {
+                    crate::hot_log!(DEBUG, "error={e} upload post task join failed while draining");
+                },
+            }
         }
     });
 
