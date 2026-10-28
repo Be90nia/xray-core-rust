@@ -36,17 +36,24 @@ use crate::{
 pub enum SocksRequest {
     /// TCP CONNECT 请求。包含目标地址。
     TcpConnect(SocksAddr),
-    /// UDP ASSOCIATE 请求。包含 relay 地址和绑定的 UDP socket。
-    UdpAssociate(SocksAddr, tokio::net::UdpSocket),
+    /// UDP ASSOCIATE 请求。
+    ///
+    /// `relay` = 回复给客户端的 BND 地址；`request` = 客户端请求帧里的目标地址
+    /// （Go `protocol.go:211-219` 两分支的判据：域名/未指定 IP 走首包锁定，
+    /// 否则钉死请求 IP:port）；`socket` = 绑定的 UDP relay。
+    UdpAssociate { relay: SocksAddr, request: SocksAddr, socket: tokio::net::UdpSocket },
 }
 
 impl std::fmt::Debug for SocksRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SocksRequest::TcpConnect(addr) => f.debug_tuple("TcpConnect").field(addr).finish(),
-            SocksRequest::UdpAssociate(addr, _) => {
-                f.debug_tuple("UdpAssociate").field(addr).field(&"<UdpSocket>").finish()
-            },
+            SocksRequest::UdpAssociate { relay, request, .. } => f
+                .debug_struct("UdpAssociate")
+                .field("relay", relay)
+                .field("request", request)
+                .field("socket", &"<UdpSocket>")
+                .finish(),
         }
     }
 }
@@ -288,39 +295,25 @@ where
         let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
 
         // 回复 [VER=5, REP=0, RSV=0, ATYP, BND.ADDR, BND.PORT]
-        let octets = match relay_addr {
-            SocketAddr::V4(v4) => v4.ip().octets(),
-            SocketAddr::V6(v6) => {
-                let mut reply = vec![SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV6];
-                reply.extend_from_slice(&v6.ip().octets());
-                reply.extend_from_slice(&v6.port().to_be_bytes());
-                stream.write_all(&reply).await?;
-                return Ok(SocksRequest::UdpAssociate(
-                    SocksAddr::from_socket_addr(relay_addr),
-                    relay_socket,
-                ));
+        let mut reply = vec![SOCKS5_VERSION, STATUS_SUCCESS, 0x00];
+        match relay_addr {
+            SocketAddr::V4(v4) => {
+                reply.push(ATYP_IPV4);
+                reply.extend_from_slice(&v4.ip().octets());
             },
-        };
-        let port_bytes = relay_addr.port().to_be_bytes();
-        stream
-            .write_all(&[
-                SOCKS5_VERSION,
-                STATUS_SUCCESS,
-                0x00,
-                ATYP_IPV4,
-                octets[0],
-                octets[1],
-                octets[2],
-                octets[3],
-                port_bytes[0],
-                port_bytes[1],
-            ])
-            .await?;
+            SocketAddr::V6(v6) => {
+                reply.push(ATYP_IPV6);
+                reply.extend_from_slice(&v6.ip().octets());
+            },
+        }
+        reply.extend_from_slice(&relay_addr.port().to_be_bytes());
+        stream.write_all(&reply).await?;
 
-        return Ok(SocksRequest::UdpAssociate(
-            SocksAddr::from_socket_addr(relay_addr),
-            relay_socket,
-        ));
+        return Ok(SocksRequest::UdpAssociate {
+            relay: SocksAddr::from_socket_addr(relay_addr),
+            request: addr,
+            socket: relay_socket,
+        });
     }
 
     // TCP CONNECT: 回复成功 [VER=5, REP=0, RSV=0, ATYP=1, 0.0.0.0, 0]
@@ -774,14 +767,68 @@ mod tests {
         let result = server.await.unwrap();
         assert!(result.is_ok());
         match result.unwrap() {
-            SocksRequest::UdpAssociate(relay_addr, socket) => {
+            SocksRequest::UdpAssociate { relay: relay_addr, request, socket } => {
                 assert_eq!(
                     relay_addr.host,
                     crate::protocol::Host::Ipv4(std::net::Ipv4Addr::new(127, 0, 0, 1))
                 );
                 assert_eq!(relay_addr.port, relay_port);
+                // 请求地址 0.0.0.0:0 = 未指定 → 上层走首包锁定分支（Go protocol.go:211-219）
+                assert!(
+                    matches!(request.host, Host::Ipv4(ip) if ip.is_unspecified()),
+                    "unspecified request addr must be carried verbatim: {request:?}"
+                );
                 // Socket should be bound and usable
                 assert!(socket.local_addr().is_ok());
+            },
+            other => panic!("expected UdpAssociate, got {other:?}"),
+        }
+    }
+
+    /// bd jzre9：ASSOCIATE 请求帧里的**显式**目标地址（IP:port）必须原样透传，
+    /// 上层据此钉死 expectedRemote（Go `protocol.go:211-219` 第二分支）。
+    #[tokio::test]
+    async fn handshake_udp_associate_carries_explicit_request_addr() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig { udp_enabled: true, ..Default::default() };
+
+        let server = xray_common::testing::spawn(
+            "handshake-udp-associate-carries-request-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            },
+        );
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        // UDP ASSOCIATE，DST = 10.1.2.3:4567（显式指定来源地址）
+        client
+            .write_all(&[
+                SOCKS5_VERSION,
+                CMD_UDP_ASSOCIATE,
+                0x00,
+                ATYP_IPV4,
+                10,
+                1,
+                2,
+                3,
+                0x11,
+                0xD7,
+            ])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_SUCCESS);
+
+        match server.await.unwrap().unwrap() {
+            SocksRequest::UdpAssociate { request, .. } => {
+                assert_eq!(request.host, Host::Ipv4(std::net::Ipv4Addr::new(10, 1, 2, 3)));
+                assert_eq!(request.port, 4567);
             },
             other => panic!("expected UdpAssociate, got {other:?}"),
         }
@@ -1150,7 +1197,7 @@ mod tests {
         assert_eq!(&reply[4..8], &configured, "BND.ADDR must be the configured address");
 
         match server.await.unwrap().unwrap() {
-            SocksRequest::UdpAssociate(relay_addr, socket) => {
+            SocksRequest::UdpAssociate { relay: relay_addr, socket, .. } => {
                 assert_eq!(relay_addr.host, Host::Ipv4(std::net::Ipv4Addr::from(configured)));
                 assert_eq!(
                     socket.local_addr().unwrap().ip(),

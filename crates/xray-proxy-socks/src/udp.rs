@@ -430,7 +430,7 @@ mod tests {
     ) {
         let (mut ctrl, _) = listener.accept().await.expect("accept");
         let relay = match socks5_server_handshake(&mut ctrl, &config).await {
-            Ok(SocksRequest::UdpAssociate(_, relay)) => relay,
+            Ok(SocksRequest::UdpAssociate { socket: relay, .. }) => relay,
             Ok(other) => panic!("expected UdpAssociate, got {other:?}"),
             Err(e) => panic!("server handshake failed: {e}"),
         };
@@ -574,7 +574,7 @@ mod tests {
             xray_common::testing::spawn("ctrl-disconnect-closes-session-accept", async move {
                 let (mut ctrl, _) = listener.accept().await.expect("accept");
                 let relay = Arc::new(match socks5_server_handshake(&mut ctrl, &config).await {
-                    Ok(SocksRequest::UdpAssociate(_, relay)) => relay,
+                    Ok(SocksRequest::UdpAssociate { socket: relay, .. }) => relay,
                     Ok(other) => panic!("expected UdpAssociate, got {other:?}"),
                     Err(e) => panic!("handshake: {e}"),
                 });

@@ -5259,7 +5259,9 @@ mod tests {
             let Ok((mut ctrl, _)) = listener.accept().await else { return };
             let config = xray_proxy_socks::ServerConfig { udp_enabled: true, ..Default::default() };
             match xray_proxy_socks::socks5_server_handshake(&mut ctrl, &config).await {
-                Ok(xray_proxy_socks::server::SocksRequest::UdpAssociate(_, relay)) => {
+                Ok(xray_proxy_socks::server::SocksRequest::UdpAssociate {
+                    socket: relay, ..
+                }) => {
                     cmd_out.lock().push(xray_proxy_socks::CMD_UDP_ASSOCIATE);
                     // relay socket 未 connect：必须 recv_from/send_to——connected 语义的
                     // send 在 Windows 上失败即终止会话（run_udp_echo_server 同款形态）。
