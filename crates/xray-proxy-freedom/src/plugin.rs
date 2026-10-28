@@ -206,10 +206,9 @@ fn parse_settings_section(section: &serde_json::Value) -> Result<Config, PluginE
         None => Vec::new(),
     };
     let fragment = match settings.get("fragment") {
-        Some(f) => Some(
-            Fragment::from_json(f)
-                .map_err(|e| PluginError::Other(e.to_string().into()))?,
-        ),
+        Some(f) => {
+            Some(Fragment::from_json(f).map_err(|e| PluginError::Other(e.to_string().into()))?)
+        },
         None => None,
     };
     let noises: Vec<Noise> = settings

@@ -411,7 +411,12 @@ impl Noise {
                 (a, b, Vec::new())
             },
             "str" => (0, 0, packet_raw.into_bytes()),
-            "hex" => (0, 0, hex::decode(&packet_raw).map_err(|e| invalid(format!("Invalid hex string: {e}")))?),
+            "hex" => (
+                0,
+                0,
+                hex::decode(&packet_raw)
+                    .map_err(|e| invalid(format!("Invalid hex string: {e}")))?,
+            ),
             "base64" => (0, 0, decode_base64(&packet_raw)?),
             "" => {
                 let (a, b) = (dialect(v, "lengthMin"), dialect(v, "lengthMax"));
@@ -431,7 +436,13 @@ impl Noise {
             Some(d) => json_range(d)?,
             None => (dialect(v, "delayMin"), dialect(v, "delayMax")),
         };
-        let apply_to = match v.get("applyTo").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        let apply_to = match v
+            .get("applyTo")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "" | "ip" | "all" => "ip",
             "ipv4" => "ipv4",
             "ipv6" => "ipv6",
@@ -1187,8 +1198,10 @@ mod tests {
             .unwrap_err();
         assert!(e.to_string().contains("Interval can't be empty"), "{e}");
 
-        let e = Fragment::from_json(&serde_json::json!({"packets": "0-3", "length": "1-2", "interval": 1}))
-            .unwrap_err();
+        let e = Fragment::from_json(
+            &serde_json::json!({"packets": "0-3", "length": "1-2", "interval": 1}),
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("PacketsFrom can't be 0"), "{e}");
     }
 
@@ -1210,12 +1223,12 @@ mod tests {
         assert!(n.packet.is_empty());
         assert_eq!(n.apply_to, "ip", "缺省 applyTo = ip");
 
-        let n = Noise::from_json(&serde_json::json!({"type": "str", "packet": " AA "}))
-            .expect("str");
+        let n =
+            Noise::from_json(&serde_json::json!({"type": "str", "packet": " AA "})).expect("str");
         assert_eq!(n.packet, b"AA", "packet 两端空白按 Go TrimSpace 去掉");
 
-        let n = Noise::from_json(&serde_json::json!({"type": "hex", "packet": "0aff"}))
-            .expect("hex");
+        let n =
+            Noise::from_json(&serde_json::json!({"type": "hex", "packet": "0aff"})).expect("hex");
         assert_eq!(n.packet, vec![0x0a, 0xff]);
 
         let n = Noise::from_json(&serde_json::json!({"type": "base64", "packet": "-_8"}))
@@ -1231,17 +1244,18 @@ mod tests {
 
         let e = Noise::from_json(&serde_json::json!({"type": "bogus", "packet": "x"})).unwrap_err();
         assert!(e.to_string().contains("only rand/str/hex/base64"), "{e}");
-        let e = Noise::from_json(&serde_json::json!({"type": "str", "applyTo": "ipv5"})).unwrap_err();
+        let e =
+            Noise::from_json(&serde_json::json!({"type": "str", "applyTo": "ipv5"})).unwrap_err();
         assert!(e.to_string().contains("only ip/ipv4/ipv6"), "{e}");
     }
 
     #[test]
     fn noise_dialect_keys_still_parse() {
-        let n = Noise::from_json(&serde_json::json!({"packet": "rand", "delayMin": 1})).expect("方言");
+        let n =
+            Noise::from_json(&serde_json::json!({"packet": "rand", "delayMin": 1})).expect("方言");
         assert!(n.packet.is_empty());
         assert_eq!(n.delay_min, 1);
     }
-
 
     // ===== RuleAction =====
 

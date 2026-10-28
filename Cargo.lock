@@ -1879,7 +1879,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -3599,7 +3599,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
@@ -3741,9 +3741,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4272,7 +4272,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5082,14 +5082,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.8"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -5692,7 +5692,7 @@ dependencies = [
  "udf-skeleton",
  "udf-skeleton-infra",
  "udf-std-ext",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "xray-common",
  "xray-features",
  "xray-frame",
@@ -5832,7 +5832,7 @@ dependencies = [
  "tracing",
  "udf-skeleton",
  "udf-skeleton-infra",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "windows-sys 0.61.2",
  "xray-common",
  "xray-features",
@@ -6012,7 +6012,7 @@ dependencies = [
  "tracing",
  "udf-skeleton-infra",
  "uuid",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "x25519-dalek",
  "xray-app-commander",
  "xray-app-dispatcher",
@@ -6660,7 +6660,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "x25519-dalek",
  "xray-common",
  "xray-proto",
@@ -6727,7 +6727,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "udf-skeleton",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "x25519-dalek",
  "x509-parser",
  "xray-common",
@@ -6768,7 +6768,7 @@ dependencies = [
  "tracing",
  "udf-skeleton-infra",
  "uuid",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "windows-sys 0.59.0",
  "xray-buf",
  "xray-common",
@@ -6951,7 +6951,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "uuid",
- "webpki-roots 1.0.8",
+ "webpki-roots 1.0.11",
  "xray-buf",
  "xray-common",
  "xray-features",

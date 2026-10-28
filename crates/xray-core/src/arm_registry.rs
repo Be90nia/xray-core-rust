@@ -328,7 +328,7 @@ mod tests {
             "trojan" => in_entries::trojan_entry,
             "vmess" => in_entries::vmess_entry,
             "http" => in_entries::http_entry,
-            "dokodemo" => in_entries::dokodemo_entry,
+            "dokodemo" | "dokodemo-door" => in_entries::dokodemo_entry,
             "shadowsocks" => in_entries::shadowsocks_entry,
             "hysteria" | "hysteria2" => in_entries::hysteria_entry,
             "anytls" => in_entries::anytls_entry,
