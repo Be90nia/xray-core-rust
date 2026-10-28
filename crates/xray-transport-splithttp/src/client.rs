@@ -613,7 +613,21 @@ impl DefaultDialerClient {
 
         // 2. 构造 hyper Request，body 用 StreamBody
         let streaming_body = make_stream_body(body_stream);
-        let req = Self::build_request_with_body(meta, streaming_body)?;
+        let mut req = Self::build_request_with_body(meta, streaming_body)?;
+        // bd biuu5：明文 h1 流式上传必须带 `Connection: close`（Go dialer.go
+        // `DisableKeepAlives: true` 等价）。Go h1 服务端未 EnableFullDuplex——未
+        // 读完请求体不写响应，而 xhttp 上传体是永不结束的 chunked 流，keep-alive
+        // 请求下两端互等；`close` 使 Go 跳过 discard-request-body 直接写响应
+        // （位级取证 reports/audit-2026-10-28/parity-s1-wire.md §4 F2）。
+        // 仅明文路径加：hyper-util legacy client 明文只走 h1（无 h2c），scheme
+        // =http 即明文 h1；TLS 路径（scheme=https）协商 h2 时 Connection 属非法
+        // 头且 h2 双向全通，不加。
+        if req.uri().scheme_str() == Some("http") {
+            req.headers_mut().insert(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("close"),
+            );
+        }
 
         // 3. 发送请求
         let resp = self.client.request(req).await.map_err(|e| {
@@ -633,8 +647,13 @@ impl DefaultDialerClient {
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
 
         if upload_only {
-            // stream-up：drain body，返回 None
-            let _ = resp.into_body().collect().await;
+            // stream-up：主路径立即返回，响应体后台丢弃（Go client.go uploadOnly
+            // 分支把 io.Copy(io.Discard, resp.Body) 放 goroutine）。stream-up 的
+            // POST 响应体是永不结束的 SSE/keepalive 流（服务端每
+            // scStreamUpServerSecs 推一次 X-padding），inline await 会把 dial
+            // 永久挂死（bd 43lut）；且 collect() 会把 padding 持续堆进内存，
+            // 必须逐帧丢弃。
+            spawn_upload_body_drain(resp.into_body());
             Ok((None, remote, local))
         } else {
             // stream-one：检查 200 + 返回 body stream
@@ -712,6 +731,25 @@ impl DefaultDialerClient {
 /// `hyper::Error` → `std::io::Error`（h2 body 流转发用）。
 pub(crate) fn hyper_err_to_io(e: hyper::Error) -> std::io::Error {
     std::io::Error::other(e.to_string())
+}
+
+/// stream-up POST 响应体的后台丢弃任务（Go `io.Copy(io.Discard, resp.Body)`
+/// goroutine 等价）。响应体永不主动结束（SSE keepalive），连接死亡或服务端
+/// 关闭会话时读端报错/EOF，任务自然退出。
+fn spawn_upload_body_drain(body: hyper::body::Incoming) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；stream-up 上传响应体后台丢弃任务，FxScope 迁移收口见 bd 39hko"
+    )]
+    tokio::spawn(async move {
+        let mut body = body;
+        while let Some(frame) = body.frame().await {
+            if let Err(e) = frame {
+                crate::hot_log!(DEBUG, "error={e} stream-up upload response drain");
+                break;
+            }
+        }
+    });
 }
 
 /// packet-up 重放资格判定（Go `canRetryError`，x/net http2 transport_common.go:

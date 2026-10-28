@@ -771,3 +771,240 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
 
     let _ = listener.close();
 }
+
+// ===== bd 43lut / biuu5：stream-up 明文 h1 流式上传拨号契约 =====
+
+/// 200 + 永不结束的响应体（stream-up POST 响应真实形态：SSE keepalive 流，
+/// 服务端每 scStreamUpServerSecs 推一次 padding，永不 EOF）。
+fn never_ending_body() -> http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible> {
+    use futures_util::TryStreamExt as _;
+    let (tx, rx) =
+        tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::convert::Infallible>>();
+    tx.send(Ok(Bytes::from_static(b"ok"))).ok();
+    // tx 由挂起任务持有且永不再发数据：响应体保持未结束状态
+    tokio::spawn(async move {
+        std::future::pending::<()>().await;
+        drop(tx);
+    });
+    http_body_util::BodyExt::boxed(http_body_util::StreamBody::new(
+        tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map_ok(hyper::body::Frame::data),
+    ))
+}
+
+/// bd 43lut：stream-up（upload_only=true）拨号必须在响应体未结束时立即返回
+/// （响应体由后台任务逐帧丢弃，Go io.Copy(io.Discard, resp.Body) goroutine
+/// 等价）。回归形态：inline collect().await 等永不结束的 SSE 流 → 本测试超时。
+#[tokio::test]
+async fn stream_up_dial_returns_while_upload_response_body_open() {
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let got_post = Arc::new(AtomicBool::new(false));
+
+    tokio::spawn({
+        let got_post = got_post.clone();
+        async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let got_post = got_post.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let got_post = got_post.clone();
+                        async move {
+                            if req.method() == Method::POST {
+                                got_post.store(true, Ordering::Relaxed);
+                            }
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(never_ending_body())
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        }
+    });
+
+    let config = Arc::new(Config::default());
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+        None,
+    ));
+    let base_uri = format!("http://127.0.0.1:{}/", addr.port());
+    // 空 stream body：请求体立即完结，焦点在响应体永不结束
+    let upload = futures_util::stream::iter(Vec::<std::io::Result<Bytes>>::new());
+    let dial = client.open_stream_uploading(&base_uri, "43lut-sess", upload, true);
+    let (body_opt, _, _) = tokio::time::timeout(Duration::from_secs(10), dial)
+        .await
+        .expect("stream-up dial must return while upload response body is open (bd 43lut)")
+        .expect("dial ok");
+    assert!(body_opt.is_none(), "upload_only=true must return None body");
+    assert!(got_post.load(Ordering::Relaxed), "server must see the POST");
+}
+
+/// bd biuu5：明文 h1 流式上传请求必须带 `Connection: close`。Go h1 服务端未
+/// EnableFullDuplex——未读完永不结束的 chunked 上传体不写响应，缺该头两端
+/// 互等（Go DisableKeepAlives: true 恒发，位级取证 parity-s1-wire.md §4 F2）。
+#[tokio::test]
+async fn stream_up_plain_h1_request_carries_connection_close() {
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+
+    tokio::spawn({
+        let captured = captured.clone();
+        async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            if req.method() == Method::POST {
+                                let mut c = captured.lock().unwrap();
+                                c.extend(req.headers().iter().map(|(k, v)| {
+                                    format!("{k}: {}", String::from_utf8_lossy(v.as_bytes()))
+                                }));
+                            }
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(never_ending_body())
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        }
+    });
+
+    let config = Arc::new(Config::default());
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+        None,
+    ));
+    let base_uri = format!("http://127.0.0.1:{}/", addr.port());
+    let upload = futures_util::stream::iter(Vec::<std::io::Result<Bytes>>::new());
+    let dial = client.open_stream_uploading(&base_uri, "biuu5-h1-sess", upload, true);
+    let (_, _, _) = tokio::time::timeout(Duration::from_secs(10), dial)
+        .await
+        .expect("dial must return (missing Connection: close deadlocks Go h1 server)")
+        .expect("dial ok");
+
+    let hdrs = captured.lock().unwrap().clone();
+    assert!(!hdrs.is_empty(), "POST must have reached server (dial returned only after response)");
+    let close = hdrs.iter().filter(|h| h.to_ascii_lowercase().starts_with("connection")).count();
+    assert_eq!(close, 1, "exactly one Connection header expected, got {hdrs:?}");
+    assert!(
+        hdrs.iter().any(|h| {
+            h.to_ascii_lowercase().starts_with("connection:")
+                && h.split_once(':')
+                    .map(|(_, v)| v.trim().eq_ignore_ascii_case("close"))
+                    .unwrap_or(false)
+        }),
+        "plain h1 streaming upload must carry `Connection: close`, got {hdrs:?}"
+    );
+}
+
+/// bd biuu5 反向契约：TLS/h2 路径的流式上传请求**不带** Connection 头
+/// （h2 协议禁 Connection 头，且 h2 路径双向全通不得破坏）。
+#[tokio::test]
+async fn stream_upload_tls_h2_request_has_no_connection_header() {
+    ensure_crypto_provider();
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+    let mut server_cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key)
+        .unwrap();
+    server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let server_cfg = Arc::new(server_cfg);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+
+    let server = tokio::spawn({
+        let captured = captured.clone();
+        async move {
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let acceptor = acceptor.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else { return };
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            if req.method() == Method::POST {
+                                let mut c = captured.lock().unwrap();
+                                c.extend(req.headers().iter().map(|(k, v)| {
+                                    format!("{k}: {}", String::from_utf8_lossy(v.as_bytes()))
+                                }));
+                            }
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(never_ending_body())
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(TokioIo::new(tls), svc)
+                    .await;
+                });
+            }
+        }
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let tls_config =
+        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let config = Arc::new(Config::default());
+    let client = Arc::new(DefaultDialerClient::new(
+        config,
+        tls_config,
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: "127.0.0.1".into() },
+        None,
+        None,
+        None,
+    ));
+    let base_uri = format!("https://127.0.0.1:{}/", addr.port());
+    let upload = futures_util::stream::iter(Vec::<std::io::Result<Bytes>>::new());
+    let dial = client.open_stream_uploading(&base_uri, "biuu5-h2-sess", upload, true);
+    let (_, _, _) = tokio::time::timeout(Duration::from_secs(15), dial)
+        .await
+        .expect("h2 dial must return")
+        .expect("dial ok");
+
+    let hdrs = captured.lock().unwrap().clone();
+    assert!(!hdrs.is_empty(), "POST must have reached server (dial returned only after response)");
+    assert!(
+        !hdrs.iter().any(|h| h.to_ascii_lowercase().starts_with("connection")),
+        "h2/TLS streaming upload must not carry Connection header, got {hdrs:?}"
+    );
+
+    server.abort();
+}
