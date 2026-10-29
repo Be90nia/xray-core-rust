@@ -8663,6 +8663,7 @@ mod tests {
     #[tokio::test]
     async fn plain_http_dispatch_strips_splice_eligibility() {
         use std::sync::Mutex;
+
         use xray_common::platform::splice::{CAN_SPLICE_COPY_NEVER, CAN_SPLICE_COPY_YES};
 
         struct CaptureDispatch(Arc<Mutex<Option<xray_app_dispatcher::AccessContext>>>);
@@ -8721,13 +8722,8 @@ mod tests {
         };
         let captured_in = Arc::clone(&captured);
         tokio::spawn(async move {
-            handle_plain_http(
-                &mut server,
-                &hs,
-                Arc::new(CaptureDispatch(captured_in)),
-                access,
-            )
-            .await;
+            handle_plain_http(&mut server, &hs, Arc::new(CaptureDispatch(captured_in)), access)
+                .await;
         });
 
         // dispatch 摘除信号 + 关下行 → 客户端收 503 收尾（同步点 = 信号已捕获）。
@@ -8737,11 +8733,9 @@ mod tests {
             .expect("503 within 5s")
             .unwrap();
 
-        let got =
-            captured.lock().unwrap().clone().expect("dispatch must receive access context");
+        let got = captured.lock().unwrap().clone().expect("dispatch must receive access context");
         assert_eq!(
-            got.can_splice_copy,
-            CAN_SPLICE_COPY_NEVER,
+            got.can_splice_copy, CAN_SPLICE_COPY_NEVER,
             "plain HTTP leg must strip splice eligibility"
         );
         assert!(got.conn.is_none(), "plain HTTP leg must not leak the raw client fd");
