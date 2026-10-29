@@ -38,8 +38,8 @@ use crate::{
         parse_socks_server_config, parse_ss_inbound_config, parse_tuic_inbound_config,
         parse_wireguard_inbound_config, register_ss_user_manager, serve_dns, serve_dokodemo,
         serve_dokodemo_udp_on, serve_http, serve_mixed, serve_reality_trojan, serve_reality_vless,
-        serve_socks5, serve_ss, spawn_inbound_serve, spawn_transport_listener_inbound,
-        ss_mode_conn_pipeline, transport_conn_addrs,
+        serve_ss, spawn_inbound_serve, spawn_transport_listener_inbound, ss_mode_conn_pipeline,
+        transport_conn_addrs,
     },
     outbound::dns_idle_timeout_for,
 };
@@ -66,18 +66,45 @@ pub(crate) async fn build_socks_inbound(
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
     let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+    // Go `proxy/socks/server.go:38-43`：socks 端口的 Server **无条件**构造一个
+    // httpServer，首字节 ∉ {0x05,0x04} 即转 `httpServer.ProcessWithFirstbyte`
+    // （`:87-90`）——即 Go 的 socks 端口同时服务 SOCKS5 与 HTTP 代理。故这里复用
+    // mixed 的 serve 栈（同一 listener 上 socks + http），不另造一份 HTTP 实现。
+    // HTTP 侧只在 socks 配了 password 认证时继承 accounts（`:47-49`），userLevel
+    // 与 socks 同源（同一个 settings JSON）。
+    let mut http_cfg = if ib.entry.data.is_empty() {
+        // 空 settings = `{}`（Go 零值配置）；`parse_http_config` 不接受空切片。
+        parse_http_config(b"{}")?
+    } else {
+        parse_http_config(&ib.entry.data)?
+    };
+    if config.auth_type != xray_proxy_socks::config::AuthType::Password {
+        http_cfg.accounts.clear();
+    }
+    let http_cfg = Arc::new(http_cfg);
     // 握手限时（Go proxy/socks：SetReadDeadline(policy().Timeouts.Handshake)）
-    let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
+    let handshake_timeout = handshake_timeout_for(&policy, config.user_level);
     // UDP associate 空闲时限（Go server.go:171-175 `SetTimeout(
     // plcy.Timeouts.ConnectionIdle)`，ForLevel 按 userLevel 查档）。
     let udp_idle = policy
         .as_ref()
         .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
         .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
-    tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening");
+    tracing::info!(tag = %ib.tag, addr = %addr, auth = ?config.auth_type, udp = config.udp_enabled, "socks5 inbound listening (http proxy fallback on non-SOCKS first byte)");
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
         let plugin_ctx = Arc::clone(&plugin_ctx);
-        async move { serve_socks5(listener, ohm, config, handshake_timeout, udp_idle, plugin_ctx).await }
+        async move {
+            serve_mixed(
+                listener,
+                ohm,
+                config,
+                http_cfg,
+                Some(handshake_timeout),
+                udp_idle,
+                plugin_ctx,
+            )
+            .await
+        }
     })))
 }
 
@@ -1097,4 +1124,96 @@ pub(crate) fn freedom_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.addr,
         Arc::new(ctx.plugin_ctx),
     ))
+}
+
+#[cfg(test)]
+mod socks_http_fallback_tests {
+    //! D-S1 回归：Go `proxy/socks/server.go:38-43` 无条件构造 httpServer +
+    //! `:87-90` 首字节 ∉ {0x05,0x04} → 按 HTTP 请求解析 —— Go 的 socks 端口
+    //! 同时服务 SOCKS5 与 HTTP 代理。本模块直接打生产构造函数
+    //! [`build_socks_inbound`]（构造臂是唯一入口），断言 HTTP CONNECT 能被解析、
+    //! 回 `200 Connection established`，并把目标交给 dispatch。
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use xray_app_dispatcher::default::{DispatchHandler, PinFuture};
+    use xray_conf::{BuiltEntry, BuiltInbound};
+
+    use super::*;
+
+    /// dispatch 桩：只把 dest 回传（不拨号），经 channel 交回测试体。
+    #[derive(Debug)]
+    struct DestRecorder(tokio::sync::mpsc::UnboundedSender<String>);
+
+    impl DispatchHandler for DestRecorder {
+        fn tag(&self) -> &str {
+            "dest-recorder"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &xray_common::net::destination::Destination,
+            _link: xray_transport::link::Link,
+        ) -> PinFuture<()> {
+            let _ = self.0.send(format!("{dest:?}"));
+            Box::pin(async {})
+        }
+    }
+
+    fn socks_inbound(port: u16) -> BuiltInbound {
+        BuiltInbound {
+            entry: BuiltEntry { kind: "socks".into(), data: b"{}".to_vec() },
+            tag: "socks-http-fallback".into(),
+            port: Some(port),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn socks_inbound_serves_http_proxy_on_non_socks_first_byte() {
+        // 端口先绑 0 取号再释放：bind 由构造函数自己完成（同端口随即复用）。
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ohm.set_default(Arc::new(DestRecorder(tx)) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let ib = socks_inbound(port);
+        let _serve = build_socks_inbound(
+            &ib,
+            ohm,
+            None,
+            CancellationToken::new(),
+            &format!("127.0.0.1:{port}"),
+            &xray_transport::dialer::StreamSettings::default(),
+            Arc::new(xray_frame::PluginContext::for_plugin("socks-http-fallback")),
+        )
+        .await
+        .expect("socks inbound must build")
+        .expect("socks inbound must spawn");
+
+        // 首字节 'C'(0x43) ∉ {0x05,0x04} → Go 走 HTTP 代理路径
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        // CONNECT 回包固定 39 字节（Go `proxy/http/server.go:177`）
+        let mut head = [0u8; 39];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut head))
+            .await
+            .expect("socks 端口的 HTTP fallback 必须回 CONNECT 响应")
+            .unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200 Connection established\r\n\r\n");
+
+        let dest = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("HTTP CONNECT 的目标必须交给 dispatch")
+            .expect("recorder 通道未关");
+        assert!(dest.contains("example.com"), "dispatch 目标须是 CONNECT 目标: {dest}");
+    }
 }

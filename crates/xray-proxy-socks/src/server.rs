@@ -26,9 +26,9 @@ use crate::{
     error::{Result, SocksError},
     protocol::{
         ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6, AUTH_NO_MATCHING_METHOD, AUTH_NOT_REQUIRED,
-        AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_UDP_ASSOCIATE, Host, SOCKS4_REQUEST_GRANTED,
-        SOCKS4_REQUEST_REJECTED, SOCKS4_VERSION, SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT,
-        STATUS_SUCCESS, SocksAddr, parse_address_port,
+        AUTH_PASSWORD, CMD_TCP_CONNECT, CMD_TOR_RESOLVE, CMD_TOR_RESOLVE_PTR, CMD_UDP_ASSOCIATE,
+        Host, SOCKS4_REQUEST_GRANTED, SOCKS4_REQUEST_REJECTED, SOCKS4_VERSION, SOCKS5_VERSION,
+        STATUS_CMD_NOT_SUPPORT, STATUS_SUCCESS, SocksAddr, parse_address_port,
     },
 };
 
@@ -279,10 +279,14 @@ where
     // 不校验 VER/RSV——`VER=0x04` 的畸形请求照常放行。RFC 1928 要求 VER=5，
     // 本实现按「与 Go 行为对齐」裁决不校验。
     let cmd = req_header[1];
-    if cmd != CMD_TCP_CONNECT && cmd != CMD_UDP_ASSOCIATE {
+    // Go `protocol.go:168-170`：`case cmdTCPConnect, cmdTorResolve, cmdTorResolvePTR:`
+    // —— 注释原文 "We don't have a solution for Tor case now. Simply treat it as
+    // connect command."；其余 CMD（含 0x02 BIND）走 `:173-176` 的 CMD_NOT_SUPPORT。
+    if !matches!(cmd, CMD_TCP_CONNECT | CMD_UDP_ASSOCIATE | CMD_TOR_RESOLVE | CMD_TOR_RESOLVE_PTR) {
         let _ = stream.write_all(&encode_socks5_reply(STATUS_CMD_NOT_SUPPORT, None)).await;
         return Err(SocksError::HandshakeFailed(format!(
-            "unsupported CMD: {cmd} (only CONNECT=1 and UDP_ASSOCIATE=3 supported)"
+            "unsupported CMD: {cmd} (CONNECT=1 / UDP_ASSOCIATE=3 / TorResolve=0xF0 / \
+             TorResolvePTR=0xF1)"
         )));
     }
     // UDP ASSOCIATE 需 udp_enabled（Go protocol.go:171-175）：未启用时回 CMD not supported 并拒绝
@@ -1332,6 +1336,64 @@ mod tests {
         assert_eq!(reply[1], STATUS_SUCCESS, "Go 不校验请求 VER，须照常成功");
 
         assert!(matches!(server.await.unwrap().unwrap(), SocksRequest::TcpConnect(_)));
+    }
+
+    /// D-S2（bd rbd9l）：Go `protocol.go:168-170` 把 CMD=0xF0（TorResolve）/
+    /// 0xF1（TorResolvePTR）与 CONNECT 并列——注释原文 "We don't have a solution
+    /// for Tor case now. Simply treat it as connect command."；其余不支持的 CMD
+    /// （0x02 BIND）仍回 `05 07 00 01 00000000 0000` 并断链（`:173-176`）。
+    #[tokio::test]
+    async fn tor_resolve_cmds_treated_as_connect_bind_still_rejected() {
+        for (cmd, must_succeed) in [
+            (CMD_TOR_RESOLVE, true),
+            (CMD_TOR_RESOLVE_PTR, true),
+            (crate::protocol::CMD_TCP_BIND, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = ServerConfig::default();
+
+            let server = xray_common::testing::spawn(
+                "tor-resolve-cmds-treated-as-connect-accept",
+                async move {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let local = sock.local_addr().unwrap();
+                    let r = socks_handshake(&mut sock, &config, Some(local)).await;
+                    if r.is_err() {
+                        // 拒绝后仍有未读请求字节：立即 drop 会 RST 吞掉在途拒绝帧
+                        // （Windows loopback 竞态，见 v49 教训）
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    r
+                },
+            );
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+            let mut resp = [0u8; 2];
+            client.read_exact(&mut resp).await.unwrap();
+            client
+                .write_all(&[SOCKS5_VERSION, cmd, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).await.unwrap();
+
+            let result = server.await.unwrap();
+            if must_succeed {
+                assert_eq!(reply[1], STATUS_SUCCESS, "CMD=0x{cmd:02X} 须当 CONNECT 处理");
+                match result.unwrap() {
+                    SocksRequest::TcpConnect(a) => {
+                        assert_eq!(a.host, Host::Ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+                        assert_eq!(a.port, 80);
+                    },
+                    other => panic!("expected TcpConnect, got {other:?}"),
+                }
+            } else {
+                assert_eq!(reply[1], STATUS_CMD_NOT_SUPPORT, "CMD=0x{cmd:02X} 须拒绝");
+                assert!(result.is_err());
+            }
+        }
     }
 
     /// D-12（Go `common/protocol/address.go:204-222`）：`ATYP=Domain` + `LEN=0`

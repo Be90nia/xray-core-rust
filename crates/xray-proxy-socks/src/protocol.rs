@@ -40,6 +40,11 @@ pub const CMD_TCP_CONNECT: u8 = 0x01;
 pub const CMD_TCP_BIND: u8 = 0x02;
 /// CMD: UDP ASSOCIATE。对应 Go `cmdUDPAssociate`。
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
+/// CMD: Tor resolve。对应 Go `cmdTorResolve`——Go 把它当 CONNECT 处理
+/// （`protocol.go:168-170` "Simply treat it as connect command."）。
+pub const CMD_TOR_RESOLVE: u8 = 0xF0;
+/// CMD: Tor resolve (PTR)。对应 Go `cmdTorResolvePTR`，同上按 CONNECT 处理。
+pub const CMD_TOR_RESOLVE_PTR: u8 = 0xF1;
 
 // ===== SOCKS4 响应码 =====
 
