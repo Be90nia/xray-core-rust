@@ -392,7 +392,9 @@ where
     // Process: SetReadDeadline(policy().Timeouts.Handshake)，超时断开；仅覆盖
     // 握手阶段，dispatch 数据路径不限时）
     let socks_req = {
-        let handshake_fut = socks_handshake(&mut stream, config);
+        // bd hzjgv D-9：CONNECT 回复的 BND 回本端地址（Go `inbound.Gateway`）
+        let gateway = stream.inbound_local();
+        let handshake_fut = socks_handshake(&mut stream, config, gateway);
         let res = match handshake_timeout {
             Some(d) => tokio::time::timeout(d, handshake_fut).await,
             None => Ok(handshake_fut.await),
@@ -734,7 +736,9 @@ pub(crate) async fn serve_mixed(
                     // SOCKS 路径（0x05 = SOCKS5 / 0x04 = SOCKS4；握手与 sniff/http
                     // 段共用同一限时）。版本分派在库层 `socks_handshake` 内按首字节
                     // 完成（Go `handshake4`/`handshake5` 同款），此处只做入口分流。
-                    let hs_fut = socks_handshake(&mut stream, &socks_cfg);
+                    // bd hzjgv D-9：CONNECT 回复的 BND 回本端地址（Go `inbound.Gateway`）
+                    let gateway = stream.inbound_local();
+                    let hs_fut = socks_handshake(&mut stream, &socks_cfg, gateway);
                     let hs = match handshake_timeout {
                         Some(d) => match tokio::time::timeout(d, hs_fut).await {
                             Ok(r) => r,

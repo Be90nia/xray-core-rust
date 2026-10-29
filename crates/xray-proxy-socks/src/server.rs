@@ -141,7 +141,7 @@ impl InboundHandler for SocksServer {
                             let fx = Arc::clone(&fx_conns);
                             let log = log.clone();
                             fx.spawn_tracked(async move {
-                                match socks_handshake(&mut stream, &config).await {
+                                match socks_handshake(&mut stream, &config, Some(bound)).await {
                                     Ok(addr) => {
                                         log.info(format!(
                                             "SOCKS5 handshake succeeded tag={tag} peer={peer} dest={addr:?}"
@@ -188,6 +188,9 @@ impl InboundHandler for SocksServer {
 
 /// SOCKS5 服务端握手（读 VER+NMETHODS 起始）。保留为独立可用入口，
 /// `兼容既有调用方与单测；内部委托 `socks5_handshake_from_methods`。`
+///
+/// 本入口无本端地址上下文 → CONNECT 成功回复的 BND 回 `0.0.0.0:0` 占位；
+/// 生产路径用 [`socks_handshake`] 并传入本端网关地址（Go `inbound.Gateway`）。
 pub async fn socks5_server_handshake<RW>(
     stream: &mut RW,
     config: &ServerConfig,
@@ -203,14 +206,22 @@ where
             header[0]
         )));
     }
-    socks5_handshake_from_methods(stream, header[1] as usize, config).await
+    socks5_handshake_from_methods(stream, header[1] as usize, config, None).await
 }
 
 /// SOCKS 版本路由：读首字节区分 SOCKS4/4a 与 SOCKS5，转交对应握手。
 ///
 /// 这是 inbound 生产入口——服务端需同时兼容 SOCKS4/4a/5 客户端。
 /// 对应 Go `ServerSession.handshake4` / `handshake5` 的版本分发。
-pub async fn socks_handshake<RW>(stream: &mut RW, config: &ServerConfig) -> Result<SocksRequest>
+///
+/// `gateway` = 本端监听地址（Go `inbound.Gateway`，`proxyman/inbound/worker.go:114`）：
+/// Go 在 CONNECT 成功回复里回 `s.address/s.port` 即该值（`protocol.go:221`）。
+/// 调用方取不到本端地址时传 `None`（BND 回 `0.0.0.0:0` 占位）。
+pub async fn socks_handshake<RW>(
+    stream: &mut RW,
+    config: &ServerConfig,
+    gateway: Option<SocketAddr>,
+) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -220,7 +231,7 @@ where
         SOCKS5_VERSION => {
             let mut nm = [0u8; 1];
             stream.read_exact(&mut nm).await?;
-            socks5_handshake_from_methods(stream, nm[0] as usize, config).await
+            socks5_handshake_from_methods(stream, nm[0] as usize, config, gateway).await
         },
         SOCKS4_VERSION => socks4_handshake(stream, config).await,
         v => Err(SocksError::HandshakeFailed(format!("unsupported SOCKS version: {v}"))),
@@ -232,11 +243,15 @@ async fn socks5_handshake_from_methods<RW>(
     stream: &mut RW,
     nmethods: usize,
     config: &ServerConfig,
+    gateway: Option<SocketAddr>,
 ) -> Result<SocksRequest>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     if nmethods == 0 {
+        // D-10（bd hzjgv）：Go `auth5`（protocol.go:101-117）读 0 个方法后仍写
+        // `05 FF`（NO ACCEPTABLE METHODS）再报错；直接断链会让客户端无法归因。
+        let _ = stream.write_all(&[SOCKS5_VERSION, AUTH_NO_MATCHING_METHOD]).await;
         return Err(SocksError::HandshakeFailed("no auth methods offered".into()));
     }
 
@@ -260,24 +275,19 @@ where
     // 读请求帧
     let mut req_header = [0u8; 4]; // VER, CMD, RSV, ATYP
     stream.read_exact(&mut req_header).await?;
-    if req_header[0] != SOCKS5_VERSION {
-        return Err(SocksError::HandshakeFailed(format!(
-            "invalid request version: {}",
-            req_header[0]
-        )));
-    }
+    // D-11（bd hzjgv）：Go `handshake5`（protocol.go:143-160）只取第 2 字节 CMD，
+    // 不校验 VER/RSV——`VER=0x04` 的畸形请求照常放行。RFC 1928 要求 VER=5，
+    // 本实现按「与 Go 行为对齐」裁决不校验。
     let cmd = req_header[1];
     if cmd != CMD_TCP_CONNECT && cmd != CMD_UDP_ASSOCIATE {
-        let reply = [SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
-        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(&encode_socks5_reply(STATUS_CMD_NOT_SUPPORT, None)).await;
         return Err(SocksError::HandshakeFailed(format!(
             "unsupported CMD: {cmd} (only CONNECT=1 and UDP_ASSOCIATE=3 supported)"
         )));
     }
     // UDP ASSOCIATE 需 udp_enabled（Go protocol.go:171-175）：未启用时回 CMD not supported 并拒绝
     if cmd == CMD_UDP_ASSOCIATE && !config.udp_enabled {
-        let reply = [SOCKS5_VERSION, STATUS_CMD_NOT_SUPPORT, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0];
-        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(&encode_socks5_reply(STATUS_CMD_NOT_SUPPORT, None)).await;
         return Err(SocksError::HandshakeFailed("UDP is not enabled".into()));
     }
 
@@ -293,21 +303,7 @@ where
         let relay_socket =
             tokio::net::UdpSocket::bind((bind_ip, 0)).await.map_err(SocksError::Io)?;
         let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
-
-        // 回复 [VER=5, REP=0, RSV=0, ATYP, BND.ADDR, BND.PORT]
-        let mut reply = vec![SOCKS5_VERSION, STATUS_SUCCESS, 0x00];
-        match relay_addr {
-            SocketAddr::V4(v4) => {
-                reply.push(ATYP_IPV4);
-                reply.extend_from_slice(&v4.ip().octets());
-            },
-            SocketAddr::V6(v6) => {
-                reply.push(ATYP_IPV6);
-                reply.extend_from_slice(&v6.ip().octets());
-            },
-        }
-        reply.extend_from_slice(&relay_addr.port().to_be_bytes());
-        stream.write_all(&reply).await?;
+        stream.write_all(&encode_socks5_reply(STATUS_SUCCESS, Some(relay_addr))).await?;
 
         return Ok(SocksRequest::UdpAssociate {
             relay: SocksAddr::from_socket_addr(relay_addr),
@@ -316,10 +312,34 @@ where
         });
     }
 
-    // TCP CONNECT: 回复成功 [VER=5, REP=0, RSV=0, ATYP=1, 0.0.0.0, 0]
-    stream.write_all(&[SOCKS5_VERSION, STATUS_SUCCESS, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]).await?;
+    // TCP CONNECT: BND = 本端网关（Go `writeSocks5Response(..., responseAddress, responsePort)`，
+    // protocol.go:221；responseAddress/Port = `inbound.Gateway`，server.go:108-113）
+    stream.write_all(&encode_socks5_reply(STATUS_SUCCESS, gateway)).await?;
 
     Ok(SocksRequest::TcpConnect(addr))
+}
+
+/// 编码 SOCKS5 回复 `[VER][REP][RSV=0][ATYP][BND.ADDR][BND.PORT]`
+/// （Go `writeSocks5Response`，`proxy/socks/protocol.go:317-326`）。
+///
+/// `bnd = None` 回 `0.0.0.0:0` 占位——Go 在失败帧与无本端地址上下文时正是
+/// 传 `net.AnyIP, net.Port(0)`。
+fn encode_socks5_reply(rep: u8, bnd: Option<SocketAddr>) -> Vec<u8> {
+    let mut reply = vec![SOCKS5_VERSION, rep, 0x00];
+    match bnd {
+        Some(SocketAddr::V4(v4)) => {
+            reply.push(ATYP_IPV4);
+            reply.extend_from_slice(&v4.ip().octets());
+            reply.extend_from_slice(&v4.port().to_be_bytes());
+        },
+        Some(SocketAddr::V6(v6)) => {
+            reply.push(ATYP_IPV6);
+            reply.extend_from_slice(&v6.ip().octets());
+            reply.extend_from_slice(&v6.port().to_be_bytes());
+        },
+        None => reply.extend_from_slice(&[ATYP_IPV4, 0, 0, 0, 0, 0, 0]),
+    }
+    reply
 }
 
 /// 从配置 address（IPOrDomain）提取 UDP relay 绑定 IP。
@@ -854,7 +874,7 @@ mod tests {
             "socks4-handshake-ipv4-connect-succeeds-accept",
             async move {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                socks_handshake(&mut sock, &config).await
+                socks_handshake(&mut sock, &config, None).await
             },
         );
 
@@ -890,7 +910,7 @@ mod tests {
             "socks4a-handshake-domain-connect-succeeds-accept",
             async move {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                socks_handshake(&mut sock, &config).await
+                socks_handshake(&mut sock, &config, None).await
             },
         );
 
@@ -932,7 +952,7 @@ mod tests {
                 "socks-handshake-routes-socks5-and-socks4-accept",
                 async move {
                     let (mut sock, _) = listener.accept().await.unwrap();
-                    socks_handshake(&mut sock, &config).await
+                    socks_handshake(&mut sock, &config, None).await
                 },
             );
             let mut client = TcpStream::connect(addr).await.unwrap();
@@ -949,7 +969,7 @@ mod tests {
                 "socks-handshake-routes-socks5-and-socks4-accept",
                 async move {
                     let (mut sock, _) = listener.accept().await.unwrap();
-                    socks_handshake(&mut sock, &config).await
+                    socks_handshake(&mut sock, &config, None).await
                 },
             );
             let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1097,7 +1117,7 @@ mod tests {
             "socks4-rejected-when-password-configured-accept",
             async move {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let r = socks_handshake(&mut sock, &config).await;
+                let r = socks_handshake(&mut sock, &config, None).await;
                 // 拒绝后服务端仍有未读请求字节，立即 drop 会发 RST 吞掉在途拒绝帧——
                 // 留时间让客户端读完（Windows loopback RST 竞态，见 v49 教训）
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1206,5 +1226,152 @@ mod tests {
             },
             other => panic!("expected UdpAssociate, got {other:?}"),
         }
+    }
+
+    // ===== bd hzjgv：握手/回复对齐 Go v26.9.9（parity-s2-parser D-9/D-10/D-11/D-12）=====
+
+    /// D-10（Go `proxy/socks/protocol.go:101-117`）：`nmethods=0` 时 Go 仍在
+    /// 回复里写 `05 FF`（NO ACCEPTABLE METHODS）再断链；Rust 旧版在写回复前
+    /// 就早退 → 客户端拿到静默断链，错误归因困难。
+    #[tokio::test]
+    async fn handshake_zero_methods_gets_05ff() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server =
+            xray_common::testing::spawn("handshake-zero-methods-gets-05ff-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks5_server_handshake(&mut sock, &config).await
+            });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 0]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            [SOCKS5_VERSION, AUTH_NO_MATCHING_METHOD],
+            "nmethods=0 必须先回 05 FF（Go auth5）"
+        );
+
+        assert!(server.await.unwrap().is_err(), "零方法协商仍须失败");
+    }
+
+    /// D-9（Go `protocol.go:221` + `server.go:108-113`）：CONNECT 成功回复的
+    /// BND = 本端网关（`inbound.Gateway` = 监听地址:端口），不是 `0.0.0.0:0`。
+    /// 严格按 BND 回连的链式代理/扫描器会连到 0.0.0.0:0（不可用）。
+    #[tokio::test]
+    async fn connect_reply_bnd_is_local_gateway() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server =
+            xray_common::testing::spawn("connect-reply-bnd-is-local-gateway-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // 本端地址 = `inbound_local()` 的同类取法（accept 返回的是 peer，不是本端）
+                let local = sock.local_addr().unwrap();
+                socks_handshake(&mut sock, &config, Some(local)).await
+            });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [SOCKS5_VERSION, AUTH_NOT_REQUIRED]);
+        client
+            .write_all(&[SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_SUCCESS);
+        assert_eq!(reply[3], ATYP_IPV4, "IPv4 网关须回 ATYP=1");
+        // BND 必须等于本端监听地址族/端口，且不得是全零占位
+        let addr_v4 = match addr {
+            std::net::SocketAddr::V4(v4) => v4,
+            other => panic!("test listener must be IPv4, got {other}"),
+        };
+        assert!(reply[4..10].iter().any(|b| *b != 0), "BND 不得全零: {reply:?}");
+        assert_eq!(&reply[4..8], &addr_v4.ip().octets(), "BND.ADDR 必须是本端地址");
+        assert_eq!(
+            u16::from_be_bytes([reply[8], reply[9]]),
+            addr_v4.port(),
+            "BND.PORT 必须是本端端口（Go 回 inbound.Gateway.Port）"
+        );
+
+        assert!(server.await.unwrap().is_ok(), "CONNECT 必须成功");
+    }
+
+    /// D-11（Go `protocol.go:143-160`）：`handshake5` 只取请求帧第 2 字节
+    /// （CMD），**不校验 VER/RSV**。Rust 旧版对 VER≠5 直接断链（不回 REP）。
+    #[tokio::test]
+    async fn request_version_byte_not_validated() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server =
+            xray_common::testing::spawn("request-version-byte-not-validated-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config, None).await
+            });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        // VER=0x04（畸形）+ CMD=CONNECT + RSV=0 + IPv4 1.2.3.4:21301
+        client
+            .write_all(&[0x04, CMD_TCP_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0x53, 0x35])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], STATUS_SUCCESS, "Go 不校验请求 VER，须照常成功");
+
+        assert!(matches!(server.await.unwrap().unwrap(), SocksRequest::TcpConnect(_)));
+    }
+
+    /// D-12（Go `common/protocol/address.go:204-222`）：`ATYP=Domain` + `LEN=0`
+    /// Go 判 `invalid domain name` 并直接断链（零回复字节，parity P14 实测）。
+    /// Rust 旧版把空域名当合法 → 回 success 并触发一轮系统 DNS（资源放大面）。
+    #[tokio::test]
+    async fn empty_domain_rejected_without_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server =
+            xray_common::testing::spawn("empty-domain-rejected-without-reply-accept", async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                socks_handshake(&mut sock, &config, None).await
+            });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[SOCKS5_VERSION, 1, AUTH_NOT_REQUIRED]).await.unwrap();
+        let mut resp = [0u8; 2];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [SOCKS5_VERSION, AUTH_NOT_REQUIRED]);
+        // ATYP=Domain + LEN=0 + port(21301)：Go 必须拒（P14：零字节 + 断链）
+        client
+            .write_all(&[SOCKS5_VERSION, CMD_TCP_CONNECT, 0x00, ATYP_DOMAIN, 0, 0x53, 0x35])
+            .await
+            .unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = match tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut buf))
+            .await
+        {
+            Ok(Ok(n)) => n,
+            // 未读的 port 字节会触发 RST——与 EOF 同义：没有任何回复字节
+            Ok(Err(_)) => 0,
+            Err(_) => panic!("空域名必须拒并断链，不能挂着不回"),
+        };
+        assert_eq!(n, 0, "空域名不得回 success 帧: {:?}", &buf[..n]);
+
+        let err = server.await.unwrap().expect_err("空域名必须拒");
+        assert!(matches!(err, SocksError::InvalidFrame(_)), "应为帧错误: {err}");
     }
 }

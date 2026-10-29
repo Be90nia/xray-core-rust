@@ -233,7 +233,7 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
             // 见函数 doc。
             if !is_valid_domain_bytes(domain_bytes) {
                 return Err(SocksError::InvalidFrame(format!(
-                    "invalid domain charset: {len} bytes at offset {offset}"
+                    "invalid domain name: {len} bytes at offset {offset}"
                 )));
             }
             let domain = std::str::from_utf8(domain_bytes)
@@ -258,18 +258,25 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
     Ok((SocksAddr { host, port }, offset))
 }
 
-/// 81uq：domain 字节流是否仅含合法字符（ASCII：`0-9 a-z A-Z - . _`）。
+/// 81uq：domain 字节流是否仅含合法字符（ASCII：`0-9 a-z A-Z - . _`），且非空。
 ///
 /// 对齐 Go `isValidDomain`（`common/protocol/address.go:159-166`），
-/// 仅做字符集过滤——长度过滤在 `parse_address_port` 已通过 length byte
+/// 仅做字符集过滤——长度上限在 `parse_address_port` 已通过 length byte
 /// 钳制在 `[0, 255]`。这里用字节直接比对避免分配 String 副本。
 ///
+/// 空切片判 false（D-12，bd hzjgv）：Go `readAddress` 对 `LEN=0` 走
+/// `BytesFrom(0)` quirk → 取到整段缓冲 → `isValidDomain` false →
+/// `invalid domain name` 并断链；Rust 旧版把空域名当合法，回 success 后
+/// 上层按空主机名触发一轮系统 DNS（资源放大面）。
+///
 /// 返回 `false` 的常见情况：
+/// - `LEN=0`（空域名）
 /// - 客户端用 ATYP=Domain + 含 `/`、`@`、`:`、` ` 的字节流伪装成"域名"
 /// - 含 `\` 或 `\0` 等 SOCKS5 解析上下文不该出现的字符
 #[must_use]
 pub fn is_valid_domain_bytes(bytes: &[u8]) -> bool {
-    bytes.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
+    !bytes.is_empty()
+        && bytes.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
 }
 
 /// 编码 SOCKS5 UDP 包。对应 Go `EncodeUDPPacket`。
@@ -408,6 +415,21 @@ mod tests {
         let bytes = [ATYP_DOMAIN, 1, 0, 0, 80];
         let err = parse_address_port(&bytes).unwrap_err();
         assert!(matches!(err, SocksError::InvalidFrame(_)));
+    }
+
+    /// D-12（bd hzjgv）：`ATYP=Domain` + `LEN=0` 必须拒。
+    ///
+    /// Go `common/protocol/address.go:204-222`（`readAddress` 的 domain 分支）对
+    /// LEN=0 取到整段缓冲 → `isValidDomain` 判 false → `invalid domain name`。
+    /// Rust 旧版 `is_valid_domain_bytes` 对空切片恒 true → 空域名当合法解析，
+    /// 上层回 success 并触发一轮系统 DNS（资源放大面）。
+    #[test]
+    fn parse_rejects_empty_domain() {
+        // ATYP_DOMAIN + LEN=0 + port(21301)
+        let bytes = [ATYP_DOMAIN, 0, 0x53, 0x35];
+        let err = parse_address_port(&bytes).unwrap_err();
+        assert!(matches!(err, SocksError::InvalidFrame(_)), "LEN=0 必须拒: {err}");
+        assert!(!is_valid_domain_bytes(&[]), "空域名不是合法域名");
     }
 
     /// 81uq：合法字符域名（含 `_` `-` `.`）必须通过校验（round-trip）。
