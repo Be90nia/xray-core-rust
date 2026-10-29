@@ -1116,6 +1116,17 @@ where
     let link =
         Link::new(Box::new(up_r) as Box<dyn BufReader>, Box::new(dn_w) as Box<dyn BufWriter>);
     let dest = hs.dest.clone();
+    // plain HTTP 的响应语义（Go 式头重建 + 可定界 keep-alive 判定）要求响应流经
+    // 本函数的下行 pipe。AccessContext.conn/can_splice_copy 是连接粒度元数据（为
+    // socks/CONNECT 隧道 leg 挂上）；本 leg 已接管客户端流（请求头重写 + 响应头
+    // 重建），若放行 splice，Linux 上 DialBridge 下行零拷贝直达客户端 raw fd、
+    // 抢在 pipe 之前——客户端收到裸响应 + 本函数读 pipe EOF 回写寄生 503（CI
+    // parser-parity H 系 fwd 用例全红根因；Windows 泵未编译恒走 pipe，无此分裂）。
+    let access = xray_app_dispatcher::AccessContext {
+        conn: None,
+        can_splice_copy: xray_common::platform::splice::CAN_SPLICE_COPY_NEVER,
+        ..access
+    };
     handler.dispatch_with_access(&dest, link, access).await;
 
     let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -8642,6 +8653,99 @@ mod tests {
         let resp = String::from_utf8_lossy(&buf);
         assert!(resp.starts_with("HTTP/1.1 503"), "got: {resp}");
         assert!(resp.contains("Connection: close"), "got: {resp}");
+    }
+
+    /// plain HTTP leg 必须向 dispatch 摘除入站 splice 资格（conn/can_splice_copy）：
+    /// 该元数据是连接粒度（socks/CONNECT 隧道 leg 消费），泄漏到 plain HTTP
+    /// dispatch 时 Linux 的 DialBridge 下行零拷贝直达客户端 raw fd——响应绕过
+    /// 本函数 pipe（客户端收裸响应 + 寄生 503，CI parser-parity H 系 17 例根因）。
+    /// 只验信号摘除，跨平台可跑（不依赖 Linux splice 泵）。
+    #[tokio::test]
+    async fn plain_http_dispatch_strips_splice_eligibility() {
+        use std::sync::Mutex;
+        use xray_common::platform::splice::{CAN_SPLICE_COPY_NEVER, CAN_SPLICE_COPY_YES};
+
+        struct CaptureDispatch(Arc<Mutex<Option<xray_app_dispatcher::AccessContext>>>);
+        impl std::fmt::Debug for CaptureDispatch {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("CaptureDispatch")
+            }
+        }
+        impl xray_app_dispatcher::DispatchHandler for CaptureDispatch {
+            fn tag(&self) -> &str {
+                "capture"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                link.writer.shutdown();
+                drop(link);
+                Box::pin(async {})
+            }
+
+            fn dispatch_with_access(
+                &self,
+                dest: &Destination,
+                link: xray_transport::link::Link,
+                access: xray_app_dispatcher::AccessContext,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                *self.0.lock().unwrap() = Some(access);
+                self.dispatch(dest, link)
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        let hs = HandshakeResult {
+            dest: Destination::tcp(Address::IPv4(Ipv4Addr::new(1, 2, 3, 4)), Port::new(80)),
+            method: "GET".into(),
+            target: "http://1.2.3.4/".into(),
+            http_version: xray_proxy_http::server::HttpVersion::H11,
+            headers: HashMap::new(),
+        };
+        // 模拟生产形态：入站 accept 时挂上的 raw fd + YES 信号（http_inbound_access）。
+        // 可连对象复用监听 addr（新连接入 backlog，无人 accept，随 listener drop 消亡）。
+        let raw = Arc::new(tokio::net::TcpStream::connect(addr).await.unwrap());
+        let access = xray_app_dispatcher::AccessContext {
+            from: "127.0.0.1:9999".into(),
+            conn: Some(raw),
+            can_splice_copy: CAN_SPLICE_COPY_YES,
+            ..xray_app_dispatcher::AccessContext::default()
+        };
+        let captured_in = Arc::clone(&captured);
+        tokio::spawn(async move {
+            handle_plain_http(
+                &mut server,
+                &hs,
+                Arc::new(CaptureDispatch(captured_in)),
+                access,
+            )
+            .await;
+        });
+
+        // dispatch 摘除信号 + 关下行 → 客户端收 503 收尾（同步点 = 信号已捕获）。
+        let mut buf = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.read_to_end(&mut buf))
+            .await
+            .expect("503 within 5s")
+            .unwrap();
+
+        let got =
+            captured.lock().unwrap().clone().expect("dispatch must receive access context");
+        assert_eq!(
+            got.can_splice_copy,
+            CAN_SPLICE_COPY_NEVER,
+            "plain HTTP leg must strip splice eligibility"
+        );
+        assert!(got.conn.is_none(), "plain HTTP leg must not leak the raw client fd");
+        assert_eq!(got.from, "127.0.0.1:9999", "非 splice 字段必须原样保留");
     }
 
     /// z8i0：dispatch Ok 但目标零响应即关闭（后台 dial 失败形态）→ 客户端
