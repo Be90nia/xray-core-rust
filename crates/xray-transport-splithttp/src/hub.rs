@@ -227,14 +227,33 @@ impl HubListener {
                 // bd wz2b S2：与 transport.rs serve_http_conn 同款 h2 显式流控——
                 // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
                 // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
+                // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取服务端阶梯保底
+                // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
+                // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES` / `XRAY_H2_RTT_HINT_MS`）
+                // 与 serve_http_conn 同源生效。不探针。
+                let win = crate::flow_window::server_windows_from_rtt(None);
                 builder
                     .http2()
                     .timer(hyper_util::rt::TokioTimer::new())
-                    .max_send_buf_size(16 * 1024 * 1024)
-                    .initial_stream_window_size(16 * 1024 * 1024)
-                    .initial_connection_window_size(32 * 1024 * 1024);
+                    .max_send_buf_size(win.max_send_buf)
+                    .initial_stream_window_size(win.stream_window)
+                    .initial_connection_window_size(win.connection_window);
                 let _ = builder.serve_connection(io, svc).await;
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// bd xzg3x：明文/unix `serve` 取窗 = 服务端阶梯保底（无握手 → 无 RTT 信号，
+    /// 不探针）；未设 bench env 时逐值等于修前硬编码。削弱任一值必红。
+    #[test]
+    fn plaintext_serve_windows_equal_pre_fix_static() {
+        let win = crate::flow_window::server_windows_from_rtt(None);
+        assert_eq!(win.stream_window, 16 * 1024 * 1024, "修前 initial_stream_window_size");
+        assert_eq!(win.connection_window, 32 * 1024 * 1024, "修前 initial_connection_window_size");
+        assert_eq!(win.max_send_buf, 16 * 1024 * 1024, "修前 max_send_buf_size");
+        assert_eq!(win, crate::flow_window::SERVER_FALLBACK);
     }
 }

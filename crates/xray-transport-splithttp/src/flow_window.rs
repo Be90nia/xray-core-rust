@@ -134,14 +134,23 @@ fn parse_rtt_hint(raw: Option<&str>) -> Option<Duration> {
 
 /// bench/诊断 env 覆盖（流窗整体覆盖优先于 send_buf 单覆盖）。
 fn apply_env_overrides(w: &mut H2Windows) {
-    if let Some(bytes) = parse_override(std::env::var(ENV_OVERRIDE).ok().as_deref()) {
+    apply_overrides(
+        w,
+        parse_override(std::env::var(ENV_OVERRIDE).ok().as_deref()),
+        parse_override(std::env::var(ENV_SEND_OVERRIDE).ok().as_deref()),
+    );
+}
+
+/// 覆盖应用（纯函数，单测零 env 全局面）：流窗整体覆盖优先于 send_buf 单覆盖。
+fn apply_overrides(w: &mut H2Windows, flow: Option<u32>, send: Option<u32>) {
+    if let Some(bytes) = flow {
         w.stream_window = bytes;
         // 连接窗 = 2× 流窗（多流上行聚合不另成钉）；u32 上界 saturating。
         w.connection_window = bytes.saturating_mul(2);
         w.max_send_buf = bytes as usize;
         return;
     }
-    if let Some(bytes) = parse_override(std::env::var(ENV_SEND_OVERRIDE).ok().as_deref()) {
+    if let Some(bytes) = send {
         w.max_send_buf = bytes as usize;
     }
 }
@@ -270,6 +279,33 @@ mod tests {
         );
         assert_eq!(pick_rtt(None, Some(Duration::from_millis(5))), Some(Duration::from_millis(5)));
         assert_eq!(pick_rtt(None, None), None);
+    }
+
+    #[test]
+    fn overrides_apply_flow_then_send() {
+        // 覆盖应用纯函数（服务端保底基；hub 明文路径 = server_windows_from_rtt(None) 同源）。
+        let mut w = SERVER_FALLBACK;
+        apply_overrides(&mut w, Some(4 * 1024 * 1024), None);
+        assert_eq!(w.stream_window, 4 * 1024 * 1024);
+        assert_eq!(w.connection_window, 8 * 1024 * 1024, "连窗 = 2× 流窗");
+        assert_eq!(w.max_send_buf, 4 * 1024 * 1024);
+
+        // send_buf 单覆盖不动流窗。
+        let mut w = SERVER_FALLBACK;
+        apply_overrides(&mut w, None, Some(6 * 1024 * 1024));
+        assert_eq!(w.stream_window, SERVER_FALLBACK.stream_window);
+        assert_eq!(w.connection_window, SERVER_FALLBACK.connection_window);
+        assert_eq!(w.max_send_buf, 6 * 1024 * 1024);
+
+        // 流窗整体覆盖优先于 send_buf 单覆盖。
+        let mut w = SERVER_FALLBACK;
+        apply_overrides(&mut w, Some(2 * 1024 * 1024), Some(6 * 1024 * 1024));
+        assert_eq!(w.max_send_buf, 2 * 1024 * 1024);
+
+        // 两者皆未设置 = 原样（逐值等于保底）。
+        let mut w = SERVER_FALLBACK;
+        apply_overrides(&mut w, None, None);
+        assert_eq!(w, SERVER_FALLBACK);
     }
 
     #[test]
