@@ -17,8 +17,8 @@
 //! `initial_window_size` / `initial_connection_window_size` 现值各 32MB
 //! （≥ bd rjzw2 RTT 阶梯下限 8MB）——回落到 hyper 默认（每流 2MB / server
 //! send_buf 400KB）即重新钉死在 `min(send_buf, 窗)/RTT` 量级（bd enc8x）；
-//! 同条款要求 Linux 服务端设 TCP_NOTSENT_LOWAT 削峰（bd rjzw2，splithttp
-//! 传输已落地，本 crate 静态 32MB 为阶梯最高档）。
+//! 同条款要求 h2 流窗/服务端 send_buf 不低于 RTT 阶梯下限 8MB（bd rjzw2，
+//! splithttp 按阶梯自适应；本 crate 静态 32MB 为阶梯最高档）。
 //!
 //! udf 判定（A7，非通用件）：HTTP/1.1 + h2 CONNECT 装配与 `ServerConfig` 段解析
 //! 都是协议方向件——按 CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，留主仓
@@ -51,8 +51,8 @@ static HTTP_CLAUSES: &[ClauseId] = &[
 /// 协议专属条款（差异表 §2.2 第 6 行：enc8x 战役成果 + bd rjzw2 RTT 自适应语义）。
 static HTTP_EXTRA: &[(&str, &str)] = &[(
     "HTTP-H2W",
-    "h2 流窗/服务端 send_buf 不得低于 RTT 阶梯下限 8MB，且 Linux 服务端必须设 \
-     TCP_NOTSENT_LOWAT 削峰（bd rjzw2；静态保底 32MB/16MB 为阶梯最高档）",
+    "h2 流窗/服务端 send_buf 不得低于 RTT 阶梯下限 8MB（bd rjzw2；静态保底 \
+     32MB/16MB 为阶梯最高档）",
 )];
 
 /// N/A 声明（P1-7 拍板 P2.2：允许声明不适用但必须带非空理由）。

@@ -53,13 +53,6 @@ pub(crate) const SERVER_FALLBACK: H2Windows = H2Windows {
     max_send_buf: crate::transport::H2_SERVER_MAX_SEND_BUF_SIZE,
 };
 
-/// 服务端 TCP_NOTSENT_LOWAT 取值（字节）：限制内核 unsent 发送队列上限，
-/// 以不降吞吐压下行排队延迟（bufferbloat）。256KB：远小于 16MB send_buf、
-/// 各档窗容量（8MB/20ms=400MB/s）之下余量充足。Linux-only（选项本身平台门控，
-/// 非 Linux 下无消费者——与 sockopt helper 的 cfg 门控一致）。
-#[cfg(target_os = "linux")]
-pub(crate) const TCP_NOTSENT_LOWAT_BYTES: i32 = 256 * 1024;
-
 /// bench/诊断专用：强制流窗字节数（conn=2×、send=同值），进程级显式值驱动，
 /// 未设置零影响。bench 用它扫「窗-吞吐」曲线定阶梯断点。
 const ENV_OVERRIDE: &str = "XRAY_H2_FLOW_WINDOW_OVERRIDE_BYTES";

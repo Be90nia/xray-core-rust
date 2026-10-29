@@ -34,7 +34,7 @@ fn contract_macro_holds_for_http() {
 
 /// 契约面内容断言：差异表 §2.2 第 6 行——9 条适用（3/5/6/7/8/9/10/12 + 条款 1
 /// 按 PM 拍板归 clauses）、2/4/11 走 N/A（理由非空）、HTTP-H2W 协议专属
-/// （bd rjzw2：h2 窗 ≥ RTT 阶梯下限 8MB + Linux 服务端 TCP_NOTSENT_LOWAT）。
+/// （bd rjzw2：h2 窗 ≥ RTT 阶梯下限 8MB）。
 #[test]
 fn contract_surface_declares_subset_na_and_extra() {
     let plugin = HttpPlugin::default();
@@ -83,8 +83,8 @@ fn contract_surface_declares_subset_na_and_extra() {
         contract.extra,
         &[(
             "HTTP-H2W",
-            "h2 流窗/服务端 send_buf 不得低于 RTT 阶梯下限 8MB，且 Linux 服务端必须设 \
-             TCP_NOTSENT_LOWAT 削峰（bd rjzw2；静态保底 32MB/16MB 为阶梯最高档）"
+            "h2 流窗/服务端 send_buf 不得低于 RTT 阶梯下限 8MB（bd rjzw2；静态保底 \
+             32MB/16MB 为阶梯最高档）"
         )],
         "协议专属条款 HTTP-H2W"
     );

@@ -178,17 +178,6 @@ async fn accept_xh_conn(
                 },
             };
             let _ = stream.set_nodelay(true);
-            // bd rjzw2：下行延迟削峰（Linux unsent 队列上限；其余平台 no-op）。
-            // 尽力而为：失败只影响排队延迟不影响吞吐，debug 留痕不拒连。
-            #[cfg(target_os = "linux")]
-            if let Err(e) = xray_transport::sockopt::apply_tcp_notsent_lowat(
-                &stream,
-                crate::flow_window::TCP_NOTSENT_LOWAT_BYTES,
-            ) {
-                crate::LOG.debug(format!(
-                    "error={e} splithttp inbound: TCP_NOTSENT_LOWAT 设置失败（继续）"
-                ));
-            }
             // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
             // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
             let stream: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
