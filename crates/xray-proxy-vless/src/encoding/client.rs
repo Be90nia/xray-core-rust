@@ -295,6 +295,13 @@ where
         self.inner.raw_tcp_clone()
     }
 
+    fn is_raw_tcp(&self) -> bool {
+        // 桥层 readv dup 读腿闸（bridge_link_with_stream_full 的
+        // `stream.is_raw_tcp() && use_readv()`）依赖本信号；响应头缓冲层是
+        // 透明的，准入语义完全由内层决定（裸 TCP=true / TLS 等包装=false）。
+        self.inner.is_raw_tcp()
+    }
+
     fn tls_readbuf_size(&self) -> usize {
         // F3：穿透响应头缓冲层透传 TLS 栈信号（vision 由外层 VisionConn 不
         // 转发兜底，读批边界语义不变）。
@@ -306,6 +313,23 @@ where
         // 才能叠加剥离器；vision/ENC 等改写数据的包装层不转发本钩子，天然排除。
         if self.done || !self.head.is_empty() {
             return None;
+        }
+        // bd du5tn：裸 TCP 且 readv 可用时自建 dup 读腿叠加剥离器——桥层
+        // （bridge_link_with_stream_full）的 readv dup 腿不带剥头，本层若返回
+        // None，桥会选 dup 腿 → 2B vless 响应头漏进下行数据流。组合腿经桥的
+        // frozen 首臂入选；use_readv() 条件与桥 dup 闸一致，不绕环境门。
+        // dup 克隆 drop 只关句柄不 shutdown（整流语义），桥侧多算的那条
+        // s_read_dup 被丢弃即回收，无资源泄漏。
+        if self.inner.is_raw_tcp() && xray_buf::readv::use_readv() {
+            if let Some(raw) = self.inner.raw_tcp_clone() {
+                return Some(Box::new(HeaderStripReader {
+                    inner: Box::new(xray_buf::io::new_readv_reader_whole(raw)),
+                    expected_version: self.expected_version,
+                    pending: MultiBuffer::new(),
+                    head_len: None,
+                    done: false,
+                }));
+            }
         }
         let inner = self.inner.frozen_reader()?;
         Some(Box::new(HeaderStripReader {
@@ -546,5 +570,155 @@ mod tests {
         let mut cursor = Cursor::new(buf);
         let got = decode_response_header(&mut cursor, VERSION).await.unwrap();
         assert_eq!(got.flow, addons.flow);
+    }
+
+    /// bd du5tn：`ResponseHeaderReader` 必须把 `is_raw_tcp` 转发给内层。
+    /// 桥层 readv dup 读腿闸（`bridge_link_with_stream_full` 的
+    /// `stream.is_raw_tcp() && use_readv()`）依赖该信号；漏转发会让裸 TCP
+    /// 客户端下行读落到 SingleReader 8KB（syscall ×8）。
+    #[tokio::test]
+    async fn response_header_reader_forwards_is_raw_tcp() {
+        use xray_transport::connection::{Connection as _, TcpConnection};
+
+        let lsn = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let out = tokio::net::TcpStream::connect(lsn.local_addr().unwrap()).await.unwrap();
+        let wrapped = ResponseHeaderReader::new(TcpConnection::new(out), VERSION);
+        assert!(wrapped.is_raw_tcp(), "裸 TCP 内层必须转发为 true（readv 腿准入信号）");
+    }
+
+    /// 反例锁「转发而非恒 true」：非裸 TCP 内层（TLS 等不覆写 `is_raw_tcp`
+    /// 的包装）必须仍拒绝——该信号同时是 splice 准入安全信号，只许透传
+    /// 内层判定，不得在包装层放大。
+    #[tokio::test]
+    async fn response_header_reader_keeps_wrapped_rejection() {
+        use xray_transport::connection::{Connection as _, TcpConnection};
+
+        struct Opaque(Box<dyn xray_transport::connection::Connection>);
+        impl AsyncRead for Opaque {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for Opaque {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut *self.0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_shutdown(cx)
+            }
+        }
+        impl xray_transport::connection::Connection for Opaque {
+            fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                self.0.remote_addr()
+            }
+
+            fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                self.0.local_addr()
+            }
+        }
+
+        let lsn = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let out = tokio::net::TcpStream::connect(lsn.local_addr().unwrap()).await.unwrap();
+        let wrapped = ResponseHeaderReader::new(Opaque(Box::new(TcpConnection::new(out))), VERSION);
+        assert!(!wrapped.is_raw_tcp(), "非裸 TCP 内层必须保持拒绝（splice 安全语义）");
+    }
+
+    /// bd du5tn 端到端锁：裸 TCP 内层 → `frozen_reader()` 必须返回「readv 读腿
+    /// + 响应头剥离器」组合腿。桥层 frozen 腿优先（`bridge.rs` match 首臂）；
+    /// 本层返回 None 时桥走不带剥离的 readv dup 腿 → 2B 响应头漏进数据流
+    /// （对端 curl 报 HTTP/0.9）。
+    #[tokio::test]
+    async fn response_header_reader_frozen_leg_is_readv_with_header_strip() {
+        use xray_buf::io::Reader as _;
+        use xray_transport::connection::{Connection as _, TcpConnection};
+
+        let lsn = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let out = tokio::net::TcpStream::connect(lsn.local_addr().unwrap()).await.unwrap();
+        let (mut srv, _) = lsn.accept().await.unwrap();
+        srv.write_all(&[VERSION, 0x00]).await.unwrap(); // vless 响应头：version + addon_len=0
+        srv.write_all(b"HELLO-PAYLOAD").await.unwrap();
+        drop(srv); // 数据发出后 FIN
+
+        let mut wrapped = ResponseHeaderReader::new(TcpConnection::new(out), VERSION);
+        let mut leg = wrapped
+            .frozen_reader()
+            .expect("裸 TCP 内层必须提供 readv+剥头组合腿（否则桥的 dup 腿漏响应头）");
+        let mut got = Vec::new();
+        loop {
+            let mb = leg.read_multi_buffer().await.expect("read ok");
+            if mb.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&mb.to_vec());
+        }
+        assert_eq!(got, b"HELLO-PAYLOAD", "响应头必须被剥离，payload 完整");
+    }
+
+    /// 非裸 TCP 内层不得假建组合腿（保持既有 None 语义，让桥走原路径）。
+    #[tokio::test]
+    async fn response_header_reader_frozen_leg_none_for_wrapped() {
+        use xray_transport::connection::{Connection as _, TcpConnection};
+
+        struct Opaque(Box<dyn xray_transport::connection::Connection>);
+        impl AsyncRead for Opaque {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_read(cx, buf)
+            }
+        }
+        impl AsyncWrite for Opaque {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut *self.0).poll_write(cx, buf)
+            }
+
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut *self.0).poll_shutdown(cx)
+            }
+        }
+        impl xray_transport::connection::Connection for Opaque {
+            fn remote_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                self.0.remote_addr()
+            }
+
+            fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
+                self.0.local_addr()
+            }
+        }
+
+        let lsn = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let out = tokio::net::TcpStream::connect(lsn.local_addr().unwrap()).await.unwrap();
+        let mut wrapped =
+            ResponseHeaderReader::new(Opaque(Box::new(TcpConnection::new(out))), VERSION);
+        assert!(wrapped.frozen_reader().is_none(), "非裸 TCP 内层不得假建组合腿");
     }
 }
