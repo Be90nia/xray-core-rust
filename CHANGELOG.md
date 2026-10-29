@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **A/B 判定工装**（`tools/ab_gate.py`）：把「性能只能同窗交错 A/B」纪律工具化——严格 A,B,A,B 交替 + 编译进程拒跑/轮间离散度标记 CONTAMINATED + 中位数比值判定 + 逐次存档 `reports/bench/ab-*.json`；A/A 干净窗偏差 3.1%（建议 tol=0.05，无法确认干净时 0.08）
 - **xray-frame 六面派生件落地**（能力收敛 W1，`1679a5a7`）：`compat`（进程级能力入口：一次性 install + 作用域守卫 + 兜底=迁移前行为；**禁 thread_local**——tokio 任务跨线程迁移语义错）/ `redline`（红线受控入口：`RedlineSite` 穷举 + 受控执行 + 源码扫描 CI 门）/ `scope`（ConnScope 两级 scope：arm → connection）/ `deadline::Budget`（双源：Tokio 虚拟钟 advance + Wall 由 `Clock` 判负）/ `logging::HotLog`（栈缓冲零分配热路径门面）/ `config::XrayConfigLayers`（tag 合并 + outbounds prepend + tail）；7 份测试随件进 CI
 - **ADR-1/ADR-2 入宪**（`CLAUDE.md §3.5.5`，`377c712d`）：能力归属三层判定顺序固定（零 Xray 语义 → udf；否则 → xray-frame；仅当逐条举证才留主仓）+ `compat`/`redline` 两条执行约束（登记集合不随迁移增长）
+- **Go/Rust 差分对拍做成 CI 门**（bd `c4ueq`，`87ef6bff`/`faa05510`）：`dist/parser_parity/` harness（origin + Go 代理 + Rust 代理 + 57 用例逐字节对拍，Date 归一）+ CI job `parser-parity`（Linux 侧跑，与 Go v26.9.9 同版本对照）；**首跑即抓到 Linux 平台真缺陷**（见 Fixed「plain HTTP 转发被 splice 快路径劫持」）
 
 ### Changed
 
@@ -33,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **plain HTTP 转发在 Linux 被 splice 快路径劫持**（CI 对拍门首跑抓到，`38804b8c`）：`handle_plain_http` 把**连接粒度**的 splice 元数据（`AccessContext.conn` = 客户端 raw fd 克隆 + `can_splice_copy=YES`）带进 dispatch → Linux 上 `DialBridge` 放行**下行零拷贝 splice**，响应绕过 plain-HTTP 的下行 pipe → 客户端收到未经 Go 式头重建的裸响应 + **尾部寄生 503**（Windows 无 splice 泵故正常，Go 两平台均 verbatim）。修：plain HTTP dispatch 前摘除该元数据（`conn=None` + `can_splice_copy=CAN_SPLICE_COPY_NEVER`），响应强制经 pipe；跨平台回归测试 `plain_http_dispatch_strips_splice_eligibility`；Linux 复跑 160B 与 Go 逐字节全等、无 503
+- **vless 客户端下行读退化 8KB 单读**（bd `du5tn`，`d68a1f66`）：`ResponseHeaderReader` 漏转发 `is_raw_tcp` → 桥层 readv dup 腿失配，下行退化为 8KB 单读（syscall ×8），客户端内核 CPU 2.8ms/MB ≈ Go 3× 成吞吐闸。修：`is_raw_tcp()` 透传内层 + `frozen_reader()` 裸 TCP 分支自建 readv dup 腿**叠加响应头剥离器**（纯转发会使 2B vless 响应头漏进数据流——红证轮抓到后补齐）。实测吞吐比值 1.12 → **0.47**（Rust 882 vs Go 469 MB/s，同窗交错 3 轮），客户端 CPU 0.39s ≤ 0.5s，批粒度 8191B → 65536B；`xray-proxy-vless` 294 tests 0 failed（4 枚新测试先红后绿），splice 准入语义未牵连
 - **通用 general 日志全族被静默滤空**（夜间实证，非 flake）：udf `ChannelRegistry` 的级别门只在 `register()` 时按 `sink.level()` 播种一次，而全局 general 壳注册那一刻恒为 `Off` → `xray_common::log::{debug,info,warning,error}` 全族（**生产同样**）被槽位原子永久滤掉；全仓 `set_level(` 调用者 0 处。修：`GlobalGeneralSink::install()` 在「自己持有槽位」时同步 `channels().set_level(...)`（关闭传 `Off`），新增 `each_activation_installs_its_own_gate` 回归
 - **HTTP 明文代理请求被 CDN 判「未完成」→ 图标全灰**（bd `os438`）：`handle_plain_http` 请求转发完成后立刻 `up_w.shutdown()`（FIN），CDN 收到「请求后立即 FIN」直接关连接不回响应，内核合成 503。修：半关推迟到 `relay_response_phase` 之后（Go `handlePlainHTTP` 语义，wire 不变）；同批对齐 1xx 透传、Host 头拒收、请求阶段失败分流 503/断链（`x23tr`/`g3mvq`/`e0gos`），对拍与 Go 相同面 29→37、差异 8→2
 - **hysteria 出站私有 `insecure` 键绕过证书校验**（bd `qp0ya`）：改走仓库唯一 TLS 入口 `build_client_config`（私有键按未知键忽略 = 校验恒开，对齐 Go `allowInsecure` 硬错语义）；dist interop 脚本改用 `pinnedPeerCertSha256`
