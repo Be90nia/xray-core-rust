@@ -716,3 +716,158 @@ async fn http_200_header_lines_accepted_e2e() {
     let resp = read_http_response(&mut client).await;
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 }
+
+// ===== 字节保真（bd t3lzr）：非 UTF-8 头值/URI 原样转发，Go v26.9.9 对拍 =====
+
+/// 抓取型源站：accept 一条连接 → 读完整请求（head + content-length body）→ 回 200
+/// → 回报 (head 原始字节, body 原始字节)。head 不含结尾空行。
+async fn spawn_capturing_origin(
+    name: &'static str,
+) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    xray_common::testing::spawn(name, async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 2048];
+        let head_end = loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "origin EOF before head complete");
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let head = buf[..head_end].to_vec();
+        let mut body = buf[head_end + 4..].to_vec();
+        let want = head
+            .split(|&b| b == b'\n')
+            .find_map(|line| {
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                let idx = line.iter().position(|&b| b == b':')?;
+                let (k, v) = (&line[..idx], &line[idx + 1..]);
+                if !k.eq_ignore_ascii_case(b"content-length") {
+                    return None;
+                }
+                std::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()
+            })
+            .unwrap_or(0);
+        while body.len() < want {
+            let n = sock.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "origin EOF before body complete");
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(want);
+        let _ = tx.send((head, body));
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+        // 半关 + 排空：立即 drop 带未读数据的 socket 在 Windows 上发 RST（见既有注释）
+        let _ = sock.shutdown().await;
+        let mut sink = [0u8; 512];
+        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+    });
+    (addr, rx)
+}
+
+/// 一条 plain HTTP 请求经真实 `HttpServer` serve 路径转发，返回上游收到的原始字节。
+async fn forward_and_capture(
+    name: &'static str,
+    build: impl FnOnce(u16) -> Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
+    let (origin, mut rx) = spawn_capturing_origin(name).await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(&build(origin.port())).await.unwrap();
+    client.shutdown().await.unwrap();
+    let resp = read_to_eof(&mut client).await;
+    assert!(
+        resp.starts_with(b"HTTP/1.1 200"),
+        "proxy response must be 200, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("origin report timeout")
+        .expect("origin reported a request")
+}
+
+/// T1（bd t3lzr）：非 UTF-8 头值按原字节到达上游（Go `X-Bin: e9ff`，修复前退化成
+/// `efbfbdefbfbd` 两个 U+FFFD）。
+#[tokio::test]
+async fn http_plain_forward_preserves_non_utf8_header_value_e2e() {
+    let (head, _body) = forward_and_capture("http-origin-bin-headerval", |port| {
+        let mut req =
+            format!("GET http://127.0.0.1:{port}/t1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Bin: ")
+                .into_bytes();
+        req.extend_from_slice(b"\xe9\xff");
+        req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        req
+    })
+    .await;
+    assert!(
+        find_subsequence(&head, b"x-bin: \xe9\xff").is_some(),
+        "非 UTF-8 头值必须原样到达上游，实际 head = {:?}",
+        String::from_utf8_lossy(&head)
+    );
+    assert!(
+        find_subsequence(&head, b"\xef\xbf\xbd").is_none(),
+        "不得出现 U+FFFD 替换字节: {:?}",
+        String::from_utf8_lossy(&head)
+    );
+}
+
+/// T2（bd t3lzr）：请求行里的非 ASCII 字节按 Go `url.URL.EscapedPath` 转义
+/// （`/t2/\xe9` → `/t2/%E9`），不是 U+FFFD。
+#[tokio::test]
+async fn http_plain_forward_percent_encodes_non_ascii_uri_e2e() {
+    let (head, _body) = forward_and_capture("http-origin-nonascii-uri", |port| {
+        let mut req = format!("GET http://127.0.0.1:{port}/t2/").into_bytes();
+        req.extend_from_slice(b"\xe9");
+        req.extend_from_slice(
+            format!(" HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").as_bytes(),
+        );
+        req
+    })
+    .await;
+    assert!(
+        find_subsequence(&head, b"GET /t2/%E9 HTTP/1.1\r\n").is_some(),
+        "非 ASCII 路径字节须转义为 %E9，实际 head = {:?}",
+        String::from_utf8_lossy(&head)
+    );
+}
+
+/// T4（bd t3lzr 防回归）：合法 UTF-8 头值原样到达上游（`中` = e4b8ad）。
+#[tokio::test]
+async fn http_plain_forward_keeps_utf8_header_value_e2e() {
+    let (head, _body) = forward_and_capture("http-origin-utf8-headerval", |port| {
+        let mut req = format!(
+            "GET http://127.0.0.1:{port}/t4 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Utf8: "
+        )
+        .into_bytes();
+        req.extend_from_slice(b"\xe4\xb8\xad");
+        req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        req
+    })
+    .await;
+    assert!(
+        find_subsequence(&head, b"x-utf8: \xe4\xb8\xad").is_some(),
+        "UTF-8 头值必须不变，实际 head = {:?}",
+        String::from_utf8_lossy(&head)
+    );
+}
+
+/// T3（bd t3lzr 防回归）：非 UTF-8 请求体逐字节到达上游（body 路径本已正确，锁死）。
+#[tokio::test]
+async fn http_plain_forward_preserves_non_utf8_body_e2e() {
+    let (_head, body) = forward_and_capture("http-origin-bin-body", |port| {
+        let mut req = format!(
+            "POST http://127.0.0.1:{port}/t3 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Content-Length: 4\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        req.extend_from_slice(b"\xe9\xff\x80\x01");
+        req
+    })
+    .await;
+    assert_eq!(body, b"\xe9\xff\x80\x01", "body 必须逐字节到达上游");
+}

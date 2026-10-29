@@ -125,9 +125,72 @@ pub fn extract_request_path(target: &str) -> String {
         .or_else(|| target.strip_prefix("https://"))
         .unwrap_or(target);
     match after_scheme.find('/') {
-        Some(slash) => after_scheme[slash..].to_string(),
+        Some(slash) => escape_path(&after_scheme[slash..]),
         None => "/".to_string(),
     }
+}
+
+/// 字节 → String 的 Latin-1（ISO-8859-1）解码：每个字节映射到同码位字符，字节零丢失。
+///
+/// Go 头处理全程按字节（不解 UTF-8，≥0x80 原始字节合法；H06）。本项目用 String 承载
+/// 头行，`from_utf8_lossy` 会把非法序列换成 U+FFFD——`e9ff` 变成 `efbfbdefbfbd`
+/// （bd t3lzr）。Latin-1 是字节↔char 的 1:1 映射，配 [`latin1_encode`] 原样还原。
+fn latin1_decode(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
+}
+
+/// String → 字节的 Latin-1 编码（[`latin1_decode`] 的逆）。
+///
+/// U+0000..=U+00FF 映射回单字节；更大码位只可能来自代码合成值（读入侧不可能产出），
+/// 按 UTF-8 编码，避免截断成乱码。
+fn latin1_encode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        match u8::try_from(u32::from(ch)) {
+            Ok(b) => out.push(b),
+            Err(_) => {
+                let mut tmp = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            },
+        }
+    }
+    out
+}
+
+/// 只剥 SP / HTAB（Go `textproto.trimString` 语义）。
+///
+/// `str::trim` 连带剥掉 U+0085 / U+00A0 等 Unicode 空白——Latin-1 解码后它们正是
+/// 原始字节 0x85 / 0xA0，剥掉即丢字节。
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches(|c| c == ' ' || c == '\t')
+}
+
+/// 路径段里的非 ASCII 字节 → `%XX`（Go `url.URL.EscapedPath`：`URL.Path` 按字节
+/// 重新转义，≥0x80 不在 `encodePath` 允许集内，实测锚点 `/t2/\xe9` → `/t2/%E9`）。
+///
+/// query（`?` 之后）在 Go 侧走 `RawQuery` 原样写出，故保持原字节不动。
+///
+/// shortcut: 只转义 ≥0x80 字节——Go `encodePath` 还会转义 `" < > [ ] { } | \ ^ \``
+/// 这类可打印 ASCII（客户端本就会先转义，实测对拍未覆盖）；需要逐字符对齐 Go 转义集
+/// 时再扩。
+fn escape_path(path_and_query: &str) -> String {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_and_query, None),
+    };
+    let mut out = String::with_capacity(path_and_query.len());
+    for b in latin1_encode(path) {
+        if b < 0x80 {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    out
 }
 
 /// 构建转发给目标服务器的 HTTP 请求（request line + headers）。
@@ -143,7 +206,9 @@ pub fn build_forwarded_request(
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
-    buf.extend_from_slice(path.as_bytes());
+    // 头值/路径按 Latin-1 还原原始字节（读入侧 [`latin1_decode`] 的逆）：非 UTF-8
+    // 头值原样到达上游（bd t3lzr）。方法名与头名已被 tchar 校验为 ASCII。
+    buf.extend_from_slice(&latin1_encode(path));
     buf.extend_from_slice(b" HTTP/1.1\r\n");
     for (key, values) in headers {
         if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
@@ -152,7 +217,7 @@ pub fn build_forwarded_request(
         for value in values {
             buf.extend_from_slice(key.as_bytes());
             buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(&latin1_encode(value));
             buf.extend_from_slice(b"\r\n");
         }
     }
@@ -618,7 +683,7 @@ pub fn resolve_request_host(
     headers
         .get("host")
         .and_then(|vals| vals.first())
-        .map(|v| v.trim().to_string())
+        .map(|v| trim_ows(v).to_string())
         .filter(|v| !v.is_empty())
 }
 
@@ -655,21 +720,27 @@ async fn read_response_head(
             }
             if let Some((k, v)) = line.split_once(':') {
                 headers
-                    .entry(k.trim().to_ascii_lowercase())
+                    .entry(trim_ows(k).to_ascii_lowercase())
                     .or_default()
-                    .push(v.trim().to_string());
+                    .push(trim_ows(v).to_string());
             }
         }
         if (100..200).contains(&code) {
-            // 1xx：透传头块，继续读最终响应（非代理处理目标）
-            let mut block = format!("{status_line}\r\n");
+            // 1xx：透传头块，继续读最终响应（非代理处理目标）。逐字节还原
+            // （Latin-1 逆编码），非 UTF-8 头值不在透传中变形。
+            let mut block = Vec::with_capacity(256);
+            block.extend_from_slice(&latin1_encode(&status_line));
+            block.extend_from_slice(b"\r\n");
             for (k, vals) in &headers {
                 for v in vals {
-                    block.push_str(&format!("{k}: {v}\r\n"));
+                    block.extend_from_slice(&latin1_encode(k));
+                    block.extend_from_slice(b": ");
+                    block.extend_from_slice(&latin1_encode(v));
+                    block.extend_from_slice(b"\r\n");
                 }
             }
-            block.push_str("\r\n");
-            client.write_all(block.as_bytes()).await?;
+            block.extend_from_slice(b"\r\n");
+            client.write_all(&block).await?;
             continue;
         }
         return Ok(ResponseHead { status_line, code, headers });
@@ -714,7 +785,7 @@ pub fn serialize_go_response_head(
     ];
 
     let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(status_line.as_bytes());
+    buf.extend_from_slice(&latin1_encode(status_line));
     buf.extend_from_slice(b"\r\n");
     // Go：ContentLength < 0 → response.Close = true → 只由 transferWriter 写
     // "Connection: close"（**不发 Proxy-Connection**——Go 仅在 400/503 错误路径
@@ -752,9 +823,9 @@ pub fn serialize_go_response_head(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (key, values) in entries {
         for value in values {
-            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&latin1_encode(&key));
             buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(&latin1_encode(value));
             buf.extend_from_slice(b"\r\n");
         }
     }
@@ -820,13 +891,13 @@ async fn forward_chunked_body(upstream: &mut TcpStream, client: &mut TcpStream) 
                 .map_err(|_| {
                     HttpProxyError::InvalidRequest(format!("malformed chunk size: {size_line:?}"))
                 })?;
-        client.write_all(size_line.as_bytes()).await?;
+        client.write_all(&latin1_encode(&size_line)).await?;
         client.write_all(b"\r\n").await?;
         if size == 0 {
             // trailer 段透传到空行（无 trailer 时首行即空）
             loop {
                 let line = read_http_line(upstream).await?;
-                client.write_all(line.as_bytes()).await?;
+                client.write_all(&latin1_encode(&line)).await?;
                 client.write_all(b"\r\n").await?;
                 if line.is_empty() {
                     return Ok(());
@@ -966,11 +1037,12 @@ where
     // 行首空格/制表符是 obs-fold 续行，按 Go `textproto.readContinuedLineSlice`
     // 折进上一头的值（H21 两侧一致面）。
     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
-    let mut head_bytes = request_line.len() + 2;
+    // Latin-1 解码后 char 数 = 原始字节数，预算按字节计（Go 侧同）。
+    let mut head_bytes = request_line.chars().count() + 2;
     let mut last_name: Option<String> = None;
     loop {
         let line = read_http_line(stream).await?;
-        head_bytes += line.len() + 2;
+        head_bytes += line.chars().count() + 2;
         if head_bytes > MAX_HTTP_HEAD_BYTES {
             return Err(HttpProxyError::Protocol(format!(
                 "http request head exceeds {MAX_HTTP_HEAD_BYTES} bytes"
@@ -988,13 +1060,13 @@ where
             };
             if let Some(value) = headers.get_mut(name).and_then(|values| values.last_mut()) {
                 value.push(' ');
-                value.push_str(line.trim());
+                value.push_str(trim_ows(&line));
             }
             continue;
         }
         let (name, value) = parse_header_line(&line)?;
-        let name = name.trim().to_ascii_lowercase();
-        headers.entry(name.clone()).or_default().push(value.trim().to_string());
+        let name = trim_ows(name).to_ascii_lowercase();
+        headers.entry(name.clone()).or_default().push(trim_ows(value).to_string());
         last_name = Some(name);
     }
     // Go `http.ReadRequest`（net/http/request.go:1138）：多个 Host 头 → 报
@@ -1048,9 +1120,9 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
     if buf.last() == Some(&b'\r') {
         buf.pop();
     }
-    // Go 按字节透传（≥0x80 原始字节合法，H06）；本实现全程 String，非法 UTF-8
-    // 序列退化为 U+FFFD——状态码与 Go 一致，仅转发字节不同（D-4 同源限制）。
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    // 头行按字节透传（Go 不解 UTF-8，≥0x80 原始字节合法，H06）：Latin-1 逐字节
+    // 1:1 映射，写回上游/客户端时经 [`latin1_encode`] 原样还原（bd t3lzr）。
+    Ok(latin1_decode(&buf))
 }
 
 /// 请求行三段切分（对齐 Go `net/http/request.go:1027` `parseRequestLine` +
@@ -1573,6 +1645,62 @@ mod tests {
     fn extract_request_path_transparent() {
         assert_eq!(extract_request_path("/index.html"), "/index.html");
         assert_eq!(extract_request_path("/"), "/");
+    }
+
+    #[test]
+    fn latin1_roundtrip_preserves_every_byte() {
+        // bd t3lzr：任意字节（含非法 UTF-8 序列与合法 UTF-8 多字节序列）必须 1:1 往返
+        for raw in [
+            &b"e9ff"[..],
+            &b"\xe9\xff\x80\x01"[..],
+            &b"\xe4\xb8\xad"[..], // 合法 UTF-8（中）
+            &b"\x85\xa0"[..],     // U+0085/U+00A0：Unicode 空白，trim 会误剥
+            &b""[..],
+        ] {
+            let s = latin1_decode(raw);
+            assert_eq!(latin1_encode(&s), raw, "decode→encode 必须字节全等");
+        }
+        assert_eq!(trim_ows("\u{85}\u{a0}v\u{85}"), "\u{85}\u{a0}v\u{85}");
+        assert_eq!(trim_ows(" \tv \t"), "v");
+    }
+
+    #[test]
+    fn extract_request_path_percent_encodes_non_ascii_bytes() {
+        // Go `url.URL.EscapedPath`：路径段 ≥0x80 字节 → %XX（实测锚点 /t2/%E9）；
+        // query 走 RawQuery 原样写出。入参是读头侧 Latin-1 解码后的形态。
+        assert_eq!(extract_request_path("/t2/\u{e9}"), "/t2/%E9");
+        assert_eq!(extract_request_path("http://h:1/t2/\u{e9}"), "/t2/%E9");
+        assert_eq!(extract_request_path("/t2/\u{e9}?q=\u{ff}"), "/t2/%E9?q=\u{ff}");
+        assert_eq!(extract_request_path("/t2/%E9"), "/t2/%E9"); // 已转义原样保留
+        assert_eq!(extract_request_path("/t2/\u{e9}\u{ff}"), "/t2/%E9%FF");
+    }
+
+    #[test]
+    fn build_forwarded_request_writes_raw_header_bytes() {
+        // bd t3lzr：非 UTF-8 头值原样写上游（读入侧 Latin-1 的逆）
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["h".into()]);
+        headers.insert("x-bin".into(), vec!["\u{e9}\u{ff}".into()]);
+        headers.insert("x-utf8".into(), vec!["\u{e4}\u{b8}\u{ad}".into()]);
+        let req = build_forwarded_request("GET", "/t2/%E9", &headers);
+        // 转发字节本就可能是非法 UTF-8（这正是本票要保真的），故只按字节断言
+        assert!(req.starts_with(b"GET /t2/%E9 HTTP/1.1\r\n"), "request line: {req:?}");
+        assert!(find_bytes(&req, b"x-bin: \xe9\xff\r\n"), "非 UTF-8 头值必须原样写上游: {req:?}");
+        // U+00E4/U+00B8/U+00AD 解码自 e4b8ad，编码回来仍是同一串字节
+        assert!(find_bytes(&req, b"x-utf8: \xe4\xb8\xad\r\n"), "UTF-8 头值不变: {req:?}");
+    }
+
+    #[tokio::test]
+    async fn read_http_line_keeps_non_utf8_bytes() {
+        // 读头侧：非 UTF-8 字节不得退化成 U+FFFD
+        let mut src = &b"X-Bin: \xe9\xff\r\n"[..];
+        let line = read_http_line(&mut src).await.unwrap();
+        assert_eq!(line, "X-Bin: \u{e9}\u{ff}");
+        assert_eq!(latin1_encode(&line), b"X-Bin: \xe9\xff");
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]
