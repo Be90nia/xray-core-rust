@@ -117,81 +117,11 @@ async fn accept_fd_backoff(e: &std::io::Error) {
     }
 }
 
-/// SOCKS5 inbound 服务入口。
-///
-/// 绑定 `addr` 监听，每个连接 spawn 独立 task：
-/// 1. SOCKS5 握手得目标 `SocksAddr`
-/// 2. 转 `Destination`，构造 `Link`（用 TcpStream 的 read/write half）
-/// 3. `ohm` 的 default handler `dispatch(dest, link)` 拨号并桥接
-///
-/// # 参数
-/// - `listener`：已绑定的 TCP listener
-/// - `ohm`：出站管理器（至少有 default handler）
-/// - `config`：SOCKS5 server 配置（auth method 等）
-///
-/// # 错误
-/// accept 循环自身错误返回；单个连接错误只 log 不中断循环。
-pub async fn serve_socks5(
-    listener: InboundTcpListener,
-    ohm: Arc<SimpleOhm>,
-    config: Arc<ServerConfig>,
-    handshake_timeout: Option<std::time::Duration>,
-    udp_idle: std::time::Duration,
-    plugin_ctx: Arc<PluginContext>,
-) -> std::io::Result<()> {
-    let handler = ohm
-        .get_default_handler()
-        .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-
-    tracing::info!(
-        addr = %listener.local_addr()?,
-        "socks5 inbound listening"
-    );
-
-    loop {
-        // finalmask.tcp：accept 后立即套上（wire 最外层；未配 mask → Plain 直通）
-        let (stream, peer) = match listener.accept_masked().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "socks5 accept failed");
-                accept_fd_backoff(&e).await;
-                continue;
-            },
-        };
-
-        let handler = Arc::clone(&handler);
-        let config = Arc::clone(&config);
-        // scope 生命周期锚：连接任务存活期间 arm scope 不 drop（裸 spawn
-        // detach 语义等价；SsConnection `_ctx` 自持同款）
-        let task_ctx = Arc::clone(&plugin_ctx);
-        let conn_ctx = Arc::clone(&plugin_ctx);
-        plugin_ctx
-            .spawn(async move {
-                let _ctx = task_ctx;
-                if let Err(e) = handle_connection(
-                    stream,
-                    peer,
-                    &config,
-                    &handler,
-                    handshake_timeout,
-                    udp_idle,
-                    conn_ctx,
-                )
-                .await
-                {
-                    // Go proxyman/worker.go:124：连接结束错误统一 LogInfo("connection ends")。
-                    tracing::info!(peer = %peer, error = %e, "socks5 connection ended with error");
-                }
-            })
-            .expect("arm FxScope is never closed");
-    }
-}
-
 /// 入站连接元数据提取（txno④ + txno-splice）。
 ///
 /// 对应 Go `session.Inbound` 的三块元数据：`Conn`（raw fd，session.go:52-53）、
 /// `Local`（本地地址）、`CanSpliceCopy`（raw 传输判定，socks server.go:69/73-75）。
-/// [`handle_connection`] 泛型于具体流类型（TCP `TcpStream` / UDS
+/// [`serve_mixed_conn`] 泛型于具体流类型（TCP `TcpStream` / UDS
 /// `Box<dyn Connection>`），本 trait 把「是否裸 TCP / 能否 dup / 本地地址」
 /// 抹平成统一入口。
 trait InboundConnMeta {
@@ -201,6 +131,13 @@ trait InboundConnMeta {
     fn inbound_local(&self) -> Option<SocketAddr>;
     /// 是否裸 TCP（Go `proxy.IsRAWTransportWithoutSecurity`，proxy.go:802-809）。
     fn is_raw_inbound(&self) -> bool;
+    /// 首字节嗅探可直用的真 socket（`peek` 不消费字节、零缓冲）。
+    ///
+    /// 无 peek 能力的传输（UDS `Box<dyn Connection>` 等）走缺省 `None`，
+    /// 调用方退回预读 1 字节回放（见 [`PeekAhead`]）。
+    fn socket_for_peek(&self) -> Option<&TcpStream> {
+        None
+    }
     /// 消费流拆为 (Reader, Writer)，按流类型分发（对应 Go `buf.NewReader`
     /// io.go:113-145 的类型分派）：裸 TCP 走 readv 聚合读（syscall.Conn →
     /// ReadVReader 分支，env 闸门 `xray.buf.readv` 关时工厂内部自动退回顺序
@@ -220,6 +157,10 @@ impl InboundConnMeta for TcpStream {
 
     fn is_raw_inbound(&self) -> bool {
         true
+    }
+
+    fn socket_for_peek(&self) -> Option<&TcpStream> {
+        Some(self)
     }
 
     fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
@@ -267,6 +208,11 @@ impl InboundConnMeta for MaybeTcpMaskConn<TcpStream> {
         self.plain().is_some()
     }
 
+    fn socket_for_peek(&self) -> Option<&TcpStream> {
+        // mask 生效时底层是密文套壳，peek 到的是密文 → 只能走预读回放
+        self.plain()
+    }
+
     fn into_link_io(self) -> (Box<dyn Reader>, Box<dyn Writer>) {
         match self {
             Self::Plain(c) => c.into_link_io(),
@@ -280,23 +226,31 @@ impl InboundConnMeta for MaybeTcpMaskConn<TcpStream> {
 
 /// 首字节嗅探用的预读包装（mixed 靠第 1 字节分流 socks 与 HTTP）。
 ///
-/// mask 生效时底层是密文套壳、拿不到 socket `peek`，故把读到的明文留在
-/// `peeked`、由 [`tokio::io::AsyncRead`] 优先回放；未配 mask 时 peek 直通
-/// `TcpStream::peek`，不产生任何缓冲（行为与 dppv 之前逐字节一致）。
-struct PeekAhead {
-    conn: MaybeTcpMaskConn<TcpStream>,
+/// 底层有真 socket（裸 TCP）时 peek 直通 `TcpStream::peek`，不产生任何缓冲
+/// （行为与 dppv 之前逐字节一致）；mask 生效或传输自身无 peek 能力（UDS
+/// `Box<dyn Connection>`）时把读到的明文留在 `peeked`、由
+/// [`tokio::io::AsyncRead`] 优先回放。
+struct PeekAhead<S> {
+    conn: S,
     peeked: Vec<u8>,
 }
 
-impl PeekAhead {
-    fn new(conn: MaybeTcpMaskConn<TcpStream>) -> Self {
+impl<S> PeekAhead<S> {
+    fn new(conn: S) -> Self {
         Self { conn, peeked: Vec::new() }
     }
+}
 
+impl<S> PeekAhead<S>
+where
+    S: tokio::io::AsyncRead + Unpin + InboundConnMeta,
+{
     /// 预读明文（语义同 `TcpStream::peek`：字节不消费，EOF 返回 0）。
     async fn peek(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(c) = self.conn.plain() {
-            return c.peek(buf).await;
+        if self.peeked.is_empty() {
+            if let Some(c) = self.conn.socket_for_peek() {
+                return c.peek(buf).await;
+            }
         }
         if self.peeked.is_empty() && !buf.is_empty() {
             let mut tmp = vec![0u8; buf.len()];
@@ -309,7 +263,7 @@ impl PeekAhead {
     }
 }
 
-impl AsyncRead for PeekAhead {
+impl<S: tokio::io::AsyncRead + Unpin> AsyncRead for PeekAhead<S> {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -326,7 +280,7 @@ impl AsyncRead for PeekAhead {
     }
 }
 
-impl AsyncWrite for PeekAhead {
+impl<S: tokio::io::AsyncWrite + Unpin> AsyncWrite for PeekAhead<S> {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -350,7 +304,10 @@ impl AsyncWrite for PeekAhead {
     }
 }
 
-impl InboundConnMeta for PeekAhead {
+impl<S> InboundConnMeta for PeekAhead<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + InboundConnMeta,
+{
     fn splice_raw_clone(&self) -> Option<TcpStream> {
         self.conn.splice_raw_clone()
     }
@@ -370,118 +327,6 @@ impl InboundConnMeta for PeekAhead {
         // 预读过明文：必须连缓冲一起交给读侧回放，不能直接拆底层 conn。
         let (rd, wr) = tokio::io::split(self);
         (new_reader(rd), new_writer(wr))
-    }
-}
-
-/// 处理单个 SOCKS 连接：handshake → dispatch（TCP CONNECT）或 UDP relay。
-///
-/// 泛型流：TcpStream（TCP 监听）与 UDS `Box<dyn Connection>`（vodx unix
-/// inbound）共用；`socks_handshake` 本就是 AsyncRead+AsyncWrite 泛型。
-async fn handle_connection<S>(
-    mut stream: S,
-    peer: std::net::SocketAddr,
-    config: &ServerConfig,
-    handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
-    handshake_timeout: Option<std::time::Duration>,
-    udp_idle: std::time::Duration,
-    plugin_ctx: Arc<PluginContext>,
-) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + InboundConnMeta,
-{
-    // 1. SOCKS 握手（兼容 4/4a/5）；受握手限时约束（Go proxy/socks/server.go
-    // Process: SetReadDeadline(policy().Timeouts.Handshake)，超时断开；仅覆盖
-    // 握手阶段，dispatch 数据路径不限时）
-    let socks_req = {
-        // bd hzjgv D-9：CONNECT 回复的 BND 回本端地址（Go `inbound.Gateway`）
-        let gateway = stream.inbound_local();
-        let handshake_fut = socks_handshake(&mut stream, config, gateway);
-        let res = match handshake_timeout {
-            Some(d) => tokio::time::timeout(d, handshake_fut).await,
-            None => Ok(handshake_fut.await),
-        };
-        match res {
-            Ok(r) => r.map_err(|e| std::io::Error::other(format!("socks handshake: {e}")))?,
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "socks handshake timeout",
-                ));
-            },
-        }
-    };
-
-    match socks_req {
-        SocksRequest::UdpAssociate { request, socket, .. } => {
-            // UDP relay：spawn pump，保持 TCP 控制连接直到客户端断开
-            // handler 是 &Arc 引用，spawn 的 future 需 'static —— spawn 前 clone
-            let udp_handler = Arc::clone(handler);
-            // 来源过滤（bd wq16g）：只接受客户端地址，其余来源丢弃
-            let relay = temp_udp_relay(socket, &request, peer);
-            // scope 生命周期锚：relay 任务存活期间 arm scope 不 drop（裸 spawn
-            // detach 语义等价；Spawned::abort 保持控制连接断开即终止 relay）
-            let relay_ctx = Arc::clone(&plugin_ctx);
-            let relay = plugin_ctx
-                .spawn(async move {
-                    let _ctx = relay_ctx;
-                    let _ = handle_udp_associate(relay, udp_handler, udp_idle).await;
-                })
-                .expect("arm FxScope is never closed");
-            // SOCKS5 UDP ASSOCIATE 语义：TCP 控制连接存在期间 relay 有效。
-            // 读到 EOF/错误（客户端关闭控制连接）即终止 relay。
-            let mut drop_buf = [0u8; 64];
-            let _ = stream.read(&mut drop_buf).await;
-            relay.abort();
-            Ok(())
-        },
-        SocksRequest::TcpConnect(addr) => {
-            // 2. SocksAddr → Destination
-            let dest = socks_addr_to_destination(&addr, Network::TCP);
-            // access log（bd 4uu）：from=客户端源地址（对应 Go socks server ctx
-            // ContextWithAccessMessage{From: conn.RemoteAddr()}）；email 留空（无认证），
-            // inbound_tag 由 InboundDispatchHandler 补齐。
-            // txno：local=入站本地地址（Go session.Inbound.Local，④ portal 写侧）；
-            // conn/can_splice_copy=splice 元数据（Go socks server.go:69 `2` + :73-75
-            // 非 raw 翻 3 + :154-156 握手完成翻 1——dispatch 时点即已 1，Go
-            // inbound.Conn 同点挂接）。raw fd 在 split 前取出（dup 克隆）。
-            let access = {
-                let (conn, can) = if stream.is_raw_inbound() {
-                    (
-                        stream.splice_raw_clone().map(Arc::new),
-                        xray_common::platform::splice::CAN_SPLICE_COPY_YES,
-                    )
-                } else {
-                    (None, xray_common::platform::splice::CAN_SPLICE_COPY_NEVER)
-                };
-                xray_app_dispatcher::AccessContext {
-                    from: peer.to_string(),
-                    local: stream.inbound_local().map(|a| a.to_string()).unwrap_or_default(),
-                    conn,
-                    can_splice_copy: can,
-                    ..Default::default()
-                }
-            };
-            // 3. 拆流 → Link：按流类型分发（InboundConnMeta::into_link_io）——
-            // 裸 TCP 接 readv 聚合读（bd 4vkp，对齐 Go NewReader syscall.Conn
-            // 分支）；UDS Box<dyn Connection> 退回顺序读；env 闸门
-            // xray.buf.readv 关时工厂内部退回顺序读（行为同前）。
-            let (reader, writer) = stream.into_link_io();
-            let link = Link::new(reader, writer);
-            // 4. dispatch（zx7: mux.cool dest 转给 mux ServerWorker）
-            if is_mux_destination(&dest) {
-                tracing::info!(
-                    "socks: mux.cool destination detected, spawning mux inbound handler"
-                );
-                // W4 面 6：carrier 与 inbound（arm）同寿命 → arm scope 托管
-                //（方案 §2 面 6：两级 scope 下 mux link 归 arm scope）。
-                plugin_ctx
-                    .spawn(handle_mux_inbound_link(link, Arc::clone(handler), None))
-                    .expect("arm FxScope is never closed");
-                return Ok(());
-            }
-            let _ = handler.dispatch_with_access(&dest, link, access).await;
-            Ok(())
-        },
     }
 }
 
@@ -711,7 +556,7 @@ pub(crate) async fn serve_mixed(
                 continue;
             },
         };
-        let mut stream = PeekAhead::new(stream);
+        let stream = PeekAhead::new(stream);
         let handler = Arc::clone(&handler);
         let socks_cfg = Arc::clone(&socks_cfg);
         let http_cfg = Arc::clone(&http_cfg);
@@ -719,127 +564,155 @@ pub(crate) async fn serve_mixed(
         let task_ctx = Arc::clone(&plugin_ctx);
         plugin_ctx
             .spawn(async move {
-                let ctx = task_ctx;
-                // 1 字节 sniff(带超时避免恶意 client 占资源)
-                let mut sniff = [0u8; 1];
-                let read_res = match handshake_timeout {
-                    Some(d) => tokio::time::timeout(d, stream.peek(&mut sniff)).await,
-                    None => Ok(stream.peek(&mut sniff).await),
-                };
-                let n = match read_res {
-                    Ok(Ok(n)) => n,
-                    _ => return,
-                };
-                if n == 0 {
-                    return;
-                }
-                if sniff[0] == 0x05 || sniff[0] == 0x04 {
-                    // SOCKS 路径（0x05 = SOCKS5 / 0x04 = SOCKS4；握手与 sniff/http
-                    // 段共用同一限时）。版本分派在库层 `socks_handshake` 内按首字节
-                    // 完成（Go `handshake4`/`handshake5` 同款），此处只做入口分流。
-                    // bd hzjgv D-9：CONNECT 回复的 BND 回本端地址（Go `inbound.Gateway`）
-                    let gateway = stream.inbound_local();
-                    let hs_fut = socks_handshake(&mut stream, &socks_cfg, gateway);
-                    let hs = match handshake_timeout {
-                        Some(d) => match tokio::time::timeout(d, hs_fut).await {
-                            Ok(r) => r,
-                            Err(_) => return,
-                        },
-                        None => hs_fut.await,
-                    };
-                    match hs {
-                        Ok(SocksRequest::TcpConnect(addr)) => {
-                            let dest = socks_addr_to_destination(&addr, Network::TCP);
-                            // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
-                            let access = http_inbound_access(&stream, peer);
-                            // 拆流按连接类型分发（裸 TCP → readv 聚合读；mask 生效 →
-                            // 顺序读，见 InboundConnMeta）
-                            let (reader, writer) = stream.into_link_io();
-                            let link = Link::new(reader, writer);
-                            if is_mux_destination(&dest) {
-                                // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
-                                ctx.spawn(handle_mux_inbound_link(link, handler, None))
-                                    .expect("arm FxScope is never closed");
-                            } else {
-                                let _ = handler.dispatch_with_access(&dest, link, access).await;
-                            }
-                        },
-                        Ok(SocksRequest::UdpAssociate { request, socket, .. }) => {
-                            // UDP relay：spawn pump + 保持 TCP 控制连接（对齐独立 socks
-                            // inbound 的 handle_connection UDP 分支与 Go server.go UDP
-                            // 语义——此前丢弃 relay socket = 假成功，bd csya）
-                            let udp_handler = Arc::clone(&handler);
-                            // 来源过滤（bd wq16g）：只接受客户端地址，其余来源丢弃
-                            let temp_udp = temp_udp_relay(socket, &request, peer);
-                            let relay = ctx
-                                .spawn(async move {
-                                    let _ =
-                                        handle_udp_associate(temp_udp, udp_handler, udp_idle).await;
-                                })
-                                .expect("arm FxScope is never closed");
-                            // 控制连接 EOF/错误（客户端关闭）即终止 relay
-                            let mut drop_buf = [0u8; 64];
-                            let _ = stream.read(&mut drop_buf).await;
-                            relay.abort();
-                        },
-                        Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
-                    }
-                } else if sniff[0].is_ascii_alphabetic() {
-                    // HTTP 路径(简化版:仅 CONNECT + plain,无 mux 派生)
-                    // keep-alive 回环（对齐 serve_http）：首包已 peek 判定为 HTTP，
-                    // 第二轮起直接读下一请求头，不再 sniff；CONNECT 升级即终结循环。
-                    loop {
-                        let handshake_fut = http_server_handshake(&mut stream, &http_cfg);
-                        let hs = match handshake_timeout {
-                            Some(d) => match tokio::time::timeout(d, handshake_fut).await {
-                                Ok(r) => r,
-                                // 超时/失败收尾先排空（Windows 防 RST 丢已写响应）
-                                Err(_) => {
-                                    http_graceful_close(&mut stream).await;
-                                    return;
-                                },
-                            },
-                            None => handshake_fut.await,
-                        };
-                        let hs = match hs {
-                            Ok(v) => v,
-                            Err(_) => {
-                                http_graceful_close(&mut stream).await;
-                                return;
-                            },
-                        };
-                        // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
-                        let access = http_inbound_access(&stream, peer);
-                        if hs.method != "CONNECT" {
-                            // P1-1：此分支此前只处理一个请求就断连，与响应头写出的
-                            // keep-alive 承诺矛盾；plain 处置语义与 serve_http 同款。
-                            match handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access)
-                                .await
-                            {
-                                PlainOutcome::NextRequest => continue,
-                                PlainOutcome::Close => {
-                                    http_graceful_close(&mut stream).await;
-                                    return;
-                                },
-                            }
-                        }
-                        let dest = hs.dest;
-                        let (reader, writer) = stream.into_link_io();
-                        let link = Link::new(reader, writer);
-                        if is_mux_destination(&dest) {
-                            // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
-                            ctx.spawn(handle_mux_inbound_link(link, handler, None))
-                                .expect("arm FxScope is never closed");
-                        } else {
-                            let _ = handler.dispatch_with_access(&dest, link, access).await;
-                        }
-                        return;
-                    }
-                } else {
-                    tracing::debug!(first_byte = sniff[0], "mixed: unknown first byte, closing");
-                }
+                serve_mixed_conn(
+                    stream,
+                    peer,
+                    socks_cfg,
+                    http_cfg,
+                    handshake_timeout,
+                    udp_idle,
+                    handler,
+                    task_ctx,
+                )
+                .await
             })
             .expect("arm FxScope is never closed");
+    }
+}
+
+/// mixed 单连接处理：首字节 0x05/0x04 → SOCKS 握手；ASCII 字母 → HTTP 代理。
+///
+/// 与传输层解耦——TCP（`PeekAhead<MaybeTcpMaskConn<TcpStream>>`，socket peek
+/// 嗅探）与 UDS（`PeekAhead<Box<dyn Connection>>`，预读 1 字节回放）共用同一份
+/// 复合栈。依据：Go `proxy/socks/server.go:38-43` 的 httpServer 与传输层无关
+/// （`proxyman/inbound/worker.go` 一律把 `net.Conn` 交给它），故 UDS 上的 socks
+/// 端口同样服务 HTTP 代理。
+#[allow(clippy::too_many_arguments)] // 8 参 = TCP/UDS 双路径直译签名，打包聚合体属内部 API 变更
+async fn serve_mixed_conn<S>(
+    mut stream: PeekAhead<S>,
+    peer: std::net::SocketAddr,
+    socks_cfg: Arc<ServerConfig>,
+    http_cfg: Arc<HttpServerConfig>,
+    handshake_timeout: Option<std::time::Duration>,
+    udp_idle: std::time::Duration,
+    handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    ctx: Arc<PluginContext>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static + InboundConnMeta,
+{
+    // 1 字节 sniff(带超时避免恶意 client 占资源)
+    let mut sniff = [0u8; 1];
+    let read_res = match handshake_timeout {
+        Some(d) => tokio::time::timeout(d, stream.peek(&mut sniff)).await,
+        None => Ok(stream.peek(&mut sniff).await),
+    };
+    let n = match read_res {
+        Ok(Ok(n)) => n,
+        _ => return,
+    };
+    if n == 0 {
+        return;
+    }
+    if sniff[0] == 0x05 || sniff[0] == 0x04 {
+        // SOCKS 路径（0x05 = SOCKS5 / 0x04 = SOCKS4；握手与 sniff/http
+        // 段共用同一限时）。版本分派在库层 `socks_handshake` 内按首字节
+        // 完成（Go `handshake4`/`handshake5` 同款），此处只做入口分流。
+        // bd hzjgv D-9：CONNECT 回复的 BND 回本端地址（Go `inbound.Gateway`）
+        let gateway = stream.inbound_local();
+        let hs_fut = socks_handshake(&mut stream, &socks_cfg, gateway);
+        let hs = match handshake_timeout {
+            Some(d) => match tokio::time::timeout(d, hs_fut).await {
+                Ok(r) => r,
+                Err(_) => return,
+            },
+            None => hs_fut.await,
+        };
+        match hs {
+            Ok(SocksRequest::TcpConnect(addr)) => {
+                let dest = socks_addr_to_destination(&addr, Network::TCP);
+                // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
+                let access = http_inbound_access(&stream, peer);
+                // 拆流按连接类型分发（裸 TCP → readv 聚合读；mask 生效 →
+                // 顺序读，见 InboundConnMeta）
+                let (reader, writer) = stream.into_link_io();
+                let link = Link::new(reader, writer);
+                if is_mux_destination(&dest) {
+                    // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
+                    ctx.spawn(handle_mux_inbound_link(link, handler, None))
+                        .expect("arm FxScope is never closed");
+                } else {
+                    let _ = handler.dispatch_with_access(&dest, link, access).await;
+                }
+            },
+            Ok(SocksRequest::UdpAssociate { request, socket, .. }) => {
+                // UDP relay：spawn pump + 保持 TCP 控制连接（对齐 Go server.go
+                // UDP 语义——此前丢弃 relay socket = 假成功，bd csya）
+                let udp_handler = Arc::clone(&handler);
+                // 来源过滤（bd wq16g）：只接受客户端地址，其余来源丢弃
+                let temp_udp = temp_udp_relay(socket, &request, peer);
+                let relay = ctx
+                    .spawn(async move {
+                        let _ = handle_udp_associate(temp_udp, udp_handler, udp_idle).await;
+                    })
+                    .expect("arm FxScope is never closed");
+                // 控制连接 EOF/错误（客户端关闭）即终止 relay
+                let mut drop_buf = [0u8; 64];
+                let _ = stream.read(&mut drop_buf).await;
+                relay.abort();
+            },
+            Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
+        }
+    } else if sniff[0].is_ascii_alphabetic() {
+        // HTTP 路径(简化版:仅 CONNECT + plain,无 mux 派生)
+        // keep-alive 回环（对齐 serve_http）：首包已 peek 判定为 HTTP，
+        // 第二轮起直接读下一请求头，不再 sniff；CONNECT 升级即终结循环。
+        loop {
+            let handshake_fut = http_server_handshake(&mut stream, &http_cfg);
+            let hs = match handshake_timeout {
+                Some(d) => match tokio::time::timeout(d, handshake_fut).await {
+                    Ok(r) => r,
+                    // 超时/失败收尾先排空（Windows 防 RST 丢已写响应）
+                    Err(_) => {
+                        http_graceful_close(&mut stream).await;
+                        return;
+                    },
+                },
+                None => handshake_fut.await,
+            };
+            let hs = match hs {
+                Ok(v) => v,
+                Err(_) => {
+                    http_graceful_close(&mut stream).await;
+                    return;
+                },
+            };
+            // bd 2b1c：access 带 from（process/source 规则 + access log 来源）
+            let access = http_inbound_access(&stream, peer);
+            if hs.method != "CONNECT" {
+                // P1-1：此分支此前只处理一个请求就断连，与响应头写出的
+                // keep-alive 承诺矛盾；plain 处置语义与 serve_http 同款。
+                match handle_plain_http(&mut stream, &hs, Arc::clone(&handler), access).await {
+                    PlainOutcome::NextRequest => continue,
+                    PlainOutcome::Close => {
+                        http_graceful_close(&mut stream).await;
+                        return;
+                    },
+                }
+            }
+            let dest = hs.dest;
+            let (reader, writer) = stream.into_link_io();
+            let link = Link::new(reader, writer);
+            if is_mux_destination(&dest) {
+                // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
+                ctx.spawn(handle_mux_inbound_link(link, handler, None))
+                    .expect("arm FxScope is never closed");
+            } else {
+                let _ = handler.dispatch_with_access(&dest, link, access).await;
+            }
+            return;
+        }
+    } else {
+        tracing::debug!(first_byte = sniff[0], "mixed: unknown first byte, closing");
     }
 }
 
@@ -948,7 +821,7 @@ pub async fn serve_http(
 /// HTTP/mixed inbound 连接元数据 → AccessContext。
 ///
 /// bd 2b1c：此前 HTTP 路径 dispatch 不带 access，from 为空 → process/source
-/// 规则永不命中、access log 缺来源。socks 分支同款见 handle_connection。
+/// 规则永不命中、access log 缺来源。socks 分支同款见 [`serve_mixed_conn`]。
 fn http_inbound_access<S: InboundConnMeta>(
     stream: &S,
     peer: std::net::SocketAddr,
@@ -4454,41 +4327,44 @@ async fn spawn_unix_inbound(
         .as_str()
     {
         "socks" => {
-            let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
+            // bd q2crg：socks 端口的 HTTP fallback 与传输层无关（Go
+            // `proxy/socks/server.go:38-43` 无条件挂 httpServer）→ UDS 与 TCP
+            // 走同一份 mixed 复合栈（禁另造 HTTP 实现）。
+            let (config, http_cfg) = parse_socks_http_configs(&ib.entry.data)?;
+            let config = Arc::new(config);
+            let http_cfg = Arc::new(http_cfg);
             let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
             let udp_idle = policy
                 .as_ref()
                 .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
                 .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
+            tracing::info!(
+                tag = %ib.tag,
+                path = %listen,
+                "socks5 (uds) inbound listening (http proxy fallback on non-SOCKS first byte)"
+            );
             Box::pin(serve_unix_listener(listener, {
                 let handler = Arc::clone(&handler);
                 Arc::new(move |conn| {
                     let handler = Arc::clone(&handler);
                     let config = Arc::clone(&config);
+                    let http_cfg = Arc::clone(&http_cfg);
                     // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
                     let task_ctx = Arc::clone(&plugin_ctx);
-                    let conn_ctx = Arc::clone(&plugin_ctx);
                     plugin_ctx
                         .spawn(async move {
-                            let _ctx = task_ctx;
                             let peer = conn.remote_addr().ok().flatten().unwrap_or(unspecified);
-                            if let Err(e) = handle_connection(
-                                conn,
+                            serve_mixed_conn(
+                                PeekAhead::new(conn),
                                 peer,
-                                &config,
-                                &handler,
+                                config,
+                                http_cfg,
                                 handshake_timeout,
                                 udp_idle,
-                                conn_ctx,
+                                handler,
+                                task_ctx,
                             )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "socks5 (uds) connection ended with error"
-                                );
-                            }
+                            .await;
                         })
                         .expect("arm FxScope is never closed");
                 })
@@ -4772,6 +4648,29 @@ async fn spawn_unix_inbound(
         std::io::ErrorKind::Unsupported,
         format!("unix socket inbound '{}' is only supported on unix platforms", ib.tag),
     ))
+}
+
+/// socks 入站端口的 (socks, http) 双配置构造——TCP 与 UDS 两条路径共用。
+///
+/// Go `proxy/socks/server.go:38-43`：socks 端口的 Server **无条件**构造一个
+/// httpServer，首字节 ∉ {0x05,0x04} 即转 `httpServer.ProcessWithFirstbyte`
+/// （`:87-90`）——socks 端口同时服务 SOCKS5 与 HTTP 代理；该 httpServer 与传输
+/// 层无关，故 UDS 上的 socks 入站同款。HTTP 侧只在 socks 配了 password 认证时
+/// 继承 accounts（`:47-49`），userLevel 与 socks 同源（同一段 settings JSON）。
+pub(crate) fn parse_socks_http_configs(
+    data: &[u8],
+) -> std::io::Result<(ServerConfig, HttpServerConfig)> {
+    let socks_cfg = parse_socks_server_config(data)?;
+    let mut http_cfg = if data.is_empty() {
+        // 空 settings = `{}`（Go 零值配置）；`parse_http_config` 不接受空切片。
+        parse_http_config(b"{}")?
+    } else {
+        parse_http_config(data)?
+    };
+    if socks_cfg.auth_type != xray_proxy_socks::config::AuthType::Password {
+        http_cfg.accounts.clear();
+    }
+    Ok((socks_cfg, http_cfg))
 }
 
 /// 从 inbound entry.data（JSON）解析 SOCKS 服务端配置。
@@ -6191,8 +6090,9 @@ mod tests {
     }
 
     /// bd vodx（unix 端到端）：socks inbound 经 `spawn_one_inbound` 的 unix
-    /// 路径分派 → `listen_unix_system` UDS listener → 泛型 `handle_connection`
-    /// → freedom → TCP echo。证明 UDS 接线被主分派入口真实调用。
+    /// 路径分派 → `listen_unix_system` UDS listener → [`serve_mixed_conn`]
+    /// 复合栈（bd q2crg 起，与 TCP 面同源）→ freedom → TCP echo。证明 UDS
+    /// 接线被主分派入口真实调用。
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_socket_socks_inbound_e2e() {
@@ -6264,6 +6164,113 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through uds proxy");
+
+        handle.abort();
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// bd q2crg（unix 端到端）：socks 入站端口的 HTTP fallback **与传输层无关**
+    /// （Go `proxy/socks/server.go:38-43` 无条件构造 httpServer，`proxyman/inbound`
+    /// 一律把 `net.Conn` 交给它），故 UDS 上的 socks 端口同样服务 HTTP 代理。
+    /// 修复前 unix 分支走纯 SOCKS 握手 → 首字节 'G' 被当 SOCKS version 拒绝。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_socks_inbound_serves_http_proxy() {
+        // 1. 本地 HTTP 上游：记录收到的请求字节，回 200 + 固定 body
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        let got = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let got_task = Arc::clone(&got);
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = up_listener.accept().await else { return };
+            let mut b = [0u8; 4096];
+            loop {
+                let Ok(n) = sock.read(&mut b).await else { return };
+                if n == 0 {
+                    return;
+                }
+                let head_done = {
+                    let mut g = got_task.lock();
+                    g.extend_from_slice(&b[..n]);
+                    g.windows(4).any(|w| w == b"\r\n\r\n")
+                };
+                if head_done {
+                    break;
+                }
+            }
+            let _ =
+                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nbody-uds-http").await;
+            // 保持连接（不让代理读到 EOF 干扰定界判定）
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        });
+
+        // 2. UDS socks inbound：走 spawn_one_inbound 的 unix 路径分派
+        let sock_path =
+            std::env::temp_dir().join(format!("xray-uds-socks-http-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock_path);
+        let ib = BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "socks".to_string(), data: b"{}".to_vec() },
+            tag: "uds-socks-http".to_string(),
+            port: None,
+            listen: Some(sock_path.to_string_lossy().into_owned()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        };
+        let handle = spawn_one_inbound(
+            &ib,
+            {
+                // plain HTTP 的 dispatch 必须「spawn 后立即返回」（生产
+                // `DefaultDispatcher::dispatch_link` 同款）；`DialBridge::dispatch`
+                // 内联 join 会与 handle_plain_http「dispatch 返回后才写请求」互等死锁。
+                let ohm = Arc::new(SimpleOhm::new());
+                ohm.set_default(
+                    Arc::new(DialDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>
+                );
+                ohm
+            },
+            None,
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("uds socks inbound should spawn a serve task");
+
+        // 3. UDS client 发 plain HTTP 代理请求（首字节 'G' ∉ {0x05,0x04}）
+        let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{port}/uds-http HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n",
+            port = up_addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        // 4. 读到「200 头 + 上游 body」即断言（plain HTTP 走 keep-alive，
+        //    代理转发后不关连接——不能等 EOF，见 Go server.go errWaitAnother）
+        let mut acc: Vec<u8> = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut b = [0u8; 4096];
+            loop {
+                match client.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => acc.extend_from_slice(&b[..n]),
+                }
+                if acc.starts_with(b"HTTP/1.1 200") && acc.ends_with(b"body-uds-http") {
+                    break;
+                }
+            }
+        })
+        .await;
+        let text = String::from_utf8_lossy(&acc);
+        let up_req = String::from_utf8_lossy(&got.lock()).to_string();
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "UDS socks 端口须按 HTTP 代理应答，实际: {text:?}；上游收到: {up_req:?}"
+        );
+        assert!(
+            text.ends_with("body-uds-http"),
+            "上游 body 必须经代理回传，实际: {text:?}；上游收到: {up_req:?}"
+        );
+        assert!(up_req.starts_with("GET /uds-http "), "上游须收到相对 path，实际: {up_req:?}");
 
         handle.abort();
         let _ = std::fs::remove_file(&sock_path);
@@ -7703,10 +7710,12 @@ mod tests {
         let config = Arc::new(ServerConfig::default());
         let ohm_clone = Arc::clone(&ohm);
         tokio::spawn(async move {
-            let _ = serve_socks5(
+            // socks 入站生产栈（bd q2crg 起即 socks + HTTP 复合）
+            let _ = serve_mixed(
                 socks_listener,
                 ohm_clone,
                 config,
+                Arc::new(HttpServerConfig::default()),
                 None,
                 std::time::Duration::from_secs(300),
                 test_plugin_ctx("socks"),
@@ -10712,7 +10721,7 @@ mod tests {
     /// → 服务端断开 → 客户端读到 EOF（Go proxy/socks SetReadDeadline 语义）。
     /// None 时不限时由既有握手 e2e 覆盖。
     #[tokio::test]
-    async fn serve_socks5_handshake_timeout_disconnects_silent_client() {
+    async fn socks_inbound_handshake_timeout_disconnects_silent_client() {
         use tokio::io::AsyncReadExt;
 
         let ohm = Arc::new(SimpleOhm::new());
@@ -10728,10 +10737,11 @@ mod tests {
         .unwrap();
         let addr = listener.local_addr().unwrap();
         let config = Arc::new(parse_socks_server_config(b"{}").unwrap());
-        tokio::spawn(serve_socks5(
+        tokio::spawn(serve_mixed(
             listener,
             ohm,
             config,
+            Arc::new(HttpServerConfig::default()),
             Some(std::time::Duration::from_millis(120)),
             std::time::Duration::from_secs(300),
             test_plugin_ctx("socks"),
@@ -11963,10 +11973,11 @@ mod tests {
         for masked in [false, true] {
             let listener = masked_listener(masked, &mask).await;
             let addr = listener.local_addr().unwrap();
-            tokio::spawn(serve_socks5(
+            tokio::spawn(serve_mixed(
                 listener,
                 capture_ohm(),
                 Arc::new(ServerConfig::default()),
+                Arc::new(HttpServerConfig::default()),
                 Some(std::time::Duration::from_secs(5)),
                 std::time::Duration::from_secs(5),
                 test_plugin_ctx("socks"),

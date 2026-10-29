@@ -35,11 +35,11 @@ use crate::{
         parse_blackhole_inbound_response, parse_dns_inbound_config, parse_dokodemo_settings,
         parse_freedom_inbound_dest, parse_http_config, parse_hysteria_inbound_config,
         parse_loopback_config, parse_naive_inbound_settings, parse_reality_config,
-        parse_socks_server_config, parse_ss_inbound_config, parse_tuic_inbound_config,
-        parse_wireguard_inbound_config, register_ss_user_manager, serve_dns, serve_dokodemo,
-        serve_dokodemo_udp_on, serve_http, serve_mixed, serve_reality_trojan, serve_reality_vless,
-        serve_ss, spawn_inbound_serve, spawn_transport_listener_inbound, ss_mode_conn_pipeline,
-        transport_conn_addrs,
+        parse_socks_http_configs, parse_socks_server_config, parse_ss_inbound_config,
+        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_ss_user_manager,
+        serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http, serve_mixed,
+        serve_reality_trojan, serve_reality_vless, serve_ss, spawn_inbound_serve,
+        spawn_transport_listener_inbound, ss_mode_conn_pipeline, transport_conn_addrs,
     },
     outbound::dns_idle_timeout_for,
 };
@@ -65,22 +65,13 @@ pub(crate) async fn build_socks_inbound(
     let listener = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);
-    let config = Arc::new(parse_socks_server_config(&ib.entry.data)?);
     // Go `proxy/socks/server.go:38-43`：socks 端口的 Server **无条件**构造一个
     // httpServer，首字节 ∉ {0x05,0x04} 即转 `httpServer.ProcessWithFirstbyte`
     // （`:87-90`）——即 Go 的 socks 端口同时服务 SOCKS5 与 HTTP 代理。故这里复用
     // mixed 的 serve 栈（同一 listener 上 socks + http），不另造一份 HTTP 实现。
-    // HTTP 侧只在 socks 配了 password 认证时继承 accounts（`:47-49`），userLevel
-    // 与 socks 同源（同一个 settings JSON）。
-    let mut http_cfg = if ib.entry.data.is_empty() {
-        // 空 settings = `{}`（Go 零值配置）；`parse_http_config` 不接受空切片。
-        parse_http_config(b"{}")?
-    } else {
-        parse_http_config(&ib.entry.data)?
-    };
-    if config.auth_type != xray_proxy_socks::config::AuthType::Password {
-        http_cfg.accounts.clear();
-    }
+    // 双配置构造与 UDS 路径共用 `parse_socks_http_configs`（同一份语义）。
+    let (config, http_cfg) = parse_socks_http_configs(&ib.entry.data)?;
+    let config = Arc::new(config);
     let http_cfg = Arc::new(http_cfg);
     // 握手限时（Go proxy/socks：SetReadDeadline(policy().Timeouts.Handshake)）
     let handshake_timeout = handshake_timeout_for(&policy, config.user_level);

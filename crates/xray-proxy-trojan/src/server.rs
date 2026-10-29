@@ -461,7 +461,7 @@ where
 // serve_trojan
 // ============================================================================
 
-/// Trojan inbound entry point (aligns with `xray_core::inbound::serve_socks5`).
+/// Trojan inbound entry point (aligns with `xray_core::inbound::serve_mixed`).
 pub async fn serve_trojan(
     ctx: std::sync::Arc<xray_frame::PluginContext>,
     listener: InboundTcpListener,
