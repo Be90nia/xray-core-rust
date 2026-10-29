@@ -64,6 +64,11 @@ libc = "0.2"
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",
   "Win32_NetworkManagement_IpHelper",
+  # nd006：Windows 环回「连接被拒」默认要等一次 SYN 重传（实测 2.03s），Go net.Dial
+  # 用 SIO_TCP_INITIAL_RTO 关掉重传 → 需要 WSAIoctl（WinSock）+ 其 OVERLAPPED 形参
+  # 类型（Win32_System_IO 门控）。
+  "Win32_Networking_WinSock",
+  "Win32_System_IO",
 ] }
 
 [dev-dependencies]

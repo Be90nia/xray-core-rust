@@ -122,6 +122,12 @@ impl DefaultSystemDialer {
         }
         // 设置非阻塞（tokio 要求）。
         socket.set_nonblocking(true)?;
+        // Windows：环回目标「端口无人监听」时系统要等一次 SYN 重传才报拒绝（实测
+        // 2.03s，见 win_loopback_fast_fail 注释）。Go net.Dial 也只对环回打这个选项。
+        #[cfg(windows)]
+        if dest.ip().is_loopback() {
+            win_loopback_fast_fail::apply(&socket);
+        }
         // 发起连接（非阻塞 connect 返回 EINPROGRESS 是正常的）。
         match socket.connect(&dest.into()) {
             Ok(()) => {},
@@ -1002,6 +1008,101 @@ fn libc_error_inprogress() -> i32 {
     150
 }
 
+/// Windows 环回拨号的「快速失败」socket 选项（对齐 Go `net/fd_windows.go:151-167`）。
+///
+/// Windows 对 `127.0.0.1` / `::1` 上**无人监听**的端口不是立刻返回 `WSAECONNREFUSED`，
+/// 而是等一次 SYN 重传才交出失败结果（实测 2.03s：阻塞 `connect()`、非阻塞 connect +
+/// `SO_ERROR` 自旋、tokio `writable()`、ConnectEx 四种形态全部 2.03s；同机 Go 裸
+/// `syscall.Connect` 亦 2.03s）。Go `net.Dial` 只 0.5ms 的唯一原因就是它先给 socket
+/// 打 `SIO_TCP_INITIAL_RTO`（`MaxSynRetransmissions` = 不重传）——与 AFD/tokio 无关。
+///
+/// 选项失败一律忽略：它只是优化，Go 同样不因它失败而放弃拨号（fd_windows.go:163-166）。
+#[cfg(windows)]
+mod win_loopback_fast_fail {
+    use std::os::windows::io::AsRawSocket;
+
+    use windows_sys::Win32::Networking::WinSock::{SOCKET, WSAIoctl};
+
+    /// `SIO_TCP_INITIAL_RTO = IOC_IN | IOC_VENDOR | 17`
+    /// （Go `internal/syscall/windows/net_windows.go:22`）。
+    const SIO_TCP_INITIAL_RTO: u32 = 0x9800_0011;
+    /// `TCP_INITIAL_RTO_UNSPECIFIED_RTT`：沿用系统默认（或管理员覆盖）的初始 RTO。
+    const UNSPECIFIED_RTT: u16 = u16::MAX;
+    /// `TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS = ^uint8(1)`：不重传 SYN（Win10 16299+）。
+    const NO_SYN_RETRANSMISSIONS: u8 = u8::MAX - 1;
+    /// Win10 16299 之前该字段是「重传次数」，`0xFE` 在那里等于重传 254 次；用 Go 注释里
+    /// 的最小值 1 兜底。
+    const MIN_SYN_RETRANSMISSIONS: u8 = 1;
+
+    /// Win10 16299+ 才支持 `TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS`
+    /// （Go `internal/syscall/windows/version_windows.go:112-115`）。
+    ///
+    /// 版本源用 `RtlGetVersion`（手写声明）：该符号在 windows-sys 里属
+    /// `Wdk::System::SystemServices`，为一行判断多拉两个 feature 不划算；
+    /// `GetVersionEx` 会按 manifest 撒谎，不可用。
+    static SUPPORTS_NO_SYN_RETRANSMISSIONS: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| {
+            let mut info = OsVersionInfoW {
+                size: std::mem::size_of::<OsVersionInfoW>() as u32,
+                major: 0,
+                minor: 0,
+                build: 0,
+                platform: 0,
+                csd: [0; 128],
+            };
+            // RtlGetVersion 是唯一不受兼容性 shim 影响的版本查询（GetVersionEx 会按
+            // manifest 撒谎）。
+            let status = unsafe { RtlGetVersion(&mut info) };
+            status == 0 && info.major >= 10 && info.build >= 16299
+        });
+
+    #[repr(C)]
+    struct InitialRtoParameters {
+        rtt: u16,
+        max_syn_retransmissions: u8,
+    }
+
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    }
+
+    /// 关掉 SYN 重传等待。失败不影响拨号（最多退回平台默认的 2s 行为）。
+    pub(super) fn apply(socket: &socket2::Socket) {
+        let max_syn = if *SUPPORTS_NO_SYN_RETRANSMISSIONS {
+            NO_SYN_RETRANSMISSIONS
+        } else {
+            MIN_SYN_RETRANSMISSIONS
+        };
+        let params =
+            InitialRtoParameters { rtt: UNSPECIFIED_RTT, max_syn_retransmissions: max_syn };
+        let mut out = 0u32;
+        let _ = unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as SOCKET,
+                SIO_TCP_INITIAL_RTO,
+                (&raw const params).cast(),
+                std::mem::size_of::<InitialRtoParameters>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut out,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // 历史布局：正式 item（DnsResolvingDialer/init_system_dialer 等）在测试模块之后，
@@ -1019,6 +1120,34 @@ mod tests {
 
     fn localhost_dest(port: u16) -> Destination {
         Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(port))
+    }
+
+    /// nd006：环回「端口无人监听」必须快速失败，且错误是真实拒绝而非拨号超时。
+    ///
+    /// Windows 默认要等一次 SYN 重传（实测 2.03s）才交出 `WSAECONNREFUSED`，Go 用
+    /// `SIO_TCP_INITIAL_RTO` 关掉重传（见 [`win_loopback_fast_fail`]）。上限取宽松的
+    /// 500ms：真回归是 ~2s，机器抖动远到不了。
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods, reason = "测试：量拒绝拨号耗时")]
+    async fn refused_connection_fails_fast_with_refused_error() {
+        use std::time::{Duration, Instant};
+
+        // bind 后立即释放 → 该端口必然无人监听（比硬编码端口号可靠）。
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let started = Instant::now();
+        let err = DefaultSystemDialer::dial_tcp_raw(None, dead, Duration::from_secs(2), 0, false)
+            .await
+            .expect_err("closed port must not connect");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "got: {err}");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "refused dial took {elapsed:?}（Windows 环回 SYN 重传没关掉？）"
+        );
     }
 
     #[tokio::test]
