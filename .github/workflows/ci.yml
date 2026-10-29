@@ -147,6 +147,13 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # bd k2hf7：xray-core inbound 深轮询链（serve_mixed → per-conn task → UDP
+    # associate）在 debug 构建下距 std 默认 2MB 测试线程栈只剩一层透传帧（现役
+    # 防线仅 xray-frame scope.rs ArmScope::spawn 的 #[inline(always)]，属编译期
+    # 决策非结构约束）——再叠一层调用即进程级 STATUS_STACK_OVERFLOW（整测试二进制
+    # 被杀，非单测失败）。16MB = 8× 余量；代价只是线程栈虚拟预留、按需提交页。
+    env:
+      RUST_MIN_STACK: 16777216
     steps:
       - uses: actions/checkout@v4
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
@@ -177,6 +184,9 @@ jobs:
     name: Test (windows, xray-proxy-tun)
     runs-on: windows-latest
     timeout-minutes: 30
+    # bd k2hf7：同 test job——测试线程栈兜底（16MB = std 默认 2MB 的 8×）
+    env:
+      RUST_MIN_STACK: 16777216
     steps:
       - uses: actions/checkout@v4
       # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，tun 才是测试目标）
@@ -200,6 +210,62 @@ jobs:
           echo "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
       - run: cargo test -p xray-proxy-tun --all-targets
+
+  # bd c4ueq：Go/Rust 入站解析器差分对拍门——同一原始字节流打 Go v26.9.9（官方
+  # release 二进制，tag + sha256 双钉死）与本仓 Rust 的 mixed 入站，比接受/拒绝、
+  # 响应字节（HTTP 侧剥 Date）与连接关闭方式三维判据；allowlist 外任何差异即红
+  # （已知残留差异逐条带理由显式放行，不静默绿）。协议语义漂移自动发现。
+  # harness：dist/parser_parity/parity.py（母本 reports/audit-2026-10-29/tmp/），
+  # 确定性 = 127.0.0.1 固定高位端口 + 源站为本地 python（origin.py）+ 零外网依赖。
+  parser-parity:
+    name: Parser Parity (Go v26.9.9 vs Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@stable
+      # 独立 prefix-key：不与其他 job 缓存互串；UDF_HEAD 防 udf 产物串味假绿
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: parser-parity-v1
+          key: ${{ env.UDF_HEAD }}
+      # 依赖闭包含 xray-proto(prost-build)，构建需要 protoc
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z），与 test/clippy 同源配方；
+      # 顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
+      - name: Build Rust xray (debug)
+        run: cargo build -p xray-cli --bin xray
+      # Go 参照：官方 release（interop.yml 同配方）；对拍门参照须逐字节确定，
+      # 故在 tag 之上再加官方 API digest 校验。21MB 下载秒级，不做缓存。
+      - name: Download Go reference (Xray-core v26.9.9, sha256-pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/xray-go.zip \
+            https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip
+          echo "1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df  /tmp/xray-go.zip" | sha256sum -c -
+          mkdir -p /tmp/xray-go
+          unzip -o /tmp/xray-go.zip -d /tmp/xray-go xray
+          chmod +x /tmp/xray-go/xray
+          /tmp/xray-go/xray version
+      - name: Parser parity matrix (HTTP 38 + SOCKS5 19)
+        env:
+          # debug Rust 服务端任务同样吃线程栈（bd k2hf7 同族），env 会继承进 xray 进程
+          RUST_MIN_STACK: 16777216
+        run: >-
+          python3 dist/parser_parity/parity.py
+          --go-bin /tmp/xray-go/xray
+          --rust-bin target/debug/xray
+      - name: Upload parity evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-parity-logs
+          path: target/parser_parity/
+          if-no-files-found: ignore
 
   # 安全与许可证审计
   audit:

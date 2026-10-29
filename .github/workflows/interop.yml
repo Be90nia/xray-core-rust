@@ -19,6 +19,10 @@ jobs:
     name: Interop (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60  # 交叉方向扩满 12+12 (+12 测), 防 macOS 45min 边缘超时 (R 战役实证)
+    # bd k2hf7：Workspace lib tests 覆盖 xray-core 深轮询链测试，测试线程栈兜底
+    # （同 ci.yml test job；16MB = std 默认 2MB 的 8×）
+    env:
+      RUST_MIN_STACK: 16777216
     strategy:
       fail-fast: false
       matrix:
