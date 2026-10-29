@@ -8,9 +8,13 @@
 //!
 //! - DNS Header（12 字节，所有字段）
 //! - Question section 第一个问题（QNAME + QTYPE + QCLASS）
-//! - QNAME 解码为可读 domain（label 拼接 + 大小写保留）
+//! - QNAME 解码为可读 domain（label 拼接 + 大小写保留 + 字节原样承载）
+//!
+//! label 用 Latin-1 承载原始字节（见 `parse_qname`），非 UTF-8 label 不会被丢弃。
 //!
 //! 不支持：Answer/Authority/Additional section、压缩指针（0xC0）、EDNS0。
+
+use xray_common::text::{latin1_decode, latin1_encode};
 
 use crate::error::{DnsProxyError, Result};
 
@@ -149,9 +153,10 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
                 "QNAME label truncated: label bytes beyond buffer".into(),
             ));
         }
-        let label = std::str::from_utf8(&bytes[offset..offset + len])
-            .map_err(|e| DnsProxyError::InvalidConfig(format!("QNAME non-utf8 label: {e}")))?;
-        labels.push(label.to_string());
+        // label 按字节承载（Latin-1 1:1）：Go `Name.unpack` 逐字节 `append`，无字符集
+        // 校验（x/net/dns/dnsmessage），非法 UTF-8 label 也能正常应答（D8）。
+        let label = latin1_decode(&bytes[offset..offset + len]);
+        labels.push(label);
         offset += len;
         hops += 1;
         if hops > 127 {
@@ -161,6 +166,19 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
     Ok((labels.join("."), offset))
 }
 
+/// 把 domain 写回 QNAME（label 长度前缀 + 终止 0），label 字节按 Latin-1 还原。
+///
+/// 解析侧用 [`latin1_decode`] 承载原始字节（Go `Name.unpack` 无字符集校验），此处用
+/// [`latin1_encode`] 原样写回——非法 UTF-8 label 才能与 Go 一致地按字节回显（D8）。
+fn push_qname(buf: &mut Vec<u8>, name: &str) {
+    for label in name.split('.').filter(|label| !label.is_empty()) {
+        let bytes = latin1_encode(label);
+        buf.push(bytes.len() as u8);
+        buf.extend_from_slice(&bytes);
+    }
+    buf.push(0); // QNAME 终止
+}
+
 /// 构造最小 DNS 响应消息（Header + 空 Answer + Question 回显）。
 ///
 /// 用于 DNS 代理的 Return 动作（返回 REFUSED）或 Hijack 动作的占位。
@@ -168,11 +186,12 @@ fn parse_qname(bytes: &[u8], mut offset: usize) -> Result<(String, usize)> {
 #[must_use]
 pub fn build_dns_response(query_header: &DnsHeader, question: &DnsQuestion, rcode: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
-    // Header（12B）：ID 原样 + flags(QR=1 + RD 回显 + AA + RA + RCODE)。
-    // AA+RA 对齐 Go proxy/dns/dns.go:400-407 rejectNonIPQuery 四标志。
+    // Header（12B）：ID 原样 + QR/AA/RD/RA + RCODE。四标志对齐 Go
+    // proxy/dns/dns.go:400-407 rejectNonIPQuery：`RecursionDesired: true` 是字面量，
+    // 与客户端 RD 无关（D1），故此处无条件置 1 而非回显 `query_header.flags`。
     let flags = 0x8000 // QR=1 (response)
-        | (query_header.flags & 0x0100) // 回显 RD
         | 0x0400 // AA=1 (authoritative answer)
+        | 0x0100 // RD=1（Go 无条件，D1）
         | 0x0080 // RA=1 (recursion available)
         | (rcode as u16 & 0x000F); // RCODE
     buf.extend_from_slice(&query_header.id.to_be_bytes());
@@ -181,14 +200,10 @@ pub fn build_dns_response(query_header: &DnsHeader, question: &DnsQuestion, rcod
     buf.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
     buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
     buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
-    // Question 回显
-    for label in question.name.split('.') {
-        buf.push(label.len() as u8);
-        buf.extend_from_slice(label.as_bytes());
-    }
-    buf.push(0); // QNAME 终止
+    // Question 回显：QCLASS 硬编码 IN，Go `Class: dnsmessage.ClassINET`（dns.go:410-415，D2）
+    push_qname(&mut buf, &question.name);
     buf.extend_from_slice(&question.q_type.to_be_bytes());
-    buf.extend_from_slice(&question.q_class.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
     buf
 }
 
@@ -215,10 +230,11 @@ pub fn build_ip_response(
     ttl: u32,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
-    // Header（12B）。AA+RA 对齐 Go proxy/dns/dns.go:341-348 handleIPQuery 四标志。
-    let flags = 0x8000 // QR=1 (response)
-        | (query_header.flags & 0x0100) // 回显 RD
+    // Header（12B）。四标志对齐 Go proxy/dns/dns.go:341-349 handleIPQuery：
+    // `RecursionDesired: true` 是字面量，与客户端 RD 无关（D1）。
+    let flags: u16 = 0x8000 // QR=1 (response)
         | 0x0400 // AA=1 (authoritative answer)
+        | 0x0100 // RD=1（Go 无条件，D1）
         | 0x0080; // RA=1 (recursion available)；RCODE=0 (NOERROR)
     buf.extend_from_slice(&query_header.id.to_be_bytes());
     buf.extend_from_slice(&flags.to_be_bytes());
@@ -226,14 +242,10 @@ pub fn build_ip_response(
     buf.extend_from_slice(&(ips.len() as u16).to_be_bytes()); // ANCOUNT
     buf.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
     buf.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
-    // Question 回显
-    for label in question.name.split('.') {
-        buf.push(label.len() as u8);
-        buf.extend_from_slice(label.as_bytes());
-    }
-    buf.push(0); // QNAME 终止
+    // Question 回显：QCLASS 硬编码 IN，Go `Class: dnsmessage.ClassINET`（dns.go:351-356，D2）
+    push_qname(&mut buf, &question.name);
     buf.extend_from_slice(&question.q_type.to_be_bytes());
-    buf.extend_from_slice(&question.q_class.to_be_bytes());
+    buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
     // Answer records
     for ip in ips {
         // NAME：与 Question 相同的 QNAME（使用压缩指针指向 Question section）
@@ -445,14 +457,74 @@ mod tests {
         assert_eq!(resp_question.q_type, question.q_type);
     }
 
+    /// D1：Go 的应答头 `RecursionDesired: true` 是字面量（proxy/dns/dns.go:341-349 /
+    /// :400-407），与客户端 RD 无关——RD=0 的查询（`dig +norecurse`）也必须回 0x8580。
     #[test]
-    fn build_response_preserves_rd_flag() {
-        let query = make_dns_a_query("x.com");
+    fn build_response_sets_rd_unconditionally() {
+        // 先构造 RD=0 查询（make_dns_a_query 默认 RD=1，此处清掉 bit 8）。
+        let mut query = make_dns_a_query("x.com");
+        query[2..4].copy_from_slice(&0x0000u16.to_be_bytes());
         let (header, question) = parse_dns_query(&query).unwrap();
-        assert!(header.recursion_desired()); // 原始 RD=1
-        let resp = build_dns_response(&header, &question, 0);
-        let (resp_header, _) = parse_dns_query(&resp).unwrap();
-        assert!(resp_header.recursion_desired()); // RD 回显
+        assert!(!header.recursion_desired());
+
+        for resp in [
+            build_dns_response(&header, &question, 0),
+            build_ip_response(&header, &question, &["1.2.3.4".parse().unwrap()], 300),
+        ] {
+            let flags = u16::from_be_bytes([resp[2], resp[3]]);
+            assert_eq!(flags, 0x8580, "Go 实测 0x8580（QR|AA|RD|RA）");
+        }
+    }
+
+    /// D2：Go 两处 question 构造都写死 `Class: dnsmessage.ClassINET`
+    /// （proxy/dns/dns.go:351-356 / :410-415），与查询的 QCLASS 无关。
+    #[test]
+    fn response_question_class_is_inet_regardless_of_query() {
+        // QCLASS=CH(3) 查询：应答 question 必须回 0001，与 answer RR 的 0001 一致。
+        let mut query = make_dns_a_query("q12.test");
+        let qclass_off = query.len() - 2;
+        query[qclass_off..].copy_from_slice(&3u16.to_be_bytes());
+        let (header, question) = parse_dns_query(&query).unwrap();
+        assert_eq!(question.q_class, 3);
+
+        for resp in [
+            build_dns_response(&header, &question, 5),
+            build_ip_response(&header, &question, &["1.2.3.4".parse().unwrap()], 300),
+        ] {
+            let qname_end = 12 + "q12.test".len() + 2; // header + qname(含终止 0)
+            let qclass_off = qname_end + 2; // 跳过 QTYPE
+            assert_eq!(&resp[qclass_off..qclass_off + 2], &[0, 1], "question QCLASS=IN");
+            // answer RR（若有）的 CLASS 同样是 IN → 同一报文里不再自相矛盾。
+            let (resp_h, resp_q) = parse_dns_query(&resp).unwrap();
+            assert_eq!(resp_q.q_class, 1);
+            assert_eq!(resp_h.id, header.id);
+        }
+    }
+
+    /// D8：非法 UTF-8 label（`q08\xff`）必须解析成功并按原始字节回显——Go
+    /// `Name.unpack` 逐字节拷贝、无字符集校验（实测 Go 有应答 / 修复前 Rust 丢弃）。
+    #[test]
+    fn non_utf8_label_round_trips_byte_exactly() {
+        let mut query =
+            Vec::from([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        query.extend_from_slice(b"\x04q08\xff\x04test\x00");
+        query.extend_from_slice(&1u16.to_be_bytes()); // QTYPE=A
+        query.extend_from_slice(&1u16.to_be_bytes()); // QCLASS=IN
+
+        let (header, question) = parse_dns_query(&query).expect("非 UTF-8 label 不得丢弃");
+        assert_eq!(question.name, "q08\u{ff}.test");
+
+        let resp = build_ip_response(&header, &question, &["1.2.3.4".parse().unwrap()], 300);
+        // 12B header 之后逐字节：04 713038ff 04test 00 0001 0001
+        assert_eq!(
+            &resp[12..27],
+            b"\x04q08\xff\x04test\x00\x00\x01\x00\x01",
+            "QNAME 原字节回显（含 QTYPE/QCLASS）"
+        );
+
+        // reject 路径（build_dns_response）同款。
+        let reject = build_dns_response(&header, &question, 0);
+        assert_eq!(&reject[12..12 + 11], b"\x04q08\xff\x04test\x00");
     }
 
     #[test]
@@ -542,7 +614,7 @@ mod tests {
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x8000, 0x8000, "QR=1");
         assert_eq!(flags & 0x0400, 0x0400, "AA=1（Go Authoritative）");
-        assert_eq!(flags & 0x0100, 0x0100, "RD 回显");
+        assert_eq!(flags & 0x0100, 0x0100, "RD=1（Go RecursionDesired 字面量，D1）");
         assert_eq!(flags & 0x0080, 0x0080, "RA=1（Go RecursionAvailable）");
 
         // Reject（REFUSED）。
@@ -550,7 +622,7 @@ mod tests {
         let flags = u16::from_be_bytes([resp[2], resp[3]]);
         assert_eq!(flags & 0x8000, 0x8000, "QR=1");
         assert_eq!(flags & 0x0400, 0x0400, "AA=1（Go Authoritative）");
-        assert_eq!(flags & 0x0100, 0x0100, "RD 回显");
+        assert_eq!(flags & 0x0100, 0x0100, "RD=1（Go RecursionDesired 字面量，D1）");
         assert_eq!(flags & 0x0080, 0x0080, "RA=1（Go RecursionAvailable）");
         assert_eq!(flags & 0x000F, 5, "RCODE=REFUSED");
     }

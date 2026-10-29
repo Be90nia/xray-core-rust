@@ -271,7 +271,7 @@ pub fn build_dns_query(
     req_id: u16,
     client_ip: &[u8],
 ) -> Result<Vec<u8>, DnsError> {
-    let name = Name::parse(fqdn, None).map_err(|e| DnsError::WireFormat(e.to_string()))?;
+    let name = name_from_fqdn(fqdn)?;
     let mut msg = Message::new(req_id, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
     msg.add_query(Query::query(name, record_type));
@@ -279,7 +279,15 @@ pub fn build_dns_query(
     // EDNS0 client subnet（可选）。
     if matches!(client_ip.len(), 4 | 16) {
         let mut edns = Edns::new();
-        edns.set_max_payload(1232);
+        // 对齐 Go `common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))`
+        // （app/dns/dnscommon.go:72-81 `genEDNS0Options`）→ 上游 OPT
+        // CLASS=1350、TTL=0xE0008000（D4）。 x/net 的 `uint32(extRCode)>>4<<24` 在 32
+        // 位左移丢高位，实际落到 OPT 的 extRCodeHigh 是 0xE0（不是 0xFE0）——实测收包见
+        // parity-sweep3-dns §9.2-C。 hickory 的 OPT TTL 高位取自
+        // `metadata.response_code.high()`，故用 `Unknown(0xE00)` 承载：low 4 位仍为
+        // 0，查询头 RCODE 不受影响。
+        edns.set_max_payload(1350).set_dnssec_ok(true);
+        msg.metadata.response_code = ResponseCode::Unknown(0xE00);
         let addr = if client_ip.len() == 4 {
             let mut b = [0u8; 4];
             b.copy_from_slice(client_ip);
@@ -295,6 +303,24 @@ pub fn build_dns_query(
     }
 
     msg.to_vec().map_err(|e| DnsError::WireFormat(e.to_string()))
+}
+
+/// fqdn → hickory [`Name`]，label 按**原始字节**承载（不做 IDNA / 大小写规范化）。
+///
+/// Go 把 `domain` 直接交 `dnsmessage.MustNewName`，全链路无 lowercase——客户端发
+/// `Q01.test` 时上游收到的仍是 `Q01`（D13）。`Name::parse` 走 `LabelEncUtf8`
+/// （`to_lowercase` + IDNA），既改写大小写，也会对非 ASCII / 非法 UTF-8 label 报错
+/// 或 punycode 化（D8 上游零收包）。`Label::from_raw_bytes` 原样承载字节。
+///
+/// shortcut: label 内嵌 `.` 的转义语法（`\.` / `\DDD`）不解析——Go 的 `NewName`
+/// 支持，但语法来源只有配置里的域名；需要时再按 Go 的转义规则预处理。
+fn name_from_fqdn(fqdn: &str) -> Result<Name, DnsError> {
+    let labels: Vec<Vec<u8>> = fqdn
+        .split('.')
+        .filter(|label| !label.is_empty())
+        .map(xray_common::text::latin1_encode)
+        .collect();
+    Name::from_labels(labels).map_err(|e| DnsError::WireFormat(e.to_string()))
 }
 
 /// DNS 响应解析结果。
@@ -397,8 +423,9 @@ impl AtomicReqIdGen {
 
 impl ReqIdGen for AtomicReqIdGen {
     fn next_id(&self) -> u16 {
-        // wrapping_add 避免 u16 溢出 panic；DNS ID 仅需唯一性不需递增。
-        self.counter.fetch_add(1, Ordering::Relaxed)
+        // Go `newReqID`：`uint16(atomic.AddUint32(&s.reqID, 1))` 先加后取 → 首包 1
+        // （app/dns/nameserver_udp.go:142-143）。`fetch_add` 是先取后加，必须再 +1（D7）。
+        self.counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 }
 
@@ -590,5 +617,42 @@ mod tests {
         let rec = parsed_to_ip_record(&parsed, now);
         let remaining = rec.expire.checked_duration_since(now).unwrap();
         assert_eq!(remaining, Duration::from_secs(600));
+    }
+
+    /// D7：Go `newReqID` 是「先加后取」（app/dns/nameserver_udp.go:142-143）→ 首包 1。
+    #[test]
+    fn req_id_starts_at_one() {
+        let ids = AtomicReqIdGen::new();
+        assert_eq!(ids.next_id(), 1);
+        assert_eq!(ids.next_id(), 2);
+    }
+
+    /// D13：上游 QNAME 大小写原样（Go `MustNewName(domain)` 无 lowercase）。
+    #[test]
+    fn build_query_preserves_qname_case() {
+        let wire = build_dns_query(&fqdn("Q01.test"), RecordType::A, 1, &[]).unwrap();
+        assert_eq!(wire[0..2], [0x00, 0x01], "req_id=1");
+        assert_eq!(&wire[12..22], b"\x03Q01\x04test\x00");
+    }
+
+    /// D8 上游侧：非 UTF-8 label 按原始字节进上游（Go 原样透传 `04 713038ff`）。
+    #[test]
+    fn build_query_keeps_non_utf8_label_bytes() {
+        let wire = build_dns_query(&fqdn("q08\u{ff}.test"), RecordType::A, 1, &[]).unwrap();
+        assert_eq!(&wire[12..23], b"\x04q08\xff\x04test\x00");
+    }
+
+    /// D4：`clientIp` 在场时的 OPT 头字节对齐 Go `SetEDNS0(1350, 0xfe00, true)`
+    /// → CLASS=1350(0x0546)、TTL=0xE0008000（extRCodeHigh=0xE0、DO=1）。
+    #[test]
+    fn build_query_opt_header_matches_go() {
+        let wire = build_dns_query(&fqdn("d02.test"), RecordType::A, 1, &[1, 2, 3, 4]).unwrap();
+        // header(12) + qname(10) + qtype(2) + qclass(2)
+        assert_eq!(wire[10..12], [0x00, 0x01], "ARCOUNT=1（OPT）");
+        let opt = 12 + 10 + 4;
+        assert_eq!(wire[opt], 0x00, "OPT 名字为 root");
+        assert_eq!(&wire[opt + 1..opt + 3], [0x00, 0x29], "TYPE=OPT(41)");
+        assert_eq!(&wire[opt + 3..opt + 5], [0x05, 0x46], "CLASS=1350");
+        assert_eq!(&wire[opt + 5..opt + 9], [0xe0, 0x00, 0x80, 0x00], "TTL=0xE0008000");
     }
 }
