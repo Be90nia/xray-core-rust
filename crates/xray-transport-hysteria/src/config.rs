@@ -65,6 +65,25 @@ pub const FrameTypeTCPRequest: u64 = 0x401;
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const MaxDatagramFrameSize: usize = 1200;
 
+/// quinn datagram 收包窗口的非帧记账开销（`size_of::<quinn_proto::frame::Datagram>()`，
+/// 该结构只含一个 `Bytes`：4 字 = 32B）。
+pub const QUINN_DATAGRAM_RX_OVERHEAD: usize = 32;
+
+/// 对端单包 datagram payload 上限（最大 MTU 1500 − 1RTT 头 29 − 帧界 9）。
+pub const PEER_MAX_DATAGRAM_PAYLOAD: usize = 1500 - 29 - 9;
+
+/// 交给 quinn 的 datagram 收包窗口 = TP `max_datagram_frame_size` 广告值。
+///
+/// **不能直接取 [`MaxDatagramFrameSize`]（bd x8vsd）**：quinn 的收包判据是
+/// `payload + size_of::<Datagram>() > 窗口` 即 `PROTOCOL_VIOLATION("oversized datagram")`
+/// 拆连（`vendor/quinn-proto/src/connection/datagrams.rs:145-149`），同一个窗口值又作为
+/// TP 广告决定对端 payload 上限 `min(窗口-3, 对端MTU-37)`。取 1200 时实际可收 payload
+/// 只有 1168，对端按 1200 发的满帧（payload ≤1197）就会拆连。
+///
+/// 取值 = [`PEER_MAX_DATAGRAM_PAYLOAD`] + [`QUINN_DATAGRAM_RX_OVERHEAD`]：可收 payload
+/// 上限恰好等于对端物理上限，判据永不误伤。
+pub const DATAGRAM_RECEIVE_WINDOW: usize = PEER_MAX_DATAGRAM_PAYLOAD + QUINN_DATAGRAM_RX_OVERHEAD;
+
 /// UDP session channel 缓冲大小（对应 Go `udpMessageChanSize = 1024`）。
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const UDP_MESSAGE_CHAN_SIZE: usize = 1024;

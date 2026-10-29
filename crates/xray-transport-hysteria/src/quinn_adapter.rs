@@ -292,14 +292,12 @@ pub(crate) fn build_hysteria_transport_config(
     // 注释内默认 10s 是死代码；bd c1qh 回滚 u9um 的 15s 有意偏离。NAT 场景用户显式配
     // keepAlivePeriod 找回）。
     if qc.enable_datagrams {
-        // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size——from_params 与
-        // default_for_hysteria 均取 crate::config::MaxDatagramFrameSize，对齐 Go
-        // transport/internet/hysteria/config.go:24 const=1200（Go 不透出用户配置面，
-        // 此处同——proto 无该字段）。注意 quinn 中该值同时是 TP 广告
-        // （transport_parameters.rs:170 取 min(x,65535)）与本地收包队列预算
-        // （datagrams.rs 超预算丢最旧），二者耦合不可分离：抬高会抬高 TP 使
-        // quic-go 对端按超尺寸分片、超过单 QUIC 包上限而丢包（实测 8192 不通、
-        // 1200 通）——默认必须保持 1200。
+        // 参数化（rjo9）：取 QuicConfig.max_datagram_frame_size = DATAGRAM_RECEIVE_WINDOW。
+        // 注意 quinn 中该值同时是 TP 广告（transport_parameters.rs:170 取 min(x,65535)）
+        // 与本地收包判据窗口（datagrams.rs:145-149 判 `payload + size_of::<Datagram>()`）。
+        // bd x8vsd：照抄 Go 的 1200 会让实际可收 payload 只有 1168，对端（Go 按
+        // AssumePeerMaxDatagramFrameSize=1200 发满）发 1169B 即被 PROTOCOL_VIOLATION
+        // 拆连——故窗口取「对端单包 payload 物理上限 + 记账开销」，见 config 常量注释。
         t.datagram_receive_buffer_size(Some(qc.max_datagram_frame_size as usize));
     }
     if qc.max_incoming_streams >= 0 {
@@ -1301,18 +1299,17 @@ mod tests {
         assert_eq!(qc.keep_alive_period_ms, 0, "Go keep-alive 默认关闭（dialer.go:113-115 注释）");
     }
 
-    /// rjo9：datagram 接收缓冲随 QuicConfig.max_datagram_frame_size 参数化；
-    /// 默认 = Go config.go:24 const 1200（Go 无用户配置面，quinn 中 TP 广告与
-    /// 本地队列预算同旋钮耦合，抬高会破坏 quic-go 对端互通——见 builder 注释）。
+    /// rjo9 + bd x8vsd：datagram 接收窗口随 QuicConfig.max_datagram_frame_size 参数化，
+    /// 默认 = DATAGRAM_RECEIVE_WINDOW（对端 payload 物理上限 + quinn 记账开销）；
+    /// 直接取 Go 的 1200 会让实际可收 payload 只剩 1168（见 config 常量注释）。
     #[test]
     fn transport_config_datagram_buffer_follows_config() {
-        // 默认（Go const 1200）：TransportConfig Debug 输出含 datagram_receive_buffer_size:
-        // Some(1200)
+        let window = crate::config::DATAGRAM_RECEIVE_WINDOW;
         let qc = QuicConfig::default_for_hysteria();
         let (t, _) = build_hysteria_transport_config(&qc);
         assert!(
-            format!("{t:?}").contains("datagram_receive_buffer_size: Some(1200)"),
-            "默认必须对齐 Go MaxDatagramFrameSize=1200，实际: {t:?}"
+            format!("{t:?}").contains(&format!("datagram_receive_buffer_size: Some({window})")),
+            "默认必须为 DATAGRAM_RECEIVE_WINDOW，实际: {t:?}"
         );
 
         // 参数化：自定义值直通 builder
@@ -1325,11 +1322,34 @@ mod tests {
         );
     }
 
+    /// bd x8vsd：广告值必须覆盖「对端单包 payload 物理上限 + quinn 记账开销」，
+    /// 否则对端合法满帧在本侧被 `oversized datagram` 拆连。
+    #[test]
+    fn datagram_window_accounts_for_quinn_rx_overhead() {
+        // quinn 收包判据按 `size_of::<Datagram>()`（Datagram 只含一个 Bytes）记账——
+        // 窗口开销常量必须与该结构尺寸一致，否则广告值与判据脱钩。
+        let quinn_rx_overhead = std::mem::size_of::<bytes::Bytes>();
+        assert_eq!(crate::config::QUINN_DATAGRAM_RX_OVERHEAD, quinn_rx_overhead);
+
+        let receivable = crate::config::DATAGRAM_RECEIVE_WINDOW - quinn_rx_overhead;
+        let peer_max = crate::config::PEER_MAX_DATAGRAM_PAYLOAD;
+        assert!(receivable >= peer_max, "可收 payload {receivable} < 对端上限 {peer_max}");
+    }
+
     /// 辅助：构造一对 QuinnQuicConn 对接（loopback）。
     /// 返回 (client_conn, server_conn, server_endpoint)——endpoint 必须由调用方持有，
     /// 否则 drop 后连接进入 idle 关闭流程（30s 后 accept_bi 超时）。
     async fn make_loopback_conn_pair()
     -> (QuinnQuicConn, QuinnQuicConn, std::sync::Arc<quinn::Endpoint>) {
+        make_loopback_conn_pair_cfg(None, None).await
+    }
+
+    /// 同 [`make_loopback_conn_pair`]，但可注入双方 `TransportConfig`
+    /// （datagram 收包窗口 / MTU 类断言用）。
+    async fn make_loopback_conn_pair_cfg(
+        server_tc: Option<std::sync::Arc<quinn::TransportConfig>>,
+        client_tc: Option<std::sync::Arc<quinn::TransportConfig>>,
+    ) -> (QuinnQuicConn, QuinnQuicConn, std::sync::Arc<quinn::Endpoint>) {
         ensure_crypto_provider();
         // 生成自签证书
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -1345,9 +1365,12 @@ mod tests {
             .unwrap();
         let server_crypto = Arc::new(server_crypto);
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
         ));
+        if let Some(tc) = server_tc {
+            server_config.transport_config(tc);
+        }
         let server_endpoint = std::sync::Arc::new(
             quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap(),
         );
@@ -1359,9 +1382,12 @@ mod tests {
         let client_crypto = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        let client_config = quinn::ClientConfig::new(Arc::new(
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
         ));
+        if let Some(tc) = client_tc {
+            client_config.transport_config(tc);
+        }
         let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client_endpoint.set_default_client_config(client_config);
 
@@ -1444,6 +1470,43 @@ mod tests {
         server.send_datagram(Bytes::from_static(b"s2c")).await.unwrap();
         let c_recv = client.receive_datagram().await.unwrap();
         assert_eq!(&c_recv[..], b"s2c");
+    }
+
+    /// bd x8vsd：广告值必须按 quinn 的**收包判据**落定，而不是照抄 Go 的
+    /// `MaxDatagramFrameSize=1200`。quinn 判 `payload + size_of::<Datagram>()`（32B）
+    /// 超窗口即 `PROTOCOL_VIOLATION("oversized datagram")` 拆连，而 Go 侧按
+    /// `AssumePeerMaxDatagramFrameSize` 会话端会发满 1200B payload。
+    #[tokio::test]
+    async fn datagram_1200_and_1414_payload_survive_default_window() {
+        // 服务端 = 生产 builder（被断言的广告值来源）
+        let (server_tc, _slot) =
+            build_hysteria_transport_config(&QuicConfig::default_for_hysteria());
+        // 客户端 initial_mtu 抬到 1452 才发得出 1200B payload
+        // （quinn max_size = mtu − 1RTT 头 29 − 帧界 9）
+        let mut client_tc = quinn::TransportConfig::default();
+        client_tc.initial_mtu(1452);
+        client_tc.datagram_receive_buffer_size(Some(4096));
+
+        let (client, server, _ep) =
+            make_loopback_conn_pair_cfg(Some(Arc::new(server_tc)), Some(Arc::new(client_tc))).await;
+
+        // 1200 = Go hysteria 会话端按 AssumePeer 发满的 payload；1414 = 1452 MTU 下
+        // 单包 payload 上限（quinn max_size），两者都必须整包到达。
+        for payload_len in [1200usize, 1414] {
+            let payload = vec![0xABu8; payload_len];
+            client.send_datagram(Bytes::from(payload.clone())).await.expect("send payload");
+            let got =
+                tokio::time::timeout(std::time::Duration::from_secs(10), server.receive_datagram())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{payload_len}B datagram must be delivered (conn must not be torn down)"
+                        )
+                    })
+                    .expect("receive datagram");
+            assert_eq!(got.len(), payload.len(), "payload must arrive intact");
+            assert_eq!(&got[..], &payload[..]);
+        }
     }
 
     #[tokio::test]

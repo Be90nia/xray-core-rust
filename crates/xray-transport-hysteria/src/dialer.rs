@@ -99,7 +99,7 @@ impl QuicConfig {
             keep_alive_period_ms: p.keep_alive_period.max(0) as u64 * 1000,
             disable_path_mtu_discovery: p.disable_path_mtu_discovery,
             enable_datagrams: true,
-            max_datagram_frame_size: crate::config::MaxDatagramFrameSize as u64,
+            max_datagram_frame_size: crate::config::DATAGRAM_RECEIVE_WINDOW as u64,
             max_incoming_streams: if p.max_incoming_streams == 0 {
                 1024
             } else {
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(cfg.max_connection_receive_window, 20_971_520);
         assert_eq!(cfg.max_idle_timeout_ms, 30_000);
         assert!(cfg.enable_datagrams);
-        assert_eq!(cfg.max_datagram_frame_size, 1200);
+        assert_eq!(cfg.max_datagram_frame_size, crate::config::DATAGRAM_RECEIVE_WINDOW as u64);
         assert_eq!(cfg.max_incoming_streams, 1024);
     }
 
@@ -442,7 +442,7 @@ mod tests {
     fn quic_config_default_for_hysteria() {
         let cfg = QuicConfig::default_for_hysteria();
         assert!(cfg.enable_datagrams);
-        assert_eq!(cfg.max_datagram_frame_size, 1200);
+        assert_eq!(cfg.max_datagram_frame_size, crate::config::DATAGRAM_RECEIVE_WINDOW as u64);
     }
 
     #[test]
