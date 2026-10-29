@@ -249,9 +249,13 @@ impl UdpNameServer {
             .to_be_bytes();
 
         // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
+        // bd wxr6u：本 NS 的 `self.dest` 标的是 UDP（UDP 查询用），fallback 是 TCP 流，
+        // 网络位不改的话 dispatcher 原样交给 freedom，freedom 按 `dest.network()` 走
+        // UDP 中继，把「2B 长度前缀 + DNS 报文」当 XUDP 帧解析 → 上游零 tcp-accept。
+        let tcp_dest = Destination::tcp(self.dest.address().clone(), self.dest.port());
         let mut stream = deadline
             .timeout(crate::dial::connect_stream(
-                &self.dest,
+                &tcp_dest,
                 self.resolver.as_ref(),
                 self.query_timeout,
                 "udp-tcp-fallback",
@@ -390,7 +394,7 @@ mod tests {
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType},
     };
-    use xray_common::net::address::Address;
+    use xray_common::net::{address::Address, network::Network};
 
     use super::*;
     use crate::config::IpOption;
@@ -777,5 +781,138 @@ mod tests {
             elapsed >= Duration::from_millis(900) && elapsed <= Duration::from_millis(1350),
             "total query deadline must be 1s, elapsed={elapsed:?}"
         );
+    }
+
+    /// 假的「截断应答」dialer：UDP 侧回 TC=1，TCP 侧记录 dest 并按网络位决定放行。
+    ///
+    /// `dial_tcp` 的 `network() != TCP` 拒绝复刻生产判别点：dispatcher 把 dest 原样交给
+    /// freedom，freedom 按 `dest.network()` 选 UDP 中继（不是流式 link）。
+    #[derive(Default)]
+    struct TruncatingDialer {
+        tcp_dests: parking_lot::Mutex<Vec<Destination>>,
+    }
+
+    impl crate::dial::QueryDialer for TruncatingDialer {
+        fn dial_tcp(
+            &self,
+            dest: &Destination,
+        ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
+            self.tcp_dests.lock().push(dest.clone());
+            let dest = dest.clone();
+            Box::pin(async move {
+                if dest.network() != Network::TCP {
+                    return Err(io::Error::other(format!(
+                        "freedom relays {:?} dest as datagrams",
+                        dest.network()
+                    )));
+                }
+                let ip = dest.address().ip().ok_or_else(|| io::Error::other("test dest is IP"))?;
+                let tcp = tokio::net::TcpStream::connect(SocketAddr::new(ip, dest.port().value()))
+                    .await?;
+                Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                    as crate::dial::DnsStream)
+            })
+        }
+
+        fn dial_udp(
+            &self,
+            _dest: &Destination,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_,
+            >,
+        > {
+            Box::pin(async { Ok(Box::new(TruncatedUdpSession { req_id: 0 }) as Box<_>) })
+        }
+    }
+
+    /// 只回一条 TC=1 应答的 UDP 会话（请求 ID 从发包首 2B 取，供解析侧 ID 校验）。
+    struct TruncatedUdpSession {
+        req_id: u16,
+    }
+
+    impl crate::dial::UdpPacketSession for TruncatedUdpSession {
+        fn send_packet<'s>(
+            &'s mut self,
+            _dest: &'s Destination,
+            payload: &'s [u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 's>> {
+            if let [hi, lo, ..] = payload {
+                self.req_id = u16::from_be_bytes([*hi, *lo]);
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv_packet(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + '_>> {
+            let req_id = self.req_id;
+            Box::pin(async move {
+                let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
+                msg.add_query(Query::query(Name::parse("fb.com.", None).unwrap(), RecordType::A));
+                msg.metadata.truncation = true;
+                Ok(Some(msg.to_vec().unwrap()))
+            })
+        }
+    }
+
+    /// bd wxr6u 回归钉：UDP 应答截断（TC=1）后 TCP fallback 必须以 **TCP 网络** dest
+    /// 拨号，且线上写「2B 长度前缀 + 裸 DNS 报文」而非 XUDP 帧。
+    ///
+    /// 生产症状（勿复现验证）：dest 沿用 UDP 网络 → freedom 走 UDP 中继 → 长度前缀
+    /// 流被当 XUDP 帧解析 → 上游零 tcp-accept、客户端读长度超时。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn tcp_fallback_dials_tcp_network_with_bare_dns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _slot = DIALER_SLOT_LOCK.lock();
+
+        // 真 TCP DNS 上游：读 2B 长度 + 报文，回一条 A 记录（请求 ID 回显）。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let _server = xray_common::testing::spawn("dns-tcp-fallback-server", async move {
+            let (mut stream, _) = listener.accept().await.expect("fallback dialed no TCP conn");
+            let mut len_buf = [0u8; 2];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+            stream.read_exact(&mut query).await.unwrap();
+            // 裸 DNS 报文才能从偏移 0 解出 Message；XUDP 帧在这必解失败。
+            let msg = Message::from_vec(&query)
+                .expect("fallback wire bytes must be a bare DNS message, not an XUDP frame");
+            let resp =
+                make_a_response(msg.metadata.id, "fb.com.", vec![Ipv4Addr::new(5, 6, 7, 8)], 60);
+            stream.write_all(&u16::try_from(resp.len()).unwrap().to_be_bytes()).await.unwrap();
+            stream.write_all(&resp).await.unwrap();
+        });
+
+        let dialer = Arc::new(TruncatingDialer::default());
+        crate::dial::set_shared_dialer(Some(dialer.clone()));
+
+        let ns = UdpNameServer::new(
+            // 与 TCP 上游同 IP/端口：fallback 只改网络位，地址沿用 `self.dest`。
+            udp_dest(tcp_addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+        let outcome = ns
+            .query_once("fb.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
+            .await;
+        crate::dial::set_shared_dialer(None);
+
+        let rec = outcome.expect("TCP fallback must return an answer");
+        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);
+
+        let dests = dialer.tcp_dests.lock();
+        assert_eq!(dests.len(), 1, "fallback must dial exactly once");
+        assert_eq!(
+            dests[0].network(),
+            Network::TCP,
+            "fallback 必须以 TCP 网络拨号，否则 freedom 按 UDP 中继吃掉长度前缀流"
+        );
+        assert_eq!(dests[0].address(), &Address::from(tcp_addr.ip()));
+        assert_eq!(dests[0].port().value(), tcp_addr.port());
     }
 }
