@@ -511,3 +511,208 @@ async fn plain_http_upstream_failure_returns_503_e2e() {
     let trailing = read_to_eof(&mut client).await;
     assert!(trailing.is_empty(), "connection must close: {trailing:?}");
 }
+
+// ===== 请求解析对拍 Go v26.9.9（bd afgov，`reports/audit-2026-10-29/parity-s2-parser.md`）=====
+//
+// 用例编号与报告 §1 一一对应；判据同报告：状态行 + body + 是否被断链。
+
+/// 一次性源站：accept 一条连接 → 读一次 → 回固定 `200` + body `ok`。
+async fn spawn_ok_origin(name: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    xray_common::testing::spawn(name, async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = sock.read(&mut buf).await.unwrap();
+        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+        // 半关 + 排空：立即 drop 带未读数据的 socket 在 Windows 上发 RST，
+        // 会截断 proxy 侧读向（见既有场景注释）
+        let _ = sock.shutdown().await;
+        let mut sink = [0u8; 512];
+        while sock.read(&mut sink).await.unwrap_or(0) > 0 {}
+    });
+    addr
+}
+
+/// 发一段字节给代理，断言「零响应字节 + 连接被关闭」——Go `http.ReadRequest`
+/// 失败后 `Process` 直接断链、不回响应（H03/H09/H10/H19/H20 的 Go 侧实测形态）。
+///
+/// 目标用**活源站**：修复前这些畸形请求会被宽松接受并正常转发回 200，断言才有判别力
+/// （拿不可达端口会因 dial 失败静默断链而假绿）。
+async fn assert_rejected_without_response(build: impl Fn(u16) -> Vec<u8>) {
+    let origin = spawn_ok_origin("http-origin-reject").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    client.write_all(&build(origin.port())).await.unwrap();
+    let received = read_to_eof(&mut client).await;
+    assert!(
+        received.is_empty(),
+        "malformed request must be rejected with no response, got {:?}",
+        String::from_utf8_lossy(&received)
+    );
+}
+
+/// H15（D-6）：裸 LF 换行必须像 Go 一样立即解析并 200——**绝不得**静默挂到 60s
+/// 握手限时（客户端会以为代理已死）。
+#[tokio::test]
+async fn http_bare_lf_request_accepted_e2e() {
+    let origin = spawn_ok_origin("http-origin-bare-lf").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "GET http://127.0.0.1:{p}/cl HTTP/1.1\nHost: 127.0.0.1:{p}\nConnection: close\n\n",
+        p = origin.port()
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut client))
+        .await
+        .expect("bare-LF request must not hang (Go answers immediately)");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(resp.ends_with("ok"), "{resp}");
+}
+
+/// H30（D-8）：绝对 URI 的 userinfo 归 `URL.User`，host 只取 authority 的 host 段
+/// （Go `net/url` `parseAuthority`：`LastIndex("@")` 之后才是 host）。
+#[tokio::test]
+async fn http_absolute_uri_with_userinfo_routes_to_host_e2e() {
+    let origin = spawn_ok_origin("http-origin-userinfo").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let req = format!(
+        "GET http://user:pass@127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\
+         Connection: close\r\n\r\n",
+        p = origin.port()
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "userinfo must not leak into host: {resp}");
+}
+
+/// H19/H20（D-7）：畸形 header 行（无冒号 / 空头名）不得静默丢弃——拒绝并断链。
+#[tokio::test]
+async fn http_header_line_without_colon_rejected_e2e() {
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET http://127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nBadHeader\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+}
+
+/// H20：空头名（`: v`）——Go `canonicalMIMEHeaderKey` 对空名返回 ok=false。
+#[tokio::test]
+async fn http_empty_header_name_rejected_e2e() {
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET http://127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n: v\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+}
+
+/// H03/H04/H05/H13（D-1）：请求行严格单空格三切分——双空格/尾空格/URI 内空格
+/// 全部落到版本段而失败（Go `parseRequestLine` + `ParseHTTPVersion`）。
+#[tokio::test]
+async fn http_request_line_double_space_rejected_e2e() {
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET  http://127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+}
+
+/// H13：URI 内含空格（第三段以 `b HTTP/1.1` 起头）→ 版本非法。
+#[tokio::test]
+async fn http_request_line_space_in_uri_rejected_e2e() {
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET http://127.0.0.1:{p}/a b HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+}
+
+/// H09/H10（D-5）：URI 含控制字符 / NUL —— Go `net/url` `stringContainsCTLByte` 拒绝。
+#[tokio::test]
+async fn http_control_char_in_uri_rejected_e2e() {
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET http://127.0.0.1:{p}/a\x01b HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+    assert_rejected_without_response(|p| {
+        format!(
+            "GET http://127.0.0.1:{p}/a\x00b HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    })
+    .await;
+}
+
+/// H06（D-3）：URI 里的非法 UTF-8 单字节（latin-1 `é`）Go 照收（net/url 允许 ≥0x80
+/// 原始字节）——不得因解码失败断链。
+#[tokio::test]
+async fn http_non_utf8_uri_accepted_e2e() {
+    let origin = spawn_ok_origin("http-origin-non-utf8").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut req = format!("GET http://127.0.0.1:{}/x", origin.port()).into_bytes();
+    req.extend_from_slice(b"\xe9");
+    req.extend_from_slice(
+        format!(" HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", origin.port())
+            .as_bytes(),
+    );
+    client.write_all(&req).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "non-UTF-8 URI must not断链: {resp}");
+}
+
+/// H17/H08（D-2）：16KB 级请求行/header 行 Go 照收（`http.ReadRequest` 手工调用不套
+/// `MaxHeaderBytes`）——不得按 16KB 断链。
+#[tokio::test]
+async fn http_16k_header_line_accepted_e2e() {
+    let origin = spawn_ok_origin("http-origin-16k-header").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let big = "a".repeat(16 * 1024);
+    let req = format!(
+        "GET http://127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nX-Big: {big}\r\n\
+         Connection: close\r\n\r\n",
+        p = origin.port()
+    );
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+}
+
+/// H18（D-2）：200 个 header 行 Go 照收（无行数上限）——不得按 128 行断链。
+#[tokio::test]
+async fn http_200_header_lines_accepted_e2e() {
+    let origin = spawn_ok_origin("http-origin-200-headers").await;
+    let proxy_addr = spawn_http_proxy(ServerConfig::default()).await;
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut req = format!(
+        "GET http://127.0.0.1:{p}/cl HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\n",
+        p = origin.port()
+    );
+    for i in 0..200 {
+        req.push_str(&format!("X-Pad-{i}: v\r\n"));
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    client.write_all(req.as_bytes()).await.unwrap();
+    let resp = read_http_response(&mut client).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+}

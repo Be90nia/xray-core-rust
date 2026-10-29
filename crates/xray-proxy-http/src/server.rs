@@ -583,6 +583,10 @@ pub fn request_keep_alive(headers: &HashMap<String, Vec<String>>) -> bool {
 /// 仅 `http://`/`https://` 前缀（absolute-form）有 authority；origin-form /
 /// authority-form 返回 `None`（等价 Go `request.URL.Host == ""`）。
 /// scheme 大小写不敏感（Go `url.Parse` 会把 scheme 归一为小写）。
+///
+/// authority 里的 `user:pass@` 归 `URL.User`，不进 host（Go `net/url`
+/// `parseAuthority`：`LastIndex("@")` 之后才是 host）——不剥会把整段当域名去解析，
+/// 必然 503（H30）。
 fn extract_url_host(target: &str) -> Option<&str> {
     let lower = target.get(..target.len().min(8))?.to_ascii_lowercase();
     let after_scheme = if lower.starts_with("http://") {
@@ -593,7 +597,8 @@ fn extract_url_host(target: &str) -> Option<&str> {
         return None;
     };
     let authority = after_scheme.split('/').next().unwrap_or_default();
-    (!authority.is_empty()).then_some(authority)
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    (!host.is_empty()).then_some(host)
 }
 
 /// 请求目标 host（Go `http.ReadRequest` + `Process` 语义）。
@@ -934,43 +939,63 @@ where
 
 /// 读请求行 + headers（握手第 1-2 步）。
 ///
-/// 返回 (method 大写, target, 请求行版本, headers)；EOF/超长行/超行数/malformed 请求行
+/// 返回 (method 大写, target, 请求行版本, headers)；EOF/超长/畸形请求行/畸形 header
 /// 统一报 [`HttpProxyError::Protocol`]（或 [`HttpProxyError::Io`]），**不回任何响应**
-/// ——对齐 Go `http.ReadRequest` 失败后 `Process` 直接断链。
+/// ——对齐 Go `http.ReadRequest` 失败后 `Process` 直接断链（`proxy/http/server.go:116`）。
 async fn read_request_head<RW>(
     stream: &mut RW,
 ) -> Result<(String, String, HttpVersion, HashMap<String, Vec<String>>)>
 where
     RW: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // 读请求行
+    // 读请求行（严格三段，见 [`parse_request_line`]）
     let request_line = read_http_line(stream).await?;
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 3 {
-        return Err(HttpProxyError::Protocol(format!("malformed request line: {request_line:?}")));
+    let (method, target, version_token) = parse_request_line(&request_line)?;
+    // Go `net/url` `parse`（url.go:517）：URL 里出现 CTL 字节（<0x20 或 0x7f）直接
+    // `invalid control character in URL`。控制字符会被原样写进上游请求行 = 请求注入面。
+    if target.bytes().any(|c| c < 0x20 || c == 0x7f) {
+        return Err(HttpProxyError::Protocol(format!(
+            "invalid control character in request target: {target:?}"
+        )));
     }
-    let method = parts[0].to_ascii_uppercase();
-    let target = parts[1].to_string();
-    let http_version = parse_http_version(parts[2]);
+    let method = method.to_ascii_uppercase();
+    let http_version = parse_http_version(version_token);
+    let target = target.to_string();
 
-    // 读 headers（最多 [`MAX_HTTP_HEADER_LINES`] 行，防无界头部注入；
-    // Go http.ReadRequest 语义下请求行+headers 共享 1MB 总预算，此处按行数收紧）
+    // 读 headers：总字节预算 [`MAX_HTTP_HEAD_BYTES`]（Go 侧无行数/行长上限，见该常量）。
+    // 行首空格/制表符是 obs-fold 续行，按 Go `textproto.readContinuedLineSlice`
+    // 折进上一头的值（H21 两侧一致面）。
     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
-    let mut header_lines = 0usize;
+    let mut head_bytes = request_line.len() + 2;
+    let mut last_name: Option<String> = None;
     loop {
         let line = read_http_line(stream).await?;
+        head_bytes += line.len() + 2;
+        if head_bytes > MAX_HTTP_HEAD_BYTES {
+            return Err(HttpProxyError::Protocol(format!(
+                "http request head exceeds {MAX_HTTP_HEAD_BYTES} bytes"
+            )));
+        }
         if line.is_empty() {
             break;
         }
-        header_lines += 1;
-        if header_lines > MAX_HTTP_HEADER_LINES {
-            return Err(HttpProxyError::Protocol(format!(
-                "too many HTTP header lines (>{MAX_HTTP_HEADER_LINES})"
-            )));
+        if line.starts_with([' ', '\t']) {
+            // 首行即续行 → Go `textproto` 报 "malformed MIME header initial line"
+            let Some(name) = last_name.as_ref() else {
+                return Err(HttpProxyError::Protocol(format!(
+                    "malformed MIME header initial line: {line:?}"
+                )));
+            };
+            if let Some(value) = headers.get_mut(name).and_then(|values| values.last_mut()) {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
-        }
+        let (name, value) = parse_header_line(&line)?;
+        let name = name.trim().to_ascii_lowercase();
+        headers.entry(name.clone()).or_default().push(value.trim().to_string());
+        last_name = Some(name);
     }
     // Go `http.ReadRequest`（net/http/request.go:1138）：多个 Host 头 → 报
     // "too many Host headers" → ReadRequest 失败 → 上层断链（不回响应）。
@@ -981,17 +1006,21 @@ where
     Ok((method, target, http_version, headers))
 }
 
-/// 单行（请求行/头部行）字节上限。Go `http.ReadRequest` 对请求行+headers 共享
-/// `DefaultMaxHeaderBytes`(1MB) 总预算；本实现逐字节读行，按 16KB/行收紧
-/// （正常 HTTP 头远低于此），防御恶意无界行撑爆内存。
-const MAX_HTTP_LINE_BYTES: usize = 16 * 1024;
-/// 请求头最大行数（不含请求行）。Go 无显式行数限制（受 1MB 总预算约束）；
-/// 此处 128 行等价收紧，防慢速逐行注入。
-const MAX_HTTP_HEADER_LINES: usize = 128;
-/// 读一行 HTTP header（到 `\r\n`，返回不含 `\r\n` 的内容）。
+/// 请求头（请求行 + 全部 header 行）总字节上限。
+///
+/// Go `http.ReadRequest` 是手工调用，不套 `http.Server` 的 `MaxHeaderBytes`——`ReadMIMEHeader`
+/// 的预算参数是 `math.MaxInt64`（`net/textproto/reader.go:512-514`，调用点
+/// `net/http/request.go:1133`），实测 Go 接受 16KB 级请求行/头行与 200 个 header
+/// （H08/H17/H18）。本实现保留 1MB 上限：即 Go `net/http.DefaultMaxHeaderBytes`
+/// 的服务端默认值，作「真实流量绝不会触及、又不让单连接无界吃内存」的界。
+const MAX_HTTP_HEAD_BYTES: usize = 1024 * 1024;
+
+/// 读一行 HTTP header（到 `\n`，返回不含行尾 `\r\n` / 裸 `\n` 的内容）。
+///
+/// 对齐 Go `net/textproto.readLineSlice`：以 `\n` 断行（**裸 LF 合法**，RFC 7230
+/// §3.5 容忍），仅在行尾剥一个 `\r`，行内 CR 原样保留。
 async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String> {
     let mut buf = Vec::with_capacity(128);
-    let mut prev_was_cr = false;
     let mut byte = [0u8; 1];
     loop {
         let n = reader.read(&mut byte).await.map_err(HttpProxyError::Io)?;
@@ -1006,20 +1035,91 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
             }
             break;
         }
-        if prev_was_cr && byte[0] == b'\n' {
+        if byte[0] == b'\n' {
             break;
         }
-        prev_was_cr = byte[0] == b'\r';
-        if !prev_was_cr {
-            buf.push(byte[0]);
-            if buf.len() > MAX_HTTP_LINE_BYTES {
-                return Err(HttpProxyError::Protocol(format!(
-                    "http header line exceeds {MAX_HTTP_LINE_BYTES} bytes"
-                )));
-            }
+        buf.push(byte[0]);
+        if buf.len() > MAX_HTTP_HEAD_BYTES {
+            return Err(HttpProxyError::Protocol(format!(
+                "http header line exceeds {MAX_HTTP_HEAD_BYTES} bytes"
+            )));
         }
     }
-    String::from_utf8(buf).map_err(|e| HttpProxyError::Protocol(format!("non-utf8 header: {e}")))
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    // Go 按字节透传（≥0x80 原始字节合法，H06）；本实现全程 String，非法 UTF-8
+    // 序列退化为 U+FFFD——状态码与 Go 一致，仅转发字节不同（D-4 同源限制）。
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// 请求行三段切分（对齐 Go `net/http/request.go:1027` `parseRequestLine` +
+/// `validMethod` + `ParseHTTPVersion`）。
+///
+/// 单空格两次 `Cut`：多空格、尾空格、URI 内空格都会把余量留进第三段而版本非法
+/// （Go 实测日志 `malformed HTTP version " HTTP/1.1"` / `"HTTP/1.1 "` /
+/// `"b HTTP/1.1"`），即 Rust 原实现用 `split_whitespace` 是过宽面（请求走私）。
+fn parse_request_line(line: &str) -> Result<(&str, &str, &str)> {
+    let malformed = || HttpProxyError::Protocol(format!("malformed request line: {line:?}"));
+    let (method, rest) = line.split_once(' ').ok_or_else(malformed)?;
+    let (target, version) = rest.split_once(' ').ok_or_else(malformed)?;
+    let method_ok = !method.is_empty() && method.bytes().all(is_tchar);
+    if !method_ok || target.is_empty() || !is_http_version_token(version) {
+        return Err(malformed());
+    }
+    Ok((method, target, version))
+}
+
+/// RFC 7230 `tchar`（Go `validHeaderFieldByte` / `isToken`）。
+fn is_tchar(c: u8) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Go `net/http.ParseHTTPVersion`（request.go:817）：`HTTP/1.1`/`HTTP/1.0` 之外只认
+/// **恰好 8 字节**的 `HTTP/<digit>.<digit>`——`HTTP/9.9` 合法（H12 两侧一致），
+/// `HTTP/1.1 ` 非法。
+fn is_http_version_token(version: &str) -> bool {
+    let b = version.as_bytes();
+    b.len() == 8
+        && &b[..5] == b"HTTP/"
+        && b[5].is_ascii_digit()
+        && b[6] == b'.'
+        && b[7].is_ascii_digit()
+}
+
+/// 解析一行 header（对齐 Go `net/textproto/reader.go:544-560` `readMIMEHeader`）。
+///
+/// 缺冒号 / 空头名 / 头名含 tchar 与空格之外字节 / 值含 CTL → 协议错误。原实现
+/// `if let Some((k, v)) = line.split_once(':')` 把这类行**静默丢弃**——无日志、无拒绝，
+/// 是走私面（H19/H20）。头名里的空格是 Go 的刻意容忍（go.dev/issue/34540，H16 实测 200）。
+fn parse_header_line(line: &str) -> Result<(&str, &str)> {
+    let malformed = || HttpProxyError::Protocol(format!("malformed MIME header line: {line:?}"));
+    let (name, value) = line.split_once(':').ok_or_else(malformed)?;
+    if name.is_empty() || !name.bytes().all(|c| is_tchar(c) || c == b' ') {
+        return Err(malformed());
+    }
+    // Go `validHeaderValueByte`：HTAB / SP / VCHAR / obs-text(≥0x80) 合法
+    if value.bytes().any(|c| c != b'\t' && (c < 0x20 || c == 0x7f)) {
+        return Err(malformed());
+    }
+    Ok((name, value))
 }
 
 /// 解析 `host:port` 字符串为 [`Destination`]。无端口时用 `default_port`。
@@ -1318,27 +1418,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_rejects_oversized_line() {
-        // 请求行超长（> MAX_HTTP_LINE_BYTES）→ InvalidRequest。Go http.ReadRequest
-        // 以 DefaultMaxHeaderBytes(1MB) 总预算拒绝超界流量，此处按 16KB/行收紧。
-        let mut req = b"CONNECT ".to_vec();
-        req.extend(std::iter::repeat_n(b'a', MAX_HTTP_LINE_BYTES + 1));
-        req.extend_from_slice(b":443 HTTP/1.1\r\n\r\n");
+    async fn handshake_rejects_oversized_head() {
+        // 请求头总字节 > MAX_HTTP_HEAD_BYTES（Go DefaultMaxHeaderBytes）→ 拒绝。
+        // 单看行长没有独立上限：Go 走 http.ReadRequest 时无任何行长/行数闸
+        // （net/textproto/reader.go:511 预算 = math.MaxInt64），故只用总量兜底。
+        let mut req = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
+        for i in 0..96 {
+            req.extend_from_slice(format!("X-Pad-{i}: ").as_bytes());
+            req.extend(std::iter::repeat_n(b'a', 12 * 1024));
+            req.extend_from_slice(b"\r\n");
+        }
+        req.extend_from_slice(b"\r\n");
+        assert!(req.len() > MAX_HTTP_HEAD_BYTES);
         let (_, result) = tcp_handshake(&req, ServerConfig::default()).await;
-        assert!(result.is_err(), "oversized request line must be rejected");
+        assert!(result.is_err(), "request head over budget must be rejected");
     }
 
     #[tokio::test]
-    async fn handshake_rejects_too_many_header_lines() {
-        // 129 个 header 行（> MAX_HTTP_HEADER_LINES）→ InvalidRequest。
-        // Go 无显式行数限制（1MB 总预算约束），此处按 128 行收紧。
+    async fn handshake_accepts_many_header_lines() {
+        // 200 个 header 行（H18）Go 照收——行数不再有闸，只受总预算约束。
         let mut req = b"CONNECT example.com:443 HTTP/1.1\r\n".to_vec();
-        for i in 0..=MAX_HTTP_HEADER_LINES {
+        for i in 0..200 {
             req.extend_from_slice(format!("X-Pad-{i}: v\r\n").as_bytes());
         }
         req.extend_from_slice(b"\r\n");
         let (_, result) = tcp_handshake(&req, ServerConfig::default()).await;
-        assert!(result.is_err(), "too many header lines must be rejected");
+        assert!(result.is_ok(), "200 header lines must be accepted: {result:?}");
+    }
+
+    #[test]
+    fn parse_request_line_strict_single_space() {
+        // Go parseRequestLine + ParseHTTPVersion：单空格两次切分 + 8 字节版本段
+        assert!(parse_request_line("GET http://h/cl HTTP/1.1").is_ok());
+        assert!(parse_request_line("GET http://h/cl HTTP/9.9").is_ok());
+        assert!(parse_request_line("GET  http://h/cl HTTP/1.1").is_err()); // H03
+        assert!(parse_request_line("GET http://h/cl  HTTP/1.1").is_err()); // H04
+        assert!(parse_request_line("GET http://h/cl HTTP/1.1 ").is_err()); // H05
+        assert!(parse_request_line("GET http://h/a b HTTP/1.1").is_err()); // H13
+        assert!(parse_request_line("GET http://h/cl").is_err()); // H02
+        assert!(parse_request_line("GET  HTTP/1.1").is_err()); // 空 target
+    }
+
+    #[test]
+    fn parse_header_line_rejects_malformed() {
+        assert!(parse_header_line("BadHeader").is_err()); // H19：无冒号
+        assert!(parse_header_line(": v").is_err()); // H20：空头名
+        assert!(parse_header_line("X: a\x01b").is_err()); // 值含 CTL
+        assert!(parse_header_line("Ho st: x").is_ok()); // H16：Go 刻意容忍名字里的空格
+        assert_eq!(parse_header_line("Host: a:b").unwrap(), ("Host", " a:b")); // 值内冒号
+    }
+
+    #[test]
+    fn extract_url_host_strips_userinfo() {
+        // H30：Go net/url parseAuthority 按 LastIndex('@') 切
+        assert_eq!(extract_url_host("http://user:pass@127.0.0.1:8080/cl"), Some("127.0.0.1:8080"));
+        assert_eq!(extract_url_host("http://user@h/p"), Some("h"));
+        assert_eq!(extract_url_host("http://h/p"), Some("h"));
+    }
+
+    #[tokio::test]
+    async fn handshake_accepts_bare_lf() {
+        // H15：裸 LF 断行（Go textproto.ReadLineSlice 只认 '\n'）必须立即正常解析
+        let req = b"GET http://example.com/path HTTP/1.1\nHost: example.com\n\n";
+        let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
+        let hs = result.unwrap();
+        assert_eq!(hs.method, "GET");
+        assert_eq!(hs.target, "http://example.com/path");
+        assert_eq!(hs.headers.get("host").unwrap()[0], "example.com");
+    }
+
+    #[tokio::test]
+    async fn handshake_folds_obs_fold_continuation() {
+        // H21：行首空格是续行，折进上一头的值（Go readContinuedLineSlice）
+        let req =
+            b"GET http://example.com/p HTTP/1.1\r\nHost: example.com\r\nX-A: v\r\n more\r\n\r\n";
+        let (_resp, result) = tcp_handshake(req, ServerConfig::default()).await;
+        let hs = result.unwrap();
+        assert_eq!(hs.headers.get("x-a").unwrap()[0], "v more");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_leading_continuation() {
+        // 首行即续行 → Go textproto "malformed MIME header initial line"
+        let req = b"GET http://example.com/p HTTP/1.1\r\n Host: example.com\r\n\r\n";
+        let (_, result) = tcp_handshake(req, ServerConfig::default()).await;
+        assert!(result.is_err(), "leading continuation line must be rejected");
     }
 
     #[tokio::test]
