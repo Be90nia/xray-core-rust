@@ -396,7 +396,7 @@ impl DefaultDialerClient {
     /// decide_http_version 消费（本调用之前）。btls 分支不读
     /// config.alpn_protocols（指纹 ALPN 走模板/显式覆盖），不受影响。
     /// `rtt_hint`：bd rjzw2 RTT 探针结果（TCP connect 计时，见
-    /// [`crate::flow_window`]）——h2 握手 SETTINGS 初窗按 RTT 阶梯自适应
+    /// `flow_window` 模块）——h2 握手 SETTINGS 初窗按 RTT 阶梯自适应
     /// （低 RTT 档缩窗削缓冲占用，高 RTT 档/探针失败回落静态保底，永不劣于
     /// 现状）。h2 接收窗运行时不可调（无翻倍 API），只能握手前定。
     #[must_use]

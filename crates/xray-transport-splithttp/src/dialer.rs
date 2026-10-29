@@ -625,7 +625,7 @@ pub async fn dial_h3(
 /// - `session_id`: uuid 字符串（stream-one 时为空）
 /// - `config`: splithttp 配置（构造 RequestMeta）
 /// - `rtt_hint`: bd rjzw2 RTT 探针结果（调用方计时真实 `dial_system` connect）， 喂 h2
-///   阶梯定窗；`None` 回落静态保底（见 [`crate::flow_window`]）
+///   阶梯定窗；`None` 回落静态保底（见 `flow_window` 模块）
 ///
 /// # Errors
 ///
