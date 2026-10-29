@@ -138,6 +138,7 @@ async fn dial_reality_stream_one_via_direct_h2_handshake() {
         base_uri,
         String::new(), // stream-one session_id 空
         config,
+        None,
     )
     .await
     .expect("dial_reality_stream_one");

@@ -395,6 +395,10 @@ impl DefaultDialerClient {
     /// `[h2, http/1.1]`（builder.rs:346）；用户 alpn 已在 register.rs
     /// decide_http_version 消费（本调用之前）。btls 分支不读
     /// config.alpn_protocols（指纹 ALPN 走模板/显式覆盖），不受影响。
+    /// `rtt_hint`：bd rjzw2 RTT 探针结果（TCP connect 计时，见
+    /// [`crate::flow_window`]）——h2 握手 SETTINGS 初窗按 RTT 阶梯自适应
+    /// （低 RTT 档缩窗削缓冲占用，高 RTT 档/探针失败回落静态保底，永不劣于
+    /// 现状）。h2 接收窗运行时不可调（无翻倍 API），只能握手前定。
     #[must_use]
     pub fn new(
         config: Arc<Config>,
@@ -403,6 +407,7 @@ impl DefaultDialerClient {
         fingerprint: Option<Fingerprint>,
         security_json: Option<serde_json::Value>,
         tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+        rtt_hint: Option<std::time::Duration>,
     ) -> Self {
         // SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
         let sni = if dial.sni.is_empty() { dial.host.clone() } else { dial.sni };
@@ -442,12 +447,14 @@ impl DefaultDialerClient {
         // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
         // 1MB/RTT。32/32MB 流窗/连窗 + 16MiB send 与 stream-one dialer.rs 同批同值
         // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
+        // bd rjzw2：三参数改由 RTT 阶梯驱动（低 RTT 缩 send_buf 削缓冲，保底=原静态值）。
+        let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .http2_initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
-            .http2_initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
-            .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE)
+            .http2_initial_stream_window_size(win.stream_window)
+            .http2_initial_connection_window_size(win.connection_window)
+            .http2_max_send_buf_size(win.max_send_buf)
             // h2 连接级 keep-alive PING：对齐 Go dialer.go http2 分支
             // ReadIdleTimeout = ChromeH2KeepAlivePeriod 45s（net.go:20）；
             // timeout 15s = Go http2.PingTimeout 缺省。对抗 CDN 100s idle 切断
@@ -884,6 +891,8 @@ mod tests {
     /// 链可调用；不 build 不拨号）：h2 初始流窗/连窗 32MB + 每流 send buf
     /// 16MiB（bd wz2b C2 上行钉 / bd c9oc F-A 在途平台钉，argo xhttp 增益）。
     /// 削弱常量 = 本测试红；builder 回退内联字面量 = 常量失引用，clippy dead_code 红。
+    /// bd rjzw2：常量语义变为「RTT 不可知时静态保底」——阶梯断言见
+    /// `h2_adaptive_windows_tier_by_rtt`。
     #[test]
     fn h2_window_pins_match_wz2b_c9oc() {
         assert_eq!(
@@ -905,6 +914,28 @@ mod tests {
             .http2_initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
             .http2_initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
             .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
+    }
+
+    /// bd rjzw2 防回档：RTT 阶梯定窗各档输出（含保底）——阶梯函数被旁路
+    /// （builder 回退常量直连）时低 RTT 档不再缩 send_buf = 缓冲占用验收失守，
+    /// 本测试红。流窗全档不缩（rjzw2 bench 实测：缩流窗钉吞吐）。
+    #[test]
+    fn h2_adaptive_windows_tier_by_rtt() {
+        use std::time::Duration;
+        let w = |rtt| crate::flow_window::client_windows_from_rtt(rtt);
+        // None → 静态保底（永不劣于现状）。
+        assert_eq!(w(None), crate::flow_window::CLIENT_FALLBACK);
+        // <40ms → send_buf 8MB，流窗 32MB 不动。
+        assert_eq!(
+            w(Some(Duration::from_millis(20))).max_send_buf,
+            8 * 1024 * 1024,
+            "低 RTT 档必须缩 send_buf（缓冲占用降验收），流窗不得缩（吞吐验收）"
+        );
+        assert_eq!(w(Some(Duration::from_millis(20))).stream_window, 32 * 1024 * 1024);
+        // 40-100ms → send_buf 12MB。
+        assert_eq!(w(Some(Duration::from_millis(80))).max_send_buf, 12 * 1024 * 1024);
+        // ≥100ms → 保底。
+        assert_eq!(w(Some(Duration::from_millis(120))), crate::flow_window::CLIENT_FALLBACK);
     }
 
     /// 1f43481b 防回档：完整 TCP connector（[`DestTcpConnector`] =
@@ -1084,6 +1115,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
     }
 
@@ -1114,6 +1146,7 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            None,
             None,
             None,
             None,
@@ -1166,6 +1199,7 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            None,
             None,
             None,
             None,

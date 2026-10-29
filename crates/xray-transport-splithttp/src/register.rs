@@ -210,12 +210,16 @@ async fn dial_splithttp(
         // 对应 Go `splithttp/dialer.go::Dial` 在 `reality.UClient(conn, ...)` 闭包里
         // 包 TCP 触发的同一行为，Rust 端拆分到 splithttp 路径专用。
         if has_reality {
+            // bd rjzw2：真实 TCP connect 计时 = RTT 探针（SYN→SYN-ACK ≈ 1 RTT，
+            // 零额外握手；含 DNS 解析时偏大 = 窗偏大的安全方向）。
+            let dial_started = xray_frame::compat::clock().now_instant();
             let tcp_conn = dial_system(dest, sockopt).await.map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("splithttp reality dial_system: {e}"),
                 )
             })?;
+            let rtt_hint = Some(dial_started.elapsed());
             let remote_addr = tcp_conn.remote_addr().ok().flatten();
             let local_addr = tcp_conn.local_addr().ok().flatten();
             // finalmask（bd dppv）：TCP 后、REALITY TLS 前（Go dialContext 层序）。
@@ -237,14 +241,16 @@ async fn dial_splithttp(
             // (line 314-318) 对齐。
             let base_uri = format!("{scheme}://{host}{path}", path = config.normalized_path());
             let session_id = String::new();
-            dialer::dial_reality_stream_one(tls_stream, remote, local, base_uri, session_id, config)
-                .await
-                .map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("splithttp reality stream-one: {e}"),
-                    )
-                })?
+            dialer::dial_reality_stream_one(
+                tls_stream, remote, local, base_uri, session_id, config, rtt_hint,
+            )
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("splithttp reality stream-one: {e}"),
+                )
+            })?
         } else {
             // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
             // Bug A: TCP 必须恒拨 `dest`，URL authority（config.host）仅作 Host 头；
@@ -262,6 +268,11 @@ async fn dial_splithttp(
                     .unwrap_or("")
                     .to_string(),
             };
+            // bd rjzw2：握手前 RTT 探针（一次性 TCP connect 计时，DNS 在计时外；
+            // 失败 → None → 阶梯回落静态保底，永不劣于现状）。独立于数据连接。
+            // bench/诊断可用 XRAY_H2_RTT_HINT_MS 强制（此时跳过探针）。
+            let rtt_hint =
+                crate::flow_window::resolve_rtt(&dial_target.host, dial_target.port).await;
             let client = Arc::new(DefaultDialerClient::new(
                 config.clone(),
                 rustls_config,
@@ -269,6 +280,7 @@ async fn dial_splithttp(
                 fingerprint,
                 settings.security_json.clone(),
                 Some(Arc::clone(&tcpmask)),
+                rtt_hint,
             ));
             dialer::dial(client, config, scheme, &host, has_reality).await.map_err(|e| {
                 io::Error::new(

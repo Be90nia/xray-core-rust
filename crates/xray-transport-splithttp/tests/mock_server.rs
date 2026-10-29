@@ -120,6 +120,7 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         None,
         None,
         None,
+        None,
     ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
@@ -228,6 +229,7 @@ async fn packet_up_posts_run_concurrently_and_keep_seq_order() {
         None,
         None,
         None,
+        None,
     ));
     let mut conn = dial_packet_up(
         client,
@@ -306,6 +308,7 @@ async fn post_packet_returns_bad_status_on_500() {
         None,
         None,
         None,
+        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
@@ -349,6 +352,7 @@ async fn open_stream_get_non_200_yields_eof() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
         None,
         None,
         None,
@@ -465,6 +469,7 @@ async fn fingerprint_btls_end_to_end_http1() {
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
         None,
+        None,
     ));
 
     let mut conn = dial_packet_up(
@@ -501,6 +506,7 @@ async fn fingerprint_btls_end_to_end_http2() {
         DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
+        None,
         None,
     ));
 
@@ -577,6 +583,7 @@ async fn conn_drop_terminates_all_http_connections() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
         None,
         None,
         None,
@@ -703,6 +710,7 @@ async fn bridge_eof_propagates_without_conn_idle() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        None,
         None,
         None,
         None,
@@ -864,6 +872,7 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
         None,
         None,
         None,
+        None,
     ));
 
     let mut conn = tokio::time::timeout(
@@ -957,6 +966,7 @@ async fn stream_up_dial_returns_while_upload_response_body_open() {
         None,
         None,
         None,
+        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
     // 空 stream body：请求体立即完结，焦点在响应体永不结束
@@ -1016,6 +1026,7 @@ async fn stream_up_plain_h1_request_carries_connection_close() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
         None,
         None,
         None,
@@ -1107,6 +1118,7 @@ async fn stream_upload_tls_h2_request_has_no_connection_header() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: "127.0.0.1".into() },
+        None,
         None,
         None,
         None,

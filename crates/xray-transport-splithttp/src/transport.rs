@@ -72,6 +72,15 @@ pub(crate) const H2_INITIAL_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 /// 上行钉 1MB/RTT）。
 pub(crate) const H2_MAX_SEND_BUF_SIZE: usize = 16 * 1024 * 1024;
 
+/// 服务端 h2 收窗原静态值（bd rjzw2：修前 `serve_http_conn` 内联值——服务端**不得**
+/// 复用客户端的 `H2_INITIAL_STREAM_WINDOW` 32MB，否则保底路径把服务端原静态
+/// 16MB 抬到 32MB：保底被偷改 + 「现状静态 vs 自适应」对比基线失效）。
+pub(crate) const H2_SERVER_INITIAL_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+/// 服务端 h2 连窗原静态值（32MB）。
+pub(crate) const H2_SERVER_INITIAL_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
+/// 服务端 h2 每流发送缓冲原静态值（16MiB）。
+pub(crate) const H2_SERVER_MAX_SEND_BUF_SIZE: usize = 16 * 1024 * 1024;
+
 /// SplitHTTP 监听入口（listener registry 注册的目标）。
 ///
 /// 镜像 Go `ListenXH`：isH3（alpn==["h3"]）走 QUIC，其余走 TCP + TLS/REALITY 包装。
@@ -169,6 +178,17 @@ async fn accept_xh_conn(
                 },
             };
             let _ = stream.set_nodelay(true);
+            // bd rjzw2：下行延迟削峰（Linux unsent 队列上限；其余平台 no-op）。
+            // 尽力而为：失败只影响排队延迟不影响吞吐，debug 留痕不拒连。
+            #[cfg(target_os = "linux")]
+            if let Err(e) = xray_transport::sockopt::apply_tcp_notsent_lowat(
+                &stream,
+                crate::flow_window::TCP_NOTSENT_LOWAT_BYTES,
+            ) {
+                crate::LOG.debug(format!(
+                    "error={e} splithttp inbound: TCP_NOTSENT_LOWAT 设置失败（继续）"
+                ));
+            }
             // Tcpmask wrap（Go hub.go:546-549 WrapListener：mask 在 TLS/REALITY
             // 之内、最贴近 wire；wrap 失败丢连接继续 accept）。
             let stream: Box<dyn xray_transport::connection::Connection> = match tcpmask.as_ref() {
@@ -402,11 +422,15 @@ async fn handle_accepted_stream<S>(
         serve_reality_conn(stream, peer, local, rc, probe, ctx).await;
     } else if let Some(tc) = tls {
         // Go hub.go:553-556 `gotls.NewListener`
+        // bd rjzw2：TLS accept 耗时 ≈ 1 RTT（ServerHello→Finished）+ 毫秒级 CPU
+        // —— 服务端 RTT 探针，喂 h2 阶梯定窗（明文分支无信号，回落静态保底）。
+        let started = xray_frame::compat::clock().now_instant();
         if let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tc).accept(stream).await {
-            serve_http_conn(tls_stream, peer, ctx).await;
+            let rtt_hint = started.elapsed();
+            serve_http_conn(tls_stream, peer, ctx, Some(rtt_hint)).await;
         }
     } else {
-        serve_http_conn(stream, peer, ctx).await;
+        serve_http_conn(stream, peer, ctx, None).await;
     }
 }
 
@@ -495,8 +519,15 @@ async fn drive_serve_guarded(
 
 /// h1 + h2c 自动协商的 HTTP 服务。对应 Go hub.go:564-578
 /// （`protocols.SetHTTP1(true)` + `SetUnencryptedHTTP2(true)` 的 http.Server）。
-async fn serve_http_conn<S>(stream: S, peer: SocketAddr, ctx: Arc<HandlerContext>)
-where
+///
+/// `rtt_hint`：bd rjzw2 服务端 RTT 探针结果（TLS/REALITY accept 耗时；明文
+/// 分支 None）——h2 SETTINGS 初窗按 RTT 阶梯自适应，保底 = 原静态值。
+async fn serve_http_conn<S>(
+    stream: S,
+    peer: SocketAddr,
+    ctx: Arc<HandlerContext>,
+    rtt_hint: Option<Duration>,
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     use hyper::service::service_fn;
@@ -518,6 +549,9 @@ where
     // builder 由 async move 块持有：serve_connection 借用 &self，装箱 future
     // 生命周期超出本函数栈帧。
     let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+        // bd rjzw2：h2 三参数改由 RTT 阶梯驱动（低 RTT 缩 send_buf 削缓冲占用；
+        // 保底 = 下方原静态值，探针失败/高 RTT 档行为与现状完全一致）。
+        let win = crate::flow_window::server_windows_from_rtt(rtt_hint);
         let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         builder
             .http1()
@@ -538,13 +572,14 @@ where
             // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
             // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
             // Go 服务端无此上限（仅受客户端窗口约束）。
-            .max_send_buf_size(16 * 1024 * 1024)
+            .max_send_buf_size(win.max_send_buf)
             // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
             // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
             // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
             // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
-            .initial_stream_window_size(16 * 1024 * 1024)
-            .initial_connection_window_size(32 * 1024 * 1024);
+            // bd rjzw2：值改由 RTT 阶梯驱动，保底 = 16MB/32MB。
+            .initial_stream_window_size(win.stream_window)
+            .initial_connection_window_size(win.connection_window);
         // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
         // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
         let _ = builder.serve_connection(io, svc).await;
@@ -719,6 +754,9 @@ async fn serve_reality_conn<S>(
 {
     use xray_reality::server::{RealityServerOutcome, server_tls};
 
+    // bd rjzw2：REALITY 握手同为 TLS 1.3 往返（≈1 RTT + 认证/HMAC 毫秒级）
+    // —— 服务端 RTT 探针，喂 h2 阶梯定窗。
+    let started = xray_frame::compat::clock().now_instant();
     // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
     // 模仿消费）；默认 rustls 路径行为不变。
     let outcome = if matches!(rc.server_acceptor, xray_reality::ServerAcceptorSetting::Btls) {
@@ -768,7 +806,7 @@ async fn serve_reality_conn<S>(
             // bd frxi：探测值随连接交付（rustls 无 record 层消费点，
             // mygg 后握手记录模仿落地前仅可观察）。
             crate::LOG.debug(format!("peer={peer} max_useless_records={max_useless_records} reality verified with probe result"));
-            serve_http_conn(tls, peer, ctx).await
+            serve_http_conn(tls, peer, ctx, Some(started.elapsed())).await
         },
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
             crate::LOG.debug(format!(

@@ -624,6 +624,8 @@ pub async fn dial_h3(
 /// - `base_uri`: 完整 URL
 /// - `session_id`: uuid 字符串（stream-one 时为空）
 /// - `config`: splithttp 配置（构造 RequestMeta）
+/// - `rtt_hint`: bd rjzw2 RTT 探针结果（调用方计时真实 `dial_system` connect）， 喂 h2
+///   阶梯定窗；`None` 回落静态保底（见 [`crate::flow_window`]）
 ///
 /// # Errors
 ///
@@ -636,6 +638,7 @@ pub async fn dial_reality_stream_one<S>(
     base_uri: String,
     session_id: String,
     config: Arc<Config>,
+    rtt_hint: Option<std::time::Duration>,
 ) -> Result<PacketUpConn>
 where
     S: AsyncReadTrait + AsyncWriteTrait + Unpin + Send + 'static,
@@ -652,11 +655,13 @@ where
     // 上行 1MB→16MB 与服务端对称（bd wz2b：服务端收窗放大后 send buf 成次级钉，
     // 4MB/RTT@169ms≈23.7MB/s < 25 判据）。
     let mut builder = http2::Builder::new(TokioExecutor::new());
+    // bd rjzw2：三参数改由 RTT 阶梯驱动（保底 = 下方原静态值）。
+    let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
     builder
         .timer(hyper_util::rt::TokioTimer::new())
-        .initial_stream_window_size(crate::transport::H2_INITIAL_STREAM_WINDOW)
-        .initial_connection_window_size(crate::transport::H2_INITIAL_CONNECTION_WINDOW)
-        .max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
+        .initial_stream_window_size(win.stream_window)
+        .initial_connection_window_size(win.connection_window)
+        .max_send_buf_size(win.max_send_buf);
     let (mut sender, conn) = builder
         .handshake::<_, ReqBody>(io)
         .await
@@ -814,6 +819,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         let result = dial(client, config, "http", "h", false).await;
         let err = match result {
@@ -953,6 +959,7 @@ mod tests {
             "https://example.com/ws".to_string(),
             String::new(),
             config,
+            None,
         )
         .await;
         let mut conn = result.expect("dial_reality_stream_one failed");

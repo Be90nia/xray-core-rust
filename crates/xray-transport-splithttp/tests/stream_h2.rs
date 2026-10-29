@@ -178,6 +178,7 @@ async fn dial_stream_up_via_h2_mock_server() {
         None,
         None,
         None,
+        None,
     ));
 
     // 3. dial_stream_up
@@ -288,6 +289,7 @@ async fn dial_stream_one_via_h2_mock_server() {
             port: server_addr.port(),
             sni: String::new(),
         },
+        None,
         None,
         None,
         None,
