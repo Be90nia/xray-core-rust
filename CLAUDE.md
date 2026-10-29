@@ -78,7 +78,7 @@ cargo doc --workspace --no-deps
 | **骨架** | `udf-frame` 仓整体（独立仓 `github.com/Be90nia/udf-frame`，跨项目复用） | **骨架**：机制/契约/规范的整理与演进场所，给派生层装 | 不含 Xray 语义；不做产品装配 |
 | **硬装血肉** | 主仓 `crates/xray-frame`（装配与插件骨架）+ 各 `xray-proxy-*` / `xray-app-*`（Xray 特有） | Xray 特有的**硬装血肉**：协议插件、装配、硬连接入 | 依赖骨架与地基；**禁复制骨架已有的功能**（§3.5.2） |
 
-**依赖方向单向**：硬装血肉 → 骨架 → 地基。反向只走**提炼回路**：血肉里的通用件提炼上浮骨架/地基 → udf 发版 → 血肉换依赖并删本地副本。**不锁版本**（Cargo.lock 自然记录实际 commit）。
+**依赖方向单向**：硬装血肉 → 骨架 → 地基。反向只走**提炼回路**：血肉里的通用件提炼上浮骨架/地基 → udf 发版 → 血肉换依赖并删本地副本。**不锁版本，但锚是显式的**：主仓对 udf 走 **path 依赖**（`crates/udf-frame/*`，整目录被 `.git/info/exclude` 排除在工作树外），`Cargo.lock` **只记 `path`、不记 commit**——实际 commit 由工作副本 HEAD 决定（`git -C crates/udf-frame rev-parse HEAD`），并钉进 `crates/udf-frame/REV`；校验件 `crates/xray-conf/tests/udf_rev_anchor.rs` 比对两侧，不一致即测试失败（bd jyjko）。
 
 ### 3.5.2 禁重复造轮子（评审打回项）
 

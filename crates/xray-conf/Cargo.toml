@@ -20,6 +20,9 @@ serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# lint 阶段编排（bd bx7my 上浮）：注册表/锁外 post_process 在 udf `skeleton::lint`，
+# 本 crate 只留阶段内容 + Go 错误文案（见 src/lint.rs 模块 doc）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
 
 [dev-dependencies]

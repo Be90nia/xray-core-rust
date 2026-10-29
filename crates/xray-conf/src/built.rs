@@ -126,7 +126,7 @@ impl Config {
         // version 等硬错都在该链触发）。Rust 的 lint 注册表此前仅测试调用
         // （生产死代码），而 build() 是所有配置的唯一生产 funnel（xray-cli
         // run.rs `load_first_config` → `Config::build`），故在此自举内置阶段
-        // （register_stage 同名覆盖，幂等）并执行。阶段回调需要 `&mut Config`
+        // （register_builtin_stages 按名跳过已注册项，幂等）并执行。阶段回调需要 `&mut Config`
         // （FakeDNS 默认池填充），而 build(&self) 不可变：在克隆体上校验，
         // 填充不回写——除新增硬错外，生产行为与既有完全一致。
         crate::init::register_builtin_stages();
@@ -428,6 +428,24 @@ mod tests {
         assert_eq!(built.app_count(), 2);
         assert_eq!(built.inbound_count(), 1);
         assert_eq!(built.outbound_count(), 2);
+    }
+
+    /// bd bx7my：udf 注册表是**追加**语义（同名不去重），而 `build()` 每次自举内置
+    /// 阶段——幂等靠 `register_builtin_stages` 按名跳过，连续 build 后阶段表必须恒定
+    /// （旧本地实现是 `map[k] = v` 同名覆盖）。
+    #[test]
+    fn repeated_build_does_not_grow_stage_table() {
+        let _g = registry_lock();
+        crate::lint::clear_stages();
+        let cfg = Config::from_json_str(MINIMAL_CONFIG).expect("parse");
+        for round in 1..=5 {
+            cfg.build().expect("build");
+            assert_eq!(
+                crate::lint::registered_stages(),
+                vec!["FakeDNS", "Validation"],
+                "第 {round} 次 build 后阶段表必须仍是两项"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! 本阶段以尽力解析的方式扫描；将来 `xray-app-dns` 强类型化后可改写。
 use std::sync::Arc;
 
+use skeleton::lint::LintError;
 use xray_common::{
     errors::{print_non_removal_deprecated_feature_warning, removed_feature_message},
     net::transport::is_known_transport_protocol,
@@ -27,13 +28,21 @@ use xray_common::{
 
 use crate::{
     config::Config,
-    lint::{LintError, LintStage, register_stage},
+    lint::{LintStage, register_stage, registered_stages},
 };
 /// Go 等价物：`func init() { RegisterConfigureFilePostProcessingStage("FakeDNS", ...) }`
 /// 在 `infra/conf` 包初始化时自动执行。
 pub fn register_builtin_stages() {
-    register_stage(Arc::new(FakeDnsStage));
-    register_stage(Arc::new(ValidationStage));
+    // udf 注册表是**追加**语义（同名不去重），而 Go 是 `map[k] = v` 同名覆盖，
+    // 且 `Config::build()` 每次都自举一次 → 按名跳过已注册项：等价旧实现
+    // 「同名覆盖」的幂等性，且不抹掉他方注册的阶段。
+    let registered = registered_stages();
+    if !registered.contains(&FakeDnsStage.name()) {
+        register_stage(Arc::new(FakeDnsStage));
+    }
+    if !registered.contains(&ValidationStage.name()) {
+        register_stage(Arc::new(ValidationStage));
+    }
 }
 
 /// FakeDNS 后处理阶段。对应 Go `infra/conf.fakeDNSPostProcessingStage`。
@@ -41,12 +50,12 @@ pub fn register_builtin_stages() {
 /// 阶段名 `FakeDNS` 与 Go `RegisterConfigureFilePostProcessingStage("FakeDNS", ...)` 一致。
 pub struct FakeDnsStage;
 
-impl LintStage for FakeDnsStage {
+impl LintStage<Config> for FakeDnsStage {
     fn name(&self) -> &'static str {
         "FakeDNS"
     }
 
-    fn process(&self, cfg: &mut Config) -> Result<(), LintError> {
+    fn run(&self, cfg: &mut Config) -> Result<(), LintError> {
         // 1. 扫 dns.servers：是否存在 `fakedns` 地址。
         let fake_dns_in_use = dns_servers_use_fakedns(cfg);
 
@@ -149,12 +158,12 @@ impl LintStage for FakeDnsStage {
 /// 阶段名 `Validation` 与 Go `RegisterConfigureFilePostProcessingStage` 命名风格一致。
 pub struct ValidationStage;
 
-impl LintStage for ValidationStage {
+impl LintStage<Config> for ValidationStage {
     fn name(&self) -> &'static str {
         "Validation"
     }
 
-    fn process(&self, cfg: &mut Config) -> Result<(), LintError> {
+    fn run(&self, cfg: &mut Config) -> Result<(), LintError> {
         // 1. destOverride 未知协议（启用 sniffing 才校验）。Go 硬拒 → 这里也硬拒。
         for ib in &cfg.inbound_configs {
             let Some(sn) = ib.sniffing.as_ref() else { continue };
@@ -163,7 +172,7 @@ impl LintStage for ValidationStage {
             }
             for d in &sn.dest_override.0 {
                 if !is_known_dest_override(d) {
-                    return Err(LintError::Invalid(format!(
+                    return Err(LintError::new(format!(
                         "inbound '{}' sniffing.destOverride contains unknown protocol '{}' \
                          (Go infra/conf/xray.go:65-79 switch rejects at build time)",
                         ib.tag, d
@@ -179,7 +188,7 @@ impl LintStage for ValidationStage {
                 continue; // 空串规范化为 reject（与 Go MuxConfig.Build 一致）
             }
             if !matches!(mux.xudp_proxy_udp_443.as_str(), "reject" | "allow" | "skip") {
-                return Err(LintError::Invalid(format!(
+                return Err(LintError::new(format!(
                     "outbound '{}' mux.xudpProxyUDP443='{}' is invalid \
                      (Go MuxConfig.Build rejects; allowed: reject|allow|skip)",
                     ob.tag, mux.xudp_proxy_udp_443
@@ -190,7 +199,7 @@ impl LintStage for ValidationStage {
         // 3. burstObservatory 启用但 pingConfig 缺失。Go 必拒 → 这里也必拒。
         if let Some(b) = cfg.burst_observatory.as_ref() {
             if b.ping_config.is_none() {
-                return Err(LintError::Invalid(
+                return Err(LintError::new(
                     "burstObservatory enabled but pingConfig is missing \
                      (Go BurstObservatoryConfig.Build rejects at build time)"
                         .to_string(),
@@ -249,7 +258,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
     let net = ss.get("method").or_else(|| ss.get("network")).and_then(|v| v.as_str()).unwrap_or("");
     match net.to_ascii_lowercase().as_str() {
         "http" | "h2" | "h3" => {
-            return Err(LintError::Invalid(format!(
+            return Err(LintError::new(format!(
                 "{kind} '{tag}' streamSettings.network=\"{net}\": {}",
                 removed_feature_message(
                     "HTTP transport (without header padding, etc.)",
@@ -278,7 +287,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
         //     `net` 为空（network/method 均缺省）→ Go 走默认 "tcp"（同 :74
         //     `config.ProtocolName = "tcp"`），不报错。
         _ if !net.is_empty() && !is_known_transport_protocol(net) => {
-            return Err(LintError::Invalid(format!(
+            return Err(LintError::new(format!(
                 "{kind} '{tag}': Config: unknown transport protocol: {net}"
             )));
         },
@@ -296,7 +305,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     {
-        return Err(LintError::Invalid(format!(
+        return Err(LintError::new(format!(
             "{kind} '{tag}': {}",
             removed_feature_message(
                 "\"allowInsecure\"",
@@ -317,7 +326,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
             _ => true,
         })
     {
-        return Err(LintError::Invalid(format!(
+        return Err(LintError::new(format!(
             "{kind} '{tag}': tlsSettings.useSystemCA is not supported by this build; \
              remove the key (Rust ships its own bundled root store)"
         )));
@@ -330,7 +339,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
     //   字段，出现即静默丢。
     for key in ["masqueSettings", "xdriveSettings", "address", "port"] {
         if ss.get(key).is_some_and(|v| !v.is_null()) {
-            return Err(LintError::Invalid(format!(
+            return Err(LintError::new(format!(
                 "{kind} '{tag}': streamSettings.{key} is not supported by this build \
                  (masque/xdrive transports and fronting address are not implemented); \
                  remove the key"
@@ -338,7 +347,7 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
         }
     }
     if matches!(net.to_ascii_lowercase().as_str(), "masque" | "xdrive") {
-        return Err(LintError::Invalid(format!(
+        return Err(LintError::new(format!(
             "{kind} '{tag}': streamSettings.network=\"{net}\" is not implemented in this build"
         )));
     }
@@ -374,7 +383,7 @@ fn check_hysteria_version(
 ) -> Result<(), LintError> {
     if let Some(ver) = settings.and_then(|s| s.get("version")).and_then(|v| v.as_i64()) {
         if ver != 2 {
-            return Err(LintError::Invalid(format!(
+            return Err(LintError::new(format!(
                 "{kind} '{tag}' {field}.version={ver}: version != 2 \
                  (Go hysteria Build requires version == 2)"
             )));
@@ -429,9 +438,11 @@ mod tests {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
-        register_builtin_stages(); // 第二次同名覆盖为同一实例
+        register_builtin_stages(); // udf 注册表是追加语义 → 幂等由注册点按名跳过保证
         let names = registered_stages();
         assert_eq!(names.iter().filter(|n| **n == "FakeDNS").count(), 1);
+        // 执行序 = 注册序；旧本地实现为名字字典序，对现存两阶段两者一致（见 lint.rs doc）。
+        assert_eq!(names, vec!["FakeDNS", "Validation"]);
     }
 
     #[test]
