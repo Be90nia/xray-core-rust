@@ -1664,8 +1664,8 @@ impl DispatchHandler for DnsDispatchBridge {
 
 /// DNS link 分发主体（Go `Handler.Process` 的 request/response 双 loop）。
 ///
-/// UDP（单请求-响应，对应 dokodemo UDP 分发的 per-session link）与
-/// TCP（长度前缀帧流，双路并发）分别处理。
+/// UDP（XUDP 帧流，逐帧一数据报，会话可连发多帧——对应 dokodemo UDP 的
+/// per-session/per-peer link）与 TCP（长度前缀帧流，双路并发）分别处理。
 async fn dispatch_dns_link(
     tag: String,
     handler: xray_proxy_dns::Handler,
@@ -1679,48 +1679,117 @@ async fn dispatch_dns_link(
         io::{Reader, Writer},
         multi::MultiBuffer,
     };
+    use xray_xudp::packet::{FrameMetadata, PacketError, PacketReader, PacketWriter};
 
     if upstream.is_udp() {
-        // ---- UDP：单包请求-响应（Go UDPReader/UDPWriter + outboundConn） ----
-        let query = match link.reader.read_multi_buffer().await {
-            Ok(mb) if !mb.is_empty() => {
-                let mut q = Vec::new();
-                for b in mb.iter() {
-                    q.extend_from_slice(b.bytes());
-                }
-                q
-            },
-            _ => return,
-        };
-        let response = if own_link {
-            // Go dns.go:242-247：自身流量原样转发，不做规则处理（防环）。
-            forward_raw(&query, &upstream, timeout).await
-        } else {
-            match handler.process(&query).await {
-                Ok(xray_proxy_dns::ProcessOutcome::Drop) => None,
-                Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => Some(response),
-                Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
-                    forward_raw(&query, &upstream, timeout).await
+        // ---- UDP：XUDP 帧 link ↔ 数据报（Go UDPReader/UDPWriter + outboundConn） ----
+        //
+        // link 契约 = XUDP 帧流（`udp_session.rs` 头注释）：帧的 payload 才是 DNS
+        // 报文。修前按「裸 DNS 报文」读写 link —— 读侧把帧头当 DNS 头解析（上游
+        // 收到整条帧）、写侧裸写应答（入站解帧得 `invalid session status`），
+        // 客户端零应答（D12）。
+        //
+        // 会话可连发多帧（Go dns.go:229 的 request 循环），故不在一包后
+        // `shutdown`；每轮读超时 = policy ConnectionIdle，也是本会话唯一的
+        // 空闲超时（无它则 UDP 会话永活）。
+        let mut accum: Vec<u8> = Vec::new();
+        // 响应帧 GlobalID 沿用请求 New 帧（Go `xudp.GetGlobalID(ctx)` 同值语义）。
+        let mut global_id = [0u8; 8];
+        loop {
+            let chunk = match tokio::time::timeout(timeout, link.reader.read_multi_buffer()).await {
+                Ok(Ok(mb)) if !mb.is_empty() => mb,
+                Ok(Ok(_)) => return, // EOF：会话关闭
+                Ok(Err(e)) => {
+                    tracing::warn!(tag = %tag, "dns udp read: {e}");
+                    return;
                 },
-                Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => match &dns_service {
-                    Some(svc) => handle_ip_query(&query, svc).await,
-                    None => None,
-                },
-                Err(e) => {
-                    tracing::debug!(tag = %tag, "dns udp process: {e}");
-                    None
-                },
+                Err(_) => return, // 空闲超时
+            };
+            for b in chunk.iter() {
+                accum.extend_from_slice(b.bytes());
             }
-        };
-        if let Some(resp) = response {
-            let buf = xray_buf::buffer::Buffer::from_vec(resp);
-            let mb = MultiBuffer::from_buffer(buf);
-            if let Err(e) = link.writer.write_multi_buffer(mb).await {
-                tracing::debug!(tag = %tag, "dns udp write: {e}");
+
+            loop {
+                let (parsed, consumed) = {
+                    let mut cursor = std::io::Cursor::new(&accum[..]);
+                    let mut reader = PacketReader::new(&mut cursor);
+                    (reader.read_packet(), cursor.position() as usize)
+                };
+                let (query, target) = match parsed {
+                    Ok(Some(pkt)) => {
+                        if global_id == [0u8; 8] {
+                            if let Ok((meta, _)) = FrameMetadata::from_bytes(&accum[..consumed]) {
+                                if let Some(gid) = meta.global_id() {
+                                    global_id = *gid;
+                                }
+                            }
+                        }
+                        accum.drain(..consumed);
+                        pkt.into_parts()
+                    },
+                    Ok(None) => break, // 半帧：等更多字节
+                    Err(PacketError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        break;
+                    },
+                    Err(e) => {
+                        // 帧流已失步（link 上被写入裸报文等），无可恢复点
+                        tracing::warn!(tag = %tag, "dns udp: invalid XUDP frame, closing: {e}");
+                        return;
+                    },
+                };
+
+                let response = if own_link {
+                    // Go dns.go:242-247：自身流量原样转发，不做规则处理（防环）。
+                    forward_raw(&query, &upstream, timeout).await
+                } else {
+                    match handler.process(&query).await {
+                        Ok(xray_proxy_dns::ProcessOutcome::Drop) => None,
+                        Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => Some(response),
+                        Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
+                            forward_raw(&query, &upstream, timeout).await
+                        },
+                        Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => {
+                            match &dns_service {
+                                Some(svc) => handle_ip_query(&query, svc).await,
+                                None => None,
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(tag = %tag, "dns udp process: {e}");
+                            None
+                        },
+                    }
+                };
+                let Some(resp) = response else { continue };
+
+                // 响应装帧（Go xudp.PacketWriter）；帧来源 = 该帧目标（缺省回退
+                // upstream），与 `UdpDispatchSession::recv_packet` 的
+                // `target.unwrap_or(dest)` 对齐。
+                let source = target.unwrap_or_else(|| upstream.clone());
+                let mut frame = Vec::with_capacity(resp.len() + 64);
+                let mut writer = PacketWriter::new(&mut frame, source, global_id);
+                if let Err(e) = writer.write_packet(&resp) {
+                    tracing::warn!(tag = %tag, "dns udp encode response: {e}");
+                    return;
+                }
+                drop(writer);
+                if frame.is_empty() {
+                    // Go xudp.go:100 同款跳过（空包/超 XUDP data 上限）；留痕，
+                    // 否则客户端只见超时。
+                    tracing::warn!(
+                        tag = %tag,
+                        "dns udp: {} B response exceeds XUDP data cap, dropped",
+                        resp.len()
+                    );
+                    continue;
+                }
+                let mb = MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(frame));
+                if let Err(e) = link.writer.write_multi_buffer(mb).await {
+                    tracing::warn!(tag = %tag, "dns udp write: {e}");
+                    return;
+                }
             }
         }
-        link.writer.shutdown();
-        return;
     }
 
     // ---- TCP：长度前缀帧流，双路 IO loop（Go task.Run(request, response)） ----
@@ -5758,6 +5827,62 @@ mod tests {
         )
     }
 
+    /// 往 UDP link 写一帧 XUDP New 帧包住 DNS 报文。
+    ///
+    /// link 契约 = `UdpDispatchSession::send_packet`（`xray-app-dispatcher/src/
+    /// udp_session.rs`）：流上流动的是**帧**，裸报文只出现在帧 payload 里。
+    /// 修前本 helper 直接把裸报文写进 link，测试复制了产品侧的错误契约
+    /// （D12：单测全绿 + 生产零应答）。
+    async fn write_udp_query(
+        w: &mut Box<dyn xray_buf::io::Writer>,
+        dest: &Destination,
+        payload: &[u8],
+    ) {
+        use xray_buf::{io::Writer as _, multi::MultiBuffer};
+        use xray_xudp::packet::PacketWriter;
+
+        let mut frames = Vec::new();
+        let mut pw = PacketWriter::new(&mut frames, dest.clone(), [0u8; 8]);
+        pw.write_packet(payload).expect("encode XUDP query frame");
+        drop(pw);
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frames);
+        w.write_multi_buffer(mb).await.expect("write XUDP query frame");
+    }
+
+    /// 从 UDP link 读回一帧响应并按帧解出 `(来源, DNS 报文)`。
+    ///
+    /// 契约 = `UdpDispatchSession::recv_packet`：响应流是帧流，裸报文 = 坏帧。
+    async fn read_udp_response(r: &mut Box<dyn xray_buf::io::Reader>) -> (Destination, Vec<u8>) {
+        use xray_buf::io::Reader as _;
+        use xray_xudp::packet::{PacketError, PacketReader};
+
+        let mut accum: Vec<u8> = Vec::new();
+        loop {
+            let (parsed, consumed) = {
+                let mut cursor = std::io::Cursor::new(&accum[..]);
+                let mut pr = PacketReader::new(&mut cursor);
+                (pr.read_packet(), cursor.position() as usize)
+            };
+            match parsed {
+                Ok(Some(pkt)) => {
+                    accum.drain(..consumed);
+                    let (data, target) = pkt.into_parts();
+                    return (target.expect("response frame must carry source target"), data);
+                },
+                Ok(None) => {},
+                Err(PacketError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {},
+                Err(e) => panic!("response link carries a non-XUDP frame: {e}"),
+            }
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_multi_buffer())
+                .await
+                .expect("timeout waiting response frame")
+                .expect("read response frame");
+            assert!(!n.is_empty(), "response link closed before a full frame");
+            accum.extend_from_slice(&n.to_vec());
+        }
+    }
+
     // ===== alwc：dns outbound settings Go 方言（解析层单测）=====
 
     /// Go `DNSOutboundConfig` 全键样例（对齐 Go dns_proxy_test.go:35-44 形态）→
@@ -5997,11 +6122,6 @@ mod tests {
     /// e2e：UDP Direct 规则 → 原样 query 转发到上游 → 响应回客户端。
     #[tokio::test]
     async fn dns_udp_direct_forwards_raw_roundtrip() {
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
-
         let upstream_resp = dns_make_query(0x7777, "example.com", 1); // 原样回显即可
         let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
             Arc::new(parking_lot::Mutex::new(None));
@@ -6019,28 +6139,18 @@ mod tests {
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
         let query = dns_make_query(0x1234, "example.com", 1);
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&query);
-        up_w.write_multi_buffer(mb).await.unwrap();
+        write_udp_query(&mut up_w, &dest, &query).await;
 
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                .await
-                .expect("timeout waiting response")
-                .unwrap();
-        assert_eq!(resp.to_vec(), upstream_resp);
-        // 上游收到原样 query（未重新编码）。
+        let (source, resp) = read_udp_response(&mut dn_r).await;
+        assert_eq!(source, dest, "响应帧来源 = 请求目标");
+        assert_eq!(resp, upstream_resp);
+        // 上游收到原样 query（未重新编码，且帧头已剥）。
         assert_eq!(captured.lock().clone(), Some(query));
     }
 
     /// e2e：默认（无规则）A 查询 → Hijack → DnsService(fakedns) → fake IP 响应。
     #[tokio::test]
     async fn dns_udp_default_a_hijacks_via_fakedns() {
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
-
         let svc = make_fakedns_service("fake-in");
         let handler =
             parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
@@ -6050,16 +6160,9 @@ mod tests {
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
         let query = dns_make_query(0x4242, "fakedns.example.com", 1); // A
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&query);
-        up_w.write_multi_buffer(mb).await.unwrap();
+        write_udp_query(&mut up_w, &dest, &query).await;
 
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                .await
-                .expect("timeout waiting hijack response")
-                .unwrap();
-        let resp = resp.to_vec();
+        let (_, resp) = read_udp_response(&mut dn_r).await;
         // Header：id 回显 + QR=1。
         assert_eq!(&resp[0..2], &0x4242u16.to_be_bytes());
         assert_eq!(resp[2] & 0x80, 0x80, "response bit");
@@ -6244,11 +6347,6 @@ mod tests {
     /// e2e：ownLink（inbound tag = nameserver client tag）→ 原样转发不劫持。
     #[tokio::test]
     async fn dns_udp_own_link_bypasses_rules() {
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
-
         let upstream_resp = dns_make_query(0x9999, "upstream.com", 1);
         let captured: Arc<parking_lot::Mutex<Option<Vec<u8>>>> =
             Arc::new(parking_lot::Mutex::new(None));
@@ -6269,28 +6367,17 @@ mod tests {
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, Some(access));
 
         let query = dns_make_query(0x5678, "raw.example.com", 1);
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&query);
-        up_w.write_multi_buffer(mb).await.unwrap();
+        write_udp_query(&mut up_w, &dest, &query).await;
 
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                .await
-                .expect("timeout waiting own-link response")
-                .unwrap();
+        let (_, resp) = read_udp_response(&mut dn_r).await;
         // 响应来自 mock（非 fakedns），上游收到原样 query。
-        assert_eq!(resp.to_vec(), upstream_resp);
+        assert_eq!(resp, upstream_resp);
         assert_eq!(captured.lock().clone(), Some(query));
     }
 
     /// e2e：Return 规则 + rCode 5 + TXT 查询 → REFUSED 响应（Go rejectNonIPQuery）。
     #[tokio::test]
     async fn dns_udp_return_rule_responds_rcode() {
-        use xray_buf::{
-            io::{Reader as _, Writer as _},
-            multi::MultiBuffer,
-        };
-
         let handler = parse_dns_outbound_config(
             br#"{"rule":[{"action":"return","qType":[16],"rCode":5}]}"#,
             std::time::Duration::from_secs(300),
@@ -6301,19 +6388,94 @@ mod tests {
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
         let query = dns_make_query(0x3141, "txt.example.com", 16); // TXT
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&query);
-        up_w.write_multi_buffer(mb).await.unwrap();
+        write_udp_query(&mut up_w, &dest, &query).await;
 
-        let resp =
-            tokio::time::timeout(std::time::Duration::from_secs(5), dn_r.read_multi_buffer())
-                .await
-                .expect("timeout waiting reject response")
-                .unwrap();
-        let resp = resp.to_vec();
+        let (_, resp) = read_udp_response(&mut dn_r).await;
         assert_eq!(&resp[0..2], &0x3141u16.to_be_bytes());
         assert_eq!(resp[2] & 0x80, 0x80, "response bit");
         assert_eq!(resp[3] & 0x0F, 5, "rcode REFUSED");
+    }
+
+    /// e2e（D12 回归钉）：**生产链路** `UdpDispatchSession` → `DnsDispatchBridge`。
+    ///
+    /// session 往 link 写 XUDP 帧、从 link 读 XUDP 帧；dns outbound 必须拆帧取
+    /// payload（帧头不是 DNS 头）再装帧回包。修前 outbound 按裸报文读写 →
+    /// 上游收到整条 46B 帧、回包裸写 → 客户端零应答，而 helper 版单测全绿
+    /// （测试复制了错误契约 = 本 bug 的逃逸点）。
+    /// 同会话连发两包：第二包必须照样往返（修前首包后即 `writer.shutdown()`）。
+    #[tokio::test]
+    async fn dns_udp_dispatch_session_framed_roundtrip() {
+        // mock 上游：逐包回显查询本身，并记录每包收到的字节。
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let captured: Arc<parking_lot::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = upstream.recv_from(&mut buf).await {
+                let datagram = buf[..n].to_vec();
+                cap.lock().push(datagram.clone());
+                let _ = upstream.send_to(&datagram, peer).await;
+            }
+        });
+
+        let handler = parse_dns_outbound_config(
+            br#"{"rule":[{"action":"direct","qType":[1]}]}"#,
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let dest = Destination::udp(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(upstream_addr.port()),
+        );
+
+        let mut session = xray_app_dispatcher::UdpDispatchSession::new(Arc::new(bridge));
+        let q1 = dns_make_query(0x5a1a, "first.session.test", 1);
+        let q2 = dns_make_query(0x5a2b, "second.session.test", 1);
+        for q in [&q1, &q2] {
+            session.send_packet(&dest, q).await.expect("send XUDP query");
+            let (source, resp) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), session.recv_packet())
+                    .await
+                    .expect("timeout waiting response")
+                    .expect("recv_packet")
+                    .expect("session must stay open across packets");
+            assert_eq!(source, dest, "回包来源 = 请求目标");
+            assert_eq!(&resp, q, "响应 payload 必须是裸 DNS 报文（帧已拆）");
+        }
+        // 上游每包收到的都是剥帧后的裸 DNS 报文（不是 46B 整帧）。
+        assert_eq!(captured.lock().clone(), vec![q1, q2]);
+    }
+
+    /// 会话寿命（D12 风险项）：多包循环不得让 UDP 会话永活——空闲超过
+    /// policy ConnectionIdle（此处注入 150ms）后 outbound 退出、link 关闭，
+    /// 会话侧 `recv_packet` 收到 EOF。
+    #[tokio::test]
+    async fn dns_udp_session_closes_after_idle_timeout() {
+        let svc = make_fakedns_service("fake-idle");
+        let handler =
+            parse_dns_outbound_config(b"{}", std::time::Duration::from_millis(150)).unwrap();
+        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
+
+        let mut session = xray_app_dispatcher::UdpDispatchSession::new(Arc::new(bridge));
+        let query = dns_make_query(0x7210, "idle.example.com", 1);
+        session.send_packet(&dest, &query).await.expect("send XUDP query");
+        let (_, resp) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session.recv_packet())
+                .await
+                .expect("timeout waiting response")
+                .expect("recv_packet")
+                .expect("session open");
+        assert_eq!(resp[2] & 0x80, 0x80, "hijack response bit");
+
+        // 空闲 > 150ms → outbound 读超时退出 → link 关闭。
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv_packet())
+            .await
+            .expect("idle session must close, not live forever");
+        assert!(matches!(closed, Ok(None)), "idle session must see link EOF: {closed:?}");
     }
 
     /// e2e：TCP 双路 loop——Direct 规则经 TCP 上游多查询 pipeline 往返。
