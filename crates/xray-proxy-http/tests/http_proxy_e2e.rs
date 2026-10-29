@@ -346,7 +346,7 @@ async fn plain_http_keep_alive_two_requests_same_connection_e2e() {
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             assert!(req.starts_with("GET /"), "upstream got: {req}");
             assert!(
-                req.contains("connection: close"),
+                req.contains("Connection: close"),
                 "forwarded request must carry Connection: close: {req}"
             );
             sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
@@ -805,7 +805,7 @@ async fn http_plain_forward_preserves_non_utf8_header_value_e2e() {
     })
     .await;
     assert!(
-        find_subsequence(&head, b"x-bin: \xe9\xff").is_some(),
+        find_subsequence(&head, b"X-Bin: \xe9\xff").is_some(),
         "非 UTF-8 头值必须原样到达上游，实际 head = {:?}",
         String::from_utf8_lossy(&head)
     );
@@ -850,7 +850,7 @@ async fn http_plain_forward_keeps_utf8_header_value_e2e() {
     })
     .await;
     assert!(
-        find_subsequence(&head, b"x-utf8: \xe4\xb8\xad").is_some(),
+        find_subsequence(&head, b"X-Utf8: \xe4\xb8\xad").is_some(),
         "UTF-8 头值必须不变，实际 head = {:?}",
         String::from_utf8_lossy(&head)
     );

@@ -101,9 +101,13 @@ const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 头解析失败 / 非透明 origin-form 的 400 响应（字节与既有 origin-form 分支一致）。
+///
+/// 头序对齐 Go `Response.Write`（`net/http/header.go:186-224` 按 canonical 名排序 +
+/// `response.go` 尾段补 CL:0）：`Connection` 先于 `Proxy-Connection`，`Content-Length: 0`
+/// 落在最后（Go 实测锚点：同一构造路径的 503 头块）。
 const RESPONSE_BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
-    Proxy-Connection: close\r\n\
     Connection: close\r\n\
+    Proxy-Connection: close\r\n\
     Content-Length: 0\r\n\r\n";
 
 /// plain HTTP 读上游响应失败 / 响应头非法的 503 响应（对齐 Go handlePlainHTTP
@@ -130,38 +134,16 @@ pub fn extract_request_path(target: &str) -> String {
     }
 }
 
-/// 字节 → String 的 Latin-1（ISO-8859-1）解码：每个字节映射到同码位字符，字节零丢失。
-///
-/// Go 头处理全程按字节（不解 UTF-8，≥0x80 原始字节合法；H06）。本项目用 String 承载
-/// 头行，`from_utf8_lossy` 会把非法序列换成 U+FFFD——`e9ff` 变成 `efbfbdefbfbd`
-/// （bd t3lzr）。Latin-1 是字节↔char 的 1:1 映射，配 [`latin1_encode`] 原样还原。
-fn latin1_decode(bytes: &[u8]) -> String {
-    bytes.iter().map(|&b| char::from(b)).collect()
-}
-
-/// String → 字节的 Latin-1 编码（[`latin1_decode`] 的逆）。
-///
-/// U+0000..=U+00FF 映射回单字节；更大码位只可能来自代码合成值（读入侧不可能产出），
-/// 按 UTF-8 编码，避免截断成乱码。
-fn latin1_encode(s: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(s.len());
-    for ch in s.chars() {
-        match u8::try_from(u32::from(ch)) {
-            Ok(b) => out.push(b),
-            Err(_) => {
-                let mut tmp = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
-            },
-        }
-    }
-    out
-}
+// 字节 ↔ String 的无损承载共用件（头行由 `from_utf8_lossy` 会把 `e9ff` 变成
+// `efbfbdefbfbd`，bd t3lzr；DNS QNAME 同款需求）。实现在 `xray-common::text`，
+// 此处 re-export 保持既有 `xray_proxy_http::latin1_*` 调用点不变（禁复制第二份）。
+pub use xray_common::text::{latin1_decode, latin1_encode};
 
 /// 只剥 SP / HTAB（Go `textproto.trimString` 语义）。
 ///
 /// `str::trim` 连带剥掉 U+0085 / U+00A0 等 Unicode 空白——Latin-1 解码后它们正是
 /// 原始字节 0x85 / 0xA0，剥掉即丢字节。
-fn trim_ows(s: &str) -> &str {
+pub fn trim_ows(s: &str) -> &str {
     s.trim_matches(|c| c == ' ' || c == '\t')
 }
 
@@ -195,14 +177,35 @@ fn escape_path(path_and_query: &str) -> String {
 
 /// 构建转发给目标服务器的 HTTP 请求（request line + headers）。
 ///
-/// 移除 hop-by-hop headers，强制 `Connection: close`；同名多值头逐行写
-/// （Go `request.Write` 语义）。
-/// 对应 Go `handlePlainHTTP` 中 `request.Header.Set("Connection", "close")` + `request.Write`。
+/// 布局对齐 Go `handlePlainHTTP` 的 `request.Write`（`net/http/request.go:674-735`）：
+/// 1. 请求行；
+/// 2. `Host: <host>`（`request.go:679` 单独先写）；
+/// 3. `User-Agent: <v>`（仅当头存在且非空；Go 对空 UA 不写）；
+/// 4. `transferWriter.writeHeader`：chunked 时 `Transfer-Encoding: chunked`， 否则 `Content-Length:
+///    N`（`transfer.go:278-320` + `shouldSendContentLength`）；
+/// 5. 其余头（含强制 `Connection: close`）按 canonical 名排序（`header.go:167-224`
+///    `WriteSubset`），跳过头名在 `Connection` 值中点名的那些头 （`RemoveHopByHopHeaders`，Go
+///    `common/protocol/http/headers.go:59-66`）。
+///
+/// 头名写 canonical 形态、头序确定——上游可见字节与 Go 逐字节一致（D-H7/D-H8）；
+/// 排序也消除了原 `HashMap` 迭代序导致的每次运行头序不同（非确定性）。
 pub fn build_forwarded_request(
     method: &str,
     path: &str,
     headers: &HashMap<String, Vec<String>>,
 ) -> Vec<u8> {
+    // 删除集 = hop-by-hop 固定名单 + `Connection` 头点名的其它头。
+    let mut named: Vec<String> = Vec::new();
+    if let Some(values) = headers.get("connection") {
+        for value in values {
+            for token in value.split(',') {
+                named.push(trim_ows(token).to_ascii_lowercase());
+            }
+        }
+    }
+    let is_hop = |key: &str| HOP_BY_HOP_HEADERS.contains(&key) || named.iter().any(|n| n == key);
+    let first = |key: &str| headers.get(key).and_then(|values| values.first());
+
     let mut buf = Vec::with_capacity(512);
     buf.extend_from_slice(method.as_bytes());
     buf.push(b' ');
@@ -210,18 +213,54 @@ pub fn build_forwarded_request(
     // 头值原样到达上游（bd t3lzr）。方法名与头名已被 tchar 校验为 ASCII。
     buf.extend_from_slice(&latin1_encode(path));
     buf.extend_from_slice(b" HTTP/1.1\r\n");
-    for (key, values) in headers {
-        if HOP_BY_HOP_HEADERS.contains(&key.as_str()) {
-            continue;
-        }
+
+    // Go 恒写 Host 行（空 host 亦是合法 Host 值）。
+    buf.extend_from_slice(b"Host: ");
+    buf.extend_from_slice(&latin1_encode(first("host").map_or("", String::as_str)));
+    buf.extend_from_slice(b"\r\n");
+    if let Some(ua) = first("user-agent").filter(|value| !value.is_empty()) {
+        buf.extend_from_slice(b"User-Agent: ");
+        buf.extend_from_slice(&latin1_encode(ua));
+        buf.extend_from_slice(b"\r\n");
+    }
+
+    // transferWriter：chunked 优先（`shouldSendContentLength` 在 chunked 时返 false）。
+    let chunked = headers.get("transfer-encoding").is_some_and(|values| {
+        values.len() == 1 && trim_ows(&values[0]).eq_ignore_ascii_case("chunked")
+    });
+    if chunked {
+        buf.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if let Some(n) = first("content-length")
+        .and_then(|value| trim_ows(value).parse::<u64>().ok())
+        .filter(|n| *n > 0 || matches!(method, "POST" | "PUT" | "PATCH"))
+    {
+        // Go 写的是解析后的十进制值（`strconv.FormatInt`），不是原始字符串。
+        buf.extend_from_slice(format!("Content-Length: {n}\r\n").as_bytes());
+    }
+
+    // 其余头：canonical 名 + 按名排序；`Connection: close` 参与同一排序
+    // （Go 由 `request.Header.Set("Connection","close")` 放入 map 后经 WriteSubset 写出）。
+    let mut entries: Vec<(String, Vec<&str>)> = headers
+        .iter()
+        .filter(|(key, _)| {
+            !matches!(key.as_str(), "host" | "user-agent" | "content-length" | "transfer-encoding")
+                && !is_hop(key)
+        })
+        .map(|(key, values)| {
+            (canonical_header_key(key), values.iter().map(String::as_str).collect())
+        })
+        .collect();
+    entries.push(("Connection".into(), vec!["close"]));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, values) in entries {
         for value in values {
-            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&latin1_encode(&key));
             buf.extend_from_slice(b": ");
             buf.extend_from_slice(&latin1_encode(value));
             buf.extend_from_slice(b"\r\n");
         }
     }
-    buf.extend_from_slice(b"connection: close\r\n\r\n");
+    buf.extend_from_slice(b"\r\n");
     buf
 }
 
@@ -1685,9 +1724,9 @@ mod tests {
         let req = build_forwarded_request("GET", "/t2/%E9", &headers);
         // 转发字节本就可能是非法 UTF-8（这正是本票要保真的），故只按字节断言
         assert!(req.starts_with(b"GET /t2/%E9 HTTP/1.1\r\n"), "request line: {req:?}");
-        assert!(find_bytes(&req, b"x-bin: \xe9\xff\r\n"), "非 UTF-8 头值必须原样写上游: {req:?}");
+        assert!(find_bytes(&req, b"X-Bin: \xe9\xff\r\n"), "非 UTF-8 头值必须原样写上游: {req:?}");
         // U+00E4/U+00B8/U+00AD 解码自 e4b8ad，编码回来仍是同一串字节
-        assert!(find_bytes(&req, b"x-utf8: \xe4\xb8\xad\r\n"), "UTF-8 头值不变: {req:?}");
+        assert!(find_bytes(&req, b"X-Utf8: \xe4\xb8\xad\r\n"), "UTF-8 头值不变: {req:?}");
     }
 
     #[tokio::test]
@@ -1716,11 +1755,11 @@ mod tests {
         let req_str = String::from_utf8(req).unwrap();
 
         assert!(req_str.starts_with("GET /path HTTP/1.1\r\n"));
-        assert!(req_str.contains("host: example.com"));
-        assert!(req_str.contains("user-agent: curl/8.0"));
-        assert!(!req_str.contains("proxy-connection"));
-        assert!(!req_str.contains("proxy-authorization"));
-        assert!(req_str.contains("connection: close\r\n\r\n"));
+        assert!(req_str.contains("Host: example.com"));
+        assert!(req_str.contains("User-Agent: curl/8.0"));
+        assert!(!req_str.contains("Proxy-Connection"));
+        assert!(!req_str.contains("Proxy-Authorization"));
+        assert!(req_str.contains("Connection: close\r\n\r\n"), "get: {req_str:?}");
     }
 
     #[test]
@@ -1733,7 +1772,12 @@ mod tests {
         let req_str = String::from_utf8(req).unwrap();
 
         assert!(req_str.starts_with("POST /submit HTTP/1.1\r\n"));
-        assert!(req_str.contains("content-length: 42"));
+        // Go：Content-Length 由 transferWriter 写在排序头之前（transfer.go:278-320）。
+        assert_eq!(
+            req_str,
+            "POST /submit HTTP/1.1\r\nHost: api.example.com\r\n\
+             Content-Length: 42\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]
@@ -1747,8 +1791,11 @@ mod tests {
         let req = build_forwarded_request("POST", "/upload", &headers);
         let req_str = String::from_utf8(req).unwrap();
 
-        assert!(req_str.contains("transfer-encoding: chunked\r\n"));
-        assert!(req_str.contains("connection: close\r\n\r\n"));
+        assert_eq!(
+            req_str,
+            "POST /upload HTTP/1.1\r\nHost: echo.example\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]
@@ -1761,8 +1808,66 @@ mod tests {
         let req = build_forwarded_request("GET", "/", &headers);
         let req_str = String::from_utf8(req).unwrap();
 
-        assert!(req_str.contains("cookie: a=1\r\n"));
-        assert!(req_str.contains("cookie: b=2\r\n"));
+        assert!(req_str.contains("Cookie: a=1\r\n"));
+        assert!(req_str.contains("Cookie: b=2\r\n"));
+    }
+
+    /// D-H7 + D-H8：头名写 canonical（Go `WriteSubset` 写 parser canonicalize 后的名），
+    /// 头序固定——`Host` 先、其余按 canonical 名排序（Go `header.go:167-224`），
+    /// 与 `HashMap` 迭代序（每次运行不同）解耦。
+    #[test]
+    fn build_forwarded_request_canonical_names_and_sorted_order() {
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["127.0.0.1:8080".into()]);
+        headers.insert("x-mixed-case".into(), vec!["v".into()]);
+        headers.insert("accept".into(), vec!["*/*".into()]);
+        headers.insert("zeta".into(), vec!["1".into()]);
+        headers.insert("alpha-beta".into(), vec!["2".into()]);
+
+        let expected = "GET /cl HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\
+                        Accept: */*\r\nAlpha-Beta: 2\r\nConnection: close\r\n\
+                        X-Mixed-Case: v\r\nZeta: 1\r\n\r\n";
+        // 连跑 5 次必须逐字节一致（HashMap 随机种子不得泄到 wire）
+        for _ in 0..5 {
+            let req = build_forwarded_request("GET", "/cl", &headers);
+            assert_eq!(String::from_utf8(req).unwrap(), expected);
+        }
+    }
+
+    /// D-H10：`Connection` 头点名的其它头一并删除（Go `RemoveHopByHopHeaders`
+    /// `common/protocol/http/headers.go:59-66`），不只是固定 hop-by-hop 名单。
+    #[test]
+    fn build_forwarded_request_deletes_headers_named_by_connection() {
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["h".into()]);
+        headers.insert("connection".into(), vec!["X-Custom, close".into()]);
+        headers.insert("x-custom".into(), vec!["v".into()]);
+        headers.insert("x-kept".into(), vec!["v".into()]);
+
+        let req = build_forwarded_request("GET", "/", &headers);
+        let req_str = String::from_utf8(req).unwrap();
+
+        assert!(!req_str.to_ascii_lowercase().contains("x-custom"), "get: {req_str:?}");
+        assert!(req_str.contains("X-Kept: v"), "get: {req_str:?}");
+        assert_eq!(req_str, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\nX-Kept: v\r\n\r\n");
+    }
+
+    /// Go `transferWriter.shouldSendContentLength`（transfer.go）：`Content-Length: 0`
+    /// 只有 POST/PUT/PATCH 才写；GET 的 CL:0 被丢弃（不转发该头）。
+    #[test]
+    fn build_forwarded_request_drops_zero_content_length_for_get() {
+        let mut headers = HashMap::new();
+        headers.insert("host".into(), vec!["h".into()]);
+        headers.insert("content-length".into(), vec!["0".into()]);
+
+        let get = String::from_utf8(build_forwarded_request("GET", "/", &headers)).unwrap();
+        assert_eq!(get, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+
+        let post = String::from_utf8(build_forwarded_request("POST", "/", &headers)).unwrap();
+        assert_eq!(
+            post,
+            "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[tokio::test]

@@ -67,8 +67,9 @@ use xray_proxy_dns::{Config as DnsConfig, DnsInbound, DnsOutbound, Handler as Dn
 // tdy: http + dokodemo inbound 集成
 use xray_proxy_http::ServerConfig as HttpServerConfig;
 use xray_proxy_http::server::{
-    HandshakeResult, build_forwarded_request, extract_request_path, http_server_handshake,
-    request_keep_alive, resolve_request_host, serialize_go_response_head,
+    HandshakeResult, HttpVersion, build_forwarded_request, extract_request_path,
+    http_server_handshake, latin1_decode, latin1_encode, request_keep_alive, resolve_request_host,
+    serialize_go_response_head, trim_ows,
 };
 use xray_proxy_socks::{
     ServerConfig,
@@ -985,6 +986,10 @@ enum RequestBodyPlan {
 
 /// 请求定界形态 + 转发用 headers（对齐 Go `fixLength`/`parseTransferEncoding`
 /// 的请求走私加固）：
+/// - HTTP/1.0 的 `Transfer-Encoding` 一律删除并忽略（Go `transfer.go:631-641`
+///   `parseTransferEncoding`：先 `delete(t.Header,"Transfer-Encoding")`，再 `if
+///   !t.protoAtLeast(1,1) { return nil }`（Issue 12785）→ 1.0 请求按无 TE
+///   定界正常转发；`xray-proxy-http` 侧同名规则（`server.rs` H10 分支）与之一致）；
 /// - 多值 Content-Length 值不一致 / 非纯十进制 / 超 `i64::MAX` → Err（Go `ReadRequest` 报错 →
 ///   断链）；
 /// - 值相同的重复 CL → 折叠为一条转发（Go dedupe，issue 16490）；
@@ -992,10 +997,14 @@ enum RequestBodyPlan {
 ///   `header.Del("Content-Length")`），防 CL.TE 走私。
 fn plan_request_framing(
     headers: &HashMap<String, Vec<String>>,
+    http_version: HttpVersion,
 ) -> Result<(RequestBodyPlan, HashMap<String, Vec<String>>), ()> {
-    let chunked = transfer_encoding_chunked(headers)?;
-    let content_length = framed_content_length(headers)?;
     let mut forward = headers.clone();
+    if http_version == HttpVersion::H10 {
+        forward.remove("transfer-encoding");
+    }
+    let chunked = transfer_encoding_chunked(&forward)?;
+    let content_length = framed_content_length(&forward)?;
     if chunked {
         forward.remove("content-length");
         return Ok((RequestBodyPlan::Chunked, forward));
@@ -1093,7 +1102,8 @@ where
     use xray_buf::io::{Reader as BufReader, Writer as BufWriter};
 
     // 1. 转发请求构建（绝对 URL → 相对 path，移除 hop-by-hop headers，强制 close）
-    let (body_plan, mut forward_headers) = match plan_request_framing(&hs.headers) {
+    let (body_plan, mut forward_headers) = match plan_request_framing(&hs.headers, hs.http_version)
+    {
         Ok(plan) => plan,
         Err(()) => {
             tracing::debug!("http: malformed Content-Length/Transfer-Encoding, closing connection");
@@ -1325,14 +1335,16 @@ where
                     "malformed chunk size",
                 ))
             })?;
-        pipe_write_all(up_w, size_line.as_bytes()).await.map_err(RequestForwardError::Upstream)?;
+        pipe_write_all(up_w, &latin1_encode(&size_line))
+            .await
+            .map_err(RequestForwardError::Upstream)?;
         pipe_write_all(up_w, b"\r\n").await.map_err(RequestForwardError::Upstream)?;
         if size == 0 {
             // trailer 段透传到空行
             loop {
                 let line =
                     read_client_line(client_read).await.map_err(RequestForwardError::Client)?;
-                pipe_write_all(up_w, line.as_bytes())
+                pipe_write_all(up_w, &latin1_encode(&line))
                     .await
                     .map_err(RequestForwardError::Upstream)?;
                 pipe_write_all(up_w, b"\r\n").await.map_err(RequestForwardError::Upstream)?;
@@ -1349,6 +1361,10 @@ where
 }
 
 /// 读一行（到 CRLF，不含 CRLF）。请求体阶段 EOF 一律错误（半途断开 = 协议失败）。
+///
+/// 字节→String 走 Latin-1（[`latin1_decode`]），回写用 [`latin1_encode`]：chunked
+/// trailer 值可以是任意字节（Go 按字节透传），lossy 解码会把非 UTF-8 trailer 变形
+/// （bd t3lzr 残余）。
 async fn read_client_line<R>(client_read: &mut R) -> std::io::Result<String>
 where
     R: AsyncRead + Unpin,
@@ -1368,7 +1384,7 @@ where
             if buf.last() == Some(&b'\r') {
                 buf.pop();
             }
-            return Ok(String::from_utf8_lossy(&buf).into_owned());
+            return Ok(latin1_decode(&buf));
         }
         if buf.len() >= MAX_LINE_BYTES {
             return Err(std::io::Error::new(
@@ -1392,15 +1408,20 @@ async fn pipe_write_all(up_w: &mut xray_buf::pipe::Writer, data: &[u8]) -> std::
 /// 解析头块（不含结尾空行）为 (状态行, 状态码, headers)。状态行非法 / 存在无
 /// 冒号的头行 → None（对齐 Go `textproto` 严格语义：坏头行整条响应作废走 503，
 /// 静默跳过会让 `Transfer-Encoding : chunked` 这类畸形行被忽略而按 CL 定界）。
+///
+/// 字节→String 走 Latin-1（[`latin1_decode`]）：响应头值可以是任意字节（Go 全程按
+/// 字节），`from_utf8_lossy` 会把非 UTF-8 值换成 U+FFFD 再被回写放大（bd t3lzr 残余）。
+/// 回写侧（[`serialize_go_response_head`] / [`serialize_raw_response_head`]）用
+/// [`latin1_encode`] 原样还原。
 fn parse_head_block(block: &[u8]) -> Option<(String, u16, HashMap<String, Vec<String>>)> {
-    let text = String::from_utf8_lossy(block);
+    let text = latin1_decode(block);
     let mut lines = text.split("\r\n");
     let status_line = lines.next()?.to_string();
     let code = status_line.split_whitespace().nth(1)?.parse::<u16>().ok()?;
     let mut headers: HashMap<String, Vec<String>> = HashMap::new();
     for line in lines {
         let (k, v) = line.split_once(':')?;
-        headers.entry(k.trim().to_ascii_lowercase()).or_default().push(v.trim().to_string());
+        headers.entry(trim_ows(k).to_ascii_lowercase()).or_default().push(trim_ows(v).to_string());
     }
     Some((status_line, code, headers))
 }
@@ -1450,13 +1471,14 @@ where
 /// 剥掉后客户端无法完成升级。
 fn serialize_raw_response_head(head: &ResponseHead) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(head.status_line.as_bytes());
+    // 头块内容来自 Latin-1 解码（[`parse_head_block`]）→ 按 Latin-1 还原原始字节。
+    buf.extend_from_slice(&latin1_encode(&head.status_line));
     buf.extend_from_slice(b"\r\n");
     for (key, values) in &head.headers {
         for value in values {
-            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&latin1_encode(key));
             buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(&latin1_encode(value));
             buf.extend_from_slice(b"\r\n");
         }
     }
@@ -9694,34 +9716,85 @@ mod tests {
     #[test]
     fn request_framing_rejects_conflicting_content_length_and_bad_values() {
         assert!(
-            plan_request_framing(&framing_headers(&[
-                ("content-length", "5"),
-                ("content-length", "6"),
-            ]))
+            plan_request_framing(
+                &framing_headers(&[("content-length", "5"), ("content-length", "6")]),
+                HttpVersion::H11,
+            )
             .is_err()
         );
         // 空 / 负数 / 带符号 / 非数字 / 超 i64::MAX（Go ParseUint(…, 63) 全拒）
         for bad in ["", " -1", "+5", "abc", "12a", "9223372036854775808"] {
             assert!(
-                plan_request_framing(&framing_headers(&[("content-length", bad)])).is_err(),
+                plan_request_framing(
+                    &framing_headers(&[("content-length", bad)]),
+                    HttpVersion::H11
+                )
+                .is_err(),
                 "Content-Length {bad:?} must be rejected"
             );
         }
         // TE：多个头 / 多编码栈 / 未知编码 → 拒绝
         assert!(
-            plan_request_framing(&framing_headers(&[
-                ("transfer-encoding", "chunked"),
-                ("transfer-encoding", "chunked"),
-            ]))
+            plan_request_framing(
+                &framing_headers(&[
+                    ("transfer-encoding", "chunked"),
+                    ("transfer-encoding", "chunked"),
+                ]),
+                HttpVersion::H11,
+            )
             .is_err()
         );
         assert!(
-            plan_request_framing(&framing_headers(&[("transfer-encoding", "gzip, chunked")]))
-                .is_err()
+            plan_request_framing(
+                &framing_headers(&[("transfer-encoding", "gzip, chunked")]),
+                HttpVersion::H11,
+            )
+            .is_err()
         );
         assert!(
-            plan_request_framing(&framing_headers(&[("transfer-encoding", "identity")])).is_err()
+            plan_request_framing(
+                &framing_headers(&[("transfer-encoding", "identity")]),
+                HttpVersion::H11,
+            )
+            .is_err()
         );
+    }
+
+    /// D-H6：HTTP/1.0 的 `Transfer-Encoding` 一律删除并忽略（Go
+    /// `net/http/transfer.go:631-641`：先 `delete(t.Header,"Transfer-Encoding")`，
+    /// 再 `if !t.protoAtLeast(1,1) { return nil }`，Issue 12785）——1.0 请求按无
+    /// TE 定界正常转发，且转发头里不再有 TE；1.1 同输入仍拒（走私敏感面不变）。
+    #[test]
+    fn request_framing_ignores_transfer_encoding_on_http_1_0() {
+        for te in ["gzip", "chunked", "gzip, chunked"] {
+            let headers = framing_headers(&[("transfer-encoding", te)]);
+            let (plan, forward) =
+                plan_request_framing(&headers, HttpVersion::H10).expect("1.0 忽略 TE");
+            assert!(matches!(plan, RequestBodyPlan::None), "TE={te}");
+            assert!(!forward.contains_key("transfer-encoding"), "1.0 必须删除 TE（TE={te}）");
+        }
+        // HTTP/1.1 走私敏感面不变：单一 `chunked` 仍是 chunked，其余仍拒。
+        let chunked = framing_headers(&[("transfer-encoding", "chunked")]);
+        let (plan, _) = plan_request_framing(&chunked, HttpVersion::H11).unwrap();
+        assert!(matches!(plan, RequestBodyPlan::Chunked));
+        assert!(matches!(
+            plan_request_framing(&chunked, HttpVersion::H10).unwrap().0,
+            RequestBodyPlan::None
+        ));
+        for te in ["gzip", "gzip, chunked", "identity"] {
+            assert!(
+                plan_request_framing(
+                    &framing_headers(&[("transfer-encoding", te)]),
+                    HttpVersion::H11
+                )
+                .is_err(),
+                "HTTP/1.1 的 TE={te} 仍须拒绝"
+            );
+        }
+        // 1.0 + TE 与 CL 并存：TE 丢弃后按 CL 定界（Go fixLength 语义）
+        let headers = framing_headers(&[("transfer-encoding", "gzip"), ("content-length", "5")]);
+        let (plan, _) = plan_request_framing(&headers, HttpVersion::H10).unwrap();
+        assert!(matches!(plan, RequestBodyPlan::Length(5)));
     }
 
     /// F8：值相同的重复 CL 折叠为一条；chunked 与 CL 并存时 chunked 生效且转发
@@ -9730,12 +9803,12 @@ mod tests {
     #[test]
     fn request_framing_dedupes_content_length_and_drops_it_for_chunked() {
         let headers = framing_headers(&[("content-length", "42"), ("content-length", "42")]);
-        let (plan, forward) = plan_request_framing(&headers).unwrap();
+        let (plan, forward) = plan_request_framing(&headers, HttpVersion::H11).unwrap();
         assert!(matches!(plan, RequestBodyPlan::Length(42)));
         assert_eq!(forward.get("content-length"), Some(&vec!["42".to_string()]));
 
         let headers = framing_headers(&[("content-length", "5"), ("transfer-encoding", "chunked")]);
-        let (plan, forward) = plan_request_framing(&headers).unwrap();
+        let (plan, forward) = plan_request_framing(&headers, HttpVersion::H11).unwrap();
         assert!(matches!(plan, RequestBodyPlan::Chunked));
         assert!(!forward.contains_key("content-length"), "chunked 生效时 CL 必须删除");
         assert_eq!(forward.get("transfer-encoding"), Some(&vec!["chunked".to_string()]));
@@ -9751,6 +9824,39 @@ mod tests {
             .expect("well-formed head must parse");
         assert_eq!(code, 200);
         assert_eq!(headers.get("content-length"), Some(&vec!["5".to_string()]));
+    }
+
+    /// bd t3lzr 残余：响应头值可以是任意字节（Go 全程按字节），解析/回写必须 1:1
+    /// ——`from_utf8_lossy` 会把 `e9ff` 变成 U+FFFD 再被放大成 `efbfbdefbfbd`。
+    #[test]
+    fn parse_head_block_keeps_non_utf8_response_header_bytes() {
+        let (status_line, code, headers) =
+            parse_head_block(b"HTTP/1.1 200 OK\r\nX-Bin: \xe9\xff\r\nContent-Length: 5")
+                .expect("head must parse");
+        assert_eq!(code, 200);
+        assert_eq!(status_line, "HTTP/1.1 200 OK");
+        let value = &headers["x-bin"][0];
+        assert_eq!(latin1_encode(value), b"\xe9\xff", "非 UTF-8 头值不得退化成 U+FFFD");
+        // 回写侧（客户端可见）同样原字节——这里走 101 透传重建（头名按解析后的小写
+        // 形态写回，属既有实现），故断言值字节本身：
+        let head = serialize_raw_response_head(&ResponseHead {
+            status_line,
+            code,
+            headers,
+            leftover: Vec::new(),
+        });
+        assert!(head.windows(2).any(|w| w == b"\xe9\xff"), "回写头块丢字节: {head:?}");
+        assert!(!head.windows(3).any(|w| w == "\u{fffd}".as_bytes()), "回写出现 U+FFFD: {head:?}");
+    }
+
+    /// bd t3lzr 残余：chunked trailer 行（`read_client_line`）同款字节保真——
+    /// 非 ASCII trailer 值不得在转发中变形。
+    #[tokio::test]
+    async fn read_client_line_keeps_non_utf8_trailer_bytes() {
+        let mut src = &b"X-Trail: \xe9\xff\r\nnext\r\n"[..];
+        let line = read_client_line(&mut src).await.unwrap();
+        assert_eq!(latin1_encode(&line), b"X-Trail: \xe9\xff");
+        assert_eq!(read_client_line(&mut src).await.unwrap(), "next");
     }
 
     /// F8：多值 CL 不一致的请求直接被拒——客户端读到 EOF、零响应字节，且不
