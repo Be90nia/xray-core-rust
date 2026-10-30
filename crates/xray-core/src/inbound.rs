@@ -37,15 +37,6 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_conf::{BuiltConfig, BuiltInbound};
-// trait 唯一消费点是下方 TUN 臂的 `handler.start()`——随该臂同门控，否则
-// darwin 等无 TUN 平台 trait 无消费者 → unused_imports 在 deny(warnings) 下硬错。
-#[cfg(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "freebsd",
-    target_os = "windows"
-))]
-use xray_features::inbound::InboundHandler;
 // W4 面 6：budget/deadline 统一走 xray_frame::deadline::Budget（Tokio 源保 advance
 // 语义）；vision 装配 spawn 走面 5 受控入口（redline 台账，坑约束 ⑫ 调用形态治理）；
 // SS 泵归每连接 ConnScope（两级 scope 模型，方案 §2 面 6）。
@@ -90,7 +81,7 @@ use xray_proxy_trojan::{
     target_os = "freebsd",
     target_os = "windows"
 ))]
-use xray_proxy_tun::{StackOptions, Tun, TunInboundHandler};
+use xray_proxy_tun::{StackOptions, Tun};
 use xray_proxy_vless::{
     MemoryAccount as VlessMemoryAccount, MemoryUser as VlessMemoryUser,
     MemoryValidator as VlessMemoryValidator, Validator as VlessValidator, VlessInboundOptions,
@@ -124,7 +115,7 @@ async fn accept_fd_backoff(e: &std::io::Error) {
 /// [`serve_mixed_conn`] 泛型于具体流类型（TCP `TcpStream` / UDS
 /// `Box<dyn Connection>`），本 trait 把「是否裸 TCP / 能否 dup / 本地地址」
 /// 抹平成统一入口。
-trait InboundConnMeta {
+pub(crate) trait InboundConnMeta {
     /// 裸 TCP 时返回 dup 克隆（Go `session.Inbound.Conn`）；非 raw 返回 `None`。
     fn splice_raw_clone(&self) -> Option<TcpStream>;
     /// 入站本地地址（Go `session.Inbound.Local`）。
@@ -230,13 +221,13 @@ impl InboundConnMeta for MaybeTcpMaskConn<TcpStream> {
 /// （行为与 dppv 之前逐字节一致）；mask 生效或传输自身无 peek 能力（UDS
 /// `Box<dyn Connection>`）时把读到的明文留在 `peeked`、由
 /// [`tokio::io::AsyncRead`] 优先回放。
-struct PeekAhead<S> {
+pub(crate) struct PeekAhead<S> {
     conn: S,
     peeked: Vec<u8>,
 }
 
 impl<S> PeekAhead<S> {
-    fn new(conn: S) -> Self {
+    pub(crate) fn new(conn: S) -> Self {
         Self { conn, peeked: Vec::new() }
     }
 }
@@ -588,7 +579,7 @@ pub(crate) async fn serve_mixed(
 /// （`proxyman/inbound/worker.go` 一律把 `net.Conn` 交给它），故 UDS 上的 socks
 /// 端口同样服务 HTTP 代理。
 #[allow(clippy::too_many_arguments)] // 8 参 = TCP/UDS 双路径直译签名，打包聚合体属内部 API 变更
-async fn serve_mixed_conn<S>(
+pub(crate) async fn serve_mixed_conn<S>(
     mut stream: PeekAhead<S>,
     peer: std::net::SocketAddr,
     socks_cfg: Arc<ServerConfig>,
@@ -1981,7 +1972,7 @@ async fn spawn_ss_pump<C>(
 ///
 /// serve_ss accept loop 与 transport inbound（grpc/kcp/ws hub）共用；
 /// transport 分支的 conn 已被 hub 解包为明文流。
-async fn ss_legacy_pipeline<C>(
+pub(crate) async fn ss_legacy_pipeline<C>(
     ib: std::sync::Arc<xray_proxy_ss::inbound::SsInbound>,
     handler: std::sync::Arc<dyn DispatchHandler>,
     stream: C,
@@ -2035,6 +2026,7 @@ pub async fn serve_ss(
             server_psk: Vec<u8>,
             users: Vec<([u8; 16], Vec<u8>)>,
         },
+        Relay(Arc<xray_proxy_ss::ss2022::RelayInbound>),
     }
     let udp_flavor = match &inbound {
         SsInboundMode::Legacy(ib) => Some(SsUdpFlavor::Legacy(Arc::clone(ib))),
@@ -2048,9 +2040,9 @@ pub async fn serve_ss(
             server_psk: ib.server_psk().to_vec(),
             users: ib.udp_user_table(),
         }),
-        // relay 模式 Go 走 RelayService NewPacketConnection（整 PacketConn 中继），
-        // 不在本批
-        SsInboundMode::Ss2022Relay(_) => None,
+        // 中继模式 Go 走 RelayInbound.Process(UDP)：同端口 UDP 监听 +
+        // 按 sessionId 的 PacketConn 中继（proto 默认 network = TCP+UDP）。
+        SsInboundMode::Ss2022Relay(ib) => Some(SsUdpFlavor::Relay(Arc::clone(ib))),
     };
     if let Some(flavor) = udp_flavor {
         let port = listener.local_addr()?.port();
@@ -2093,6 +2085,9 @@ pub async fn serve_ss(
                                         Arc::clone(&ctx),
                                     )
                                     .await
+                                },
+                                SsUdpFlavor::Relay(ib) => {
+                                    serve_ss2022_relay_udp(udp, ib, handler, Arc::clone(&ctx)).await
                                 },
                             };
                         })
@@ -2488,8 +2483,14 @@ pub async fn serve_ss2022_udp(
                 .spawn(async move {
                     // scope 生命周期锚：session relay 存活期间 arm scope 不 drop
                     let _ctx = ctx_pin;
-                    ss2022_udp_client_relay(relay_udp, client, relay_session, rx, relay_handler)
-                        .await;
+                    ss2022_udp_client_relay(
+                        relay_udp,
+                        client,
+                        Some(relay_session),
+                        rx,
+                        relay_handler,
+                    )
+                    .await;
                 })
                 .expect("arm FxScope is never closed");
             tx
@@ -2501,17 +2502,75 @@ pub async fn serve_ss2022_udp(
     }
 }
 
+/// SS-2022 中继 UDP 入口（Go `RelayInbound.processUDP`）。
+///
+/// recv_from → [`RelayInbound::relay_udp_packet`]（剥 relay 层 + 用下一跳 PSK
+/// 重加密包头）→ 按 client sessionId 分发到 per-session relay task，整帧（已换成
+/// 下一跳可见的 `[ECB(destPSK,hdr)][body]`）转发到 destinations 表指定目标。
+/// 回包原样回送客户端（`session = None`，见 [`ss2022_udp_client_relay`]）。
+pub async fn serve_ss2022_relay_udp(
+    udp: Arc<dyn xray_transport::finalmask::UdpIo>,
+    relay: Arc<xray_proxy_ss::ss2022::RelayInbound>,
+    handler: Arc<dyn DispatchHandler>,
+    plugin_ctx: Arc<PluginContext>,
+) -> std::io::Result<()> {
+    tracing::info!(addr = %udp.local_addr()?, "ss2022 relay udp listening");
+    let mut buf = vec![0u8; 65_536];
+    type Item = (Destination, Vec<u8>, SocketAddr);
+    let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
+    loop {
+        let (n, client) = match udp.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "ss2022 relay udp recv failed");
+                continue;
+            },
+        };
+        // ponytail: 收包时顺带清扫已退出（60s 空闲淘汰）会话的残留 sender；
+        // O(sessions)/包，海量并发 UDP 客户端时换后台定时清扫
+        sessions.retain(|_, tx| !tx.is_closed());
+        let mut frame = Vec::new();
+        let (sid, address, port) = match relay.relay_udp_packet(&buf[..n], &mut frame) {
+            Ok(v) => v,
+            Err(e) => {
+                // Go 同款：身份不匹配/坏帧静默丢弃（不产生回包，只在 debug 留痕）
+                tracing::debug!(error = %e, "ss2022 relay udp packet rejected");
+                continue;
+            },
+        };
+        let dest = Destination::new(address, Port::new(port), Network::UDP);
+        let tx = sessions.entry(sid).or_insert_with(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let relay_udp = Arc::clone(&udp);
+            let relay_handler = Arc::clone(&handler);
+            let ctx_pin = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    // scope 生命周期锚：session relay 存活期间 arm scope 不 drop
+                    let _ctx = ctx_pin;
+                    ss2022_udp_client_relay(relay_udp, client, None, rx, relay_handler).await;
+                })
+                .expect("arm FxScope is never closed");
+            tx
+        });
+        if tx.send((dest, frame, client)).await.is_err() {
+            // relay task 已退出（空闲淘汰）：丢弃 entry，该 session 下一包重建
+            sessions.remove(&sid);
+        }
+    }
+}
+
 /// 单 client session 的 SS-2022 UDP relay（Go 每个 udpNat entry 的读写 task）。
 ///
 /// - up：主循环 decode 后的 (dest, payload) → [`UdpDispatchSession::send_packet`]
-/// - down：`recv_packet` 回包 → [`ServerUdpSession2022::encode`] → send_to
-///   客户端（最新源地址，随每包更新）
+/// - down：`recv_packet` 回包 → `session.encode_into` → send_to 客户端
+///   （最新源地址，随每包更新）；`session = None`（中继）时回包原样透传
 ///
 /// 60s 双向无活动自动退出。
 async fn ss2022_udp_client_relay(
     udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     mut client: SocketAddr,
-    session: Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>,
+    session: Option<Arc<xray_proxy_ss::ss2022::packet::ServerUdpSession2022>>,
     mut rx: tokio::sync::mpsc::Receiver<(Destination, Vec<u8>, SocketAddr)>,
     handler: Arc<dyn DispatchHandler>,
 ) {
@@ -2538,17 +2597,26 @@ async fn ss2022_udp_client_relay(
             r = dispatch.recv_packet() => {
                 match r {
                     Ok(Some((source, payload))) => {
-                        if session
-                            .encode_into(
-                                source.address(),
-                                source.port().value(),
-                                &payload,
-                                &mut enc,
-                                &mut plain,
-                            )
-                            .is_ok()
-                        {
-                            let _ = udp.send_to(&enc, client).await;
+                        match &session {
+                            Some(session) => {
+                                if session
+                                    .encode_into(
+                                        source.address(),
+                                        source.port().value(),
+                                        &payload,
+                                        &mut enc,
+                                        &mut plain,
+                                    )
+                                    .is_ok()
+                                {
+                                    let _ = udp.send_to(&enc, client).await;
+                                }
+                            },
+                            // 中继模式：回包已由下一跳以链尾 PSK 加密，客户端就按它解，
+                            // 原样回送（Go `handleUDPResponse` 的 nil 编码器分支）。
+                            None => {
+                                let _ = udp.send_to(&payload, client).await;
+                            },
                         }
                         idle = Budget::tokio().deadline(SS_UDP_IDLE_TIMEOUT);
                     }
@@ -4081,50 +4149,23 @@ pub(crate) async fn spawn_one_inbound(
     shutdown_token: CancellationToken,
     api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    // TUN inbound 不需要 port/addr，提前处理
-    // Windows 侧设备（tun-rs wintun）、netstack（smoltcp）、路由/DNS（sysroute）、
-    // WFP 泄漏阻断均已实现并真机验证（bd cv3w/ijn7），故与 Go `tun_windows.go` 对齐开放。
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows"
-    ))]
-    if ib.entry.kind.as_str() == "tun" {
-        let options = parse_tun_inbound_config(&ib.entry.data)?;
-        let dispatch = ohm.get_default_handler().ok_or_else(|| {
-            std::io::Error::other("tun inbound requires a default outbound handler")
-        })?;
-        let handler = TunInboundHandler::new(&ib.tag, options, dispatch)
-            .await
-            .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
-        tracing::info!(tag = %ib.tag, "tun inbound listening");
-        // W4 面 6 例外登记（方案 §2 面 6「不可迁残余 1」）：本函数对外**返回
-        // JoinHandle**（调用方 InboundRuntime 契约），改为 scope 托管 = 改公开
-        // 契约 + 4 平台门控臂（linux/android/freebsd/windows），收益（1 处 spawn
-        // 记账）远小于风险 → 保留裸 spawn，逐点理由登记。
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留"
-        )]
-        let handle = tokio::spawn(async move {
-            if let Err(e) = handler.start().await {
-                tracing::error!(error = ?e, "tun inbound stopped");
-            }
-        });
-        return Ok(Some(handle));
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows"
-    )))]
-    if ib.entry.kind.as_str() == "tun" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "TUN inbound is only supported on Linux/Android/FreeBSD/Windows",
-        ));
+    // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
+    // 已删）。表条目转发 phase 1 同一构造函数；未命中 = 未支持协议，显式 warn
+    // 跳过（不静默构造）。查表先行：listen 形态（是否消费地址）即表条目属性。
+    let Some(ctor) = crate::arm_registry::lookup_inbound_builder(ib.entry.kind.as_str()) else {
+        tracing::warn!(
+            tag = %ib.tag,
+            protocol = %ib.entry.kind,
+            "inbound protocol not yet supported, skipping"
+        );
+        return Ok(None);
+    };
+    // tun：自管监听面（设备 + netstack），不消费 listen/port —— 跳过 sockopt 校验
+    // 与地址解析直接分派（平台门控在表值 `tun_entry` 内）。
+    if !ctor.needs_listen_addr {
+        let settings = xray_transport::dialer::StreamSettings::from_json(None);
+        return build_inbound(ctor.stream, ib, ohm, policy, shutdown_token, "", &settings, api)
+            .await;
     }
     // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。
     xray_transport::dialer::StreamSettings::validate_sockopt_json(
@@ -4134,9 +4175,10 @@ pub(crate) async fn spawn_one_inbound(
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
     // vodx：unix 路径监听（Go system_listener.go:118 UnixAddr 分支）走 UDS
     // listener；端口语义不适用，须在 port 解析前分派。判别与 xray-conf
-    // Address::is_unix_path 一致（'/' 绝对路径 / '@' abstract）。
+    // Address::is_unix_path 一致（'/' 绝对路径 / '@' abstract）。UDS 形态同样查
+    // 同一张表（`uds_stream` / `uds_transport` 槽）。
     if is_unix_listen_path(listen) {
-        return spawn_unix_inbound(ib, ohm, policy, shutdown_token, listen, api).await;
+        return spawn_unix_inbound(ib, ohm, policy, shutdown_token, listen, api, ctor).await;
     }
     let port = match ib.port {
         Some(p) => p,
@@ -4154,35 +4196,40 @@ pub(crate) async fn spawn_one_inbound(
     // arm_builders::inbound（各 builder 内 settings.socket_options() 同值）。
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
+    build_inbound(ctor.stream, ib, ohm, policy, shutdown_token, &addr, &settings, api).await
+}
 
-    // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
-    // 已删）。注册表值转发 phase 1 同一构造函数；未命中 = 未支持协议，显式 warn
-    // 跳过（不静默构造）。
-    if let Some(builder) = crate::arm_registry::lookup_inbound_builder(ib.entry.kind.as_str()) {
-        // bd a9xgp：宿主 arm scope 登记表注入（停机级联；api 缺省 = 独立/测试
-        // 构造，不接线，级联由 token 监视 + Drop 兜底）。
-        let mut plugin_ctx = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
-        if let Some(api) = api {
-            plugin_ctx = plugin_ctx.with_arm_registry(Arc::clone(api.arm_scopes()));
-        }
-        return builder(crate::arm_builders::InboundCtx {
-            ib,
-            ohm,
-            policy,
-            shutdown_token,
-            addr: &addr,
-            settings: &settings,
-            api,
-            plugin_ctx,
-        })
-        .await;
+/// 表值调用的唯一入口：构造 L2 能力句柄（bd a9xgp 宿主 arm scope 登记表注入；
+/// api 缺省 = 独立/测试构造，不接线，级联由 token 监视 + Drop 兜底）后转发 ctor。
+#[allow(
+    clippy::too_many_arguments,
+    reason = "8 参 = 入口前置换算产物直译（ctor/ib/ohm/policy/token/addr/settings/api），打包聚合体属内部 API 变更"
+)]
+async fn build_inbound(
+    ctor: crate::arm_builders::InboundBuilder,
+    ib: &BuiltInbound,
+    ohm: Arc<SimpleOhm>,
+    policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    shutdown_token: CancellationToken,
+    addr: &str,
+    settings: &xray_transport::dialer::StreamSettings,
+    api: Option<&InboundRuntime>,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    let mut plugin_ctx = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        plugin_ctx = plugin_ctx.with_arm_registry(Arc::clone(api.arm_scopes()));
     }
-    tracing::warn!(
-        tag = %ib.tag,
-        protocol = %ib.entry.kind,
-        "inbound protocol not yet supported, skipping"
-    );
-    Ok(None)
+    ctor(crate::arm_builders::InboundCtx {
+        ib,
+        ohm,
+        policy,
+        shutdown_token,
+        addr,
+        settings,
+        api,
+        plugin_ctx,
+    })
+    .await
 }
 
 /// listen 地址是否为 unix domain socket 路径。
@@ -4229,12 +4276,13 @@ fn parse_listen_addr(addr: &str, port: u16) -> std::io::Result<SocketAddr> {
 /// UDS accept 循环：每连接调用 `on_conn`（与 transport hub ConnHandler 同形）。
 ///
 /// 单次 accept 失败仅 log 不终止 listener（与各 TCP serve 循环同语义）。
-#[cfg(unix)]
-async fn serve_unix_listener(
-    listener: xray_transport::system_listener::UnixListener,
+/// listener 取 `dyn SystemListener`（UDS 实现经其 `accept` 交出
+/// `Box<dyn Connection>`）：UDS 臂因此在非 unix 平台同样可编，只是永不调用
+/// （`spawn_unix_inbound` 的非 unix 拒绝臂）。
+pub(crate) async fn serve_unix_listener(
+    listener: Box<dyn xray_transport::system_listener::SystemListener>,
     on_conn: xray_transport::listener_registry::ConnHandler,
 ) -> std::io::Result<()> {
-    use xray_transport::system_listener::SystemListener;
     loop {
         match listener.accept().await {
             Ok(conn) => on_conn(conn),
@@ -4254,10 +4302,10 @@ async fn serve_unix_listener(
 ///
 /// transport 协议（ws/grpc/kcp/…）经 [`spawn_unix_transport_inbound`] 分派到
 /// listener_registry unix 注册表，security 同 TCP 路径一样由 hub 内部完成。
-/// 裸 TCP 协议的 serve 层为 TcpStream 特化，仅接线已有泛型/`Connection`
-/// 入口的协议（socks/vless/vmess/trojan/ss），其余显式报错；该 serve 栈无
-/// TLS accept 层，security=tls/reality 在此形态不可行——只对该形态显式报
-/// 错（Go unix listen 可包 TLS 的语义由 hub 路径提供）。
+/// 裸 TCP 协议的 serve 层为 TcpStream 特化，仅接线已有泛型/`Connection` 入口的
+/// 协议——覆盖矩阵 = 表条目的 `uds_stream` 槽（socks/vless/vmess/trojan/ss），
+/// 无槽者显式报错；该 serve 栈无 TLS accept 层，security=tls/reality 在此形态
+/// 不可行——只对该形态显式报错（Go unix listen 可包 TLS 的语义由 hub 路径提供）。
 #[cfg(unix)]
 async fn spawn_unix_inbound(
     ib: &BuiltInbound,
@@ -4266,20 +4314,10 @@ async fn spawn_unix_inbound(
     shutdown_token: CancellationToken,
     listen: &str,
     api: Option<&InboundRuntime>,
+    ctor: crate::arm_builders::InboundCtor,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     use xray_transport::system_listener::listen_unix_system;
 
-    // L2 能力句柄：UDS 分支与 transport 分支同源（arm_plugin_ctx 派发点构造）。
-    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
-    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
-    if let Some(api) = api {
-        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
-    }
-    let plugin_ctx = std::sync::Arc::new(ctx_builder);
-    // 各协议 arm 的 `move` 闭包会把 plugin_ctx 搬走；末尾 spawn_inbound_serve
-    // 仍需一句柄（同一 PluginContext 实例）→ 提前留一份克隆
-    // （E0382：Unix 构建红点，Windows 编译不到本函数故本地不复现）。
-    let serve_ctx = Arc::clone(&plugin_ctx);
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
@@ -4291,6 +4329,7 @@ async fn spawn_unix_inbound(
             listen,
             settings,
             api,
+            ctor,
         )
         .await;
     }
@@ -4306,10 +4345,9 @@ async fn spawn_unix_inbound(
             ));
         },
     }
-    // 协议支持矩阵前置：不支持 UDS 的协议在 bind 前显式报错（fail-fast，
-    // 对齐 Go inbound 创建失败即启动失败的语义）。
-    const UDS_SUPPORTED_PROTOCOLS: &[&str] = &["socks", "vless", "vmess", "trojan", "shadowsocks"];
-    if !UDS_SUPPORTED_PROTOCOLS.contains(&ib.entry.kind.as_str()) {
+    // 协议支持矩阵 = 表条目的 `uds_stream` 槽：无槽即该协议不支持 UDS 裸流，在
+    // bind 前显式报错（fail-fast，对齐 Go inbound 创建失败即启动失败的语义）。
+    let Some(build_serve) = ctor.uds_stream else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
@@ -4317,229 +4355,29 @@ async fn spawn_unix_inbound(
                 ib.tag, ib.entry.kind
             ),
         ));
+    };
+    // L2 能力句柄：UDS 分支与 transport 分支同源（arm_plugin_ctx 派发点构造）。
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
     }
+    let plugin_ctx = Arc::new(ctx_builder);
     let listener = listen_unix_system(listen, settings.socket_options()).await?;
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-    // UDS 无 SocketAddr；对齐 Go UnixConnWrapper.RemoteAddr 的 0.0.0.0:0。
-    let unspecified = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+    let serve = build_serve(crate::arm_builders::UnixInboundCtx {
+        ib,
+        policy: &policy,
+        settings: &settings,
+        listen,
+        listener: Box::new(listener),
+        handler,
+        plugin_ctx: Arc::clone(&plugin_ctx),
+    })?;
 
-    let serve: std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> = match ib
-        .entry
-        .kind
-        .as_str()
-    {
-        "socks" => {
-            // bd q2crg：socks 端口的 HTTP fallback 与传输层无关（Go
-            // `proxy/socks/server.go:38-43` 无条件挂 httpServer）→ UDS 与 TCP
-            // 走同一份 mixed 复合栈（禁另造 HTTP 实现）。
-            let (config, http_cfg) = parse_socks_http_configs(&ib.entry.data)?;
-            let config = Arc::new(config);
-            let http_cfg = Arc::new(http_cfg);
-            let handshake_timeout = Some(handshake_timeout_for(&policy, config.user_level));
-            let udp_idle = policy
-                .as_ref()
-                .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
-                .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
-            tracing::info!(
-                tag = %ib.tag,
-                path = %listen,
-                "socks5 (uds) inbound listening (http proxy fallback on non-SOCKS first byte)"
-            );
-            Box::pin(serve_unix_listener(listener, {
-                let handler = Arc::clone(&handler);
-                Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let config = Arc::clone(&config);
-                    let http_cfg = Arc::clone(&http_cfg);
-                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let peer = conn.remote_addr().ok().flatten().unwrap_or(unspecified);
-                            serve_mixed_conn(
-                                PeekAhead::new(conn),
-                                peer,
-                                config,
-                                http_cfg,
-                                handshake_timeout,
-                                udp_idle,
-                                handler,
-                                task_ctx,
-                            )
-                            .await;
-                        })
-                        .expect("arm FxScope is never closed");
-                })
-            }))
-        },
-        "vless" => {
-            let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx.clone())?;
-            let options =
-                VlessInboundOptions { decryption: decryption.clone(), ..Default::default() };
-            let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
-            tracing::info!(
-                tag = %ib.tag,
-                users = validator.get_uuid_count(),
-                "vless (uds) inbound listening"
-            );
-            Box::pin(serve_unix_listener(listener, {
-                let handler = Arc::clone(&handler);
-                Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let validator = Arc::clone(&validator);
-                    let fallbacks = fallbacks.clone();
-                    let options = options.clone();
-                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let _ctx = task_ctx;
-                            let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                            if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
-                                conn,
-                                &handler,
-                                &validator,
-                                fallbacks,
-                                peer,
-                                local,
-                                String::new(),
-                                String::new(),
-                                Some(options),
-                                None,
-                            )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "vless (uds) connection ended with error"
-                                );
-                            }
-                        })
-                        .expect("arm FxScope is never closed");
-                })
-            }))
-        },
-        "vmess" => {
-            let validator = build_vmess_validator(&ib.entry.data)?;
-            let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
-            // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
-            let is_drain = !settings.is_tls();
-            tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
-            let hs_timeout = handshake_timeout_for(&policy, 0);
-            Box::pin(serve_unix_listener(listener, {
-                let handler = Arc::clone(&handler);
-                Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let validator = Arc::clone(&validator);
-                    let history = Arc::clone(&history);
-                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let _ctx = task_ctx;
-                            let (peer, _local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                            if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
-                                conn, &handler, &validator, &history, is_drain, hs_timeout,
-                            )
-                            .await
-                            {
-                                tracing::info!(
-                                    peer = %peer,
-                                    error = %e,
-                                    "vmess (uds) connection ended with error"
-                                );
-                            }
-                        })
-                        .expect("arm FxScope is never closed");
-                })
-            }))
-        },
-        "trojan" => {
-            let users = build_trojan_users(&ib.entry.data)?;
-            let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
-            let validator = Arc::new(xray_proxy_trojan::Validator::new());
-            for (_, user) in users {
-                if let Err(e) = validator.add(user) {
-                    tracing::warn!(
-                        error = %e,
-                        "skip duplicate user during trojan uds inbound init"
-                    );
-                }
-            }
-            tracing::info!(tag = %ib.tag, "trojan (uds) inbound listening");
-            let hs_timeout = handshake_timeout_for(&policy, 0);
-            Box::pin(serve_unix_listener(listener, {
-                let handler = Arc::clone(&handler);
-                Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let validator = Arc::clone(&validator);
-                    let fallbacks = fallbacks.clone();
-                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let _ctx = task_ctx;
-                            let (peer, local) = transport_conn_addrs(conn.as_ref(), unspecified);
-                            xray_proxy_trojan::serve_trojan_conn(
-                                conn,
-                                validator,
-                                handler,
-                                fallbacks,
-                                peer,
-                                local,
-                                String::new(),
-                                String::new(),
-                                hs_timeout,
-                            )
-                            .await;
-                        })
-                        .expect("arm FxScope is never closed");
-                })
-            }))
-        },
-        "shadowsocks" => {
-            let inbound = match parse_ss_inbound_config(&ib.entry.data)? {
-                SsInboundMode::Legacy(ss_ib) => ss_ib,
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        format!("uds inbound '{}': ss2022 not supported over unix socket", ib.tag),
-                    ));
-                },
-            };
-            tracing::info!(tag = %ib.tag, "shadowsocks (uds) inbound listening");
-            Box::pin(serve_unix_listener(listener, {
-                let handler = Arc::clone(&handler);
-                Arc::new(move |conn| {
-                    let handler = Arc::clone(&handler);
-                    let inbound = Arc::clone(&inbound);
-                    let hs_timeout = handshake_timeout_for(&policy, 0);
-                    // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let _ctx = Arc::clone(&task_ctx);
-                            ss_legacy_pipeline(
-                                inbound,
-                                handler,
-                                conn,
-                                hs_timeout,
-                                Arc::clone(&task_ctx),
-                            )
-                            .await;
-                        })
-                        .expect("arm FxScope is never closed");
-                })
-            }))
-        },
-        _ => unreachable!("uds protocol support checked above"),
-    };
-
-    Ok(Some(spawn_inbound_serve(&serve_ctx, ib.tag.clone(), shutdown_token, serve)))
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, serve)))
 }
 
 /// transport 协议 + unix 路径 inbound（bd lfrg 收尾）。
@@ -4551,9 +4389,9 @@ async fn spawn_unix_inbound(
 /// listener 移入 pending future 保活（与 [`spawn_transport_listener_inbound`]
 /// 同骨架），shutdown abort 时随 task drop。
 ///
-/// 协议覆盖 = arm_builders 有 transport 分支的四种 inbound（vless/trojan/
-/// vmess/shadowsocks）；其余 kind 显式 Unsupported。未注册 unix 监听的
-/// transport 协议（如 kcp）由 listener_registry 报 Go 对齐的 NotFound。
+/// 协议覆盖 = 表条目的 `uds_transport` 槽（vless/trojan/vmess/shadowsocks）；
+/// 其余 kind 显式 Unsupported。未注册 unix 监听的 transport 协议（如 kcp）由
+/// listener_registry 报 Go 对齐的 NotFound。
 #[cfg(unix)]
 async fn spawn_unix_transport_inbound(
     ib: &BuiltInbound,
@@ -4563,59 +4401,25 @@ async fn spawn_unix_transport_inbound(
     listen: &str,
     settings: xray_transport::dialer::StreamSettings,
     api: Option<&InboundRuntime>,
+    ctor: crate::arm_builders::InboundCtor,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    use crate::arm_builders::inbound::{
-        ss_transport_on_conn, trojan_transport_on_conn, vless_transport_on_conn,
-        vmess_transport_on_conn,
-    };
-
-    // UDS 无 SocketAddr；对齐 Go UnixConnWrapper.RemoteAddr 的 0.0.0.0:0。
-    let fallback_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-    let on_conn = match ib.entry.kind.as_str() {
-        "vless" => {
-            let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
-            // L2 能力句柄：与 spawn_unix_inbound 同源（arm_plugin_ctx 派发点构造）。
-            // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
-            let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
-            if let Some(api) = api {
-                ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
-            }
-            let plugin_ctx = std::sync::Arc::new(ctx_builder);
-            let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx)?;
-            let options = VlessInboundOptions {
-                decryption: decryption.clone(),
-                handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
-                ..Default::default()
-            };
-            vless_transport_on_conn(ib, &ohm, &settings, validator, options, fallback_addr, listen)
-        },
-        "trojan" => {
-            let users = build_trojan_users(&ib.entry.data)?;
-            let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
-            trojan_transport_on_conn(
-                ib,
-                &ohm,
-                &policy,
-                &settings,
-                users,
-                fallbacks,
-                fallback_addr,
-                listen,
-            )
-        },
-        "vmess" => {
-            let validator = build_vmess_validator(&ib.entry.data)?;
-            vmess_transport_on_conn(ib, &ohm, &policy, &settings, validator, fallback_addr, listen)
-        },
-        "shadowsocks" => ss_transport_on_conn(ib, &ohm, &policy, api, &settings, listen),
-        other => Err(std::io::Error::new(
+    let Some(build_on_conn) = ctor.uds_transport else {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(
-                "uds inbound '{}': transport protocol '{}' not supported for inbound kind '{other}' over unix socket",
-                ib.tag, settings.protocol
+                "uds inbound '{}': transport protocol '{}' not supported for inbound kind '{}' over unix socket",
+                ib.tag, settings.protocol, ib.entry.kind
             ),
-        )),
-    }?;
+        ));
+    };
+    let on_conn = build_on_conn(crate::arm_builders::UnixTransportCtx {
+        ib,
+        ohm: &ohm,
+        policy: &policy,
+        settings: &settings,
+        api,
+        ident: listen,
+    })?;
     // sockopt 先取（trustedXForwardedFor 等，Go socketSettings 对 unix 分支
     // 同样生效）；settings 随后移入 registry。
     let sockopt = settings.socket_options();
@@ -4646,8 +4450,9 @@ async fn spawn_unix_inbound(
     shutdown_token: CancellationToken,
     listen: &str,
     api: Option<&InboundRuntime>,
+    ctor: crate::arm_builders::InboundCtor,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    let _ = (ohm, policy, shutdown_token, listen, api);
+    let _ = (ib, ohm, policy, shutdown_token, listen, api, ctor);
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!("unix socket inbound '{}' is only supported on unix platforms", ib.tag),
@@ -7011,6 +6816,106 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(5), client_sock.recv(&mut rbuf))
                 .await
                 .expect("recv timeout")
+                .expect("recv");
+        let (addr, port, echoed) = client.decode(&rbuf[..n]).unwrap();
+        assert_eq!(addr, Address::IPv4(echo_v4));
+        assert_eq!(port, echo_addr.port());
+        assert_eq!(echoed, payload);
+    }
+
+    /// 1jcoo：SS-2022 中继 UDP 两跳 e2e（Go `RelayInbound.processUDP`）。
+    ///
+    /// client([relayPSK, destPSK]) → `serve_ss2022_relay_udp`（剥 relay 层 + 用
+    /// destPSK 重加密包头）→ 下一跳 `serve_ss2022_udp`（单用户 destPSK）→
+    /// freedom → UDP echo → 回程（destPSK 加密，中继原样透传）→ client 解回原文。
+    #[tokio::test]
+    async fn ss2022_relay_udp_two_hop_e2e() {
+        use base64::Engine as _;
+        use xray_app_dispatcher::default::DialBridge;
+        use xray_proxy_freedom::{dispatcher::FreedomDispatchBridge, make_freedom_dial_fn};
+        use xray_proxy_ss::ss2022::{
+            RelayDestination, RelayInbound, key::CipherKind2022, packet::ClientUdpSession2022,
+        };
+
+        // 1. UDP echo
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_v4 = match echo_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => panic!("echo should be ipv4"),
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else { break };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+
+        // 2. 下一跳：SS-2022 单用户 UDP 入站（destPSK 即链尾 PSK）
+        let dest_psk: Vec<u8> = (64..96u8).collect();
+        let dest_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest_port = dest_sock.local_addr().unwrap().port();
+        let echo_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(FreedomDispatchBridge::from_bridge(
+                test_plugin_ctx("freedom"),
+                Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+            ));
+        tokio::spawn(serve_ss2022_udp(
+            Arc::new(dest_sock),
+            CipherKind2022::Aes256Gcm,
+            dest_psk.clone(),
+            Vec::new(),
+            Arc::clone(&echo_handler),
+            test_plugin_ctx("shadowsocks"),
+        ));
+
+        // 3. 中继：relayPSK + destinations=[127.0.0.1:dest_port]
+        let relay_psk: Vec<u8> = (0..32u8).collect();
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let relay_ib = Arc::new(
+            RelayInbound::new(
+                "2022-blake3-aes-256-gcm",
+                &b64.encode(&relay_psk),
+                vec![RelayDestination {
+                    key: dest_psk.clone(),
+                    address: Address::IPv4(Ipv4Addr::LOCALHOST),
+                    port: dest_port,
+                    email: "dest@relay".into(),
+                    level: 0,
+                }],
+            )
+            .expect("relay inbound"),
+        );
+        let relay_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let hop_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(FreedomDispatchBridge::from_bridge(
+                test_plugin_ctx("freedom"),
+                Arc::new(DialBridge::new("freedom", make_freedom_dial_fn())),
+            ));
+        tokio::spawn(serve_ss2022_relay_udp(
+            Arc::new(relay_sock),
+            relay_ib,
+            hop_handler,
+            test_plugin_ctx("shadowsocks"),
+        ));
+
+        // 4. client：多 key（链首 relay、链尾 dest），目标 = echo
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client_sock.connect(relay_addr).await.unwrap();
+        let client =
+            ClientUdpSession2022::new(CipherKind2022::Aes256Gcm, vec![relay_psk, dest_psk])
+                .unwrap();
+        let payload = b"ss2022-relay-udp-two-hop".to_vec();
+        let frame = client.encode(&Address::IPv4(echo_v4), echo_addr.port(), &payload).unwrap();
+        client_sock.send(&frame).await.unwrap();
+
+        let mut rbuf = vec![0u8; 65_535];
+        let n =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_sock.recv(&mut rbuf))
+                .await
+                .expect("relay two-hop recv timeout")
                 .expect("recv");
         let (addr, port, echoed) = client.decode(&rbuf[..n]).unwrap();
         assert_eq!(addr, Address::IPv4(echo_v4));
@@ -12617,7 +12522,8 @@ mod tests {
     /// - D1 落地回归：list() 恒 tag 升序（BTreeMap 确定序）。
     #[tokio::test]
     async fn xiuvr3a_registry_behaviour_matrix_19kinds_x3variants() {
-        /// 阶段 1 权威全集（arm_builders INBOUND_CTORS 18 + tun 特殊分支）。
+        /// 阶段 1 权威全集（arm_builders INBOUND_CTORS 19 键；tun 自 bd 7y07s 起
+        /// 同样经表分派，条目 `needs_listen_addr=false` 决定入口不做 port/addr 解析）。
         const KINDS: [&str; 19] = [
             "socks",
             "mixed",

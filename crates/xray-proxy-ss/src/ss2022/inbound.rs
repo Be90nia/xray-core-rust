@@ -31,7 +31,7 @@ use crate::{
     protocol::addr_type,
     ss2022::{
         key::{
-            CipherKind2022, decrypt_identity_header, derive_psk, derive_session_subkey,
+            CipherKind2022, decrypt_identity_header, derive_psk, derive_session_subkey, ecb_block,
             psk_from_base64, psk_identity,
         },
         replay::{REPLAY_WINDOW, SaltReplayFilter},
@@ -327,7 +327,7 @@ impl RelayInbound {
     pub fn new(
         cipher: &str,
         server_psk_b64: &str,
-        destinations: Vec<RelayDestination>,
+        mut destinations: Vec<RelayDestination>,
     ) -> Result<Self> {
         let kind = CipherKind2022::from_name(cipher)?;
         // 中继模式规范仅支持 AES（SIP022）
@@ -335,6 +335,11 @@ impl RelayInbound {
             return Err(SsError::Ss2022UnsupportedMethod(cipher.to_string()));
         }
         let psk = derive_psk(&psk_from_base64(server_psk_b64)?, kind)?;
+        // 目标 PSK 归一到 key_size：UDP 的 EIH 解密与下一跳重加密直接拿它作
+        // ECB key（Go `ParseKey(d.Key, KeySaltLength)` 对齐；短于 key_size 显式报错）。
+        for d in &mut destinations {
+            d.key = derive_psk(&d.key, kind)?;
+        }
         Ok(Self { psk, kind, destinations, timestamp_tolerance: 30 })
     }
 
@@ -373,6 +378,58 @@ impl RelayInbound {
             .find(|d| crate::ss2022::key::psk_identity(&d.key) == decrypted[..])
             .ok_or_else(|| io::Error::other(SsError::Ss2022NoUserMatched.to_string()))?;
         Ok((dest.address.clone(), dest.port, salt, conn))
+    }
+
+    /// 中继入站 UDP 帧改写（Go `RelayInbound.processUDP`）。
+    ///
+    /// wire 进：`[ECB(relayPSK, hdr)][ECB(relayPSK, identity(destPSK) ^ hdr)][body]`
+    /// wire 出（写入 `out`）：`[ECB(destPSK, hdr)][body]`——剥掉 relay 层，body 的
+    /// 端到端 AEAD 原样透传；下一跳用自己 PSK 正常解。
+    ///
+    /// 回程不需要改写：下一跳以 destPSK 加密回包，而客户端链尾 PSK 就是 destPSK，
+    /// 中继原样回送即可（Go `EnsureLink(..., nil)` 的 nil 编码器语义）。
+    ///
+    /// 返回 (client sessionId, 下一跳地址, 端口)。
+    ///
+    /// # Errors
+    /// - [`SsError::InsufficientData`]：包不足两个 AES 块。
+    /// - [`SsError::Ss2022NoUserMatched`]：destinations 表无匹配身份。
+    pub fn relay_udp_packet(&self, pkt: &[u8], out: &mut Vec<u8>) -> Result<(u64, Address, u16)> {
+        const BLOCK: usize = crate::ss2022::key::IDENTITY_HEADER_LEN;
+        if pkt.len() < 2 * BLOCK {
+            return Err(SsError::InsufficientData(pkt.len()));
+        }
+        let hdr = ecb_block(
+            self.kind,
+            &self.psk,
+            pkt[..BLOCK].try_into().expect("pkt.len() >= 2 * BLOCK checked above"),
+            false,
+        )?;
+        let eih = ecb_block(
+            self.kind,
+            &self.psk,
+            pkt[BLOCK..2 * BLOCK].try_into().expect("pkt.len() >= 2 * BLOCK checked above"),
+            false,
+        )?;
+        let ident = {
+            let mut id = eih;
+            for (b, h) in id.iter_mut().zip(hdr.iter()) {
+                *b ^= h;
+            }
+            id
+        };
+        let dest = self
+            .destinations
+            .iter()
+            .find(|d| psk_identity(&d.key) == ident)
+            .ok_or(SsError::Ss2022NoUserMatched)?;
+        let reenc = ecb_block(self.kind, &dest.key, &hdr, true)?;
+        out.clear();
+        out.extend_from_slice(&reenc);
+        out.extend_from_slice(&pkt[2 * BLOCK..]);
+        let session_id =
+            u64::from_be_bytes(hdr[..8].try_into().expect("hdr is the 16B ecb_block output"));
+        Ok((session_id, dest.address.clone(), dest.port))
     }
 
     /// 目标数量。
@@ -1144,6 +1201,162 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), roundtrip)
             .await
             .expect("relay roundtrip timed out (wire mismatch)");
+    }
+
+    /// 建一个只含一个下一跳的 relay（aes-128，PSK 固定便于断言）。
+    fn relay_for_test(relay_psk: &[u8], dest_psk: &[u8], port: u16) -> RelayInbound {
+        use base64::Engine as _;
+        let b64 = |p: &[u8]| base64::engine::general_purpose::STANDARD.encode(p);
+        RelayInbound::new(
+            "2022-blake3-aes-128-gcm",
+            &b64(relay_psk),
+            vec![RelayDestination {
+                key: dest_psk.to_vec(),
+                address: Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+                email: "dest@relay".into(),
+                level: 0,
+            }],
+        )
+        .expect("relay inbound")
+    }
+
+    /// SS-2022 relay UDP 两跳链路（对齐 Go `relay_test.go`
+    /// `TestRelayUDPSessionStabilityAndDispatch` 的字节口径）：
+    /// client([relayPSK,destPSK]) 编码 → `relay_udp_packet` 剥层重加密 →
+    /// 下一跳用 dest PSK 解出原文 → 回包（dest PSK 加密）→ client 解回原文。
+    #[test]
+    fn relay_udp_chain_roundtrip() {
+        use crate::ss2022::packet::{
+            ClientUdpSession2022, ServerUdpSession2022, server_decode_header,
+        };
+
+        let kind = CipherKind2022::Aes128Gcm;
+        let relay_psk = [0x11u8; 16];
+        let dest_psk = [0x22u8; 16];
+        let relay = relay_for_test(&relay_psk, &dest_psk, 8388);
+
+        let client = ClientUdpSession2022::new(kind, vec![relay_psk.to_vec(), dest_psk.to_vec()])
+            .expect("client udp session");
+        let target = Address::Domain("echo.example".into());
+        let payload = b"relay-udp-payload";
+        let pkt = client.encode(&target, 443, payload).expect("client encode");
+
+        // 1. relay 剥 relay 层，换成下一跳可见的 [ECB(destPSK,hdr)][body]
+        let mut fwd = Vec::new();
+        let (sid, address, port) = relay.relay_udp_packet(&pkt, &mut fwd).expect("relay rewrite");
+        assert_eq!(sid, client.session_id());
+        assert_eq!(address, Address::IPv4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(port, 8388);
+        // 剥掉 relay 的 EIH 块（Go `b.Advance(AESBlockSize)`）：长度 -16，
+        // 剩余 = [ECB(destPSK,hdr)][端到端 AEAD body]
+        assert_eq!(fwd.len(), pkt.len() - 16, "relay 剥掉一个 16B 身份块");
+        assert_ne!(fwd[..16], pkt[16..32], "包头已用 dest PSK 重加密");
+        assert_eq!(fwd[16..], pkt[32..], "body 原样透传");
+
+        // 2. 下一跳按单用户（无 EIH）解：目标与原文一致
+        let hdr = server_decode_header(kind, &dest_psk, &[], &fwd).expect("dest decode header");
+        assert_eq!(hdr.eih_len, 0);
+        assert_eq!(hdr.session_id, client.session_id());
+        let session = ServerUdpSession2022::new(kind, dest_psk.to_vec(), hdr.session_id)
+            .expect("dest session");
+        let (got_addr, got_port, got) =
+            session.decode_body(&hdr.hdr, hdr.packet_id, &fwd[16..]).expect("dest decode body");
+        assert_eq!((got_addr, got_port), (target.clone(), 443));
+        assert_eq!(got, payload);
+
+        // 3. 回包不经 relay 改写：dest PSK 加密 → client 直接解
+        let resp = session.encode(&target, 443, payload).expect("dest encode");
+        let (_, _, back) = client.decode(&resp).expect("client decode response");
+        assert_eq!(back, payload);
+    }
+
+    /// relay 层 PSK 不匹配：身份乱码 → 显式错误（Go 静默丢包，但 API 面必须报错）。
+    #[test]
+    fn relay_udp_wrong_relay_key_rejected() {
+        use crate::ss2022::packet::ClientUdpSession2022;
+        let kind = CipherKind2022::Aes128Gcm;
+        let relay_psk = [0x11u8; 16];
+        let dest_psk = [0x22u8; 16];
+        let wrong_relay = [0x33u8; 16];
+        let relay = relay_for_test(&relay_psk, &dest_psk, 8388);
+
+        let client = ClientUdpSession2022::new(kind, vec![wrong_relay.to_vec(), dest_psk.to_vec()])
+            .expect("client udp session");
+        let pkt = client
+            .encode(&Address::Domain("echo.example".into()), 443, b"x")
+            .expect("client encode");
+
+        let mut fwd = Vec::new();
+        let err = relay.relay_udp_packet(&pkt, &mut fwd).expect_err("wrong relay key must fail");
+        assert!(matches!(err, SsError::Ss2022NoUserMatched), "got {err:?}");
+    }
+
+    /// destinations 表里没有该身份：显式报错，不静默放行。
+    #[test]
+    fn relay_udp_unknown_destination_rejected() {
+        use crate::ss2022::packet::ClientUdpSession2022;
+        let kind = CipherKind2022::Aes128Gcm;
+        let relay_psk = [0x11u8; 16];
+        let dest_psk = [0x22u8; 16];
+        let other_dest = [0x44u8; 16];
+        let relay = relay_for_test(&relay_psk, &dest_psk, 8388);
+
+        let client = ClientUdpSession2022::new(kind, vec![relay_psk.to_vec(), other_dest.to_vec()])
+            .expect("client udp session");
+        let pkt = client
+            .encode(&Address::Domain("echo.example".into()), 443, b"x")
+            .expect("client encode");
+
+        let mut fwd = Vec::new();
+        let err = relay.relay_udp_packet(&pkt, &mut fwd).expect_err("unknown dest must fail");
+        assert!(matches!(err, SsError::Ss2022NoUserMatched), "got {err:?}");
+    }
+
+    /// relay 层 PSK 不匹配（TCP）：EIH 解出的身份对不上 destinations → 显式错误。
+    #[tokio::test]
+    async fn relay_tcp_wrong_key_rejected() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::ss2022::key::encrypt_identity_header;
+
+        let kind = CipherKind2022::Aes128Gcm;
+        let relay_psk = [0x11u8; 16];
+        let dest_psk = [0x22u8; 16];
+        let wrong_relay = [0x33u8; 16];
+        let relay = relay_for_test(&relay_psk, &dest_psk, 8388);
+
+        let salt = [0x55u8; 16];
+        let eih = encrypt_identity_header(&wrong_relay, &dest_psk, &salt, kind).expect("eih");
+        let (mut tx, rx) = tokio::io::duplex(64);
+        tx.write_all(&salt).await.unwrap();
+        tx.write_all(&eih).await.unwrap();
+
+        let err = relay.handle_conn_relay(rx).await.expect_err("wrong relay key must fail");
+        assert!(err.to_string().contains("no user matched"), "got: {err}");
+    }
+
+    /// destinations 表里没有该身份（TCP）：显式错误。
+    #[tokio::test]
+    async fn relay_tcp_unknown_destination_rejected() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::ss2022::key::encrypt_identity_header;
+
+        let kind = CipherKind2022::Aes128Gcm;
+        let relay_psk = [0x11u8; 16];
+        let dest_psk = [0x22u8; 16];
+        let other_dest = [0x44u8; 16];
+        let relay = relay_for_test(&relay_psk, &dest_psk, 8388);
+
+        let salt = [0x66u8; 16];
+        let eih = encrypt_identity_header(&relay_psk, &other_dest, &salt, kind).expect("eih");
+        let (mut tx, rx) = tokio::io::duplex(64);
+        tx.write_all(&salt).await.unwrap();
+        tx.write_all(&eih).await.unwrap();
+
+        let err = relay.handle_conn_relay(rx).await.expect_err("unknown dest must fail");
+        assert!(err.to_string().contains("no user matched"), "got: {err}");
     }
 
     #[test]

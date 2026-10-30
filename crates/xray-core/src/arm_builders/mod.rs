@@ -67,6 +67,90 @@ pub(crate) type InboundBuildFut<'a> =
 
 pub(crate) type InboundBuilder = for<'a> fn(InboundCtx<'a>) -> InboundBuildFut<'a>;
 
+/// UDS 裸流 serve 构造上下文：UDS listener 与默认 handler 由
+/// [`crate::inbound::spawn_unix_inbound`] 绑定/取出后传入，臂只组装 per-conn 栈。
+///
+/// 类型面刻意不引用平台专属类型（listener 走 `dyn SystemListener`）——UDS 臂因此
+/// 与非 unix 平台同源编译；非 unix 平台永不调用（`spawn_unix_inbound` 有拒绝臂）。
+pub(crate) struct UnixInboundCtx<'a> {
+    pub(crate) ib: &'a BuiltInbound,
+    pub(crate) policy: &'a Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    pub(crate) settings: &'a xray_transport::dialer::StreamSettings,
+    /// UDS 路径（监听标识；per-instance 日志同源）。
+    pub(crate) listen: &'a str,
+    pub(crate) listener: Box<dyn xray_transport::system_listener::SystemListener>,
+    pub(crate) handler: Arc<dyn DispatchHandler>,
+    /// L2 能力句柄（与 TCP 臂同源，见 [`InboundCtx::plugin_ctx`]）；serve future
+    /// 与 [`crate::inbound::spawn_inbound_serve`] 各持一份克隆。
+    pub(crate) plugin_ctx: Arc<PluginContext>,
+}
+
+/// UDS accept 循环 future（与 `crate::inbound::serve_unix_listener` 同形）。
+pub(crate) type UnixServe = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+pub(crate) type UnixInboundBuilder = for<'a> fn(UnixInboundCtx<'a>) -> std::io::Result<UnixServe>;
+
+/// UDS 上 transport 协议的 per-conn 构造上下文（对应
+/// `crate::inbound::spawn_unix_transport_inbound`）。
+pub(crate) struct UnixTransportCtx<'a> {
+    pub(crate) ib: &'a BuiltInbound,
+    pub(crate) ohm: &'a Arc<SimpleOhm>,
+    pub(crate) policy: &'a Option<Arc<dyn xray_features::policy::PolicyManager>>,
+    pub(crate) settings: &'a xray_transport::dialer::StreamSettings,
+    pub(crate) api: Option<&'a crate::inbound::InboundRuntime>,
+    /// 监听标识：UDS 路径（TCP 侧同位置传 `addr:port`）。
+    pub(crate) ident: &'a str,
+}
+
+pub(crate) type UnixTransportBuilder =
+    for<'a> fn(
+        UnixTransportCtx<'a>,
+    ) -> std::io::Result<xray_transport::listener_registry::ConnHandler>;
+
+/// 入站表条目：一个 `<方向>:<协议>` 条目承载该协议的**三种监听形态**构造器。
+///
+/// 单表是「协议 → 可构造形态」的唯一真源：TCP 主路径走 [`Self::stream`]，UDS 裸流
+/// 走 [`Self::uds_stream`]，UDS transport 走 [`Self::uds_transport`]；槽为 `None`
+/// 即该形态不支持，调用方显式失败（不再有第二份手写白名单或内联 match）。
+#[derive(Clone, Copy)]
+pub(crate) struct InboundCtor {
+    /// TCP 地址监听的主构造器（平台门控的拒绝臂也在此槽，如 tun 非支持平台）。
+    pub(crate) stream: InboundBuilder,
+    /// 是否消费 listen 地址/端口；`false` = 自管监听面（tun：设备 + netstack），
+    /// 入口跳过 sockopt 校验与 port/addr 解析。
+    pub(crate) needs_listen_addr: bool,
+    /// UDS 裸流 serve 栈（`None` = 该协议不支持 unix socket）。
+    ///
+    /// 非 unix 平台不读该槽（无 UDS 监听路径可走），槽位仍登记以保持表条目
+    /// 平台无关——单表是「协议 → 形态」唯一真源，不按平台分叉。
+    #[cfg_attr(
+        not(unix),
+        allow(
+            dead_code,
+            reason = "UDS 槽只在 unix 监听路径被读；非 unix 平台仍登记以维持单表结构"
+        )
+    )]
+    pub(crate) uds_stream: Option<UnixInboundBuilder>,
+    /// UDS 上 transport 协议的 per-conn 构造（`None` = 该协议无 transport 分支）。
+    #[cfg_attr(not(unix), allow(dead_code, reason = "同上：UDS 槽只在 unix 监听路径被读"))]
+    pub(crate) uds_transport: Option<UnixTransportBuilder>,
+}
+
+/// 纯 TCP 形态的表条目（无 UDS 形态、消费 listen 地址）。
+pub(crate) const fn tcp(stream: InboundBuilder) -> InboundCtor {
+    ctor(stream, true, None, None)
+}
+
+/// 表条目全字段构造（const：表是 `&'static` 纯数据源，零分配）。
+pub(crate) const fn ctor(
+    stream: InboundBuilder,
+    needs_listen_addr: bool,
+    uds_stream: Option<UnixInboundBuilder>,
+    uds_transport: Option<UnixTransportBuilder>,
+) -> InboundCtor {
+    InboundCtor { stream, needs_listen_addr, uds_stream, uds_transport }
+}
+
 /// outbound 构造上下文：build_protocol_handler 臂前公共前解析产物 + 装配参数
 /// 原样打包（各协议消费子集，未消费字段随 ctx 丢弃，与拆分前臂未消费局部一致）。
 pub(crate) struct OutboundCtx<'a, 'b> {
@@ -123,31 +207,70 @@ pub(crate) type OutboundBuilder = for<'a, 'b> fn(OutboundCtx<'a, 'b>) -> Outboun
 ///
 /// 键 = `<方向>:<协议>`：方向前缀使入/出站同名协议不撞注册表重名，并为将来
 /// 16 个协议 Plugin（键 = 裸协议名）并入同一注册表留出键空间。
-pub(crate) static INBOUND_CTORS: &[(&str, InboundBuilder)] = &[
-    ("inbound:socks", inbound::socks_entry),
-    ("inbound:mixed", inbound::mixed_entry),
-    ("inbound:vless", inbound::vless_entry),
-    ("inbound:trojan", inbound::trojan_entry),
-    ("inbound:vmess", inbound::vmess_entry),
-    ("inbound:http", inbound::http_entry),
+///
+/// 一条目 = 该协议的全部监听形态（TCP / UDS 裸流 / UDS transport，见
+/// [`InboundCtor`]）——加协议即加一行，不存在第二张表或手写白名单。
+pub(crate) static INBOUND_CTORS: &[(&str, InboundCtor)] = &[
+    ("inbound:socks", ctor(inbound::socks_entry, true, Some(inbound::unix_socks_serve), None)),
+    ("inbound:mixed", tcp(inbound::mixed_entry)),
+    (
+        "inbound:vless",
+        ctor(
+            inbound::vless_entry,
+            true,
+            Some(inbound::unix_vless_serve),
+            Some(inbound::unix_vless_transport),
+        ),
+    ),
+    (
+        "inbound:trojan",
+        ctor(
+            inbound::trojan_entry,
+            true,
+            Some(inbound::unix_trojan_serve),
+            Some(inbound::unix_trojan_transport),
+        ),
+    ),
+    (
+        "inbound:vmess",
+        ctor(
+            inbound::vmess_entry,
+            true,
+            Some(inbound::unix_vmess_serve),
+            Some(inbound::unix_vmess_transport),
+        ),
+    ),
+    ("inbound:http", tcp(inbound::http_entry)),
     // Go 注册名是 `dokodemo-door`（infra/conf/dokodemo.go + proxy/dokodemo 的
     // ProtocolName），配置按 Go 文档写 `dokodemo-door`——只留 `dokodemo` 键会
     // 使整条入站落到「未支持协议」被静默跳过；两个键都收。
-    ("inbound:dokodemo-door", inbound::dokodemo_entry),
-    ("inbound:dokodemo", inbound::dokodemo_entry),
-    ("inbound:shadowsocks", inbound::shadowsocks_entry),
+    ("inbound:dokodemo-door", tcp(inbound::dokodemo_entry)),
+    ("inbound:dokodemo", tcp(inbound::dokodemo_entry)),
+    (
+        "inbound:shadowsocks",
+        ctor(
+            inbound::shadowsocks_entry,
+            true,
+            Some(inbound::unix_shadowsocks_serve),
+            Some(inbound::unix_shadowsocks_transport),
+        ),
+    ),
     // 原 match 臂为 `"hysteria" | "hysteria2"` 双键——数据源同样双键指向同一适配器，
     // 否则 hysteria2 配置会漏查落到「未支持协议」分支。
-    ("inbound:hysteria", inbound::hysteria_entry),
-    ("inbound:hysteria2", inbound::hysteria_entry),
-    ("inbound:anytls", inbound::anytls_entry),
-    ("inbound:tuic", inbound::tuic_entry),
-    ("inbound:naive", inbound::naive_entry),
-    ("inbound:wireguard", inbound::wireguard_entry),
-    ("inbound:dns", inbound::dns_entry),
-    ("inbound:loopback", inbound::loopback_entry),
-    ("inbound:blackhole", inbound::blackhole_entry),
-    ("inbound:freedom", inbound::freedom_entry),
+    ("inbound:hysteria", tcp(inbound::hysteria_entry)),
+    ("inbound:hysteria2", tcp(inbound::hysteria_entry)),
+    ("inbound:anytls", tcp(inbound::anytls_entry)),
+    ("inbound:tuic", tcp(inbound::tuic_entry)),
+    ("inbound:naive", tcp(inbound::naive_entry)),
+    ("inbound:wireguard", tcp(inbound::wireguard_entry)),
+    ("inbound:dns", tcp(inbound::dns_entry)),
+    ("inbound:loopback", tcp(inbound::loopback_entry)),
+    ("inbound:blackhole", tcp(inbound::blackhole_entry)),
+    ("inbound:freedom", tcp(inbound::freedom_entry)),
+    // tun 恒有键：入口见 `needs_listen_addr == false` 即跳过 sockopt 校验与
+    // port/addr 解析直接分派；非支持平台的值是拒绝臂（错误变体/文案与删除前
+    // cfg(not) 臂逐字一致），与 outbound:tun 同款形态。
+    ("inbound:tun", ctor(inbound::tun_entry, false, None, None)),
 ];
 
 /// 出站构造器**数据源**（纯数据；键格式同 `INBOUND_CTORS`）。
@@ -176,3 +299,5 @@ pub(crate) static OUTBOUND_CTORS: &[(&str, OutboundBuilder)] = &[
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+mod uds_tests;

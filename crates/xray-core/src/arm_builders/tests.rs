@@ -121,8 +121,9 @@ async fn arm_lookup_outbound_entry_builds_every_protocol() {
     }
 }
 
-/// inbound 表完备性 + fn 指针等同：17 协议（含 hysteria 双键别名）的表值必须
-/// 指向对应适配器函数；tun（入口内联处理，不经表分派）与未知协议无键。
+/// inbound 表完备性 + fn 指针等同：19 协议（含 hysteria 双键别名 + tun）的表值必须
+/// 指向对应适配器函数；UDS 形态槽必须恰好登记 5 个裸流 + 4 个 transport 协议
+/// （原手写白名单/inline match 的替代真源）。
 #[test]
 fn arm_lookup_inbound_table_is_complete() {
     use super::{InboundBuilder, inbound as entries};
@@ -148,18 +149,40 @@ fn arm_lookup_inbound_table_is_complete() {
         ("loopback", entries::loopback_entry),
         ("blackhole", entries::blackhole_entry),
         ("freedom", entries::freedom_entry),
+        ("tun", entries::tun_entry),
     ];
     for (protocol, expected) in cases {
         let got = lookup_inbound_builder(protocol)
             .unwrap_or_else(|| panic!("{protocol}: missing from inbound table"));
         assert_eq!(
-            got as usize, *expected as usize,
+            got.stream as usize, *expected as usize,
             "{protocol}: table must map to the expected adapter"
         );
     }
-    // tun inbound 在 spawn_one_inbound 内联处理（持有 TUN 设备的专用构造 / 平台
-    // 拒绝），不经表分派——表内刻意无键。
-    assert!(lookup_inbound_builder("tun").is_none());
+    // UDS 形态槽（bd 7y07s）：裸流 5 协议 / transport 4 协议——原
+    // `UDS_SUPPORTED_PROTOCOLS` 白名单与两处 inline match 的真源。
+    let uds_streams: Vec<&str> = ["socks", "vless", "vmess", "trojan", "shadowsocks"]
+        .into_iter()
+        .filter(|p| lookup_inbound_builder(p).expect("key").uds_stream.is_some())
+        .collect();
+    assert_eq!(uds_streams, ["socks", "vless", "vmess", "trojan", "shadowsocks"]);
+    let uds_transports: Vec<&str> = ["vless", "vmess", "trojan", "shadowsocks"]
+        .into_iter()
+        .filter(|p| lookup_inbound_builder(p).expect("key").uds_transport.is_some())
+        .collect();
+    assert_eq!(uds_transports, ["vless", "vmess", "trojan", "shadowsocks"]);
+    // 其余协议无 UDS 形态（UDS 入口据此显式 Unsupported，不静默回落 TCP）。
+    for protocol in
+        ["mixed", "http", "dokodemo", "dokodemo-door", "anytls", "tuic", "hysteria", "dns"]
+    {
+        let ctor = lookup_inbound_builder(protocol).expect("key");
+        assert!(
+            ctor.uds_stream.is_none() && ctor.uds_transport.is_none(),
+            "{protocol}: 不应有 UDS 形态"
+        );
+    }
+    // tun 自管监听面：不消费 listen 地址（入口不解析 port/addr，平台门控在表值内）。
+    assert!(!lookup_inbound_builder("tun").expect("tun").needs_listen_addr);
     // 未知协议无键 → 入口显式 warn+skip（见 arm_lookup_missing_key_fails_visible）。
     assert!(lookup_inbound_builder("no-such-protocol").is_none());
 }
@@ -187,7 +210,7 @@ async fn arm_lookup_inbound_loopback_entry_matches_table_value() {
     assert!(r1.is_none(), "loopback entry path must be Ok(None)");
     let entry = lookup_inbound_builder("loopback").expect("loopback missing from inbound table");
     let settings = xray_transport::dialer::StreamSettings::from_json(None);
-    let r2 = entry(InboundCtx {
+    let r2 = (entry.stream)(InboundCtx {
         ib: &ib,
         ohm: Arc::new(SimpleOhm::new()),
         policy: None,

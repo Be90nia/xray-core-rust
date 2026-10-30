@@ -1,6 +1,6 @@
 //! 生产装配主路的构造器注册表（W1 切片 1a：arm 构造表并入 xray-frame PluginRegistry）。
 //!
-//! 机制：37 个 arm 构造器（入站 19 键 + 出站 18 键）以**类型擦除载荷**挂在
+//! 机制：38 个 arm 构造器（入站 20 键 + 出站 18 键）以**类型擦除载荷**挂在
 //! [`Plugin`] 实例上注册进 [`PluginRegistry`]；生产查表唯一路径 =
 //! [`lookup_inbound_builder`] / [`lookup_outbound_builder`]（`registry.get(<方向>:<协议>)`
 //! → 载荷下转 → 构造 fn → 调用）。
@@ -32,25 +32,25 @@ use xray_frame::{
     PluginRegistry,
 };
 
-use crate::arm_builders::{INBOUND_CTORS, InboundBuilder, OUTBOUND_CTORS, OutboundBuilder};
+use crate::arm_builders::{INBOUND_CTORS, InboundCtor, OUTBOUND_CTORS, OutboundBuilder};
 
 /// 入站方向前缀（注册表键 = `<前缀><协议>`）。
 const INBOUND_PREFIX: &str = "inbound:";
 /// 出站方向前缀。
 const OUTBOUND_PREFIX: &str = "outbound:";
 
-/// 注册表容量上界（fail-closed）：当前 37 条（入站 19 + 出站 18），留余量给
+/// 注册表容量上界（fail-closed）：当前 38 条（入站 20 + 出站 18），留余量给
 /// 将来并入的 16 个协议 Plugin 条目。
 const REGISTRY_CAP: usize = 64;
 
-/// 构造器载荷：入站/出站两种 HRTB fn 指针。
+/// 构造器载荷：入站条目 / 出站构造 fn。
 ///
 /// `'static` 成立：fn 指针的 `'a` 由 `for<'a>` 绑定（类型内无自由生命周期），
-/// 故本枚举满足 `Any` 约束，可经 `downcast_ref` 还原为具体构造 fn。
+/// 故本枚举满足 `Any` 约束，可经 `downcast_ref` 还原为具体载荷。
 #[derive(Clone, Copy)]
 enum ArmCtor {
-    /// 入站协议臂构造器（`fn(InboundCtx) -> InboundBuildFut`）。
-    Inbound(InboundBuilder),
+    /// 入站协议臂条目（TCP / UDS 裸流 / UDS transport 三种形态，见 [`InboundCtor`]）。
+    Inbound(InboundCtor),
     /// 出站协议臂构造器（`fn(OutboundCtx) -> OutboundResult`）。
     Outbound(OutboundBuilder),
 }
@@ -172,11 +172,11 @@ impl Plugin for ArmEntry {
 /// 生产构造器注册表（唯一构造路径的权威表）。
 static ARM_REGISTRY: LazyLock<PluginRegistry> = LazyLock::new(build_arm_registry);
 
-/// 注册 37 个 arm 构造条目（数据源 = `arm_builders` 的构造器表）并走一遍 deps 门。
+/// 注册 38 个 arm 构造条目（数据源 = `arm_builders` 的构造器表）并走一遍 deps 门。
 fn build_arm_registry() -> PluginRegistry {
     let mut reg = PluginRegistry::new(REGISTRY_CAP).expect("arm registry cap > 0");
-    for (name, builder) in INBOUND_CTORS {
-        reg.register(Arc::new(ArmEntry { name, ctor: ArmCtor::Inbound(*builder) }))
+    for (name, ctor) in INBOUND_CTORS {
+        reg.register(Arc::new(ArmEntry { name, ctor: ArmCtor::Inbound(*ctor) }))
             .expect("arm registry: 入站键唯一（方向前缀）");
     }
     for (name, builder) in OUTBOUND_CTORS {
@@ -213,7 +213,9 @@ fn lookup_ctor(prefix: &str, protocol: &str) -> Option<ArmCtor> {
 }
 
 /// 入站构造器查表（未命中 = 未支持协议，入口显式 warn+skip）。
-pub(crate) fn lookup_inbound_builder(protocol: &str) -> Option<InboundBuilder> {
+///
+/// 返回整条目：调用方按 listen 形态取 `stream` / `uds_stream` / `uds_transport`。
+pub(crate) fn lookup_inbound_builder(protocol: &str) -> Option<InboundCtor> {
     match lookup_ctor(INBOUND_PREFIX, protocol)? {
         ArmCtor::Inbound(builder) => Some(builder),
         ArmCtor::Outbound(_) => None,
@@ -240,7 +242,8 @@ mod tests {
     use super::*;
     use crate::{
         arm_builders::{
-            InboundCtx, OutboundResult, inbound as in_entries, outbound as out_entries,
+            InboundBuilder, InboundCtx, OutboundResult, inbound as in_entries,
+            outbound as out_entries,
         },
         inbound::spawn_one_inbound,
         outbound::build_protocol_handler,
@@ -339,6 +342,7 @@ mod tests {
             "loopback" => in_entries::loopback_entry,
             "blackhole" => in_entries::blackhole_entry,
             "freedom" => in_entries::freedom_entry,
+            "tun" => in_entries::tun_entry,
             _ => return None,
         })
     }
@@ -367,7 +371,7 @@ mod tests {
         })
     }
 
-    /// 注册表键空间自检：37 条、方向前缀唯一、无裸协议名（为 16 个协议 Plugin 留位）。
+    /// 注册表键空间自检：38 条、方向前缀唯一、无裸协议名（为 16 个协议 Plugin 留位）。
     #[test]
     fn registry_keyspace_is_direction_prefixed_and_unique() {
         assert_eq!(ARM_REGISTRY.len(), INBOUND_CTORS.len() + OUTBOUND_CTORS.len());
@@ -404,8 +408,8 @@ mod tests {
             let old = INBOUND_CTORS.iter().find(|(n, _)| *n == *name).map(|(_, b)| *b);
             let expected = expected_inbound(protocol);
             comparisons += 1;
-            let a = new.map(|f| f as usize);
-            let b = old.map(|f| f as usize);
+            let a = new.map(|f| f.stream as usize);
+            let b = old.map(|f| f.stream as usize);
             let c = expected.map(|f| f as usize);
             if a != b || a != c {
                 diffs += 1;
@@ -506,7 +510,7 @@ mod tests {
             .expect("entry spawn");
         let entry = lookup_inbound_builder("loopback").expect("loopback 必须在注册表内");
         let settings = xray_transport::dialer::StreamSettings::from_json(None);
-        let r2 = entry(InboundCtx {
+        let r2 = (entry.stream)(InboundCtx {
             ib: &ib,
             ohm: Arc::new(SimpleOhm::new()),
             policy: None,
@@ -526,8 +530,11 @@ mod tests {
     fn unknown_protocol_is_absent() {
         assert!(lookup_inbound_builder("no-such-protocol").is_none());
         assert!(lookup_outbound_builder("no-such-protocol").is_none());
-        // tun 入站在入口内联处理（平台专用），不经表分派 → 注册表内刻意无键。
-        assert!(lookup_inbound_builder("tun").is_none());
+        // tun 入站有键（bd 7y07s 起经表分派）：条目自报不消费 listen 地址，入口据此
+        // 跳过 sockopt 校验与 port/addr 解析，平台门控在表值 tun_entry 内。
+        let tun = lookup_inbound_builder("tun").expect("tun 必须在注册表内");
+        assert!(!tun.needs_listen_addr, "tun 自管监听面，不消费 listen 地址");
+        assert!(tun.uds_stream.is_none() && tun.uds_transport.is_none(), "tun 无 UDS 形态");
     }
 
     /// L5 门自查（装配期 fail-visible）：缺 deps / 成环 / 缺配置段三情形。

@@ -572,6 +572,20 @@ pub struct Shadowsocks2022User {
     pub level: u8,
 }
 
+/// SS-2022 中继产物中的下一跳。对应 Go `shadowsocks_2022.RelayDestination`
+/// （config.proto）+ `buildShadowsocks2022` relay 分支（shadowsocks.go:160-178）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shadowsocks2022RelayDestination {
+    /// 下一跳用户 PSK（base64，= `users[].password`）。
+    pub key: String,
+    pub email: String,
+    /// 下一跳地址（Go `user.Address.Build()`）。
+    pub address: Address,
+    /// 下一跳端口。
+    pub port: u16,
+    pub level: u8,
+}
+
 /// 旧 AEAD 产物中的用户。对应 Go `shadowsocks.Account`（shadowsocks.go:72-87）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowsocksAeadUser {
@@ -582,8 +596,7 @@ pub struct ShadowsocksAeadUser {
 }
 
 /// [`ShadowsocksInboundSettings::build`] 产物。对应 Go
-/// `ShadowsocksServerConfig.Build()` 的三条输出路径（shadowsocks.go:53-179）；
-/// Relay 分支（:160-178）未实装，命中时显式报错。
+/// `ShadowsocksServerConfig.Build()` 的四条输出路径（shadowsocks.go:53-179）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShadowsocksServerBuild {
     /// Go `shadowsocks_2022.ServerConfig` 单用户（:116-123，不校验 key 非空）。
@@ -593,6 +606,13 @@ pub enum ShadowsocksServerBuild {
         method: String,
         key: String,
         users: Vec<Shadowsocks2022User>,
+        network: Option<NetworkList>,
+    },
+    /// Go `shadowsocks_2022.RelayServerConfig`（:160-178，中继/多跳）。
+    Ss2022Relay {
+        method: String,
+        key: String,
+        destinations: Vec<Shadowsocks2022RelayDestination>,
         network: Option<NetworkList>,
     },
     /// Go `shadowsocks.ServerConfig` 旧 AEAD（:64-110）。`users` 为空 Vec 对应
@@ -605,7 +625,7 @@ impl ShadowsocksInboundSettings {
     /// `buildShadowsocks2022`（:115-179）。错误文案与 Go 对齐。
     ///
     /// # Errors
-    /// - 多用户 2022 非 aes 方法 / 用户带 method / relay（未实装）
+    /// - 多用户/中继 2022 非 aes 方法 / 用户带 method / 中继用户缺 address
     /// - 旧 AEAD 密码为空、cipher 不支持或未知
     pub fn build(&self) -> crate::error::Result<ShadowsocksServerBuild> {
         // Go :56-58：clients 非 nil 覆盖 users（含空切片）。
@@ -628,8 +648,8 @@ impl ShadowsocksInboundSettings {
         }
     }
 
-    /// Go `buildShadowsocks2022` 多用户分支（:125-157；:125-127 空 method 检查在
-    /// Go 不可达——空 method 不会命中 2022 分流——故不复刻）。
+    /// Go `buildShadowsocks2022` 多用户 + 中继分支（:125-178；:125-127 空 method
+    /// 检查在 Go 不可达——空 method 不会命中 2022 分流——故不复刻）。
     ///
     /// `method` 传**已小写化**的 method（Go `v.Cipher` 在进本分支前已 ToLower）。
     fn build_ss2022_multi(
@@ -643,11 +663,36 @@ impl ShadowsocksInboundSettings {
                 "shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported".into(),
             ));
         }
-        // Go :132：users[0].Address 决定 multi vs relay；relay 未实装（non-goal）。
+        // Go :132：users[0].Address 决定 multi vs relay。
         if users[0].address.is_some() {
-            return Err(crate::error::ConfError::Invalid(
-                "shadowsocks 2022 (relay): relay server is not supported yet".into(),
-            ));
+            let mut destinations = Vec::with_capacity(users.len());
+            for user in users {
+                // Go :165-167：中继用户 method 必须为空。
+                if user.method.as_deref().is_some_and(|m| !m.is_empty()) {
+                    return Err(crate::error::ConfError::Invalid(
+                        "shadowsocks 2022 (relay): users must have empty method".into(),
+                    ));
+                }
+                // Go :168-170：中继每个用户都必须有下一跳地址。
+                let address = user.address.clone().ok_or_else(|| {
+                    crate::error::ConfError::Invalid(
+                        "shadowsocks 2022 (relay): all users must have relay address".into(),
+                    )
+                })?;
+                destinations.push(Shadowsocks2022RelayDestination {
+                    key: user.password.clone().unwrap_or_default(),
+                    email: user.email.clone().unwrap_or_default(),
+                    address,
+                    port: user.port.unwrap_or(0),
+                    level: user.level.unwrap_or(0),
+                });
+            }
+            return Ok(ShadowsocksServerBuild::Ss2022Relay {
+                method: method.to_string(),
+                key: self.password.clone().unwrap_or_default(),
+                destinations,
+                network: self.network.clone(),
+            });
         }
         let mut out = Vec::with_capacity(users.len());
         for user in users {
@@ -1723,6 +1768,53 @@ mod tests {
         }
     }
 
+    /// Go `buildShadowsocks2022` relay 分支（shadowsocks.go:160-178）：
+    /// `users[0].address` 非空 → `RelayServerConfig`，每 user 成一条下一跳。
+    #[test]
+    fn shadowsocks_inbound_2022_relay_builds_destinations() {
+        let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"c2VydmVy",
+            "users":[{"password":"dXNlcjE=","address":"1.2.3.4","port":8388,"email":"a@b","level":2},
+                     {"password":"dXNlcjI=","address":"ex.com","port":9000}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022Relay { method, key, destinations, .. } => {
+                assert_eq!(method, "2022-blake3-aes-256-gcm");
+                assert_eq!(key, "c2VydmVy");
+                assert_eq!(destinations.len(), 2);
+                assert_eq!(destinations[0].key, "dXNlcjE=");
+                assert_eq!(destinations[0].address, Address("1.2.3.4".into()));
+                assert_eq!(destinations[0].port, 8388);
+                assert_eq!(destinations[0].email, "a@b");
+                assert_eq!(destinations[0].level, 2);
+                assert_eq!(destinations[1].address, Address("ex.com".into()));
+                assert_eq!(destinations[1].port, 9000);
+            },
+            other => panic!("expected Ss2022Relay, got {other:?}"),
+        }
+    }
+
+    /// Go :168-170：relay 分支里任一 user 缺 address → 显式错误（不静默跳过）。
+    #[test]
+    fn shadowsocks_inbound_2022_relay_missing_address_errors() {
+        let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"c2VydmVy",
+            "users":[{"password":"dXNlcjE=","address":"1.2.3.4","port":8388},
+                     {"password":"dXNlcjI=","port":9000}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("all users must have relay address"), "got: {err}");
+    }
+
+    /// Go :165-167：relay 分支用户级 method 必须为空。
+    #[test]
+    fn shadowsocks_inbound_2022_relay_user_method_rejected() {
+        let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"c2VydmVy",
+            "users":[{"password":"dXNlcjE=","address":"1.2.3.4","port":8388,
+                      "method":"aes-128-gcm"}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        let err = s.build().unwrap_err().to_string();
+        assert!(err.contains("users must have empty method"), "got: {err}");
+    }
+
     #[test]
     fn shadowsocks_outbound_uot_uot_version_round_trip() {
         // servers[0] 携带 uot/uotVersion → Ss2022 产物字段映射（Go :243-244）。
@@ -1800,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn shadowsocks_inbound_single_2022_and_relay_rejected() {
+    fn shadowsocks_inbound_single_2022_and_relay_builds() {
         // 无 users → shadowsocks_2022.ServerConfig 单用户（Go :116-123）。
         let raw = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=","email":"s@x"}"#;
         let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
@@ -1812,12 +1904,19 @@ mod tests {
             },
             other => panic!("expected Ss2022Single, got {other:?}"),
         }
-        // users[0].address 存在 → relay 分支（non-goal，显式报错）。
+        // users[0].address 存在 → relay 分支（Go :160-178，产出下一跳表）。
         let relay = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=",
             "users":[{"password":"dXNlcg==","address":"127.0.0.1","port":8389}]}"#;
         let s: ShadowsocksInboundSettings = serde_json::from_str(relay).unwrap();
-        let err = s.build().unwrap_err().to_string();
-        assert!(err.contains("relay"), "got: {err}");
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022Relay { key, destinations, .. } => {
+                assert_eq!(key, "aGk=");
+                assert_eq!(destinations.len(), 1);
+                assert_eq!(destinations[0].key, "dXNlcg==");
+                assert_eq!(destinations[0].port, 8389);
+            },
+            other => panic!("expected Ss2022Relay, got {other:?}"),
+        }
         // 多用户用户级 method 必须为空（Go :141-143）。
         let with_method = r#"{"method":"2022-blake3-aes-256-gcm","password":"aGk=",
             "users":[{"password":"dXNlcg==","method":"aes-256-gcm"}]}"#;

@@ -1,10 +1,10 @@
 //! inbound 协议臂构造函数（T4.2 phase 1 抽臂）。
 //!
 //! 每个 [`crate::inbound::spawn_one_inbound`] match 臂的构造逻辑原样搬迁至此。
-//! unix（UDS）变体的 5 个臂（socks/vless/vmess/trojan/shadowsocks）serve 栈不同
-//! （`serve_unix_listener` + per-conn closure），无法在行为零变化前提下与 TCP 臂
-//! 合并成同一构造函数，维持原状（见报告）；其协议构造逻辑经 `crate::inbound`
-//! 同一批具名解析函数与本模块共享，无第二份副本。
+//! UDS 形态（T4.2 W2 / bd 7y07s）同样在此：`UnixInboundCtx`/`UnixTransportCtx`
+//! 两类 ctx + 每协议一个构造器，由 [`crate::arm_builders::INBOUND_CTORS`] 的
+//! `uds_stream`/`uds_transport` 槽登记——「协议 → 可构造监听形态」单源，入口不再
+//! 有内联 match 或手写白名单。
 
 use std::sync::Arc;
 
@@ -24,22 +24,24 @@ use xray_proxy_loopback::LoopbackHandler;
 use xray_proxy_trojan::serve_trojan;
 use xray_proxy_vless::{Validator as VlessValidator, VlessInboundOptions, serve_vless};
 use xray_proxy_vmess::serve_vmess;
-use xray_transport::system_listener::InboundTcpListener;
+// Connection trait：UDS 臂的 per-conn 闭包要调 `conn.remote_addr()`（trait 方法）。
+use xray_transport::{connection::Connection as _, system_listener::InboundTcpListener};
 
 use crate::{
     inbound::{
-        DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, build_tls_acceptor,
-        build_trojan_fallbacks, build_trojan_users, build_vless_decryption, build_vless_fallbacks,
-        build_vless_validator, build_vmess_validator, handshake_timeout_for, inbound_tcpmask,
-        inbound_udpmask, is_transport_listener_protocol, parse_anytls_tls_acceptor,
-        parse_blackhole_inbound_response, parse_dns_inbound_config, parse_dokodemo_settings,
-        parse_freedom_inbound_dest, parse_http_config, parse_hysteria_inbound_config,
-        parse_loopback_config, parse_naive_inbound_settings, parse_reality_config,
-        parse_socks_http_configs, parse_socks_server_config, parse_ss_inbound_config,
-        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_ss_user_manager,
-        serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http, serve_mixed,
-        serve_reality_trojan, serve_reality_vless, serve_ss, spawn_inbound_serve,
-        spawn_transport_listener_inbound, ss_mode_conn_pipeline, transport_conn_addrs,
+        DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, PeekAhead, SsInboundMode,
+        build_tls_acceptor, build_trojan_fallbacks, build_trojan_users, build_vless_decryption,
+        build_vless_fallbacks, build_vless_validator, build_vmess_validator, handshake_timeout_for,
+        inbound_tcpmask, inbound_udpmask, is_transport_listener_protocol,
+        parse_anytls_tls_acceptor, parse_blackhole_inbound_response, parse_dns_inbound_config,
+        parse_dokodemo_settings, parse_freedom_inbound_dest, parse_http_config,
+        parse_hysteria_inbound_config, parse_loopback_config, parse_naive_inbound_settings,
+        parse_reality_config, parse_socks_http_configs, parse_socks_server_config,
+        parse_ss_inbound_config, parse_tuic_inbound_config, parse_wireguard_inbound_config,
+        register_ss_user_manager, serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http,
+        serve_mixed, serve_mixed_conn, serve_reality_trojan, serve_reality_vless, serve_ss,
+        serve_unix_listener, spawn_inbound_serve, spawn_transport_listener_inbound,
+        ss_legacy_pipeline, ss_mode_conn_pipeline, transport_conn_addrs,
     },
     outbound::dns_idle_timeout_for,
 };
@@ -948,10 +950,364 @@ pub(crate) fn ss_transport_on_conn(
     }))
 }
 
+// ============ T4.2 W2：UDS 形态构造器（同一张表的 uds_stream / uds_transport 槽） ============
+//
+// 表条目把「协议 → 可构造监听形态」收成单源；本节 9 个构造器就是删除前
+// `spawn_unix_inbound` / `spawn_unix_transport_inbound` 内联 match 的逐臂搬迁
+// （臂内逻辑、日志文案、错误变体与拆分前逐字一致）。UDS listener / 默认 handler
+// 由入口绑定后经 ctx 传入，且 ctx 类型不含平台专属类型（listener 走
+// `dyn SystemListener`、连接走 `Box<dyn Connection>`），故本节与非 unix 平台同源
+// 编译——非 unix 平台永不调用（`spawn_unix_inbound` 有 Unsupported 拒绝臂）。
+
+/// UDS 无 SocketAddr；对齐 Go `UnixConnWrapper.RemoteAddr` 的 `0.0.0.0:0`
+/// （TCP 侧同位置传 bind 地址）。
+fn uds_fallback_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+}
+
+/// socks over UDS：与 TCP 走同一份 mixed 复合栈（bd q2crg：socks 端口的 HTTP
+/// fallback 与传输层无关，Go `proxy/socks/server.go:38-43` 无条件挂 httpServer）。
+pub(crate) fn unix_socks_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixServe> {
+    let UnixInboundCtx { ib, policy, listen, listener, handler, plugin_ctx, .. } = ctx;
+    let (config, http_cfg) = parse_socks_http_configs(&ib.entry.data)?;
+    let config = Arc::new(config);
+    let http_cfg = Arc::new(http_cfg);
+    let handshake_timeout = Some(handshake_timeout_for(policy, config.user_level));
+    let udp_idle = policy
+        .as_ref()
+        .map(|pm| pm.policy_for_level(config.user_level).timeout.connection_idle)
+        .unwrap_or(xray_features::policy::TimeoutPolicy::default().connection_idle);
+    tracing::info!(
+        tag = %ib.tag,
+        path = %listen,
+        "socks5 (uds) inbound listening (http proxy fallback on non-SOCKS first byte)"
+    );
+    Ok(Box::pin(serve_unix_listener(listener, {
+        let handler = Arc::clone(&handler);
+        Arc::new(move |conn| {
+            let handler = Arc::clone(&handler);
+            let config = Arc::clone(&config);
+            let http_cfg = Arc::clone(&http_cfg);
+            // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+            let task_ctx = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    let peer = conn.remote_addr().ok().flatten().unwrap_or(uds_fallback_addr());
+                    serve_mixed_conn(
+                        PeekAhead::new(conn),
+                        peer,
+                        config,
+                        http_cfg,
+                        handshake_timeout,
+                        udp_idle,
+                        handler,
+                        task_ctx,
+                    )
+                    .await;
+                })
+                .expect("arm FxScope is never closed");
+        })
+    })))
+}
+
+/// vless over UDS（裸流；transport 形态见 [`unix_vless_transport`]）。
+pub(crate) fn unix_vless_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixServe> {
+    let UnixInboundCtx { ib, listener, handler, plugin_ctx, .. } = ctx;
+    let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+    let decryption = build_vless_decryption(&ib.entry.data, plugin_ctx.clone())?;
+    let options = VlessInboundOptions { decryption: decryption.clone(), ..Default::default() };
+    let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
+    tracing::info!(
+        tag = %ib.tag,
+        users = validator.get_uuid_count(),
+        "vless (uds) inbound listening"
+    );
+    Ok(Box::pin(serve_unix_listener(listener, {
+        let handler = Arc::clone(&handler);
+        Arc::new(move |conn| {
+            let handler = Arc::clone(&handler);
+            let validator = Arc::clone(&validator);
+            let fallbacks = fallbacks.clone();
+            let options = options.clone();
+            // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+            let task_ctx = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    let _ctx = task_ctx;
+                    let (peer, local) = transport_conn_addrs(conn.as_ref(), uds_fallback_addr());
+                    if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
+                        conn,
+                        &handler,
+                        &validator,
+                        fallbacks,
+                        peer,
+                        local,
+                        String::new(),
+                        String::new(),
+                        Some(options),
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::info!(
+                            peer = %peer,
+                            error = %e,
+                            "vless (uds) connection ended with error"
+                        );
+                    }
+                })
+                .expect("arm FxScope is never closed");
+        })
+    })))
+}
+
+/// vmess over UDS（裸流；transport 形态见 [`unix_vmess_transport`]）。
+pub(crate) fn unix_vmess_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixServe> {
+    let UnixInboundCtx { ib, policy, settings, listener, handler, plugin_ctx, .. } = ctx;
+    let validator = build_vmess_validator(&ib.entry.data)?;
+    let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+    // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
+    let is_drain = !settings.is_tls();
+    tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Box::pin(serve_unix_listener(listener, {
+        let handler = Arc::clone(&handler);
+        Arc::new(move |conn| {
+            let handler = Arc::clone(&handler);
+            let validator = Arc::clone(&validator);
+            let history = Arc::clone(&history);
+            // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+            let task_ctx = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    let _ctx = task_ctx;
+                    let (peer, _local) = transport_conn_addrs(conn.as_ref(), uds_fallback_addr());
+                    if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
+                        conn, &handler, &validator, &history, is_drain, hs_timeout,
+                    )
+                    .await
+                    {
+                        tracing::info!(
+                            peer = %peer,
+                            error = %e,
+                            "vmess (uds) connection ended with error"
+                        );
+                    }
+                })
+                .expect("arm FxScope is never closed");
+        })
+    })))
+}
+
+/// trojan over UDS（裸流；transport 形态见 [`unix_trojan_transport`]）。
+pub(crate) fn unix_trojan_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixServe> {
+    let UnixInboundCtx { ib, policy, listener, handler, plugin_ctx, .. } = ctx;
+    let users = build_trojan_users(&ib.entry.data)?;
+    let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
+    let validator = Arc::new(xray_proxy_trojan::Validator::new());
+    for (_, user) in users {
+        if let Err(e) = validator.add(user) {
+            tracing::warn!(error = %e, "skip duplicate user during trojan uds inbound init");
+        }
+    }
+    tracing::info!(tag = %ib.tag, "trojan (uds) inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Box::pin(serve_unix_listener(listener, {
+        let handler = Arc::clone(&handler);
+        Arc::new(move |conn| {
+            let handler = Arc::clone(&handler);
+            let validator = Arc::clone(&validator);
+            let fallbacks = fallbacks.clone();
+            // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+            let task_ctx = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    let _ctx = task_ctx;
+                    let (peer, local) = transport_conn_addrs(conn.as_ref(), uds_fallback_addr());
+                    xray_proxy_trojan::serve_trojan_conn(
+                        conn,
+                        validator,
+                        handler,
+                        fallbacks,
+                        peer,
+                        local,
+                        String::new(),
+                        String::new(),
+                        hs_timeout,
+                    )
+                    .await;
+                })
+                .expect("arm FxScope is never closed");
+        })
+    })))
+}
+
+/// shadowsocks over UDS（裸流；transport 形态见 [`unix_shadowsocks_transport`]）。
+///
+/// shortcut: 仅 legacy AEAD 模式支持 UDS；ss2022 在 bind 前显式 Unsupported
+/// （对齐删除前的臂内拒绝，Go 侧的 UDS 支持面待单独对拍）。
+pub(crate) fn unix_shadowsocks_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixServe> {
+    let UnixInboundCtx { ib, policy, listener, handler, plugin_ctx, .. } = ctx;
+    let inbound = match parse_ss_inbound_config(&ib.entry.data)? {
+        SsInboundMode::Legacy(ss_ib) => ss_ib,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("uds inbound '{}': ss2022 not supported over unix socket", ib.tag),
+            ));
+        },
+    };
+    tracing::info!(tag = %ib.tag, "shadowsocks (uds) inbound listening");
+    let hs_timeout = handshake_timeout_for(policy, 0);
+    Ok(Box::pin(serve_unix_listener(listener, {
+        let handler = Arc::clone(&handler);
+        Arc::new(move |conn| {
+            let handler = Arc::clone(&handler);
+            let inbound = Arc::clone(&inbound);
+            // scope 生命周期锚：连接任务存活期间 arm scope 不 drop
+            let task_ctx = Arc::clone(&plugin_ctx);
+            plugin_ctx
+                .spawn(async move {
+                    let _ctx = Arc::clone(&task_ctx);
+                    ss_legacy_pipeline(inbound, handler, conn, hs_timeout, Arc::clone(&task_ctx))
+                        .await;
+                })
+                .expect("arm FxScope is never closed");
+        })
+    })))
+}
+
+// ---- UDS 上的 transport 协议：per-conn 构造（与 TCP 分支同一批 on_conn 构造函数） ----
+
+/// vless + transport 协议 over UDS（ws/grpc/kcp/httpupgrade/splithttp）。
+pub(crate) fn unix_vless_transport(
+    ctx: UnixTransportCtx<'_>,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let validator: Arc<dyn VlessValidator> = build_vless_validator(&ctx.ib.entry.data)?;
+    // L2 能力句柄：与 UDS 裸流分支同源（arm_plugin_ctx 派发点构造）。
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ctx.ib.entry.kind.as_str());
+    if let Some(api) = ctx.api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+    }
+    let decryption = build_vless_decryption(&ctx.ib.entry.data, Arc::new(ctx_builder))?;
+    let options = VlessInboundOptions {
+        decryption: decryption.clone(),
+        handshake_timeout: Some(handshake_timeout_for(ctx.policy, 0)),
+        ..Default::default()
+    };
+    vless_transport_on_conn(
+        ctx.ib,
+        ctx.ohm,
+        ctx.settings,
+        validator,
+        options,
+        uds_fallback_addr(),
+        ctx.ident,
+    )
+}
+
+/// trojan + transport 协议 over UDS。
+pub(crate) fn unix_trojan_transport(
+    ctx: UnixTransportCtx<'_>,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let users = build_trojan_users(&ctx.ib.entry.data)?;
+    let fallbacks = build_trojan_fallbacks(&ctx.ib.entry.data)?;
+    trojan_transport_on_conn(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.settings,
+        users,
+        fallbacks,
+        uds_fallback_addr(),
+        ctx.ident,
+    )
+}
+
+/// vmess + transport 协议 over UDS。
+pub(crate) fn unix_vmess_transport(
+    ctx: UnixTransportCtx<'_>,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    let validator = build_vmess_validator(&ctx.ib.entry.data)?;
+    vmess_transport_on_conn(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.settings,
+        validator,
+        uds_fallback_addr(),
+        ctx.ident,
+    )
+}
+
+/// shadowsocks + transport 协议 over UDS。
+pub(crate) fn unix_shadowsocks_transport(
+    ctx: UnixTransportCtx<'_>,
+) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
+    ss_transport_on_conn(ctx.ib, ctx.ohm, ctx.policy, ctx.api, ctx.settings, ctx.ident)
+}
+
+// ---- tun：自管监听面（不消费 TCP 地址，入口见 needs_listen_addr=false 直接分派） ----
+
+/// tun inbound。Windows 侧设备（tun-rs wintun）、netstack（smoltcp）、路由/DNS
+/// （sysroute）、WFP 泄漏阻断均已实现并真机验证（bd cv3w/ijn7），故与 Go
+/// `tun_windows.go` 对齐开放。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+pub(crate) fn tun_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
+    Box::pin(async move {
+        let options = crate::inbound::parse_tun_inbound_config(&ctx.ib.entry.data)?;
+        let dispatch = ctx.ohm.get_default_handler().ok_or_else(|| {
+            std::io::Error::other("tun inbound requires a default outbound handler")
+        })?;
+        let handler = xray_proxy_tun::TunInboundHandler::new(&ctx.ib.tag, options, dispatch)
+            .await
+            .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
+        tracing::info!(tag = %ctx.ib.tag, "tun inbound listening");
+        // W4 面 6 例外登记（方案 §2 面 6「不可迁残余 1」）：本构造对外**返回
+        // JoinHandle**（调用方 InboundRuntime 契约），改为 scope 托管 = 改公开
+        // 契约 + 4 平台门控臂（linux/android/freebsd/windows），收益（1 处 spawn
+        // 记账）远小于风险 → 保留裸 spawn，逐点理由登记。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留"
+        )]
+        let handle = tokio::spawn(async move {
+            if let Err(e) = handler.start().await {
+                tracing::error!(error = ?e, "tun inbound stopped");
+            }
+        });
+        Ok(Some(handle))
+    })
+}
+
+/// 非 tun 支持平台：拒绝臂（错误变体/文案与删除前 `cfg(not)` 臂逐字一致）。
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+)))]
+pub(crate) fn tun_entry<'a>(_ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
+    Box::pin(async move {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TUN inbound is only supported on Linux/Android/FreeBSD/Windows",
+        ))
+    })
+}
+
 // ============ T4.2 phase 2：查表入口适配器（表值 → phase 1 同一构造函数） ============
 // 适配器只做参数解包转发；两路等价性测试见 arm_builders::tests。
 
-use crate::arm_builders::{InboundBuildFut, InboundCtx};
+use crate::arm_builders::{
+    InboundBuildFut, InboundCtx, UnixInboundCtx, UnixServe, UnixTransportCtx,
+};
 
 pub(crate) fn socks_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
     Box::pin(build_socks_inbound(
