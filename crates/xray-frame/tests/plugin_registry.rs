@@ -2,7 +2,11 @@
 //! ①deps 反序 ②缺依赖 ③成环 ④重名 ⑤容量（含 new(0)）⑥无依赖稳定注册序。
 //! 不启动任何生命周期钩子（P0-4 非目标隔离）。
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use xray_frame::{
     PluginError, PluginRegistry,
@@ -107,6 +111,24 @@ fn two_node_cycle_reports_both_names() {
         Err(other) => panic!("expected CyclicDep, got {other:?}"),
         Ok(_) => panic!("expected CyclicDep, got Ok"),
     }
+}
+
+/// ③b 成环必须**有限时间**返回 `CyclicDep`：`start_order` 的轮数上界保证「成环
+/// 分支被去掉」的变异体以断言失败退出，而不是在 `find` 恒 None 下无限循环
+/// （挂死型红不可观测）。工作线程 + 超时把「挂死」和「panic」都变成可断言的失败。
+#[test]
+fn two_node_cycle_returns_within_bounded_time() {
+    let mut reg = PluginRegistry::new(8).expect("cap ok");
+    reg.register(stub("a", &[PluginDep { name: "b" }])).expect("first");
+    reg.register(stub("b", &[PluginDep { name: "a" }])).expect("second");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(matches!(reg.start_order(), Err(PluginError::CyclicDep { .. })));
+    });
+    let reported_cycle = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("成环必须在有限时间内返回（挂死或 panic 均算失败）");
+    assert!(reported_cycle, "成环 → CyclicDep");
 }
 
 /// ④重名不覆盖：第二个同名 → Duplicate，注册表不扩容不覆盖。

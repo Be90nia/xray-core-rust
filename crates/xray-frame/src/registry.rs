@@ -68,31 +68,31 @@ impl PluginRegistry {
         }
 
         // 每轮扫「依赖已全部排程」的**最小注册序位** → 同层稳定按注册序。
+        // 轮数上界 = n：每轮必推进一个节点，n 轮内必收敛；显式上界使「成环分支
+        // 被去掉」的变异体以断言失败退出，而不是在 `find` 恒 None 下空转挂死。
         let n = self.plugins.len();
         let mut scheduled = vec![false; n];
         let mut order = Vec::with_capacity(n);
-        while order.len() < n {
-            let picked = self.plugins.iter().enumerate().find(|(i, plugin)| {
+        for _ in 0..n {
+            let Some((i, plugin)) = self.plugins.iter().enumerate().find(|(i, plugin)| {
                 !scheduled[*i] && plugin.deps().iter().all(|dep| scheduled[self.index[dep.name]])
-            });
-            match picked {
-                Some((i, plugin)) => {
-                    scheduled[i] = true;
-                    order.push(Arc::clone(plugin));
-                },
+            }) else {
                 // 无可排程节点：残留集即环链（含环全体 + 环下游）。
-                None => {
-                    let cycle = self
-                        .plugins
-                        .iter()
-                        .zip(&scheduled)
-                        .filter(|&(_, &done)| !done)
-                        .map(|(plugin, _)| plugin.name().to_string())
-                        .collect();
-                    return Err(PluginError::CyclicDep { cycle });
-                },
-            }
+                let cycle = self
+                    .plugins
+                    .iter()
+                    .zip(&scheduled)
+                    .filter(|&(_, &done)| !done)
+                    .map(|(plugin, _)| plugin.name().to_string())
+                    .collect();
+                return Err(PluginError::CyclicDep { cycle });
+            };
+            scheduled[i] = true;
+            order.push(Arc::clone(plugin));
         }
+        // 上界耗尽仍有节点未排程 = 出现了无进展轮（只可能来自绕过上方成环分支
+        // 的代码腐化）。用 assert 而非 debug_assert：release 下也宁可炸，不静默返半序。
+        assert_eq!(order.len(), n, "start_order: 上界内未排完全部节点（无进展轮绕过了成环分支）");
         Ok(order)
     }
 
