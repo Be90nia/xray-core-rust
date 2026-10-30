@@ -68,6 +68,20 @@ def head_sha():
     return cp.stdout.strip()
 
 
+# 影响二进制的路径：这些一改就必须等新 CI 绿（工具/文档/报告改动不影响产物）。
+SRC_PATHS = ("crates/", "vendor/", "protos/", "Cargo.toml", "Cargo.lock",
+             "rust-toolchain.toml", "build.rs", ".github/")
+
+
+def source_equivalent(green_sha, local_sha):
+    """绿 run 的 sha 与 HEAD 之间是否只差非源码文件（tools/docs/reports）。"""
+    cp = sh(["git", "diff", "--name-only", green_sha, local_sha], cwd=ROOT)
+    if cp.returncode != 0:
+        return False
+    changed = [l for l in cp.stdout.split() if l.strip()]
+    return not any(c.startswith(SRC_PATHS) for c in changed)
+
+
 def download_artifact(run_id, name, dest_dir):
     # artifact 有几十 MB，CN 网络下 `gh run download` 常半路 wsarecv 超时：
     # 单次失败不代表产物有问题——重试 3 次，每次清掉半截目录。
@@ -201,9 +215,16 @@ def main():
     sha = run["head_sha"]
     local = head_sha()
     print(f"[ci] run={run['id']} sha={sha[:8]} 本地HEAD={local[:8]}")
-    if sha != local and not args.smoke:
-        print("[fatal] CI 绿的不是当前 HEAD——先让 CI 跑绿本次改动（避免测旧产物出假结论）")
-        return 2
+    if sha != local:
+        if source_equivalent(sha, local):
+            print(f"[ci] 绿 run 比 HEAD 旧（{sha[:8]} -> {local[:8]}），但差异只在"
+                  f"非源码路径（tools/docs/reports）——产物等价，放行")
+        elif not args.smoke:
+            print("[fatal] 绿 run 与 HEAD 存在**源码差异**——先让 CI 跑绿本次改动"
+                  "（避免测旧产物出假结论）")
+            return 2
+        else:
+            print("[smoke] 源码不平，仅作管路自检")
 
     # ② 下载 artifacts
     tmp = tempfile.mkdtemp(prefix="xray-ci-")
