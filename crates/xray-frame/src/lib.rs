@@ -58,6 +58,14 @@ pub mod redline;
 // 两级 scope 模型（面 6 · 能力收敛方案 §2 面 6）：arm scope → connection
 // scope（表达 mux link 的跨连接生命周期）。
 pub mod scope;
+// 派生件 1（bd h4bl5）：serveStale 缓存——udf `std_ext::cache::SyncTtlCache` 之上
+// 组合包装「过期保留读 + 同 key 刷新 single-flight」。
+pub mod cache;
+// 装配状态环（唯一路径）：Reducer/EffectBuf/compose/journal 三族的生产消费点。
+pub mod state_loop;
+// 派生件 2（bd h4bl5）：UUIDv4 凭据 id 值面——udf `std_ext::id::RandomId`
+// 之上组合包装「位面归一化 + 严格 v4 解析」。
+pub mod uuid;
 
 pub use assembly::{Framework, FrameworkBuilder, FrameworkOptions};
 pub use audit::{AuditHandle, AuditRecord, DEFAULT_AUDIT_RING_CAP};
