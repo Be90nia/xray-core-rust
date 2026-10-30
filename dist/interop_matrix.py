@@ -73,8 +73,15 @@ def build(proto, P, rust_client):
     return si, co
 
 def kill():
-    subprocess.run(['cmd', '/c', 'taskkill /F /IM xray.exe'], capture_output=True, timeout=5)
-    subprocess.run(['cmd', '/c', 'taskkill /F /IM xray-go.exe'], capture_output=True, timeout=5)
+    # 本机 taskkill 实测 0.9–3.4s、偶发 >5s（并发编译/杀毒扫描时更慢）；5s 直接抛
+    # TimeoutExpired 会让整个矩阵半路崩掉（2026-10-30 实测崩在第 3 例）。
+    # 与 bd fjbit 对 interop_hysteria 的修法一致：给 20s、失败只警告不中断
+    # （真杀不掉会让后续 bind 失败并写进该例日志，不会静默）。
+    for name in ('xray.exe', 'xray-go.exe'):
+        try:
+            subprocess.run(['cmd', '/c', f'taskkill /F /IM {name}'], capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            print(f'[WARN] taskkill {name} 超时 20s，继续（后续 bind 失败会写进用例日志）')
 
 def run_one(idx, proto, server_bin, client_bin, tag):
     P = 18100 + idx * 2
