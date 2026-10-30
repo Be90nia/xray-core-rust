@@ -1227,7 +1227,9 @@ mod tests {
         // （取时走 clock 端口，裸 Instant::now 被 lint 禁）
         let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
         loop {
-            if !logs.lock().expect("log capture lock").is_empty() {
+            // 只等目标 error 行：同进程其它初始化日志（compat facade 的 DEBUG）会先落地，
+            // 「有任何一行就 break」会让断言读到无关行必红（非本判定器语义）。
+            if logs.lock().expect("log capture lock").iter().any(|m| m.contains("ERROR")) {
                 break;
             }
             assert!(

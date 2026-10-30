@@ -278,6 +278,8 @@ pub struct InterStreamConn {
     remote: SocketAddr,
     /// client 模式（首包加 frame type 前缀）。
     client_first: Mutex<bool>,
+    /// 帧解析后回灌的预读字节（帧与首笔负载常被合并到同一次 read）。
+    read_ahead: Mutex<Vec<u8>>,
 }
 
 impl InterStreamConn {
@@ -288,12 +290,54 @@ impl InterStreamConn {
         remote: SocketAddr,
         client: bool,
     ) -> Self {
-        Self { stream, local, remote, client_first: Mutex::new(client) }
+        Self {
+            stream,
+            local,
+            remote,
+            client_first: Mutex::new(client),
+            read_ahead: Mutex::new(Vec::new()),
+        }
     }
 
-    /// 读（对应 Go `Read`）。
+    /// 读（对应 Go `Read`）：先排空帧解析回灌的预读字节，再走 QUIC stream。
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.take_read_ahead(buf);
+        if n > 0 {
+            return Ok(n);
+        }
         self.stream.read(buf).await
+    }
+
+    /// 排空预读字节（锁不跨 await——调用方 future 必须 Send）。
+    fn take_read_ahead(&self, buf: &mut [u8]) -> usize {
+        let mut pending = self.read_ahead.lock();
+        let n = pending.len().min(buf.len());
+        if n == 0 {
+            return 0;
+        }
+        buf[..n].copy_from_slice(&pending[..n]);
+        pending.drain(..n);
+        n
+    }
+
+    /// 回灌帧解析时多读到的字节（保持字节序：下一次 `read` 先吐出它们）。
+    ///
+    /// QUIC stream 单次 `read` 返回「当前已到达的全部字节」，TCP 请求帧常与其
+    /// 后的首笔负载合并到达；帧解析只消费帧本身，剩下的负载必须回灌，否则
+    /// 整包丢失 → relay 等数据、对端等响应，双向空等（bd xuoef）。
+    pub fn push_back(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut pending = self.read_ahead.lock();
+        if pending.is_empty() {
+            *pending = bytes.to_vec();
+        } else {
+            // 顺序：新回灌字节在原预读之前（调用方总是解析更早的数据）
+            let mut merged = bytes.to_vec();
+            merged.extend_from_slice(&pending);
+            *pending = merged;
+        }
     }
 
     /// 写（对应 Go `Write`）。

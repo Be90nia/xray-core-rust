@@ -422,6 +422,8 @@ async fn handle_tcp_stream(
                 let mut resp_buf = Vec::new();
                 write_tcp_response(&mut resp_buf, true, "")?;
                 stream.write(&resp_buf).await?;
+                // 帧后同包到达的负载必须回灌给 relay（bd xuoef：丢弃 → 双向空等）
+                stream.push_back(&buf[cursor.position() as usize..]);
                 // 调度到 dispatcher
                 return dispatcher.dispatch_tcp(&addr, stream).await;
             },
@@ -532,6 +534,8 @@ async fn handle_udp_session(
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use xray_transport_hysteria::hub::StubListenerFactory;
 
     use super::*;
@@ -597,5 +601,116 @@ mod tests {
     fn no_auth_validator_when_auth_empty() {
         // auth 为空时 validator=None（不鉴权）——验证构造逻辑不 panic
         let _ = make_handler("");
+    }
+
+    /// 单次 QUIC read 返回「TCP 请求帧 ++ 首笔负载」时，负载必须到达 dispatcher。
+    ///
+    /// QUIC stream 的 read 吐出当前已到达的全部字节，Go client 的 fast-open 会让
+    /// 请求帧与首笔请求数据合并到达。帧解析只消费帧本身，剩下字节若丢弃，relay
+    /// 等数据/对端等响应 → 双向空等（bd xuoef，Go client → Rust server TCP 挂死）。
+    #[tokio::test]
+    async fn tcp_request_frame_trailing_payload_reaches_dispatcher() {
+        let addr = "127.0.0.1:9";
+        let mut wire = vec![addr.len() as u8];
+        wire.extend_from_slice(addr.as_bytes());
+        wire.push(0); // padding_len = 0
+        wire.extend_from_slice(b"PING123");
+
+        let stream = Arc::new(InterStreamConn::new(
+            Arc::new(MockQuicStream::new(wire)),
+            "127.0.0.1:1".parse().unwrap(),
+            "127.0.0.1:2".parse().unwrap(),
+            false,
+        ));
+        let disp = Arc::new(CaptureDispatcher(std::sync::Mutex::new((String::new(), Vec::new()))));
+
+        handle_tcp_stream(Arc::clone(&stream), disp.clone()).await.expect("handle_tcp_stream");
+        let (dest, payload) = disp.0.lock().expect("capture lock").clone();
+        assert_eq!(dest, addr);
+        assert_eq!(payload, b"PING123");
+    }
+
+    /// 把整段 wire 一次性吐出的最小 stream 替身（模拟 QUIC read 的「有多少给多少」）。
+    #[derive(Debug)]
+    struct MockQuicStream {
+        pending: std::sync::Mutex<Vec<u8>>,
+        written: std::sync::Mutex<Vec<u8>>,
+    }
+
+    impl MockQuicStream {
+        fn new(wire: Vec<u8>) -> Self {
+            Self {
+                pending: std::sync::Mutex::new(wire),
+                written: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl xray_transport_hysteria::conn::QuicStream for MockQuicStream {
+        fn read<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut g = self.pending.lock().expect("pending lock");
+                let n = g.len().min(buf.len());
+                buf[..n].copy_from_slice(&g[..n]);
+                g.drain(..n);
+                Ok(n)
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            buf: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                self.written.lock().expect("written lock").extend_from_slice(buf);
+                Ok(buf.len())
+            })
+        }
+
+        fn poll_write(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.written.lock().expect("written lock").extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn cancel_read(&self, _code: u64) {}
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn local_addr(&self) -> std::net::SocketAddr {
+            "127.0.0.1:1".parse().expect("static addr")
+        }
+
+        fn remote_addr(&self) -> std::net::SocketAddr {
+            "127.0.0.1:2".parse().expect("static addr")
+        }
+    }
+
+    /// 记录 (dest, 首笔负载) 的 dispatcher 替身。
+    #[derive(Debug)]
+    struct CaptureDispatcher(std::sync::Mutex<(String, Vec<u8>)>);
+
+    impl TcpDispatcher for CaptureDispatcher {
+        fn dispatch_tcp(
+            &self,
+            dest_addr: &str,
+            stream: Arc<InterStreamConn>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+            let dest = dest_addr.to_string();
+            Box::pin(async move {
+                let mut buf = [0u8; 64];
+                let n = stream.read(&mut buf).await?;
+                *self.0.lock().expect("capture lock") = (dest, buf[..n].to_vec());
+                Ok(())
+            })
+        }
     }
 }
