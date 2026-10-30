@@ -54,6 +54,9 @@ hickory-resolver = { workspace = true }
 # B6（bd t975）第二波：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-observatory（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+# bd cm2es：retry 机制消费 udf std_ext::retry（重试环/退避/取消安全）；
+# Go 语义失败列表留本仓派生薄壳（crate::retry::RetryError）。
+udf-std-ext = { path = "../udf-frame/std-ext" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

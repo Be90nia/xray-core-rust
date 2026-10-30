@@ -6768,6 +6768,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "udf-skeleton-infra",
+ "udf-std-ext",
  "uuid",
  "webpki-roots 1.0.11",
  "windows-sys 0.59.0",

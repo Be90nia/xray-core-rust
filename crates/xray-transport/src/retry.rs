@@ -2,8 +2,19 @@
 //!
 //! Go `ExponentialBackoff` 名为指数实为线性：第 n 次失败后延迟 `n * base`
 //! （0, d, 2d, 3d...），首次立即执行。成功立即返回；连续相同错误去重累积。
+//!
+//! 机制归属（bd cm2es，CLAUDE.md §3.5）：重试环（次数闸/裁决序/退避饱和/取消
+//! 安全）消费 udf `std_ext::retry::retry_if_async` + `RetryPolicy`。
+//!
+//! 两处 Go 特有内容留本仓做派生薄壳：
+//!
+//! - 失败列表：udf `RetryError` 只回灌末次错误，Go `On()` 聚合去重全列表。
+//!
+//! - 首次零延迟：udf 自 attempt=1 起算，比 Go 多一档 base，睡前减回。
 
 use std::{future::Future, time::Duration};
+
+use std_ext::retry::{AsyncSleeper, RetryPolicy, retry_if_async};
 
 /// 全部重试失败后的聚合错误（对应 Go `ErrRetryFailed` + accumulated errors）。
 #[derive(Debug)]
@@ -24,6 +35,20 @@ impl<E: std::fmt::Display> std::fmt::Display for RetryError<E> {
 
 impl<E: std::fmt::Display + std::fmt::Debug> std::error::Error for RetryError<E> {}
 
+/// Go 形异步睡眠口：udf 传入的 `d` 是政策退避值 `base * attempts`（attempt 自 1 起）。
+///
+/// Go 首次失败后延迟为零，故睡 `d - base` 还原 0, d, 2d 序列（逐次相等由
+/// `delay_sequence_matches_go_table` 钉住）。
+struct GoSleeper {
+    base: Duration,
+}
+
+impl AsyncSleeper for GoSleeper {
+    fn sleep(&self, d: Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(d.saturating_sub(self.base))
+    }
+}
+
 /// 指数退避重试（对应 Go `retry.ExponentialBackoff(attempts, delay).On(f)`）。
 ///
 /// - 首次立即执行；第 n 次失败（n 从 0 计）后延迟 `n * base_delay_ms` 再重试。
@@ -43,23 +68,51 @@ where
     Fut: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
-    let mut errors: Vec<E> = Vec::new();
-    for attempt in 0..attempts {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                let dup = errors.last().is_some_and(|last| last.to_string() == e.to_string());
-                if !dup {
-                    errors.push(e);
-                }
-                if attempt + 1 < attempts {
-                    tokio::time::sleep(Duration::from_millis(u64::from(attempt) * base_delay_ms))
-                        .await;
-                }
-            },
-        }
+    if attempts == 0 {
+        return Err(RetryError { errors: Vec::new() });
     }
-    Err(RetryError { errors })
+    let base = Duration::from_millis(base_delay_ms);
+    // udf 政策构造期拒绝零 base：Go 零退避（base=0）改用 1ns base + max_delay=0
+    // 截平表达，退避值恒零，语义不变。
+    let policy = if base.is_zero() {
+        RetryPolicy::new(attempts, Duration::from_nanos(1), Duration::ZERO)
+    } else {
+        RetryPolicy::new(attempts, base, Duration::MAX)
+    }
+    // 恒等抖动源=关 jitter：Go 退避确定性，时序须与改前逐次相等。
+    .with_jitter(|d| d);
+
+    // op 闭包侧边收集去重列表（&Mutex 是 Copy，可随每次调用的 future 借出，
+    // 无需 Arc/分配）。udf 侧错误类型取 `()`——末次错误已进列表，不再回灌。
+    let errors: parking_lot::Mutex<Vec<E>> = parking_lot::Mutex::new(Vec::new());
+    let sink = &errors;
+    let outcome = retry_if_async(
+        &policy,
+        |_attempt| {
+            let fut = f();
+            async move {
+                match fut.await {
+                    Ok(v) => Ok(v),
+                    Err(e) => {
+                        let mut acc = sink.lock();
+                        let dup = acc.last().is_some_and(|last| last.to_string() == e.to_string());
+                        if !dup {
+                            acc.push(e);
+                        }
+                        Err(())
+                    },
+                }
+            }
+        },
+        GoSleeper { base },
+        |_| true,
+    )
+    .await;
+
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(_) => Err(RetryError { errors: std::mem::take(&mut *errors.lock()) }),
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +196,26 @@ mod tests {
         assert_eq!(stamps[4] - stamps[3], Duration::from_millis(300));
     }
 
+    /// 契约：完整退避序列等于 Go `ExponentialBackoff`——第 k 次失败后睡 `k * base`，
+    /// 末次失败后不睡。机制改由 udf 政策驱动后此表是等价性真源（逐次相等，非近似）。
+    #[tokio::test(start_paused = true)]
+    async fn delay_sequence_matches_go_table() {
+        for (attempts, base) in [(1u32, 100u64), (3, 200), (5, 1), (5, 100)] {
+            let mut stamps: Vec<tokio::time::Instant> = Vec::new();
+            let _ = exponential_backoff(attempts, base, || {
+                stamps.push(tokio::time::Instant::now());
+                std::future::ready(Err::<u32, _>("x".to_string()))
+            })
+            .await;
+            let got: Vec<Duration> = stamps.windows(2).map(|w| w[1] - w[0]).collect();
+            let want: Vec<Duration> = (0..attempts)
+                .filter(|k| k + 1 < attempts)
+                .map(|k| Duration::from_millis(u64::from(k) * base))
+                .collect();
+            assert_eq!(got, want, "attempts={attempts} base={base}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn distinct_consecutive_errors_accumulate() {
         let mut n = 0;
@@ -153,6 +226,24 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.errors, vec!["e1".to_string(), "e2".to_string(), "e3".to_string()]);
+    }
+
+    /// 契约：失败列表 = Go `On()` 累积语义——只对**连续**相同错误去重，被不同错误
+    /// 隔开的同错各自留一条（去重窗口是前一条，不是全历史）。
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_dedup_keeps_full_list() {
+        let mut n = 0;
+        let err = exponential_backoff(4, 1, || {
+            n += 1;
+            let msg = match n {
+                3 => "b",
+                _ => "a",
+            };
+            std::future::ready(Err::<u32, _>(msg.to_string()))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.errors, vec!["a".to_string(), "b".to_string(), "a".to_string()]);
     }
 
     #[tokio::test]
