@@ -68,11 +68,22 @@ def head_sha():
 
 
 def download_artifact(run_id, name, dest_dir):
-    os.makedirs(dest_dir, exist_ok=True)
-    cp = sh(["gh", "run", "download", str(run_id), "--repo", REPO, "-n", name,
-             "-D", dest_dir])
-    if cp.returncode != 0:
-        raise RuntimeError(f"下载 artifact {name} 失败: {cp.stderr[:300]}")
+    # artifact 有几十 MB，CN 网络下 `gh run download` 常半路 wsarecv 超时：
+    # 单次失败不代表产物有问题——重试 3 次，每次清掉半截目录。
+    last = ""
+    for attempt in range(1, 4):
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        os.makedirs(dest_dir, exist_ok=True)
+        cp = sh(["gh", "run", "download", str(run_id), "--repo", REPO, "-n", name,
+                 "-D", dest_dir], timeout=1800)
+        if cp.returncode == 0:
+            break
+        last = (cp.stderr or cp.stdout)[:300]
+        print(f"[artifact] {name} 第 {attempt} 次下载失败: {last}")
+        if attempt < 3:
+            time.sleep(15)
+    else:
+        raise RuntimeError(f"下载 artifact {name} 失败（3 次重试后）: {last}")
     for root, _dirs, files in os.walk(dest_dir):
         for f in files:
             if f in ("xray", "xray.exe"):
@@ -157,11 +168,21 @@ def main():
     problems = []
 
     # ① 最新成功 CI run（须与本地 HEAD 同 sha，否则测的不是当前代码）
+    # smoke 例外：绿 run 尚无时退回**最近一个产出了 artifact 的 run**（Build job
+    # 绿即可下载），只为验管路；真跑绝不走这条路。
     try:
         run = gh_json(f"repos/{REPO}/actions/runs/{args.run_id}") if args.run_id else latest_green_run()
     except RuntimeError as e:
-        print(f"[fatal] {e}")
-        return 2
+        if not args.smoke:
+            print(f"[fatal] {e}")
+            return 2
+        print(f"[smoke] 无绿 run（{e}）——退回最近产出了 artifact 的 run 验管路")
+        runs = gh_json(f"repos/{REPO}/actions/runs?branch={BRANCH}&per_page=30")["workflow_runs"]
+        cands = [r for r in runs if r.get("name") == "CI" and r["status"] == "completed"]
+        if not cands:
+            print("[fatal] 连一个完成的 CI run 都没有")
+            return 2
+        run = cands[0]
     sha = run["head_sha"]
     local = head_sha()
     print(f"[ci] run={run['id']} sha={sha[:8]} 本地HEAD={local[:8]}")
