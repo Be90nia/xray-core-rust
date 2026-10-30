@@ -700,7 +700,7 @@ mod tests {
             Arc::new(HangServer { cache: cache2, hang: std::sync::atomic::AtomicBool::new(true) });
         pull(server2, "stale.com.".to_string(), v4_only_option(), permit);
         assert_eq!(fx_open.in_flight(), 1, "open scope must host the pull task");
-        fx_open.shutdown().await;
+        let _ = fx_open.shutdown().await; // 测试收尾：让渡 panic 报告
         skeleton_infra::fx::expect_idle(&fx_open);
     }
 

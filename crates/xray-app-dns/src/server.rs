@@ -1714,7 +1714,7 @@ mod tests {
         );
 
         // ② 停机排空：abort + join 至在途归零。
-        svc.scope().shutdown().await;
+        let _ = svc.scope().shutdown().await; // 测试收尾：让渡 panic 报告
         skeleton_infra::fx::expect_idle(svc.scope());
 
         // ① scope 已关：再 start 拒新，留痕不 panic、不新增。

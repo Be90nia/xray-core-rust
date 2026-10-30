@@ -591,7 +591,7 @@ mod tests {
         assert!(c.find_records("live.com.").is_some(), "live entry must survive");
 
         // P1-11：任务归 scope 生命周期集托管——排空后在途归零。
-        fx.shutdown().await;
+        let _ = fx.shutdown().await; // 报告含 panic 载荷：测试收尾显式让渡
         skeleton_infra::fx::expect_idle(&fx);
     }
 
