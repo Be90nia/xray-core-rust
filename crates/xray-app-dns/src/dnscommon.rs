@@ -271,23 +271,11 @@ pub fn build_dns_query(
     req_id: u16,
     client_ip: &[u8],
 ) -> Result<Vec<u8>, DnsError> {
-    let name = name_from_fqdn(fqdn)?;
-    let mut msg = Message::new(req_id, MessageType::Query, OpCode::Query);
-    msg.metadata.recursion_desired = true;
-    msg.add_query(Query::query(name, record_type));
+    let mut msg = new_query_message(fqdn, record_type, req_id)?;
 
     // EDNS0 client subnet（可选）。
     if matches!(client_ip.len(), 4 | 16) {
-        let mut edns = Edns::new();
-        // 对齐 Go `common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))`
-        // （app/dns/dnscommon.go:72-81 `genEDNS0Options`）→ 上游 OPT
-        // CLASS=1350、TTL=0xE0008000（D4）。 x/net 的 `uint32(extRCode)>>4<<24` 在 32
-        // 位左移丢高位，实际落到 OPT 的 extRCodeHigh 是 0xE0（不是 0xFE0）——实测收包见
-        // parity-sweep3-dns §9.2-C。 hickory 的 OPT TTL 高位取自
-        // `metadata.response_code.high()`，故用 `Unknown(0xE00)` 承载：low 4 位仍为
-        // 0，查询头 RCODE 不受影响。
-        edns.set_max_payload(1350).set_dnssec_ok(true);
-        msg.metadata.response_code = ResponseCode::Unknown(0xE00);
+        let mut edns = attach_go_edns0(&mut msg);
         let addr = if client_ip.len() == 4 {
             let mut b = [0u8; 4];
             b.copy_from_slice(client_ip);
@@ -303,6 +291,49 @@ pub fn build_dns_query(
     }
 
     msg.to_vec().map_err(|e| DnsError::WireFormat(e.to_string()))
+}
+
+/// 构造「同一条查询 + EDNS0 OPT（无 option 数据）」的重发报文。
+///
+/// 对齐 Go `app/dns/nameserver_udp.go:122-129`：TC=1 后复制原查询 → `SetEDNS0(1350,
+/// 0xfe00, true)` → `Body = &OPTResource{}`（空 options）→ 换新 req ID。
+pub fn build_dns_query_with_opt(
+    fqdn: &str,
+    record_type: RecordType,
+    req_id: u16,
+) -> Result<Vec<u8>, DnsError> {
+    let mut msg = new_query_message(fqdn, record_type, req_id)?;
+    let edns = attach_go_edns0(&mut msg);
+    msg.set_edns(edns);
+    msg.to_vec().map_err(|e| DnsError::WireFormat(e.to_string()))
+}
+
+/// 查询报文骨架（RD=1 + 单个 question）。对应 Go `buildReqMsgs` 的 `Message` 初始化。
+fn new_query_message(
+    fqdn: &str,
+    record_type: RecordType,
+    req_id: u16,
+) -> Result<Message, DnsError> {
+    let name = name_from_fqdn(fqdn)?;
+    let mut msg = Message::new(req_id, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(name, record_type));
+    Ok(msg)
+}
+
+/// 挂上 Go 语义的 EDNS0 OPT 头（CLASS=1350 / DO=1 / TTL=0xE0008000），返回可继续填
+/// option 的 [`Edns`]（尚未 `set_edns`）。
+///
+/// 对齐 Go `common.Must(opt.Header.SetEDNS0(1350, 0xfe00, true))`
+/// （app/dns/dnscommon.go:72-81 `genEDNS0Options`）。 x/net 的 `uint32(extRCode)>>4<<24` 在
+/// 32 位左移丢高位，实际落到 OPT 的 extRCodeHigh 是 0xE0（不是 0xFE0）——实测收包见
+/// parity-sweep3-dns §9.2-C。 hickory 的 OPT TTL 高位取自 `metadata.response_code.high()`，
+/// 故用 `Unknown(0xE00)` 承载：low 4 位仍为 0，查询头 RCODE 不受影响。
+fn attach_go_edns0(msg: &mut Message) -> Edns {
+    let mut edns = Edns::new();
+    edns.set_max_payload(1350).set_dnssec_ok(true);
+    msg.metadata.response_code = ResponseCode::Unknown(0xE00);
+    edns
 }
 
 /// fqdn → hickory [`Name`]，label 按**原始字节**承载（不做 IDNA / 大小写规范化）。
@@ -654,5 +685,20 @@ mod tests {
         assert_eq!(&wire[opt + 1..opt + 3], [0x00, 0x29], "TYPE=OPT(41)");
         assert_eq!(&wire[opt + 3..opt + 5], [0x05, 0x46], "CLASS=1350");
         assert_eq!(&wire[opt + 5..opt + 9], [0xe0, 0x00, 0x80, 0x00], "TTL=0xE0008000");
+    }
+
+    /// TC=1 重发报文：同 Go `Body = &OPTResource{}`——OPT 无 option 数据，RDLENGTH=0。
+    #[test]
+    fn retry_query_opt_has_empty_rdata() {
+        let wire = build_dns_query_with_opt(&fqdn("d02.test"), RecordType::A, 7).unwrap();
+        assert_eq!(&wire[0..2], [0x00, 0x07], "重发用调用方给的新 req ID");
+        assert_eq!(wire[10..12], [0x00, 0x01], "ARCOUNT=1（OPT）");
+        let opt = 12 + 10 + 4;
+        assert_eq!(
+            &wire[opt..opt + 9],
+            [0x00, 0x00, 0x29, 0x05, 0x46, 0xe0, 0x00, 0x80, 0x00],
+            "root|TYPE=OPT(41)|CLASS=1350|TTL=0xE0008000"
+        );
+        assert_eq!(&wire[opt + 9..], [0x00, 0x00], "RDLENGTH=0（空 OPTResource）");
     }
 }

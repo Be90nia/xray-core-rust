@@ -6,7 +6,8 @@
 //!   follow-up）。
 //! - DNS wire format 由 `hickory-proto` 处理（覆盖 A/AAAA/MX/TXT/EDNS0）。
 //! - 自动接入 cache（实现 `CachedNameserver`，由 `cached::query_ip` 统一调度）。
-//! - truncated 响应自动 TCP 重试（RFC 7766 §5）。
+//! - truncated（TC=1）响应：按 Go 语义在同一 UDP 通道上追加 EDNS0 OPT 重发一次， **不建 TCP
+//!   连接**（Go `nameserver_udp.go:118-137` 无 TCP fallback 分支）。
 //!
 //! ## 跳过范围
 //!
@@ -25,8 +26,8 @@ use crate::{
     cache_controller::CacheController,
     config::IpOption,
     dnscommon::{
-        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
-        parsed_to_ip_record,
+        AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, build_dns_query_with_opt,
+        parse_dns_response, parsed_to_ip_record,
     },
     error::DnsError,
     nameserver::{
@@ -52,8 +53,6 @@ pub struct UdpNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
-    /// TCP fallback 缓冲区大小。
-    tcp_recv_max: usize,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
     /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
@@ -80,7 +79,6 @@ impl UdpNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
-            tcp_recv_max: 65535,
             resolver,
             force_local: false,
         }
@@ -134,6 +132,10 @@ impl UdpNameServer {
     /// bd 2iauj：拨号/解析/发送/收包共享调用方传入的整条查询绝对 `deadline`
     /// （Go nameserver_udp.go:161-189 的 dispatch 与等待都在外层 ctx 预算内，
     /// 见 nameserver.go:183 `WithTimeout(ctx, c.timeoutMs)`）。
+    ///
+    /// TC=1（bd a42ht）：按 Go `nameserver_udp.go:118-137` 在同一条 UDP 通道上追加
+    /// EDNS0 OPT + 新 ID 重发**一次**，重发与首包共享同一 `deadline`（Go 复用同一 ctx），
+    /// 第二次仍截断则照 Go 把截断应答直接交给 cache（不循环）。
     async fn query_once(
         &self,
         fqdn: &str,
@@ -177,9 +179,30 @@ impl UdpNameServer {
             // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
             let now = self.cache.clock().now_instant();
             let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
-            if parsed.truncated {
-                return self.tcp_fallback_query(fqdn, record_type, deadline.clone()).await;
+            if !self.should_retry_with_edns0(parsed.truncated) {
+                return Ok(parsed_to_ip_record(&parsed, now));
             }
+            let (retry_id, retry_wire) = self.edns0_retry_wire(fqdn, record_type)?;
+            deadline
+                .timeout(session.send_packet(&self.dest, &retry_wire))
+                .await
+                .map_err(|_| DnsError::WireFormat("udp retry send timeout".to_string()))?
+                .map_err(|e| DnsError::WireFormat(format!("udp retry send: {e}")))?;
+            let resp = deadline
+                .timeout(session.recv_packet())
+                .await
+                .map_err(|_| {
+                    DnsError::WireFormat(format!(
+                        "udp retry recv timeout after {:?}",
+                        self.query_timeout
+                    ))
+                })?
+                .map_err(|e| DnsError::WireFormat(format!("udp retry recv: {e}")))?;
+            let Some(resp) = resp else {
+                return Err(DnsError::WireFormat("udp dial session closed".to_string()));
+            };
+            let now = self.cache.clock().now_instant();
+            let parsed = parse_dns_response(&resp, retry_id, record_type, now)?;
             return Ok(parsed_to_ip_record(&parsed, now));
         }
 
@@ -219,93 +242,47 @@ impl UdpNameServer {
         // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
         let now = self.cache.clock().now_instant();
         let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
-        if parsed.truncated {
-            return self.tcp_fallback_query(fqdn, record_type, deadline).await;
+        if !self.should_retry_with_edns0(parsed.truncated) {
+            return Ok(parsed_to_ip_record(&parsed, now));
         }
-        Ok(parsed_to_ip_record(&parsed, now))
-    }
-
-    /// UDP truncated (TC=1) 后自动 TCP 重试。
-    ///
-    /// 对应 Go `(*ClassicNameServer).query` TCP fallback 路径。
-    /// RFC 7766 §5: 客户端必须支持 TCP 重试。
-    /// bd 2iauj：fallback 共享整条查询的 `deadline`（Go 的 truncated 重试是
-    /// nameserver_udp.go:118-137 的 EDNS0 重发、复用同一 ctx；Rust 走 TCP fallback
-    /// 属既有差异，预算语义对齐：重试不另起满额预算）。
-    async fn tcp_fallback_query(
-        &self,
-        fqdn: &str,
-        record_type: RecordType,
-        deadline: BudgetDeadline,
-    ) -> Result<IpRecord, DnsError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let req_id = self.id_gen.next_id();
-        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
-
-        // TCP: 2B big-endian 长度前缀。
-        let len_be = u16::try_from(payload.len())
-            .map_err(|_| DnsError::WireFormat("query too large for TCP".into()))?
-            .to_be_bytes();
-
-        // 经路由出站或直连兜底（域名每查询现解析）——与 TCP NS 同一拨号路径。
-        // bd wxr6u：本 NS 的 `self.dest` 标的是 UDP（UDP 查询用），fallback 是 TCP 流，
-        // 网络位不改的话 dispatcher 原样交给 freedom，freedom 按 `dest.network()` 走
-        // UDP 中继，把「2B 长度前缀 + DNS 报文」当 XUDP 帧解析 → 上游零 tcp-accept。
-        let tcp_dest = Destination::tcp(self.dest.address().clone(), self.dest.port());
-        let mut stream = deadline
-            .timeout(crate::dial::connect_stream(
-                &tcp_dest,
-                self.resolver.as_ref(),
-                self.query_timeout,
-                "udp-tcp-fallback",
-                self.force_local,
-            ))
+        // Go nameserver_udp.go:118-137：同一 UDP 通道追加 EDNS0 OPT + 新 ID 重发一次。
+        let (retry_id, retry_wire) = self.edns0_retry_wire(fqdn, record_type)?;
+        deadline
+            .timeout(sock.send_to(&retry_wire, sock_addr))
+            .await
+            .map_err(|_| DnsError::WireFormat("udp retry send timeout".to_string()))?
+            .map_err(|e| DnsError::WireFormat(format!("udp retry send: {e}")))?;
+        let n = deadline
+            .timeout(sock.recv(&mut buf))
             .await
             .map_err(|_| {
                 DnsError::WireFormat(format!(
-                    "tcp fallback dial timeout after {:?}",
+                    "udp retry recv timeout after {:?}",
                     self.query_timeout
                 ))
-            })??;
-
-        deadline
-            .timeout(stream.write_all(&len_be))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp fallback write len timeout".into()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp fallback write len: {e}")))?;
-        deadline
-            .timeout(stream.write_all(&payload))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp fallback write payload timeout".into()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp fallback write payload: {e}")))?;
-
-        // 读 2B 长度前缀。
-        let mut len_buf = [0u8; 2];
-        deadline
-            .timeout(stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp fallback read len timeout".into()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp fallback read len: {e}")))?;
-        let resp_len = u16::from_be_bytes(len_buf) as usize;
-        if resp_len == 0 || resp_len > self.tcp_recv_max {
-            return Err(DnsError::WireFormat(format!(
-                "tcp fallback invalid response length: {resp_len}"
-            )));
-        }
-
-        let mut resp_buf = vec![0u8; resp_len];
-        deadline
-            .timeout(stream.read_exact(&mut resp_buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp fallback read response timeout".into()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp fallback read response: {e}")))?;
-
-        // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
+            })?
+            .map_err(|e| DnsError::WireFormat(format!("udp retry recv: {e}")))?;
         let now = self.cache.clock().now_instant();
-        let parsed = parse_dns_response(&resp_buf, req_id, record_type, now)?;
-        // TCP 响应不应有 truncated（如果仍有，说明服务端异常，忽略 TC 标志）。
+        let parsed = parse_dns_response(&buf[..n], retry_id, record_type, now)?;
         Ok(parsed_to_ip_record(&parsed, now))
+    }
+
+    /// TC=1 是否要追加 EDNS0 重发。
+    ///
+    /// Go `nameserver_udp.go:119-121`：截断且**原查询的 Additionals 为空**才重发；
+    /// 首包已带 OPT（`clientIp` 在场，见 `build_dns_query`）时直接按截断应答收场。
+    fn should_retry_with_edns0(&self, truncated: bool) -> bool {
+        truncated && !matches!(self.client_ip.len(), 4 | 16)
+    }
+
+    /// 构造重发查询：新 req ID + 追加 OPT（Go `newMsg.ID = s.newReqID()`）。
+    fn edns0_retry_wire(
+        &self,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> Result<(u16, Vec<u8>), DnsError> {
+        let req_id = self.id_gen.next_id();
+        Ok((req_id, build_dns_query_with_opt(fqdn, record_type, req_id)?))
     }
 }
 
@@ -394,7 +371,7 @@ mod tests {
         op::{Message, MessageType, OpCode, Query},
         rr::{Name, RData, Record, RecordType},
     };
-    use xray_common::net::{address::Address, network::Network};
+    use xray_common::net::address::Address;
 
     use super::*;
     use crate::config::IpOption;
@@ -783,35 +760,178 @@ mod tests {
         );
     }
 
-    /// 假的「截断应答」dialer：UDP 侧回 TC=1，TCP 侧记录 dest 并按网络位决定放行。
-    ///
-    /// `dial_tcp` 的 `network() != TCP` 拒绝复刻生产判别点：dispatcher 把 dest 原样交给
-    /// freedom，freedom 按 `dest.network()` 选 UDP 中继（不是流式 link）。
-    #[derive(Default)]
-    struct TruncatingDialer {
-        tcp_dests: parking_lot::Mutex<Vec<Destination>>,
+    /// 断言查询包尾部追加了 Go 语义的 EDNS0 OPT：
+    /// root / TYPE=41 / CLASS=1350 / TTL=0xE0008000(DO=1) / RDLENGTH=0
+    /// （Go `SetEDNS0(1350, 0xfe00, true)` + 空 `OPTResource`）。
+    fn assert_go_edns0_opt(wire: &[u8]) {
+        assert_eq!(&wire[10..12], [0x00, 0x01], "ARCOUNT=1（追加 OPT）");
+        let tail = &wire[wire.len() - 11..];
+        assert_eq!(
+            tail,
+            [0x00, 0x00, 0x29, 0x05, 0x46, 0xe0, 0x00, 0x80, 0x00, 0x00, 0x00],
+            "OPT 字节 = root|TYPE=41|CLASS=1350|TTL=0xE0008000|RDLENGTH=0, got {tail:02x?}"
+        );
     }
 
-    impl crate::dial::QueryDialer for TruncatingDialer {
+    /// 上游 mock 记下的查询包（原始字节 + 来源地址）。
+    type RecordedQuery = (Vec<u8>, SocketAddr);
+
+    /// bd a42ht：UDP 应答 TC=1 → Go 语义是「同一 UDP 通道追加 EDNS0 OPT(1350, DO=1)
+    /// + 新 req ID 重发」，不是 TCP fallback（Go `nameserver_udp.go:118-137` 无 TCP 分支）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn truncated_response_retries_with_edns0_over_udp() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let seen: Arc<parking_lot::Mutex<Vec<RecordedQuery>>> = Arc::default();
+        let seen_srv = seen.clone();
+        let _srv = xray_common::testing::spawn("dns-tc1-edns0-retry", async move {
+            let mut buf = vec![0u8; 4096];
+            // 第一包 → 回 TC=1（0 答案，真实截断应答形态）。
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            seen_srv.lock().push((buf[..n].to_vec(), peer));
+            let first = Message::from_vec(&buf[..n]).unwrap();
+            let mut trunc = Message::new(first.metadata.id, MessageType::Response, OpCode::Query);
+            trunc.add_query(Query::query(Name::parse("tc1.com.", None).unwrap(), RecordType::A));
+            trunc.metadata.truncation = true;
+            sock.send_to(&trunc.to_vec().unwrap(), peer).await.unwrap();
+
+            // 第二包 → 回 A 记录。
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            seen_srv.lock().push((buf[..n].to_vec(), peer));
+            let second = Message::from_vec(&buf[..n]).unwrap();
+            let resp = make_a_response(
+                second.metadata.id,
+                "tc1.com.",
+                vec![Ipv4Addr::new(1, 1, 1, 1)],
+                60,
+            );
+            sock.send_to(&resp, peer).await.unwrap();
+        });
+
+        let ns = UdpNameServer::new(
+            udp_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            Vec::new(),
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+        let rec = ns
+            .query_once("tc1.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
+            .await
+            .expect("TC=1 后 EDNS0 UDP 重发必须拿到答案");
+        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "TC=1 必须在 UDP 上重发一次（走 TCP fallback 时这里只有 1 包）");
+        assert_eq!(seen[0].1, seen[1].1, "重发必须复用同一 UDP 源端口（零额外连接）");
+        let first_id = u16::from_be_bytes([seen[0].0[0], seen[0].0[1]]);
+        let retry_id = u16::from_be_bytes([seen[1].0[0], seen[1].0[1]]);
+        assert_ne!(retry_id, first_id, "重发必须用新 req ID");
+        assert_eq!(&seen[0].0[10..12], [0x00, 0x00], "首包无 EDNS0（ARCOUNT=0）");
+        assert_go_edns0_opt(&seen[1].0);
+    }
+
+    /// bd a42ht：首包已带 EDNS0（clientIp 在场）时 Go 不再重发，直接按截断应答收场
+    /// （Go `nameserver_udp.go:121` `len(req.msg.Additionals) == 0` 门）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+    async fn truncated_response_with_existing_edns0_is_not_retried() {
+        let _slot = DIALER_SLOT_LOCK.lock();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let resends: Arc<parking_lot::Mutex<u32>> = Arc::default();
+        let resends_srv = resends.clone();
+        let _srv = xray_common::testing::spawn("dns-tc1-edns0-gate", async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut trunc = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
+            trunc.add_query(Query::query(Name::parse("tc2.com.", None).unwrap(), RecordType::A));
+            trunc.metadata.truncation = true;
+            sock.send_to(&trunc.to_vec().unwrap(), peer).await.unwrap();
+            // 重发窗：Go 语义下不该再来第二包。
+            let mut buf2 = [0u8; 4096];
+            if tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf2))
+                .await
+                .is_ok()
+            {
+                *resends_srv.lock() += 1;
+            }
+        });
+
+        let ns = UdpNameServer::new(
+            udp_dest(addr),
+            Arc::new(CacheController::new("test", true, false, 0, 0)),
+            vec![1, 2, 3, 4],
+            Duration::from_secs(2),
+            Arc::new(crate::dial::SystemHostResolver),
+        );
+        let rec = ns
+            .query_once("tc2.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
+            .await
+            .expect("已有 EDNS0 的截断应答按 Go 语义直接收场");
+        assert!(rec.ips.is_empty(), "截断应答无答案，got {:?}", rec.ips);
+        assert_eq!(*resends.lock(), 0, "已有 EDNS0 时不得重发");
+    }
+
+    /// 记录查询包的假 UDP 会话：首包回 TC=1，重发包回 A 记录。
+    struct Tc1RecordingSession {
+        sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+        req_id: u16,
+        calls: u8,
+    }
+
+    impl crate::dial::UdpPacketSession for Tc1RecordingSession {
+        fn send_packet<'s>(
+            &'s mut self,
+            _dest: &'s Destination,
+            payload: &'s [u8],
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 's>> {
+            self.sent.lock().push(payload.to_vec());
+            if let [hi, lo, ..] = payload {
+                self.req_id = u16::from_be_bytes([*hi, *lo]);
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn recv_packet(
+            &mut self,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + '_>> {
+            self.calls += 1;
+            let first = self.calls == 1;
+            let req_id = self.req_id;
+            Box::pin(async move {
+                let name = Name::parse("rt.com.", None).unwrap();
+                let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
+                msg.add_query(Query::query(name.clone(), RecordType::A));
+                if first {
+                    msg.metadata.truncation = true;
+                    return Ok(Some(msg.to_vec().unwrap()));
+                }
+                msg.add_answer(Record::from_rdata(
+                    name,
+                    60,
+                    RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::new(2, 2, 2, 2))),
+                ));
+                Ok(Some(msg.to_vec().unwrap()))
+            })
+        }
+    }
+
+    /// 记录查询包的假 dialer：UDP 会话按首包/重发包作答，供路由路径验证重发。
+    #[derive(Default)]
+    struct Tc1RecordingDialer {
+        sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl crate::dial::QueryDialer for Tc1RecordingDialer {
         fn dial_tcp(
             &self,
-            dest: &Destination,
+            _dest: &Destination,
         ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
-            self.tcp_dests.lock().push(dest.clone());
-            let dest = dest.clone();
-            Box::pin(async move {
-                if dest.network() != Network::TCP {
-                    return Err(io::Error::other(format!(
-                        "freedom relays {:?} dest as datagrams",
-                        dest.network()
-                    )));
-                }
-                let ip = dest.address().ip().ok_or_else(|| io::Error::other("test dest is IP"))?;
-                let tcp = tokio::net::TcpStream::connect(SocketAddr::new(ip, dest.port().value()))
-                    .await?;
-                Ok(Box::new(xray_transport::connection::TcpConnection::new(tcp))
-                    as crate::dial::DnsStream)
-            })
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::Unsupported, "tc1 test dialer")) })
         }
 
         fn dial_udp(
@@ -822,97 +942,42 @@ mod tests {
                 dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_,
             >,
         > {
-            Box::pin(async { Ok(Box::new(TruncatedUdpSession { req_id: 0 }) as Box<_>) })
-        }
-    }
-
-    /// 只回一条 TC=1 应答的 UDP 会话（请求 ID 从发包首 2B 取，供解析侧 ID 校验）。
-    struct TruncatedUdpSession {
-        req_id: u16,
-    }
-
-    impl crate::dial::UdpPacketSession for TruncatedUdpSession {
-        fn send_packet<'s>(
-            &'s mut self,
-            _dest: &'s Destination,
-            payload: &'s [u8],
-        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 's>> {
-            if let [hi, lo, ..] = payload {
-                self.req_id = u16::from_be_bytes([*hi, *lo]);
-            }
-            Box::pin(async { Ok(()) })
-        }
-
-        fn recv_packet(
-            &mut self,
-        ) -> Pin<Box<dyn Future<Output = io::Result<Option<Vec<u8>>>> + Send + '_>> {
-            let req_id = self.req_id;
+            let sent = self.sent.clone();
             Box::pin(async move {
-                let mut msg = Message::new(req_id, MessageType::Response, OpCode::Query);
-                msg.add_query(Query::query(Name::parse("fb.com.", None).unwrap(), RecordType::A));
-                msg.metadata.truncation = true;
-                Ok(Some(msg.to_vec().unwrap()))
+                Ok(Box::new(Tc1RecordingSession { sent, req_id: 0, calls: 0 }) as Box<_>)
             })
         }
     }
 
-    /// bd wxr6u 回归钉：UDP 应答截断（TC=1）后 TCP fallback 必须以 **TCP 网络** dest
-    /// 拨号，且线上写「2B 长度前缀 + 裸 DNS 报文」而非 XUDP 帧。
-    ///
-    /// 生产症状（勿复现验证）：dest 沿用 UDP 网络 → freedom 走 UDP 中继 → 长度前缀
-    /// 流被当 XUDP 帧解析 → 上游零 tcp-accept、客户端读长度超时。
+    /// 路由出站路径（共享 dialer）同样按 Go 语义在**同一 UDP 会话**上重发。
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
-    async fn tcp_fallback_dials_tcp_network_with_bare_dns() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    async fn dialer_path_retries_truncated_with_edns0_over_udp() {
         let _slot = DIALER_SLOT_LOCK.lock();
-
-        // 真 TCP DNS 上游：读 2B 长度 + 报文，回一条 A 记录（请求 ID 回显）。
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_addr = listener.local_addr().unwrap();
-        let _server = xray_common::testing::spawn("dns-tcp-fallback-server", async move {
-            let (mut stream, _) = listener.accept().await.expect("fallback dialed no TCP conn");
-            let mut len_buf = [0u8; 2];
-            stream.read_exact(&mut len_buf).await.unwrap();
-            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
-            stream.read_exact(&mut query).await.unwrap();
-            // 裸 DNS 报文才能从偏移 0 解出 Message；XUDP 帧在这必解失败。
-            let msg = Message::from_vec(&query)
-                .expect("fallback wire bytes must be a bare DNS message, not an XUDP frame");
-            let resp =
-                make_a_response(msg.metadata.id, "fb.com.", vec![Ipv4Addr::new(5, 6, 7, 8)], 60);
-            stream.write_all(&u16::try_from(resp.len()).unwrap().to_be_bytes()).await.unwrap();
-            stream.write_all(&resp).await.unwrap();
-        });
-
-        let dialer = Arc::new(TruncatingDialer::default());
+        let dialer = Arc::new(Tc1RecordingDialer::default());
         crate::dial::set_shared_dialer(Some(dialer.clone()));
-
         let ns = UdpNameServer::new(
-            // 与 TCP 上游同 IP/端口：fallback 只改网络位，地址沿用 `self.dest`。
-            udp_dest(tcp_addr),
+            udp_dest(SocketAddr::from_str("127.0.0.1:53").unwrap()),
             Arc::new(CacheController::new("test", true, false, 0, 0)),
             Vec::new(),
             Duration::from_secs(2),
             Arc::new(crate::dial::SystemHostResolver),
         );
         let outcome = ns
-            .query_once("fb.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
+            .query_once("rt.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
             .await;
         crate::dial::set_shared_dialer(None);
 
-        let rec = outcome.expect("TCP fallback must return an answer");
-        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))]);
-
-        let dests = dialer.tcp_dests.lock();
-        assert_eq!(dests.len(), 1, "fallback must dial exactly once");
-        assert_eq!(
-            dests[0].network(),
-            Network::TCP,
-            "fallback 必须以 TCP 网络拨号，否则 freedom 按 UDP 中继吃掉长度前缀流"
+        let rec = outcome.expect("路由路径的 EDNS0 重发必须拿到答案");
+        assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))]);
+        let sent = dialer.sent.lock();
+        assert_eq!(sent.len(), 2, "TC=1 必须在同一 UDP 会话上重发一次");
+        assert_eq!(&sent[0][10..12], [0x00, 0x00], "首包无 EDNS0（ARCOUNT=0）");
+        assert_go_edns0_opt(&sent[1]);
+        assert_ne!(
+            u16::from_be_bytes([sent[0][0], sent[0][1]]),
+            u16::from_be_bytes([sent[1][0], sent[1][1]]),
+            "重发必须用新 req ID"
         );
-        assert_eq!(dests[0].address(), &Address::from(tcp_addr.ip()));
-        assert_eq!(dests[0].port().value(), tcp_addr.port());
     }
 }
