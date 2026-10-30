@@ -136,12 +136,12 @@ fn fields_carry_all_four_members() {
     let fields =
         ObserveFields::new(&ctx, Stage::Forward, "10.0.0.1:443".into(), "example.com:80".into());
 
-    assert_ne!(fields.conn_id, 0, "conn_id 必填非零（取自 ctx.next_conn_id）");
-    assert_eq!(fields.stage, Stage::Forward);
-    assert_eq!(fields.peer, "10.0.0.1:443");
-    assert_eq!(fields.dest, "example.com:80");
+    assert_ne!(fields.conn_id(), 0, "conn_id 必填非零（取自 ctx.next_conn_id）");
+    assert_eq!(fields.stage(), Stage::Forward);
+    assert_eq!(fields.peer(), "10.0.0.1:443");
+    assert_eq!(fields.dest(), "example.com:80");
     // 机器可读：Display = 变体名，非自由文本。
-    assert_eq!(fields.stage.to_string(), "Forward");
+    assert_eq!(fields.stage().to_string(), "Forward");
 }
 
 #[test]
@@ -160,9 +160,9 @@ fn emit_line_carries_quadruple_with_short_hex_and_pinned_target() {
 
     let out = buf.snapshot();
     // 短 hex = u128 的 32 位 hex 前 16 位 == 高 64 位的 16-hex 零填充表示。
-    let expect_hex = format!("{:016x}", fields.conn_id >> 64);
+    let expect_hex = format!("{:016x}", fields.conn_id() >> 64);
     assert_eq!(expect_hex.len(), 16);
-    assert!(format!("{:032x}", fields.conn_id).starts_with(&expect_hex), "截断取前 16 位");
+    assert!(format!("{:032x}", fields.conn_id()).starts_with(&expect_hex), "截断取前 16 位");
     let conn_token =
         out.split("conn=").nth(1).expect("conn= present").split(' ').next().expect("token");
     assert_eq!(conn_token, expect_hex, "短 hex 截断正确: {out}");
