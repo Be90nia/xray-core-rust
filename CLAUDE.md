@@ -98,6 +98,37 @@ cargo doc --workspace --no-deps
    - 配置/JSON：`skeleton::config::{ConfigPort, EnvSource, StdEnv, MockEnv}`｜`skeleton_infra::config::ConfigFile<C>`（`config-json`/`config-toml` feature：分层折叠 `layer`/`default_layer`/`file_layer` + `load`/`save`，真相不静默丢）｜`skeleton_infra::parse_mock`（解析测试替身）
    - 契约与测试替身：`skeleton::{Reducer, Store, EffectBuf, JournalPort, Driver, Subscription}`｜`skeleton_infra::compose::combine`｜`skeleton_infra::testing::{TestStore, ScriptedRuntime, MockEnv}`｜`parse_mock`
 
+### 3.5.2.1 查法：符号级检索（可直接抄的命令，**禁整读 >500 行的大文件**）
+
+> 查「这个符号在哪 / 函数体是什么 / 改了影响谁」——**先符号级，再行号**，别用 grep 抓几百行回来自己拼。
+
+**① 图谱（最优先，本仓已接）**
+```bash
+codebase-memory-mcp cli search_code --project=D-Project-Xray-core-rust --query="CacheController upsert find_records"
+codebase-memory-mcp cli get_code_snippet --project=D-Project-Xray-core-rust --qualified_name="crates/xray-core/src/inbound.rs::spawn_unix_inbound"
+```
+
+**② serena-cli（LSP 后端，按名寻址；PATH 失败就用绝对路径 `D:/Program Files/serena-cli/serena-cli.exe`）**
+```bash
+serena-cli warm rust                                                    # 先热身（参数是语言名，不是文件）
+serena-cli overview <FILE>                                              # 顶层符号列表（禁 read 整文件）
+serena-cli symbol-body <FILE> <SYMBOL>                                 # 按名取函数体（免行号往返）
+serena-cli edit-context <FILE> <SYMBOL>                                # 改前一次拿齐 body+callers+doc+tests
+serena-cli find-referencing-symbols <FILE> <LINE> <COL>                # 改前影响面（行号 1-based 含端）
+serena-cli diagnostics <FILE> --wait-gen 1                             # 收尾验证
+serena-cli undo                                                        # 改坏了回滚（事务级）
+```
+写入类：`replace-body <FILE> <SYMBOL> --with <NEW>`（**整符号替换**，`--with` 必须给完整新体）；`insert-text-after-symbol <FILE> <SYMBOL> <TEXT>`（`TEXT` 是**位置参数**）；行级三件套才可用 `--expected-hash`。
+
+**③ 硬纪律（踩过的坑）**
+- 行号一律 **1-based 含端**（传 0 是用法错误）；`def/refs` 用的是**行:列**，按名取位置用 `symbol-body`/`edit-context`。
+- `--with` / 多行文本**一律走临时文件**（`--with "$(cat 文件)"`）：内容含 `'`/`"` 时内联引号必炸；`cat` 到空文件会把整个符号**静默清空** → 下笔前 `cat 文件 | wc -c` 验非空，改完**回读核对**。
+- `replace-body` **连 doc 注释一起换**（想只换函数体就把原 doc 抄进 `--with` 开头）；rust intra-doc link（`` [`x`] ``）过写门会被吃成 `[]` → 换体后回读 doc 区核对。
+- `insert-text-after-symbol` 落点可能锚偏 → dry-run 的 `end_line` 与定义行核对不一致就别应用，改走 `insert-at-line` + `--expected-hash`。
+- 大文件（`inbound.rs` 5000+ 行）**先 `overview` 再按名取体**；一次 grep 抓几百行 = 白烧 token。
+
+**④ 仍然手写 read/grep 的场合**：跨仓（Go 源码在 `D:/Project/Xray-core`，LSP 不覆盖）、markdown/JSON 配置、proto 文件、纯文本片段。
+
 ### 3.5.3 分层纪律边界
 
 - **地基/骨架不引 Xray 类型**（提炼判据：零 xray 类型 = 全泛型/trait）——这是血肉能上浮的前提
