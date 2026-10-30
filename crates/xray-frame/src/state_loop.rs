@@ -3,7 +3,7 @@
 //! # 唯一路径
 //!
 //! 装配生命周期（注册 → 依赖序启动 → 运行 → 停机）只此一份实现：本模块的 reducer
-//! 持相位机与账本，解释器（[`fx`]）持真插件调用；`crate::assembly::Framework` 的
+//! 持相位机与账本，解释器（`fx`）持真插件调用；`crate::assembly::Framework` 的
 //! `bring_up` / `shutdown` 经本模块驱动。旧 `lifecycle::bring_up` 已删（无第二份账本
 //! / 第二份顺序逻辑）。
 //!
@@ -11,9 +11,9 @@
 //!
 //! | udf 基件 | 本层派生 | 消费点 |
 //! |---|---|---|
-//! | `skeleton::Reducer` + `skeleton::EffectBuf` | [`LifecycleReducer`]（相位迁移 + 效果派发）、[`AuditReducer`]（轨迹派生） | [`AssemblyLoop`] 的 store 排空环 |
+//! | `skeleton::Reducer` + `skeleton::EffectBuf` | `LifecycleReducer`（相位迁移 + 效果派发）、`AuditReducer`（轨迹派生） | [`AssemblyLoop`] 的 store 排空环 |
 //! | `skeleton_infra::runtime::SyncStore` | 同步排空至 idle 的状态环载体 | `Framework::bring_up` / `shutdown` |
-//! | `skeleton_infra::compose::combine` | [`AssemblyRoot`]（父状态 = 生命周期分片 + 审计分片） | 同上（两分片同动作流） |
+//! | `skeleton_infra::compose::combine` | `AssemblyRoot`（父状态 = 生命周期分片 + 审计分片） | 同上（两分片同动作流） |
 //! | `skeleton::JournalPort` + `skeleton_infra::journal::JsonlJournal` | 审计轨迹落盘（**用户显式配置才写**） | `FrameworkBuilder::with_journal` |
 //!
 //! # 状态词表（xray 语义只落本层；udf 侧零 xray 概念）
@@ -521,8 +521,8 @@ impl Reducer for AssemblyRoot {
 /// 装配状态环（装配生命周期的**唯一路径**）。
 ///
 /// - 载体 = `skeleton_infra::runtime::SyncStore`（同步排空至 idle）。
-/// - 根 reducer = [`AssemblyRoot`]（combine 两分片）。
-/// - 解释器 = [`fx::LoopFx`]（真插件调用 + 失败回滚 + 协调器停机）。
+/// - 根 reducer = `AssemblyRoot`（combine 两分片）。
+/// - 解释器 = `fx::LoopFx`（真插件调用 + 失败回滚 + 协调器停机）。
 pub struct AssemblyLoop {
     store: SyncStore<AssemblyState, AssemblyAction, AssemblyOp>,
     journal: Mutex<Option<AssemblyJournal>>,

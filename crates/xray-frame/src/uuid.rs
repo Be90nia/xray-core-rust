@@ -3,8 +3,7 @@
 //! 四栏归属：
 //!
 //! - **udf 基件**：`std_ext::id::RandomId`（`random` feature 门后的凭据级 CSPRNG v4：OS `getrandom`
-//!   直通、`ver=0100`/`var=10` 位面集中装配、连字形
-//!   [`Display`](std::fmt::Display)/[`FromStr`](std::str::FromStr) 面、数值面
+//!   直通、`ver=0100`/`var=10` 位面集中装配、连字形 `Display`/`FromStr` 面、数值面
 //!   `as_u128`/`from_u128`）。基件是**透明载体**：`from_u128` 形状不校验、 `from_str` 不校验
 //!   `ver`/`var`——位语义按 udf 契约归消费方。
 //! - **派生方式**：**组合包装**（newtype 包住基件）+ 位面归一化/严格校验——

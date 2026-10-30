@@ -3348,8 +3348,7 @@ pub(crate) fn spawn_inbound_serve(
         let arm = arm_anchor;
         tokio::select! {
             _ = watch_token.cancelled() => {
-                arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await
-                    .unwrap_or_else(|e| drain_warn(&tag, e));
+                drain_report(&tag, arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await);
             }
             joined = inner.join() => {
                 if let Err(skeleton_infra::fx::TaskError::Panicked(_)) = joined {
@@ -3364,17 +3363,29 @@ pub(crate) fn spawn_inbound_serve(
                 // 停机形态 → 幂等排空；token 未取消 = listener 自然终局，保留
                 // 既有「连接任务不随 listener 死亡」的 detach 语义不排空。
                 if watch_token.is_cancelled() {
-                    arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await
-                        .unwrap_or_else(|e| drain_warn(&tag, e));
+                    drain_report(
+                        &tag,
+                        arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await,
+                    );
                 }
             }
         }
     })
 }
 
-/// 停机排空超时留痕（超时档已到 = 剩余任务已被 abort 兜底，仅日志面）。
-fn drain_warn(tag: &str, e: skeleton_infra::fx::TaskError) {
-    tracing::warn!(tag = %tag, error = %e, "arm scope drain timed out; residual tasks aborted");
+/// 停机排空留痕（仅日志面）：超时档已到 = 剩余任务已被 abort 兜底；排空中收割到
+/// 的任务 panic 逐条上报（udf `51c2428b` 前这条路径会静默丢弃 join 结果）。
+fn drain_report(tag: &str, report: skeleton_infra::fx::ShutdownReport) {
+    for msg in &report.panicked {
+        tracing::error!(tag = %tag, payload = %msg, "arm scope task panicked during drain");
+    }
+    if report.timed_out > 0 {
+        tracing::warn!(
+            tag = %tag,
+            unfinished = report.timed_out,
+            "arm scope drain timed out; residual tasks aborted"
+        );
+    }
 }
 
 /// 从 inbound streamSettings 构建 TLS acceptor（security=tls 时）。
@@ -4393,6 +4404,10 @@ async fn spawn_unix_inbound(
 /// 其余 kind 显式 Unsupported。未注册 unix 监听的 transport 协议（如 kcp）由
 /// listener_registry 报 Go 对齐的 NotFound。
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "8 参 = TCP/UDS 双路径直译签名（ctor/ib/ohm/policy/token/listen/settings/api），打包聚合体属内部 API 变更"
+)]
 async fn spawn_unix_transport_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,

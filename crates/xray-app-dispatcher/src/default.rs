@@ -2977,11 +2977,8 @@ mod tests {
             .expect("新建 scope 必须受理");
         assert_eq!(dispatcher.scope().in_flight(), 1, "spawn 后在途数必须可见");
 
-        dispatcher
-            .scope()
-            .shutdown_timeout(Duration::from_secs(5))
-            .await
-            .expect("可 abort 的在途任务应能等净");
+        let report = dispatcher.scope().shutdown_timeout(Duration::from_secs(5)).await;
+        assert_eq!(report.timed_out, 0, "可 abort 的在途任务应能等净");
         assert!(!finished.load(Ordering::SeqCst), "停机走 abort：不得等 30s 任务跑完");
         assert_eq!(dispatcher.scope().in_flight(), 0, "收口后 in_flight 归零（泄漏判据）");
         assert!(dispatcher.scope().spawn(async {}).is_err(), "停机后拒发新任务");

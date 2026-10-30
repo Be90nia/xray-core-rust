@@ -548,6 +548,7 @@ async fn start_full_dispatched(
         let watcher = xray_frame::compat::spawn_scope().spawn_detached(async move {
             token.cancelled().await;
             let Some(dispatcher) = weak.upgrade() else { return };
+            // 报告由 ManagedScope 内部落日志（panic 清单 + 未完成数），此处只吸收值。
             let _ = dispatcher.scope().shutdown_timeout(DISPATCHER_DRAIN_TIMEOUT).await;
         });
         if watcher.is_err() {

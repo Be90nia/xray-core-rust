@@ -30,7 +30,7 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use skeleton_infra::fx::{
-    CancelSource, CancelToken, FxScope, ScopeClosed, Spawned, TaskError, cancel_pair,
+    CancelSource, CancelToken, FxScope, ScopeClosed, ShutdownReport, Spawned, cancel_pair,
 };
 use tokio::sync::watch;
 
@@ -84,7 +84,10 @@ impl ArmScope {
     /// 停机与 close 形态**同必级联**到 conn scope（子 scope 监视任务 observe 广播
     /// → 取消），调用方不再需要「先 close 再 shutdown_timeout」的两步纪律。
     /// 幂等：重复广播仅多一次无害唤醒。
-    pub async fn shutdown_timeout(&self, d: Duration) -> Result<(), TaskError> {
+    ///
+    /// 返回 udf `ShutdownReport`（udf `51c2428b`/issue#13 起：排空中收割到的任务
+    /// panic 载荷与未完成数不再丢弃，由调用方决定上报形态）。
+    pub async fn shutdown_timeout(&self, d: Duration) -> ShutdownReport {
         self.closed.send_replace(true);
         self.fx.shutdown_timeout(d).await
     }
@@ -184,7 +187,9 @@ impl ConnScope {
     /// 停机（取消 + abort 在途任务 + 等净）。
     pub async fn shutdown(&self) {
         self.source.cancel();
-        self.fx.shutdown().await;
+        // udf `shutdown` 带 `#[must_use]`（报告含 panic 清单）：本件只做关闭，
+        // 报告面归 `shutdown_timeout` 路径（带域日志）；此处显式让渡。
+        let _ = self.fx.shutdown().await;
     }
 
     /// 在途任务数（泄漏断言锚）。
