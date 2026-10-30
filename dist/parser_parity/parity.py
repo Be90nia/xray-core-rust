@@ -12,6 +12,12 @@
   ALLOWED    差异命中 ALLOWLIST（已知残留差异，逐条带理由，不得静默绿）
   DIFF       allowlist 外差异 → 打印差异用例表，退出码非零 → CI 红
 
+关闭方式的判据按用例声明（`add(..., eof_judge=...)`）：
+  "both"  两侧 eof 都必须一致（默认）
+  "rust"  只判 Rust 侧必须在对端观察窗内关闭；Go 侧关闭时刻只记 note——用于关闭时刻
+          由 Go 自身策略计时（半关闭宽限窗）决定的用例，见 H38 的注释与
+          reports/audit-2026-10-30/ParityFlake.md。
+
 用法：
   python parity.py --go-bin <go-xray> --rust-bin <rust-xray> [--workdir DIR]
                    [--only CASE_ID ...]
@@ -34,8 +40,15 @@ DEF_RUST_PORT = 44810
 
 
 # ---------------------------------------------------------------- 用例定义
-def step(send, window=2.0, shutdown=False):
-    return {"send": send, "window": window, "shutdown": shutdown}
+def step(send, window=2.0, shutdown=False, close_wait=0.0):
+    """window = 收响应的主窗；close_wait = 主窗内没等到 EOF 时再等关闭的附加窗。
+
+    close_wait 只用于「字节已在主窗收全、关闭时刻取决于对端计时」的用例（如 H38）：
+    Go 参考实现的关闭走半关闭宽限窗（freedom.go:388/427 `SetTimeout` 的
+    DownlinkOnly/UplinkOnly），该计时受 runner 负载影响可漂出主窗；把关闭观察
+    与字节观察分开，字节判据仍是主窗内的硬断言。
+    """
+    return {"send": send, "window": window, "shutdown": shutdown, "close_wait": close_wait}
 
 
 def http(head_bytes, window=2.5, shutdown=False):
@@ -50,8 +63,11 @@ def head(lines):
 CASES = []
 
 
-def add(cid, group, summary, steps):
-    CASES.append({"id": cid, "group": group, "summary": summary, "steps": steps})
+def add(cid, group, summary, steps, eof_judge="both"):
+    """eof_judge：'both' = 两侧关闭方式都判（默认）；'rust' = 只判 Rust 侧关闭，
+    Go 侧关闭时刻只作旁证记录（用于对端关闭由 Go 内部策略计时决定、负载下无界的用例）。"""
+    CASES.append({"id": cid, "group": group, "summary": summary, "steps": steps,
+                  "eof_judge": eof_judge})
 
 
 def build_cases(origin_port):
@@ -147,9 +163,20 @@ def build_cases(origin_port):
         http(b"\r\n\r\n"))
     add("H37", "截断", "仅裸 CR 分隔（无 LF）",
         http(b"GET http://" + O + b"/cl HTTP/1.1\rHost: " + O + b"\r\r"))
+    # H38 关闭时刻**不判两侧相等**（eof_judge="rust"）：
+    #   客户端发完 CONNECT 头即半关闭、隧道内零字节。Rust 收到上行 EOF 立即
+    #   `shutdown()` 上游写半部（xray-transport/src/bridge.rs 上行收尾），源站读侧
+    #   立刻 EOF → 隧道在毫秒级关闭；Go 的 freedom 上行 `buf.Copy` 收尾后不转发 FIN，
+    #   改由半关闭宽限窗（Go SessionDefault UplinkOnly/DownlinkOnly=1s，freedom.go:388/427
+    #   `SetTimeout` + common/signal ActivityTimer 的 Periodic 计时）在 ~1s 后整体关闭。
+    #   于是「关闭快慢」是 Go 侧策略计时差，不是解析器差异，且该计时在 CPU 争用下可漂出
+    #   任意时长（实测 2 核绑定 + 负载：3/8 轮 >6s 未关）→ 主窗内比两侧 eof 会在随机 CI
+    #   轮次打红（run 40896435024 即 go eof=False@3.003 vs rust eof=True@0.001）。
+    #   判据因此改为：字节必须全等（主窗内硬断言）+ **Rust 必须在主窗+close_wait 内关闭**
+    #   （防挂死/防泄漏回归，实测 Rust 0.002~0.15s，余量 ~70 倍），Go 侧关闭时刻进旁证。
     add("H38", "截断", "CONNECT 后立即半关闭（无隧道数据）",
         [step(b"CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n" % (origin_port, origin_port),
-              3.0, shutdown=True)])
+              3.0, shutdown=True, close_wait=10.0)], eof_judge="rust")
 
     # ------------------------------------------------ SOCKS5 握手 19 例
     GREET = step(b"\x05\x01\x00", 1.5)
@@ -212,8 +239,24 @@ ALLOWLIST = {
 
 
 # ---------------------------------------------------------------- 探针
+def read_until(sock, t0, deadline, rx, send_err):
+    """读到 deadline（绝对时刻）或对端 EOF；返回 (rx, eof, eof_at, send_err)。eof_at 自 t0 起算。"""
+    while time.time() < deadline:
+        sock.settimeout(max(0.05, deadline - time.time()))
+        try:
+            d = sock.recv(65536)
+        except socket.timeout:
+            break
+        except OSError as e:  # RST 等
+            return rx, True, round(time.time() - t0, 3), send_err or repr(e)
+        if not d:
+            return rx, True, round(time.time() - t0, 3), send_err
+        rx += d
+    return rx, False, None, send_err
+
+
 def probe(port, steps):
-    """按步骤发字节并收字节；返回 {connect, steps:[{rx_hex, eof, ...}]}。"""
+    """按步骤发字节并收字节；返回 {connect, steps:[{rx_hex, eof, eof_at, ...}]}。"""
     out = {"connect": True, "steps": []}
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
@@ -229,22 +272,13 @@ def probe(port, steps):
                     s.shutdown(socket.SHUT_WR)
             except OSError as e:
                 sent, send_err = False, repr(e)
-            rx, eof = b"", False
-            while time.time() - t0 < st["window"]:
-                s.settimeout(max(0.05, st["window"] - (time.time() - t0)))
-                try:
-                    d = s.recv(65536)
-                except socket.timeout:
-                    break
-                except OSError as e:  # RST 等
-                    eof, send_err = True, send_err or repr(e)
-                    break
-                if not d:
-                    eof = True
-                    break
-                rx += d
+            rx, eof, eof_at, send_err = read_until(s, t0, t0 + st["window"], b"", send_err)
+            # 主窗内字节已收全但没等到关闭：按 close_wait 追加观察关闭时刻（语义见 step()）
+            if not eof and st.get("close_wait"):
+                rx, eof, eof_at, send_err = read_until(
+                    s, t0, t0 + st["window"] + st["close_wait"], rx, send_err)
             out["steps"].append({"sent": sent, "send_err": send_err, "rx_hex": rx.hex(),
-                                 "rx_len": len(rx), "eof": eof,
+                                 "rx_len": len(rx), "eof": eof, "eof_at": eof_at,
                                  "open": not eof and not rx,
                                  "elapsed": round(time.time() - t0, 3)})
             if eof:
@@ -290,17 +324,31 @@ def summarize(side_res):
     return "/".join(parts) or "no-steps"
 
 
-def compare(cid, g, r):
-    """返回 (verdict, note)。判据 = 字节（归一后）+ 关闭方式，两维都一致才算 SAME。"""
+def compare(case, g, r):
+    """返回 (verdict, note)。判据 = 字节（归一后）+ 关闭方式，两维都一致才算 SAME。
+
+    `case["eof_judge"] == "rust"`：只判 Rust 侧关闭（对端关闭时刻由 Go 内部策略计时
+    决定的用例，见 CASES 里 H38 的说明）。此时 Go 侧 eof/eof_at 只写进 note 作旁证；
+    判定改成「声明了 close_wait 的步骤，Rust 必须在主窗 + close_wait 内关闭」。
+    """
+    cid, eof_judge = case["id"], case.get("eof_judge", "both")
     if not g["connect"] or not r["connect"]:
         return "DIFF", "connect failed on one side"
     ng, nr = len(g["steps"]), len(r["steps"])
     if ng != nr:
         return "DIFF", f"step count {ng} vs {nr}"
     notes = []
+    bnd_notes = []
+    close_diff = []
     for i, (a, b) in enumerate(zip(g["steps"], r["steps"]), 1):
         if a["eof"] != b["eof"]:
-            notes.append(f"step{i} 关闭方式不同：go eof={a['eof']} rust eof={b['eof']}")
+            if eof_judge == "rust":
+                notes.append(f"step{i} 关闭时刻旁证（不判）：go eof={a['eof']}@{a['eof_at']}s "
+                             f"rust eof={b['eof']}@{b['eof_at']}s")
+            else:
+                close_diff.append(f"step{i} 关闭方式不同：go eof={a['eof']} rust eof={b['eof']}")
+        if eof_judge == "rust" and not b["eof"] and case["steps"][i - 1].get("close_wait"):
+            close_diff.append(f"step{i} rust 未在观察窗内关闭（eof=False）")
         if a["rx_hex"] == b["rx_hex"]:
             continue
         if cid.startswith("H"):
@@ -313,12 +361,14 @@ def compare(cid, g, r):
         if bnd_g and bnd_r:
             if hg != hr:
                 return "DIFF", f"step{i} 帧头不同 go={hg} rust={hr}"
-            notes.append(f"step{i} BND 已归一 go={bnd_g} rust={bnd_r}")
+            bnd_notes.append(f"step{i} BND 已归一 go={bnd_g} rust={bnd_r}")
             continue
-        return "DIFF", f"step{i} 字节不同" + ("；" + "；".join(notes) if notes else "")
-    if notes and any("关闭方式" in n for n in notes):
-        return "DIFF", "；".join(notes)
-    return "SAME", "字节全等且关闭方式相同" + ("（BND 已归一）" if notes else "")
+        return "DIFF", f"step{i} 字节不同" + (
+            "；" + "；".join(notes + bnd_notes) if notes or bnd_notes else "")
+    if close_diff:
+        return "DIFF", "；".join(close_diff + notes + bnd_notes)
+    tail = "（Go 侧关闭时刻仅记录）" if eof_judge == "rust" else ""
+    return "SAME", f"字节全等且关闭方式相同{tail}" + ("（BND 已归一）" if bnd_notes else "")
 
 
 # ---------------------------------------------------------------- 生命周期
@@ -410,7 +460,7 @@ def main():
             c1 = origin_count(origin_log)
             r = probe(args.rust_port, case["steps"])
             c2 = origin_count(origin_log)
-            verdict, note = compare(cid, g, r)
+            verdict, note = compare(case, g, r)
             if verdict == "DIFF" and cid in ALLOWLIST:
                 verdict, note = "ALLOWED", "allowlist: %s" % ALLOWLIST[cid]
             rec = {"id": cid, "group": case["group"], "summary": case["summary"],
