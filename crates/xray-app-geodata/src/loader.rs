@@ -15,7 +15,8 @@
 //! `MemoryPool`（缓冲）× `ThreadPool`（worker）+ 借用超时；本 crate 不复制
 //! 任何池逻辑，只做编排（任务构造 / 提交 / 串行收集）。
 
-// udf-promotion-candidate: 提炼条件=零 xray 类型（薄壳编排机制，可上浮 std-ext）
+// 留主仓（方向件：内容域绑定）——壳编排的输入是 geodata dat 文件加载与 geoip/
+// geosite 规则集构建，属文件/内容方向件（CLAUDE.md §3.5.3），不进 udf。
 
 use std::{
     io::Read,

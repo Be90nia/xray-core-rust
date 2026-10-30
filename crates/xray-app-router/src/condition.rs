@@ -1229,9 +1229,10 @@ pub const ENV_QUEUE_CAP: &str = "XRAY_ROUTER_POOL_QUEUE_CAP";
 /// 池参数 env 覆盖项：worker 借缓冲超时（毫秒）。
 pub const ENV_BORROW_TIMEOUT_MS: &str = "XRAY_ROUTER_POOL_BORROW_TIMEOUT_MS";
 
-// udf-promotion-candidate: 提炼条件=零 xray 类型（薄壳编排机制，可上浮 std-ext）
+// 留主仓（方向件：内容域绑定）——壳编排的输入是路由 matcher 构建（路由规则内容域），
+// 属内容方向件（CLAUDE.md §3.5.3），不进 udf；池件本体仍白拿 udf。
 /// 路由 matcher 构建互喂池：[`PooledThreadPool`] 薄壳（P1-2 `GeodataLoadPool`
-/// 同款形态；壳属消费 crate 本地件，批量上浮 udf 列 P4 提炼候选）。
+/// 同款形态；壳是内容域方向件，留消费 crate，不上浮 udf）。
 ///
 /// 硬边界：只接启动期/热更期 matcher 构建（CPU 密集、纯内存、不持 IO）；
 /// 数据面 `apply` 与持 socket 任务禁入（契约坑约束 12）。

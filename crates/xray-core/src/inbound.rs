@@ -3096,7 +3096,7 @@ impl InboundRuntime {
     /// tag 是否已登记（对应 Go `ihm.GetHandler` 的存在性检查）。
     #[must_use]
     pub fn contains(&self, tag: &str) -> bool {
-        self.slots.read().get(&tag.to_string()).is_some()
+        self.slots.read().get(tag).is_some()
     }
 
     /// 停止并注销一个入站。对应 Go `ihm.RemoveHandler`。
@@ -3133,7 +3133,7 @@ impl InboundRuntime {
     /// [`ProxymanError::NotUserManager`]（Go 类型断言失败的等价语义）。
     pub fn user_manager(&self, tag: &str) -> Result<Arc<dyn ApiUserManager>, ProxymanError> {
         let slots = self.slots.read();
-        let slot = slots.get(&tag.to_string());
+        let slot = slots.get(tag);
         let slot = slot.ok_or_else(|| ProxymanError::HandlerNotFound(tag.to_string()))?;
         slot.users.clone().ok_or(ProxymanError::NotUserManager)
     }

@@ -2101,16 +2101,9 @@ fn insert_handler(reg: &mut HandlerRegistry, tag: &str, handler: Arc<dyn Dispatc
     }
 }
 
-/// 浅拷贝注册表（udf `BoundedRegistry` 未派生 `Clone`）：共享 handler，tag 复制。
-fn copy_handler_registry(src: &HandlerRegistry) -> HandlerRegistry {
-    let mut out = new_handler_registry();
-    for (tag, handler) in src.iter() {
-        let inserted = out.insert(tag.clone(), Arc::clone(handler));
-        // 同上界 ⇒ 源 len ≤ max，Reject 分支不可达。
-        debug_assert!(inserted.is_ok(), "copy into same-capacity registry cannot reject");
-    }
-    out
-}
+// 注册表拷贝直接用 udf `BoundedRegistry: Clone`（逐字段深拷贝：map/上限/策略全带，
+// 值 `Arc` 仅计数递增 ⇒ 语义 = 共享 handler + 复制 tag）。注册表归一化纪律：
+// 复制不得绕过上限，故禁手写重建（那会重新依赖「源 len ≤ max」这个隐含前提）。
 
 /// 简单的 [`OutboundHandlerManager`]：udf `BoundedRegistry` + default。
 ///
@@ -2151,8 +2144,8 @@ impl SimpleOhm {
     pub fn snapshot(&self) -> SimpleOhm {
         Self {
             default: parking_lot::RwLock::new(self.default.read().clone()),
-            tagged: parking_lot::RwLock::new(copy_handler_registry(&self.tagged.read())),
-            shadow: parking_lot::RwLock::new(copy_handler_registry(&self.shadow.read())),
+            tagged: parking_lot::RwLock::new((*self.tagged.read()).clone()),
+            shadow: parking_lot::RwLock::new((*self.shadow.read()).clone()),
         }
     }
 
@@ -2218,9 +2211,8 @@ impl Default for SimpleOhm {
 
 impl OutboundHandlerManager for SimpleOhm {
     fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        // udf `get(&K)` 无 `Borrow<Q>` 泛型 ⇒ String 键需一次短串分配（HashMap 时代
-        // `get(&str)` 零分配）。频次=每 dispatch 一次量级，非每包；上游加泛型后回落。
-        self.tagged.read().get(&tag.to_string()).cloned()
+        // udf `get<Q: Borrow<Q>>`：String 键用 `&str` 借用查表，零分配。
+        self.tagged.read().get(tag).cloned()
     }
 
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
@@ -2228,7 +2220,7 @@ impl OutboundHandlerManager for SimpleOhm {
     }
 
     fn select_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        self.shadow.read().get(&tag.to_string()).cloned()
+        self.shadow.read().get(tag).cloned()
     }
 }
 
@@ -5339,6 +5331,66 @@ mod tests {
             "remove 后两侧未命中不得报差异"
         );
         assert_eq!(dual_write::lookup_diff_count(), l1, "remove 后漂移监控不得误报差异");
+    }
+
+    /// `SimpleOhm::snapshot()` 靠 `BoundedRegistry::Clone` 复制注册表（不手写重建）：
+    /// 克隆体必须连 `max` 与 `Eviction::Reject` 一起带过来，否则快照表要么无界、
+    /// 要么满时静默淘汰旧 handler（旧手写版靠「源 len ≤ max」这个隐含前提才不撞）。
+    /// 生产表 max=`MAX_TAGGED_HANDLERS` 无法填满，故用同型小表验语义（同一个
+    /// derived `Clone` 实现）。
+    #[test]
+    fn cloned_registry_keeps_max_and_reject_policy() {
+        let called = || std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mk = |tag: &'static str| {
+            std::sync::Arc::new(TaggedEchoHandler::new(tag, called())) as Arc<dyn DispatchHandler>
+        };
+
+        let mut src: HandlerRegistry = BoundedRegistry::new(2, Eviction::Reject);
+        src.insert("a".to_string(), mk("a")).unwrap();
+        src.insert("b".to_string(), mk("b")).unwrap();
+
+        let mut cloned = src.clone();
+        assert_eq!(cloned.capacity(), 2, "Clone 丢了 max 上限");
+        assert_eq!(cloned.len(), 2, "Clone 丢了登记项");
+        // 满表再插：Reject 策略随 Clone 过来 ⇒ 显式 Err，不静默淘汰旧项。
+        let err = cloned.insert("c".to_string(), mk("c")).expect_err("克隆体未受 max 约束");
+        assert_eq!(err.capacity, 2, "错误里的容量应是克隆体的 max");
+        assert_eq!(cloned.len(), 2, "Reject 未随 Clone 过来（静默淘汰了旧项）");
+        // 深拷贝非共享句柄：克隆体写入不回灌原件。
+        assert!(src.get("a").is_some());
+        assert!(src.get("c").is_none(), "克隆体插入泄漏回原件");
+    }
+
+    /// #4 分配取证：udf `get<Q: Borrow<Q>>` 让 tag 查表走借用形。测的是**生产路径**
+    /// `SimpleOhm::get_handler`：改前（`get(&tag.to_string())`）每次查表 1 次堆分配，
+    /// 改后借用形 0 次。计数源复用 udp_session 的线程归属分配器（本 crate 只有一个
+    /// `#[global_allocator]`）。
+    // lib.rs 的 warn(print_stdout) 排在 test 级 allow 之后覆盖它，取证数字须打印。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn tag_lookup_allocates_nothing_after_borrow_generic() {
+        use std::cell::Cell;
+
+        use crate::udp_session::tests::THREAD_ALLOCS;
+
+        const LOOKUPS: usize = 64;
+        let ohm = SimpleOhm::new();
+        ohm.add(
+            "alloc-probe",
+            Arc::new(TaggedEchoHandler::new(
+                "alloc-probe",
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )),
+        );
+
+        let before = THREAD_ALLOCS.with(Cell::get);
+        for _ in 0..LOOKUPS {
+            assert!(ohm.get_handler("alloc-probe").is_some());
+        }
+        let allocs = THREAD_ALLOCS.with(Cell::get) - before;
+
+        println!("tag lookup allocs/lookup: {}", allocs / LOOKUPS);
+        assert_eq!(allocs, 0, "借用查表必须零分配（改前每次 1 次 to_string 分配）");
     }
 
     /// B4 S3/S4：生产选择面 = 实例影子表（无兜底，唯一路径）。

@@ -179,7 +179,7 @@ impl UdpDispatchSession {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::net::Ipv4Addr;
 
     use xray_common::net::{address::Address, port::Port};
@@ -494,7 +494,9 @@ mod tests {
     };
 
     thread_local! {
-        static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
+        // pub(crate)：本 crate 其他测试模块复用此计数（一个二进制只能有一个
+        // `#[global_allocator]`，故计数源共享而非各造一份）。
+        pub(crate) static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
     }
 
     struct CountingAlloc;

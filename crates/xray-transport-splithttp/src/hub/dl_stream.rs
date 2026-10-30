@@ -8,9 +8,8 @@
 //! 帧粒度与原实现一致：一次 `poll_read` 产出一帧（同 `ReaderStream` 的
 //! `poll_read_buf` 单次读语义），故 h2 DATA 帧尺寸分布不变。
 //!
-//! // udf-promotion-candidate: 提炼条件=零 xray 类型（池化读流机制：池借固定块 →
-//! // `Bytes::from_owner` 归还，仅依赖 alloc_site 埋点，可上浮 std-ext）；待 udf
-//! // 接线窗开后上浮并删本地副本（与 alloc_site 同批）。
+//! 留主仓（方向件：依赖 `bytes::Bytes::from_owner`）——池化读流只服务 h2 DATA
+//! 帧这一网络方向，`bytes` 属方向件非 udf 依赖纪律，不上浮。
 
 use std::{
     io,

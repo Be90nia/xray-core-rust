@@ -9,8 +9,10 @@
 //! 有界环溢出丢最旧的显式证据**——[`AuditHandle::evicted_count`] 单调记录被逐
 //! 出数，禁静默重写历史（对账键：`seq` 在订阅窗内连续，缺口即溢出证据）。
 //!
-//! // udf-promotion-candidate: AuditHandle/AuditRecord 零 xray 类型可上浮 udf；
-//! // 本票非目标含「不改 udf-frame」，故留主仓（提炼归 P4 回灌轮）。
+//! 留 xray-frame（ADR-1 默认答案：派生层）。举证：udf 侧无可复用等价件——
+//! skeleton-infra/src/audit.rs 的 `AuditEvent{seq, kind}` 是 store/journal 生命
+//! 周域的 dispatch 记账节点，与本处 `AuditRecord{seq, plugin, message}` 形状、
+//! 用途都不同。
 
 use std::sync::{
     Mutex, MutexGuard,
