@@ -159,6 +159,10 @@ serena-cli undo                                                        # 改坏�
 > **判定口径**：件内**无 Xray 语义**（Go 兼容语义算 Xray 语义）→ 可提炼；机制与内容分离时**机制上浮、内容留仓**。提炼走 §3.5.3 回路，件头标注 `udf-promotion-candidate`。
 >
 > **锚点纪律（pzjpj）**：本文档只写**符号名 + 所属 crate**；精确行号仅允许出现在**带 rev 的审计快照**里（行号随树漂移，已多轮实证腐烂）。需要定位时跑可复现命令，如 `grep -n "pub struct SimpleOhm" crates/xray-app-dispatcher/src/default.rs`。
+>
+> **双主路口径（zhvi3，2026-10-30 PM 拍板）**：装配面有两条并存的**主路**——**生产主路** = `xray_conf::Config::build()` → `xray_core::start_full`（出站经 `arm_builders` 构造表 + `register_outbounds` 填 `SimpleOhm`；**默认可执行文件走这条**）；**目标主路** = `xray-cli` 的 `framework-assembly`（`derive_families → assemble → fill_bridge → start_full_with_outbound_handlers`；尚未进默认构建）。两者由 `crates/xray-core/tests/assembly_path_equivalence.rs` 的**差异台账契约测试**锁住：已知差异四类（① 覆盖差：生产多 `mux`/`naive`、`dokodemo` ↔ `dokodemo-door` 名称不同源；② 失败语义差；③ 框架路额外门：同 protocol 只转首个 / guard 面 `mux`·`sendThrough`·`dialerProxy`·`proxySettings` 拒绝 / 代理链 late-bind；④ 入站同源：框架路把出站 handler 灌进生产 `start_full_with_outbound_handlers`，入站表天然等价）逐条登记，**已知差异不算失败，未知差异即红**。
+>
+> **关键事实（zhvi3 本票发现）**：**`fail-fast` 门（缺段/坏段 → 启动前 fail-visible）目前只在框架路生效**——生产路对「协议不支持 / 配置解析失败」是 `register_outbounds` 的 `warn + skip`（**静默丢弃**，两个 `Err` 分支都不返回错误）；生产路唯一的启动期硬门 = 入站构造/绑定失败 + `xray-conf` build 期 `ValidationStage`（两路共用）。因此**「配置写错 → 启动即报」这句承诺在默认可执行文件里不成立**；引用任何治理解读时，必须显式指明说的是哪条主路。
 
 ### 3.5.5 能力归属三层判定与派生回路（ADR-1，2026-10-27 PM 拍板 · 评审打回项）
 
@@ -180,6 +184,20 @@ serena-cli undo                                                        # 改坏�
 **已定裁决**：`MergePolicy`（tag-aware 数组合并 / outbounds prepend）归 xray-frame，且必须与 udf `merge_over` 的"数组整体替换"语义**并存可见**（后者是 udf 刻意设计，不得被覆盖或混淆）；本轮**不动父仓**加 `ConfigFile::fold_with`。
 
 **详案**（本地文档，未入库）：`docs/architecture/xray-frame-能力收敛方案-2026-10-27.md`（六面派生方案 + 8 波次实施表 + 融合度预估 57%→79%→100% 路径）
+
+### 3.5.6 spawn 三分类口径（D6 面⑦ ≡ D7 统一判据，2026-10-30 定案）
+
+> 背景：D6 面⑦ 要求「任务托管迁 FxScope」，D7 判「站点逐个 allow + reason = 语义达标」，同一份代码两种结论（`dod-evidence-audit.md` U3）。以下为唯一判据，两处都按此解释。
+
+| 类 | 判据 | 处理 |
+|---|---|---|
+| **① 接管类** | 任务生命周期绑定某组件——宿主 drop 或停机时**应当**随之取消（连接级 dispatch、arm/连接任务、装配级批次） | 必须走托管口：`PluginContext` 的 fx 句柄；**无 ctx 站点**走 `xray_frame::compat::ManagedScope`（组合包装 udf `FxScope`，提供 spawn / close / in_flight / shutdown_timeout） |
+| **② 豁免类** | 任务**必须**活得比任何组件久（进程级 `LazyLock` 初始化、日志 flush、指标上报），或属数据面逐包泵（坑约束 ⑫ 零改动红线） | 允许裸 spawn，但必须逐站 `#[allow(clippy::disallowed_methods, reason = "...")]` 登记；CI 门核对「调用集合 ⊆ 登记集合」 |
+| **③ 违规** | 裸 spawn 且无 allow / reason | CI 红，不得合入 |
+
+- **口径等价性**：D6 面⑦「任务托管迁 FxScope」的解释 = **① 类站点全部有托管口消费**；② 类逐站登记即视为达成（**不要求**把数据面逐包泵强迁，那会撞坑约束 ⑫）。按此判据，D6 面⑦ 与 D7 是同一结论的两种数法。
+- **停机语义**：托管口的 `shutdown_timeout` = udf 三段（close 闸 → **abort 在途** → 等净），**不是**「等任务跑完」；连接级优雅终止由 inbound arm scope 先取消。零残留判据 = 排空后 `in_flight() == 0`。
+- **禁止双份账本**：同一组任务不得既自持 `JoinSet` / 自建收割账本、又经托管口记账——两套账本 = 两套停机语义。
 
 ---
 
