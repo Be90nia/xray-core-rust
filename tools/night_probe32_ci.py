@@ -33,6 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO = "Be90nia/xray-core-rust"
 BRANCH = "feature/fix-inbound-parity"
 VPS = "root@176.122.139.45"
+VPS_PORT = "26617"  # 非 22：该机 SSH 端口，默认 22 会 Connection refused
 VPS_BIN = "/root/agsbx/xray"
 VPS_SVC = "xr"
 URIS = r"C:\Users\Begonia\Desktop\test.txt"
@@ -92,20 +93,32 @@ def download_artifact(run_id, name, dest_dir):
 
 
 def ssh(cmd, timeout=120):
-    return sh(["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", VPS, cmd], timeout=timeout)
+    return sh(["ssh", "-p", VPS_PORT, "-o", "ConnectTimeout=10", "-o", "BatchMode=yes",
+               VPS, cmd], timeout=timeout)
 
 
 def deploy(run_id, linux_bin, stamp):
     """换核 + 校验 + 失败回滚。返回 (ok, 说明)。"""
-    bak = f"{VPS_BIN}.bak-{stamp}"
-    pre = ssh(f"systemctl is-active {VPS_SVC}; ss -ltn | grep -c LISTEN")
+    # CI 备份用独立前缀：绝不参与清理用户手建的回滚点（.bak-<时间戳> 那批）。
+    bak = f"{VPS_BIN}.bak-ci-{stamp}"
+    need_mb = os.path.getsize(linux_bin) * 2 // (1024 * 1024) + 100  # 新核 + 备份 + 余量
+    pre = ssh(
+        f"systemctl is-active {VPS_SVC}; ss -ltn | grep -c LISTEN; "
+        f"df -Pm /root | tail -1 | awk '{{print $4}}'"
+    )
     if pre.returncode != 0:
         return False, f"预检 SSH/服务失败: {(pre.stderr or pre.stdout)[:200]}"
     pre_lines = pre.stdout.strip().splitlines()
-    pre_ports = int(pre_lines[-1].strip() or 0) if pre_lines else 0
+    if len(pre_lines) < 3:
+        return False, f"预检输出不全: {pre.stdout[:200]}"
+    pre_ports = int(pre_lines[-2].strip() or 0)
+    free_mb = int(pre_lines[-1].strip() or 0)
+    if free_mb < need_mb:
+        return False, f"/root 余量 {free_mb}MB < 需要 {need_mb}MB（先清备份再换核）"
 
     remote_tmp = f"/tmp/xray-ci-{stamp}"
-    cp = sh(["scp", "-o", "ConnectTimeout=10", linux_bin, f"{VPS}:{remote_tmp}"])
+    cp = sh(["scp", "-P", VPS_PORT, "-o", "ConnectTimeout=10", linux_bin,
+             f"{VPS}:{remote_tmp}"])
     if cp.returncode != 0:
         return False, f"scp 失败: {cp.stderr[:200]}"
 
@@ -131,7 +144,9 @@ def deploy(run_id, linux_bin, stamp):
                  f"systemctl start {VPS_SVC}; systemctl is-active {VPS_SVC}", timeout=180)
         return False, (f"换核失败已回滚（回滚态={rb.stdout.strip()[:60]}）；"
                        f"pre_ports={pre_ports} post_ports={post_ports} err={(r.stderr or r.stdout)[:200]}")
-    return True, f"176 已换核 {stamp}；监听 {post_ports} 个（与换核前一致）；备份 {bak}"
+    # 备份保留最近 3 份：/root 分区只有 1.7G 空闲，无限堆备份迟早把换核逼停。
+    ssh(f"ls -1t {VPS_BIN}.bak-ci-* 2>/dev/null | tail -n +4 | xargs -r rm -f", timeout=120)
+    return True, f"176 已换核 {stamp}；监听 {post_ports} 个（与换核前一致）；备份 {bak}（仅保留最近 3 份）"
 
 
 def run32(bin_path, limit):
