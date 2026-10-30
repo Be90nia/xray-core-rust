@@ -463,7 +463,7 @@ impl ReqIdGen for AtomicReqIdGen {
 /// DNS over TCP 帧读写（RFC 1035 §4.2.2：2B 大端长度前缀 + 裸报文）。
 ///
 /// TCP nameserver 与 UDP 的 TCP 兜底共用同一套帧机制；两处历史错误文案不同
-/// （`tcp ...` / `tcp fallback ...`），故只把文案差异登记在 [`FrameCtx`]，
+/// （`tcp ...` / `tcp fallback ...`），故只把文案差异登记在 [`FrameCtx`](tcp_frame::FrameCtx)，
 /// 机制与文案都不再各写一份。
 pub mod tcp_frame {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

@@ -2504,10 +2504,10 @@ pub async fn serve_ss2022_udp(
 
 /// SS-2022 中继 UDP 入口（Go `RelayInbound.processUDP`）。
 ///
-/// recv_from → [`RelayInbound::relay_udp_packet`]（剥 relay 层 + 用下一跳 PSK
+/// recv_from → `RelayInbound::relay_udp_packet`（剥 relay 层 + 用下一跳 PSK
 /// 重加密包头）→ 按 client sessionId 分发到 per-session relay task，整帧（已换成
 /// 下一跳可见的 `[ECB(destPSK,hdr)][body]`）转发到 destinations 表指定目标。
-/// 回包原样回送客户端（`session = None`，见 [`ss2022_udp_client_relay`]）。
+/// 回包原样回送客户端（`session = None`，见 `ss2022_udp_client_relay`）。
 pub async fn serve_ss2022_relay_udp(
     udp: Arc<dyn xray_transport::finalmask::UdpIo>,
     relay: Arc<xray_proxy_ss::ss2022::RelayInbound>,
