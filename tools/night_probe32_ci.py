@@ -191,6 +191,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0,
                     help="只截断输出/报告行数（harness 仍跑全量；全量约 7 分钟）")
     ap.add_argument("--run-id", type=int, default=0, help="指定 CI run（默认取最新成功）")
+    ap.add_argument("--no-speed", action="store_true", help="跳过测速段")
+    ap.add_argument("--speed-pick", default="1,3,5", help="测速节点序号")
     args = ap.parse_args()
 
     stamp = time.strftime("%Y%m%d-%H%M")
@@ -296,7 +298,28 @@ def main():
                             f"复跑：`python tools/night_probe32_ci.py --no-deploy`")
                     print(f"[bd] {bd_create(title, desc)}")
 
-        # ⑤ 异常回退信号（只记录，不开票：弱信号，避免误报）
+        # ⑤ 测速（Rust=本 run 的 CI 产物 vs Go=v2rayN 内核，交替多轮）
+        # 用户口径：05:00 要的是**测速**，不只是通断。单侧数字不算数，必须带 Go 对照。
+        speed_txt = ""
+        if not args.smoke and not args.no_speed:
+            go_src = r"D:\Program Files\v2rayN-windows-64\bin\xray\xray.exe"
+            go_bin = os.path.join(tmp, "go-xray.exe")
+            shutil.copy2(go_src, go_bin)  # 拷出来跑，绝不动 v2rayN 原件
+            cp = sh([sys.executable, os.path.join(ROOT, "tools", "speed_ab_rust_vs_go.py"),
+                     "--rust", win_bin, "--go", go_bin, "--rounds", "3",
+                     "--pick", args.speed_pick], cwd=ROOT, timeout=1800)
+            speed_txt = (cp.stdout or "") + "\n" + (cp.stderr or "")
+            print("[speed] " + " | ".join(
+                l for l in cp.stdout.splitlines() if l.startswith(("|", "**", "判决")))[:600])
+
+        if speed_txt.strip() and not args.smoke:
+            with io.open(rep, "a", encoding="utf-8") as fh:
+                fh.write("\n## 测速（Rust=本 run CI 产物 vs Go=v2rayN 内核，交替 3 轮·2MB）\n\n```\n")
+                fh.write(speed_txt.strip()[-4000:])
+                fh.write("\n```\n")
+            print("[report] 测速段已并入报告")
+
+        # ⑥ 异常回退信号（只记录，不开票：弱信号，避免误报）
         for r in rows:
             if r["body"] > 0 and med and r["body"] < med * 0.5:
                 print(f"[note] 疑似回退 #{r['idx']} {r['proto']} body={r['body']}B << median {med}B")
