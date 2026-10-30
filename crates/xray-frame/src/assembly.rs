@@ -18,25 +18,27 @@
 use std::{
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::Duration,
 };
 
 use skeleton::{clock::SystemClock, config::StdEnv};
-use skeleton_infra::shutdown::{
-    ComponentOutcome, OutcomeKind, ShutdownCoordinator, ShutdownReport,
+use skeleton_infra::{
+    journal::{JournalError, JsonlJournal},
+    shutdown::{ComponentOutcome, OutcomeKind, ShutdownCoordinator, ShutdownReport},
 };
 
 use crate::{
     audit::AuditHandle,
     context::{PluginContext, derive_fingerprint},
     error::PluginError,
-    lifecycle::{StartedPlugins, bring_up},
     logging::LogFacade,
     plugin::Plugin,
     pool::BufferPool,
     registry::PluginRegistry,
     scope::ArmScope,
+    state_loop::{self, AssemblyJournal, AuditSlice, CtxFactory, StartedPlugins, TrailEntry},
 };
 
 /// `FrameworkOptions::shutdown_timeout = None` 时的默认停机超时（P0-8 拍板数字）。
@@ -66,6 +68,8 @@ pub struct Framework {
     started: Option<StartedPlugins>,
     /// build 阶段构造的 per-plugin ctx（`build(ctx)` 变更后原样交 init/start）。
     ctxs: Option<HashMap<&'static str, PluginContext>>,
+    /// 审计账本路径（`None` = 不写盘；用户显式配置才记账）。
+    journal_path: Option<PathBuf>,
 }
 
 /// 手写（scope/coordinator 无 Debug）：打印运行态与插件数——`Result` 错误路径
@@ -98,15 +102,15 @@ impl Framework {
         self.started.is_some()
     }
 
-    /// 阶段③：init/start 拓扑序编排。复用 [`bring_up`]
-    /// 全部语义（逐插件 init→start 交替、任一步失败逆序回滚、stop 闭包按逆启动序
-    /// 注册进 coordinator）；失败 → 已启动者回滚 + `started` 保持 `None`。
-    /// 失败后本实例为终态（插件不保证 init 幂等，禁重试；`shutdown` 仍安全）。
+    /// 阶段③：init/start 拓扑序编排（**唯一路径 = [`crate::state_loop`]**）。
+    /// 依赖序计划在 `Plan::from_registry` 处产出（缺依赖 / 成环 → `Err`，启动前
+    /// fail-visible，零生命周期调用）；失败 → 已启动者回滚 + `started` 保持
+    /// `None`。失败后本实例为终态（插件不保证 init 幂等，禁重试；`shutdown` 仍安全）。
     pub fn bring_up(&mut self) -> Result<(), PluginError> {
         // factory 逐名取回 build 期 ctx（bring_up 单线程顺序调用；同注册表
         // 重排序确定性 → build 期顺序与取用顺序一致）。
         let table = Mutex::new(self.ctxs.take().unwrap_or_default());
-        let factory = |plugin: &Arc<dyn Plugin>| {
+        let factory: CtxFactory = Arc::new(move |plugin: &Arc<dyn Plugin>| {
             lock(&table).remove(plugin.name()).ok_or_else(|| {
                 PluginError::Other(
                     format!(
@@ -116,9 +120,26 @@ impl Framework {
                     .into(),
                 )
             })
-        };
-        self.started = Some(bring_up(&self.registry, factory, Arc::clone(&self.coordinator))?);
+        });
+        let journal = self.open_journal()?;
+        self.started = Some(state_loop::bring_up_with_journal(
+            &self.registry,
+            factory,
+            Arc::clone(&self.coordinator),
+            journal,
+        )?);
         Ok(())
+    }
+
+    /// 打开审计账本（**用户显式配置才写**；缺省 `None` = 内存账本零 IO）。
+    ///
+    /// shortcut: 账本按追加挂载，跨进程重启不复原审计分片（`seq` 自 0 重新计），
+    /// 需要跨重启真复原时改用 `SyncStore::restore_from` 播种。
+    fn open_journal(&self) -> Result<Option<AssemblyJournal>, PluginError> {
+        let Some(path) = self.journal_path.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(open_ledger(path).map_err(|err| PluginError::Other(Box::new(err)))?)))
     }
 
     /// 优雅停机三段（坑约束 #6 停机链唯一出口）。消费所有权——重复 shutdown
@@ -163,6 +184,8 @@ pub struct FrameworkBuilder {
     /// 装配根缓冲池（nn8os W2 2a：`with_pool` 注入，各插件 ctx 共享同一池；
     /// 缺省 `None` = 未接线 → 插件取 `ctx.pool()` fail-visible）。
     pool: Option<Arc<dyn BufferPool>>,
+    /// 审计账本落盘路径（`with_journal` 注入；缺省 `None` = 不写盘）。
+    journal_path: Option<PathBuf>,
 }
 
 impl FrameworkBuilder {
@@ -180,6 +203,7 @@ impl FrameworkBuilder {
             config_root: serde_json::json!({}),
             audit: Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
             pool: None,
+            journal_path: None,
         })
     }
 
@@ -197,6 +221,15 @@ impl FrameworkBuilder {
     #[must_use]
     pub fn with_pool(mut self, pool: Arc<dyn BufferPool>) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// 注入审计账本路径（`JournalPort` + udf JSONL）：**用户显式配置才写盘**，
+    /// 缺省 `None` = 内存账本，零 IO。启动期装配轨迹与停机轨迹都落此文件，
+    /// 停机时 `persist_snapshot` 落快照行并 fsync。
+    #[must_use]
+    pub fn with_journal(mut self, path: impl Into<PathBuf>) -> Self {
+        self.journal_path = Some(path.into());
         self
     }
 
@@ -226,6 +259,7 @@ impl FrameworkBuilder {
             config_root: _,
             audit: _,
             pool: _,
+            journal_path,
         } = self;
         Ok(Framework {
             registry,
@@ -234,6 +268,7 @@ impl FrameworkBuilder {
             shutdown_timeout,
             started: None,
             ctxs: Some(ctxs),
+            journal_path,
         })
     }
 
@@ -254,6 +289,19 @@ impl FrameworkBuilder {
             ctx.set_pool(Arc::clone(pool));
         }
         ctx
+    }
+}
+
+/// 账本版本头（`JsonlJournal` 的 v1 格式）。
+const JOURNAL_VERSION: u32 = 1;
+
+/// 挂载账本：新路径建账（版本头 + 首次 flush），已有路径按追加挂载（尾部
+/// 残行截断交给 udf，`VersionMismatch` / `Corrupt` 原样上抛 fail-visible）。
+fn open_ledger(path: &Path) -> Result<JsonlJournal<TrailEntry, AuditSlice>, JournalError> {
+    if path.exists() {
+        JsonlJournal::open(path, JOURNAL_VERSION)
+    } else {
+        JsonlJournal::create(path)
     }
 }
 
@@ -430,5 +478,83 @@ mod tests {
             .build()
             .expect("pool wired → build 成功");
         assert!(!fw.is_running(), "build 后仍未启动");
+    }
+
+    /// 审计账本接线：`with_journal` 是**唯一**写盘入口（用户显式配置才写）。
+    /// 未配置 → `open_journal` 返回 `None`（零 IO）；配置 → 启动轨迹 + 停机轨迹 +
+    /// 快照行都落同一文件。
+    #[tokio::test]
+    async fn journal_is_written_only_when_explicitly_configured() {
+        use crate::plugin::{Lifecycle, PluginContract};
+
+        struct NoopLifecycle;
+
+        impl Lifecycle for NoopLifecycle {
+            fn init(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+                Ok(())
+            }
+
+            fn start(&self, _ctx: &PluginContext) -> Result<(), PluginError> {
+                Ok(())
+            }
+
+            fn stop(&self) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        static NOOP_LIFECYCLE: NoopLifecycle = NoopLifecycle;
+        static NOOP_CONTRACT: PluginContract =
+            PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
+
+        struct NoopPlugin;
+
+        impl Plugin for NoopPlugin {
+            fn name(&self) -> &'static str {
+                "journal-probe"
+            }
+
+            fn version(&self) -> &'static str {
+                "0.0.0"
+            }
+
+            fn contract(&self) -> &PluginContract {
+                &NOOP_CONTRACT
+            }
+
+            fn lifecycle(&self) -> &dyn Lifecycle {
+                &NOOP_LIFECYCLE
+            }
+
+            fn build(&self, _ctx: &mut PluginContext) -> Result<(), PluginError> {
+                Ok(())
+            }
+        }
+
+        let path = std::env::temp_dir()
+            .join(format!("xray-frame-assembly-journal-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut fw = Framework::builder(opts(4, None))
+            .expect("cap 4")
+            .with_journal(&path)
+            .register(Arc::new(NoopPlugin))
+            .expect("register")
+            .build()
+            .expect("build");
+        fw.bring_up().expect("bring up");
+        let report = fw.shutdown().await;
+        assert!(report.is_clean(), "健康链报告干净：{report:?}");
+
+        let text = std::fs::read_to_string(&path).expect("账本落盘");
+        for kind in
+            ["\"kind\":\"register\"", "\"kind\":\"plugin_started\"", "\"kind\":\"plugin_stopped\""]
+        {
+            assert!(text.contains(kind), "轨迹缺 {kind}：{text}");
+        }
+        assert!(text.contains("{\"t\":\"s\""), "停机落快照行：{text}");
+        let _ = std::fs::remove_file(&path);
+
+        let fw = Framework::builder(opts(4, None)).expect("cap 4").build().expect("build");
+        assert!(fw.open_journal().expect("未配置 = 零 IO").is_none(), "缺省不写盘");
     }
 }

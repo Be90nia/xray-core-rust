@@ -17,8 +17,13 @@ udf-skeleton = { path = "../udf-frame/skeleton" }
 # runtime：`SyncStore` 审计事件流（日志装配决策轨，bd bb1dn）；
 # tracing：`tracingx` 事件流→tracing 桥。两 feature 均不新增第三方
 # （tracing 早已在树内，log feature 带入）。
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log", "runtime", "tracing"] }
-udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
+# compose/journal：装配状态环的两族基件（`compose::combine` 父子分片组合 +
+# `journal::JsonlJournal` 审计轨迹落盘）。两 feature 均不新增第三方。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log", "runtime", "tracing", "compose", "journal"] }
+# random：凭据级 `std_ext::id::RandomId`（UUIDv4 CSPRNG，getrandom 底座，
+# bd h4bl5 派生件 2 的基件）。getrandom 早已在树内（workspace `uuid` crate
+# v4 feature 走同一底座），无新增第三方。
+udf-std-ext = { path = "../udf-frame/std-ext", features = ["json", "random"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
