@@ -529,8 +529,38 @@ async fn start_full_dispatched(
         routed = dns_router.is_some(),
         "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
+
+    // 关闭 watcher（bd 4a1zy）：shutdown_token 取消 → dispatcher 后台任务排空。
+    // 排空结果（成功/超时）由 `ManagedScope::shutdown_timeout` 经 LogFacade 上报，
+    // 禁静默；watcher 自身**不得**挂在被排空的 scope 上（否则等自己 = 恒超时），
+    // 故走进程级托管口 `compat::spawn`（装配根一次性安装的同一 scope）。
+    {
+        // 持 **Weak** 而非 scope 克隆：强引用会把 dispatcher 的 `FxScope` 续命到
+        // token 取消，使「dispatcher 先于实例销毁」时在途任务不再随 Arc 归零
+        // abort（迁移前语义）。upgrade 失败 = 已无可排空（scope 已随 drop 收口）。
+        let weak = std::sync::Arc::downgrade(&dispatcher);
+        let token = instance.shutdown_token().clone();
+        let log = xray_frame::compat::log();
+        // 用**脱管口**（`spawn_detached`）：watcher 必须活得比进程级托管 scope 的
+        // 生命周期集更久（它本身就是停机执行体），进集只会污染进程级 `in_flight`
+        // 记账并按实例数滞留条目。udf 文档口径：脱管口仅限「明确要求活得比 scope
+        // 久」——本条正是。
+        let watcher = xray_frame::compat::spawn_scope().spawn_detached(async move {
+            token.cancelled().await;
+            let Some(dispatcher) = weak.upgrade() else { return };
+            let _ = dispatcher.scope().shutdown_timeout(DISPATCHER_DRAIN_TIMEOUT).await;
+        });
+        if watcher.is_err() {
+            log.error("dispatcher shutdown watcher not spawned: process scope already closed");
+        }
+    }
+
     Ok((Arc::new(instance), ohm, handles, loopback_sink))
 }
+
+/// dispatcher 后台任务排空超时（对齐停机档 5s：xray-frame
+/// `DEFAULT_SHUTDOWN_TIMEOUT` / `shutdown_bridge::DEFAULT_CLOSE_TIMEOUT`）。
+const DISPATCHER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // ========== gRPC HandlerService 生产实现（bd jezb）==========
 

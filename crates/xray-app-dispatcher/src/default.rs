@@ -19,6 +19,7 @@ use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pi
 
 use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use xray_buf::multi::MultiBuffer;
+use xray_frame::compat::ManagedScope;
 
 use crate::{error::DispatcherError, sniffer::SniffResult};
 
@@ -863,70 +864,9 @@ impl Drop for OnlineIpGuard {
     }
 }
 
-/// 后台 task 共享收口：完成即收割，宿主 drop 时 abort 全部在途 task——结构化
-/// 并发，杜绝孤儿（bd mvsc；模式参照 xray-app-metrics metrics.rs `conn_tasks`）。
-///
-/// C-10 选定方案 (c)「同步收割」：`parking_lot::Mutex` 下就地 `try_join_next`，
-/// 不再为每次 spawn 起一层 wrapper task（旧形态 = wrapper 抢 tokio Mutex →
-/// 收割 → spawn，dispatch 路径每连接多一个 task 与一次跨 `await` 的锁等待）。
-/// 收割点两处：①每次 spawn 前；②宿主 drop 时（[`TrackedTasks::drop`]）——把
-/// 「最后一次 spawn 之后才 panic」的那批结果也报出来（C-12 观测面）。
-/// **仍不引入常驻 reaper**（wfx8-5 拒绝项：不为簿记新增定时器并发面）：静默期内
-/// 已完成 task 的句柄滞留到下一次 spawn 或 Drop 才释放。无常驻任务则该窗口无法
-/// 再压缩，代价只是已完成 task 的 JoinHandle 字节，且不随连接数增长（只随静默期
-/// 内 spawn 过的 task 数）。
-type BackgroundTasks = Arc<parking_lot::Mutex<TrackedTasks>>;
-
-/// `JoinSet` 的 Drop 只 abort 在途 task、不交付收割结果；包一层以便把
-/// JoinError 观测面（C-12）延伸到宿主销毁时点。
-struct TrackedTasks {
-    set: tokio::task::JoinSet<()>,
-}
-
-impl TrackedTasks {
-    fn new() -> Self {
-        Self { set: tokio::task::JoinSet::new() }
-    }
-}
-
-impl Drop for TrackedTasks {
-    fn drop(&mut self) {
-        harvest(&mut self.set);
-    }
-}
-
-/// 收割已完成 task 并上报结果（C-12）：此前 `try_join_next()` 的 `Result` 被整体
-/// 丢弃，被托管 task 的 panic 与 abort 到此无声消失（唯一兜底是 xray-core
-/// `Instance` 的进程级 panic hook，且只在 `new_from_built` 路径装）。级别/写法贴
-/// 本 crate 既有裸 tracing 惯例（无 PluginContext，不引 LogFacade）。
-fn harvest(set: &mut tokio::task::JoinSet<()>) {
-    while let Some(finished) = set.try_join_next() {
-        let Err(err) = finished else { continue };
-        if err.is_panic() {
-            // task 身份：JoinError 只暴露 tokio 的 task Id（spawn 侧不另取名）。
-            let task = err.id();
-            let payload = err.into_panic();
-            let msg = payload
-                .downcast_ref::<&'static str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic payload>");
-            tracing::error!(%task, "background task panicked: {msg}");
-        } else {
-            // 取消/abort 是宿主销毁期的正常收尾，debug 级留痕。
-            tracing::debug!(task = %err.id(), "background task cancelled");
-        }
-    }
-}
-
-/// 把后台 task 收进共享 JoinSet：先收割上一批（含 panic 上报），再入队。
-/// `JoinSet::spawn` 与旧 wrapper 里的 `tokio::spawn` 同要求——须在 runtime
-/// 上下文内调用（两个调用点都在异步任务里）。
-fn spawn_tracked(set: &BackgroundTasks, task: impl Future<Output = ()> + Send + 'static) {
-    let mut tracked = set.lock();
-    harvest(&mut tracked.set);
-    tracked.set.spawn(task);
-}
+// 后台 task 托管自 bd 4a1zy 起走 xray-frame `compat::ManagedScope`（组合包装
+// udf `FxScope`）：生命周期集、拒发闸、排空/超时全部归框架件，本 crate 不再自持
+// JoinSet 账本（双份账本 = 两套停机语义，已删）。
 
 // ========== DefaultDispatcher ==========
 
@@ -954,9 +894,10 @@ pub struct DefaultDispatcher {
     ///
     /// None = 不记 access log（等价 Go ctx 无 AccessMessage → 不 Record）。
     pub access_sink: Option<Arc<dyn AccessLogSink>>,
-    /// 后台 dispatch task 收口（bd mvsc）：dispatch_link spawn 的处理 task
-    /// 全部入 set，宿主 drop 时 JoinSet abort 在途 task。
-    background_tasks: BackgroundTasks,
+    /// 后台 dispatch task 收口（bd 4a1zy）：dispatch_link spawn 的处理 task 全部
+    /// 归框架托管 scope（`in_flight` 计数 + 停机排空），宿主 drop 时 scope 随之
+    /// abort 在途 task。停机 watcher 见 xray-core `functions.rs`。
+    scope: ManagedScope,
     /// B4 对照自检注入（**实例级**，行为修饰符故随实例；计数器/记录环为聚合
     /// 观测量保持进程级）：`DW_INJECT_DIFF` 环境变量在 `new` 时读入作初值，
     /// 测试经 [`Self::set_dual_write_inject`] 覆写。
@@ -996,12 +937,18 @@ impl DefaultDispatcher {
             policy_manager: None,
             udp443_policies: std::sync::Arc::new(HashMap::new()),
             access_sink: None,
-            background_tasks: Arc::new(parking_lot::Mutex::new(TrackedTasks::new())),
+            scope: ManagedScope::new("dispatcher"),
             #[cfg(feature = "dispatcher-dual-write")]
             dual_write_inject: Arc::new(parking_lot::Mutex::new(
                 std::env::var("DW_INJECT_DIFF").ok().and_then(dual_write::normalize_inject_tag),
             )),
         }
+    }
+
+    /// 后台任务托管 scope（宿主停机编排面：`shutdown_timeout` 排空在途 dispatch
+    /// task，超时/失败由 `ManagedScope` 记 error，不静默）。
+    pub fn scope(&self) -> &ManagedScope {
+        &self.scope
     }
 
     /// B4 对照自检注入（实例级）：`Some(tag)` 对该请求 tag 的对照侧故意给错值，
@@ -1586,8 +1533,12 @@ impl DefaultDispatcher {
             let _ = fut.await;
         };
 
-        spawn_tracked(&self.background_tasks, fut);
-        Ok(())
+        // 停机窗内 scope 已关：拒发必须回错（否则连接静默挂住等对端超时）。
+        // ManagedScope 内部已记 warn，此处只负责把失败交给调用方。
+        self.scope
+            .spawn(fut)
+            .map(|_| ())
+            .map_err(|_| DispatcherError::Other("dispatcher shutting down".into()))
     }
 }
 
@@ -1767,9 +1718,9 @@ pub struct DialBridge {
     /// 最近一次 dispatch 的 splice 准入结果（[`Self::splice_admitted`] 读；
     /// Arc 便于 dispatch future（'static）捕获落盘）。
     splice_admitted: Arc<std::sync::atomic::AtomicBool>,
-    /// chained dispatch task 收口（bd mvsc）：bridge drop 时 JoinSet abort
-    /// 在途 chained task，杜绝 fire-and-forget 孤儿。
-    background_tasks: BackgroundTasks,
+    /// chained dispatch task 收口（bd 4a1zy）：bridge 自持托管 scope，bridge drop
+    /// ⇒ scope 随之 abort 在途 chained task（杜绝 fire-and-forget 孤儿）。
+    scope: ManagedScope,
 }
 
 /// 入站 splice 元数据的 dispatch 作用域通道（txno-splice）。
@@ -1828,8 +1779,10 @@ struct ProxyChainConfig {
 impl DialBridge {
     #[must_use]
     pub fn new(tag: impl Into<String>, dial: DialFn) -> Self {
+        let tag: String = tag.into();
         Self {
-            tag: tag.into(),
+            scope: ManagedScope::new(format!("dial-bridge:{tag}")),
+            tag,
             dial,
             proxy_chain: parking_lot::RwLock::new(ProxyChainConfig {
                 chain_tag: None,
@@ -1838,7 +1791,6 @@ impl DialBridge {
             policy: parking_lot::RwLock::new(None),
             splice_outbound: std::sync::atomic::AtomicBool::new(false),
             splice_admitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            background_tasks: Arc::new(parking_lot::Mutex::new(TrackedTasks::new())),
         }
     }
 
@@ -2013,8 +1965,8 @@ impl DialBridge {
         let dest = dest.clone();
         // 提前克隆 policy：避免 async move 持 &self 越界
         let policy = self.current_policy();
-        // 提前抓 set 引用：chained task 收进 bridge 的 JoinSet（bd mvsc）
-        let background_tasks = Arc::clone(&self.background_tasks);
+        // 提前克隆 scope：chained task 收进 bridge 的托管 scope（bd 4a1zy）
+        let scope = self.scope.clone();
 
         Box::pin(async move {
             let Some(ohm) = ohm else {
@@ -2060,13 +2012,13 @@ impl DialBridge {
             // spawn chained handler dispatch
             let chained_tag = chained_handler.tag().to_string();
             let chained_fut = chained_handler.dispatch(&dest, chained_link);
-            spawn_tracked(&background_tasks, async move {
+            let _ = scope.spawn(async move {
                 let _ = chained_fut.await;
                 tracing::trace!(tag = %chained_tag, "chained handler dispatch done");
             });
-            // 立即释放 set 引用：否则本 future 持 Arc 到桥接结束，
-            // bridge drop 时 JoinSet 计数不归零、chained task 无法被 abort。
-            drop(background_tasks);
+            // 立即释放 scope 引用：否则本 future 持 Arc 到桥接结束，
+            // bridge drop 时 chained task 不会被 abort。
+            drop(scope);
             // 桥接原始 link ↔ client_link
             // link.reader → client_link.writer（上行）
             // client_link.reader → link.writer（下行）
@@ -2998,83 +2950,53 @@ mod tests {
         w.shutdown(); // 关闭触发 bridge 结束
     }
 
-    /// C-12：被托管 task 的 panic 必须可观测——收割时逐个检查
-    /// `try_join_next` 结果，panic 走 `tracing::error!` 并带 payload。手写
-    /// subscriber（零新依赖，同 xray-conf/ss2022 模式）；`set_default` 后必须
-    /// rebuild callsite interest，否则换订阅者后首评估残留 never → 恒捕 0。
+    /// bd 4a1zy 验收（dispatcher 侧）：后台任务托管面从自持 `JoinSet` 迁到
+    /// `xray-frame` `compat::ManagedScope` 后，实例 scope 的三个契约仍成立——
+    /// ①在途 dispatch task 可见（`in_flight`）；②`shutdown_timeout` 收口后归零
+    /// 且闸关拒发；③被托管 task panic 不传染 scope（后续 spawn 照常受理，panic
+    /// 由 udf `FxScope` 归一 + 进程 panic hook 承接，本 crate 不再自持收割账本）。
     #[tokio::test]
-    async fn tracked_task_panic_is_reported() {
-        use std::sync::{Arc, Mutex};
+    async fn dispatcher_scope_drains_and_rejects_after_shutdown() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Duration,
+        };
 
-        struct EventCapture(Arc<Mutex<Vec<String>>>);
-        impl tracing::Subscriber for EventCapture {
-            fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
-                true
-            }
+        let dispatcher = DefaultDispatcher::new();
+        assert_eq!(dispatcher.scope().in_flight(), 0, "新建实例零在途任务");
 
-            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
-            }
+        // ① 在途可见 + ② 收口后归零/拒发
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = Arc::clone(&finished);
+        dispatcher
+            .scope()
+            .spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                task_finished.store(true, Ordering::SeqCst);
+            })
+            .expect("新建 scope 必须受理");
+        assert_eq!(dispatcher.scope().in_flight(), 1, "spawn 后在途数必须可见");
 
-            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        dispatcher
+            .scope()
+            .shutdown_timeout(Duration::from_secs(5))
+            .await
+            .expect("可 abort 的在途任务应能等净");
+        assert!(!finished.load(Ordering::SeqCst), "停机走 abort：不得等 30s 任务跑完");
+        assert_eq!(dispatcher.scope().in_flight(), 0, "收口后 in_flight 归零（泄漏判据）");
+        assert!(dispatcher.scope().spawn(async {}).is_err(), "停机后拒发新任务");
 
-            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
-            }
-
-            fn enter(&self, _span: &tracing::span::Id) {}
-
-            fn exit(&self, _span: &tracing::span::Id) {}
-
-            fn event(&self, event: &tracing::Event<'_>) {
-                struct Fmt(String);
-                impl tracing::field::Visit for Fmt {
-                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                        self.0.push_str(&format!("{}={value} ", field.name()));
-                    }
-
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        self.0.push_str(&format!("{}={value:?} ", field.name()));
-                    }
-                }
-                let mut visitor = Fmt(String::new());
-                event.record(&mut visitor);
-                self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(visitor.0);
-            }
-        }
-
-        let capture = Arc::new(Mutex::new(Vec::new()));
-        let guard = tracing::subscriber::set_default(EventCapture(Arc::clone(&capture)));
-        tracing::callsite::rebuild_interest_cache();
-
-        let tasks: BackgroundTasks = Arc::new(parking_lot::Mutex::new(TrackedTasks::new()));
-        // 被托管 task 必然 panic：修复前该 JoinError 被 try_join_next 丢弃，
-        // 捕获集为空（红）；修复后下一次 spawn 的收割上报。
-        spawn_tracked(&tasks, async { panic!("tracked task blew up") });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        spawn_tracked(&tasks, async {});
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        drop(guard);
-
-        let lines = capture.lock().unwrap_or_else(std::sync::PoisonError::into_inner).join("\n");
-        assert!(
-            lines.contains("background task panicked"),
-            "被托管 task 的 panic 必须上报: {lines:?}"
-        );
-        assert!(lines.contains("tracked task blew up"), "panic payload 必须带上: {lines:?}");
-        assert_eq!(
-            lines.matches("background task panicked").count(),
-            1,
-            "正常结束的 task 不得产出 panic 上报: {lines:?}"
-        );
+        // ③ panic 隔离：单个 task panic 不把 scope 打成不可用。
+        let after_panic = DefaultDispatcher::new();
+        after_panic.scope().spawn(async { panic!("managed task blew up") }).expect("受理");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(after_panic.scope().in_flight(), 0, "panic 任务必须收尾（不滞留）");
+        assert!(after_panic.scope().spawn(async {}).is_ok(), "panic 后 scope 仍受理新任务");
     }
 
-    /// mvsc：bridge drop 后 chained dispatch task 必须随共享 JoinSet 结构化
-    /// 收尾（abort），不允许 fire-and-forget 孤儿存活。修复前 tokio::spawn
-    /// 孤儿在 bridge 释放后仍被唤醒跑到 done=true → 红。
+    /// mvsc/4a1zy：bridge drop 后 chained dispatch task 必须随 bridge 的托管
+    /// scope 结构化收尾（abort），不允许 fire-and-forget 孤儿存活。修复前
+    /// tokio::spawn 孤儿在 bridge 释放后仍被唤醒跑到 done=true → 红。
     #[tokio::test]
     async fn chained_dispatch_task_dies_with_bridge() {
         use std::{

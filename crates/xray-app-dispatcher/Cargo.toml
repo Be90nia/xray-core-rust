@@ -17,6 +17,11 @@ xray-xudp = { path = "../xray-xudp" }
 # memgov 纯 std 零三方增量；不拖 runtime/pool 默认档（口径同 xray-core）。
 # path 形态同各 app crate（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov"] }
+# bd 4a1zy：后台任务托管面走 xray-frame `compat::ManagedScope`（组合包装 udf
+# `FxScope` + fail-visible 报告）。此前仅测试面消费（P3-1 S2 双写对照
+# tests/dual_write_parity.rs 的新路 = xray-frame `dispatch::lookup`）；生产托管
+# 收敛后为常规依赖（依赖方向合规：xray-frame 零 xray-core/proxy 依赖，无环）。
+xray-frame = { path = "../xray-frame" }
 thiserror.workspace = true
 tokio.workspace = true
 rand = { workspace = true }
@@ -27,9 +32,6 @@ ring.workspace = true
 
 [dev-dependencies]
 xray-app-stats = { path = "../xray-app-stats" }
-# P3-1 S2 双写对照（tests/dual_write_parity.rs）：新旧路径比对新路 = xray-frame
-# 查表（dispatch::lookup）；仅测试面消费，生产依赖图零变化。
-xray-frame = { path = "../xray-frame" }
 
 [features]
 # P3-1 S0/S2 对照基线开关：default 关。S4 后本 flag 只门「对照/记录面」
