@@ -23,14 +23,19 @@
 
 use std::{
     collections::HashMap,
+    convert::Infallible,
     fmt,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
     },
 };
 
-use skeleton_infra::logx::mask_secrets;
+use skeleton::Store as _;
+use skeleton_infra::{audit::AuditTicket, logx::mask_secrets, runtime::SyncStore};
+
+/// 日志装配审计轨（bd bb1dn）：store 常驻进程，桥随 store 生命周期存在。
+static LOG_AUDIT: LazyLock<LogAuditBus> = LazyLock::new(LogAuditBus::new);
 
 /// 手工 FieldSet 的引导 callsite：只贡献一个稳定地址当 Identifier 键
 /// （等价 `identify_callsite!(&ANCHOR)`，tracing 未 re-export 该宏，直构
@@ -95,6 +100,14 @@ impl Clone for LogFacade {
 
 impl LogFacade {
     pub fn new(domain: &str, secrets: Vec<Arc<str>>) -> Self {
+        // 埋点：门面域构造（装配决策点，非每包；域级过滤 xray_frame::log=debug）。
+        audit_dispatch(LogAuditAction::Facade { secrets: secrets.len() });
+        crate::log_embed!(
+            LOG_DOMAIN,
+            tracing::Level::DEBUG,
+            "facade domain={domain} secrets={}",
+            secrets.len()
+        );
         Self {
             target: Box::leak(format!("xray_frame::{domain}").into_boxed_str()),
             secrets,
@@ -163,7 +176,27 @@ impl LogFacade {
 pub fn init_from_env(
     default_level: log::LevelFilter,
 ) -> Result<(), skeleton_infra::logx::AlreadyInit> {
-    skeleton_infra::logx::init_tracing_from_env(default_level)
+    let result = skeleton_infra::logx::init_tracing_from_env(default_level);
+    // 装配裁决埋点：终态=info / 异常路径=warn（级别规范同 udf embed 纪律）。
+    audit_dispatch(LogAuditAction::Init { ok: result.is_ok() });
+    match result {
+        Ok(()) => {
+            crate::log_embed!(
+                LOG_INIT,
+                tracing::Level::INFO,
+                "log init ok level={default_level:?}"
+            );
+            Ok(())
+        },
+        Err(e) => {
+            crate::log_embed!(
+                LOG_INIT,
+                tracing::Level::WARN,
+                "log init rejected: global subscriber taken"
+            );
+            Err(e)
+        },
+    }
 }
 
 // =========================================================================
@@ -313,6 +346,8 @@ impl HotLog {
         // Relaxed：见 max_level 字段注释——单变量独立开关，store 后续 load
         // 立即可见（原子变量修改可见性），无伴随数据需同步。
         self.max_level.store(level_filter_rank(level), Ordering::Relaxed);
+        // 埋点：闸门配置决策点（一次，非每包）。
+        audit_dispatch(LogAuditAction::HotLevel { rank: level_filter_rank(level) });
         self
     }
 
@@ -351,12 +386,19 @@ impl HotLog {
 
     /// 便捷发射：内部临时栈缓冲（常量栈空间，非每包分配）。
     pub fn debug_fmt(&self, args: fmt::Arguments) {
-        if !self.enabled(tracing::Level::DEBUG) {
+        self.log_fmt(tracing::Level::DEBUG, args);
+    }
+
+    /// 任意级别便捷发射（[`debug_fmt`](Self::debug_fmt) 的泛化，`log_embed!`
+    /// 的落点）：**级别先行判定**——未命中时连 [`HotBuf::write_fmt`] 都不发生
+    /// （零格式化、零堆分配），命中时只写调用方栈上的 [`HotBuf`]。
+    pub fn log_fmt(&self, level: tracing::Level, args: fmt::Arguments) {
+        if !self.enabled(level) {
             return;
         }
         let mut buf = HotBuf::<256>::new();
         buf.write_fmt(args);
-        self.emit(tracing::Level::DEBUG, buf.as_str());
+        self.emit(level, buf.as_str());
     }
 
     /// 内部分发（消息已是 `&str`，零分配）。
@@ -435,4 +477,125 @@ fn level_from_rank(rank: usize) -> tracing::Level {
         3 => tracing::Level::DEBUG,
         _ => tracing::Level::TRACE,
     }
+}
+
+// =========================================================================
+// 观测接线（bd bb1dn）：审计事件流 → tracing 桥 + log-embed 埋点门
+// =========================================================================
+//
+// 派生四栏（ADR-1「派生 ≠ 复制」）：
+// - **udf 基件**：`skeleton_infra::runtime::SyncStore`（审计事件流：enqueued / reduced / rejected
+//   …）+ `skeleton_infra::tracingx::bridge_events_to_tracing` （事件流 → tracing 一次接线；target
+//   由 udf 侧钉死 `skeleton::audit`）。
+// - **派生方式**：**A 类直接用 + 组合**——本层持一份 store 并挂桥，不自造事件 流/桥；Xray 语义只落在
+//   reducer 的 Action/State 词表。
+// - **xray-frame 件**：[`LogAuditAction`] / [`LogAuditState`] / [`LogAudit`] 三小 类型 + [`audit`]
+//   访问器 + [`log_embed!`] 埋点门。
+// - **消费点**：装配 init [`init_from_env`]、门面构造 [`LogFacade::new`]、热路径 闸门
+//   [`HotLog::with_max_level`]。
+//
+// 用途：日志基础设施**自身的装配决策**成为可订阅事件流（init 成功/被拒、门面
+// 域与掩码表规模、闸门级别）——「日志发了没人看见」类问题的自证面（bd 8zs12
+// 同族）。审计流固定 target `skeleton::audit`：`RUST_LOG=skeleton::audit=info`
+// 单开；默认兜底预设含 `skeleton=off`，故常态零输出零打扰。
+
+/// 审计桥环容量（udf `subscribe_events` 语义：溢出丢最旧，缺口 = 显式证据）。
+const LOG_AUDIT_CAP: usize = 64;
+
+/// 域 `log::init` 埋点门（装配裁决现场唯一 target）。
+static LOG_INIT: HotLog = HotLog::with_target("xray_frame::log::init");
+/// 域 `log::domain` 埋点门（门面域构造）。
+static LOG_DOMAIN: HotLog = HotLog::with_target("xray_frame::log::domain");
+
+/// 日志装配审计动作（Xray 语义词表，留派生层）。
+#[derive(Debug, Clone, Copy)]
+pub enum LogAuditAction {
+    /// 装配 init 结果：`ok=false` = 全局订阅者已被占用（重复 init 被拒）。
+    Init { ok: bool },
+    /// 门面构造：`secrets` = 掩码表条目数（**只记条数不记内容**，密钥面零泄漏）。
+    Facade { secrets: usize },
+    /// 热路径闸门配置（rank 口径同 `level_filter_rank`）。
+    HotLevel { rank: u8 },
+}
+
+/// 审计状态（纯计数：无业务值、无指针，`Clone` 即快照）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogAuditState {
+    pub init_ok: u32,
+    pub init_rejected: u32,
+    pub facades: u32,
+    pub hot_levels: u32,
+}
+
+/// 审计 reducer（纯函数：只累加计数，零效果）。
+pub struct LogAudit;
+
+impl skeleton::Reducer for LogAudit {
+    type Action = LogAuditAction;
+    type Op = Infallible;
+    type State = LogAuditState;
+
+    fn initial(&self) -> LogAuditState {
+        LogAuditState::default()
+    }
+
+    fn reduce(
+        &self,
+        state: &LogAuditState,
+        action: LogAuditAction,
+        _out: &mut skeleton::EffectBuf<LogAuditAction, Infallible>,
+    ) -> LogAuditState {
+        let mut next = *state;
+        match action {
+            LogAuditAction::Init { ok: true } => next.init_ok = next.init_ok.saturating_add(1),
+            LogAuditAction::Init { ok: false } => {
+                next.init_rejected = next.init_rejected.saturating_add(1)
+            },
+            LogAuditAction::Facade { .. } => next.facades = next.facades.saturating_add(1),
+            LogAuditAction::HotLevel { .. } => next.hot_levels = next.hot_levels.saturating_add(1),
+        }
+        next
+    }
+}
+
+/// 审计总线：store 与桥票据同生共死（票据 Drop = 停桥，故与 store 同住静态）。
+struct LogAuditBus {
+    store: SyncStore<LogAuditState, LogAuditAction, Infallible>,
+    _bridge: AuditTicket,
+}
+
+impl LogAuditBus {
+    fn new() -> Self {
+        let store = SyncStore::new(LogAudit, skeleton::NoFx);
+        let bridge = skeleton_infra::tracingx::bridge_events_to_tracing(&store, LOG_AUDIT_CAP);
+        Self { store, _bridge: bridge }
+    }
+}
+
+/// 日志装配审计 store（读侧取证面：`audit().snapshot()` / `take_events()`）。
+pub fn audit() -> &'static SyncStore<LogAuditState, LogAuditAction, Infallible> {
+    &LOG_AUDIT.store
+}
+
+/// 记账一次装配决策（停机窗内 store 已关闭 = no-op，不 panic、不抛错）。
+fn audit_dispatch(action: LogAuditAction) {
+    audit().dispatch(action);
+}
+
+/// log-embed 埋点门（派生自 udf `embed_event!` 纪律；target `xray_frame::<域>`）。
+///
+/// 三条纪律与 udf 同源：
+/// 1. 只埋**行为决策点**（构造 / 裁决 / 拒绝 / 闸门），禁埋纯计算路径；
+/// 2. **字段化禁分配**——消息写调用方静态 [`HotLog`] 的栈 [`HotBuf`]，且级别
+///    先行判定：未命中级别时连格式化都不发生（零堆分配，口径同
+///    `tests/hot_log.rs::disabled_level_costs_zero_allocation`）；
+/// 3. 级别规范：正常流转 = DEBUG / 异常路径 = WARN / 终态 = INFO。
+///
+/// 用法（门面必须是 `static`/`const` 构造，**禁每包 clone**）：
+/// `log_embed!(LOG_INIT, tracing::Level::WARN, "rejected: {reason}");`
+#[macro_export]
+macro_rules! log_embed {
+    ($log:expr, $level:expr, $($arg:tt)*) => {
+        $log.log_fmt($level, ::core::format_args!($($arg)*))
+    };
 }

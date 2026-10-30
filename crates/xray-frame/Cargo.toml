@@ -14,7 +14,10 @@ publish = false
 # lib 名纪律：import 用 udf 包的 lib 名（skeleton / skeleton_infra / std_ext）。
 [dependencies]
 udf-skeleton = { path = "../udf-frame/skeleton" }
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log"] }
+# runtime：`SyncStore` 审计事件流（日志装配决策轨，bd bb1dn）；
+# tracing：`tracingx` 事件流→tracing 桥。两 feature 均不新增第三方
+# （tracing 早已在树内，log feature 带入）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "log", "runtime", "tracing"] }
 udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
 tokio = { workspace = true }
 serde = { workspace = true }
