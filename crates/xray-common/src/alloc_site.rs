@@ -4,10 +4,15 @@
 //!
 //! # 门控
 //!
-//! `ENABLED`（私有）由 xray-cli `alloc_stats::init()` 按 `XRAY_ALLOC_STATS_SITES` 置位。
-//! 未启用时 `enter` 直通（不触碰 TLS、不返回需恢复的守卫）、`scope` 只多一层
-//! no-op 守卫，alloc 钩子在 COUNTING 分支短路——默认零记账开销（对齐 alloc_stats
-//! 直通纪律）。
+//! 全局闸由 udf `skeleton_infra::alloc_site` 持有（[`set_enabled`] 即其
+//! `set_global_enabled`）；xray-cli `alloc_stats::init()` 按
+//! `XRAY_ALLOC_STATS_SITES` 置位。未启用时 `enter` 直通（不触碰 TLS、不返回需
+//! 恢复的守卫）、`scope` 只多一层 no-op 守卫，alloc 钩子在 COUNTING 分支短路
+//! ——零记账开销（对齐 alloc_stats 直通纪律）。
+//!
+//! 机制件的闸**默认开**，Xray 的语义是「未设 env = 关」——由 xray-cli 启动期
+//! 一次性置位兜住；init 之前的窗口只影响 `enter` 的 TLS 触碰，不产生计数
+//! （alloc 钩子另有 COUNTING 闸，同样默认关）。
 //!
 //! # 线程局部语义 与 `scope`（未来域）
 //!
@@ -21,15 +26,20 @@
 //! 续跑仍归对站点，poll 之间不驻留线程局部。
 //!
 //! # udf 判定
-// udf-promotion-candidate: 提炼条件=零 xray 具体类型（本文件已满足：纯进程级
-// 机制，站点目录由消费方编译期注册）；待 udf 接线闸（P0-9）开后上浮 skeleton-infra。
+//!
+//! 机制（站点静态表 + 每站点原子计数 + 两级开关 + 零分配查表）已上浮
+//! `skeleton_infra::alloc_site`（udf-frame#6，bd 24a5k），本文件不再持有。
+//! 内容留仓，机制已上浮 udf（bd 24a5k / udf-frame#6）：站点目录（名字与审计
+//! 归属）、字节维度、线程局部标记与 [`scope`]、快照口径。
 
 use std::{
     cell::Cell,
     future::{Future, poll_fn},
     pin::pin,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+use skeleton_infra::alloc_site::{AllocSite, global_enabled, set_global_enabled};
 
 /// 无站点（线程默认态）。
 pub const NONE: u8 = 0;
@@ -54,17 +64,31 @@ pub const BUF_READ: u8 = 5;
 pub const SITE_NAMES: [&str; 6] =
     ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal", "tls_read", "buf_read"];
 
-/// 站点归集开关：xray-cli init() 一次性置位，热路径只读。
-static ENABLED: AtomicBool = AtomicBool::new(false);
+// 内容留仓，机制已上浮 udf（bd 24a5k / udf-frame#6）：以下只是站点清单的
+// 具名登记（名字 = dump 行与归集脚本的契约），计数/开关/查表机制在 udf。
+static SITE_NONE: AllocSite = AllocSite::new("(none)");
+static SITE_TLS_WRITE: AllocSite = AllocSite::new("tls_write");
+static SITE_XHTTP_SRV_SEND: AllocSite = AllocSite::new("xhttp_srv_send");
+static SITE_VLESS_ENC_SEAL: AllocSite = AllocSite::new("vless_enc_seal");
+static SITE_TLS_READ: AllocSite = AllocSite::new("tls_read");
+static SITE_BUF_READ: AllocSite = AllocSite::new("buf_read");
 
-/// 各站点累计记账（仅 ENABLED=true 时更新；Relaxed 同 alloc_stats 无同步语义需求）。
-struct SiteCounters {
-    n: AtomicU64,
-    bytes: AtomicU64,
-}
+/// 站点目录表（枚举序 = 站点 id 序）：名 → 站点查表口 = udf
+/// `skeleton_infra::alloc_site::find(SITE_TABLE, name)`（零堆分配）。
+pub static SITE_TABLE: &[&AllocSite] = &[
+    &SITE_NONE,
+    &SITE_TLS_WRITE,
+    &SITE_XHTTP_SRV_SEND,
+    &SITE_VLESS_ENC_SEAL,
+    &SITE_TLS_READ,
+    &SITE_BUF_READ,
+];
 
-static SITES: [SiteCounters; SITE_NAMES.len()] =
-    [const { SiteCounters { n: AtomicU64::new(0), bytes: AtomicU64::new(0) } }; SITE_NAMES.len()];
+/// 各站点累计字节（Relaxed 同 alloc_stats 无同步语义需求）。
+///
+/// 机制件只计事件数（`AllocSite::bump`），字节维度是 Xray 的上报口径
+/// （MB/MB 归因），留仓。
+static SITE_BYTES: [AtomicU64; SITE_NAMES.len()] = [const { AtomicU64::new(0) }; SITE_NAMES.len()];
 
 thread_local! {
     /// 当前线程站点标记。const 初始化 = 访问无懒初始化分支、无分配、无析构——
@@ -72,15 +96,15 @@ thread_local! {
     static CURRENT: Cell<u8> = const { Cell::new(NONE) };
 }
 
-/// 站点归集是否已启用（alloc 钩子热路径判定）。
+/// 站点归集是否已启用（alloc 钩子热路径判定）——闸在 udf [`global_enabled`]。
 #[inline]
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    global_enabled()
 }
 
-/// 启用/停用站点归集（xray-cli alloc_stats::init 启动期调用一次）。
+/// 启用/停用站点归集（xray-cli alloc_stats::init 启动期调用一次）——置 udf 全局闸。
 pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
+    set_global_enabled(on);
 }
 
 /// 供分配器钩子读取当前线程站点（一次 const-init TLS 访问）。
@@ -92,9 +116,12 @@ pub fn current() -> u8 {
 /// 供分配器钩子记账（调用方已保证 `site != NONE`）。
 #[inline]
 pub fn record(site: u8, n: u64, bytes: u64) {
-    let s = &SITES[site as usize];
-    s.n.fetch_add(n, Ordering::Relaxed);
-    s.bytes.fetch_add(bytes, Ordering::Relaxed);
+    let idx = site as usize;
+    // udf 站点计数只有单次 `bump`（生产路径 n 恒为 1，循环即一次调用）。
+    for _ in 0..n {
+        SITE_TABLE[idx].bump();
+    }
+    SITE_BYTES[idx].fetch_add(bytes, Ordering::Relaxed);
 }
 
 /// 单站点快照（dump 侧读）。
@@ -107,9 +134,8 @@ pub struct SiteSnap {
 /// 全站点快照（索引 = 站点 id，含 NONE 位恒 0）。
 pub fn snapshot() -> [SiteSnap; SITE_NAMES.len()] {
     let mut out = [SiteSnap { n: 0, bytes: 0 }; SITE_NAMES.len()];
-    for (i, s) in SITES.iter().enumerate() {
-        out[i] =
-            SiteSnap { n: s.n.load(Ordering::Relaxed), bytes: s.bytes.load(Ordering::Relaxed) };
+    for (i, site) in SITE_TABLE.iter().enumerate() {
+        out[i] = SiteSnap { n: site.count(), bytes: SITE_BYTES[i].load(Ordering::Relaxed) };
     }
     out
 }
@@ -256,6 +282,102 @@ mod tests {
         );
         // NONE 位恒不记账。
         assert_eq!(after[NONE as usize].n, 0);
+    }
+
+    /// 目录表与名字清单同源（内容↔机制对齐）：索引序与名字逐位一致。
+    #[test]
+    fn site_table_matches_names() {
+        assert_eq!(SITE_TABLE.len(), SITE_NAMES.len());
+        for (site, name) in SITE_TABLE.iter().zip(SITE_NAMES) {
+            assert_eq!(site.name, name);
+        }
+    }
+
+    /// 名 → 站点查表（udf `find`）：命中返回表内同一实例，未命中 `None`。
+    #[test]
+    fn find_hits_and_misses() {
+        let hit =
+            skeleton_infra::alloc_site::find(SITE_TABLE, "tls_read").expect("目录表必含 tls_read");
+        assert!(std::ptr::eq(hit, SITE_TABLE[TLS_READ as usize]));
+        assert!(skeleton_infra::alloc_site::find(SITE_TABLE, "no_such_site").is_none());
+    }
+
+    /// 每站点开关（udf 机制）：关 ⇒ `record` 零写入且历史计数保留，重开继续累加。
+    #[test]
+    fn per_site_switch_gates_record() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _on = EnabledGuard::set();
+        let site = SITE_TABLE[XHTTP_SRV_SEND as usize];
+        let before = site.count();
+        site.set_enabled(false);
+        record(XHTTP_SRV_SEND, 1, 64);
+        assert_eq!(site.count(), before, "站点关 ⇒ 零写入，历史保留");
+        site.set_enabled(true);
+        record(XHTTP_SRV_SEND, 1, 64);
+        assert_eq!(site.count(), before + 1, "重开继续累加");
+    }
+
+    /// 全局闸（udf 机制）：关 ⇒ 一刀切零写入；[`enabled`] 与闸同源。
+    #[test]
+    fn global_switch_gates_record() {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(false);
+        assert!(!enabled());
+        let site = SITE_TABLE[VLESS_ENC_SEAL as usize];
+        let before = site.count();
+        record(VLESS_ENC_SEAL, 1, 32);
+        assert_eq!(site.count(), before, "全局关 ⇒ 一刀切零写入");
+        set_enabled(true);
+        assert!(enabled());
+        record(VLESS_ENC_SEAL, 1, 32);
+        assert_eq!(site.count(), before + 1);
+        set_enabled(false);
+    }
+
+    /// 归因输出并列取证（bd 24a5k）：固定记录序列 → 逐站点增量行。
+    /// 行格式与 xray-cli dump 站点行同形（`site= alloc_n= alloc_bytes=`），
+    /// 只取本测试增量，避免并行用例的累计污染。
+    fn attribution_lines() -> Vec<String> {
+        let _serial = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _on = EnabledGuard::set();
+        let before = snapshot();
+        record(TLS_WRITE, 3, 4096);
+        record(XHTTP_SRV_SEND, 2, 1024);
+        record(VLESS_ENC_SEAL, 1, 512);
+        record(TLS_READ, 4, 8192);
+        record(BUF_READ, 5, 2048);
+        let after = snapshot();
+        SITE_NAMES
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, name)| {
+                format!(
+                    "site={name} alloc_n={} alloc_bytes={}",
+                    after[i].n - before[i].n,
+                    after[i].bytes - before[i].bytes
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    #[allow(clippy::print_stdout, reason = "归因并列取证：改前/改后输出逐行对照（bd 24a5k）")]
+    fn site_attribution_lines_unchanged() {
+        let lines = attribution_lines();
+        for l in &lines {
+            println!("{l}");
+        }
+        assert_eq!(
+            lines,
+            [
+                "site=tls_write alloc_n=3 alloc_bytes=4096",
+                "site=xhttp_srv_send alloc_n=2 alloc_bytes=1024",
+                "site=vless_enc_seal alloc_n=1 alloc_bytes=512",
+                "site=tls_read alloc_n=4 alloc_bytes=8192",
+                "site=buf_read alloc_n=5 alloc_bytes=2048",
+            ]
+        );
     }
 
     /// 让出点：首次 poll 返回 Pending 并自唤醒，再次 poll 通过。

@@ -28,7 +28,9 @@ rustls = { workspace = true }
 # 树内（tracing 依赖），零新第三方（同 xray-frame B6 取证口径）。
 log = "0.4"
 # 分发机制单入口 = udf logx 多通道 ChannelRegistry（general/access/dns）。
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log"] }
+# memgov：`alloc_site` 站点登记机制（bd 24a5k 换依赖）住 memgov feature 门内，
+# 显式列出避免依赖 udf 默认 feature 组合的隐式传递。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log", "memgov"] }
 # bd bf92：antireplay MapFilter 时间源走 skeleton::clock（热路径泛型静态分发）。
 udf-skeleton = { path = "../udf-frame/skeleton" }
 
