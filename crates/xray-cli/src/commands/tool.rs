@@ -39,7 +39,9 @@ pub fn execute_uuid(args: &UuidArgs) -> Result<(), CliError> {
 }
 
 /// 解析/生成 UUID。输入 ≤30 字节：标准格式规范化，非标准串 v5 派生
-/// （对齐 Go `uuid.ParseString` 语义，`xray_common::uuid::UUID::parse`）。
+/// （对齐 Go `uuid.ParseString` 语义，`xray_common::uuid::UUID::parse`）；
+/// 无输入 ⇒ v4 走派生件 [`xray_frame::uuid::Uuid`]（udf `RandomId` CSPRNG 基件，
+/// 形状/文本由类型保证）。
 pub fn resolve_uuid(input: Option<&str>) -> Result<String, CliError> {
     match input {
         Some(input) => {
@@ -52,7 +54,10 @@ pub fn resolve_uuid(input: Option<&str>) -> Result<String, CliError> {
                 .map(|u| u.to_string())
                 .ok_or_else(|| CliError::UuidParseFailed(input.to_string()))
         },
-        None => Ok(uuid::Uuid::new_v4().to_string()),
+        // OS CSPRNG 失败 = 硬错（禁弱熵回退，udf RandomId 红线同款）。
+        None => xray_frame::uuid::Uuid::new()
+            .map(|u| u.to_string())
+            .map_err(|e| CliError::Fatal(format!("failed to generate UUID: {e}"))),
     }
 }
 
@@ -78,6 +83,16 @@ mod uuid_tests {
     fn uuid_no_input_generates_v4() {
         let out = resolve_uuid(None).expect("v4");
         assert_eq!(uuid::Uuid::parse_str(&out).expect("parseable").get_version_num(), 4);
+    }
+
+    /// 生成面经派生件：CLI 输出必须能被 `xray_frame::uuid::Uuid` 严格 v4 解析
+    /// （形状由类型保证，非事后补位）。
+    #[test]
+    fn uuid_no_input_roundtrips_through_derived_piece() {
+        use std::str::FromStr;
+        let out = resolve_uuid(None).expect("v4");
+        let parsed = xray_frame::uuid::Uuid::from_str(&out).expect("strict v4 parse");
+        assert_eq!(parsed.to_string(), out);
     }
 }
 

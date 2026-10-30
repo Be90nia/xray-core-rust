@@ -18,6 +18,7 @@ use std::{
 };
 
 use tokio::sync::broadcast;
+use xray_frame::cache::RefreshPermit;
 
 use crate::{
     cache_controller::CacheController,
@@ -127,12 +128,13 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
                     };
                 }
                 // 过期可服务：Go merge 对过期记录返回 `(ips, ttl<=0, nil)`——
-                // serveStale 时秒回旧 IP 并后台刷新。
-                if cache.serve_stale
-                    && (cache.serve_expired_ttl_secs == 0 || cache.serve_expired_ttl_secs < ttl)
-                {
+                // serveStale 时秒回旧 IP 并后台刷新。闸门与去重都走派生件 1
+                // （`xray_frame::cache`）：窗口口径单源 + 同 fqdn 只起一个 pull。
+                if cache.stale_servable(ttl) {
                     if let Some((sips, _)) = stale_result(&rec, option, now) {
-                        pull(server, fqdn_owned.to_string(), option);
+                        // 许可先取（此后 `cache` 借用结束，`server` 才能移进 pull）。
+                        let permit = cache.begin_stale_refresh(fqdn_owned);
+                        pull(server, fqdn_owned.to_string(), option, permit);
                         return Ok((sips, 1));
                     }
                 }
@@ -283,19 +285,36 @@ pub async fn fetch<S: CachedNameserver>(
 }
 
 /// 后台拉取（serveStale 路径）。对应 Go `pull`（nameserver_cached.go:45-49）：
-/// 8s 兜底超时；并发去重由 `fetch` 的 singleflight 天然承担（同 key 在途时
-/// 后续 pull 合并为等待者，不重复打上游）。
+/// 8s 兜底超时；并发去重**由派生件 1 的刷新许可前置承担**（`permit == None` =
+/// 同 fqdn 已有 pull 在飞，本次不重复起任务；旧实现是把 N 个任务都起起来再靠
+/// `fetch` 的 singleflight 合并）。
 ///
 /// P1-11：spawn 走实例 `FxScope` 托管（坑约束 5）——scope 未注单（实例未
 /// start 的直连/测试路径）跳过留 debug 痕；已关（停机中）拒新留 warn 痕。
-/// 均不裸 spawn、不 panic。
-pub fn pull<S: CachedNameserver + 'static>(server: Arc<S>, fqdn: String, option: IpOption) {
+/// 均不裸 spawn、不 panic。许可随任务结束（drop）释放；任一早退路径同样释放，
+/// 不会把 fqdn 永久卡在「在飞」。
+pub fn pull<S: CachedNameserver + 'static>(
+    server: Arc<S>,
+    fqdn: String,
+    option: IpOption,
+    permit: Option<RefreshPermit>,
+) {
+    let Some(permit) = permit else {
+        tracing::debug!(
+            target: "xray.dns",
+            fqdn = %fqdn,
+            "dns serveStale pull skipped: same-fqdn refresh already in flight"
+        );
+        return;
+    };
     let cache = server.cache_controller();
     let fx = cache.fx_scope().cloned();
     let server_name = cache.name.clone();
     let spawned = fx.map(|fx| {
         let task_fqdn = fqdn.clone();
         fx.spawn_tracked(async move {
+            // 许可生命周期 = 本次刷新任务：任务结束（超时/完成）即释放。
+            let _permit = permit;
             let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &task_fqdn, option))
                 .await;
         })
@@ -647,7 +666,12 @@ mod tests {
             cache: cache.clone(),
             hang: std::sync::atomic::AtomicBool::new(true),
         });
-        pull(server, "stale.com.".to_string(), v4_only_option());
+        pull(
+            server,
+            "stale.com.".to_string(),
+            v4_only_option(),
+            cache.begin_stale_refresh("stale.com."),
+        );
         assert!(cache.fx_scope().is_none(), "unattached scope must stay unattached");
 
         // 已关闭：拒新，in_flight 不增。
@@ -658,16 +682,23 @@ mod tests {
             cache: cache.clone(),
             hang: std::sync::atomic::AtomicBool::new(true),
         });
-        pull(server, "stale.com.".to_string(), v4_only_option());
+        pull(
+            server,
+            "stale.com.".to_string(),
+            v4_only_option(),
+            cache.begin_stale_refresh("stale.com."),
+        );
         assert_eq!(fx.in_flight(), 0, "closed scope must not gain new tasks");
 
         // 开放 scope：pull 任务入集；排空后在途归零。
         let cache2 = Arc::new(CacheController::new("probe2", false, true, 30, 0));
         let fx_open = Arc::new(skeleton_infra::fx::FxScope::new());
         cache2.attach_scope(&fx_open);
+        // 许可先取（cache2 随后被移进 server）。
+        let permit = cache2.begin_stale_refresh("stale.com.");
         let server2 =
             Arc::new(HangServer { cache: cache2, hang: std::sync::atomic::AtomicBool::new(true) });
-        pull(server2, "stale.com.".to_string(), v4_only_option());
+        pull(server2, "stale.com.".to_string(), v4_only_option(), permit);
         assert_eq!(fx_open.in_flight(), 1, "open scope must host the pull task");
         fx_open.shutdown().await;
         skeleton_infra::fx::expect_idle(&fx_open);

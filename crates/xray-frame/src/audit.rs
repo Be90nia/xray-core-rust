@@ -11,14 +11,15 @@
 //!
 //! 留 xray-frame（ADR-1 默认答案：派生层）。举证：udf 侧无可复用等价件——
 //! skeleton-infra/src/audit.rs 的 `AuditEvent{seq, kind}` 是 store/journal 生命
-//! 周域的 dispatch 记账节点，与本处 `AuditRecord{seq, plugin, message}` 形状、
-//! 用途都不同。
+//! 周域的 dispatch 记账节点，与本处 `AuditRecord{seq, plugin, message, fields}`
+//! 形状、用途都不同（字段袋本身复用 udf `skeleton::fields::FieldBag`，不自造）。
 
 use std::sync::{
     Mutex, MutexGuard,
     atomic::{AtomicU64, Ordering},
 };
 
+use skeleton::fields::FieldBag;
 use skeleton_infra::memgov::{BoundError, BoundedRegistry, Eviction};
 
 /// 缺省审计环容量。每插件实例一份（装配根共享面），1024 条足够事后取证窗口；
@@ -32,10 +33,14 @@ fn lock_audit<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// 一条插件审计事件（事后取证值面）。
 ///
-/// `seq` 进程内单调（同一 [`AuditHandle`] 内连续）；`plugin` = 发射插件名；
-/// `message` 为渲染后的单行文本（发射方负责不含密钥——掩码纪律归 [`crate::logging::LogFacade`]
-/// 面）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `seq` 进程内单调（同一 [`AuditHandle`] 内连续）；`plugin` = 发射插件名（域段）；
+/// `message` 为渲染后的单行文本；`fields` = 结构化字段袋（udf [`FieldBag`]：插入序
+/// 稳定、同名覆盖、克隆 O(1)）——**文本面保持原样不动**，结构化面是**增量**入口
+/// （[`AuditHandle::record_fields`]，文本路径下为共享空袋，零额外分配）。
+///
+/// 密钥面纪律：`message`/字段值由发射方保证不含密钥（掩码归
+/// [`crate::logging::LogFacade`] 面）。
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuditRecord {
     /// 单调序号（Handle 内连续；空洞 = 溢出显式证据）。
     pub seq: u64,
@@ -43,12 +48,14 @@ pub struct AuditRecord {
     pub plugin: &'static str,
     /// 渲染后的单行审计文本。
     pub message: String,
+    /// 结构化审计字段（文本路径为空袋）。
+    pub fields: FieldBag,
 }
 
 /// 插件审计事件流句柄（L2 `ctx.audit()` 实体）。
 ///
 /// 共享形态：装配根建一份，`Arc` 注入各插件 [`crate::context::PluginContext`]，
-/// 全插件事件落同一环（`plugin` 字段标注归属）。发射 O(log n)（BTreeMap 插入），
+/// 全插件事件落同一环（`domain` 字段标注归属）。发射 O(log n)（BTreeMap 插入），
 /// 无分配路径外的锁竞争面（单 Mutex 串行——审计非热路径）。
 pub struct AuditHandle {
     ring: Mutex<BoundedRegistry<u64, AuditRecord>>,
@@ -79,11 +86,26 @@ impl AuditHandle {
         }
     }
 
-    /// 记一条审计事件，返回其 `seq`。
+    /// 记一条审计事件（文本面，既有 API 原样保留），返回其 `seq`。
     ///
     /// 环满 → 逐出最旧（`EvictOldest`）+ [`Self::evicted_count`] 自增——发射
     /// 永不失败、永不阻塞（fail-visible 靠溢出计数，不靠拒收）。
     pub fn record(&self, plugin: &'static str, message: impl std::fmt::Display) -> u64 {
+        let message = message.to_string();
+        self.push(|seq| AuditRecord { seq, plugin, message, fields: FieldBag::new() })
+    }
+
+    /// 记一条审计事件（**结构化字段面**，增量入口），返回其 `seq`。
+    ///
+    /// `domain` 落 [`AuditRecord::plugin`]（归属域，与文本面同字段）；`message`
+    /// 留空串（`String::new` 不分配）。取值/对账走 `fields.get`，渲染归消费面。
+    pub fn record_fields(&self, domain: &'static str, fields: FieldBag) -> u64 {
+        self.push(|seq| AuditRecord { seq, plugin: domain, message: String::new(), fields })
+    }
+
+    /// 插入唯一路径：分配 `seq` + 环满逐出记账（两个公开入口共用，逐出判定
+    /// 只此一份——2026-10-26 首填多计 bug 的修正在此）。
+    fn push(&self, build: impl FnOnce(u64) -> AuditRecord) -> u64 {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut ring = lock_audit(&self.ring);
         // 逐出判定必须取**插入前**环态：EvictOldest 下只有「插入前已满」的
@@ -92,8 +114,7 @@ impl AuditHandle {
         // seq 连续单调 → 插入键恒为最大键，「插入前已满 ⇒ 必逐出最小键（最旧）」精确。
         let evicted_now = ring.len() == self.capacity;
         // BoundError 仅 Reject 策略产生；EvictOldest 环满自逐，insert 恒 Ok。
-        let _: Result<(), BoundError> =
-            ring.insert(seq, AuditRecord { seq, plugin, message: message.to_string() });
+        let _: Result<(), BoundError> = ring.insert(seq, build(seq));
         if evicted_now {
             self.evicted.fetch_add(1, Ordering::Relaxed);
         }
@@ -140,7 +161,18 @@ impl AuditHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use skeleton::fields::FieldValue;
+
     use super::*;
+
+    /// 字段袋：一两个字段足够锚住「值面 = 结构化字段，非渲染文本」。
+    fn bag(name: &'static str, value: FieldValue) -> FieldBag {
+        let mut bag = FieldBag::new();
+        bag.insert(name, value);
+        bag
+    }
 
     #[test]
     fn record_and_take_roundtrip_is_ascending() {
@@ -159,6 +191,42 @@ mod tests {
     }
 
     #[test]
+    fn text_path_keeps_message_and_leaves_fields_empty() {
+        let h = AuditHandle::new(4);
+        h.record("p", format_args!("coded {}/{}", 1, 2));
+        let rec = &h.take_events()[0];
+        assert_eq!(rec.message, "coded 1/2", "文本面语义原样（既有调用点零改动）");
+        assert!(rec.fields.is_empty(), "文本路径不付字段袋代价");
+    }
+
+    #[test]
+    fn record_fields_keeps_structured_values_verbatim() {
+        let h = AuditHandle::new(4);
+        h.record_fields(
+            "tls",
+            bag("handshake_ms", FieldValue::Duration(Duration::from_millis(12))),
+        );
+        let rec = &h.take_events()[0];
+        assert_eq!(rec.plugin, "tls", "域落归属字段");
+        assert_eq!(rec.message, "", "结构化路径不渲染文本");
+        assert_eq!(
+            rec.fields.get("handshake_ms"),
+            Some(&FieldValue::Duration(Duration::from_millis(12))),
+            "字段值与发射时逐值相等（无降级成字符串）"
+        );
+        assert_eq!(rec.fields.len(), 1);
+    }
+
+    #[test]
+    fn record_fields_empty_bag_is_legal() {
+        let h = AuditHandle::new(4);
+        h.record_fields("p", FieldBag::new());
+        let rec = &h.take_events()[0];
+        assert_eq!(rec.plugin, "p");
+        assert!(rec.fields.is_empty(), "空字段袋合法（只记归属+序号）");
+    }
+
+    #[test]
     fn ring_eviction_is_explicit_not_silent() {
         let h = AuditHandle::new(2);
         h.record("p", "one");
@@ -174,18 +242,19 @@ mod tests {
         h.record("p", "four");
         h.record("p", "five");
         assert_eq!(h.evicted_count(), 1, "drain 后重填至满位，零逐出");
-        h.record("p", "six");
-        assert_eq!(h.evicted_count(), 2, "重填后的满位插入恢复逐出计数");
+        h.record_fields("p", bag("n", FieldValue::Count(6)));
+        assert_eq!(h.evicted_count(), 2, "重填后的满位插入恢复逐出计数（字段路径同记账）");
         let events = h.take_events();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].message, "five");
-        assert_eq!(events[1].message, "six");
+        assert_eq!(events[1].fields.get("n"), Some(&FieldValue::Count(6)));
     }
 
     #[test]
-    fn display_message_renders_at_record_time() {
-        let h = AuditHandle::new(4);
-        h.record("p", format_args!("coded {}/{}", 1, 2));
-        assert_eq!(h.take_events()[0].message, "coded 1/2");
+    fn both_paths_share_one_seq_stream() {
+        let h = AuditHandle::new(8);
+        assert_eq!(h.record("p", "one"), 0);
+        assert_eq!(h.record_fields("p", FieldBag::new()), 1);
+        assert_eq!(h.record("p", "three"), 2);
     }
 }

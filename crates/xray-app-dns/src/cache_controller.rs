@@ -18,6 +18,10 @@ use parking_lot::RwLock;
 use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::fx::FxScope;
 use tokio::sync::broadcast;
+// 派生件 1（bd h4bl5）：serveStale 的窗口口径 + 同 fqdn 单飞刷新许可。
+// DNS 答案本体仍留 `ips`（Go 对拍面：per-family 过期 + cleanup/shrink + pubsub
+// 广播），换掉的只是本仓原先自实现的「过期可服务窗口 + 后台刷新去重」。
+use xray_frame::cache::{RefreshGate, RefreshPermit, stale_window};
 
 use crate::{
     config::IpOption,
@@ -62,6 +66,11 @@ pub struct CacheController {
     /// 零 spawn）；serveStale pull（`nameserver/cached.rs`）与 DoH h2 conn 驱动
     /// （`nameserver/doh.rs`）经 `fx_scope` 取用同一 scope。
     fx: OnceLock<Arc<FxScope>>,
+    /// serveStale 宽限窗（派生件 1 口径：`None` = 无上限；`Some(ZERO)` = 不服务
+    /// 过期值）。构造时由 `serve_stale`/`serve_expired_ttl` 折算，此后不变。
+    stale_window: Option<Duration>,
+    /// serveStale 后台刷新闸（派生件 1）：同 fqdn 同时至多一个 pull 在飞。
+    stale_gate: RefreshGate<String>,
 }
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
@@ -76,6 +85,12 @@ pub enum CacheEvent {
         /// 返回的记录。
         record: IpRecord,
     },
+}
+
+/// `serveExpiredTTL`（秒）→ 宽限窗：0 = 不设上限（Go 语义：`serveExpiredTTL == 0`
+/// 表示过期后无限期可服务）。
+fn nonzero_grace(secs: u32) -> Option<Duration> {
+    (secs != 0).then(|| Duration::from_secs(u64::from(secs)))
 }
 
 impl CacheController {
@@ -128,6 +143,9 @@ impl CacheController {
             single_flight: tokio::sync::Mutex::new(HashMap::new()),
             clock,
             fx: OnceLock::new(),
+            // Go `serveExpiredTTL == 0` ⇒ 不设上限；`serveStale == false` ⇒ 零宽限。
+            stale_window: stale_window(serve_stale, nonzero_grace(serve_expired_ttl)),
+            stale_gate: RefreshGate::new(),
         }
     }
 
@@ -333,6 +351,33 @@ impl CacheController {
         if spawned.is_err() {
             tracing::warn!(server = %self.name, "dns cleanup task not started: fx scope closed");
         }
+    }
+
+    /// serveStale 判定（派生件 1 单源）：`ttl` 为 `merge_records` 给出的剩余
+    /// TTL（秒，> 0 未过期、<= 0 已过期秒数的相反数）。
+    ///
+    /// 等价于 Go `nameserver_cached.go:35` 的
+    /// `serveExpiredTTL == 0 || serveExpiredTTL < ttl`（`serveExpiredTTL` 存负值）：
+    /// 宽限窗 `None` = 不设上限；`Some(d)` ⇒ 超时 `d` 内仍可服务。
+    #[must_use]
+    pub fn stale_servable(&self, ttl: i32) -> bool {
+        if ttl > 0 {
+            return false;
+        }
+        match self.stale_window {
+            None => true,
+            Some(window) => Duration::from_secs(ttl.unsigned_abs() as u64) < window,
+        }
+    }
+
+    /// 取得该 fqdn 的后台刷新许可：已有 pull 在飞 ⇒ `None`（本次直接用旧值）。
+    ///
+    /// 许可随 [`RefreshPermit`] drop 释放，故调用方必须把它移交给刷新任务。
+    #[must_use]
+    pub fn begin_stale_refresh(&self, fqdn: &str) -> Option<RefreshPermit> {
+        // shortcut: 每次过期读一次 String 分配（非法热路径，过期答案本就要打上游）；热起来再换
+        // Arc<str> 键。
+        self.stale_gate.try_begin(&fqdn.to_string())
     }
 
     /// 计算考虑 `serve_stale` 后的“有效当前时间”。
