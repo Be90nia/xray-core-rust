@@ -6,11 +6,25 @@
 """
 import subprocess, time, os, json, sys, base64, hashlib, socket, struct, threading
 
-RUST = 'dist/xray.exe'
+RUST = os.environ.get('XRAY_RUST_BIN') or 'dist/xray.exe'
 # Go 对照二进制：允许 XRAY_GO 覆盖，否则取本机现存的第一个（xray_go.exe 为历史路径）
 GO = os.environ.get('XRAY_GO') or next(
     (p for p in ('D:/tmp/xray_go.exe', 'D:/tmp/go2617/xray.exe') if os.path.exists(p)),
     'D:/tmp/xray_go.exe')
+
+
+def _banner():
+    """打印实际用到的二进制与版本指纹 —— 防止「以为在测新代码、其实在测旧基线」。"""
+    for tag, p in (('Rust', RUST), ('Go  ', GO)):
+        try:
+            out = subprocess.run([p, 'version'], capture_output=True, text=True, timeout=10)
+            v = (out.stdout or out.stderr).strip().splitlines()[:1]
+        except Exception as e:
+            v = [f'<不可执行: {e!r}>']
+        print(f'[banner] {tag} binary = {p}  |  {v[0] if v else "?"}')
+
+
+_banner()
 CERT = 'D:/tmp/interop_cert.pem'
 KEY = 'D:/tmp/interop_key.pem'
 with open(CERT) as _f:

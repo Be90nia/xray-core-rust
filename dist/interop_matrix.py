@@ -4,8 +4,26 @@ Go/Rust client 均用 pinnedPeerCertSha256（5x41: allowInsecure 配置期硬错
 """
 import subprocess, time, os, json, sys, base64, hashlib
 
-RUST = 'dist/xray.exe'
-GO = 'D:/Project/Xray-core/target/xray-go.exe'
+RUST = os.environ.get('XRAY_RUST_BIN') or 'dist/xray.exe'
+# 注意:默认的 dist/xray.exe 是**基线二进制**(红线,勿覆盖)。本地验证当前代码必须
+# 显式指定新构建(XRAY_RUST_BIN=target/release/xray.exe),否则会静默测到旧版本
+# (2026-10-30 因此误判一次修复无效)。Go 侧同理:默认路径是 9 月的旧物,须用 XRAY_GO
+# 指向当前裁定基准(26.10.17 = D:/tmp/go2617/xray.exe)。
+GO = os.environ.get('XRAY_GO') or 'D:/Project/Xray-core/target/xray-go.exe'
+
+
+def _banner():
+    """打印实际用到的二进制与版本指纹 —— 防止「以为在测新代码、其实在测旧基线」。"""
+    for tag, p in (('Rust', RUST), ('Go  ', GO)):
+        try:
+            out = subprocess.run([p, 'version'], capture_output=True, text=True, timeout=10)
+            v = (out.stdout or out.stderr).strip().splitlines()[:1]
+        except Exception as e:
+            v = [f'<不可执行: {e!r}>']
+        print(f'[banner] {tag} binary = {p}  |  {v[0] if v else "?"}')
+
+
+_banner()
 CERT = 'D:/tmp/interop_cert.pem'
 KEY = 'D:/tmp/interop_key.pem'
 # leaf DER sha256 (Go client pinnedPeerCertSha256)；从证书现算，避免证书重新生成后 pin 失配
