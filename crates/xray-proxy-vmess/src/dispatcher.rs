@@ -38,7 +38,10 @@ use crate::{
     account::MemoryAccount,
     encoding::{
         ChunkNonceGenerator, VERSION,
-        body_chunk::{ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter, SizeParser},
+        body_chunk::{
+            AEADSizeParserAdapter, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter,
+            SizeParser, make_authenticated_length_size_parser,
+        },
         client::ClientSession,
         generate_chacha20poly1305_key,
         server::has_aes_gcm_hardware_support,
@@ -63,6 +66,11 @@ pub struct VmessOutboundConfig {
     pub level: u32,
     /// 用户 email（stats 系统标识用）。
     pub email: String,
+    /// 实验特性开关（Go `VMessAccount.Experiments` → `Account.TestsEnabled`）。
+    ///
+    /// Go 用 `strings.Contains` 判两个子串：`AuthenticatedLength`（length 字段
+    /// 单独 AEAD 加密）与 `NoTerminationSignal`（不写终止 chunk）。
+    pub experiments: String,
 }
 
 impl VmessOutboundConfig {
@@ -77,6 +85,7 @@ impl VmessOutboundConfig {
             stream_settings: None,
             level: 0,
             email: String::new(),
+            experiments: String::new(),
         }
     }
 
@@ -111,6 +120,13 @@ impl VmessOutboundConfig {
         self
     }
 
+    /// 设置实验特性开关（builder 风格）。
+    #[must_use]
+    pub fn with_experiments(mut self, experiments: impl Into<String>) -> Self {
+        self.experiments = experiments.into();
+        self
+    }
+
     /// 服务器 Destination（TCP）。
     fn server_destination(&self) -> Destination {
         Destination::new(self.server_address.clone(), self.server_port, Network::TCP)
@@ -119,13 +135,14 @@ impl VmessOutboundConfig {
 
 /// 从 JSON 字符串解析 security 类型。
 ///
-/// Go 端 `security` 字段值：`"aes-128-gcm"` / `"chacha20-poly1305"` / `"auto"`。
-/// `"none"` / `"zero"` 已被 Go 上游移除（v26.7.28）。
+/// Go `infra/conf/vmess.go:26`：`switch strings.ToLower(a.Security)`，只认
+/// `"aes-128-gcm"` / `"chacha20-poly1305"` / `"auto"`，**其余一律 AUTO**（含
+/// 空串与未知名）。`"none"` / `"zero"` 已被 Go 上游移除（v26.7.28）。
 fn parse_security(s: &str) -> SecurityType {
-    match s {
-        "aes-128-gcm" | "aes-128-gcm@shadowsocks.org" => SecurityType::Aes128Gcm,
-        "chacha20-poly1305" | "chacha20-poly1305@shadowsocks.org" => SecurityType::Chacha20Poly1305,
-        "auto" => SecurityType::Auto,
+    match s.to_lowercase().as_str() {
+        "aes-128-gcm" => SecurityType::Aes128Gcm,
+        "chacha20-poly1305" => SecurityType::Chacha20Poly1305,
+        // "auto" 与未知名同落 Auto（Go `default:` 分支）
         _ => SecurityType::Auto,
     }
 }
@@ -191,6 +208,14 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     let security_str = user.get("security").and_then(|v| v.as_str()).unwrap_or("auto");
     let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Go infra/conf/vmess.go:42/164：flat 形态取顶层 `experiments`，vnext 形态取
+    // `users[].experiments`（本函数扁平化时只搬 id/security/level/email，故回落顶层）。
+    let experiments = user
+        .get("experiments")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| v.get("experiments").and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+        .to_string();
 
     // alterId≠0 的 legacy VMess 不支持（AEAD-only）；数字/字符串形式都认
     // （老配置生成器输出过字符串 alterId）。
@@ -210,7 +235,8 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
     )
     .with_security(parse_security(security_str))
     .with_level(level)
-    .with_email(email))
+    .with_email(email)
+    .with_experiments(experiments))
 }
 
 use std::str::FromStr;
@@ -277,7 +303,17 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
             ) {
                 option.set(request_option::GLOBAL_PADDING);
             }
-            let account = MemoryAccount::new(config.user_uuid.clone()).with_security(security);
+            // Go proxy/vmess/outbound/outbound.go:117-119：`AuthenticatedLength` 实验 →
+            // 选项位置位（body length 字段改 AEAD 加密）；`NoTerminationSignal` 不进
+            // 选项位，只在请求结束时决定是否写终止 chunk（outbound.go:180）。
+            let authenticated_length = config.experiments.contains("AuthenticatedLength");
+            let no_termination_signal = config.experiments.contains("NoTerminationSignal");
+            if authenticated_length {
+                option.set(request_option::AUTHENTICATED_LENGTH);
+            }
+            let mut account = MemoryAccount::new(config.user_uuid.clone()).with_security(security);
+            account.authenticated_length_experiment = authenticated_length;
+            account.no_termination_signal = no_termination_signal;
             let session = ClientSession::new();
             // command/network 按 dest.network（Go vmess outbound.go:88-91：
             // UDP 目标 → RequestCommandUDP）。
@@ -305,17 +341,14 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
             let resp_iv = session.response_body_iv;
             let use_padding = option.has(request_option::GLOBAL_PADDING);
 
-            // 6. size parser：CHUNK_MASKING → Shake（req/resp 各自 IV 播种），否则 Plain
-            let req_size_parser: Box<dyn SizeParser + Send> = if use_masking {
-                Box::new(ShakeSizeParserAdapter::new(&req_iv))
-            } else {
-                Box::new(PlainSizeParser)
-            };
-            let resp_size_parser: Box<dyn SizeParser + Send> = if use_masking {
-                Box::new(ShakeSizeParserAdapter::new(&resp_iv))
-            } else {
-                Box::new(PlainSizeParser)
-            };
+            // 6. size parser：AUTHENTICATED_LENGTH → AEAD 长度字段（padding 仍来自 CHUNK_MASKING 的
+            //    SHAKE 流）；否则 CHUNK_MASKING → Shake（req/resp 各自 IV 播种），否则 Plain。
+            let req_size_parser =
+                build_size_parser(authenticated_length, use_masking, req_iv, &session, security)
+                    .map_err(|e| format!("vmess build request size parser: {e}"))?;
+            let resp_size_parser =
+                build_size_parser(authenticated_length, use_masking, resp_iv, &session, security)
+                    .map_err(|e| format!("vmess build response size parser: {e}"))?;
             // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界 必须保持，duplex
             //    流桥会合并多次 write 破坏边界）；TCP：VmessConn （内部 spawn 双向 chunk
             //    pump；响应头在 down pump 内惰性解码）。
@@ -332,6 +365,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
                     resp_iv,
                     resp_size_parser,
                     use_padding,
+                    !no_termination_signal,
                 )) as Box<dyn Connection>);
             }
             Ok(Box::new(VmessConn::from_conn(
@@ -346,6 +380,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
                 resp_iv,
                 resp_size_parser,
                 use_padding,
+                !no_termination_signal,
             )) as Box<dyn Connection>)
         })
     })
@@ -380,6 +415,7 @@ impl VmessConn {
         resp_iv: [u8; 16],
         resp_size_parser: Box<dyn SizeParser + Send>,
         resp_padding: bool,
+        termination_signal: bool,
     ) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
         let (stream_r, stream_w) = tokio::io::split(conn);
@@ -388,8 +424,15 @@ impl VmessConn {
             .spawn(async move {
                 let (server_r, mut server_w) = tokio::io::split(server_io);
                 // up: 明文 duplex → chunk 加密 → wire（请求 body）
-                let up =
-                    pump_up(server_r, stream_w, req_cipher, req_iv, req_size_parser, req_padding);
+                let up = pump_up(
+                    server_r,
+                    stream_w,
+                    req_cipher,
+                    req_iv,
+                    req_size_parser,
+                    req_padding,
+                    termination_signal,
+                );
                 // down: 先惰性解码响应头，再 chunk 解密 → 明文 duplex。
                 // 与 up 并发执行：服务端（Go SetFlushNext）把响应头缓冲到首块下行数据，
                 // 上行数据必须先于响应头到达，因此不能在 dial 阶段同步等待响应头。
@@ -465,6 +508,8 @@ struct VmessUdpConn {
     /// ShakeSizeParserAdapter 内部 XofReader 非 Sync，无法裸存。
     req_size_parser: parking_lot::Mutex<Box<dyn SizeParser + Send>>,
     req_padding: bool,
+    /// `NoTerminationSignal` 实验：关闭时不写终止 chunk。
+    termination_signal: bool,
     /// 单 chunk 明文容量上限（packet 超限截断；UDP relay 实际包 ≤ MTU）
     up_chunk_cap: usize,
     wpending: Vec<u8>,
@@ -487,6 +532,7 @@ impl VmessUdpConn {
         resp_iv: [u8; 16],
         mut resp_size_parser: Box<dyn SizeParser + Send>,
         resp_padding: bool,
+        termination_signal: bool,
     ) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (stream_r, stream_w) = tokio::io::split(conn);
@@ -540,6 +586,7 @@ impl VmessUdpConn {
             req_cipher,
             req_size_parser: parking_lot::Mutex::new(req_size_parser),
             req_padding,
+            termination_signal,
             up_chunk_cap,
             wpending: Vec::with_capacity(up_chunk_cap + 96),
             wpos: 0,
@@ -602,8 +649,9 @@ impl AsyncWrite for VmessUdpConn {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = &mut *self.get_mut();
-        // 写终止 chunk（seal([])）——服务端 decode 看到空明文即流结束
-        if this.wpos >= this.wpending.len() {
+        // 写终止 chunk（seal([])）——服务端 decode 看到空明文即流结束；
+        // `NoTerminationSignal` 实验时省略（Go outbound.go:180）。
+        if this.termination_signal && this.wpos >= this.wpending.len() {
             let nonce = this.up_nonce.next_ref();
             encode_frame_into(
                 &mut this.wpending,
@@ -660,6 +708,62 @@ impl Connection for VmessUdpConn {
 /// 任意 security 开（enablePadding 短路项）。
 fn should_set_global_padding(use_masking: bool, env_padding: bool) -> bool {
     use_masking || env_padding
+}
+
+/// 构造一个方向的 chunk size parser（对齐 Go `encoding/client.go:120-127` 的
+/// `EncodeRequestBody` / `:239-246` 的 `DecodeResponseBody`）。
+///
+/// Go 在 `switch request.Security` 之前就按 `CHUNK_MASKING` 选出 padding 生成器
+/// （Shake），`AUTHENTICATED_LENGTH` 只把 `sizeParser` 变量换成 AEAD 解析器——
+/// 长度流与 padding 流是两条独立流，故这里也分开持有。
+fn build_size_parser(
+    authenticated_length: bool,
+    masking: bool,
+    direction_iv: [u8; 16],
+    session: &ClientSession,
+    security: SecurityType,
+) -> Result<Box<dyn SizeParser + Send>, VmessError> {
+    if !authenticated_length {
+        return Ok(if masking {
+            Box::new(ShakeSizeParserAdapter::new(&direction_iv)) as Box<dyn SizeParser + Send>
+        } else {
+            Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>
+        });
+    }
+    Ok(Box::new(AuthLenSizeParser {
+        // 请求/响应两个方向都从 request_body_key/iv 派生（Go 端同）
+        len: make_authenticated_length_size_parser(
+            &session.request_body_key,
+            &session.request_body_iv,
+            security,
+        )?,
+        padding: masking.then(|| ShakeSizeParserAdapter::new(&direction_iv)),
+    }))
+}
+
+/// `AUTHENTICATED_LENGTH` 实验的 size parser：长度字段走 AEAD（Go
+/// `NewAEADSizeParser`），padding 长度仍取自 CHUNK_MASKING 的 SHAKE 流。
+struct AuthLenSizeParser {
+    len: AEADSizeParserAdapter,
+    padding: Option<ShakeSizeParserAdapter>,
+}
+
+impl SizeParser for AuthLenSizeParser {
+    fn size_bytes(&self) -> usize {
+        self.len.size_bytes()
+    }
+
+    fn encode(&mut self, size: u16, out: &mut [u8]) {
+        self.len.encode(size, out);
+    }
+
+    fn decode(&mut self, input: &[u8]) -> u16 {
+        self.len.decode(input)
+    }
+
+    fn next_padding_len(&mut self) -> u16 {
+        self.padding.as_mut().map_or(0, SizeParser::next_padding_len)
+    }
 }
 
 /// 解析 security：Auto → 具体算法（与 server 端 `has_aes_gcm_hardware_support` 同语义）。
@@ -787,6 +891,7 @@ async fn pump_up<C, R, W>(
     iv: [u8; 16],
     mut size_parser: Box<dyn SizeParser + Send>,
     global_padding: bool,
+    termination_signal: bool,
 ) where
     C: AeadCipher + Send,
     R: AsyncRead + Unpin,
@@ -820,17 +925,21 @@ async fn pump_up<C, R, W>(
             },
         }
     }
-    // 写终止 chunk：seal([]) → 仅 tag 字节，服务端 decode 看到 plaintext 为空即请求 body 结束
-    let _ = write_one_chunk(
-        &mut stream_w,
-        &[],
-        &cipher,
-        &mut nonce_gen,
-        size_parser.as_mut(),
-        global_padding,
-        &mut chunk_buf,
-    )
-    .await;
+    // 写终止 chunk：seal([]) → 仅 tag 字节，服务端 decode 看到 plaintext 为空即请求
+    // body 结束。`NoTerminationSignal` 实验（Go outbound.go:180）时整块省略，靠连接
+    // 关闭让服务端识别流结束。
+    if termination_signal {
+        let _ = write_one_chunk(
+            &mut stream_w,
+            &[],
+            &cipher,
+            &mut nonce_gen,
+            size_parser.as_mut(),
+            global_padding,
+            &mut chunk_buf,
+        )
+        .await;
+    }
     let _ = stream_w.flush().await;
     let _ = stream_w.shutdown().await;
 }
@@ -1232,6 +1341,7 @@ mod tests {
             [0xBBu8; 16],
             Box::new(PlainSizeParser),
             false,
+            true,
         );
 
         conn.write_all(b"ping").await.unwrap();
@@ -1287,6 +1397,7 @@ mod tests {
             [0xBBu8; 16],
             Box::new(PlainSizeParser),
             false,
+            true,
         );
         let cap = conn.wpending.capacity();
         assert_eq!(cap, conn.up_chunk_cap + 96, "帧缓冲构造期一次预留");
@@ -1430,5 +1541,163 @@ mod tests {
         }
         assert_eq!(w.writes, 2, "each chunk must be one write_all (old impl: 3)");
         assert!(chunk_buf.capacity() <= cap, "chunk_buf must be reused without growth");
+    }
+
+    /// 41se0：Go `infra/conf/vmess.go:26` 用 `strings.ToLower(a.Security)` 匹配，
+    /// 大小写不敏感——`"AES-128-GCM"` 必须命中 AES128_GCM（旧实现精确小写匹配 → Auto）。
+    #[test]
+    fn parse_security_is_case_insensitive() {
+        assert!(matches!(parse_security("AES-128-GCM"), SecurityType::Aes128Gcm));
+        assert!(matches!(parse_security("Chacha20-Poly1305"), SecurityType::Chacha20Poly1305));
+        assert!(matches!(parse_security("Auto"), SecurityType::Auto));
+    }
+
+    /// 41se0：Go switch 只认三值，其余（含臆造的 `@shadowsocks.org` 别名）一律 AUTO。
+    #[test]
+    fn parse_security_unknown_falls_back_to_auto() {
+        for s in
+            ["aes-128-gcm@shadowsocks.org", "chacha20-poly1305@shadowsocks.org", "none", "zero", ""]
+        {
+            assert!(matches!(parse_security(s), SecurityType::Auto), "{s} must map to Auto");
+        }
+    }
+
+    /// y3t1z：`experiments` 从配置读入（vnext 形态的 `users[].experiments` 与
+    /// flat 形态的顶层 `experiments` 都认，Go vmess.go:42/164）。
+    #[test]
+    fn parse_vmess_config_reads_experiments() {
+        let vnext_form = r#"{
+            "vnext": [{
+                "address": "server.example.com",
+                "port": 443,
+                "users": [{
+                    "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                    "security": "aes-128-gcm",
+                    "experiments": "AuthenticatedLength|NoTerminationSignal"
+                }]
+            }]
+        }"#;
+        let cfg = parse_vmess_config(vnext_form.as_bytes()).expect("vnext form");
+        assert_eq!(cfg.experiments, "AuthenticatedLength|NoTerminationSignal");
+
+        let flat_form = r#"{
+            "address": "server.example.com",
+            "port": 443,
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "security": "AES-128-GCM",
+            "experiments": "AuthenticatedLength"
+        }"#;
+        let cfg = parse_vmess_config(flat_form.as_bytes()).expect("flat form");
+        assert_eq!(cfg.experiments, "AuthenticatedLength");
+        // 41se0：大小写不敏感
+        assert!(matches!(cfg.security, SecurityType::Aes128Gcm));
+
+        let none = r#"{
+            "vnext": [{
+                "address": "server.example.com",
+                "port": 443,
+                "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811" }]
+            }]
+        }"#;
+        assert_eq!(parse_vmess_config(none.as_bytes()).expect("default").experiments, "");
+    }
+
+    /// y3t1z：`experiments: "AuthenticatedLength"` 必须落到 wire——
+    /// ① 请求头 option 带 `AUTHENTICATED_LENGTH`（Go outbound.go:117-119）；
+    /// ② body length 字段真的走 AEAD（服务端用 AEAD size parser 才解得出 payload）。
+    #[tokio::test]
+    async fn experiments_authenticated_length_reaches_wire() {
+        use tokio::net::TcpListener;
+
+        use crate::{
+            encoding::{
+                body_chunk::{
+                    ChunkNonceAdapter, decode_single_chunk_async,
+                    make_authenticated_length_size_parser,
+                },
+                server::{ServerSession, SessionHistory},
+            },
+            validator::{MemoryUser, TimedUserValidator, Validator},
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let uuid = UUID::new();
+        let server_uuid = uuid.clone();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let validator = TimedUserValidator::new();
+            validator
+                .add(MemoryUser::new("alice@example.com", MemoryAccount::new(server_uuid)))
+                .expect("add user");
+            let history = SessionHistory::new();
+            let mut session = ServerSession::new(&validator, &history);
+            let (header, _user) =
+                session.decode_request_header_async(&mut sock).await.expect("decode header");
+            let mut sp = AuthLenSizeParser {
+                len: make_authenticated_length_size_parser(
+                    &session.request_body_key,
+                    &session.request_body_iv,
+                    header.security,
+                )
+                .expect("aead size parser"),
+                // GLOBAL_PADDING 对 AEAD 档恒开（shouldEnablePadding），padding 长度来自
+                // CHUNK_MASKING 的 SHAKE 流（req IV 播种）——解块前必须先消费它。
+                padding: Some(ShakeSizeParserAdapter::new(&session.request_body_iv)),
+            };
+            let cipher = Aes128Gcm::new(&session.request_body_key).expect("cipher");
+            let mut nonce_gen = ChunkNonceAdapter::new(&session.request_body_iv, 12);
+            let pkt = decode_single_chunk_async(&mut sock, &cipher, &mut nonce_gen, &mut sp, true)
+                .await
+                .expect("decode body chunk");
+            (header.option, pkt)
+        });
+
+        let cfg = Arc::new(
+            VmessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(port),
+            )
+            .with_security(SecurityType::Aes128Gcm)
+            .with_experiments("AuthenticatedLength"),
+        );
+        let dial = make_vmess_dial_fn(cfg, test_ctx());
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(port));
+        let mut conn = dial(&dest).await.expect("dial");
+        conn.write_all(b"ping").await.expect("write body");
+        conn.flush().await.expect("flush body");
+
+        let (option, pkt) = server.await.expect("server task");
+        assert!(
+            option.has(request_option::AUTHENTICATED_LENGTH),
+            "request header must carry AUTHENTICATED_LENGTH option"
+        );
+        assert_eq!(pkt.as_deref(), Some(&b"ping"[..]), "AEAD length field must decode");
+    }
+
+    /// y3t1z：`NoTerminationSignal` → 上行流结束不写终止 chunk（Go outbound.go:180）。
+    /// Plain size parser + 无 padding 时帧长固定：数据帧 = 2 + (5 + 16)，终止帧 = 2 + 16。
+    #[tokio::test]
+    async fn no_termination_signal_omits_final_empty_chunk() {
+        async fn wire_len(termination_signal: bool) -> usize {
+            let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
+            let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+            let data: &[u8] = b"hello";
+            pump_up(
+                data,
+                &mut w,
+                cipher,
+                [0xAAu8; 16],
+                Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>,
+                false,
+                termination_signal,
+            )
+            .await;
+            w.buf.len()
+        }
+        assert_eq!(wire_len(true).await, 23 + 18, "默认写终止 chunk（2 size + 16 tag）");
+        assert_eq!(wire_len(false).await, 23, "NoTerminationSignal 只留数据帧");
     }
 }
