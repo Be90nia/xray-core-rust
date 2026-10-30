@@ -529,17 +529,19 @@ pub enum ShadowsocksMethod {
 impl ShadowsocksMethod {
     /// 解析 method 字符串。未知返回 `None`（对应 Go `CipherType_UNKNOWN` 哨兵，
     /// 由调用方按上下文生成 "unknown/unsupported cipher method" 错误）。
+    ///
+    /// **大小写不敏感**（Go 26.10.17）：2022 分支判定走
+    /// `shadowsocks_2022.GetCipherMethod(v.Cipher)`（`cipher.go:24-28`
+    /// 先 `strings.ToLower(name)` 再查表），旧 AEAD 走 `cipherFromString`
+    /// （同样 `strings.ToLower`）。两条分支统一小写化后匹配。
     #[must_use]
     pub fn from_method(name: &str) -> Option<Self> {
-        // 2022：精确匹配（Go C.Contains(shadowaead_2022.List, cipher)）。
-        match name {
-            "2022-blake3-aes-128-gcm" => return Some(Self::Ss2022Aes128Gcm),
-            "2022-blake3-aes-256-gcm" => return Some(Self::Ss2022Aes256Gcm),
-            "2022-blake3-chacha20-poly1305" => return Some(Self::Ss2022ChaCha20Poly1305),
-            _ => {},
-        }
-        // 旧 AEAD：小写化匹配（Go cipherFromString）。
         match name.to_ascii_lowercase().as_str() {
+            // 2022（Go `GetCipherMethod`）：大小写不敏感。
+            "2022-blake3-aes-128-gcm" => Some(Self::Ss2022Aes128Gcm),
+            "2022-blake3-aes-256-gcm" => Some(Self::Ss2022Aes256Gcm),
+            "2022-blake3-chacha20-poly1305" => Some(Self::Ss2022ChaCha20Poly1305),
+            // 旧 AEAD（Go `cipherFromString`）。
             "aes-128-gcm" | "aead_aes_128_gcm" => Some(Self::Aes128Gcm),
             "aes-256-gcm" | "aead_aes_256_gcm" => Some(Self::Aes256Gcm),
             "chacha20-poly1305" | "aead_chacha20_poly1305" | "chacha20-ietf-poly1305" => {
@@ -609,14 +611,17 @@ impl ShadowsocksInboundSettings {
         // Go :56-58：clients 非 nil 覆盖 users（含空切片）。
         let users = self.clients.as_ref().or(self.users.as_ref()).map(Vec::as_slice);
         if ShadowsocksMethod::from_method(&self.method).is_some_and(|m| m.is_ss2022()) {
+            // Go `buildShadowsocks2022` 首行 `v.Cipher = strings.ToLower(v.Cipher)`：
+            // 小写化**先于**后续的 `"aes"` 子串检查与 config.Method 落值。
+            let method = self.method.to_ascii_lowercase();
             match users {
                 None | Some([]) => Ok(ShadowsocksServerBuild::Ss2022Single {
-                    method: self.method.clone(),
+                    method,
                     key: self.password.clone().unwrap_or_default(),
                     email: self.email.clone().unwrap_or_default(),
                     network: self.network.clone(),
                 }),
-                Some(u) => self.build_ss2022_multi(u),
+                Some(u) => self.build_ss2022_multi(&method, u),
             }
         } else {
             self.build_legacy(users)
@@ -625,12 +630,15 @@ impl ShadowsocksInboundSettings {
 
     /// Go `buildShadowsocks2022` 多用户分支（:125-157；:125-127 空 method 检查在
     /// Go 不可达——空 method 不会命中 2022 分流——故不复刻）。
+    ///
+    /// `method` 传**已小写化**的 method（Go `v.Cipher` 在进本分支前已 ToLower）。
     fn build_ss2022_multi(
         &self,
+        method: &str,
         users: &[ShadowsocksUserConfig],
     ) -> crate::error::Result<ShadowsocksServerBuild> {
         // Go :128-130：多用户仅支持 blake3-aes-*-gcm（chacha 被拒）。
-        if !self.method.contains("aes") {
+        if !method.contains("aes") {
             return Err(crate::error::ConfError::Invalid(
                 "shadowsocks 2022 (multi-user): only blake3-aes-*-gcm methods are supported".into(),
             ));
@@ -656,7 +664,7 @@ impl ShadowsocksInboundSettings {
             });
         }
         Ok(ShadowsocksServerBuild::Ss2022MultiUser {
-            method: self.method.clone(),
+            method: method.to_string(),
             key: self.password.clone().unwrap_or_default(),
             users: out,
             network: self.network.clone(),
@@ -1659,12 +1667,60 @@ mod tests {
             ShadowsocksMethod::from_method("2022-blake3-chacha20-poly1305"),
             Some(ShadowsocksMethod::Ss2022ChaCha20Poly1305)
         );
-        // 2022 名大小写敏感：大写变体不命中 2022，落入旧 AEAD 解析失败（UNKNOWN）。
-        assert_eq!(ShadowsocksMethod::from_method("2022-BLAKE3-AES-128-GCM"), None);
+        // 2022 名大小写不敏感（Go 26.10.17 `GetCipherMethod` 先 ToLower 再查表）。
+        //
+        // 【旧断言更新说明】旧口径断言 `"2022-BLAKE3-AES-128-GCM" → None`
+        // （把"2022 名大小写敏感"锁死），那是 **26.9.9 口径**（当时
+        // `C.Contains(shadowaead_2022.List, cipher)` 精确匹配）。26.10.17
+        // 上游改为 `shadowsocks_2022.GetCipherMethod(v.Cipher)`，其内部
+        // `strings.ToLower(name)` → 大写命中 2022 分支。本断言按新口径更新，
+        // **不是放宽**：未知 method 仍拒（见下一行）。
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-BLAKE3-AES-128-GCM"),
+            Some(ShadowsocksMethod::Ss2022Aes128Gcm)
+        );
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-BLAKE3-AES-256-GCM"),
+            Some(ShadowsocksMethod::Ss2022Aes256Gcm)
+        );
+        assert_eq!(
+            ShadowsocksMethod::from_method("2022-BLAKE3-CHACHA20-POLY1305"),
+            Some(ShadowsocksMethod::Ss2022ChaCha20Poly1305)
+        );
+        // 大小写放宽**不得**变成「什么都能进」：未知 method 仍拒。
         assert_eq!(ShadowsocksMethod::from_method("rc4-md5"), None);
+        assert_eq!(ShadowsocksMethod::from_method("2022-blake3-aes-192-gcm"), None);
+        assert_eq!(ShadowsocksMethod::from_method(""), None);
         // 分流判定。
         assert!(ShadowsocksMethod::Ss2022ChaCha20Poly1305.is_ss2022());
         assert!(!ShadowsocksMethod::Aes256Gcm.is_ss2022());
+    }
+
+    /// Go `buildShadowsocks2022` 首行 `v.Cipher = strings.ToLower(v.Cipher)`：
+    /// 入站 2022 产物的 method 落**小写**值（且多用户分支的 `"aes"` 子串检查
+    /// 在小写化之后做——否则大写 `2022-BLAKE3-AES-256-GCM` 会被误拒）。
+    #[test]
+    fn shadowsocks_inbound_2022_build_lowercases_method() {
+        // 单用户面。
+        let raw = r#"{"method":"2022-BLAKE3-AES-256-GCM","password":"aGk="}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022Single { method, .. } => {
+                assert_eq!(method, "2022-blake3-aes-256-gcm");
+            },
+            other => panic!("expected Ss2022Single, got {other:?}"),
+        }
+        // 多用户面（大写 aes 方法必须过 `"aes"` 子串检查 → 不被误拒）。
+        let raw = r#"{"method":"2022-BLAKE3-AES-256-GCM","password":"c2VydmVy",
+            "users":[{"password":"dXNlcjE="},{"password":"dXNlcjI="}]}"#;
+        let s: ShadowsocksInboundSettings = serde_json::from_str(raw).unwrap();
+        match s.build().unwrap() {
+            ShadowsocksServerBuild::Ss2022MultiUser { method, users, .. } => {
+                assert_eq!(method, "2022-blake3-aes-256-gcm");
+                assert_eq!(users.len(), 2);
+            },
+            other => panic!("expected Ss2022MultiUser, got {other:?}"),
+        }
     }
 
     #[test]

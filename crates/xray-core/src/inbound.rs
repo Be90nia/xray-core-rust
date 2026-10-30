@@ -3087,7 +3087,8 @@ impl InboundRuntime {
         match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel, Some(self)).await {
             Ok(handle) => Ok(handle),
             Err(e) => {
-                self.slots.write().remove(&ib.tag);
+                // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配。
+                self.slots.write().remove(ib.tag.as_str());
                 Err(e)
             },
         }
@@ -3105,7 +3106,9 @@ impl InboundRuntime {
     ///
     /// tag 不存在 → [`ProxymanError::HandlerNotFound`]。
     pub fn remove_inbound(&self, tag: &str) -> Result<(), ProxymanError> {
-        let slot = self.slots.write().remove(&tag.to_string());
+        // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配
+        // （改前每次摘除 1 次 `to_string()` 堆分配）。
+        let slot = self.slots.write().remove(tag);
         match slot {
             Some(s) => {
                 s.cancel.cancel();
@@ -3143,7 +3146,8 @@ impl InboundRuntime {
     /// 槽位在 spawn 前已插入，缺失说明调用方未登记 tag（编程错误）。
     fn register_user_manager(&self, tag: &str, users: Arc<dyn ApiUserManager>) {
         let mut slots = self.slots.write();
-        let Some(mut slot) = slots.remove(&tag.to_string()) else {
+        // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配。
+        let Some(mut slot) = slots.remove(tag) else {
             tracing::warn!(tag = %tag, "user manager registered for unknown inbound");
             return;
         };
@@ -5244,9 +5248,11 @@ pub(crate) fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundM
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
 
-    // SS-2022 检测：method 以 "2022-blake3-" 开头
+    // SS-2022 检测：method 以 "2022-blake3-" 开头（大小写不敏感，同 Go 26.10.17
+    // `GetCipherMethod` 的 ToLower 口径——否则大写 method 在此门就被拒，
+    // 到不了运行期 `CipherKind2022::from_name` 的大小写不敏感闸）。
     let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
-    if method.starts_with("2022-blake3-") {
+    if method.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("2022-blake3-")) {
         return parse_ss2022_inbound_config(method, &v);
     }
 
@@ -7355,6 +7361,34 @@ mod tests {
             panic!("clients[] fallback should build multi-user inbound");
         };
         assert_eq!(multi.users_count(), 1);
+    }
+
+    /// Go 26.10.17 `proxy/shadowsocks_2022/cipher.go:24-28` `GetCipherMethod`
+    /// 先 `strings.ToLower` → **大写 2022 method 必须命中 ss2022 入站面**
+    /// （路由门 + 运行期 `CipherKind2022::from_name` 两道闸都要大小写不敏感）。
+    #[test]
+    fn parse_ss_inbound_config_accepts_uppercase_2022_method() {
+        let psk = "EREREREREREREREREREREA==";
+        let json = format!(r#"{{"method":"2022-BLAKE3-AES-128-GCM","password":"{psk}"}}"#);
+        let mode = super::parse_ss_inbound_config(json.as_bytes()).unwrap();
+        assert!(
+            matches!(mode, super::SsInboundMode::Ss2022(_)),
+            "大写 2022 method 应命中 ss2022 面（Go GetCipherMethod 大小写不敏感）"
+        );
+    }
+
+    /// 未知 method 仍被拒（大小写放宽不得变成「什么都能进」）：
+    /// 近似 2022 前缀但非已知方法名 → 过路由门后在 ss2022 cipher 名解析闸被拒。
+    #[test]
+    fn parse_ss_inbound_config_rejects_unknown_2022_like_method() {
+        let json = r#"{"method":"2022-BLAKE3-AES-192-GCM","password":"EREREREREREREREREREREA=="}"#;
+        let Err(err) = super::parse_ss_inbound_config(json.as_bytes()) else {
+            panic!("未知 2022 变体 method 应被拒");
+        };
+        assert!(
+            err.to_string().contains("2022-BLAKE3-AES-192-GCM"),
+            "未知 2022 变体 method 应被拒，实际: {err}"
+        );
     }
 
     /// ss2022 中继 Go 形：`users[0].address` 非空 → relay（Go shadowsocks.go:130），

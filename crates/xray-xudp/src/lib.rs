@@ -152,7 +152,10 @@ pub struct GlobalIdInput {
 ///
 /// # 算法
 ///
-/// lake3(source_string, base_key) → 取前 8 字节
+/// blake3 **keyed** 模式（key = base_key 32B），data = `Source.String()`
+/// 单一消息，取 digest 前 8 字节——与 Go `xudp.GetGlobalID` 同构。
+///
+/// key 与 data **不混入同一 message**（keyed 模式语义）。
 ///
 /// # 参数
 ///
@@ -182,9 +185,8 @@ fn compute_global_id(
         return [0u8; GLOBAL_ID_LEN];
     }
 
-    let mut hasher = Hasher::new_derive_key("xray-xudp-global-id");
+    let mut hasher = Hasher::new_keyed(base_key);
     hasher.update(input.source.as_bytes());
-    hasher.update(base_key);
 
     let mut output = [0u8; GLOBAL_ID_LEN];
     output.copy_from_slice(&hasher.finalize().as_bytes()[..GLOBAL_ID_LEN]);
@@ -364,6 +366,60 @@ mod tests {
         let key = [99u8; BASE_KEY_LEN];
         let id = compute_global_id(&input, &key, false);
         assert_eq!(id, [0u8; GLOBAL_ID_LEN]);
+    }
+
+    /// Go 26.10.17 `common/xudp/xudp.go:82-96` GetGlobalID 固定向量对拍。
+    ///
+    /// Go 侧算法：**keyed 模式**（key = baseKey 32B），data = `Source.String()`
+    /// 单一消息，输出取 digest 前 8 字节：
+    /// `h := blake3.New(8, ensureBaseKey()); h.Write([]byte(src)); h.Sum(nil)`。
+    /// key 与 data **不混入同一 message**——这正是 Rust 旧实现
+    /// （derive_key + 把 base_key 当 data 追加）与 Go 的分歧点。
+    ///
+    /// 向量来源（两套独立实现互证，值已固化进本断言）：
+    /// - Go：`reports/audit-2026-10-30/tmp/SmallDrift/go-xudp-vector/main.go`， 用 Xray-core go.mod
+    ///   锁定的 `lukechampine.com/blake3 v1.4.1` 按上述三行复算。
+    /// - Python：`blake3` 1.0.9（参考实现）keyed 模式复算，两套输出逐字节一致。
+    ///
+    /// test key = 0x00..0x1f（32 字节）。
+    #[test]
+    fn test_global_id_matches_go_keyed_vector() {
+        let key: [u8; BASE_KEY_LEN] = std::array::from_fn(|i| i as u8);
+        let cases: [(&str, [u8; GLOBAL_ID_LEN]); 3] = [
+            ("udp:1.2.3.4:5678", [0x01, 0x5a, 0x4f, 0x6a, 0x5c, 0xcf, 0xcd, 0x82]),
+            ("udp:10.0.0.9:5555", [0x1f, 0x14, 0xc0, 0x60, 0x07, 0x20, 0x3a, 0x3a]),
+            ("udp:203.0.113.7:4444", [0x0c, 0x42, 0x94, 0x42, 0x46, 0xbd, 0x95, 0xac]),
+        ];
+        for (src, want) in cases {
+            let input =
+                GlobalIdInput { source: src.to_string(), source_network: Network::UDP, cone: true };
+            let got = compute_global_id(&input, &key, false);
+            assert_eq!(got, want, "GlobalID mismatch for {src}");
+        }
+    }
+
+    /// keyed 模式语义闸：key 不进 message。
+    ///
+    /// Go 的 keyed 模式把 base_key 当 **key**（不进 message），data 只有
+    /// `Source.String()`。若实现退化成"把 key 追加进 data"，本断言必红
+    /// （同 key 不同 source 的输出会与 Go 向量不符）。
+    #[test]
+    fn test_global_id_key_is_not_part_of_message() {
+        let key = [0xABu8; BASE_KEY_LEN];
+        let input = GlobalIdInput {
+            source: "udp:1.2.3.4:5678".to_string(),
+            source_network: Network::UDP,
+            cone: true,
+        };
+        // 与 Go 同 key 下的向量不同（Go 该 key 无固化值，此处只断言"换 key 换输出"
+        // 且输出不等于把 key 拼进 data 的 derive_key 结果）。
+        let keyed = compute_global_id(&input, &key, false);
+        let mut hasher = Hasher::new_derive_key("xray-xudp-global-id");
+        hasher.update(input.source.as_bytes());
+        hasher.update(&key);
+        let mut derive_style = [0u8; GLOBAL_ID_LEN];
+        derive_style.copy_from_slice(&hasher.finalize().as_bytes()[..GLOBAL_ID_LEN]);
+        assert_ne!(keyed, derive_style, "keyed 模式不得把 key 当 data 追加");
     }
 
     #[test]

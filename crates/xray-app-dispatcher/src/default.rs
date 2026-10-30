@@ -2164,12 +2164,13 @@ impl SimpleOhm {
     /// default handler 的 tag 与之相同时 default 一并清空。
     /// 返回 tag 是否存在（不存在 = no-op，由调用方决定是否报错）。
     pub fn remove(&self, tag: &str) -> bool {
-        let key = tag.to_string();
-        let existed = self.tagged.write().remove(&key).is_some();
+        // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配
+        // （改前每次摘除 1 次 `to_string()` 堆分配）。
+        let existed = self.tagged.write().remove(tag).is_some();
         if !existed {
             return false;
         }
-        self.shadow.write().remove(&key);
+        self.shadow.write().remove(tag);
         let default_matches = self.default.read().as_ref().is_some_and(|h| h.tag() == tag);
         if default_matches {
             *self.default.write() = None;
@@ -2193,7 +2194,7 @@ impl SimpleOhm {
     /// 测试/巡检面：**只**删实例影子表（旧表保持不动），用途同上。
     #[cfg(test)]
     pub(crate) fn shadow_remove_only(&self, tag: &str) -> bool {
-        self.shadow.write().remove(&tag.to_string()).is_some()
+        self.shadow.write().remove(tag).is_some()
     }
 }
 
@@ -5391,6 +5392,40 @@ mod tests {
 
         println!("tag lookup allocs/lookup: {}", allocs / LOOKUPS);
         assert_eq!(allocs, 0, "借用查表必须零分配（改前每次 1 次 to_string 分配）");
+    }
+
+    /// #8 分配取证：udf `remove<Q: Borrow<Q>>` 让 tag 摘除走借用形。测的是**生产路径**
+    /// `SimpleOhm::remove`：改前（`let key = tag.to_string()`）每次摘除 1 次堆分配，
+    /// 改后借用形 0 次。计数源复用 udp_session 的线程归属分配器（本 crate 只有一个
+    /// `#[global_allocator]`）。
+    // lib.rs 的 warn(print_stdout) 排在 test 级 allow 之后覆盖它，取证数字须打印。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn tag_remove_allocates_nothing_after_borrow_generic() {
+        use std::cell::Cell;
+
+        use crate::udp_session::tests::THREAD_ALLOCS;
+
+        const REMOVES: usize = 64;
+        let ohm = SimpleOhm::new();
+        let handler: Arc<dyn DispatchHandler> = Arc::new(TaggedEchoHandler::new(
+            "rm-alloc-probe",
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        ));
+        // 登记与 tag 构造都在计数窗之外（登记本身含 to_string 分配，不属被测路径）。
+        let tags: Vec<String> = (0..REMOVES).map(|i| format!("rm-alloc-probe-{i}")).collect();
+        for tag in &tags {
+            ohm.add(tag, Arc::clone(&handler));
+        }
+
+        let before = THREAD_ALLOCS.with(Cell::get);
+        for tag in &tags {
+            assert!(ohm.remove(tag), "登记过的 tag 必须摘除命中");
+        }
+        let allocs = THREAD_ALLOCS.with(Cell::get) - before;
+
+        println!("tag remove allocs/remove: {}", allocs / REMOVES);
+        assert_eq!(allocs, 0, "借用摘除必须零分配（改前每次 1 次 to_string 分配）");
     }
 
     /// B4 S3/S4：生产选择面 = 实例影子表（无兜底，唯一路径）。

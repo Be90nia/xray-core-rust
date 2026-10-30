@@ -16,19 +16,20 @@ use crate::error::HysteriaProxyError;
 
 /// 地址最大长度（防 DoS）。
 ///
-/// 合法地址是 `host:port`：域名 ≤253 + `:` + 端口 ≤5 = ≤259 字节，271 留少量裕量。
-/// 比 Go 基准的 2048 更紧——超过该值必为恶意 varint 声明。
-pub const MAX_ADDRESS_LENGTH: u64 = 271;
+/// Go `proxy/hysteria/protocol.go:19` `MaxAddressLength = 2048`。
+/// 合法地址是 `host:port`：域名 ≤253 + `:` + 端口 ≤5 = ≤259 字节，2048 留足裕量。
+pub const MAX_ADDRESS_LENGTH: u64 = 2048;
 
-/// 消息最大长度（64 KiB）。
+/// 消息最大长度。
 ///
-/// Go 基准为 2048；放宽到 64 KiB 上限（超限仍拒绝，接受侧不放大分配）。
-pub const MAX_MESSAGE_LENGTH: u64 = 64 * 1024;
+/// Go `proxy/hysteria/protocol.go:18` `MaxMessageLength = 2048`。
+pub const MAX_MESSAGE_LENGTH: u64 = 2048;
 
-/// Padding 最大长度（64 KiB）。
+/// Padding 最大长度。
 ///
+/// Go `proxy/hysteria/protocol.go:20` `MaxPaddingLength = 4096`。
 /// padding 读取后即丢弃（`discard_exact` 按块读，不按声明值预分配）。
-pub const MAX_PADDING_LENGTH: u64 = 64 * 1024;
+pub const MAX_PADDING_LENGTH: u64 = 4096;
 
 // ===== QUIC varint 读写 =====
 
@@ -533,6 +534,113 @@ mod tests {
         assert!(err.to_string().contains("invalid address length"), "got {err}");
     }
 
+    // ===== Go 26.10.17 `proxy/hysteria/protocol.go:17-19` 上限逐条对拍 =====
+    //
+    // Go: MaxAddressLength = 2048 / MaxMessageLength = 2048 / MaxPaddingLength = 4096。
+    // 下面用**写死数值**（不引用本 crate 常量）断言行为，红绿不随常量漂移。
+
+    /// Go `MaxAddressLength = 2048`：界内（恰 2048）收。
+    #[test]
+    fn tcp_request_accepts_addr_len_at_go_limit_2048() {
+        let addr = vec![b'a'; 2048];
+        let mut buf = varint_bytes(2048);
+        buf.extend_from_slice(&addr);
+        buf.extend(varint_bytes(0)); // padding_len = 0
+        let decoded =
+            read_tcp_request(&mut io::Cursor::new(&buf)).expect("2048B addr should be accepted");
+        assert_eq!(decoded.len(), 2048);
+    }
+
+    /// Go `MaxAddressLength = 2048`：超限（2049）拒。
+    #[test]
+    fn tcp_request_rejects_addr_len_above_go_limit_2048() {
+        let buf = varint_bytes(2049);
+        let err = read_tcp_request(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid address length"), "got {err}");
+    }
+
+    /// Go `MaxMessageLength = 2048`：界内（恰 2048）收。
+    #[test]
+    fn tcp_response_accepts_msg_len_at_go_limit_2048() {
+        let msg = "x".repeat(2048);
+        let mut buf = vec![0u8]; // status = ok
+        buf.extend(varint_bytes(2048));
+        buf.extend_from_slice(msg.as_bytes());
+        buf.extend(varint_bytes(0)); // padding_len = 0
+        let (ok, decoded) =
+            read_tcp_response(&mut io::Cursor::new(&buf)).expect("2048B msg should be accepted");
+        assert!(ok);
+        assert_eq!(decoded.len(), 2048);
+    }
+
+    /// Go `MaxMessageLength = 2048`：超限（2049）拒。
+    #[test]
+    fn tcp_response_rejects_msg_len_above_go_limit_2048() {
+        let mut buf = vec![0u8]; // status = ok
+        buf.extend(varint_bytes(2049));
+        buf.extend(varint_bytes(0));
+        let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid message length"), "got {err}");
+    }
+
+    /// Go `MaxPaddingLength = 4096`：界内（恰 4096）收。
+    #[test]
+    fn tcp_request_accepts_padding_len_at_go_limit_4096() {
+        let addr = b"example.com:443";
+        let mut buf = varint_bytes(addr.len() as u64);
+        buf.extend_from_slice(addr);
+        buf.extend(varint_bytes(4096));
+        buf.extend(std::iter::repeat_n(0u8, 4096));
+        let mut cursor = io::Cursor::new(&buf);
+        let decoded = read_tcp_request(&mut cursor).expect("4096B padding should be accepted");
+        assert_eq!(decoded, "example.com:443");
+        assert_eq!(cursor.position() as usize, buf.len(), "padding fully consumed");
+    }
+
+    /// Go `MaxPaddingLength = 4096`：超限（4097）拒。
+    #[test]
+    fn tcp_request_rejects_padding_len_above_go_limit_4096() {
+        let addr = b"example.com:443";
+        let mut buf = varint_bytes(addr.len() as u64);
+        buf.extend_from_slice(addr);
+        buf.extend(varint_bytes(4097));
+        let err = read_tcp_request(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid padding length"), "got {err}");
+    }
+
+    /// Go `MaxPaddingLength = 4096`（响应面同一常量）：超限（4097）拒。
+    #[test]
+    fn tcp_response_rejects_padding_len_above_go_limit_4096() {
+        let mut buf = vec![0u8]; // status = ok
+        buf.extend(varint_bytes(0)); // msg_len = 0
+        buf.extend(varint_bytes(4097));
+        let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid padding length"), "got {err}");
+    }
+
+    /// Go `ParseUDPMessage` 拒 `lAddr > MaxMessageLength`（Go 用 MessageLength
+    /// 判地址长度；与 MaxAddressLength 同为 2048，数值等价）。
+    /// 界内（2048）收。
+    #[test]
+    fn udp_message_accepts_addr_len_at_go_limit_2048() {
+        let mut m = vec![0u8; 8];
+        m.extend(varint_bytes(2048));
+        m.extend(vec![b'a'; 2048]);
+        m.push(0x42); // 至少 1 字节 data
+        let parsed = UdpMessage::parse(&m).expect("2048B addr should be accepted");
+        assert_eq!(parsed.addr.len(), 2048);
+        assert_eq!(parsed.data, vec![0x42]);
+    }
+
+    /// Go `ParseUDPMessage`：超限（2049）拒。
+    #[test]
+    fn udp_message_rejects_addr_len_above_go_limit_2048() {
+        let mut m = vec![0u8; 8];
+        m.extend(varint_bytes(2049));
+        let err = UdpMessage::parse(&m).unwrap_err();
+        assert!(err.to_string().contains("invalid address length"), "got {err}");
+    }
+
     #[test]
     fn tcp_request_rejects_oversize_padding_len() {
         let addr = b"example.com:443";
@@ -576,17 +684,19 @@ mod tests {
     }
 
     #[test]
-    fn tcp_response_accepts_msg_over_legacy_2k_limit() {
-        // 旧上限 2048、现上限 64 KiB：2049 字节消息应被接受（放宽不收紧消息面）
+    fn tcp_response_rejects_msg_over_go_limit_2048() {
+        // Go `MaxMessageLength = 2048`：2049 字节消息必须被拒。
+        //
+        // 【旧断言更新说明】本测试旧版断言"2049B msg 应被接受"（锁定 64 KiB
+        // 放宽口径），与 Go 26.10.17 `MaxMessageLength = 2048` 不符，按新口径
+        // 改为拒——**收紧**，不是放宽。
         let msg = "x".repeat(2049);
         let mut buf = vec![0u8]; // status
         buf.extend(varint_bytes(msg.len() as u64));
         buf.extend_from_slice(msg.as_bytes());
         buf.extend(varint_bytes(0));
-        let (ok, decoded) =
-            read_tcp_response(&mut io::Cursor::new(&buf)).expect("2049B msg should be accepted");
-        assert!(ok);
-        assert_eq!(decoded, msg);
+        let err = read_tcp_response(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(err.to_string().contains("invalid message length"), "got {err}");
     }
 
     #[test]

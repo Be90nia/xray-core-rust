@@ -174,6 +174,40 @@ async fn inbound_faces_parse_per_mode() {
     framework.shutdown().await;
 }
 
+/// Go 26.10.17 `proxy/shadowsocks_2022/cipher.go:24-28` `GetCipherMethod`
+/// 先 `strings.ToLower` → **大写 2022 method 必须命中 ss2022 面**
+/// （路由门 + 运行期 `CipherKind2022::from_name` 两道闸都大小写不敏感）。
+#[tokio::test]
+async fn inbound_face_accepts_uppercase_2022_method() {
+    let plugin = Arc::new(SsPlugin::default());
+    let framework = build_framework(
+        &plugin,
+        ss_section_config(json!({
+            "method": "2022-BLAKE3-AES-128-GCM", "password": "9uQBlkLt6MtyKzbEw3LhWQ=="
+        })),
+    );
+    assert!(
+        matches!(plugin.face().expect("built"), SsFace::Ss2022(_)),
+        "大写 2022 method 应命中 ss2022 面（Go GetCipherMethod 大小写不敏感）"
+    );
+    framework.shutdown().await;
+}
+
+/// 大小写放宽不得变成「什么都能进」：未知 2022 变体 method 仍硬错。
+///
+/// 该 method 过路由门（`2022-blake3-` 前缀）后，在 ss2022 的 cipher 名解析闸
+/// 被拒（`invalid cipher name`）——拒绝点与错误文案不重要，**被拒**才重要。
+#[test]
+fn inbound_face_rejects_unknown_2022_like_method() {
+    let err = build_err(ss_section_config(json!({
+        "method": "2022-BLAKE3-AES-192-GCM", "password": "9uQBlkLt6MtyKzbEw3LhWQ=="
+    })));
+    assert!(
+        err.to_string().contains("2022-BLAKE3-AES-192-GCM"),
+        "未知 2022 变体 method 应被拒，实际: {err}"
+    );
+}
+
 /// 出站面：`servers` 数组（parse_ss_config 形 1）→ Outbound，产物逐字段核对
 /// + dial_fn 产出（既有构造，wire 不变）。
 #[tokio::test]

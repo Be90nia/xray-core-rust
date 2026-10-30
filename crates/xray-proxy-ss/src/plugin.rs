@@ -202,7 +202,8 @@ fn parse_section(section: &serde_json::Value) -> Result<SsFace, PluginError> {
 /// shadowsocks.go:46-47），扁平 `password` → 单用户 [`SsInbound::new`]。
 fn parse_inbound(settings: &serde_json::Value) -> Result<SsFace, PluginError> {
     let method = settings.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
-    if method.starts_with("2022-blake3-") {
+    // SS-2022 判定大小写不敏感（Go 26.10.17 `GetCipherMethod` 先 ToLower）。
+    if method.get(..12).is_some_and(|p| p.eq_ignore_ascii_case("2022-blake3-")) {
         return parse_ss2022_inbound(method, settings);
     }
     if let Some(clients) =

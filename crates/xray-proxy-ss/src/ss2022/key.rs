@@ -19,8 +19,11 @@ pub enum CipherKind2022 {
 
 impl CipherKind2022 {
     /// 从 cipher 名称解析（如 "2022-blake3-aes-256-gcm"）。
+    ///
+    /// **大小写不敏感**（Go 26.10.17 `proxy/shadowsocks_2022/cipher.go:24-28`
+    /// `GetCipherMethod` 先 `strings.ToLower(name)` 再查表）。
     pub fn from_name(name: &str) -> Result<Self> {
-        match name {
+        match name.to_ascii_lowercase().as_str() {
             "2022-blake3-aes-128-gcm" => Ok(Self::Aes128Gcm),
             "2022-blake3-aes-256-gcm" => Ok(Self::Aes256Gcm),
             "2022-blake3-chacha20-poly1305" => Ok(Self::ChaCha20Poly1305),
@@ -217,6 +220,36 @@ mod tests {
             CipherKind2022::ChaCha20Poly1305
         );
         assert!(CipherKind2022::from_name("aes-256-gcm").is_err());
+    }
+
+    /// Go 26.10.17 `proxy/shadowsocks_2022/cipher.go:24-28`
+    /// `GetCipherMethod(name)`：**先 `strings.ToLower(name)` 再查表**。
+    ///
+    /// 运行期第二道闸（`CipherKind2022::from_name`）必须同构——否则配置层
+    /// 放行大写 method，运行期却拒（配置与运行期口径分裂）。
+    #[test]
+    fn cipher_kind_from_name_is_case_insensitive_like_go() {
+        assert_eq!(
+            CipherKind2022::from_name("2022-BLAKE3-AES-128-GCM").unwrap(),
+            CipherKind2022::Aes128Gcm
+        );
+        assert_eq!(
+            CipherKind2022::from_name("2022-BLAKE3-AES-256-GCM").unwrap(),
+            CipherKind2022::Aes256Gcm
+        );
+        assert_eq!(
+            CipherKind2022::from_name("2022-Blake3-ChaCha20-Poly1305").unwrap(),
+            CipherKind2022::ChaCha20Poly1305
+        );
+    }
+
+    /// 大小写放宽**不得**变成「什么都能进」：未知 method 仍被拒。
+    #[test]
+    fn cipher_kind_from_name_still_rejects_unknown() {
+        assert!(CipherKind2022::from_name("rc4-md5").is_err());
+        assert!(CipherKind2022::from_name("2022-blake3-aes-192-gcm").is_err());
+        assert!(CipherKind2022::from_name("2022-blake3-aes-128-gcm-extra").is_err());
+        assert!(CipherKind2022::from_name("").is_err());
     }
 
     #[test]
