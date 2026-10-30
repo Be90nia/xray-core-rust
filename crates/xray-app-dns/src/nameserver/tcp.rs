@@ -17,7 +17,7 @@ use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
 use hickory_proto::rr::RecordType;
 use skeleton_infra::fx::FxScope;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use xray_common::net::{destination::Destination, port::Port};
 use xray_frame::deadline::{Budget, BudgetDeadline};
 
@@ -27,6 +27,7 @@ use crate::{
     dnscommon::{
         AtomicReqIdGen, IpRecord, ReqIdGen, build_dns_query, parse_dns_response,
         parsed_to_ip_record,
+        tcp_frame::{self, FrameCtx},
     },
     error::DnsError,
     nameserver::{
@@ -34,9 +35,6 @@ use crate::{
         cached::{CachedNameserver, QueryOutcome, query_ip},
     },
 };
-
-/// TCP DNS 单次响应最大字节数（DNS over TCP 理论上限 65535；实际 rarely > 4096）。
-const TCP_RECV_MAX: usize = 65535;
 
 /// TCP DNS nameserver。对应 Go `TCPNameServer`。
 pub struct TcpNameServer {
@@ -151,39 +149,13 @@ impl TcpNameServer {
         record_type: RecordType,
         deadline: BudgetDeadline,
     ) -> Result<IpRecord, DnsError> {
-        deadline
-            .timeout(stream.write_all(len_be))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp write len timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp write len: {e}")))?;
-        deadline
-            .timeout(stream.write_all(payload))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp write payload timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp write payload: {e}")))?;
+        tcp_frame::write(stream, len_be, payload, &deadline, FrameCtx::Tcp).await?;
         deadline
             .timeout(stream.flush())
             .await
             .map_err(|_| DnsError::WireFormat("tcp flush timeout".to_string()))?
             .map_err(io_to_dns)?;
-
-        let mut len_buf = [0u8; 2];
-        deadline
-            .timeout(stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp read len timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp read len: {e}")))?;
-        let resp_len = usize::from(u16::from_be_bytes(len_buf));
-        if resp_len == 0 || resp_len > TCP_RECV_MAX {
-            return Err(DnsError::WireFormat(format!("invalid tcp response length: {resp_len}")));
-        }
-
-        let mut buf = vec![0u8; resp_len];
-        deadline
-            .timeout(stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| DnsError::WireFormat("tcp read payload timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("tcp read payload: {e}")))?;
+        let buf = tcp_frame::read(stream, &deadline, FrameCtx::Tcp).await?;
 
         // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
         let now = self.cache.clock().now_instant();
@@ -201,9 +173,7 @@ impl TcpNameServer {
     ) -> Result<IpRecord, DnsError> {
         let req_id = self.id_gen.next_id();
         let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
-        let len_be = u16::try_from(payload.len())
-            .map_err(|_| DnsError::WireFormat("query too large for TCP".to_string()))?
-            .to_be_bytes();
+        let len_be = tcp_frame::len_prefix(&payload)?;
 
         if self.dest.address().is_domain() {
             // 域名 NS（bd mcpo）：每查询新建流——连接池会把旧解析钉死，

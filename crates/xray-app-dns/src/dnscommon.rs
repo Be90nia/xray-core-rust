@@ -460,6 +460,112 @@ impl ReqIdGen for AtomicReqIdGen {
     }
 }
 
+/// DNS over TCP 帧读写（RFC 1035 §4.2.2：2B 大端长度前缀 + 裸报文）。
+///
+/// TCP nameserver 与 UDP 的 TCP 兜底共用同一套帧机制；两处历史错误文案不同
+/// （`tcp ...` / `tcp fallback ...`），故只把文案差异登记在 [`FrameCtx`]，
+/// 机制与文案都不再各写一份。
+pub mod tcp_frame {
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use xray_frame::deadline::BudgetDeadline;
+
+    use crate::error::DnsError;
+
+    /// 单条应答长度上限（2B 长度前缀的最大值）。
+    pub const RECV_MAX: usize = 65535;
+
+    /// 调用点（决定错误文案；两处文案逐字保留）。
+    #[derive(Clone, Copy)]
+    pub enum FrameCtx {
+        /// TCP nameserver：`tcp write len timeout` / `tcp read payload timeout` / `invalid tcp
+        /// response length`。
+        Tcp,
+        /// UDP 的 TCP 兜底：`tcp fallback ...` / `tcp fallback invalid response length`。
+        UdpFallback,
+    }
+
+    impl FrameCtx {
+        fn prefix(self) -> &'static str {
+            match self {
+                Self::Tcp => "tcp",
+                Self::UdpFallback => "tcp fallback",
+            }
+        }
+
+        /// 读段名词：`tcp read payload` vs `tcp fallback read response`。
+        fn read_noun(self) -> &'static str {
+            match self {
+                Self::Tcp => "payload",
+                Self::UdpFallback => "response",
+            }
+        }
+
+        /// 长度非法句：两处词序不同（`invalid tcp ...` / `tcp fallback invalid ...`）。
+        fn invalid_len(self, resp_len: usize) -> String {
+            match self {
+                Self::Tcp => format!("invalid tcp response length: {resp_len}"),
+                Self::UdpFallback => format!("tcp fallback invalid response length: {resp_len}"),
+            }
+        }
+    }
+
+    /// 2B 大端长度前缀；报文超 u16 上限即失败（TCP DNS 帧装不下）。
+    pub fn len_prefix(payload: &[u8]) -> Result<[u8; 2], DnsError> {
+        u16::try_from(payload.len())
+            .map(u16::to_be_bytes)
+            .map_err(|_| DnsError::WireFormat("query too large for TCP".to_string()))
+    }
+
+    /// 写一个帧：长度前缀 + 裸报文（不 flush，调用点自行决定）。
+    pub async fn write<S: AsyncWrite + Unpin>(
+        stream: &mut S,
+        len_be: &[u8; 2],
+        payload: &[u8],
+        deadline: &BudgetDeadline,
+        ctx: FrameCtx,
+    ) -> Result<(), DnsError> {
+        let p = ctx.prefix();
+        deadline
+            .timeout(stream.write_all(len_be))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("{p} write len timeout")))?
+            .map_err(|e| DnsError::WireFormat(format!("{p} write len: {e}")))?;
+        deadline
+            .timeout(stream.write_all(payload))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("{p} write payload timeout")))?
+            .map_err(|e| DnsError::WireFormat(format!("{p} write payload: {e}")))?;
+        Ok(())
+    }
+
+    /// 读一个帧：长度前缀 + 裸报文（长度 0 或超 [`RECV_MAX`] 即失败）。
+    pub async fn read<S: AsyncRead + Unpin>(
+        stream: &mut S,
+        deadline: &BudgetDeadline,
+        ctx: FrameCtx,
+    ) -> Result<Vec<u8>, DnsError> {
+        let p = ctx.prefix();
+        let mut len_buf = [0u8; 2];
+        deadline
+            .timeout(stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("{p} read len timeout")))?
+            .map_err(|e| DnsError::WireFormat(format!("{p} read len: {e}")))?;
+        let resp_len = usize::from(u16::from_be_bytes(len_buf));
+        if resp_len == 0 || resp_len > RECV_MAX {
+            return Err(DnsError::WireFormat(ctx.invalid_len(resp_len)));
+        }
+        let noun = ctx.read_noun();
+        let mut buf = vec![0u8; resp_len];
+        deadline
+            .timeout(stream.read_exact(&mut buf))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("{p} read {noun} timeout")))?
+            .map_err(|e| DnsError::WireFormat(format!("{p} read {noun}: {e}")))?;
+        Ok(buf)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
