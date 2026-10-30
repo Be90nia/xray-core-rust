@@ -8,7 +8,7 @@
 
 ## 0. 项目一句话
 
-**Xray-core-rust** = Go Xray-core v26.9.9 Rust 复刻，私有仓 `github.com/Be90nia/xray-core-rust`，master `ceb6a487`（`feature/framework` 领先 695 commit，`7b336a12` 实测），CI 10 门，32/32 协议全通，crates/ 下 804 个 `.rs` ≈ 36.4 万行 Rust，55 个 crate 条目（54 自建 + `udf-frame` 外部仓工作副本）。
+**Xray-core-rust** = Go Xray-core **v26.10.17** Rust 复刻（起点 v26.9.9；**对拍裁定基准 = 26.10.17**，源码 `D:/Project/Xray-core` @ `92ccc939`，26.9.9 仅用于解释「上游改了什么」不得用于裁定；上游已达 26.10.21，**待 10.17 全量复刻完成后**再讨论提升，禁提前把 10.21 新增项当缺口），私有仓 `github.com/Be90nia/xray-core-rust`，master `ceb6a487`（`feature/framework` 领先 695 commit，`7b336a12` 实测），CI 10 门，32/32 协议全通，crates/ 下 804 个 `.rs` ≈ 36.4 万行 Rust，55 个 crate 条目（54 自建 + `udf-frame` 外部仓工作副本）。
 
 ---
 
@@ -105,6 +105,11 @@ cargo doc --workspace --no-deps
 - **血肉不复制骨架功能**（§3.5.2）；需求差异用**组合/特化**解决，不靠复制
 - **骨架不感知血肉**（不因某协议需求污染地基语义）
 - **改 udf 仓走提炼回路**：独立 PR + CI 三平台绿 + xray-frame 换依赖复测 32/32
+- **新功能一律长在框架上（用户口供 2026-10-30 · 硬约束）**：新增能力**不得在框架之外开发** —— 机制落 `udf-frame`（地基/骨架，零 xray 语义）或 `xray-frame`（派生层，可含 xray 语义），协议/应用 crate 只允许留**薄适配**（接线 + Xray 特有语义）。
+  - 判据：新功能是否需要被多个协议/场景复用？→ 是 → 机制进 xray-frame；是否零 xray 语义且进程级通用？→ 是 → 进 udf-frame（走提炼回路）。
+  - 禁：在 `xray-app-*` / `xray-proxy-*` / `xray-transport-*` 里自造机制再让别的协议来抄；禁把机制留在只有它自己在用的 crate 里。
+  - 落地顺序：先在 xray-frame 落机制件（能力句柄挂 `PluginContext`）→ 协议 crate 只调框架 API → 通用部分按 §3.5.4 提炼上浮 udf。
+  - 例外：纯协议 wire 语义（字节序/加解密/握手格式）与 Go 对拍差异修正，**留在协议 crate**（属内容不属机制），但必须走 §3.5.2 查重。
 
 ### 3.5.4 归一化面（主仓已自造、但属通用件 → **必须提炼回 udf**，主仓不得留副本）
 
