@@ -3,8 +3,8 @@
 //! ①三插件端到端：stop 执行序 = 逆启动序（`Framework::shutdown` 全链观察序断言）
 //! ②某插件 stop 闭包 panic → 该组件 `OutcomeKind::Failed`、其余 `Stopped`、
 //!   `is_clean()==false`，编排不中断（后续组件照常执行）
-//! ③`with_default_timeout(50ms)` 下慢闭包 → `OutcomeKind::TimedOut` 且编排
-//!   不挂死
+//! ③慢组件 stop 闭包**永不完成**（显式闸 = 真泄漏形态）→ `OutcomeKind::TimedOut`
+//!   且编排不挂死、后续组件照常执行（判定不依赖挂钟；挂死由墙钟截止暴露）
 //! ④重名防线双层：整链侧（P0-2 注册表拒 → `builder.register` Err）+
 //!   coordinator 侧重名形状（`RegisterError::Duplicate`，bring_up 映射的输入；
 //!   udf 既有测例 `skeleton-infra/tests/shutdown.rs::duplicate_name_is_rejected`）
@@ -12,7 +12,8 @@
 //!   （透传断裂 → 默认 5s 档吞掉 50ms 档，慢闭包记 Stopped，本测例必红）
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc::channel},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -52,12 +53,34 @@ impl Probe {
     }
 }
 
-/// 生命周期行为体：stop 可注入 panic / 慢闭包（P0-8 观测面注入点）。
+/// 停机闸：stop 闭包阻塞到 `release()`——构造「任务永不完成」的**真泄漏**形态，
+/// 让超时判定可观测而不依赖挂钟（线程 spawn/调度延迟不参与判别）。
+#[derive(Clone, Default)]
+struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+impl Gate {
+    fn wait(&self) {
+        let (flag, wake) = &*self.0;
+        let mut released = flag.lock().expect("gate poisoned");
+        while !*released {
+            released = wake.wait(released).expect("gate poisoned");
+        }
+    }
+
+    fn release(&self) {
+        let (flag, wake) = &*self.0;
+        *flag.lock().expect("gate poisoned") = true;
+        wake.notify_all();
+    }
+}
+
+/// 生命周期行为体：stop 可注入 panic / 慢闭包 / 阻塞闸（P0-8 观测面注入点）。
 struct LifecycleBody {
     name: &'static str,
     probe: Probe,
     panic_stop: bool,
     slow_stop: Option<Duration>,
+    hold_stop: Option<Gate>,
 }
 
 impl Lifecycle for LifecycleBody {
@@ -73,6 +96,9 @@ impl Lifecycle for LifecycleBody {
 
     fn stop(&self) -> Result<(), PluginError> {
         self.probe.record(format!("{}:stop", self.name));
+        if let Some(gate) = &self.hold_stop {
+            gate.wait();
+        }
         if let Some(d) = self.slow_stop {
             std::thread::sleep(d);
         }
@@ -121,7 +147,13 @@ fn fake(name: &'static str, deps: &'static [PluginDep], probe: &Probe) -> FakePl
         name,
         deps,
         contract: PluginContract { clauses: &[], extra: &[], not_applicable: &[] },
-        body: LifecycleBody { name, probe: probe.clone(), panic_stop: false, slow_stop: None },
+        body: LifecycleBody {
+            name,
+            probe: probe.clone(),
+            panic_stop: false,
+            slow_stop: None,
+            hold_stop: None,
+        },
     }
 }
 
@@ -132,6 +164,11 @@ fn with_panic_stop(mut plugin: FakePlugin) -> FakePlugin {
 
 fn with_slow_stop(mut plugin: FakePlugin, d: Duration) -> FakePlugin {
     plugin.body.slow_stop = Some(d);
+    plugin
+}
+
+fn with_held_stop(mut plugin: FakePlugin, gate: &Gate) -> FakePlugin {
+    plugin.body.hold_stop = Some(gate.clone());
     plugin
 }
 
@@ -237,29 +274,50 @@ fn stop_panic_marks_failed_others_stopped_and_report_not_clean() {
     );
 }
 
-/// 用例③：默认档 50ms 下慢闭包 → `TimedOut` 且编排不挂死、其余组件照常。
+/// 用例③：慢组件的 stop 闭包**永不完成**（[`Gate`] 卡住 = 真泄漏形态）→
+/// `TimedOut` 且编排不挂死、后续组件照常执行。
+///
+/// 判定与调度延迟解耦：真泄漏对任何有限超时档必判 `TimedOut`（与挂钟无关），
+/// 健康组件的 `Stopped` 只需档位容得下一次线程 spawn+首调度——取 2s（实测
+/// 32 路 CPU 争用下 no-op 闭包延迟最大 395ms，5× 余量；50ms 档同负载下 25%
+/// 概率假判 `TimedOut`，即本测例原 flake 根因）。编排完成走墙钟截止：
+/// 超时判定真失效（闭包挂死 → 永不返回）时以可见失败收场，而非挂死测试进程。
 #[test]
 fn slow_stop_times_out_without_hanging_orchestration() {
     let probe = Probe::new();
+    let gate = Gate::default();
     let registry = registry_of(vec![
-        with_slow_stop(fake("SLOW", NO_DEPS, &probe), Duration::from_millis(500)),
+        // 注册序 QUICK,SLOW → 停机序（逆启动序）SLOW,QUICK：慢组件先超时，其余照常。
         fake("QUICK", NO_DEPS, &probe),
+        with_held_stop(fake("SLOW", NO_DEPS, &probe), &gate),
     ]);
     let coordinator =
-        Arc::new(ShutdownCoordinator::new().with_default_timeout(Duration::from_millis(50)));
+        Arc::new(ShutdownCoordinator::new().with_default_timeout(Duration::from_secs(2)));
     let started = bring_up(&registry, ctx_factory(), coordinator).expect("bring_up ok");
 
-    let begin = Instant::now();
-    let report = started.tear_down();
+    // 编排交给 worker 线程：真挂死（超时判定不生效）→ 墙钟截止把 HANG 变成失败。
+    let (tx, rx) = channel();
+    let worker = thread::spawn(move || {
+        let _ = tx.send(started.tear_down());
+    });
+    let report = rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("编排挂死：超时判定未生效（真泄漏未被判定）");
+    gate.release(); // 放行泄漏闭包，回收 SLOW 的 watchdog 线程（不影响已出的报告）
+    worker.join().expect("worker 线程 panic");
 
-    assert!(begin.elapsed() < Duration::from_secs(2), "编排被慢闭包拖死");
     assert_eq!(outcome(&report, "SLOW").kind, OutcomeKind::TimedOut, "{report:?}");
     assert_eq!(
         outcome(&report, "QUICK").kind,
         OutcomeKind::Stopped,
-        "慢组件超时后其余组件照常执行"
+        "慢组件超时后其余组件照常执行：{report:?}"
     );
     assert!(!report.is_clean());
+    assert_eq!(
+        &probe.events()[4..],
+        ["SLOW:stop", "QUICK:stop"],
+        "编排不中断：SLOW 闭包已进入且仍阻塞 → 超时后才轮到 QUICK"
+    );
 }
 
 /// 用例④（防线第一层·整链侧）：重名插件 → `builder.register` Err（P0-2 注册表
