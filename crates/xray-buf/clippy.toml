@@ -17,4 +17,7 @@ disallowed-methods = [
     { path = "std::thread::spawn", reason = "裸线程逃逸托管与停机编排（坑约束 #5/#6）：确需 OS 线程的场景逐点 #[allow(clippy::disallowed_methods)] + 理由登记" },
     { path = "slice::to_vec", reason = "数据面禁 to_vec 扁平化堆分配：热路径用池化 Buffer/MultiBuffer 传递；确需扁平化时 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
     { path = "xray_buf::multi::MultiBuffer::to_vec", reason = "数据面禁 MultiBuffer 整链扁平化：确需快照时 #[allow] + 理由注释登记" },
+    { path = "std::time::Instant::now", reason = "数据面 crate 不持时钟面（零 skeleton 依赖纪律）：时限/时戳语义由上层注入；确需时逐点 #[allow(clippy::disallowed_methods)] + 理由登记" },
+    { path = "tokio::time::Instant::now", reason = "同上（数据面零时钟纪律）：确需时逐点 #[allow] + 理由登记" },
+    { path = "std::time::SystemTime::now", reason = "同上（数据面零时钟纪律）：现存唯一登记点 = alloc.rs now_ms 池惰性清扫锚" },
 ]

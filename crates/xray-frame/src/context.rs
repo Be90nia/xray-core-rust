@@ -32,7 +32,9 @@ pub fn derive_fingerprint(listen_addr: Option<&str>) -> u64 {
     match listen_addr {
         Some(addr) => stable64(addr.as_bytes()),
         None => {
-            let startup_nanos = std::time::SystemTime::now()
+            // 时钟走 udf Clock 合同面（SystemClock = 合同的系统钟实现；禁裸 SystemTime::now）
+            let startup_nanos = SystemClock
+                .now_system()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default();

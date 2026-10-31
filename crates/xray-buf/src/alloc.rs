@@ -39,6 +39,12 @@ const SWEEP_INTERVAL_MS: u64 = 60_000;
 /// 上次惰性收缩时间（unix ms）。`fetch_max` 天然去重并发清扫。
 static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
 
+// 数据面零时钟纪律的唯一登记点：池惰性清扫时戳锚（SWEEP_INTERVAL_MS 周期去重），
+// 非时限语义；本 crate 零 skeleton 依赖（接 udf Clock = 新增依赖，红线），故留裸取时。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "池惰性清扫时戳锚（非时限语义）：xray-buf 零 skeleton 依赖纪律，接 udf Clock 需新增依赖（红线）；唯一登记点，无第二处"
+)]
 #[inline]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()

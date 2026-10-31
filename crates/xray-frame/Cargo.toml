@@ -47,7 +47,9 @@ tokio = { workspace = true, features = ["test-util"] }
 #（FxScope/Clock/MockEnv）+ 配置字面量。
 xray-buf = { path = "../xray-buf" }
 udf-skeleton = { path = "../udf-frame/skeleton" }
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+# testing：`TestStore`/`ScriptedRuntime` 状态环 reducer 契约替身（D5 testing 族
+# 消费点，2026-10-31）。resolver 2：dev feature 只进测试构建，生产构建不携带。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "testing"] }
 serde_json = { workspace = true }
 
 [lints.clippy]

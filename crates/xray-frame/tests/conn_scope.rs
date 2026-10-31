@@ -3,6 +3,10 @@
 //! mzput 验收：级联信号事件驱动（watch 广播，无 20ms 轮询）——父先关的
 //! 注册窗口、挂起期间关闭窗口、无定时器依赖（start_paused 虚拟钟证伪轮询）。
 
+// 时钟禁令只约束生产路径；集成测试为独立编译单元，lib.rs 的 cfg_attr(test) 豁免不覆盖，
+// 文件顶显式豁免（惯例同 xray-app-router/tests/router_parallel_build.rs）。
+#![allow(clippy::disallowed_methods)]
+
 use std::time::Duration;
 
 use xray_frame::scope::{ArmScope, ConnScope};

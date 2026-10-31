@@ -11,6 +11,10 @@
 //! ⑤`FrameworkOptions.shutdown_timeout` 真透传 `with_default_timeout`
 //!   （透传断裂 → 默认 5s 档吞掉 50ms 档，慢闭包记 Stopped，本测例必红）
 
+// 时钟禁令只约束生产路径；集成测试为独立编译单元，lib.rs 的 cfg_attr(test) 豁免不覆盖，
+// 文件顶显式豁免（惯例同 xray-app-router/tests/router_parallel_build.rs）。
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     sync::{Arc, Condvar, Mutex, mpsc::channel},
     thread,

@@ -174,7 +174,7 @@ async fn serve_loop(
 // 数据面热路径不迁（同 tuic udp_assoc_direct 台账形态）。
 #[allow(
     clippy::disallowed_methods,
-    reason = "tokio 虚拟钟预算面（数据面热路径）：握手 deadline 与 timeout 同钟族，713x6 判定 tokio 一律不迁"
+    reason = "tokio 虚拟钟预算面（数据面热路径）：握手 deadline 与 timeout 同钟族，713x6 判定 tokio 一律不迁（Budget timer-arm 迁移跟踪 bd 23vrp）"
 )]
 async fn handle_conn(
     tcp: TcpStream,

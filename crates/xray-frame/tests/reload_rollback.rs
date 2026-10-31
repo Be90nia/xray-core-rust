@@ -5,6 +5,10 @@
 //! 日志 capture 用 `set_default` + `with_writer` 闭环 writer（LogFacade emit
 //! 是运行期分发，无 callsite interest 缓存；同 tests/log_discipline.rs 手法）。
 
+// 时钟禁令只约束生产路径；集成测试为独立编译单元，lib.rs 的 cfg_attr(test) 豁免不覆盖，
+// 文件顶显式豁免（惯例同 xray-app-router/tests/router_parallel_build.rs）。
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     collections::VecDeque,
     fs,

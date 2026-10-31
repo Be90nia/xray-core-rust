@@ -42,11 +42,12 @@
 //! [`ClauseId`](crate::plugin::ClauseId) 枚举位，无任何执行断言面——补夹具
 //! 前，条款声明不得当作「已受约束」）。
 //!
-//! 接线现状（bd 2zi1o，2026-10-26 复核）：16 个协议 crate 的
-//! `tests/plugin_contract.rs` 中仅 vless/ss/trojan 3 crate 各有 1 条真实插件
-//! 实例夹具（含条款 6 的执行面断言），其余 13 crate 仍是框架原语夹具（bd
-//! wkemq「装配链契约测试对 stop 未注册零鉴别力」：空 `ShutdownReport` 的
-//! `is_clean()` 恒 true）。
+//! 接线现状（16/16，D4 复核 2026-10-31）：16 个协议 crate 的
+//! `tests/plugin_contract.rs` 全部接真实插件实例夹具（Default 构造 →
+//! Framework register → bring_up → shutdown → 报告内容断言
+//! `stopped==["<crate>"]` 钉死空报告边界——bd wkemq「装配链契约测试对
+//! stop 未注册零鉴别力」已偿；16 夹具实跑全绿，见
+//! reports/audit-2026-10-31/dod-D3-D4-D5.md）。
 //!
 //! | 条款 | 声明态 | 断言面与缺口 |
 //! |---|---|---|
@@ -55,7 +56,7 @@
 //! | 3 ConnIdPresent | 已实现 | [`assert_conn_id_present`](crate::assert_conn_id_present)（非零 / 严格递增） |
 //! | 4 PoolDiscipline | 部分 | [`assert_pool_discipline`](crate::assert_pool_discipline) 管借还配平；N/A 豁免口已启用（先例 blackhole 零缓冲桩）——覆盖依赖 crate 诚实声明 |
 //! | 5 SpawnManaged | 仅声明 | 无协议 crate 通用夹具（框架自测 `tests/fx_managed_spawn.rs` 管托管机制本身，不验插件接线） |
-//! | 6 StopRegistered | 部分 | 通用夹具无运行期断言面；vless/ss/trojan 真实实例夹具有执行面断言（bd 2zi1o），其余 13 crate 无（bd wkemq：is_clean() 对空 ShutdownReport 恒 true） |
+//! | 6 StopRegistered | 已实现 | 真实实例夹具 16/16：报告内容断言 `stopped==["<crate>"]` 钉死空报告边界（bd wkemq 已偿；D4 复核 2026-10-31） |
 //! | 7 ConfigSectionOnly | 部分 | 无通用夹具；blackhole/vmess 以 crate 自写装配门负向测试补位，覆盖不统一 |
 //! | 8 ErrorClassifiedNoPanicEscape | 仅声明 | 无通用夹具——错误归类与 panic 隔离语义无执行断言面 |
 //! | 9 BoundedResources | 部分 | 仅经 [`assert_pool_discipline`](crate::assert_pool_discipline) 覆盖借还记账面；「资源上有界」本身（容量/内存上限）无通用断言 |
@@ -70,7 +71,7 @@
 use std::{
     future::Future,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use skeleton::{
@@ -288,7 +289,7 @@ where
     );
 
     // 负向①：pending 任务必被掐成 Err(Elapsed)，且真实等待 ≥ d（真超时必红）。
-    let t0 = Instant::now();
+    let t0 = SystemClock.now_instant();
     let timed_out: Result<T, _> =
         with_deadline(Arc::clone(&clock), std::future::pending(), d).await;
     assert!(
@@ -299,7 +300,7 @@ where
     assert!(waited >= d, "[deadline:{name}] 超时在 d={d:?} 前返回（实际 {waited:?}）——假超时");
 
     // 负向②：guard 入口同构。
-    let t0 = Instant::now();
+    let t0 = SystemClock.now_instant();
     let timed_out: Result<T, _> = guard.guard(clock, std::future::pending()).await;
     assert!(timed_out.is_err(), "[deadline:{name}] guard 入口未掐断 pending 任务（超时形同虚设）");
     let waited = t0.elapsed();

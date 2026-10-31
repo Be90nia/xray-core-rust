@@ -758,6 +758,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use skeleton::{clock::SystemClock, config::MockEnv};
+    // udf testing 族替身（D5 消费点，2026-10-31）：reducer 契约逐条断言面。
+    use skeleton_infra::testing::{ExpectedEffect, Script, ScriptedRuntime, TestStore};
 
     use super::*;
     use crate::{
@@ -1199,5 +1201,181 @@ mod tests {
             report.per_component.iter().any(|c| c.name == "journal_snapshot"),
             "快照失败行必须在报告里：{report:?}"
         );
+    }
+
+    // =========================================================================
+    // udf testing 族替身消费点（D5，2026-10-31）：状态环 reducer 契约的逐动作/
+    // 逐效果断言面，脱离 LoopFx 解释器独立成立。TestStore=效果回收断言
+    // （CollectRuntime 只回收不解释）；ScriptedRuntime=脚本化回灌，确定性复现
+    // 驱动协议「效果出 → 解释器回灌 → 相位迁移」。替身来自 udf 基件（§3.5.2
+    // 白拿），语义不复制。
+    // =========================================================================
+
+    /// 用例⑮：TestStore 钉启动效果契约——依赖序 `BringUp × N` + `FinishStart`
+    /// 收尾、效果 id 从 0 单调；效果未解释前相位停在 Starting。
+    #[test]
+    fn test_store_pins_start_effect_contract() {
+        let probe = Probe::default();
+        let registry = registry_of(vec![fake("A", NO_DEPS, &probe), fake("B", DEP_A, &probe)]);
+        let plan = Arc::new(Plan::from_registry(&registry).expect("plan"));
+        let mut store = TestStore::new(AssemblyRoot::new(plan));
+
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register { name: "A".into() }));
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register { name: "B".into() }));
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Registered);
+
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        // 逐条效果断言：依赖序 + id 单调（ExpectedEffect 全比对）。
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(0)),
+            op: AssemblyOp::BringUp { name: "A".into() },
+        });
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(1)),
+            op: AssemblyOp::BringUp { name: "B".into() },
+        });
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(2)),
+            op: AssemblyOp::FinishStart,
+        });
+        // CollectRuntime 只回收不解释 → 相位停在 Starting（执行是解释器职责）。
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Starting);
+    }
+
+    /// 用例⑯：TestStore 钉结果回灌 + 停机效果 + 审计轨迹派生——驱动层回灌
+    /// （`AssemblyLoop::start` 所派的同款结果动作）后相位 Running；`Stop` 恰发
+    /// 一条 `BeginStop`（id 跨动作连续）；审计分片对同动作流逐条记账。
+    #[test]
+    fn test_store_pins_outcome_stop_and_audit_trail() {
+        let probe = Probe::default();
+        let registry = registry_of(vec![fake("A", NO_DEPS, &probe), fake("B", DEP_A, &probe)]);
+        let plan = Arc::new(Plan::from_registry(&registry).expect("plan"));
+        let mut store = TestStore::new(AssemblyRoot::new(plan));
+
+        for name in ["A", "B"] {
+            store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register {
+                name: name.into(),
+            }));
+        }
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        for (id, op) in [
+            (0, AssemblyOp::BringUp { name: "A".into() }),
+            (1, AssemblyOp::BringUp { name: "B".into() }),
+            (2, AssemblyOp::FinishStart),
+        ] {
+            store.receive(ExpectedEffect::Run { id: Some(EffectId::new(id)), op });
+        }
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::StartOutcome {
+            init_ok: vec!["A".into(), "B".into()],
+            started: vec!["A".into(), "B".into()],
+            failed: None,
+        }));
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Running);
+        assert_eq!(store.state().lifecycle.started, ["A", "B"]);
+        assert_eq!(
+            store.state().lifecycle.plugins,
+            [
+                PluginEntry { name: "A".into(), phase: Phase::Started },
+                PluginEntry { name: "B".into(), phase: Phase::Started },
+            ]
+        );
+
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Stop));
+        store
+            .receive(ExpectedEffect::Run { id: Some(EffectId::new(3)), op: AssemblyOp::BeginStop });
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Stopping);
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::StopOutcome {
+            stopped: vec!["B".into(), "A".into()],
+        }));
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Stopped);
+
+        // 审计分片轨迹（kind+plugin 序完全确定；seq 单调由分片内 base+len 保证）。
+        let trail: Vec<_> =
+            store.state().audit.entries.iter().map(|e| (e.kind, e.plugin.clone())).collect();
+        assert_eq!(
+            trail,
+            [
+                (AuditKind::Register, Some("A".to_string())),
+                (AuditKind::Register, Some("B".to_string())),
+                (AuditKind::Start, None),
+                (AuditKind::PluginStarted, Some("A".to_string())),
+                (AuditKind::PluginStarted, Some("B".to_string())),
+                (AuditKind::Stop, None),
+                (AuditKind::PluginStopped, Some("B".to_string())),
+                (AuditKind::PluginStopped, Some("A".to_string())),
+            ]
+        );
+    }
+
+    /// 用例⑰：TestStore 钉相位门负例——非法转移记痕 + 计数、相位不变、零效果
+    /// （拒绝路径不泄效果：后续合法 Start 的效果序若混入泄效果即在此破）。
+    #[test]
+    fn test_store_pins_phase_gate_rejections() {
+        let probe = Probe::default();
+        let registry = registry_of(vec![fake("A", NO_DEPS, &probe)]);
+        let plan = Arc::new(Plan::from_registry(&registry).expect("plan"));
+        let mut store = TestStore::new(AssemblyRoot::new(plan));
+
+        // Empty 相位：Start / Stop 均拒（计数单调、相位不变）。
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Empty);
+        assert_eq!(store.state().lifecycle.rejections, 1);
+        assert!(store.state().lifecycle.rejected.as_deref().expect("reason").contains("start"));
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Stop));
+        assert_eq!(store.state().lifecycle.rejections, 2);
+
+        // Registered 相位：StartOutcome 拒（仅 Starting 受理）。
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register { name: "A".into() }));
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::StartOutcome {
+            init_ok: vec!["A".into()],
+            started: vec!["A".into()],
+            failed: None,
+        }));
+        assert_eq!(store.state().lifecycle.phase, AssemblyPhase::Registered);
+        assert_eq!(store.state().lifecycle.rejections, 3);
+        assert!(store.state().lifecycle.rejected.as_deref().expect("reason").contains("outcome"));
+
+        // 拒绝路径零效果：合法 Start 只出 BringUp + FinishStart 两条（id 从 0 起）。
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(0)),
+            op: AssemblyOp::BringUp { name: "A".into() },
+        });
+        store.receive(ExpectedEffect::Run {
+            id: Some(EffectId::new(1)),
+            op: AssemblyOp::FinishStart,
+        });
+    }
+
+    /// 用例⑱：ScriptedRuntime 脚本化回灌——效果出（Start 契约）→ 脚本回灌驱动层
+    /// 同款结果动作 → 相位 Running + 账本/审计推进。驱动协议的确定性复现，
+    /// 零真实插件（真解释路径由 LoopFx 全环用例覆盖）。
+    #[tokio::test]
+    async fn scripted_runtime_pins_outcome_feedback_round_trip() {
+        let probe = Probe::default();
+        let registry = registry_of(vec![fake("A", NO_DEPS, &probe), fake("B", DEP_A, &probe)]);
+        let plan = Arc::new(Plan::from_registry(&registry).expect("plan"));
+        let scope = Arc::new(skeleton_infra::fx::FxScope::new());
+        let mut scripted = ScriptedRuntime::<AssemblyAction, AssemblyOp>::new(Arc::clone(&scope));
+        scripted.feed([Script::Emit(AssemblyAction::Lifecycle(LifecycleAction::StartOutcome {
+            init_ok: vec!["A".into(), "B".into()],
+            started: vec!["A".into(), "B".into()],
+            failed: None,
+        }))]);
+        let store = SyncStore::new(AssemblyRoot::new(plan), scripted);
+
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register { name: "A".into() }));
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register { name: "B".into() }));
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        // 脚本任务在 FxScope 内回灌；在飞清零即回灌链折叠完毕。
+        while scope.in_flight() > 0 {
+            tokio::task::yield_now().await;
+        }
+        let state = store.snapshot();
+        assert_eq!(state.lifecycle.phase, AssemblyPhase::Running, "脚本回灌推进相位");
+        assert_eq!(state.lifecycle.started, ["A", "B"]);
+        assert!(state.audit.entries.iter().any(|e| e.kind == AuditKind::PluginStarted));
+        // 收尾净空（fx::expect_idle 同款锚）。
+        let _ = scope.shutdown().await;
     }
 }

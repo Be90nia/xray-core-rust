@@ -8,6 +8,10 @@
 //! - `scoped_install_shadows_and_is_dropped`：作用域安装优先；守卫 drop 后
 //!   作用域那份**不再可见**（与永久槽/兜底是谁无关 → 与并发时序无关）。
 
+// 时钟禁令只约束生产路径；集成测试为独立编译单元，lib.rs 的 cfg_attr(test) 豁免不覆盖，
+// 文件顶显式豁免（惯例同 xray-app-router/tests/router_parallel_build.rs）。
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},

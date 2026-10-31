@@ -17,8 +17,10 @@ use std::{
     future::Future,
     io::Write as _,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
+
+use skeleton::clock::{Clock as _, SystemClock};
 
 use crate::logging::LogFacade;
 
@@ -187,7 +189,9 @@ pub fn temp_file(target: &Path, suffix: &str) -> Result<(fs::File, PathBuf), Rel
         .into_owned();
     let pid = std::process::id();
     for counter in 1..=16u64 {
-        let nanos = SystemTime::now()
+        // 时钟走 udf Clock 合同面（暂存件命名唯一性锚；禁裸 SystemTime::now）
+        let nanos = SystemClock
+            .now_system()
             .duration_since(UNIX_EPOCH)
             .map(|d| u64::from(d.subsec_nanos()))
             .unwrap_or(0);

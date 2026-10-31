@@ -6,6 +6,10 @@
 //! Cargo 的每个 integration test 文件 = 独立二进制 = 独立进程 → 本文件天然
 //! 满足隔离（方案 §2 面 2 "测试隔离"表的"显式注入/隔离"要求）。
 
+// 时钟禁令只约束生产路径；集成测试为独立编译单元，lib.rs 的 cfg_attr(test) 豁免不覆盖，
+// 文件顶显式豁免（惯例同 xray-app-router/tests/router_parallel_build.rs）。
+#![allow(clippy::disallowed_methods)]
+
 use std::{
     sync::Arc,
     time::{Duration, SystemTime},

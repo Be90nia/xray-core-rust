@@ -184,6 +184,13 @@ pub struct Budget {
     start: BudgetInstant,
 }
 
+// 本 impl 即仓内唯一 tokio 虚拟钟取时桥：tokio advance/timeout_at 只收 tokio::time::Instant，
+// 接 udf Clock 会作废虚拟推进测试语义（713x6 裁决 tokio 面不迁）；墙钟语义走 wall(Clock) 出口；
+// std Instant 臂为跨源构造漂移的防御兜底（源与起点同源构造，实际不可达）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟取时桥本体（唯一登记面）：advance/timeout_at 只收 tokio Instant，接 udf Clock 即作废虚拟推进语义（713x6）；墙钟语义走 Budget::wall(Clock) 出口（本文件已就位）"
+)]
 impl Budget {
     /// 默认源 = tokio（虚拟可推进；`tokio::time::advance` 语义完整保留）。
     pub fn tokio() -> Self {
@@ -253,6 +260,11 @@ pub struct BudgetDeadline {
     at: BudgetInstant,
 }
 
+// 同 Budget：tokio 源臂与跨源兜底臂都属取时桥本体（登记见上方 Budget 侧注）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟取时桥本体（唯一登记面）：timeout_at/is_expired/remaining 的 tokio 源臂只收 tokio Instant，std 臂为跨源防御兜底（713x6 tokio 面不迁）"
+)]
 impl BudgetDeadline {
     /// 预算超时包装：Tokio 源 → `tokio::time::timeout_at`（**保 advance 语义**）；
     /// Wall 源 → tokio 计时器 + 墙钟判负（`MockClock` 推进可强制判负）。

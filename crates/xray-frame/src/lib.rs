@@ -17,6 +17,11 @@
 //! 四元组 + Stage 枚举 + 统一落点 emit 挂 P0-7 LogFacade）；P1-6 reload
 //! （配置热更回滚语义件 Stage/ReloadTx/swap_all/ConfigReloadListener）。
 
+// 生产时钟站点逐点 allow + 理由登记（台账见 reports/audit-2026-10-31/dod-fix-D3-D8-docs.md）；
+// 单元测试编译单元统一豁免（惯例同 xray-buf/xray-proxy-* lib.rs）；集成测试（tests/）
+// 为独立编译单元、cfg_attr(test) 不覆盖，各文件顶显式豁免。
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 /// 契约层词汇直呼（继承面 A 类：`use skeleton::`——包名 udf-skeleton 的 lib 名）。
 pub use skeleton::EffectId;
 

@@ -560,7 +560,7 @@ async fn udp_assoc_task(
 /// → fn 内 2 处 idle reset 留原形态，待 Budget 补 timer-arm 面再收。
 #[allow(
     clippy::disallowed_methods,
-    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（待 Budget 补 timer-arm 面）"
+    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（迁移跟踪 bd 23vrp：Budget 补 timer-arm 面后迁）"
 )]
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
     let log = &*SERVER_LOG;
@@ -628,7 +628,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
 /// allow 统一登记）——Budget 不外露绝对时刻，`Sleep::reset` 只能收 tokio Instant。
 #[allow(
     clippy::disallowed_methods,
-    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（待 Budget 补 timer-arm 面）"
+    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（迁移跟踪 bd 23vrp：Budget 补 timer-arm 面后迁）"
 )]
 async fn udp_assoc_dispatch(
     assoc_id: u16,
