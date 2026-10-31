@@ -8,7 +8,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -401,6 +401,8 @@ pub struct FileHandler {
     format: LogFormat,
     /// 写失败（open/writeln）累计丢弃行数（P1-10-b 可观测口径）。
     dropped: AtomicU64,
+    /// 首条写失败告警已发（bd sex3y：fail-visible 一次，不按行刷屏）。
+    warned: AtomicBool,
     /// 713x6：时间戳前缀时间源；生产 `SystemClock`，测试可注入 `MockClock`。
     clock: Arc<dyn Clock>,
     // inner 及其字段仅在 unix 分支的 write_line() 中读写；Windows 分支走
@@ -421,9 +423,23 @@ impl FileHandler {
             path,
             format: LogFormat::Console,
             dropped: AtomicU64::new(0),
+            warned: AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
+    }
+
+    /// 写失败可见化（bd sex3y）：旧形态只 `dropped += 1`，进程静默丢行、零日志。
+    /// 首条告警带路径落 `xray_app_log` target（后续失败只计数，不刷屏）。
+    fn warn_write_failed(&self, err: &std::io::Error) {
+        if self.warned.swap(true, Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            target: "xray_app_log",
+            path = %self.path,
+            "log file write failed (further failures only counted in dropped_lines): {err}"
+        );
     }
 
     /// 组装带前缀的输出行：Console 加 Go 风格时间戳，Json 原样。
@@ -450,6 +466,7 @@ impl FileHandler {
             path,
             format,
             dropped: AtomicU64::new(0),
+            warned: AtomicBool::new(false),
             clock: Arc::new(SystemClock),
             inner: Mutex::new(FileHandleState { file: None, open_inode: 0 }),
         }
@@ -502,15 +519,17 @@ impl LogHandler for FileHandler {
                     state.file = Some(file);
                     state.open_inode = current_inode;
                 },
-                Err(_) => {
+                Err(e) => {
+                    self.warn_write_failed(&e);
                     self.dropped.fetch_add(1, Relaxed);
                     return;
                 },
             }
         }
         if let Some(f) = state.file.as_mut()
-            && writeln!(f, "{full}").is_err()
+            && let Err(e) = writeln!(f, "{full}")
         {
+            self.warn_write_failed(&e);
             self.dropped.fetch_add(1, Relaxed);
         }
     }
@@ -525,11 +544,13 @@ impl LogHandler for FileHandler {
         let full = self.timestamped_line(line);
         match OpenOptions::new().create(true).append(true).open(&self.path) {
             Ok(mut f) => {
-                if writeln!(f, "{full}").is_err() {
+                if let Err(e) = writeln!(f, "{full}") {
+                    self.warn_write_failed(&e);
                     self.dropped.fetch_add(1, Relaxed);
                 }
             },
-            Err(_) => {
+            Err(e) => {
+                self.warn_write_failed(&e);
                 self.dropped.fetch_add(1, Relaxed);
             },
         }
@@ -553,6 +574,16 @@ impl HandlerCreator for FileHandlerCreator {
             return Err(LogError::HandlerCreate(
                 "file log handler requires a non-empty path".into(),
             ));
+        }
+        // bd sex3y：Go 在 creator 阶段就打开文件（common/log/logger.go
+        // CreateFileLogWriter）→ 路径不可写在**启动期**失败；旧形态只在写入时
+        // per-write open 失败、只 `dropped += 1`，进程照常启动且零告警。
+        // 此处同参数探测一次（create+append，句柄即弃），把该失败提到启动期。
+        if let Err(e) = OpenOptions::new().create(true).append(true).open(&options.path) {
+            return Err(LogError::HandlerCreate(format!(
+                "cannot open log file {:?}: {e}",
+                options.path
+            )));
         }
         Ok(Some(Arc::new(FileHandler::with_format(options.path.clone(), options.format))))
     }
@@ -682,6 +713,44 @@ fn global_general_sink() -> &'static Arc<GlobalGeneralSink> {
     &GLOBAL_GENERAL_SINK
 }
 
+/// 进程级 DNS 日志生产者的出口（bd sex3y）：`LogFeature::start` 装、`close` 卸。
+/// 「只有通用出口、没有生产者」是审计实证的缺口（E1 全程零 DNS 行）——DNS 查询
+/// 侧不需要拿 `LogInstance`（它拿不到），只需一行 [`record_dns`]。
+static ACTIVE_DNS_INSTANCE: LazyLock<RwLock<Option<Arc<LogInstance>>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// 未装出口时的首条告警标记（进程级只告警一次）。
+static DNS_PRODUCER_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// 装配 DNS 生产者出口（`LogFeature::start` 调，进程内一次激活期一份）。
+pub(crate) fn install_dns_producer(instance: Arc<LogInstance>) {
+    *ACTIVE_DNS_INSTANCE.write() = Some(instance);
+}
+
+/// 卸载出口（`LogFeature::close` 调）：此后 [`record_dns`] 不再写已关实例。
+pub(crate) fn uninstall_dns_producer() {
+    *ACTIVE_DNS_INSTANCE.write() = None;
+}
+
+/// DNS 查询日志生产者，等价 Go `log.Record(&DNSLog{...})`（common/log/dns.go）。
+///
+/// DNS 查询完成处调用一行即可：入口按天关走 [`LogInstance::handle`]（掩码 →
+/// `enable_dns_log` 门 → Dns 通道 → 与 access 同汇落 `access_log_path`）。
+/// 未装出口（log 未装配 / 已关）时首条告警一行后静默——「写了没人看见」留痕。
+pub fn record_dns(dns: DnsLog) {
+    let instance = ACTIVE_DNS_INSTANCE.read().clone();
+    let Some(instance) = instance else {
+        if !DNS_PRODUCER_WARNED.swap(true, Relaxed) {
+            tracing::warn!(
+                target: "xray_app_log",
+                "dns log entry dropped: no log instance installed (log app not started)"
+            );
+        }
+        return;
+    };
+    instance.handle(&LogEntry::Dns(dns));
+}
+
 /// `error_log_level` → registry 等级门。`log::Level` 与 `SeverityLevel` 的详细度
 /// 同向（Error < Warn < Info < Debug），直接逐档对齐；`Unknown`（proto 零值 /
 /// 未配置）按 Go 缺省 Warning 门处理——warning 及以上可见（bd 8zs12），与
@@ -786,6 +855,13 @@ impl LogInstance {
             },
             Ok(None) => {},
             Err(e) => {
+                // bd sex3y：**文件**日志打不开 = 配置/环境错，Go 在启动期即失败
+                // （common/log/logger.go CreateFileLogWriter 回错）→ 硬错上抛，
+                // 禁「照常启动 + 静默丢行」。非 File 类（creator 未注册等装配面
+                // 问题）沿用既有 warn 容忍，改前行为不变。
+                if self.config.access_log_type == LogType::File {
+                    return Err(e);
+                }
                 at_warning(&LogError::HandlerCreate(format!("access logger init failed: {e}")));
             },
         }
@@ -810,6 +886,10 @@ impl LogInstance {
             },
             Ok(None) => {},
             Err(e) => {
+                // bd sex3y：error 日志路径不可写同属启动期配置错（Go 同义硬错）。
+                if self.config.error_log_type == LogType::File {
+                    return Err(e);
+                }
                 at_warning(&LogError::HandlerCreate(format!("error logger init failed: {e}")));
             },
         }
@@ -1615,13 +1695,14 @@ mod tests {
         );
     }
 
-    /// P1-10-b 契约验收③：通道写失败 → 丢弃计数可观测且不 panic（File
-    /// handler 打不开路径 → dropped_total 递增）。
+    /// bd sex3y 验收：写失败**可见**——路径不可写在装配期直接 Err（Go
+    /// `CreateFileLogWriter` 同义），不再「照常启动 + 只 dropped+=1」。
     #[test]
-    fn instance_dropped_total_on_file_write_failure() {
+    fn instance_unwritable_file_log_fails_at_start() {
         let bad = std::env::temp_dir()
             .join(format!("p110-no-such-dir-{}", std::process::id()))
             .join("a.log");
+        let _ = std::fs::remove_dir_all(bad.parent().expect("有父目录"));
         let cfg = LogConfig {
             access_log_type: LogType::File,
             access_log_path: bad.to_string_lossy().into_owned(),
@@ -1630,14 +1711,8 @@ mod tests {
         let inst = LogInstance::new(cfg).unwrap();
         let r = HandlerCreatorRegistry::new();
         register_default_creators(&r).unwrap();
-        inst.start(&r).unwrap();
-        assert_eq!(inst.dropped_total(), 0);
-
-        inst.handle(&LogEntry::Access(AccessMessage {
-            from: "1.1.1.1".into(),
-            ..Default::default()
-        }));
-
-        assert!(inst.dropped_total() >= 1, "写失败必须计入 dropped_total（udf 可观测面）");
+        let err = inst.start(&r).expect_err("不可写路径必须在启动期失败");
+        assert!(format!("{err}").contains("cannot open log file"), "错误必须点明打不开文件: {err}");
+        assert!(!inst.is_active(), "启动失败不得置 active");
     }
 }

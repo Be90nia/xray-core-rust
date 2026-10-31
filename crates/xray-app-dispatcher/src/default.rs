@@ -1031,12 +1031,15 @@ impl DefaultDispatcher {
         outbound_tag: Option<&str>,
         access: Option<AccessContext>,
     ) -> Result<xray_transport::link::Link, DispatcherError> {
-        // ponytail: policy_manager 存在时用 policy_for_level(0) 动态查询策略，
-        // 否则回退到 default_policy。per-user level 需 dispatch 签名变更（deferred）。
+        // Go `d.policy.ForLevel(user.Level)`（app/dispatcher/default.go:162）：
+        // 层级来自 ctx 的 `session.Inbound.User.Level`，不是固定 0——此前
+        // per-user `levels.<n>.bufferSize/timeout` 在 IPC/DNS 这类走本入口的
+        // 调用上一律失效（bd s6h2j）。
+        let level = access.as_ref().map_or(0, |a| a.level);
         let policy = self
             .policy_manager
             .as_ref()
-            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(0));
+            .map_or(self.default_policy.clone(), |pm| pm.policy_for_level(level));
         // pipe 选项对应 Go transport/pipe.OptionsFromContext：
         // buffer.PerConnection → WithSizeLimit（512KiB 背压上限）。
         let pipe_opt = xray_buf::pipe::PipeOption {
@@ -1044,6 +1047,12 @@ impl DefaultDispatcher {
             idle_timeout: Some(policy.timeout.connection_idle),
             ..xray_buf::pipe::PipeOption::default()
         };
+        tracing::debug!(
+            level,
+            limit = pipe_opt.limit,
+            idle_ms = policy.timeout.connection_idle.as_millis(),
+            "dispatch: per-level policy applied to link pipes"
+        );
         let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
 
@@ -1246,9 +1255,19 @@ impl DefaultDispatcher {
             .as_ref()
             .map_or_else(xray_features::policy::SystemStats::default, |pm| pm.for_system());
         let policy_stats = policy.stats.clone();
+        // s6h2j：level 策略（timeout + bufferSize）挂成 task-local 随 dispatch future
+        // 走——出站侧（DialBridge）拿不到 access，只能经此读（Go 走 ctx
+        // `policy.ForLevel`）。日志给出「配置生效」的直接观测点。
+        tracing::debug!(
+            level = user_level,
+            buffer = policy.buffer.connection,
+            idle_ms = policy.timeout.connection_idle.as_millis(),
+            "dispatch_link: per-level policy bound to connection"
+        );
+        let conn_policy = policy.clone();
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
-        let fut = async move {
+        let fut = CONN_POLICY.scope(conn_policy, async move {
             // ---- Phase 1: Sniffing ----
             let mut cr = CachedReader::with_inner(outbound_reader);
             let (final_dest, sniffed_protocol, route_target) = if sniff_req.enabled {
@@ -1531,7 +1550,7 @@ impl DefaultDispatcher {
             let fut =
                 handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
             let _ = fut.await;
-        };
+        });
 
         // 停机窗内 scope 已关：拒发必须回错（否则连接静默挂住等对端超时）。
         // ManagedScope 内部已记 warn，此处只负责把失败交给调用方。
@@ -1760,6 +1779,23 @@ tokio::task_local! {
     pub static INBOUND_SPLICE: InboundSpliceMeta;
 }
 
+tokio::task_local! {
+    /// 本连接的 per-level 策略（Go ctx 里的 `policy.ForLevel(user.Level)`），
+    /// 随 dispatch future 走（`INBOUND_SPLICE` 同款机制）。
+    ///
+    /// 设置点 = [`DefaultDispatcher::dispatch_link`]（按 `access.level` 查
+    /// `policy_manager`，Go default.go:162）；消费点 = [`DialBridge`] 的桥接
+    /// 超时与代理链 pipe 上限——`DispatchHandler::dispatch(dest, link)` 无 ctx
+    /// 参数，task-local 是跨进 outbound 的唯一通道（Go 靠 ctx）。
+    static CONN_POLICY: xray_features::policy::Policy;
+}
+
+/// 当前连接的 per-level 策略；不在 dispatch 内（直连调用/测试）时 `None`。
+#[must_use]
+fn current_conn_policy() -> Option<xray_features::policy::Policy> {
+    CONN_POLICY.try_with(Clone::clone).ok()
+}
+
 /// splice 准入激活累计（txno-splice 生产观测：零拷贝下行快路径接管连接数）。
 ///
 /// [`DialBridge::dispatch`] 桥接判定每准入一连接 +1；Windows/macOS（平台闸门）
@@ -1816,8 +1852,27 @@ impl DialBridge {
     }
 
     /// 取当前 policy（无显式设置时用 default）。
+    ///
+    /// 只取装配期注入值（`xray-core` 按**出站自己的** `userLevel` 注入，Go
+    /// `freedom.go:208 h.policyManager.ForLevel(h.config.UserLevel)` /
+    /// `socks/client.go:100` / `vmess/outbound:136` 同语义）——**不**改成入站
+    /// 用户层级的 timeout：Go 的出站超时取自出站用户配置，入站层级只决定
+    /// relay pipe 的 buffer/空闲窗（见 [`Self::current_pipe_limit`]）。
     fn current_policy(&self) -> xray_features::policy::TimeoutPolicy {
         self.policy.read().clone().unwrap_or_default()
+    }
+
+    /// 本连接 pipe 的背压上限（字节，-1 = 无限）。
+    ///
+    /// Go 全部 relay pipe 出自 `getLink`（app/dispatcher/default.go:140-143 →
+    /// transport/pipe/pipe.go:47-61 `OptionsFromContext`：`limit = buffer.PerConnection`），
+    /// 即**按用户层级**取值。此前本处硬编码 `BufferPolicy::default()`（只认 env），
+    /// 配置的 `levels.<n>.bufferSize` 形同虚设（bd s6h2j）。
+    fn current_pipe_limit(&self) -> i64 {
+        current_conn_policy().map_or_else(
+            || xray_features::policy::BufferPolicy::default().connection as i64,
+            |p| p.buffer.connection as i64,
+        )
     }
 
     /// 设置代理链 tag 和出站管理器。
@@ -1965,6 +2020,8 @@ impl DialBridge {
         let dest = dest.clone();
         // 提前克隆 policy：避免 async move 持 &self 越界
         let policy = self.current_policy();
+        // 提前取值：pipe 上限同样来自 per-level 策略（读 task-local，须在本 task 现址）。
+        let pipe_limit = self.current_pipe_limit();
         // 提前克隆 scope：chained task 收进 bridge 的托管 scope（bd 4a1zy）
         let scope = self.scope.clone();
 
@@ -1986,12 +2043,13 @@ impl DialBridge {
             // 选项对齐 Go transport/pipe.OptionsFromContext（pipe.go:47-61）：
             // buffer.PerConnection → WithSizeLimit 背压上限。Go 全部 relay pipe
             // 均出自 getLink（default.go:140-143）带界；此前此处用
-            // PipeOption::default()（limit=-1 无界）是 exci 票的蓄洪缺口。
-            // DialBridge 只注入 TimeoutPolicy（bd 4-6），buffer 档与 dispatcher
-            // 无 policy_manager 时的 default_policy 同源（Policy::default() →
-            // BufferPolicy::default()，env 桥接 512KiB）。
+            // PipeOption::default()（limit=-1 无界）是 exci 票的蓄洪缺口，
+            // 后改硬编码 BufferPolicy::default()（只认 env、忽略 levels.<n>.bufferSize
+            // ——bd s6h2j）；现按本连接层级取值。
+            let limit = pipe_limit;
+            tracing::debug!(tag = %tag, chain_tag = %chain_tag, limit, "proxy chain pipes bounded by per-level bufferSize");
             let pipe_opt = xray_buf::pipe::PipeOption {
-                limit: xray_features::policy::BufferPolicy::default().connection as i64,
+                limit,
                 idle_timeout: Some(policy.connection_idle),
                 ..xray_buf::pipe::PipeOption::default()
             };
@@ -3073,6 +3131,35 @@ mod tests {
     }
 
     use xray_features::stats::Manager as _;
+
+    /// s6h2j：pipe 上限取值源必须是**本连接层级**的 `bufferSize`（Go getLink →
+    /// `OptionsFromContext`：`limit = buffer.PerConnection`），不是 env 缺省。
+    #[tokio::test]
+    async fn chain_pipe_limit_follows_conn_policy_level() {
+        let dial: DialFn = Arc::new(|_dest: &Destination| {
+            Box::pin(async { Err("unused: chain never dials".to_string()) })
+        });
+        let bridge = DialBridge::new("bridge-limit", dial);
+        // 无 conn policy（直连调用）→ env 缺省（Go defaultBufferPolicy）。
+        assert_eq!(
+            bridge.current_pipe_limit(),
+            xray_features::policy::BufferPolicy::default().connection as i64
+        );
+        let level3 = xray_features::policy::Policy {
+            buffer: xray_features::policy::BufferPolicy { connection: 4096, write: 1024 },
+            ..Default::default()
+        };
+        let limit = CONN_POLICY.scope(level3.clone(), async { bridge.current_pipe_limit() }).await;
+        assert_eq!(limit, 4096, "level 3 的 bufferSize 必须成为 pipe 上限");
+        // 出站超时仍取出站自己的 userLevel（Go freedom.go:208），不被入站层级改写。
+        assert_eq!(
+            CONN_POLICY.scope(level3, async { bridge.current_policy().connection_idle }).await,
+            xray_features::policy::TimeoutPolicy::default().connection_idle,
+            "入站层级不得改写出站桥接超时"
+        );
+        // scope 外不得残留（跨连接串味 = 别的连接用错 level）。
+        assert!(current_conn_policy().is_none(), "scope 外不得残留");
+    }
 
     /// exci：dispatch_via_chain 的两对 pipe 必须带 BufferPolicy 背压上限——
     /// Go 全部 relay pipe 出自 getLink（app/dispatcher/default.go:140-143，

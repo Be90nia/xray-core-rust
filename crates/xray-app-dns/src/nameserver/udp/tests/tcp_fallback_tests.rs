@@ -127,6 +127,53 @@ async fn truncated_response_falls_back_to_tcp_and_gets_full_answer() {
     assert!(Message::from_vec(&trace[2].1).is_ok(), "TCP 侧必须是裸 DNS 报文（不是 XUDP 帧）");
 }
 
+/// 记录 TCP 拨号必失败的假 dialer：模拟「上游只监听 UDP / TCP 被墙」。
+#[derive(Default)]
+struct TcpFailingDialer;
+
+impl crate::dial::QueryDialer for TcpFailingDialer {
+    fn dial_tcp(
+        &self,
+        _dest: &Destination,
+    ) -> Pin<Box<dyn Future<Output = io::Result<crate::dial::DnsStream>> + Send + '_>> {
+        Box::pin(async { Err(io::Error::other("upstream has no TCP listener")) })
+    }
+
+    fn dial_udp(
+        &self,
+        _dest: &Destination,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Box<dyn crate::dial::UdpPacketSession>>> + Send + '_>>
+    {
+        Box::pin(async { Ok(Box::new(AlwaysTruncatedSession { req_id: 0 }) as Box<_>) })
+    }
+}
+
+/// bd 1ksxu D7：TCP 兜底失败 → **回落 Go 语义**（按截断应答收场）。
+///
+/// Go `nameserver_udp.go:118-137` 没有 TCP 分支，截断应答直接进 cache，客户端拿到
+/// NOERROR/0 记录；修前 Rust 兜底失败即整条查询报错 → dns 出站零应答、客户端等到
+/// 超时（现场表现为「DNS 偶发无响应」）。
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
+async fn tcp_fallback_failure_returns_truncated_answer_not_error() {
+    let _slot = DIALER_SLOT_LOCK.lock();
+    crate::dial::set_shared_dialer(Some(Arc::new(TcpFailingDialer)));
+    let ns = UdpNameServer::new(
+        udp_dest("127.0.0.1:9".parse().unwrap()),
+        Arc::new(CacheController::new("test", true, false, 0, 0)),
+        Vec::new(),
+        Duration::from_secs(2),
+        Arc::new(crate::dial::SystemHostResolver),
+    );
+    let outcome = ns
+        .query_once("fb.com.", RecordType::A, Budget::tokio().deadline(Duration::from_secs(2)))
+        .await;
+    crate::dial::set_shared_dialer(None);
+
+    let rec = outcome.expect("兜底失败必须回落截断应答（Ok），不得整体报错");
+    assert!(rec.ips.is_empty(), "截断应答无记录：客户端应拿到 NOERROR/0 记录，而不是没有应答");
+}
+
 /// 恒回 TC=1 的假 UDP 会话（首包与 EDNS0 重发都截断）。
 struct AlwaysTruncatedSession {
     req_id: u16,

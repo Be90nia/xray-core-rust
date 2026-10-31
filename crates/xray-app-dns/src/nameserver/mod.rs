@@ -237,49 +237,56 @@ impl Client {
             return Box::pin(async { Err(DnsError::EmptyResponse) });
         }
         let fut = self.server.query_ip(domain, option);
+        // Go nameserver.go:184：查询 ctx 带本 client 的 tag 作为 `session.Inbound`
+        // ——dns 出站据此判 ownLink 防环（proxy/dns/dns.go:242）。缺此标记时
+        // 本服务自己的上游查询会被当用户流量再劫持一次，形成查询回环（D1）。
+        let client_tag = self.tag.clone();
         // DNS 上游查询打标（xray_transport::dns_skip 设置点）：消费点（上游直连
         // 拨号）据此把 skip 拒拨限定在 Xray 自身查询，不影响用户流量（TUN 接管
         // 场景，Go dns_skip.go 语义）。
-        Box::pin(xray_transport::dns_skip::scope_dns_upstream_query(async move {
-            let (ips, ttl) = fut.await?;
-            if ips.is_empty() {
-                return Err(DnsError::EmptyResponse);
-            }
-            let mut ips = ips;
-            if let Some(m) = self.expected_ips.as_ref() {
-                if !self.act_prior {
-                    ips = m.filter_ips(&ips);
-                    if ips.is_empty() {
-                        return Err(DnsError::EmptyResponse);
+        Box::pin(crate::dial::scope_client_tag(
+            client_tag,
+            xray_transport::dns_skip::scope_dns_upstream_query(async move {
+                let (ips, ttl) = fut.await?;
+                if ips.is_empty() {
+                    return Err(DnsError::EmptyResponse);
+                }
+                let mut ips = ips;
+                if let Some(m) = self.expected_ips.as_ref() {
+                    if !self.act_prior {
+                        ips = m.filter_ips(&ips);
+                        if ips.is_empty() {
+                            return Err(DnsError::EmptyResponse);
+                        }
                     }
                 }
-            }
-            if let Some(m) = self.unexpected_ips.as_ref() {
-                if !self.act_unprior {
-                    ips.retain(|ip| !m.match_ip(*ip));
-                    if ips.is_empty() {
-                        return Err(DnsError::EmptyResponse);
+                if let Some(m) = self.unexpected_ips.as_ref() {
+                    if !self.act_unprior {
+                        ips.retain(|ip| !m.match_ip(*ip));
+                        if ips.is_empty() {
+                            return Err(DnsError::EmptyResponse);
+                        }
                     }
                 }
-            }
-            if let Some(m) = self.expected_ips.as_ref() {
-                if self.act_prior {
-                    let matched = m.filter_ips(&ips);
-                    if !matched.is_empty() {
-                        ips = matched;
+                if let Some(m) = self.expected_ips.as_ref() {
+                    if self.act_prior {
+                        let matched = m.filter_ips(&ips);
+                        if !matched.is_empty() {
+                            ips = matched;
+                        }
                     }
                 }
-            }
-            if let Some(m) = self.unexpected_ips.as_ref() {
-                if self.act_unprior {
-                    let matched = m.filter_ips(&ips);
-                    if !matched.is_empty() {
-                        ips = matched;
+                if let Some(m) = self.unexpected_ips.as_ref() {
+                    if self.act_unprior {
+                        let matched = m.filter_ips(&ips);
+                        if !matched.is_empty() {
+                            ips = matched;
+                        }
                     }
                 }
-            }
-            Ok((ips, ttl))
-        }))
+                Ok((ips, ttl))
+            }),
+        ))
     }
 }
 
@@ -533,6 +540,53 @@ mod tests {
         let (ips, ttl) = client.query_ip("example.com", IpOption::all()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 60);
+    }
+
+    /// 7qxjj①：查询期间 client tag 必须对 dialer 可见（Go nameserver.go:184
+    /// `session.ContextWithInbound`）——dns 出站 ownLink 判定靠它认领本服务
+    /// 自己的上游查询，缺失即回环零应答。
+    #[tokio::test]
+    async fn client_query_ip_exposes_client_tag_to_dialer() {
+        struct TagCapturingServer(Arc<parking_lot::Mutex<Option<String>>>);
+
+        impl Server for TagCapturingServer {
+            fn name(&self) -> &str {
+                "capture"
+            }
+
+            fn is_disable_cache(&self) -> bool {
+                false
+            }
+
+            fn query_ip<'a>(
+                &'a self,
+                _domain: &'a str,
+                _option: IpOption,
+            ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>>
+            {
+                let seen = Arc::clone(&self.0);
+                Box::pin(async move {
+                    *seen.lock() = crate::dial::current_client_tag();
+                    Ok((vec![IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9))], 60))
+                })
+            }
+        }
+
+        let seen: Arc<parking_lot::Mutex<Option<String>>> = Arc::default();
+        let client = Client::new(
+            sample_ns(),
+            IpOption::all(),
+            Box::new(TagCapturingServer(Arc::clone(&seen))),
+        )
+        .unwrap();
+        client.query_ip("example.com", IpOption::all()).await.unwrap();
+        assert_eq!(
+            seen.lock().as_deref(),
+            Some("gcp"),
+            "查询期间必须暴露本 client 的 tag（dialer 侧据此判 ownLink）"
+        );
+        // scope 退出后不得残留（跨查询串味 = 别的 client 被误判 ownLink）。
+        assert_eq!(crate::dial::current_client_tag(), None);
     }
 
     #[test]

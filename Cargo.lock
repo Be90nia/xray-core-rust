@@ -5671,6 +5671,7 @@ dependencies = [
  "udf-skeleton-infra",
  "udf-std-ext",
  "uuid",
+ "xray-app-log",
  "xray-buf",
  "xray-common",
  "xray-features",

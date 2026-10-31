@@ -142,6 +142,32 @@ pub fn shared_dialer() -> Option<Arc<dyn QueryDialer>> {
     SHARED_DIALER.read().clone()
 }
 
+// ========== 查询所属 client tag（Go ctx 的 `session.Inbound`） ==========
+
+tokio::task_local! {
+    /// 当前 DNS 上游查询属于哪个 nameserver client。Go 侧是 ctx 里的
+    /// `session.Inbound`（`app/dns/nameserver.go:184` `session.ContextWithInbound(
+    /// ctx, &session.Inbound{Tag: c.tag})`），消费点 `proxy/dns/dns.go:242` 的
+    /// `isOwnLink(ctx)`——命中即「本服务自己的上游查询」，原样转发防环。
+    ///
+    /// task-local 形态而非参数：`QueryDialer` 是静态共享槽（一个 dialer 服务全部
+    /// client），且 dialer 实现在装配层（xray-core），拿不到 client。
+    /// 生产消费者见 `DispatcherDnsDialer`（把值写进 `AccessContext.inbound_tag`）。
+    static DNS_CLIENT_TAG: String;
+}
+
+/// 在「属于 client `tag`」的标记内执行 `f`。设置点 =
+/// [`crate::nameserver::Client::query_ip`]（Go 同一位置）。
+pub async fn scope_client_tag<F: Future>(tag: String, f: F) -> F::Output {
+    DNS_CLIENT_TAG.scope(tag, f).await
+}
+
+/// 当前查询的 client tag；无标记（直连调用/测试）时 `None`。
+#[must_use]
+pub fn current_client_tag() -> Option<String> {
+    DNS_CLIENT_TAG.try_with(Clone::clone).ok()
+}
+
 // ========== Link 流适配 ==========
 
 /// `Link`（MultiBuffer 粒度 reader/writer）→ `AsyncRead + AsyncWrite` 流适配。

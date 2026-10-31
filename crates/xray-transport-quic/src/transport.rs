@@ -326,6 +326,25 @@ mod tests {
         });
     }
 
+    /// 服务端 StreamSettings：显式配一张自签证书。
+    ///
+    /// 波2 起 `xray_tls::server_config::build_server_config` 对齐 Go 语义——
+    /// 未配证书**不再现生成 rcgen 自签**，握手直接报
+    /// `no server certificate chain resolved`（Go: `tls: no certificates configured`）。
+    /// 因此 QUIC 服务端测试必须自带证书，否则测的是「缺证书」而不是传输本身。
+    fn tls_server_settings() -> StreamSettings {
+        let (cert, key) = xray_tls::certificate::generate_self_signed_cert(&["127.0.0.1"])
+            .expect("self-signed cert");
+        StreamSettings {
+            protocol: "quic".into(),
+            security: "tls".into(),
+            security_json: Some(serde_json::json!({
+                "certificates": [{ "certificate": cert, "key": key }]
+            })),
+            ..Default::default()
+        }
+    }
+
     /// quinn 客户端连指定地址（allowInsecure 跳过自签验证，1s idle timeout 快速失败）。
     #[allow(unused_variables)] // addr 保留供未来 allowInsecure 分支判定
     fn quinn_client_connect(addr: SocketAddr) -> quinn::Endpoint {
@@ -352,11 +371,7 @@ mod tests {
     #[tokio::test]
     async fn close_rejects_new_connections() {
         ensure_provider();
-        let settings = StreamSettings {
-            protocol: "quic".into(),
-            security: "tls".into(),
-            ..Default::default()
-        };
+        let settings = tls_server_settings();
         let handler: ConnHandler = Arc::new(|_| {});
         let listener =
             listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), handler)
@@ -404,12 +419,8 @@ mod tests {
     /// 边界场景，sing-box #4222 类错分段在此暴露）回环 echo 校验字节完整。
     async fn echo_roundtrip_with(disable_gso: bool) {
         ensure_provider();
-        let settings = StreamSettings {
-            protocol: "quic".into(),
-            security: "tls".into(),
-            transport_json: Some(serde_json::json!({ "disableGSO": disable_gso })),
-            ..Default::default()
-        };
+        let mut settings = tls_server_settings();
+        settings.transport_json = Some(serde_json::json!({ "disableGSO": disable_gso }));
         let listener =
             listen("127.0.0.1:0".parse().unwrap(), &settings, &Default::default(), echo_handler())
                 .await

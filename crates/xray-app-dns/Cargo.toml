@@ -9,6 +9,9 @@ rust-version.workspace = true
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-geodata = { path = "../xray-geodata" }
+# bd sex3y：DNS 查询事件日志生产者（Go `common/log.Record(&DNSLog{})`，
+# app/dns 各查询完成点调用；API 是进程级出口，无需持有 LogInstance）。
+xray-app-log = { path = "../xray-app-log" }
 async-trait = "0.1"
 thiserror.workspace = true
 tokio.workspace = true

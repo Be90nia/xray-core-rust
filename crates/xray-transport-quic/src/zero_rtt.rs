@@ -144,9 +144,16 @@ mod tests {
     /// 票内配额只能 0 或 u32::MAX（`InvalidMaxEarlyDataSize`）——返回后覆盖为
     /// u32::MAX（vendored quinn-proto `QuicServerConfig` 同款值）。
     fn server_endpoint() -> quinn::Endpoint {
+        // 波2 起缺证书不再自签（Go 语义：握手即报 no certificates configured），
+        // 测试必须显式配一张自签证书。
+        let (cert, key) = xray_tls::certificate::generate_self_signed_cert(&["127.0.0.1"])
+            .expect("self-signed cert");
         let mut tls = xray_tls::server_config::build_server_config(
             "tls",
-            Some(&serde_json::json!({ "allowEarlyData": true })),
+            Some(&serde_json::json!({
+                "allowEarlyData": true,
+                "certificates": [{ "certificate": cert, "key": key }]
+            })),
         )
         .expect("server config")
         .expect("tls server config");

@@ -39,6 +39,14 @@ SRV_PORT, CLI_SOCKS, HTTP_PORT = 18454, 11082, 18101
 BIG = os.path.join(WORK, 'big.bin')
 SIZE_MB, NCURL = 200, 2       # 每轮 2 次 200MB 下载取均值（拉长测量窗降噪声）
 
+# --- remote 场景（bd dm2wo：真机 A/B，用户自测口径）---
+# 本机受控测速 <17MB/s 无效（见 MEMORY），绝对值须在用户真机/真节点上取；
+# 本仓只提供等配置双端脚手架，数字归用户。
+REMOTE = {'url': None, 'a_cfg': None, 'b_cfg': None, 'a_socks': 10808, 'b_socks': 10809,
+          'ncurl': 3, 'max_time': 60}
+REMOTE_WORK = 'D:/tmp/abgate-remote'
+
+
 
 def sha256(path):
     h = hashlib.sha256()
@@ -51,10 +59,13 @@ def sha256(path):
 def compiler_procs():
     """tasklist 数 cargo/rustc/cl 进程；tasklist 不可用返回 (None, [])。"""
     try:
-        out = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True,
-                             text=True, timeout=30).stdout
+        # 不传 text=True：tasklist 在本机输出非 UTF-8（中文系统代码页），
+        # 严格解码会在读线程抛 UnicodeDecodeError 使 stdout 变 None。
+        raw = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True,
+                             timeout=30).stdout
     except Exception as e:
         return None, [f'tasklist failed: {e}']
+    out = raw.decode('utf-8', 'replace')
     found = []
     for line in out.splitlines():
         name = line.split(',')[0].strip('"').lower() if ',' in line else ''
@@ -136,7 +147,60 @@ def run_minvless(tag, side, idx, exe):
     return sum(speeds) / len(speeds), wall
 
 
+def wait_socks(host, port, timeout_s, proc):
+    """等客户端 SOCKS 端口可连（proc 提前退出直接失败）。"""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f'client exited early rc={proc.returncode}')
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise RuntimeError(f'SOCKS {host}:{port} 在 {timeout_s}s 内未就绪')
+
+
+def run_remote(tag, side, idx, exe):
+    """跑一轮单侧（真机）：起该侧客户端二进制 → 经其 SOCKS 下载固定 URL，返回 MB/s。
+
+    两侧用同一节点、同一 URL、同一 payload 次数，交替执行——比值才有意义。
+    """
+    cfg = REMOTE['a_cfg'] if side == 'A' else REMOTE['b_cfg']
+    socks = REMOTE['a_socks'] if side == 'A' else REMOTE['b_socks']
+    rtag = f'{tag}-{side.lower()}{idx}'
+    os.makedirs(REMOTE_WORK, exist_ok=True)
+    log_path = os.path.join(REMOTE_WORK, f'cli-{rtag}.log')
+    t0 = time.time()
+    with open(log_path, 'wb') as log:
+        pc = subprocess.Popen([exe, 'run', '-c', cfg], stdout=log, stderr=subprocess.STDOUT)
+        speeds = []
+        try:
+            wait_socks('127.0.0.1', socks, 15, pc)
+            for _ in range(REMOTE['ncurl']):
+                r = subprocess.run(
+                    ['curl', '-sS', '-o', 'NUL', '--max-time', str(REMOTE['max_time']),
+                     '-w', '%{speed_download}', '-x', f'socks5h://127.0.0.1:{socks}',
+                     REMOTE['url']],
+                    capture_output=True, text=True, timeout=REMOTE['max_time'] + 10)
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f'round {side}#{idx}: curl rc={r.returncode}: '
+                        f'{r.stderr.strip()[-300:]} (日志 {log_path})')
+                speeds.append(float(r.stdout.strip()) / 1e6)
+        finally:
+            pc.terminate()
+            try:
+                pc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pc.kill()
+    wall = time.time() - t0
+    return sum(speeds) / len(speeds), wall
+
+
 def run_side(tag, side, idx, exe, scenario):
+    if scenario == 'remote':
+        return run_remote(tag, side, idx, exe)
     return (run_loopback if scenario == 'loopback' else run_minvless)(tag, side, idx, exe)
 
 
@@ -163,11 +227,34 @@ def main():
     ap.add_argument('--tol', type=float, default=0.05,
                     help='允许 B 比 A 慢的比例（默认 0.05 = 5%%）')
     ap.add_argument('--tag', default='ab', help='存档 tag（默认 ab）')
-    ap.add_argument('--scenario', choices=('minvless', 'loopback'), default='minvless',
-                    help='minvless=裸 vless+tcp（跨二进制，默认）；loopback=基线拓扑（仅 Rust↔Rust）')
+    ap.add_argument('--scenario', choices=('minvless', 'loopback', 'remote'), default='minvless',
+                    help='minvless=裸 vless+tcp（跨二进制，默认）；loopback=基线拓扑（仅 Rust↔Rust）；'
+                         'remote=真机（双侧客户端各连同一真节点，数字归用户自测）')
+    ap.add_argument('--url', help='remote：下载目标 URL（两侧同一 URL）')
+    ap.add_argument('--a-config', help='remote：A 侧客户端配置 json 路径')
+    ap.add_argument('--b-config', help='remote：B 侧客户端配置 json 路径')
+    ap.add_argument('--a-socks', type=int, default=10808, help='remote：A 侧客户端 SOCKS 端口（默认 10808）')
+    ap.add_argument('--b-socks', type=int, default=10809, help='remote：B 侧客户端 SOCKS 端口（默认 10809）')
+    ap.add_argument('--ncurl', type=int, default=3, help='remote：每轮下载次数（取均值，默认 3）')
+    ap.add_argument('--max-time', type=int, default=60, help='remote：单次下载上限秒（默认 60）')
+    ap.add_argument('--emit-md', action='store_true', help='额外写一份 markdown 结果表（归档同目录）')
     ap.add_argument('--force', action='store_true',
                     help='检测到编译进程仍强行运行（记入报告）')
     args = ap.parse_args()
+
+    if args.scenario == 'remote':
+        missing = [n for n, v in (('--url', args.url), ('--a-config', args.a_config),
+                                  ('--b-config', args.b_config)) if not v]
+        if missing:
+            print(f'ERROR: remote 场景缺参数: {missing}', file=sys.stderr)
+            sys.exit(2)
+        for cfg in (args.a_config, args.b_config):
+            if not os.path.exists(cfg):
+                print(f'ERROR: 配置不存在: {cfg}', file=sys.stderr)
+                sys.exit(2)
+        REMOTE.update(url=args.url, a_cfg=args.a_config, b_cfg=args.b_config,
+                      a_socks=args.a_socks, b_socks=args.b_socks,
+                      ncurl=args.ncurl, max_time=args.max_time)
 
     for p in (args.bin_a, args.bin_b):
         if not os.path.exists(p):
@@ -240,6 +327,14 @@ def main():
     ts = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     os.makedirs(REPORT_DIR, exist_ok=True)
     archive = os.path.abspath(os.path.join(REPORT_DIR, f'ab-{ts}-{args.tag}.json'))
+    if args.scenario == 'loopback':
+        scenario_desc = 'loopback_alloc_bench.py --runs 1 (200MB xhttp+reality+vless(mlkem-enc) 全链路)'
+    elif args.scenario == 'remote':
+        scenario_desc = (f'真机双端客户端 A/B（同一节点同一 URL={REMOTE["url"]}，'
+                         f'每轮 {REMOTE["ncurl"]} 次下载取均值，单次上限 {REMOTE["max_time"]}s，'
+                         f'SOCKS A={REMOTE["a_socks"]} B={REMOTE["b_socks"]}）')
+    else:
+        scenario_desc = f'自建裸 vless+tcp loopback ({SIZE_MB}MB×{NCURL} curl 均值)'
     doc = {'tool': 'tools/ab_gate.py', 'utc': ts, 'tag': args.tag, 'hostname': socket.gethostname(),
            'a': {'path': os.path.abspath(args.bin_a), 'sha256': sha_a, 'rounds': a_vals,
                  'median': round(med_a, 3), 'mad': round(mad_a, 3), 'iqr': round(iqr_a, 3),
@@ -251,11 +346,42 @@ def main():
            'verdict': verdict, 'contaminated': bool(contam or comp_during),
            'contamination_reason': contam, 'compilers_seen_during_run': comp_during,
            'forced': forced, 'preflight_compilers': sorted(set(pre)) if pre else [],
-           'scenario': ('loopback_alloc_bench.py --runs 1 (200MB xhttp+reality+vless(mlkem-enc) 全链路)'
-                        if args.scenario == 'loopback' else
-                        f'自建裸 vless+tcp loopback ({SIZE_MB}MB×{NCURL} curl 均值)')}
+           'scenario': scenario_desc}
     with open(archive, 'w') as f:
         json.dump(doc, f, indent=1, ensure_ascii=False)
+
+    if args.emit_md:
+        md_path = archive[:-5] + '.md'
+        lines = [
+            f'# A/B 吞吐结果 {ts} ({args.tag})',
+            '',
+            f'- 场景: {scenario_desc}',
+            f'- 主机: {socket.gethostname()}  交错轮数: {args.rounds}  容差: {args.tol}',
+            f'- A (基准): `{args.bin_a}` sha256 `{sha_a[:16]}..`',
+            f'- B (对照): `{args.bin_b}` sha256 `{sha_b[:16]}..`',
+            f'- 判定: **{verdict}**  B/A 中位比 = {ratio:.4f}'
+            f'{"  (CONTAMINATED)" if (contam or comp_during) else ""}',
+            '',
+            '| 轮次 | A MB/s | B MB/s |',
+            '|---|---|---|',
+        ]
+        for i in range(1, args.rounds + 1):
+            av = next((r['mbps'] for r in rounds if r['round'] == i and r['side'] == 'A'), None)
+            bv = next((r['mbps'] for r in rounds if r['round'] == i and r['side'] == 'B'), None)
+            lines.append(f'| {i} | {av:.2f} | {bv:.2f} |')
+        lines += [
+            '',
+            f'| 侧 | 中位数 | MAD | IQR | 轮间离散度 |',
+            '|---|---|---|---|---|',
+            f'| A | {med_a:.2f} | {mad_a:.2f} | {iqr_a:.2f} | {spread_a*100:.1f}% |',
+            f'| B | {med_b:.2f} | {mad_b:.2f} | {iqr_b:.2f} | {spread_b*100:.1f}% |',
+            '',
+            f'污染: {contam or "无"}{"；轮中编译进程 " + ",".join(comp_during) if comp_during else ""}',
+            '',
+        ]
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        print(f'AB-GATE-MD: {os.path.relpath(md_path)}')
 
     print(f'AB-GATE-SUMMARY: tag={args.tag} ratio_B_over_A={ratio:.4f} tol={args.tol} verdict={verdict} '
           f'median_a={med_a:.1f}MB/s median_b={med_b:.1f}MB/s spread_a={spread_a*100:.1f}% '

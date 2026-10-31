@@ -263,6 +263,16 @@ pub(crate) static INBOUND_CTORS: &[(&str, InboundCtor)] = &[
     ("inbound:tuic", tcp(inbound::tuic_entry)),
     ("inbound:naive", tcp(inbound::naive_entry)),
     ("inbound:wireguard", tcp(inbound::wireguard_entry)),
+    // Rust 独占协议（bd 1ksxu D5 拍板：保留 + 显式标注 Go 不兼容）。
+    // 证据：Go 26.10.17 `infra/conf/xray.go:28-39` 的 inbound 协议表**没有** dns
+    // （`dns` 只存在于同文件 :42-56 的 outbound 表）；同一份 `{"protocol":"dns"}`
+    // 配置在 Go 上装配期拒启、在 Rust 上监听成功 → 配置面不可跨实现复用。
+    // 保留理由：这是 Rust 侧独立的本地 DNS 服务器入站（自持上游解析器，走
+    // `xray-proxy-dns` 的 DnsInbound），不参与 Go 等价面判据；Go 兼容配置永远
+    // 不会写出这个键，故不污染 32/32 与 interop 门。
+    // 已知差异（用户会踩）：① Go 会拒启，跨实现复用配置需改 `dokodemo-door`+dns
+    // outbound；② settings 形态是 Rust 自有 `{"servers":["ip:port"]}`，与 Go
+    // 顶层 `dns.servers` 不共享上游列表。
     ("inbound:dns", tcp(inbound::dns_entry)),
     ("inbound:loopback", tcp(inbound::loopback_entry)),
     ("inbound:blackhole", tcp(inbound::blackhole_entry)),

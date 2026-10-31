@@ -122,6 +122,15 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
             // 上游（修复前落 fetch，负缓存每次完整上游 RTT，bd wmdn①）。
             if !matches!(err, Some(DnsError::RecordNotFound)) {
                 if ttl > 0 {
+                    // Go nameserver_cached.go:32：cache HIT 也记一条 dns log（elapsed 0）。
+                    record_dns_log(
+                        &cache.name,
+                        fqdn_owned,
+                        &ips,
+                        0,
+                        xray_app_log::DnsStatus::CacheHit,
+                        err.as_ref(),
+                    );
                     return match err {
                         None => Ok((ips, ttl as u32)),
                         Some(e) => Err(e),
@@ -132,6 +141,15 @@ pub async fn query_ip<S: CachedNameserver + 'static>(
                 // （`xray_frame::cache`）：窗口口径单源 + 同 fqdn 只起一个 pull。
                 if cache.stale_servable(ttl) {
                     if let Some((sips, _)) = stale_result(&rec, option, now) {
+                        // Go nameserver_cached.go:37：过期秒回也记一条（Optimiste）。
+                        record_dns_log(
+                            &cache.name,
+                            fqdn_owned,
+                            &sips,
+                            0,
+                            xray_app_log::DnsStatus::CacheOptimiste,
+                            None,
+                        );
                         // 许可先取（此后 `cache` 借用结束，`server` 才能移进 pull）。
                         let permit = cache.begin_stale_refresh(fqdn_owned);
                         pull(server, fqdn_owned.to_string(), option, permit);
@@ -199,6 +217,7 @@ pub async fn fetch<S: CachedNameserver>(
     option: IpOption,
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
     let cache = server.cache_controller();
+    let started = cache.clock().now_instant();
     let sf_key = (fqdn.to_string(), option.ipv4_enable, option.ipv6_enable);
 
     // singleflight：如果已有同名查询在进行，等待其结果；否则成为领导者。
@@ -258,13 +277,14 @@ pub async fn fetch<S: CachedNameserver>(
 
     let (ips, ttl, err) =
         merge_records(option, outcome.rec_v4.as_ref(), outcome.rec_v6.as_ref(), now);
+    let elapsed_ms = now.duration_since(started).as_millis() as u64;
     if let Some(e) = err {
         // bd d881②：merge 只见 rec（None 一律合成 RecordNotFound，Go
         // getIPs(nil) 同款）——真实上游错误（超时/连接失败）在 outcome.errors，
         // 这里透传原始错误；RecordNotFound 只留给真正的「查无此记录」（负缓存
         // rcode 路径）。聚合形态与 merge_records 一致：同类取首条，异类合并。
         let mut errs = outcome.errors;
-        return Err(match errs.len() {
+        let merged = match errs.len() {
             0 => e,
             1 => errs.swap_remove(0),
             _ if errs
@@ -277,11 +297,48 @@ pub async fn fetch<S: CachedNameserver>(
             _ => DnsError::SystemResolve(
                 errs.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("; "),
             ),
-        });
+        };
+        // Go nameserver_cached.go:126：查询收场统一记一条（含错误）。
+        record_dns_log(
+            &cache.name,
+            fqdn,
+            &ips,
+            elapsed_ms,
+            xray_app_log::DnsStatus::Queried,
+            Some(&merged),
+        );
+        return Err(merged);
     }
 
     let r_ttl: u32 = if ttl > 0 { ttl as u32 } else { 1 };
+    // Go nameserver_cached.go:126：`log.Record(&log.DNSLog{... Status: DNSQueried, Elapsed:
+    // ...})`。
+    record_dns_log(&cache.name, fqdn, &ips, elapsed_ms, xray_app_log::DnsStatus::Queried, None);
     Ok((ips, r_ttl))
+}
+
+/// 记一条 DNS 查询日志（Go `log.Record(&log.DNSLog{})`，common/log/dns.go:9-16）。
+///
+/// 进程级出口（`LogFeature::start` 装、`close` 卸），未装配时 API 自身留痕后静默。
+/// `query` 取 Go 同款的 `"<qtype> <fqdn>"` 形态不在此处判定（本层不知 qtype），
+/// 只填 domain —— 与 Go `DNSLog.Domain` 一致，读者侧靠 result/status 区分。
+fn record_dns_log(
+    server: &str,
+    domain: &str,
+    ips: &[IpAddr],
+    elapsed_ms: u64,
+    status: xray_app_log::DnsStatus,
+    error: Option<&DnsError>,
+) {
+    xray_app_log::record_dns(xray_app_log::DnsLog {
+        query: String::new(),
+        domain: domain.to_string(),
+        result: ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+        server: server.to_string(),
+        elapsed_ms,
+        status,
+        error: error.map(ToString::to_string),
+    });
 }
 
 /// 后台拉取（serveStale 路径）。对应 Go `pull`（nameserver_cached.go:45-49）：

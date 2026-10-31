@@ -1666,8 +1666,22 @@ impl DispatchHandler for DnsDispatchBridge {
         let upstream = handler.rewrite_dest(dest);
         let timeout = handler.timeout;
         let own_link = self.is_own_link("");
+        // 客户端侧帧格式按**入站 link 的网络**（Go proxy/dns/dns.go:163
+        // `srcNetwork := ob.Target.Network`，TCP 走 TCP 帧、其余走 UDP 帧），
+        // 与上游侧（rewrite 后 dest）独立。
+        let client_is_udp = !dest.is_tcp();
         Box::pin(async move {
-            dispatch_dns_link(tag, handler, dns_service, upstream, timeout, own_link, link).await;
+            dispatch_dns_link(
+                tag,
+                handler,
+                dns_service,
+                upstream,
+                timeout,
+                own_link,
+                client_is_udp,
+                link,
+            )
+            .await;
         })
     }
 
@@ -1683,16 +1697,32 @@ impl DispatchHandler for DnsDispatchBridge {
             (self.tag.clone(), self.handler.clone(), self.dns_service.clone());
         let upstream = handler.rewrite_dest(dest);
         let timeout = handler.timeout;
+        let client_is_udp = !dest.is_tcp();
         Box::pin(async move {
-            dispatch_dns_link(tag, handler, dns_service, upstream, timeout, own_link, link).await;
+            dispatch_dns_link(
+                tag,
+                handler,
+                dns_service,
+                upstream,
+                timeout,
+                own_link,
+                client_is_udp,
+                link,
+            )
+            .await;
         })
     }
 }
 
 /// DNS link 分发主体（Go `Handler.Process` 的 request/response 双 loop）。
 ///
-/// UDP（XUDP 帧流，逐帧一数据报，会话可连发多帧——对应 dokodemo UDP 的
-/// per-session/per-peer link）与 TCP（长度前缀帧流，双路并发）分别处理。
+/// 客户端侧帧格式由 `client_is_udp` 决定（Go `dns.go:163` `srcNetwork`）：
+/// UDP → XUDP 帧流（逐帧一数据报，会话可连发多帧——对应 dokodemo UDP 的
+/// per-session/per-peer link）；TCP → 长度前缀帧流（双路并发）。
+/// 上游侧帧格式**另按** rewrite 后 dest 网络（Go `dns.go:203` `dest.Network`，
+/// 见 [`forward_raw`] / [`write_or_inline_upstream`]）——两侧判据独立，
+/// 绑在同一分支上是 D2（TCP 客户端 + UDP 上游零应答）。
+#[allow(clippy::too_many_arguments)] // Go `Handler.Process` 的 ctx 面直译（客户端/上游帧判据各自独立进参，打包聚合体反失可读性）
 async fn dispatch_dns_link(
     tag: String,
     handler: xray_proxy_dns::Handler,
@@ -1700,6 +1730,7 @@ async fn dispatch_dns_link(
     upstream: Destination,
     timeout: std::time::Duration,
     own_link: bool,
+    client_is_udp: bool,
     mut link: Link,
 ) {
     use xray_buf::{
@@ -1708,7 +1739,7 @@ async fn dispatch_dns_link(
     };
     use xray_xudp::packet::{FrameMetadata, PacketError, PacketReader, PacketWriter};
 
-    if upstream.is_udp() {
+    if client_is_udp {
         // ---- UDP：XUDP 帧 link ↔ 数据报（Go UDPReader/UDPWriter + outboundConn） ----
         //
         // link 契约 = XUDP 帧流（`udp_session.rs` 头注释）：帧的 payload 才是 DNS

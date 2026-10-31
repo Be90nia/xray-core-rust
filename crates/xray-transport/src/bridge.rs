@@ -315,6 +315,15 @@ async fn read_downlink(
     xray_common::alloc_site::scope(xray_common::alloc_site::BUF_READ, r.read_multi_buffer()).await
 }
 
+/// 连接中止闸等待（bd rjt2o）：闸已关时立即 Ready，否则挂起到关闸。
+///
+/// **只搬运判定，不新造判定**——关闸决定由既有读侧 deadline 分支做（单一超时
+/// 账本，禁双份账，CLAUDE.md §3.5.6）。发送端全亡（桥已弃）按已关兜底。
+/// 零分配、零拷贝；每批一次 `watch` poll（与同函数内已有的 `timeout()` 同量级）。
+async fn wait_abort(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|closed| *closed).await;
+}
+
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -401,146 +410,215 @@ where
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
 
+    // 中止闸（bd rjt2o）：`join!` 要求四腿全归，而被堵在 send/write 的腿不再被
+    // poll → 读侧判定（connIdle / 半窗）永远无法执行 ⇒ 对端活着但不读时连接
+    // 钉死无界（S1/S3 实测）。闸只负责**投递**判定：关闸点 = 既有读超时分支
+    // （判定源不变，无双份超时账），唤醒点 = 4 个 send/write await。
+    // 零额外拷贝：缓冲区仍按原路 move，select 只多 poll 一个 watch。
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+
     // 上行 reader：link.reader → up_tx。超时语义与串行版逐行等价：
     // conn_idle 双向存活空闲断开；对向读侧结束后本向仅剩 half_window 宽限。
-    let up_reader = async move {
-        let mut down_done = down_done_rx;
-        let mut window: Option<std::time::Duration> = None;
-        loop {
-            // 读 future 每轮重建是 cancel-safe 的：select!/timeout 丢弃的 future
-            // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
-            let mb = match window {
-                None => tokio::select! {
-                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
-                    res = timeout(conn_idle, reader.read_multi_buffer()) => match res {
-                        Ok(r) => r,
-                        Err(_) => break,
+    let up_reader = {
+        let abort_tx = abort_tx.clone();
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut down_done = down_done_rx;
+            let mut window: Option<std::time::Duration> = None;
+            loop {
+                // 读 future 每轮重建是 cancel-safe 的：select!/timeout 丢弃的 future
+                // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
+                let mb = match window {
+                    None => tokio::select! {
+                        // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
+                        res = timeout(conn_idle, reader.read_multi_buffer()) => match res {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = abort_tx.send(true);
+                                break;
+                            },
+                        },
+                        _ = down_done.changed() => {
+                            window = *down_done.borrow();
+                            continue;
+                        }
                     },
-                    _ = down_done.changed() => {
-                        window = *down_done.borrow();
-                        continue;
-                    }
-                },
-                Some(d) => match timeout(d, reader.read_multi_buffer()).await {
-                    Ok(r) => r,
-                    Err(_) => break, // uplink_only 窗口内无数据
-                },
-            };
-            match mb {
-                Ok(mb) if !mb.is_empty() => {
-                    if p7lm_trace {
-                        tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
-                    }
-                    // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
-                    // send 立即 Err → 本向级联退出，绝不静默吞数据。
-                    if up_tx.send(mb).await.is_err() {
-                        break;
-                    }
-                },
-                _ => break,
+                    Some(d) => match timeout(d, reader.read_multi_buffer()).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // uplink_only 窗口内无数据
+                            let _ = abort_tx.send(true);
+                            break;
+                        },
+                    },
+                };
+                match mb {
+                    Ok(mb) if !mb.is_empty() => {
+                        if p7lm_trace {
+                            tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
+                        }
+                        // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
+                        // send 立即 Err → 本向级联退出，绝不静默吞数据。关闸时
+                        // 放弃在飞批次（收尾态，连接已被判死）。
+                        let sent = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break,
+                            r = up_tx.send(mb) => r,
+                        };
+                        if sent.is_err() {
+                            break;
+                        }
+                    },
+                    _ => break,
+                }
             }
+            let _ = up_done_tx.send(Some(downlink_only));
+            io::Result::Ok(())
         }
-        let _ = up_done_tx.send(Some(downlink_only));
-        io::Result::Ok(())
     };
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
-    let up_writer = async move {
-        while let Some(mb) = up_rx.recv().await {
-            if p7lm_trace {
-                tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_write", "");
+    let up_writer = {
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            loop {
+                let mb = tokio::select! {
+                    _ = wait_abort(&mut abort_rx) => break,
+                    r = up_rx.recv() => match r {
+                        Some(mb) => mb,
+                        None => break,
+                    },
+                };
+                if p7lm_trace {
+                    tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_write", "");
+                }
+                // 关闸时丢弃在飞批次：对端不读 + 连接已被判死，半截写无意义。
+                let wrote = tokio::select! {
+                    _ = wait_abort(&mut abort_rx) => break,
+                    r = write_all_mb(&mut s_write, &mb) => r,
+                };
+                if wrote.is_err() {
+                    break;
+                }
             }
-            if write_all_mb(&mut s_write, &mb).await.is_err() {
-                break;
-            }
+            // 无条件 shutdown（EOF 排空收尾与写错误收尾同路径），只关本向写半部。
+            // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
+            // 传播 half_window，对向不静默半断。3s 界：对端不读时 shutdown 自身
+            // 也会挂（对称下方 shutdown_flush 的既有界）。
+            let _ = timeout(std::time::Duration::from_secs(3), s_write.shutdown()).await;
+            io::Result::Ok(())
         }
-        // 无条件 shutdown（EOF 排空收尾与写错误收尾同路径），只关本向写半部。
-        // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
-        // 传播 half_window，对向不静默半断。
-        let _ = s_write.shutdown().await;
-        io::Result::Ok(())
     };
     // 下行 reader：xray_buf 顺序读（池化 Buffer，对应 Go 无 vectored 源的
     // SingleReader 路径）→ down_tx。超时同构上行。
-    let down_reader = async move {
-        let mut up_done = up_done_rx;
-        let mut window: Option<std::time::Duration> = None;
-        loop {
-            let mb = match window {
-                None => tokio::select! {
-                    // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
-                    res = timeout(conn_idle, read_downlink(&mut s_read)) => match res {
-                        Ok(r) => r,
-                        Err(_) => break,
+    let down_reader = {
+        let abort_tx = abort_tx.clone();
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut up_done = up_done_rx;
+            let mut window: Option<std::time::Duration> = None;
+            loop {
+                let mb = match window {
+                    None => tokio::select! {
+                        // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
+                        res = timeout(conn_idle, read_downlink(&mut s_read)) => match res {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = abort_tx.send(true);
+                                break;
+                            },
+                        },
+                        _ = up_done.changed() => {
+                            window = *up_done.borrow();
+                            continue;
+                        }
                     },
-                    _ = up_done.changed() => {
-                        window = *up_done.borrow();
-                        continue;
-                    }
-                },
-                Some(d) => match timeout(d, read_downlink(&mut s_read)).await {
-                    Ok(r) => r,
-                    Err(_) => break, // downlink_only 窗口内无数据
-                },
-            };
-            match mb {
-                Ok(mb) if !mb.is_empty() => {
-                    if p7lm_trace {
-                        tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
-                    }
-                    if down_tx.send(mb).await.is_err() {
-                        break;
-                    }
-                },
-                _ => break, // EOF / 读错误
+                    Some(d) => match timeout(d, read_downlink(&mut s_read)).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // downlink_only 窗口内无数据
+                            let _ = abort_tx.send(true);
+                            break;
+                        },
+                    },
+                };
+                match mb {
+                    Ok(mb) if !mb.is_empty() => {
+                        if p7lm_trace {
+                            tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
+                        }
+                        let sent = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break,
+                            r = down_tx.send(mb) => r,
+                        };
+                        if sent.is_err() {
+                            break;
+                        }
+                    },
+                    _ => break, // EOF / 读错误
+                }
             }
+            let _ = down_done_tx.send(Some(uplink_only));
+            io::Result::Ok(())
         }
-        let _ = down_done_tx.send(Some(uplink_only));
-        io::Result::Ok(())
     };
 
     // 下行 writer：down_rx → link.writer（xray_buf Writer 管线，自带池化）。
-    let down_writer = async move {
-        let mut dw_bytes: u64 = 0;
-        while let Some(mb) = down_rx.recv().await {
-            if p7lm_trace {
-                tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_write", "");
-            }
-            dw_bytes += mb.len() as u64;
-            if writer.write_multi_buffer(mb).await.is_err() {
+    let down_writer = {
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut dw_bytes: u64 = 0;
+            loop {
+                let mb = tokio::select! {
+                    _ = wait_abort(&mut abort_rx) => break,
+                    r = down_rx.recv() => match r {
+                        Some(mb) => mb,
+                        None => break,
+                    },
+                };
                 if p7lm_trace {
-                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "down_write_err", "");
+                    tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_write", "");
                 }
-                break;
+                dw_bytes += mb.len() as u64;
+                let wrote = tokio::select! {
+                    _ = wait_abort(&mut abort_rx) => break,
+                    r = writer.write_multi_buffer(mb) => r,
+                };
+                if wrote.is_err() {
+                    if p7lm_trace {
+                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "down_write_err", "");
+                    }
+                    break;
+                }
             }
-        }
-        // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
-        // bd VISIONMAC：收尾必须 flush+shutdown（poll_shutdown）——TLS 层
-        // poll_write 是 BufWriter 语义（Ok(len) 只保证密文入 sendable_tls，
-        // write_io 撞 WouldBlock 尾巴滞留缓冲，poll_arm_gate 文档同源），
-        // 旧 no-op shutdown 下滞留尾巴随 drop 静默蒸发：对端 deframer 停在
-        // 半条记录上永久 Pending，直到 FIN → "peer closed without
-        // close_notify" 断链截断（VPS netem r6 实锤滞留 65,383B =
-        // sendable_tls 64KB 上限）。Go 无此坑：internalClose 链显式
-        if p7lm_trace {
-            tracing::warn!(target: "p7lm", total = dw_bytes, phase = "drain_done_shutdown_flush_begin", "");
-        }
-        let flush_res = timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
-        if p7lm_trace {
-            match &flush_res {
-                Ok(Ok(())) => {
-                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_ok", "")
-                },
-                Ok(Err(e)) => {
-                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_err", err = %e)
-                },
-                Err(_) => {
-                    tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_timeout_3s", "")
-                },
+            // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
+            // bd VISIONMAC：收尾必须 flush+shutdown（poll_shutdown）——TLS 层
+            // poll_write 是 BufWriter 语义（Ok(len) 只保证密文入 sendable_tls，
+            // write_io 撞 WouldBlock 尾巴滞留缓冲，poll_arm_gate 文档同源），
+            // 旧 no-op shutdown 下滞留尾巴随 drop 静默蒸发：对端 deframer 停在
+            // 半条记录上永久 Pending，直到 FIN → "peer closed without
+            // close_notify" 断链截断（VPS netem r6 实锤滞留 65,383B =
+            // sendable_tls 64KB 上限）。Go 无此坑：internalClose 链显式
+            if p7lm_trace {
+                tracing::warn!(target: "p7lm", total = dw_bytes, phase = "drain_done_shutdown_flush_begin", "");
             }
+            let flush_res =
+                timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
+            if p7lm_trace {
+                match &flush_res {
+                    Ok(Ok(())) => {
+                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_ok", "")
+                    },
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_err", err = %e)
+                    },
+                    Err(_) => {
+                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_timeout_3s", "")
+                    },
+                }
+            }
+            let _ = flush_res;
+            // CloseWrite+排空。3s 上限防极端积压下收尾挂死（连接本就在收尾）。
+            io::Result::Ok(())
         }
-        let _ = flush_res;
-        // CloseWrite+排空。3s 上限防极端积压下收尾挂死（连接本就在收尾）。
-        io::Result::Ok(())
     };
 
     // join! 语义：四块被并发轮询（读等待不阻塞写推进），全部完成后返回。
@@ -600,51 +678,73 @@ where
     let (_s_read, mut s_write) = tokio::io::split(stream); // 下行走 splice，读半部不再需要
     let (up_done_tx, _up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    // 中止闸（bd rjt2o）：上行写腿被堵时读侧判定无法执行（同 full 变体）；
+    // 下行是内核 splice（Go 24h 计时 + EOF 即终），不接闸。
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
     // 上行 = Go buf.Copy(input, writer)（freedom.go:421）：link.reader → 出站，
     // ConnectionIdle 空闲窗 + 下行结束后的 UplinkOnly 半关闭窗，语义同
     // [`bridge_link_with_stream_full`] 的上行。
-    let up = async move {
-        let mut down_done = down_done_rx;
-        let mut window: Option<std::time::Duration> = None;
-        loop {
-            let mb = match window {
-                None => {
-                    // 预算先绑定具名局部：`Budget::tokio()` 是临时值，
-                    // 在 select! 内其借用会跨越 await（E0716：Linux 构建红点）。
-                    let idle_dl = Budget::tokio().deadline(conn_idle);
-                    tokio::select! {
-                        res = idle_dl.timeout(reader.read_multi_buffer()) => {
-                            match res {
-                                Ok(r) => r,
-                                Err(_) => break,
+    let up = {
+        let abort_tx = abort_tx.clone();
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut down_done = down_done_rx;
+            let mut window: Option<std::time::Duration> = None;
+            loop {
+                let mb = match window {
+                    None => {
+                        // 预算先绑定具名局部：`Budget::tokio()` 是临时值，
+                        // 在 select! 内其借用会跨越 await（E0716：Linux 构建红点）。
+                        let idle_dl = Budget::tokio().deadline(conn_idle);
+                        tokio::select! {
+                            res = idle_dl.timeout(reader.read_multi_buffer()) => {
+                                match res {
+                                    Ok(r) => r,
+                                    Err(_) => {
+                                        let _ = abort_tx.send(true);
+                                        break;
+                                    },
+                                }
+                            }
+                            _ = down_done.changed() => {
+                                window = *down_done.borrow();
+                                continue;
                             }
                         }
-                        _ = down_done.changed() => {
-                            window = *down_done.borrow();
-                            continue;
+                    },
+                    Some(d) => {
+                        match Budget::tokio().deadline(d).timeout(reader.read_multi_buffer()).await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = abort_tx.send(true);
+                                break;
+                            },
                         }
-                    }
-                },
-                Some(d) => {
-                    match Budget::tokio().deadline(d).timeout(reader.read_multi_buffer()).await {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    }
-                },
-            };
-            match mb {
-                Ok(mb) if !mb.is_empty() => {
-                    if write_all_mb(&mut s_write, &mb).await.is_err() {
-                        break;
-                    }
-                },
-                _ => break,
+                    },
+                };
+                match mb {
+                    Ok(mb) if !mb.is_empty() => {
+                        let wrote = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break,
+                            r = write_all_mb(&mut s_write, &mb) => r,
+                        };
+                        if wrote.is_err() {
+                            break;
+                        }
+                    },
+                    _ => break,
+                }
             }
+            // 3s 界：对端不读时 shutdown 自身也会挂（同 full 变体的 shutdown_flush）。
+            let _ = Budget::tokio()
+                .deadline(std::time::Duration::from_secs(3))
+                .timeout(s_write.shutdown())
+                .await;
+            let _ = up_done_tx.send(Some(downlink_only));
+            io::Result::Ok(())
         }
-        let _ = s_write.shutdown().await;
-        let _ = up_done_tx.send(Some(downlink_only));
-        io::Result::Ok(())
     };
 
     // 下行 = Go tc.ReadFrom(readerConn)（proxy.go:768）：出站裸 socket 经内核
@@ -705,94 +805,133 @@ pub async fn bridge_link_with_link(
     // 半关闭限窗语义同 bridge_link_with_stream_full（Go UplinkOnly/DownlinkOnly）。
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    // 中止闸（bd rjt2o）：同 bridge_link_with_stream_full——`join!` 等两腿全归，
+    // 被堵在写腿的那一向不再被 poll，读侧判定无法执行。闸只搬运既有判定。
+    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
     // 上行：a → b
-    let up = async move {
-        let mut down_done = down_done_rx;
-        let mut window: Option<std::time::Duration> = None;
-        loop {
-            let mb = match window {
-                None => {
-                    let idle_dl = Budget::tokio().deadline(conn_idle);
-                    tokio::select! {
-                        // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
-                        res = idle_dl.timeout(a_reader.read_multi_buffer()) => match res {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        },
-                        _ = down_done.changed() => {
-                            window = *down_done.borrow();
-                            continue;
+    let up = {
+        let abort_tx = abort_tx.clone();
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut down_done = down_done_rx;
+            let mut window: Option<std::time::Duration> = None;
+            loop {
+                let mb = match window {
+                    None => {
+                        let idle_dl = Budget::tokio().deadline(conn_idle);
+                        tokio::select! {
+                            // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                            res = idle_dl.timeout(a_reader.read_multi_buffer()) => match res {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    let _ = abort_tx.send(true);
+                                    break;
+                                },
+                            },
+                            _ = down_done.changed() => {
+                                window = *down_done.borrow();
+                                continue;
+                            }
                         }
-                    }
-                },
-                Some(d) => {
-                    match Budget::tokio().deadline(d).timeout(a_reader.read_multi_buffer()).await {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    }
-                },
-            };
-            match mb {
-                Ok(mb) if !mb.is_empty() => {
-                    if b_writer.write_multi_buffer(mb).await.is_err() {
-                        break;
-                    }
-                },
-                _ => break,
+                    },
+                    Some(d) => {
+                        match Budget::tokio()
+                            .deadline(d)
+                            .timeout(a_reader.read_multi_buffer())
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = abort_tx.send(true);
+                                break;
+                            },
+                        }
+                    },
+                };
+                match mb {
+                    Ok(mb) if !mb.is_empty() => {
+                        let wrote = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break,
+                            r = b_writer.write_multi_buffer(mb) => r,
+                        };
+                        if wrote.is_err() {
+                            break;
+                        }
+                    },
+                    _ => break,
+                }
             }
+            // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
+            let _ = Budget::tokio()
+                .deadline(std::time::Duration::from_secs(3))
+                .timeout(b_writer.shutdown_flush())
+                .await;
+            let _ = up_done_tx.send(Some(downlink_only));
+            io::Result::Ok(())
         }
-        // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
-        let _ = Budget::tokio()
-            .deadline(std::time::Duration::from_secs(3))
-            .timeout(b_writer.shutdown_flush())
-            .await;
-        let _ = up_done_tx.send(Some(downlink_only));
-        io::Result::Ok(())
     };
 
     // 下行：b → a
-    let down = async move {
-        let mut up_done = up_done_rx;
-        let mut window: Option<std::time::Duration> = None;
-        loop {
-            let mb = match window {
-                None => {
-                    let idle_dl = Budget::tokio().deadline(conn_idle);
-                    tokio::select! {
-                        // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
-                        res = idle_dl.timeout(b_reader.read_multi_buffer()) => match res {
-                            Ok(r) => r,
-                            Err(_) => break,
-                        },
-                        _ = up_done.changed() => {
-                            window = *up_done.borrow();
-                            continue;
+    let down = {
+        let abort_tx = abort_tx.clone();
+        let mut abort_rx = abort_rx.clone();
+        async move {
+            let mut up_done = up_done_rx;
+            let mut window: Option<std::time::Duration> = None;
+            loop {
+                let mb = match window {
+                    None => {
+                        let idle_dl = Budget::tokio().deadline(conn_idle);
+                        tokio::select! {
+                            // 空闲 deadline 语义同 bridge_link_with_stream_full（ConnectionIdle）
+                            res = idle_dl.timeout(b_reader.read_multi_buffer()) => match res {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    let _ = abort_tx.send(true);
+                                    break;
+                                },
+                            },
+                            _ = up_done.changed() => {
+                                window = *up_done.borrow();
+                                continue;
+                            }
                         }
-                    }
-                },
-                Some(d) => {
-                    match Budget::tokio().deadline(d).timeout(b_reader.read_multi_buffer()).await {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    }
-                },
-            };
-            match mb {
-                Ok(mb) if !mb.is_empty() => {
-                    if a_writer.write_multi_buffer(mb).await.is_err() {
-                        break;
-                    }
-                },
-                _ => break,
+                    },
+                    Some(d) => {
+                        match Budget::tokio()
+                            .deadline(d)
+                            .timeout(b_reader.read_multi_buffer())
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => {
+                                let _ = abort_tx.send(true);
+                                break;
+                            },
+                        }
+                    },
+                };
+                match mb {
+                    Ok(mb) if !mb.is_empty() => {
+                        let wrote = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break,
+                            r = a_writer.write_multi_buffer(mb) => r,
+                        };
+                        if wrote.is_err() {
+                            break;
+                        }
+                    },
+                    _ => break,
+                }
             }
+            let _ = Budget::tokio()
+                .deadline(std::time::Duration::from_secs(3))
+                .timeout(a_writer.shutdown_flush())
+                .await;
+            let _ = down_done_tx.send(Some(uplink_only));
+            io::Result::Ok(())
         }
-        let _ = Budget::tokio()
-            .deadline(std::time::Duration::from_secs(3))
-            .timeout(a_writer.shutdown_flush())
-            .await;
-        let _ = down_done_tx.send(Some(uplink_only));
-        io::Result::Ok(())
     };
 
     let (up_res, down_res) = tokio::join!(up, down);
@@ -1548,6 +1687,177 @@ mod tests {
         );
         let _ = up_w;
         let _ = dn_r;
+    }
+
+    // ---- 中止闸（bd rjt2o）：写腿被堵时连接必须按时拆（S1/S3 钉死回归门）----
+
+    /// 上行写腿被堵（对端活着但不读，写永不 Ready）+ 上行 reader 把 64 条 mpsc
+    /// 灌满 → 读侧判定只能由下行腿的 connIdle 给出：关闸 → 写腿/send 腿即刻归 →
+    /// 桥按时返回。修前此形态永不返回（`join!` 等四腿全归）。
+    #[tokio::test]
+    async fn bridge_stream_full_abort_gate_releases_stalled_uplink_writer() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+            time::Duration,
+        };
+
+        use xray_features::policy::TimeoutPolicy;
+
+        use crate::link::Link;
+
+        /// 写永不 Ready（对端不读）、读永不就绪；shutdown 也永不就绪（3s 界必须兜住）。
+        struct StallConn;
+        impl tokio::io::AsyncRead for StallConn {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl tokio::io::AsyncWrite for StallConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Pending
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl Connection for StallConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        // 上行源 4MB 顺序读：够把 PIPE_BUF_CAP=64 条 mpsc 灌满 → up_reader 卡在 send。
+        let up_src = xray_buf::io::new_reader(std::io::Cursor::new(vec![0u8; 4 * 1024 * 1024]));
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(up_src, Box::new(dn_w));
+
+        let policy =
+            TimeoutPolicy { connection_idle: Duration::from_millis(100), ..Default::default() };
+        let start = xray_frame::compat::clock().now_instant();
+        let res = tokio::time::timeout(
+            Duration::from_secs(6),
+            bridge_link_with_stream_full(link, StallConn, &policy),
+        )
+        .await
+        .expect("write-stalled bridge must return (abort gate), not pin the connection");
+        assert!(res.is_ok());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "conn_idle(100ms) + shutdown 3s 界, got {:?}",
+            start.elapsed()
+        );
+        let _ = dn_r;
+    }
+
+    /// 下行写腿被堵（link.writer 写永不完成）：下行读侧 connIdle 到点 → 关闸 →
+    /// 写腿即刻归，桥按时返回（修前 `join!` 永挂）。
+    #[tokio::test]
+    async fn bridge_stream_full_abort_gate_releases_stalled_downlink_writer() {
+        use std::{future::Future, pin::Pin, task::Context, time::Duration};
+
+        use xray_buf::{
+            io::{Result as BufResult, Writer},
+            multi::MultiBuffer,
+        };
+        use xray_features::policy::TimeoutPolicy;
+
+        use crate::link::Link;
+
+        /// 写永不完成的 link.writer（背压钉死）。
+        struct StallLinkWriter;
+        impl Writer for StallLinkWriter {
+            fn write_multi_buffer(
+                &mut self,
+                _mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = BufResult<()>> + Send + '_>> {
+                Box::pin(std::future::pending::<BufResult<()>>())
+            }
+        }
+
+        /// 读：先给一帧下行数据（喂满 down_writer 让它卡在写），之后永不就绪。
+        struct ChunkThenSilent {
+            chunk: Option<Vec<u8>>,
+        }
+        impl tokio::io::AsyncRead for ChunkThenSilent {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                match self.chunk.take() {
+                    Some(d) => {
+                        buf.put_slice(&d);
+                        Poll::Ready(Ok(()))
+                    },
+                    None => Poll::Pending,
+                }
+            }
+        }
+        impl tokio::io::AsyncWrite for ChunkThenSilent {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for ChunkThenSilent {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        // 上行源有界（快速 EOF，不参与判定），确保关闸只能来自下行读侧。
+        let up_src = xray_buf::io::new_reader(std::io::Cursor::new(vec![0u8; 64 * 1024]));
+        let link = Link::new(up_src, Box::new(StallLinkWriter));
+        let stream = ChunkThenSilent { chunk: Some(vec![0x5A; 4096]) };
+
+        let policy =
+            TimeoutPolicy { connection_idle: Duration::from_millis(100), ..Default::default() };
+        let start = xray_frame::compat::clock().now_instant();
+        let res = tokio::time::timeout(
+            Duration::from_secs(6),
+            bridge_link_with_stream_full(link, stream, &policy),
+        )
+        .await
+        .expect("down-write-stalled bridge must return (abort gate), not pin the connection");
+        assert!(res.is_ok());
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "downlink_only(1s) 窗口应当兜住收尾, got {:?}",
+            start.elapsed()
+        );
     }
 
     /// bridge_connections 池化路径：两端双向 8KB 流量必须无丢失、按时返回。

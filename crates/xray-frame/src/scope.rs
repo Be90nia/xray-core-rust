@@ -27,12 +27,25 @@
 //! 经 [`ConnScope::child_of`] 订阅信号**事件驱动**级联取消——替代旧 20ms 闸位
 //! 轮询（每连接 ≈50 次/秒空转唤醒，bd mzput），稳态零唤醒。
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use skeleton_infra::fx::{
     CancelSource, CancelToken, FxScope, ScopeClosed, ShutdownReport, Spawned, cancel_pair,
 };
 use tokio::sync::watch;
+
+use crate::logging::LogFacade;
+
+/// scope 域日志门面（进程级单例）：spawn 拒发与任务 panic 的上报口，target
+/// `xray_frame::scope`。克隆 = 空 Vec + 空 HashMap（零堆分配）。
+fn scope_log() -> LogFacade {
+    static LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("scope", Vec::new()));
+    LOG.clone()
+}
 
 /// arm 级父 scope（关闭信号中枢）：内嵌 udf `FxScope`（托管语义零变化）+
 /// `watch` 关闭广播。**父级关闭事件必须经 [`ArmScope::close`]**——裸
@@ -57,7 +70,8 @@ impl ArmScope {
         &self.fx
     }
 
-    /// 托管任务（等价 `self.fx().spawn`）。
+    /// 托管任务（udf `FxScope::spawn_tracked` + 收割：先清已完成条目再入集，
+    /// bd 86i4h 阶段1——条目数跟随在途数而非累计 spawn 数）。
     ///
     /// `#[inline(always)]`：薄透传不落真实栈帧——debug 构建不内联，本仓 xray-core
     /// inbound 深轮询链的测试线程栈余量已薄（mzput 实证：一层透传帧即可击穿
@@ -70,7 +84,7 @@ impl ArmScope {
     where
         T: Send + 'static,
     {
-        self.fx.spawn_tracked(fut)
+        crate::compat::spawn_reaping(&self.fx, &scope_log(), "arm scope", fut)
     }
 
     /// accepting 闸读侧（true = 已关）。
@@ -157,7 +171,7 @@ impl ConnScope {
         scope
     }
 
-    /// 托管任务（等价 `ctx.spawn`，但归属本连接 scope）。
+    /// 托管任务（等价 `ctx.spawn`，但归属本连接 scope；含增量收割，bd 86i4h）。
     ///
     /// 返回的句柄 join 后得 `Option<T>`：`None` = 任务被 scope 取消（父关 /
     /// 本 scope 关闭）而非正常完成——取消语义必须与"完成"可区分（禁静默把
@@ -170,7 +184,9 @@ impl ConnScope {
         T: Send + 'static,
     {
         let token = self.token.clone();
-        self.fx.spawn_tracked(async move { token.run_until_cancelled(fut).await })
+        crate::compat::spawn_reaping(&self.fx, &scope_log(), "conn scope", async move {
+            token.run_until_cancelled(fut).await
+        })
     }
 
     /// 取消令牌观察面（任务内携带判停）。

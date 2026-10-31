@@ -209,6 +209,13 @@ impl DnsAppConfig {
 
         let query_strategy = parse_query_strategy(self.query_strategy.as_deref());
         let base_ip_option = ip_option_from_strategy(query_strategy);
+        // Go dns.go:89-92：`defaultTag := config.Tag`，空则随机——**在构建 clients
+        // 之前**算定，各 nameserver 缺 tag 时用它（dns.go:142-145 `tag := defaultTag`）。
+        // 缺这层，client tag 恒随机 → 配置了顶层 `tag` 也命不中 ownLink。
+        let service_tag = match self.tag.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => generate_random_tag(),
+        };
 
         let client_ip = parse_client_ip(self.client_ip.as_deref())?;
         validate_client_ip_len(client_ip.len())?;
@@ -248,6 +255,7 @@ impl DnsAppConfig {
                 self.disable_cache.unwrap_or(false),
                 self.serve_stale.unwrap_or(false),
                 self.serve_expired_ttl.unwrap_or(0),
+                &service_tag,
             )?;
             let client_idx = clients.len() as u16;
             clients.push(Arc::new(c));
@@ -316,7 +324,7 @@ impl DnsAppConfig {
         }
         let hosts = StaticHosts::new(mappings)?;
 
-        let tag = self.tag.unwrap_or_else(generate_random_tag);
+        let tag = service_tag;
 
         Ok(DnsServiceConfig {
             client_ip,
@@ -429,6 +437,9 @@ fn build_client(
     global_disable_cache: bool,
     global_serve_stale: bool,
     global_serve_expired_ttl: u32,
+    // 顶层 `dns.tag`（空则已由 `build` 生成随机值）：per-server 无 tag 时的
+    // 缺省（Go dns.go:142-145 `tag := defaultTag`）。
+    global_tag: &str,
 ) -> Result<Client, DnsError> {
     let client_ip = parse_client_ip(ns.client_ip.as_deref())?;
     let client_ip = if client_ip.is_empty() {
@@ -457,7 +468,12 @@ fn build_client(
         skip_fallback: ns.skip_fallback,
         timeout_ms: ns.timeout.unwrap_or(0),
         query_strategy: ns.query_strategy.as_deref().map(|s| parse_query_strategy(Some(s))),
-        tag: ns.tag.clone().unwrap_or_default(),
+        // Go dns.go:142-145：`tag := defaultTag; if len(ns.Tag) > 0 { tag = ns.Tag }`
+        // ——缺省不是随机量，而是顶层 `dns.tag`（校验点 = is_own_link 的 client 集合）。
+        tag: match ns.tag.as_deref() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => global_tag.to_string(),
+        },
         final_query: ns.final_query.unwrap_or(false),
         // Go app/dns/dns.go:127-130：disableCache := config.DisableCache;
         // if ns.DisableCache != nil { disableCache = *ns.DisableCache }。
@@ -932,9 +948,18 @@ mod tests {
         }"#;
         let ns: NameServerJson = serde_json::from_str(json).unwrap();
         let datadir = std::path::Path::new("");
-        let client: Client =
-            build_client(&ns, &[], crate::config::IpOption::all(), datadir, 0, false, false, 0)
-                .unwrap();
+        let client: Client = build_client(
+            &ns,
+            &[],
+            crate::config::IpOption::all(),
+            datadir,
+            0,
+            false,
+            false,
+            0,
+            "xray.system.test",
+        )
+        .unwrap();
 
         // Client 公开字段。
         assert_eq!(client.policy_id, 7);
@@ -966,6 +991,7 @@ mod tests {
                 false, // 全局 disableCache = false
                 true,  // 全局 serveStale = true
                 30,    // 全局 serveExpiredTTL = 30
+                "xray.system.test",
             )
             .unwrap()
         };
@@ -998,6 +1024,7 @@ mod tests {
                 true, // 全局 disableCache = true
                 false,
                 0,
+                "xray.system.test",
             )
             .unwrap()
         };
@@ -1009,6 +1036,28 @@ mod tests {
         // per-NS 显式 false 覆盖全局 true。
         let overridden = mk(r#"{ "address": "1.1.1.1", "disableCache": false }"#);
         assert!(!overridden.server.is_disable_cache(), "per-NS disableCache=false 应覆盖全局 true");
+    }
+
+    /// 7qxjj②：Go dns.go:89-92/142-145——per-server 无 `tag` 时 client tag 取
+    /// **顶层 `dns.tag`**（缺省才随机）。ownLink 判定比对的就是这组 client tag，
+    /// 缺这层时配了顶层 tag 也命不中（每条 client 各自随机）。
+    #[test]
+    fn client_tag_defaults_to_service_tag() {
+        let cfg: DnsAppConfig = serde_json::from_str(
+            r#"{
+            "tag": "dns-service",
+            "servers": [
+                {"address": "1.1.1.1"},
+                {"address": "8.8.8.8", "tag": "explicit"}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let built = cfg.build().unwrap();
+        let tags: Vec<&str> = built.clients.iter().map(|c| c.tag.as_str()).collect();
+        assert_eq!(tags, vec!["dns-service", "explicit"]);
+        // 服务级 tag 同时是 DnsServiceConfig.tag（ownLink 的另一半）。
+        assert_eq!(built.tag, "dns-service");
     }
 
     /// 8kha：构建 DNS 配置并返回各 client 的 policy_id（按 servers 顺序）。

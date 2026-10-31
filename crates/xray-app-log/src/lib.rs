@@ -38,7 +38,7 @@ pub use feature::LogFeature;
 pub use instance::{
     AccessMessage, AccessStatus, ConsoleHandler, ConsoleHandlerCreator, DnsLog, DnsStatus,
     FileHandler, FileHandlerCreator, GeneralMessage, HandlerCreator, HandlerCreatorOptions,
-    HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance, NoneHandlerCreator,
+    HandlerCreatorRegistry, LogEntry, LogHandler, LogInstance, NoneHandlerCreator, record_dns,
     register_default_creators,
 };
 pub use mask::{mask_addresses, parse_mask_address};

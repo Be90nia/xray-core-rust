@@ -365,6 +365,12 @@ async fn start_full_dispatched(
         if let Some(stats) = instance.get_feature::<crate::register::AppStatsFeature>() {
             metrics.set_stats_collector(stats);
         }
+        // bd sex3y②：`/debug/vars` 的 observatory 段接 Observatory app
+        // （Go metrics `expvar.Publish("observatory", ...)` 读 observatory 快照）；
+        // 无 observatory app 时保持 None（该段导出 null，与 Go 无 app 同）。
+        if let Some(obs) = instance.get_feature::<xray_app_observatory::ObservatoryFeature>() {
+            metrics.set_obs_collector(Arc::new(ObservatoryMetricsCollector(obs)));
+        }
     }
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
     dispatcher.udp443_policies =
@@ -794,8 +800,36 @@ impl xray_app_proxyman::command::HandlerService for ApiHandlerService {
     }
 }
 
-// ========== DNS 查询拨号桥（bd mcpo）==========
+// ========== Observatory → metrics `/debug/vars` 适配（bd sex3y②）==========
 
+/// Observatory app 快照 → metrics 的 observatory 段。
+///
+/// 对应 Go `app/metrics` 侧 `expvar.Publish("observatory", ...)` 读 observatory
+/// 的 `ObservationResult`；Rust 两侧类型各自独立（observatory 不依赖 metrics），
+/// 故在装配层（此处）做一次字段映射，避免任一侧反向依赖。
+struct ObservatoryMetricsCollector(Arc<xray_app_observatory::ObservatoryFeature>);
+
+impl xray_app_metrics::ObservationCollector for ObservatoryMetricsCollector {
+    fn collect(&self) -> Option<xray_app_metrics::ObservationSnapshot> {
+        let obs = self.0.observer().get_observation();
+        Some(xray_app_metrics::ObservationSnapshot {
+            entries: obs
+                .status
+                .into_iter()
+                .map(|s| xray_app_metrics::ObservationEntry {
+                    outbound_tag: s.outbound_tag,
+                    extra: vec![
+                        ("alive".to_string(), s.alive.to_string()),
+                        ("delay".to_string(), s.delay.to_string()),
+                        ("lastError".to_string(), s.last_error_reason),
+                    ],
+                })
+                .collect(),
+        })
+    }
+}
+
+// ========== DNS 查询拨号桥（bd mcpo）==========
 /// 生产 DNS 查询拨号器：把 [`xray_app_dns::dial::QueryDialer`] 语义桥到
 /// [`DefaultDispatcher`]（对应 Go DNS nameserver 持 routing.Dispatcher）。
 #[derive(Debug)]
@@ -816,8 +850,13 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
         // 路由层不得再解析目标域名，否则域名 NS + 非 AsIs 策略会递归查询。
         let dispatcher = Arc::clone(&self.dispatcher);
         let dest = dest.clone();
+        // Go nameserver.go:184：本 client 的 tag 作为 `session.Inbound.Tag` 随 ctx
+        // 进 dispatcher——dns 出站 ownLink 判定（proxy/dns/dns.go:242）靠它认领
+        // 「本服务自己的上游查询」，否则上游查询被当用户流量再劫持一次（D1 回环）。
+        let inbound_tag = xray_app_dns::dial::current_client_tag().unwrap_or_default();
         Box::pin(async move {
-            let access = AccessContext { skip_dns_resolve: true, ..AccessContext::default() };
+            let access =
+                AccessContext { inbound_tag, skip_dns_resolve: true, ..AccessContext::default() };
             let link = dispatcher
                 .dispatch_with_access(&dest, &SniffingRequest::default(), None, None, Some(access))
                 .map_err(|e| std::io::Error::other(format!("dns dispatch: {e}")))?;
@@ -840,10 +879,12 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
     > {
         // Go nameserver_udp.go:134 udpServer.Dispatch 包粒度语义：raw DNS 包
         // 经 UdpDispatchSession 装 XUDP 帧 → dispatch_link 路由 → outbound
-        // （freedom 等）拆帧发出。
+        // （freedom 等）拆帧发出。client tag 随 handler 走到 dispatch_link，
+        // 供 dns 出站 ownLink 认领（Go nameserver.go:184，见 dial_tcp 同注）。
         let session =
             xray_app_dispatcher::UdpDispatchSession::new(Arc::new(DispatcherLinkHandler {
                 dispatcher: Arc::clone(&self.dispatcher),
+                inbound_tag: xray_app_dns::dial::current_client_tag().unwrap_or_default(),
             }));
         Box::pin(async move {
             Ok(Box::new(DnsUdpSessionAdapter { session })
@@ -856,6 +897,8 @@ impl xray_app_dns::dial::QueryDialer for DispatcherDnsDialer {
 /// dispatcher 完整路由链（等价生产 inbound 的 InboundDispatchHandler 路径）。
 struct DispatcherLinkHandler {
     dispatcher: Arc<DefaultDispatcher>,
+    /// 查询所属 DNS client tag（Go `session.Inbound.Tag`，ownLink 判定用）。
+    inbound_tag: String,
 }
 
 impl std::fmt::Debug for DispatcherLinkHandler {
@@ -876,7 +919,11 @@ impl xray_app_dispatcher::DispatchHandler for DispatcherLinkHandler {
     ) -> xray_app_dispatcher::default::PinFuture<()> {
         // DNS 查询同样置 SkipDNSResolve（Go UDP 直连不经路由；Rust 经路由链，
         // 置位以保持"DNS 查询不再被解析"的等价语义，防递归）。
-        let access = AccessContext { skip_dns_resolve: true, ..AccessContext::default() };
+        let access = AccessContext {
+            inbound_tag: self.inbound_tag.clone(),
+            skip_dns_resolve: true,
+            ..AccessContext::default()
+        };
         let r = self.dispatcher.dispatch_link(
             dest,
             link,

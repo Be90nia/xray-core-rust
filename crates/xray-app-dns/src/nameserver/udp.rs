@@ -288,6 +288,10 @@ impl UdpNameServer {
     ///
     /// 与 Go 的差异（有意）：Go `nameserver_udp.go:118-137` 只有 EDNS0 重发，TC=1 时
     /// 把截断应答直接交给 cache；此处按 RFC 7766 §5 追加 TCP 兜底。
+    ///
+    /// 兜底失败（上游只监听 UDP / TCP 被墙）时**回落 Go 语义**：按截断应答收场
+    /// （NOERROR + 0 记录进 cache → 客户端拿到空应答），不再整体报错致零应答
+    /// （bd 1ksxu D7：Go 客户端得到空应答，Rust 客户端一直等到超时）。
     async fn finish_udp_response(
         &self,
         parsed: &ParsedResponse,
@@ -299,7 +303,17 @@ impl UdpNameServer {
         if !parsed.truncated {
             return Ok(parsed_to_ip_record(parsed, now));
         }
-        self.tcp_fallback_query(fqdn, record_type, deadline).await
+        match self.tcp_fallback_query(fqdn, record_type, deadline).await {
+            Ok(record) => Ok(record),
+            Err(e) => {
+                tracing::warn!(
+                    target: "xray.dns.udp",
+                    fqdn, error = %e,
+                    "TC=1 tcp fallback failed, returning truncated answer (Go semantics)"
+                );
+                Ok(parsed_to_ip_record(parsed, now))
+            },
+        }
     }
 
     /// TC=1 是否要追加 EDNS0 重发。

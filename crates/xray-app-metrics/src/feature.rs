@@ -90,6 +90,18 @@ impl MetricsFeature {
         self
     }
 
+    /// 装配阶段注入 observation 收集器（`&self` 版本：Instance 持
+    /// `Arc<MetricsFeature>` 时调用，bd sex3y—— `with_obs_collector` 吃所有权，
+    /// 装配点只有 `Arc` 句柄）。内部 RwLock，start 前生效。
+    ///
+    /// 生产缺口（审计 2026-10-31）：`metrics_factory` 造出的 feature 无人注入
+    /// obs collector ⇒ `/debug/vars` 的 `observatory` 恒 `null`。注入方 = 持
+    /// observatory `StatusStore` 的装配面（xray-core functions.rs 的 stats 注入
+    /// 块旁），由它把状态转成 [`crate::ObservationSnapshot`]。
+    pub fn set_obs_collector(&self, obs: Arc<dyn ObservationCollector>) {
+        *self.obs.write() = Some(obs);
+    }
+
     /// 获取内部 MetricsHandler 引用。
     pub fn handler(&self) -> &MetricsHandler {
         &self.handler

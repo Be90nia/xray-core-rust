@@ -168,3 +168,56 @@ async fn feature_serves_metrics_with_injected_obs_collector() {
 
     feature.close().expect("close ok");
 }
+
+/// bd sex3y 验收：装配面（`&self` 形）注入前后 `/debug/vars` 的 `observatory`
+/// 观测差异——未注入 = `null`（当前生产形态），注入后 = 按 outbound_tag 的条目。
+#[tokio::test]
+async fn set_obs_collector_changes_debug_vars_observatory() {
+    use xray_app_metrics::{ObservationCollector, ObservationEntry, ObservationSnapshot};
+
+    struct WithObs;
+    impl ObservationCollector for WithObs {
+        fn collect(&self) -> Option<ObservationSnapshot> {
+            let mut s = ObservationSnapshot::default();
+            s.entries.push(ObservationEntry {
+                outbound_tag: "out_obs".into(),
+                extra: vec![("alive".into(), "true".into())],
+            });
+            Some(s)
+        }
+    }
+
+    // ① 未注入：observatory 恒 null（审计实证的生产形态）。
+    let (addr, plain) = start_feature_retrying(|addr| {
+        MetricsFeature::new(xray_app_metrics::MetricsConfig {
+            tag: "obs-before".into(),
+            listen: addr.to_string(),
+        })
+    })
+    .await;
+    let resp = http_get(addr, "/debug/vars").await;
+    assert!(
+        resp.contains("\"observatory\":null"),
+        "未注入 obs collector 时 observatory 必须是 null: {resp}"
+    );
+    plain.close().expect("close ok");
+
+    // ② 注入后（Arc<MetricsFeature> 上的 &self 形，生产装配同款）：条目出现。
+    let (addr, injected) = start_feature_retrying(|addr| {
+        let feature = MetricsFeature::new(xray_app_metrics::MetricsConfig {
+            tag: "obs-after".into(),
+            listen: addr.to_string(),
+        });
+        let as_arc = Arc::new(feature);
+        as_arc.set_obs_collector(Arc::new(WithObs));
+        Arc::try_unwrap(as_arc).unwrap_or_else(|_| unreachable!("唯一强引用"))
+    })
+    .await;
+    let resp = http_get(addr, "/debug/vars").await;
+    assert!(
+        resp.contains("\"observatory\":{\"out_obs\":{"),
+        "注入后 observatory 必须按 outbound_tag 出现: {resp}"
+    );
+    assert!(resp.contains("\"alive\":\"true\""), "extra 键值必须带上: {resp}");
+    injected.close().expect("close ok");
+}

@@ -186,6 +186,51 @@ where
     spawn_scope().spawn_tracked(fut)
 }
 
+/// 增量收割：把已完成条目清出 udf `JoinSet`，其中 panic 载荷落 `log`（abort
+/// 条目 = 预期消亡，不计）。返回收割到的条目数（诊断/断言面）。
+///
+/// 收割语义 = udf `FxScope::try_reap`（非阻塞，不动在途任务、不改 `in_flight`）；
+/// 本件只负责**上报形态**与**装配点**——无此装配点的 scope 条目按累计 spawn
+/// 数永久滞留（udf issue#13 缺口一）。
+pub fn reap_into(scope: &FxScope, log: &LogFacade, label: &str) -> usize {
+    let reaped = scope.try_reap();
+    let count = reaped.len();
+    for outcome in reaped {
+        if let TaskError::Panicked(msg) = outcome {
+            log.error(format!("{label}: background task panicked: {msg}"));
+        }
+    }
+    count
+}
+
+/// 托管 spawn 的收割版（bd 86i4h 阶段1）：**先收割已完成条目、再入集新任务**
+/// ——条目数跟随在途任务数而非累计任务数（长跑服务端「每连接一个任务」形态的
+/// 内存只涨不降即由此消失）。拒发（`ScopeClosed`）与 panic 上报口径同
+/// [`ManagedScope::spawn`]，调用方无需各自处理。
+///
+/// spawn 速率 ≥ panic 速率时滞留窗口恒有界；空闲期 panic 由停机排空兜底上报
+/// （udf `ShutdownReport::panicked`，不丢）。
+///
+/// `#[inline(always)]`：本件是每条连接的热路径透传口，薄帧不得成为栈开销
+/// （xray-core inbound 深轮询链栈余量薄，mzput 实证）。
+#[inline(always)]
+pub fn spawn_reaping<T>(
+    scope: &FxScope,
+    log: &LogFacade,
+    label: &str,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> Result<Spawned<T>, ScopeClosed>
+where
+    T: Send + 'static,
+{
+    reap_into(scope, log, label);
+    let spawned = scope.spawn_tracked(fut);
+    if spawned.is_err() {
+        log.warn(format!("{label}: spawn rejected (scope closed)"));
+    }
+    spawned
+}
+
 /// 托管任务面（bd 4a1zy）：组合包装 udf [`FxScope`]，四口 = `spawn` / `close` /
 /// `in_flight` / `shutdown_timeout`。
 ///
@@ -224,7 +269,7 @@ impl ManagedScope {
 
     /// 托管 spawn：scope 已关（拒发）时记 warn 并回 `Err`。
     ///
-    /// 每次 spawn 前先 `reap`（udf `try_reap`）——已完成条目即时出集，其中
+    /// 走 [`spawn_reaping`]（udf `try_reap` + 入集）：已完成条目即时出集，其中
     /// 的 panic 载荷当场落日志。udf `task_body` 自带 `catch_unwind`（panic 归一成
     /// `TaskError::Panicked` 双投 oneshot + 集合条目），故本件**不再包任务体**：
     /// 上报口径 = `background task panicked: {payload}`（同迁移前 `harvest`）。
@@ -232,25 +277,15 @@ impl ManagedScope {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.reap();
-        let spawned = self.scope.spawn_tracked(fut);
-        if spawned.is_err() {
-            self.log.warn(format!("{}: spawn rejected (scope closed)", self.label));
-        }
-        spawned
+        spawn_reaping(&self.scope, &self.log, &self.label, fut)
     }
 
-    /// 增量收割已完成条目（udf `try_reap`）：panic 载荷落 error，abort 条目是预期
-    /// 消亡（`Cancelled`）不计；不动在途任务、不改 `in_flight`。
+    /// 增量收割已完成条目（udf `try_reap`）并上报 panic；返回收割条数。
     ///
-    /// 由 [`Self::spawn`] 每次调用前触发：spawn 速率 ≥ panic 速率时滞留窗口恒有界；
-    /// 空闲期的 panic 由停机排空兜底上报（不会丢）。
-    fn reap(&self) {
-        for outcome in self.scope.try_reap() {
-            if let TaskError::Panicked(msg) = outcome {
-                self.log.error(format!("{}: background task panicked: {msg}", self.label));
-            }
-        }
+    /// [`Self::spawn`] 每次调用前已自动收割；本体供**无 spawn 的空闲期**显式
+    /// 触发（调用方自定节拍），确保滞留窗口有界。
+    pub fn reap(&self) -> usize {
+        reap_into(&self.scope, &self.log, &self.label)
     }
 
     /// 关 accepting 闸（拒新 spawn，放行在途——udf `FxScope::close` 语义）。
@@ -478,6 +513,135 @@ mod tests {
         assert!(lines.contains("managed-scope boom"), "panic 载荷必须带上: {lines:?}");
         assert!(lines.contains("test-panic"), "报告必须带域标识: {lines:?}");
         assert!(lines.contains("drain boom"), "停机期 panic 必须上报: {lines:?}");
+    }
+
+    /// bd 86i4h 阶段1 验收：`spawn_reaping` 的收割分类——`Panicked` 载荷上报
+    /// （error+域标识）、`Cancelled`（abort=预期消亡）不上报、`Ok` 条目静默出集；
+    /// 二次收割为空（条目真的清出，不是计数漂移）。拒发（闸关）走 warn 上报。
+    #[test]
+    fn spawn_reaping_classifies_panic_cancelled_ok_and_rejects() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            // set_default（线程局部门面）+ block_on：future 恒在调用线程 poll，
+            // 捕获必定命中（多线程 runtime 上任务跨 worker 迁移会逃出捕获窗）。
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let scope = FxScope::new();
+                let log = LogFacade::new("test-reap", Vec::new());
+
+                // ① panic（句柄即弃 → 载荷只在集合面）
+                drop(
+                    spawn_reaping(&scope, &log, "reap-test", async { panic!("reap-boom") })
+                        .expect("spawn accepted"),
+                );
+                // ② 正常完成（Ok 条目）
+                drop(spawn_reaping(&scope, &log, "reap-test", async {}).expect("spawn accepted"));
+                // ③ abort（Cancelled 条目）
+                let doomed = spawn_reaping(&scope, &log, "reap-test", async {
+                    std::future::pending::<()>().await
+                })
+                .expect("spawn accepted");
+                doomed.abort();
+
+                for _ in 0..200 {
+                    if scope.in_flight() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(scope.in_flight(), 0, "三类任务都必须终局（panic 不逃逸）");
+
+                let reaped = reap_into(&scope, &log, "reap-test");
+                assert_eq!(
+                    reaped, 2,
+                    "try_reap 只回错误结局（Panicked + Cancelled）；Ok 条目静默出集: {reaped}"
+                );
+                assert_eq!(reap_into(&scope, &log, "reap-test"), 0, "二次收割空（幂等）");
+
+                // 拒发可见：闸关后 spawn 回 Err 且留 warn（禁静默放弃）。
+                scope.close();
+                assert!(
+                    spawn_reaping(&scope, &log, "reap-test", async {}).is_err(),
+                    "闸关后必须拒发"
+                );
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(lines.contains("background task panicked"), "panic 必须上报: {lines:?}");
+        assert!(lines.contains("reap-boom"), "panic 载荷必须带上: {lines:?}");
+        assert!(lines.contains("reap-test"), "报告必须带域标识: {lines:?}");
+        assert!(lines.contains("spawn rejected"), "拒发必须上报: {lines:?}");
+        assert_eq!(
+            lines.matches("background task panicked").count(),
+            1,
+            "Cancelled（abort）不得计入 panic 上报: {lines:?}"
+        );
+    }
+
+    /// 接线验收（bd 86i4h 阶段1）：`ArmScope::spawn` / `ConnScope::spawn` 内部
+    /// 已走 `spawn_reaping`——panic 载荷在**下一次 spawn** 被清出集合并上报，
+    /// 不再滞留到停机（长跑服务端「每连接一任务」的内存只涨不降）。
+    ///
+    /// 判别器：`ArmScope::fx().try_reap()` 只剩 0 条 = 前一次的 panic 条目已被
+    /// spawn 内置收割吃掉（未接线时它仍在集合里，返回 1 条）。
+    #[test]
+    fn scope_spawn_reaps_and_reports_panic() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let arm = crate::scope::ArmScope::new();
+                let doomed = arm.spawn(async { panic!("arm-boom") }).expect("spawn accepted");
+                while !doomed.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                drop(doomed); // 句柄丢弃：载荷只在集合面
+                let _ = arm.spawn(async {}).expect("spawn accepted");
+                assert_eq!(
+                    arm.fx().try_reap().len(),
+                    0,
+                    "ArmScope::spawn 必须内置收割（panic 条目不得滞留）"
+                );
+
+                let conn = crate::scope::ConnScope::new();
+                let doomed = conn.spawn(async { panic!("conn-boom") }).expect("spawn accepted");
+                while !doomed.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                drop(doomed);
+                let probe = conn.spawn(async {}).expect("spawn accepted");
+                while !probe.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+
+                for _ in 0..200 {
+                    if conn.in_flight() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(conn.in_flight(), 0, "任务必须终局（panic 不逃逸）");
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(lines.contains("arm-boom"), "ArmScope 收割必须上报 panic: {lines:?}");
+        assert!(lines.contains("conn-boom"), "ConnScope 收割必须上报 panic: {lines:?}");
     }
 
     /// 事件捕获订阅器：只把日志文本收进 `Vec`（线程局部安装，不抢全局槽）。

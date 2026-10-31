@@ -101,13 +101,16 @@ fn rand_u32() -> u32 {
 }
 
 fn rand_delay(range: PaddingDelayRange) -> Duration {
-    let min = range.min.as_nanos() as u64;
-    let max = range.max.as_nanos() as u64;
+    let min = range.min.as_nanos();
+    let max = range.max.as_nanos();
     if min == max {
         return range.min;
     }
+    // span 按 u128 计：`from_millis` 接受任意 u64 毫秒，纳秒区间可远超 u32。
+    // 旧实现 `span as u32` 把区间截到低 32 位（5s 区间实际只取到 ~0.7s），
+    // 且 span 为 2^32 倍数时除零 panic；Go 对应实现用 big.Int 无宽度限制。
     let span = max - min + 1;
-    let offset = u64::from(rand_u32() % (span as u32));
+    let offset = (u128::from(rand::random::<u64>()) % span) as u64;
     range.min + Duration::from_nanos(offset)
 }
 
@@ -554,6 +557,30 @@ mod tests {
     #[test]
     fn reject_empty_schedule() {
         assert!(validate_padding_schedule(&[], 0).is_err());
+    }
+
+    /// bd 3q3h0：`rand_delay` 的 span 曾按 u32 截断——>4.29s 的区间取样被截到低 32 位，
+    /// 且 span 恰为 2^32 时 rem-by-zero panic。两种失效形态各留一处断言。
+    #[test]
+    fn rand_delay_covers_spans_wider_than_u32() {
+        // span = 2^32 纳秒：旧实现在此除零 panic
+        let exact = PaddingDelayRange {
+            min: Duration::ZERO,
+            max: Duration::from_nanos(u64::from(u32::MAX)),
+        };
+        for _ in 0..32 {
+            let d = rand_delay(exact);
+            assert!(
+                d >= exact.min && d <= exact.max,
+                "{d:?} 越出 {:?}..={:?}",
+                exact.min,
+                exact.max
+            );
+        }
+        // 10s 区间：旧实现取样上限只有 ~1.41s，4096 次不可能有一次超过 5s
+        let wide = PaddingDelayRange::from_millis(0, 10_000);
+        let over_half = (0..4096).filter(|_| rand_delay(wide) > Duration::from_secs(5)).count();
+        assert!(over_half > 0, "10s 区间取样被截断在 5s 以下（4096 次全落低段）");
     }
 
     #[test]

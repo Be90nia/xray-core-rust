@@ -6,6 +6,7 @@
 use std::{future::Future, net::IpAddr, pin::Pin};
 
 use hickory_resolver::TokioResolver;
+use skeleton::clock::{Clock as _, SystemClock};
 /// 默认 TTL（Go `dns.DefaultTTL` = 300，features/dns/client.go:37）。
 pub use xray_features::dns::DEFAULT_TTL;
 
@@ -49,6 +50,8 @@ impl Server for LocalNameServer {
         option: IpOption,
     ) -> Pin<Box<dyn Future<Output = Result<(Vec<IpAddr>, u32), DnsError>> + Send + 'a>> {
         Box::pin(async move {
+            // 713x6：计时走时钟契约（生产 = SystemClock，Go `time.Since` 同语义）。
+            let started = SystemClock.now_instant();
             let lookup = self
                 .resolver
                 .lookup_ip(domain)
@@ -63,6 +66,17 @@ impl Server for LocalNameServer {
                     IpAddr::V6(_) => option.ipv6_enable,
                 })
                 .collect();
+
+            // Go nameserver_local.go:26：解析完成记一条 dns log。
+            xray_app_log::record_dns(xray_app_log::DnsLog {
+                query: String::new(),
+                domain: domain.to_string(),
+                result: ips.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
+                server: "localhost".to_string(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                status: xray_app_log::DnsStatus::Queried,
+                error: ips.is_empty().then(|| DnsError::EmptyResponse.to_string()),
+            });
 
             if ips.is_empty() { Err(DnsError::EmptyResponse) } else { Ok((ips, DEFAULT_TTL)) }
         })

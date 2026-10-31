@@ -10,7 +10,7 @@ use xray_features::{Feature, FeatureError, Result};
 use crate::{
     command::DefaultLogService,
     config::LogConfig,
-    instance::{HandlerCreatorRegistry, LogInstance, register_default_creators},
+    instance::{self, HandlerCreatorRegistry, LogInstance, register_default_creators},
 };
 
 /// Log app Feature 实现。
@@ -60,10 +60,15 @@ impl Feature for LogFeature {
             .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })?;
         self.instance
             .start(&self.registry)
-            .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })
+            .map_err(|e| FeatureError::StartFailed { name: "log", message: e.to_string() })?;
+        // bd sex3y：DNS 查询侧的日志生产者出口在此装配——DNS crate 只需调
+        // `xray_app_log::record_dns(...)`，不必持有 LogInstance。
+        instance::install_dns_producer(Arc::clone(&self.instance));
+        Ok(())
     }
 
     fn close(&self) -> Result<()> {
+        instance::uninstall_dns_producer();
         self.instance.close();
         Ok(())
     }
