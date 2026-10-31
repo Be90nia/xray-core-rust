@@ -23,8 +23,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use xray_app_dispatcher::default::DialFn;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use xray_app_dispatcher::{default::DialFn, udp_session::XudpWireConn};
 use xray_common::net::{address::Address, destination::Destination};
 use xray_transport::connection::Connection;
 
@@ -119,7 +119,23 @@ pub fn make_dial_fn(client: Arc<AnytlsClient>) -> DialFn {
                 return Box::pin(async move { Err(e) });
             },
         };
+        let is_udp = dest.is_udp();
+        let udp_dest = dest.clone();
         Box::pin(async move {
+            if is_udp {
+                // UoT v2（bd yfcnr）：以 magic 目标建 TCP 会话 → 写 Request
+                // （isConnect=true + 真实目标）→ 之后每包 `[2B len][payload]`。
+                // 规范见 crate::uot 模块头。
+                let magic = SocksAddr::domain(crate::uot::MAGIC_ADDRESS, 0);
+                let conn =
+                    client.dial(&magic).await.map_err(|e| format!("anytls uot dial: {e}"))?;
+                let mut conn = AnytlsConnection::new(conn);
+                let request = crate::uot::encode_request(true, &socks)
+                    .map_err(|e| format!("anytls uot request: {e}"))?;
+                conn.write_all(&request).await.map_err(|e| format!("anytls uot request: {e}"))?;
+                conn.flush().await.map_err(|e| format!("anytls uot request: {e}"))?;
+                return Ok(Box::new(XudpWireConn::new(conn, udp_dest)) as Box<dyn Connection>);
+            }
             let conn = client.dial(&socks).await.map_err(|e| format!("anytls dial: {e}"))?;
             Ok(Box::new(AnytlsConnection::new(conn)) as Box<dyn Connection>)
         })

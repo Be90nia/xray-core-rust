@@ -20,6 +20,11 @@ pub enum SsError {
     #[error("invalid password/PSK: {0}")]
     InvalidPassword(String),
 
+    /// 空口令：Go `infra/conf/shadowsocks.go:71-73`「Shadowsocks password is not
+    /// specified.」——空串口令会退化成公开常量 KDF("")，故任何路径都拒。
+    #[error("Shadowsocks password is not specified.")]
+    EmptyPassword,
+
     #[error("failed to read 50 bytes: {0}")]
     ReadInitial(String),
 

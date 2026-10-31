@@ -53,6 +53,7 @@ fn make_trojan_validator() -> (Arc<TrojanValidator>, TrojanAccount) {
     (Arc::new(v), account)
 }
 
+#[allow(dead_code)] // 旧签名遗留：serve_trojan 已改为共享 Validator（bd hl8q6）
 fn make_trojan_users() -> HashMap<String, TrojanUser> {
     let account = TrojanAccount::new(PASSWORD);
     let user = TrojanUser::new("interop@example.com", 0, account);
@@ -147,7 +148,7 @@ async fn rust_trojan_server_go_client() {
 
     // Start Rust Trojan server
     let ohm = make_trojan_ohm();
-    let users = make_trojan_users();
+    let (trojan_validator, _) = make_trojan_validator();
     let trojan_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let rust_trojan_port = trojan_listener.local_addr().expect("local addr").port();
     let ohm_clone = Arc::clone(&ohm);
@@ -160,7 +161,7 @@ async fn rust_trojan_server_go_client() {
             Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
             listener,
             ohm_clone,
-            users,
+            trojan_validator,
             None,
             None,
             std::time::Duration::from_secs(30),

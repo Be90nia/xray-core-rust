@@ -268,17 +268,44 @@ impl Router {
         Ok(())
     }
 
-    /// 重载规则。
+    /// 运行时规则重载，对应 Go `Router.ReloadRules(config, shouldAppend)`
+    /// （`app/router/router.go`）：
     ///
-    /// 对应 Go `Router.ReloadRules`。
-    pub fn reload_rules(&self, protos: &[RoutingRule]) -> Result<(), RouterError> {
-        let balancers = self.balancers.read();
-        let mut new_rules = Vec::with_capacity(protos.len());
-        let mut seen = std::collections::HashSet::new();
-        for p in protos {
+    /// - `should_append = true`：旧规则与旧 balancer **保留**，新规则追加在尾部； 新规则 ruleTag
+    ///   与"已有 + 本批"重复即 Err（Go `duplicate ruleTag`）。
+    /// - `should_append = false`：规则集**整体替换**为本 config 的规则，balancer 映射同样只留本
+    ///   config 的（Go 非 append 分支不拷贝旧 balancer）。
+    ///
+    /// 规则引用未在本映射中出现的 balancerTag ⇒ 走 `build_rule_with_pool` 的
+    /// "balancer not found" 错误（Go 同语义）。构建全部成功才落库（Go 先在
+    /// 临时集合里建，任一失败即返回、旧规则不动）。
+    pub fn reload_rules(&self, config: &Config, should_append: bool) -> Result<(), RouterError> {
+        let old_rules = self.rules.read().clone();
+        let mut new_balancers: HashMap<String, Arc<Balancer>> =
+            if should_append { self.balancers.read().clone() } else { HashMap::new() };
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut new_rules: Vec<Arc<Rule>> =
+            if should_append { old_rules.clone() } else { Vec::with_capacity(config.rule.len()) };
+        if should_append {
+            for r in &old_rules {
+                if !r.rule_tag.is_empty() {
+                    seen.insert(r.rule_tag.clone());
+                }
+            }
+        }
+
+        let observer = self.observer.read().as_ref().map(Arc::clone);
+        for br in &config.balancing_rule {
+            let b = build_balancer(br, &self.ohm, observer.clone())?;
+            if new_balancers.insert(br.tag.clone(), Arc::new(b)).is_some() {
+                return Err(RouterError::DuplicateBalancerTag);
+            }
+        }
+
+        for p in &config.rule {
             let r = build_rule_with_pool(
                 p,
-                &balancers,
+                &new_balancers,
                 self.geo_loader.as_deref(),
                 self.build_pool.as_ref(),
             )?;
@@ -287,6 +314,8 @@ impl Router {
             }
             new_rules.push(Arc::new(r));
         }
+
+        *self.balancers.write() = new_balancers;
         *self.rules.write() = new_rules;
         Ok(())
     }
@@ -521,11 +550,34 @@ mod tests {
     fn test_reload_rules_replaces_all() {
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
         r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
-        let new_rules = vec![simple_tag_rule("t2", "b.com")];
-        // 给新规则添加 rule_tag
-        let _ = r.reload_rules(&new_rules);
-        // 不抛错即 OK；详情见 list_rules
-        assert_eq!(r.list_rules().len(), 1);
+        let cfg = Config {
+            rule: vec![RoutingRule { rule_tag: "r2".into(), ..simple_tag_rule("t2", "b.com") }],
+            ..Config::default()
+        };
+        r.reload_rules(&cfg, false).expect("replace reload");
+        // shouldAppend=false = 整体替换（Go ReloadRules 非 append 分支）
+        assert_eq!(r.list_rules(), vec!["r2".to_string()]);
+    }
+
+    /// bd 9c8k6 ①：shouldAppend=true 保留旧规则并追加（Go 语义）。
+    #[test]
+    fn test_reload_rules_append_keeps_old_and_rejects_dup_tag() {
+        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
+        let cfg = Config {
+            rule: vec![RoutingRule { rule_tag: "r2".into(), ..simple_tag_rule("t2", "b.com") }],
+            ..Config::default()
+        };
+        r.reload_rules(&cfg, true).expect("append reload");
+        assert_eq!(r.list_rules(), vec!["r1".to_string(), "r2".to_string()]);
+
+        // 追加批里与已有 ruleTag 重复 ⇒ Err（Go `duplicate ruleTag`），且规则集不变。
+        let dup = Config {
+            rule: vec![RoutingRule { rule_tag: "r2".into(), ..simple_tag_rule("t3", "c.com") }],
+            ..Config::default()
+        };
+        assert!(matches!(r.reload_rules(&dup, true), Err(RouterError::DuplicateRuleTag(_))));
+        assert_eq!(r.list_rules(), vec!["r1".to_string(), "r2".to_string()]);
     }
 
     #[test]

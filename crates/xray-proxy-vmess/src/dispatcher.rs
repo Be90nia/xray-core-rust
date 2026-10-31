@@ -23,7 +23,10 @@ use std::{
 
 use skeleton_infra::fx::Spawned;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use xray_app_dispatcher::default::DialFn;
+use xray_app_dispatcher::{
+    default::DialFn,
+    udp_session::{XudpReframer, XudpUnframer},
+};
 use xray_common::{
     bitmask::Bitmask,
     net::{address::Address, destination::Destination, network::Network, port::Port},
@@ -263,6 +266,8 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
             let server_dest = config.server_destination();
             let sockopt =
                 config.stream_settings.as_ref().map(|s| s.socket_options()).unwrap_or_default();
+            // UDP 会话目标（socket 面）：wire 不携带回程来源，裹帧时用它。
+            let udp_dest = Destination::udp(target_addr.clone(), target_port);
             // bd cjwc G6（Go proxy/vmess/outbound/outbound.go:71）：连接级退避
             // ExponentialBackoff(5, 200)。请求头在 dial 成功后才发送，环内无协议字节。
             let mut conn: Box<dyn Connection> =
@@ -356,6 +361,7 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
                 return Ok(Box::new(VmessUdpConn::from_udp_conn(
                     &ctx,
                     conn,
+                    udp_dest,
                     session,
                     req_cipher,
                     req_iv,
@@ -494,11 +500,15 @@ impl Connection for VmessConn {
 
 /// VMess UDP 出站连接：chunk 即 packet（Go 非 cone 语义）。
 ///
-/// 上行：每次 [`AsyncWrite::poll_write`] 把传入 buf 编码为**恰好一个** chunk
-/// （AEAD seal，见 [`crate::encoding::body_chunk::encode_single_chunk`]）直写底层
-/// 连接——duplex 流桥会合并多次 write 破坏 packet 边界，故不走 [`VmessConn`]
-/// 的 duplex 泵。下行：spawn task 惰性解响应头后逐 chunk 解密，包经 mpsc 队列
-/// 交付，[`AsyncRead::poll_read`] 每次返回一个 packet。
+/// 上行：每次 [`AsyncWrite::poll_write`] 把传入 buf 按 XUDP 帧切成裸载荷，
+/// 每包编码为**恰好一个** chunk（AEAD seal，见
+/// [`crate::encoding::body_chunk::encode_single_chunk`]）直写底层连接——duplex
+/// 流桥会合并多次 write 破坏 packet 边界，故不走 [`VmessConn`] 的 duplex 泵。
+/// 下行：spawn task 惰性解响应头后逐 chunk 解密，包经 mpsc 队列交付，
+/// [`AsyncRead::poll_read`] 每次返回一个 packet（裹回 XUDP 帧）。
+///
+/// **两套表示**（bd t0ls1）：内部 dispatch link 跑 XUDP 帧（自带 per-packet
+/// 目标 + GlobalID），VMess wire 跑裸载荷 chunk（目标在请求头）。
 struct VmessUdpConn {
     inner_w: tokio::io::WriteHalf<Box<dyn Connection>>,
     rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
@@ -512,6 +522,18 @@ struct VmessUdpConn {
     termination_signal: bool,
     /// 单 chunk 明文容量上限（packet 超限截断；UDP relay 实际包 ≤ MTU）
     up_chunk_cap: usize,
+    /// 上行剥帧：XUDP 帧流 → 裸载荷
+    unframer: XudpUnframer,
+    /// 下行裹帧：裸载荷 → XUDP 帧流
+    reframer: XudpReframer,
+    /// 本轮 poll_write 已收下的字节数（返回 Pending 后重入不再重复喂）
+    fed: usize,
+    /// 待发的 XUDP 帧头（meta + 2B 载荷长度）
+    hdr: Vec<u8>,
+    hpos: usize,
+    /// 待交付的下行载荷与其游标（帧头先行）
+    rpay: Vec<u8>,
+    rpos: usize,
     wpending: Vec<u8>,
     wpos: usize,
     _down_task: Spawned<()>,
@@ -523,6 +545,7 @@ impl VmessUdpConn {
     fn from_udp_conn(
         ctx: &PluginContext,
         conn: Box<dyn Connection>,
+        dest: Destination,
         session: ClientSession,
         req_cipher: BodyCipher,
         req_iv: [u8; 16],
@@ -588,6 +611,13 @@ impl VmessUdpConn {
             req_padding,
             termination_signal,
             up_chunk_cap,
+            unframer: XudpUnframer::new(),
+            reframer: XudpReframer::new(dest),
+            fed: 0,
+            hdr: Vec::with_capacity(64),
+            hpos: 0,
+            rpay: Vec::new(),
+            rpos: 0,
             wpending: Vec::with_capacity(up_chunk_cap + 96),
             wpos: 0,
             _down_task: down_task,
@@ -602,6 +632,58 @@ impl AsyncWrite for VmessUdpConn {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = &mut *self;
+        // 上一轮已收下 buf（Pending 重入）→ 只排干，不再重复喂
+        if this.fed == 0 {
+            let fed = buf.len();
+            let cap = this.up_chunk_cap;
+            let mut framed = std::mem::take(&mut this.wpending);
+            framed.clear();
+            this.wpos = 0;
+            let mut encode_err: Option<std::io::Error> = None;
+            let parse_err = {
+                let Self {
+                    unframer,
+                    req_cipher,
+                    req_size_parser,
+                    req_padding,
+                    up_nonce,
+                    ..
+                } = this;
+                unframer
+                    .feed(buf, |_, payload| {
+                        if encode_err.is_some() {
+                            return;
+                        }
+                        // 一包一 chunk：与 TCP 泵同款持久缓冲 + next_ref + seal_into
+                        // （稳态零分配）。超 chunk 容量时截断（UDP 实际包 ≤ MTU）。
+                        let payload = &payload[..payload.len().min(cap)];
+                        let nonce = up_nonce.next_ref();
+                        if let Err(e) = encode_frame_into(
+                            &mut framed,
+                            payload,
+                            req_cipher,
+                            nonce,
+                            req_size_parser.lock().as_mut(),
+                            *req_padding,
+                        ) {
+                            encode_err =
+                                Some(std::io::Error::other(format!("vmess udp encode: {e}")));
+                        }
+                    })
+                    .err()
+            };
+            this.wpending = framed;
+            if let Some(e) = encode_err {
+                return Poll::Ready(Err(e));
+            }
+            if let Some(e) = parse_err {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("vmess udp: XUDP 帧解析: {e}"),
+                )));
+            }
+            this.fed = fed;
+        }
         // 排干 pending 帧（一包一帧，不可分）
         while this.wpos < this.wpending.len() {
             let n = std::task::ready!(
@@ -615,32 +697,11 @@ impl AsyncWrite for VmessUdpConn {
             }
             this.wpos += n;
         }
-        // 一包一 chunk：与 TCP 泵同款持久缓冲 + next_ref + seal_into（稳态零分配）
-        let payload = &buf[..buf.len().min(this.up_chunk_cap)];
-        let nonce = this.up_nonce.next_ref();
-        encode_frame_into(
-            &mut this.wpending,
-            payload,
-            &this.req_cipher,
-            nonce,
-            this.req_size_parser.lock().as_mut(),
-            this.req_padding,
-        )
-        .map_err(|e| std::io::Error::other(format!("vmess udp encode: {e}")))?;
+        let fed = this.fed;
+        this.fed = 0;
+        this.wpending.clear();
         this.wpos = 0;
-        while this.wpos < this.wpending.len() {
-            let n = std::task::ready!(
-                Pin::new(&mut this.inner_w).poll_write(cx, &this.wpending[this.wpos..])
-            )?;
-            if n == 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "vmess udp: frame write stalled",
-                )));
-            }
-            this.wpos += n;
-        }
-        Poll::Ready(Ok(payload.len()))
+        Poll::Ready(Ok(fed))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -669,22 +730,47 @@ impl AsyncWrite for VmessUdpConn {
 }
 
 impl AsyncRead for VmessUdpConn {
-    // 三臂皆 return：单次 poll 只交付一个 packet，迭代由 down task 的真 loop 与
-    // 调用方 relay 承担（Go 同语义：buf.Copy 是迭代驱动）
-    #[allow(clippy::never_loop)]
+    // 每轮循环只交付一段（帧头 → 载荷），迭代由调用方 relay 驱动
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
         loop {
-            match std::task::ready!(self.get_mut().rx.poll_recv(cx)) {
+            // 1) 待发的 XUDP 帧头优先（帧头必须排在载荷之前）
+            if this.hpos < this.hdr.len() {
+                let n = (this.hdr.len() - this.hpos).min(buf.remaining());
+                buf.put_slice(&this.hdr[this.hpos..this.hpos + n]);
+                this.hpos += n;
+                return Poll::Ready(Ok(()));
+            }
+            // 2) 当前 packet 载荷未交付完 → 交付剩余（不截断数据报）
+            if this.rpos < this.rpay.len() {
+                let n = (this.rpay.len() - this.rpos).min(buf.remaining());
+                buf.put_slice(&this.rpay[this.rpos..this.rpos + n]);
+                this.rpos += n;
+                return Poll::Ready(Ok(()));
+            }
+            // 3) 取下一个 packet 并裹 XUDP 帧头
+            match std::task::ready!(this.rx.poll_recv(cx)) {
                 Some(Ok(pkt)) => {
-                    // 包大于 ReadBuf 时截断剩余（数据报不可分；relay 缓冲 ≥ MTU，
-                    // 与 Go buf 单包上限语义一致）
-                    let n = pkt.len().min(buf.remaining());
-                    buf.put_slice(&pkt[..n]);
-                    return Poll::Ready(Ok(()));
+                    // 空载荷帧会让下游 PacketReader 判流结束，直接跳过
+                    if pkt.is_empty() {
+                        continue;
+                    }
+                    let mut hdr = std::mem::take(&mut this.hdr);
+                    let res = this.reframer.write_header(pkt.len(), None, &mut hdr);
+                    this.hdr = hdr;
+                    this.hpos = 0;
+                    if let Err(e) = res {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("vmess udp: XUDP 应答帧头: {e}"),
+                        )));
+                    }
+                    this.rpay = pkt;
+                    this.rpos = 0;
                 },
                 Some(Err(e)) => return Poll::Ready(Err(e)),
                 None => return Poll::Ready(Ok(())), // down task 结束 = 流结束
@@ -1322,8 +1408,35 @@ mod tests {
         );
     }
 
-    /// vmess UDP（bd uhg2）：一包一 chunk。写侧 poll_write 边界=packet 边界，
-    /// server 侧逐 chunk 解出恰好两包。
+    /// 构造一帧 XUDP（link 侧表示；vmess crate 不依赖 xray-xudp，手拼线格式）：
+    /// `[2B meta_len][2B session][1B status][1B opt][1B net][2B port][atyp][addr]
+    /// [?8B gid][2B len][payload]`。
+    fn xudp_frame(payload: &[u8], first: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_be_bytes()); // session id
+        body.push(if first { 1 } else { 2 }); // status: New / Keep
+        body.push(1); // opt = Data
+        body.push(2); // network = UDP
+        body.extend_from_slice(&53u16.to_be_bytes()); // port（PortThenAddress）
+        body.push(1); // atyp = IPv4
+        body.extend_from_slice(&[8, 8, 8, 8]);
+        if first {
+            body.extend_from_slice(&[3u8; 8]); // GlobalID（仅 New）
+        }
+        let mut f = Vec::new();
+        f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        f.extend_from_slice(&body);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn udp_dest() -> Destination {
+        Destination::new(Address::from_ipv4_bytes([8, 8, 8, 8]), Port::new(53), Network::UDP)
+    }
+
+    /// vmess UDP（bd uhg2 / t0ls1）：link 侧 XUDP 帧按包剥帧，一包一 chunk。
+    /// server 侧逐 chunk 解出恰好两包（裸载荷，不含 XUDP 帧头）。
     #[tokio::test]
     async fn vmess_udp_conn_write_boundaries() {
         use tokio::io::AsyncWriteExt;
@@ -1332,6 +1445,7 @@ mod tests {
         let mut conn = VmessUdpConn::from_udp_conn(
             &test_ctx(),
             Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            udp_dest(),
             ClientSession::new(),
             BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),
             [0xAAu8; 16],
@@ -1344,8 +1458,8 @@ mod tests {
             true,
         );
 
-        conn.write_all(b"ping").await.unwrap();
-        conn.write_all(&[9u8; 600]).await.unwrap();
+        conn.write_all(&xudp_frame(b"ping", true)).await.unwrap();
+        conn.write_all(&xudp_frame(&[9u8; 600], false)).await.unwrap();
         conn.flush().await.unwrap();
 
         // server 侧：同 key/iv 序列解密，应解出恰好两包
@@ -1388,6 +1502,7 @@ mod tests {
         let mut conn = VmessUdpConn::from_udp_conn(
             &test_ctx(),
             Box::new(xray_transport::connection::DuplexConnection::new(client_side)),
+            udp_dest(),
             ClientSession::new(),
             BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher")),
             [0xAAu8; 16],
@@ -1402,7 +1517,7 @@ mod tests {
         let cap = conn.wpending.capacity();
         assert_eq!(cap, conn.up_chunk_cap + 96, "帧缓冲构造期一次预留");
         for _ in 0..8 {
-            conn.write_all(&[7u8; 1200]).await.unwrap();
+            conn.write_all(&xudp_frame(&[7u8; 1200], false)).await.unwrap();
         }
         assert_eq!(conn.wpending.capacity(), cap, "每包不得重建/扩容帧缓冲");
     }

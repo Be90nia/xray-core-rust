@@ -267,25 +267,56 @@ impl RoutingRouter for DispatchRouterBridge {
 /// 解析失败或无 sniffing 配置时返回 default（enabled=false，零行为变化）。
 #[must_use]
 pub fn sniffing_request_from_json(v: Option<&serde_json::Value>) -> SniffingRequest {
-    sniffing_request_from_json_in(v, &resolve_asset_dir())
+    match try_sniffing_request_from_json_in(v, &resolve_asset_dir()) {
+        Ok(r) => r,
+        Err(e) => {
+            // 非装配门调用方（loopback 出站 / 框架装配路）没有错误返回面：
+            // 降级为**全关嗅探**（enabled=false ⇒ 不改写目的地，fail-safe 方向），
+            // 并显式 error 留痕——生产入站走 `try_sniffing_request_from_json` 拒启。
+            tracing::error!(target: "xray_core", "sniffing config invalid, sniffing disabled: {e}");
+            SniffingRequest::default()
+        },
+    }
 }
 
-/// 同 [`sniffing_request_from_json`]，geodata 资产目录显式给定
+/// `BuiltInbound.sniffing` JSON → [`SniffingRequest`]，解析失败即 Err（bd vdl95）。
+///
+/// 生产装配路径用本函数：排除规则（`domainsExcluded`/`ipsExcluded`）任一条解析
+/// 失败、geoip/geosite 资产加载失败、或整表编译不出任何匹配器 ⇒ 返回 Err ⇒
+/// 入站构造失败 ⇒ 启动拒启（Go `SniffingConfig.Build` 同为 Build 期硬错）。
+///
+/// # Errors
+/// 排除规则解析/编译/资产加载失败，或 sniffing 段类型不符。
+pub fn try_sniffing_request_from_json(
+    v: Option<&serde_json::Value>,
+) -> std::io::Result<SniffingRequest> {
+    try_sniffing_request_from_json_in(v, &resolve_asset_dir())
+}
+
+/// 同 [`try_sniffing_request_from_json`]，geodata 资产目录显式给定
 /// （geoip:/geosite: 展开用；测试注入）。
-fn sniffing_request_from_json_in(v: Option<&serde_json::Value>, datadir: &Path) -> SniffingRequest {
-    let Some(cfg) =
-        v.cloned().and_then(|v| serde_json::from_value::<xray_conf::SniffingConfig>(v).ok())
-    else {
-        return SniffingRequest::default();
+fn try_sniffing_request_from_json_in(
+    v: Option<&serde_json::Value>,
+    datadir: &Path,
+) -> std::io::Result<SniffingRequest> {
+    let Some(raw) = v else {
+        return Ok(SniffingRequest::default());
     };
-    SniffingRequest {
+    // 有 sniffing 段但类型不符 ⇒ 硬错（Go 反序列化失败即拒启；旧实现 .ok() 静默
+    // 降级为 default，等于"配置写错 = 嗅探静默消失"）。
+    let cfg: xray_conf::SniffingConfig = serde_json::from_value(raw.clone()).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("sniffing: {e}"))
+    })?;
+    Ok(SniffingRequest {
         enabled: cfg.enabled,
         metadata_only: cfg.metadata_only,
         route_only: cfg.route_only,
         override_destination_for_protocol: normalize_dest_override(&cfg.dest_override.0),
-        exclude_for_domain: build_domain_excluder(&cfg.domains_excluded.0, datadir),
-        exclude_for_ip: build_ip_excluder(&cfg.ips_excluded.0, datadir),
-    }
+        exclude_for_domain: build_domain_excluder(&cfg.domains_excluded.0, datadir)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        exclude_for_ip: build_ip_excluder(&cfg.ips_excluded.0, datadir)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+    })
 }
 
 /// destOverride 别名归一化（va51①，对照 Go `infra/conf/xray.go:65-79` switch）。
@@ -334,31 +365,29 @@ fn add_proto_domain(
 /// `DomainReg.BuildDomainMatcher` 等价物）。
 ///
 /// 规则形态：full:/domain:/regexp:/keyword: 前缀，无前缀 = Substr，
-/// geosite:/ext: 经 loader 展开为域名列表。单条失败 `warn` 跳过（Go 为
-/// Build 期硬错；本函数签名无 Result 且调用方在票外，降级为可见告警，
-/// 不静默吞）。
-fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeDomainMatcher>> {
+/// geosite:/ext: 经 loader 展开为域名列表。
+///
+/// bd vdl95：任何一条规则解析/编译/资产加载失败即 **Err**（对齐 Go Build 期
+/// 硬错）。旧实现逐条 warn+skip，最坏 `added == 0` ⇒ 整表失效而嗅探照开 ⇒
+/// 本应排除的域名仍被 destOverride 改写目的地（安全面 fail-open）。
+fn build_domain_excluder(
+    rules: &[String],
+    datadir: &Path,
+) -> std::result::Result<Option<Arc<ExcludeDomainMatcher>>, String> {
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
     let loader = GeoDataLoader::new(datadir.to_path_buf());
     let mut any = LinearAnyMatcher::new();
     let mut added = 0u32;
     for raw in rules {
-        let rule = match parse_domain_rule(raw, xray_geodata::geosite::DomainType::Substr, datadir)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(target: "xray_core",
-                    "sniffing domainsExcluded {raw:?} 解析失败，跳过: {e}");
-                continue;
-            },
-        };
+        let rule = parse_domain_rule(raw, xray_geodata::geosite::DomainType::Substr, datadir)
+            .map_err(|e| format!("sniffing domainsExcluded {raw:?} 解析失败: {e}"))?;
         match rule.value {
-            Some(DomainRuleValue::Custom(d)) => match add_proto_domain(&mut any, added + 1, &d) {
-                Ok(()) => added += 1,
-                Err(e) => tracing::warn!(target: "xray_core",
-                    "sniffing domainsExcluded {raw:?} 编译失败，跳过: {e}"),
+            Some(DomainRuleValue::Custom(d)) => {
+                add_proto_domain(&mut any, added + 1, &d)
+                    .map_err(|e| format!("sniffing domainsExcluded {raw:?} 编译失败: {e}"))?;
+                added += 1;
             },
             Some(DomainRuleValue::Geosite(gs)) => {
                 let site = if gs.attrs.is_empty() {
@@ -366,54 +395,55 @@ fn build_domain_excluder(rules: &[String], datadir: &Path) -> Option<Arc<Exclude
                 } else {
                     loader.load_site_with_attrs(&gs.file, &gs.code, &gs.attrs)
                 };
-                let site = match site {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(target: "xray_core",
-                            "sniffing domainsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
-                            gs.file, gs.code);
-                        continue;
-                    },
-                };
+                let site = site.map_err(|e| {
+                    format!(
+                        "sniffing domainsExcluded {raw:?} 加载 {}:{} 失败: {e}",
+                        gs.file, gs.code
+                    )
+                })?;
                 for d in &site.domain {
-                    match add_proto_domain(&mut any, added + 1, d) {
-                        Ok(()) => added += 1,
-                        Err(e) => tracing::warn!(target: "xray_core",
-                            "sniffing geosite {}:{} 条目编译失败，跳过: {e}", gs.file, gs.code),
-                    }
+                    add_proto_domain(&mut any, added + 1, d).map_err(|e| {
+                        format!("sniffing geosite {}:{} 条目编译失败: {e}", gs.file, gs.code)
+                    })?;
+                    added += 1;
                 }
             },
             None => {},
         }
     }
     if added == 0 {
-        return None;
+        return Err(format!("sniffing domainsExcluded 无任何可编译条目: {rules:?}"));
     }
     let any = Arc::new(any);
-    Some(Arc::new(move |domain: &str| any.match_any(domain)))
+    Ok(Some(Arc::new(move |domain: &str| any.match_any(domain))))
 }
 
 /// ipsExcluded → typed matcher（Go `IPReg.BuildIPMatcher` 等价物）。
 ///
 /// 形态：CIDR（`10.0.0.0/8`，无 `/` 按单地址）与 `geoip:XX`（loader 展开为
-/// CIDR 列表），`!` 反向前缀由 rule_parser 转为 reverse_match。单条失败
-/// `warn` 跳过（理由同 [`build_domain_excluder`]）。
-fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMatcher>> {
+/// CIDR 列表），`!` 反向前缀由 rule_parser 转为 reverse_match。
+///
+/// bd vdl95：任一条失败即 **Err**（理由与 [`build_domain_excluder`] 同——跳过 =
+/// 排除表缺项 = 嗅探改写不该改写的目的地）。
+fn build_ip_excluder(
+    rules: &[String],
+    datadir: &Path,
+) -> std::result::Result<Option<Arc<ExcludeIpMatcher>>, String> {
     if rules.is_empty() {
-        return None;
+        return Ok(None);
     }
     let loader = GeoDataLoader::new(datadir.to_path_buf());
     let mut matchers: Vec<Box<dyn GeoIpMatcher>> = Vec::new();
     for raw in rules {
-        let rule = match parse_ip_rules(std::slice::from_ref(raw), datadir) {
-            Ok(mut v) if v.len() == 1 => v.remove(0),
-            Ok(_) => continue,
-            Err(e) => {
-                tracing::warn!(target: "xray_core",
-                    "sniffing ipsExcluded {raw:?} 解析失败，跳过: {e}");
-                continue;
-            },
-        };
+        let mut parsed = parse_ip_rules(std::slice::from_ref(raw), datadir)
+            .map_err(|e| format!("sniffing ipsExcluded {raw:?} 解析失败: {e}"))?;
+        if parsed.len() != 1 {
+            return Err(format!(
+                "sniffing ipsExcluded {raw:?} 应产出 1 条规则，实得 {}",
+                parsed.len()
+            ));
+        }
+        let rule = parsed.remove(0);
         match rule.value {
             Some(IpRuleValue::Custom(cr)) => {
                 if let Some(cidr) = cr.cidr {
@@ -424,26 +454,24 @@ fn build_ip_excluder(rules: &[String], datadir: &Path) -> Option<Arc<ExcludeIpMa
                     matchers.push(Box::new(m));
                 }
             },
-            Some(IpRuleValue::Geoip(gr)) => match loader.load_ip(&gr.file, &gr.code) {
-                Ok(geoip) => {
-                    let mut m = HeuristicIPMatcher::from_cidrs(&geoip.cidr);
-                    if gr.reverse_match {
-                        m.set_reverse(true);
-                    }
-                    matchers.push(Box::new(m));
-                },
-                Err(e) => tracing::warn!(target: "xray_core",
-                    "sniffing ipsExcluded {raw:?} 加载 {}:{} 失败，跳过: {e}",
-                    gr.file, gr.code),
+            Some(IpRuleValue::Geoip(gr)) => {
+                let geoip = loader.load_ip(&gr.file, &gr.code).map_err(|e| {
+                    format!("sniffing ipsExcluded {raw:?} 加载 {}:{} 失败: {e}", gr.file, gr.code)
+                })?;
+                let mut m = HeuristicIPMatcher::from_cidrs(&geoip.cidr);
+                if gr.reverse_match {
+                    m.set_reverse(true);
+                }
+                matchers.push(Box::new(m));
             },
             None => {},
         }
     }
     if matchers.is_empty() {
-        return None;
+        return Err(format!("sniffing ipsExcluded 无任何可编译条目: {rules:?}"));
     }
     let multi = Arc::new(GeneralMultiIPMatcher::new(matchers));
-    Some(Arc::new(move |ip: IpAddr| multi.match_ip(ip)))
+    Ok(Some(Arc::new(move |ip: IpAddr| multi.match_ip(ip))))
 }
 
 /// Mux carrier 拦截装饰器：对应 Go proxyman always.go:89 `mux: mux.NewServer(ctx)`
@@ -762,7 +790,10 @@ fn build_adapter(
 ///
 /// `rule_set` 依赖 proto 更新（当前 `RoutingRule` 无该字段，见
 /// `xray-app-router/src/rule_set.rs`），暂以 TODO 标记，待 proto 升级后接入。
-fn parse_routing_json_to_proto(
+///
+/// 公开面（bd 9c8k6 ②）：`xray api adrules` 需要把 JSON 配置编译成与生产装配
+/// **同一套** `xray.app.router.Config`（含 balancers），禁 CLI 侧自造方言。
+pub fn parse_routing_json_to_proto(
     json: &[u8],
 ) -> Result<xray_proto::xray::app::router::Config, WiringError> {
     parse_routing_json_to_proto_in(json, &resolve_asset_dir())
@@ -2376,7 +2407,8 @@ mod tests {
             ],
             "ipsExcluded": ["192.168.1.1", "2001:db8::/32"]
         });
-        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        let req = try_sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"))
+            .expect("sniffing");
         assert!(req.enabled);
         let dom = req.exclude_for_domain.expect("domain matcher built");
         // full: 精确匹配（非后缀）
@@ -2411,7 +2443,7 @@ mod tests {
             "enabled": true,
             "ipsExcluded": ["geoip:private"]
         });
-        let req = sniffing_request_from_json_in(Some(&json), &dir);
+        let req = try_sniffing_request_from_json_in(Some(&json), &dir).expect("sniffing");
         let ipm = req.exclude_for_ip.expect("geoip matcher built");
         assert!(ipm("10.1.2.3".parse().unwrap()));
         assert!(ipm("192.168.5.5".parse().unwrap()));
@@ -2419,33 +2451,38 @@ mod tests {
         assert!(!ipm("8.8.8.8".parse().unwrap()));
     }
 
-    /// 单条坏规则 warn 跳过、其余保留（Go 为 Build 期硬错；本函数签名无
-    /// Result 且调用方在票外，降级为可见告警，不静默吞、不整表作废）。
+    /// bd vdl95：**单条坏规则整表拒启**（Go Build 期硬错）。旧行为 warn+skip
+    /// 让排除表缺项/整表失效而嗅探照开——安全面 fail-open，期望已反转。
     #[test]
-    fn sniffing_exclusions_bad_rule_skipped_others_kept() {
-        let json = serde_json::json!({
+    fn sniffing_exclusions_bad_rule_hard_error() {
+        let bad_domain = serde_json::json!({
             "enabled": true,
-            "domainsExcluded": ["full:good.example", "regexp:([bad"],
+            "domainsExcluded": ["full:good.example", "regexp:([bad"]
+        });
+        let err = try_sniffing_request_from_json_in(Some(&bad_domain), Path::new("/nonexistent"))
+            .expect_err("bad domain rule must abort, not be skipped");
+        assert!(err.to_string().contains("domainsExcluded"), "unexpected error: {err}");
+
+        let bad_ip = serde_json::json!({
+            "enabled": true,
             "ipsExcluded": ["not-an-ip", "10.0.0.0/8"]
         });
-        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
-        let dom = req.exclude_for_domain.expect("good rule kept");
-        assert!(dom("good.example"));
-        assert!(!dom("anything-else"));
-        let ipm = req.exclude_for_ip.expect("good cidr kept");
-        assert!(ipm("10.1.2.3".parse().unwrap()));
-        assert!(!ipm("11.1.2.3".parse().unwrap()));
+        let err = try_sniffing_request_from_json_in(Some(&bad_ip), Path::new("/nonexistent"))
+            .expect_err("bad ip rule must abort, not be skipped");
+        assert!(err.to_string().contains("ipsExcluded"), "unexpected error: {err}");
     }
 
     /// 无排除配置 → matcher 为 None（Go nil），enabled 等字段照常透传。
     #[test]
     fn sniffing_no_exclusions_yields_none_matchers() {
         let json = serde_json::json!({ "enabled": true, "destOverride": ["http"] });
-        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        let req = try_sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"))
+            .expect("sniffing");
         assert!(req.enabled);
         assert!(req.exclude_for_domain.is_none());
         assert!(req.exclude_for_ip.is_none());
-        let none = sniffing_request_from_json_in(None, Path::new("/nonexistent"));
+        let none = try_sniffing_request_from_json_in(None, Path::new("/nonexistent"))
+            .expect("absent sniffing section is not an error");
         assert!(!none.enabled);
         assert!(none.exclude_for_domain.is_none());
         assert!(none.exclude_for_ip.is_none());
@@ -2459,7 +2496,8 @@ mod tests {
             "enabled": true,
             "destOverride": ["https", "ssl", "TLS", "fakedns+others", "http", "quic"]
         });
-        let req = sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"));
+        let req = try_sniffing_request_from_json_in(Some(&json), Path::new("/nonexistent"))
+            .expect("sniffing");
         assert_eq!(
             req.override_destination_for_protocol,
             ["tls", "tls", "tls", "fakedns", "http", "quic"]

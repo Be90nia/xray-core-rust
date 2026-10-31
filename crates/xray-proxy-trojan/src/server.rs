@@ -14,7 +14,6 @@
 //! - TLS 包装层
 
 use std::{
-    collections::HashMap,
     pin::Pin,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
@@ -462,11 +461,14 @@ where
 // ============================================================================
 
 /// Trojan inbound entry point (aligns with `xray_core::inbound::serve_mixed`).
+///
+/// bd hl8q6：`validator` 由装配层构造并共享（用户热更 gRPC 句柄）；用户集合与
+/// add 顺序仍由装配层按配置决定，serve 不再自建 validator。
 pub async fn serve_trojan(
     ctx: std::sync::Arc<xray_frame::PluginContext>,
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
-    users: HashMap<String, MemoryUser>,
+    validator: Arc<Validator>,
     fallbacks: Option<Arc<FallbackPolicy>>,
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
     // sm80④：装配层传 policy_for_level(level).timeout.handshake；测试可传短值。
@@ -475,13 +477,6 @@ pub async fn serve_trojan(
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-
-    let validator = Arc::new(Validator::new());
-    for (_, user) in users {
-        if let Err(e) = validator.add(user) {
-            SERVER_LOG.warn(format!("skip duplicate user during serve_trojan init error={e}"));
-        }
-    }
 
     SERVER_LOG.info(format!(
         "trojan inbound listening addr={} users={}",
@@ -1049,11 +1044,11 @@ mod tests {
         let bridge = Arc::new(DialBridge::new("freedom", dial_fn)) as Arc<dyn DispatchHandler>;
         ohm.set_default(bridge);
 
-        // 3. 构造用户表：password → MemoryUser，HashMap key = user.key_hash()
+        // 3. 构造用户表：password → MemoryUser → 共享 validator（bd hl8q6 形态）
         let account = MemoryAccount::new("password");
         let user = MemoryUser::new("echo-test@example.com", 0, account.clone());
-        let mut users = HashMap::new();
-        users.insert(user.key_hash(), user);
+        let validator = Arc::new(Validator::new());
+        validator.add(user).unwrap();
 
         // 4. 起 trojan inbound
         let trojan_listener = InboundTcpListener::bind(
@@ -1069,7 +1064,7 @@ mod tests {
                 std::sync::Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
                 trojan_listener,
                 ohm_clone,
-                users,
+                validator,
                 None,
                 None,
                 xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
@@ -1156,11 +1151,11 @@ mod tests {
             as Arc<dyn DispatchHandler>;
         ohm.set_default(counting);
 
-        // 3. trojan inbound
+        // 3. trojan inbound（共享 validator，bd hl8q6 形态）
         let account = MemoryAccount::new("password");
         let user = MemoryUser::new("udp-test@example.com", 0, account.clone());
-        let mut users = HashMap::new();
-        users.insert(user.key_hash(), user);
+        let validator = Arc::new(Validator::new());
+        validator.add(user).unwrap();
         let trojan_listener = InboundTcpListener::bind(
             "127.0.0.1:0",
             xray_transport::sockopt::SocketOptions::default(),
@@ -1174,7 +1169,7 @@ mod tests {
                 std::sync::Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
                 trojan_listener,
                 ohm_clone,
-                users,
+                validator,
                 None,
                 None,
                 xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,

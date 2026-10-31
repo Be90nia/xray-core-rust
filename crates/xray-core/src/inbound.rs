@@ -1719,6 +1719,18 @@ pub async fn serve_dokodemo_udp_on(
             pkt = hub_rx.recv() => {
                 let Some(pkt) = pkt else { return Ok(()) }; // hub 关闭
                 let peer = pkt.source;
+                // 会话容量门（bd zmpxy）：UDP 源地址可伪造，每源一会话且每会话
+                // 64KiB buf + 队列 ⇒ 单主机可造任意会话数（实测 800 源 +118.9MB
+                // 线性增长）。超上限的新 peer 直接丢包（既有 peer 不受影响），
+                // 空出的槽由空闲 TTL 清扫回收。
+                if !dokodemo_udp_admits(peers.len(), !peers.contains_key(&peer)) {
+                    tracing::debug!(
+                        peer = %peer,
+                        cap = DOKODEMO_UDP_MAX_SESSIONS,
+                        "dokodemo udp session table full; packet dropped"
+                    );
+                    continue;
+                }
                 // 逐包目标：TPROXY 命中原始目标用之，否则 predefined
                 // （Go destinationOverridden → ob.Target 覆盖）。
                 let dest_override = pkt
@@ -1727,7 +1739,7 @@ pub async fn serve_dokodemo_udp_on(
                 let entry = match peers.entry(peer) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        let (tx, rx) = tokio::sync::mpsc::channel(64);
+                        let (tx, rx) = tokio::sync::mpsc::channel(DOKODEMO_UDP_PEER_QUEUE);
                         let overridden = dest_override.is_some();
                         let first_dest = dest_override.clone().unwrap_or_else(|| dest.clone());
                         let relay_handler = Arc::clone(&handler);
@@ -1774,6 +1786,23 @@ pub async fn serve_dokodemo_udp_on(
 /// dokodemo UDP 会话空闲清理阈值（60s，Go udp Dispatcher 会话超时同值）。
 const DOKODEMO_UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// dokodemo UDP 全局会话数上限（bd zmpxy）。
+///
+/// 一个 peer 源地址 = 一个会话任务（含 64KiB 收缓冲 + 队列）；源地址可伪造 ⇒
+/// 无门即"任意会话数"。4096 会话对应最坏常驻 ≈ 4096×(64KiB+) ≈ 数百 MB，且
+/// 空闲 60s 即回收；正常 dokodemo 场景（客户端数远小于此）零感知。
+const DOKODEMO_UDP_MAX_SESSIONS: usize = 4096;
+
+/// 每 peer 入站队列深度（Go `udp.Dispatcher` 的 16×8KB 池化缓冲同量级；
+/// 旧值 64 × 最坏 64KiB 载荷 = 每会话 4MB 队列，压到 16 即 1/4）。
+const DOKODEMO_UDP_PEER_QUEUE: usize = 16;
+
+/// dokodemo UDP 会话准入判定（bd zmpxy）：既有 peer 恒放行，新 peer 仅在表未满
+/// 时放行。独立函数以便对容量门做纯逻辑断言（真跑 4096 会话的测试代价过大）。
+fn dokodemo_udp_admits(count: usize, is_new_peer: bool) -> bool {
+    !is_new_peer || count < DOKODEMO_UDP_MAX_SESSIONS
+}
+
 /// per-peer 会话表条目。
 struct PeerSession {
     /// 主循环 → peer task 的入站包队列 `(逐包 dest 覆盖, payload)`。
@@ -1797,9 +1826,10 @@ async fn dokodemo_peer_relay(
     overridden: bool,
 ) {
     let mut session = UdpDispatchSession::new(handler);
-    #[allow(unused_mut)] // fake_cache 仅 linux cfg 分支被 &mut 借用，非 linux 构建下 mut 冗余
-    let mut fake_cache: HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>> =
-        HashMap::new();
+    #[cfg(target_os = "linux")]
+    let mut fake_cache = FakeResponderCache::default();
+    #[cfg(not(target_os = "linux"))]
+    let fake_cache = ();
     loop {
         tokio::select! {
             r = rx.recv() => {
@@ -1821,11 +1851,8 @@ async fn dokodemo_peer_relay(
                     Ok(Some((source, payload))) => {
                         // TPROXY（Linux）：按响应源选 fakeudp；None=经 hub 回发
                         #[cfg(target_os = "linux")]
-                        let fake = if overridden {
-                            fake_responder(&mut fake_cache, &source)
-                        } else {
-                            None
-                        };
+                        let fake =
+                            if overridden { fake_cache.get_or_create(&source) } else { None };
                         #[cfg(not(target_os = "linux"))]
                         let fake: Option<Arc<tokio::net::UdpSocket>> = None;
                         #[cfg(not(target_os = "linux"))]
@@ -1862,37 +1889,61 @@ async fn dokodemo_peer_relay(
     }
 }
 
-/// TPROXY 响应回发 socket：按响应源（IP）取/建 fakeudp 透明 socket。
+/// TPROXY 响应回发 socket 缓存（bd il9lh MW-3）。
 ///
-/// - 响应源为 IP：`fakeudp` bind 到该源地址（per 源缓存，Go `w.conns` 同键）。
-/// - 创建失败（需 CAP_NET_ADMIN）或源为域名（无法 bind）：返回 `None`，调用 方丢弃该响应（Go
-///   PacketWriter 创建失败 LogInfo+drop 同款降级）。
-///
-/// mark 恒 0：Rust dokodemo UDP 路径未接 session sockopt mark（Go 缺省 0 同值）。
+/// 旧实现是**无上限** `HashMap<(源 IP, 源端口), UdpSocket>`：每个上游响应源
+/// 各占一个 fd，长跑后 fd 线性增长。这里加 256 条上界 + LRU 逐出（命中搬到队尾，
+/// 满则关掉最旧的一条——socket 随 Arc drop 关闭）。
 #[cfg(target_os = "linux")]
-fn fake_responder(
-    cache: &mut HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>>,
-    source: &Destination,
-) -> Option<Arc<tokio::net::UdpSocket>> {
-    let ip = match source.address() {
-        Address::IPv4(v4) => std::net::IpAddr::V4(*v4),
-        Address::IPv6(v6) => std::net::IpAddr::V6(*v6),
-        Address::Domain(_) => return None,
-    };
-    let key = (ip, source.port().value());
-    if let Some(s) = cache.get(&key) {
-        return Some(Arc::clone(s));
-    }
-    match xray_proxy_dokodemo::fakeudp::fake_udp(SocketAddr::new(ip, key.1), 0) {
-        Ok(s) => {
-            let s = Arc::new(s);
-            cache.insert(key, Arc::clone(&s));
-            Some(s)
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "dokodemo TPROXY fakeudp create failed; response dropped");
-            None
-        },
+#[derive(Default)]
+struct FakeResponderCache {
+    map: HashMap<(std::net::IpAddr, u16), Arc<tokio::net::UdpSocket>>,
+    /// LRU 序：队首=最久未用，队尾=最近使用。
+    order: std::collections::VecDeque<(std::net::IpAddr, u16)>,
+}
+
+/// fake socket 缓存条目上限（上界 × 1 fd/条，对齐票面 256）。
+#[cfg(target_os = "linux")]
+const FAKE_RESPONDER_CACHE_CAP: usize = 256;
+
+#[cfg(target_os = "linux")]
+impl FakeResponderCache {
+    /// 取（或建）该源地址对应的 fake socket；创建失败/源为域名返回 `None`
+    /// （调用方丢弃该响应，Go PacketWriter 同款降级）。
+    fn get_or_create(&mut self, source: &Destination) -> Option<Arc<tokio::net::UdpSocket>> {
+        let ip = match source.address() {
+            Address::IPv4(v4) => std::net::IpAddr::V4(*v4),
+            Address::IPv6(v6) => std::net::IpAddr::V6(*v6),
+            Address::Domain(_) => return None,
+        };
+        let key = (ip, source.port().value());
+        if let Some(s) = self.map.get(&key) {
+            // LRU touch：仅当不在队尾时搬移（队尾即最近使用）。
+            if self.order.back() != Some(&key) {
+                if let Some(pos) = self.order.iter().position(|k| *k == key) {
+                    self.order.remove(pos);
+                    self.order.push_back(key);
+                }
+            }
+            return Some(Arc::clone(s));
+        }
+        match xray_proxy_dokodemo::fakeudp::fake_udp(SocketAddr::new(ip, key.1), 0) {
+            Ok(s) => {
+                let s = Arc::new(s);
+                // 满则逐出最旧（队首）；socket 随最后一个 Arc drop 关闭。
+                while self.map.len() >= FAKE_RESPONDER_CACHE_CAP {
+                    let Some(old) = self.order.pop_front() else { break };
+                    self.map.remove(&old);
+                }
+                self.map.insert(key, Arc::clone(&s));
+                self.order.push_back(key);
+                Some(s)
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "dokodemo TPROXY fakeudp create failed; response dropped");
+                None
+            },
+        }
     }
 }
 
@@ -2968,21 +3019,23 @@ pub async fn spawn_inbounds(
 /// default 保持真实出站（避免递归）。wrapper 外再包 MuxCarrierHandler（Go
 /// always.go:89 mux.NewServer 装饰器）：v1.mux.cool carrier 由 mux ServerWorker 接管，
 /// 子会话回 wrapper。
+///
+/// bd vdl95：sniffing 配置（含 domainsExcluded/ipsExcluded）解析失败即 Err →
+/// 入站构造失败 → 启动拒启；不再"排除了却不生效"。
 fn per_inbound_ohm(
     ohm: &Arc<SimpleOhm>,
     dispatcher: Option<&Arc<xray_app_dispatcher::DefaultDispatcher>>,
     ib: &BuiltInbound,
-) -> Arc<SimpleOhm> {
-    dispatcher
-        .map(|d| {
-            let snap = Arc::new(ohm.snapshot());
-            let sniff = crate::wiring::sniffing_request_from_json(ib.sniffing_json.as_ref());
-            let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
-                Arc::new(crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag));
-            snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
-            snap
-        })
-        .unwrap_or_else(|| Arc::clone(ohm))
+) -> std::io::Result<Arc<SimpleOhm>> {
+    let Some(d) = dispatcher else {
+        return Ok(Arc::clone(ohm));
+    };
+    let snap = Arc::new(ohm.snapshot());
+    let sniff = crate::wiring::try_sniffing_request_from_json(ib.sniffing_json.as_ref())?;
+    let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+        Arc::new(crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag));
+    snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
+    Ok(snap)
 }
 
 // ===========================================================================
@@ -3069,6 +3122,239 @@ fn user_proto(email: &str, level: u32) -> ProtoUser {
     ProtoUser { level, email: email.to_string(), account: None }
 }
 
+// ===========================================================================
+// 各协议用户热更（bd hl8q6，对标 Go `proxy/*.AddUser/RemoveUser`）
+// ===========================================================================
+//
+// 载荷约定：`user.account.value` = 该协议配置里同一用户的 **JSON**（与 CLI
+// `api add-user` 用 `extract_users_from_inbound` 产出的形态同源，也与既有 ss
+// 实现一致）。各协议的 validator 都在 serve 循环里以 `Arc` 共享，故运行时增删
+// 对**后续**连接立即生效（在途连接不切断，与 Go 同语义）。
+//
+// `get_user`/`list_users` 只回 email+level：validator 不保留原始 account 载荷
+// （与 [`SsUserManager`] 同款已知差异，避免把凭据经 gRPC 回吐）。
+
+/// 取 `user.account` 的 JSON 载荷。
+fn account_json(user: &ProtoUser) -> Result<serde_json::Value, ProxymanError> {
+    let account = user
+        .account
+        .as_ref()
+        .ok_or_else(|| ProxymanError::UserParse("add_user requires account payload".into()))?;
+    serde_json::from_slice(&account.value)
+        .map_err(|e| ProxymanError::UserParse(format!("account payload is not JSON: {e}")))
+}
+
+/// 取 account JSON 里的非空字符串字段。
+fn account_str(js: &serde_json::Value, key: &str) -> Result<String, ProxymanError> {
+    js.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| ProxymanError::UserParse(format!("account requires non-empty `{key}`")))
+}
+
+/// vless 用户管理：委托 validator（与 serve loop 共享 Arc）。
+struct VlessUserManager(Arc<dyn VlessValidator>);
+
+impl ApiUserManager for VlessUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let proto = VlessProtoAccount {
+            id: account_str(&js, "id")?,
+            flow: js.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            encryption: "none".to_string(),
+            ..Default::default()
+        };
+        let account = VlessMemoryAccount::from_proto_account(&proto)
+            .map_err(|e| ProxymanError::UserParse(format!("vless account: {e}")))?;
+        self.0
+            .add(VlessMemoryUser::new(user.email.clone(), user.level, account))
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0.del(email).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.0.get_by_email(email).map(|u| user_proto(&u.email, u.level))
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0.get_all().into_iter().map(|u| user_proto(&u.email, u.level)).collect()
+    }
+}
+
+/// vmess 用户管理：validator 只提供 add/remove/count（无枚举面），列表面自持
+/// (email → level) 索引；启动期由 settings JSON 种入。
+struct VmessUserManager {
+    validator: Arc<VmessTimedUserValidator>,
+    users: parking_lot::Mutex<std::collections::BTreeMap<String, u32>>,
+}
+
+impl VmessUserManager {
+    /// 从 settings JSON 种入初始用户索引（`clients`/`users`）。
+    fn new(validator: Arc<VmessTimedUserValidator>, settings: &[u8]) -> Self {
+        let mut users = std::collections::BTreeMap::new();
+        let parsed = serde_json::from_slice::<serde_json::Value>(settings).ok();
+        let list = parsed
+            .as_ref()
+            .and_then(|v| v.get("clients").filter(|c| !c.is_null()).or_else(|| v.get("users")))
+            .and_then(|c| c.as_array());
+        if let Some(clients) = list {
+            for c in clients {
+                let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("");
+                if !email.is_empty() {
+                    let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    users.insert(email.to_string(), level);
+                }
+            }
+        }
+        Self { validator, users: parking_lot::Mutex::new(users) }
+    }
+}
+
+impl ApiUserManager for VmessUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let id = account_str(&js, "id")?;
+        let uuid = UUID::parse(&id).ok_or_else(|| {
+            ProxymanError::UserParse(format!("vmess invalid uuid: {} bytes", id.len()))
+        })?;
+        let account = VmessMemoryAccount::new(uuid);
+        VmessValidator::add(
+            &*self.validator,
+            VmessMemoryUser::new(user.email.clone(), account).with_level(user.level),
+        )
+        .map_err(|e| ProxymanError::UserParse(e.to_string()))?;
+        self.users.lock().insert(user.email.clone(), user.level);
+        Ok(())
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.users.lock().remove(email);
+        if VmessValidator::remove(&*self.validator, email) {
+            Ok(())
+        } else {
+            Err(ProxymanError::UserParse(format!("vmess user not found: {email}")))
+        }
+    }
+
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.users.lock().get(email).map(|level| user_proto(email, *level))
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.users.lock().iter().map(|(email, level)| user_proto(email, *level)).collect()
+    }
+}
+
+/// trojan 用户管理：委托 validator（与 serve loop 共享 Arc）。
+struct TrojanUserManager(Arc<xray_proxy_trojan::Validator>);
+
+impl ApiUserManager for TrojanUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let account = TrojanMemoryAccount::new(account_str(&js, "password")?);
+        self.0
+            .add(TrojanMemoryUser::new(user.email.clone(), user.level, account))
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0.del(email).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.0.get_by_email(email).map(|u| user_proto(&u.email, u.level))
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0.get_all().into_iter().map(|u| user_proto(&u.email, u.level)).collect()
+    }
+}
+
+/// ss2022 多用户管理（单用户/中继模式无用户表，仍按 NotUserManager 明确拒绝）。
+struct Ss2022UserManager(Arc<xray_proxy_ss::ss2022::MultiUserInbound>);
+
+impl ApiUserManager for Ss2022UserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let psk = xray_proxy_ss::ss2022::psk_from_base64(&account_str(&js, "password")?)
+            .map_err(|e| ProxymanError::UserParse(format!("ss2022 PSK: {e}")))?;
+        self.0
+            .add_user(xray_proxy_ss::ss2022::Ss2022User {
+                email: user.email.clone(),
+                level: user.level,
+                psk,
+            })
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0.remove_user(email).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    /// account 不回填（同 [`SsUserManager`]）：用户表不保留原始 PSK 载荷。
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.list_users().into_iter().find(|u| u.email == email)
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0.user_emails().into_iter().map(|(email, level)| user_proto(&email, level)).collect()
+    }
+}
+
+/// wireguard 用户管理：委托 handler 的 [`WgUserRegistry`]（与 accept loop 共享）。
+struct WgUserManager(Arc<xray_proxy_wireguard::WireguardInboundHandler>);
+
+impl ApiUserManager for WgUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let peer = xray_proxy_wireguard::PeerConfig {
+            public_key: account_str(&js, "public_key")?,
+            pre_shared_key: js
+                .get("pre_shared_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            endpoint: js.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            keep_alive: js.get("keep_alive").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            allowed_ips: js
+                .get("allowed_ips")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect())
+                .unwrap_or_default(),
+            level: user.level,
+            email: user.email.clone(),
+        };
+        self.0
+            .user_registry()
+            .add_user(user.email.clone(), user.level, peer)
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0
+            .user_registry()
+            .remove_user(email)
+            .map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.0.user_registry().get_user(email).map(|u| user_proto(&u.email, u.level))
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0
+            .user_registry()
+            .list_users()
+            .into_iter()
+            .map(|u| user_proto(&u.email, u.level))
+            .collect()
+    }
+}
+
 struct InboundSlot {
     /// proxy_settings 的 type_url（`xray.proxy.{kind}.Config`），ListInbounds 回填。
     proxy_type_url: String,
@@ -3130,30 +3416,61 @@ impl InboundRuntime {
 
     /// 启动一个 inbound 并登记（配置期与 gRPC AddInbound 共用同一路径）。
     ///
+    /// 去重与登记在**同一把写锁内**完成（bd ym0z8）：并发同 tag 的调用只有一个
+    /// 能插入（udf `BoundedRegistry::insert` 对重复键是静默覆盖，故此处先 `get`
+    /// 复查再插，锁内原子），输家直接返回 `AlreadyExists`，不会把赢家的 slot
+    /// 摘掉造成孤儿监听。spawn 期间被 `RemoveInbound` 取消 → 回滚 slot 并返回 Err
+    /// （不再"API 说成功、实际已死"）。
+    ///
     /// # Errors
     ///
-    /// tag 已存在或 listener 绑定/协议配置失败——错误原样返回，不静默跳过。
+    /// - 同 tag 已登记 → [`std::io::ErrorKind::AlreadyExists`]（`existing tag found`）
+    /// - listener 绑定/协议配置失败 → 原错误上抛
+    /// - 启动期间被取消 → [`std::io::ErrorKind::Interrupted`]
     pub async fn start_inbound(
         &self,
         ib: &BuiltInbound,
     ) -> std::io::Result<Option<JoinHandle<()>>> {
-        if self.contains(&ib.tag) {
-            return Err(std::io::Error::other(format!("existing tag found: {}", ib.tag)));
-        }
         let cancel = self.shutdown.child_token();
         let type_url = format!("xray.proxy.{}.Config", ib.entry.kind);
-        // 满表 fail-closed：insert Err 显式上抛（上界 INBOUND_REGISTRY_CAP，配置
-        // 面工程上不可达），不静默淘汰（xiuvr-3a D3）。
-        self.slots
-            .write()
-            .insert(
-                ib.tag.clone(),
-                InboundSlot { proxy_type_url: type_url, cancel: cancel.clone(), users: None },
-            )
-            .map_err(|e| std::io::Error::other(format!("inbound registry full: {e}")))?;
-        let per_ohm = per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib);
-        match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel, Some(self)).await {
-            Ok(handle) => Ok(handle),
+        {
+            let mut slots = self.slots.write();
+            if slots.get(ib.tag.as_str()).is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("existing tag found: {}", ib.tag),
+                ));
+            }
+            // 满表 fail-closed：insert Err 显式上抛（上界 INBOUND_REGISTRY_CAP，配置
+            // 面工程上不可达），不静默淘汰（xiuvr-3a D3）。
+            slots
+                .insert(
+                    ib.tag.clone(),
+                    InboundSlot { proxy_type_url: type_url, cancel: cancel.clone(), users: None },
+                )
+                .map_err(|e| std::io::Error::other(format!("inbound registry full: {e}")))?;
+        }
+        // sniffing 配置非法在这里拒启（bd vdl95）：pre-spawn 失败须回滚刚插的 slot。
+        let per_ohm = match per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib) {
+            Ok(o) => o,
+            Err(e) => {
+                self.slots.write().remove(ib.tag.as_str());
+                return Err(e);
+            },
+        };
+        match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel.clone(), Some(self)).await
+        {
+            Ok(handle) => {
+                // 启动期间被 RemoveInbound 取消：listener 已随 token 收起，报 Err。
+                if cancel.is_cancelled() {
+                    self.slots.write().remove(ib.tag.as_str());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        format!("inbound {} cancelled during start", ib.tag),
+                    ));
+                }
+                Ok(handle)
+            },
             Err(e) => {
                 // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配。
                 self.slots.write().remove(ib.tag.as_str());
@@ -3209,20 +3526,17 @@ impl InboundRuntime {
         slot.users.clone().ok_or(ProxymanError::NotUserManager)
     }
 
-    /// 协议 handler 启动时登记用户管理器（当前仅 shadowsocks legacy 走这条）。
+    /// 协议 handler 启动时登记用户管理器（各协议 builder 在 spawn 前调用）。
     ///
-    /// 槽位在 spawn 前已插入，缺失说明调用方未登记 tag（编程错误）。
+    /// bd 9c8k6 ③：就地取 `get_mut` 写 `users`，**不再 remove+insert**——旧实现
+    /// 与 `RemoveInbound`（同一把写锁摘 slot）交错时会把已删 tag 的 slot
+    /// 重新插回去（复活已删 tag + 泄漏孤儿 slot）。
     fn register_user_manager(&self, tag: &str, users: Arc<dyn ApiUserManager>) {
         let mut slots = self.slots.write();
-        // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配。
-        let Some(mut slot) = slots.remove(tag) else {
-            tracing::warn!(tag = %tag, "user manager registered for unknown inbound");
-            return;
-        };
-        slot.users = Some(users);
-        // 键刚被 remove，insert 恒成功（不触发淘汰）；Err 仅为理论竞态留痕。
-        if slots.insert(tag.to_string(), slot).is_err() {
-            tracing::error!(tag = %tag, "inbound registry insert failed after remove");
+        match slots.get_mut(tag) {
+            Some(slot) => slot.users = Some(users),
+            // tag 已被 RemoveInbound 摘除：丢弃登记，不复活。
+            None => tracing::debug!(tag = %tag, "user manager registration skipped: tag removed"),
         }
     }
 }
@@ -3872,7 +4186,8 @@ pub(crate) async fn serve_reality_vless(
 pub(crate) async fn serve_reality_trojan(
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
-    users: HashMap<String, TrojanMemoryUser>,
+    // bd hl8q6：validator 由装配层构造并共享（用户热更句柄）。
+    validator: Arc<xray_proxy_trojan::Validator>,
     fb_policy: Option<Arc<FallbackPolicy>>,
     cfg: RealityInboundConfig,
     handshake_timeout: std::time::Duration,
@@ -3883,14 +4198,7 @@ pub(crate) async fn serve_reality_trojan(
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let local = listener.local_addr()?;
-    tracing::info!(addr = %local, users = users.len(), "trojan+reality inbound listening");
-
-    let validator = Arc::new(xray_proxy_trojan::Validator::new());
-    for (_, user) in users {
-        if let Err(e) = validator.add(user) {
-            tracing::warn!(error = %e, "skip duplicate user during trojan+reality inbound init");
-        }
-    }
+    tracing::info!(addr = %local, users = validator.get_key_count(), "trojan+reality inbound listening");
 
     // bd frxi：探测上下文（Go tcp/hub.go:79 无条件跑，Rust 侧 opt-in）；
     // 与 serve_reality_vless 同构，probe 结果随连接交付。
@@ -4136,17 +4444,68 @@ pub(crate) fn handshake_timeout_for(
 
 /// 把 ss inbound 的 validator 登记进 gRPC 用户管理面。
 ///
-/// shortcut: 仅 legacy AEAD 模式（用户表可增删查）；ss2022 单/多用户/中继模式的
-/// 用户面未接线，gRPC 用户操作按 `NotUserManager` 明确拒绝。
+/// 覆盖 legacy AEAD（validator）与 ss2022 **多用户**（用户表）；ss2022 单用户/
+/// 中继模式没有用户表，仍按 `NotUserManager` 明确拒绝（Go 同：只有
+/// `inbound_multi.go` 实现 UserManager）。
 pub(crate) fn register_ss_user_manager(
     api: Option<&InboundRuntime>,
     tag: &str,
     mode: &SsInboundMode,
 ) {
-    let (Some(api), SsInboundMode::Legacy(ss)) = (api, mode) else {
-        return;
-    };
-    api.register_user_manager(tag, Arc::new(SsUserManager(Arc::clone(ss))));
+    let Some(api) = api else { return };
+    match mode {
+        SsInboundMode::Legacy(ss) => {
+            api.register_user_manager(tag, Arc::new(SsUserManager(Arc::clone(ss))));
+        },
+        SsInboundMode::Ss2022Multi(multi) => {
+            api.register_user_manager(tag, Arc::new(Ss2022UserManager(Arc::clone(multi))));
+        },
+        SsInboundMode::Ss2022(_) | SsInboundMode::Ss2022Relay(_) => {},
+    }
+}
+
+/// vless 用户热更登记（bd hl8q6）：validator 与 serve loop 共享同一 `Arc`。
+pub(crate) fn register_vless_user_manager(
+    api: Option<&InboundRuntime>,
+    tag: &str,
+    validator: &Arc<dyn VlessValidator>,
+) {
+    let Some(api) = api else { return };
+    api.register_user_manager(tag, Arc::new(VlessUserManager(Arc::clone(validator))));
+}
+
+/// vmess 用户热更登记（bd hl8q6）。`settings` 用于种入列表面（validator 无枚举面）。
+pub(crate) fn register_vmess_user_manager(
+    api: Option<&InboundRuntime>,
+    tag: &str,
+    validator: &Arc<VmessTimedUserValidator>,
+    settings: &[u8],
+) {
+    let Some(api) = api else { return };
+    api.register_user_manager(
+        tag,
+        Arc::new(VmessUserManager::new(Arc::clone(validator), settings)),
+    );
+}
+
+/// trojan 用户热更登记（bd hl8q6）：validator 与 serve loop 共享同一 `Arc`。
+pub(crate) fn register_trojan_user_manager(
+    api: Option<&InboundRuntime>,
+    tag: &str,
+    validator: &Arc<xray_proxy_trojan::Validator>,
+) {
+    let Some(api) = api else { return };
+    api.register_user_manager(tag, Arc::new(TrojanUserManager(Arc::clone(validator))));
+}
+
+/// wireguard 用户热更登记（bd hl8q6）：委托 handler 内与 accept loop 共享的注册表。
+pub(crate) fn register_wg_user_manager(
+    api: Option<&InboundRuntime>,
+    tag: &str,
+    handler: &Arc<xray_proxy_wireguard::WireguardInboundHandler>,
+) {
+    let Some(api) = api else { return };
+    api.register_user_manager(tag, Arc::new(WgUserManager(Arc::clone(handler))));
 }
 
 /// 按协议种类启动单个 inbound listener。
@@ -4161,15 +4520,14 @@ pub(crate) async fn spawn_one_inbound(
     api: Option<&InboundRuntime>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
-    // 已删）。表条目转发 phase 1 同一构造函数；未命中 = 未支持协议，显式 warn
-    // 跳过（不静默构造）。查表先行：listen 形态（是否消费地址）即表条目属性。
+    // 已删）。表条目转发 phase 1 同一构造函数；未命中 = 未支持协议 → **拒启**
+    // （bd vdl95：Go infra/conf/xray.go「unknown protocol」硬错；旧行为 warn+skip
+    // 会让节点静默消失、端口无监听而管理员无感）。
     let Some(ctor) = crate::arm_registry::lookup_inbound_builder(ib.entry.kind.as_str()) else {
-        tracing::warn!(
-            tag = %ib.tag,
-            protocol = %ib.entry.kind,
-            "inbound protocol not yet supported, skipping"
-        );
-        return Ok(None);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown inbound protocol: {}", ib.entry.kind),
+        ));
     };
     // tun：自管监听面（设备 + netstack），不消费 listen/port —— 跳过 sockopt 校验
     // 与地址解析直接分派（平台门控在表值 `tun_entry` 内）。
@@ -4624,6 +4982,26 @@ pub(crate) fn build_vless_validator(
     }
 
     Ok(std::sync::Arc::new(validator))
+}
+
+/// trojan 用户表 → 与 serve 循环共享的 `Arc<Validator>`（bd hl8q6）。
+///
+/// 语义与 serve 内部原实现逐字一致：按 `users` 表迭代 add，重复 email 只 warn
+/// 不中断（Go `Validator.Add` 失败同样只记日志）。放 builder 侧构造，gRPC
+/// `AddUser/RemoveUser` 才能拿到同一句柄。
+///
+/// # Errors
+/// 当前不会失败（保留 Result 供将来 add 硬门）。
+pub(crate) fn build_trojan_validator_shared(
+    users: &HashMap<String, TrojanMemoryUser>,
+) -> Result<Arc<xray_proxy_trojan::Validator>, String> {
+    let validator = Arc::new(xray_proxy_trojan::Validator::new());
+    for user in users.values() {
+        if let Err(e) = validator.add(user.clone()) {
+            tracing::warn!(error = %e, "skip duplicate user during trojan inbound init");
+        }
+    }
+    Ok(validator)
 }
 
 /// 解析 settings.decryption → handler 级共享 ENC 解密实例（Go inbound.go:104-114）。
@@ -8380,11 +8758,13 @@ mod tests {
         )) as Arc<dyn xray_app_dispatcher::DispatchHandler>;
         ohm.set_default(bridge);
 
-        // 3. trojan users
+        // 3. trojan users（bd hl8q6 形态：共享 validator 由装配/测试侧构造）
         let account = TrojanMemoryAccount::new("trojan-reality-39436-pass");
         let user = TrojanMemoryUser::new("reality-e2e@trojan", 0, account.clone());
         let mut users = HashMap::new();
         users.insert(user.key_hash(), user);
+        let trojan_validator =
+            build_trojan_validator_shared(&users).expect("build trojan validator");
 
         // 4. serve_reality_trojan（修复后的装配路径）
         let server_secret = x25519_dalek::StaticSecret::from([0x77u8; 32]);
@@ -8415,7 +8795,7 @@ mod tests {
             let _ = serve_reality_trojan(
                 rl,
                 ohm_c,
-                users,
+                trojan_validator,
                 None,
                 reality_cfg,
                 std::time::Duration::from_secs(30),
@@ -12484,6 +12864,63 @@ mod tests {
         }
     }
 
+    /// bd zmpxy：dokodemo UDP 会话准入门的容量语义——表满时**新 peer 被拒**、
+    /// **既有 peer 仍放行**（不被连坐），且槽位被空闲 TTL 清掉后立刻可再准入
+    /// （"计数归还"）。
+    #[test]
+    fn dokodemo_udp_admission_respects_cap_and_returns_slot() {
+        // 未满：新 peer 放行。
+        assert!(dokodemo_udp_admits(0, true));
+        assert!(dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS - 1, true));
+        // 恰好满：新 peer 被拒，既有 peer 仍放行。
+        assert!(!dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS, true));
+        assert!(dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS, false));
+        // 伪造源地址洪泛（远超上限）：仍然只拒新 peer。
+        assert!(!dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS * 8, true));
+        // 计数归还：清扫掉一个会话后（len → cap-1）新 peer 立刻可准入。
+        assert!(dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS - 1, true));
+        // 每 peer 队列深度确实压到 16（票据「缓冲按需」面）。
+        assert_eq!(DOKODEMO_UDP_PEER_QUEUE, 16);
+    }
+
+    /// bd ym0z8：同 tag **并发** `start_inbound` —— 20 个并发只有一个成功，其余
+    /// 全是 `AlreadyExists`，且不留孤儿 slot（`list()` 恰好 1 条）。
+    ///
+    /// 旧实现 `contains()` 与 `insert` 分属两把锁且 udf `insert` 对重复键静默覆盖：
+    /// 赢家 slot 被后到者覆盖、失败分支再把赢家 slot 摘掉 → 孤儿监听 + 后续
+    /// RemoveInbound 找不到 tag（API 假成功）。
+    #[tokio::test]
+    async fn start_inbound_same_tag_concurrent_only_one_wins() {
+        let rt = Arc::new(xiuvr3a_runtime());
+        let tag = "t-concurrent";
+        // 20 个并发：都拿同一份配置（blackhole 会真的 bind 一个 listener）。
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            let rt = Arc::clone(&rt);
+            let ib = xiuvr3a_inbound("blackhole", tag, serde_json::json!({}));
+            tasks.push(tokio::spawn(async move { rt.start_inbound(&ib).await }));
+        }
+        let mut ok = 0usize;
+        let mut already = 0usize;
+        let mut other = Vec::new();
+        for t in tasks {
+            match t.await.expect("join") {
+                Ok(_) => ok += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => already += 1,
+                Err(e) => other.push(e.to_string()),
+            }
+        }
+        assert_eq!(ok, 1, "同 tag 并发只能有一个成功（实际 ok={ok}，already={already}）");
+        assert_eq!(already, 19, "输家必须统一 AlreadyExists（other={other:?}）");
+        assert!(other.is_empty(), "不应出现其它错误类型：{other:?}");
+
+        // 无孤儿：注册表恰好 1 条，且能被正常摘除（旧实现此处会是 HandlerNotFound）。
+        let listed: Vec<String> = rt.list().into_iter().map(|(t, _)| t).collect();
+        assert_eq!(listed, vec![tag.to_string()], "slot 不得重复登记/丢失");
+        rt.remove_inbound(tag).expect("winner slot must be removable");
+        assert!(rt.list().is_empty(), "摘除后注册表必须清空（无孤儿 slot）");
+    }
+
     /// 生命周期全操作回归（xiuvr-3a 切 BoundedRegistry 后）：登记/查询/摘除/
     /// 回滚的派生不变量（start Ok ⇒ contains=true；Err ⇒ contains=false）。
     #[tokio::test]
@@ -12495,19 +12932,19 @@ mod tests {
         assert!(rt.list().is_empty());
         assert!(matches!(rt.user_manager("nope"), Err(ProxymanError::HandlerNotFound(_))));
 
-        // 未支持 kind：登记成功 + warn skip（Ok(None)）→ 槽位留存（既有行为），
-        // 派生一致性：start 返回 Ok ⇒ contains 必 true。
-        let res = rt
+        // 未支持 kind：**拒启**（bd vdl95；旧行为 warn skip + 槽位留存 → 端口
+        // 无监听而管理员无感）。派生一致性：Err ⇒ contains 必 false（回滚）。
+        let err = rt
             .start_inbound(&xiuvr3a_inbound("no-such-proto", "t-unsup", serde_json::json!({})))
             .await
-            .expect("unsupported kind must warn-skip, not error");
-        assert!(res.is_none(), "unsupported kind must not spawn a serve task");
-        assert!(rt.contains("t-unsup"), "slot stays registered after warn-skip");
-        assert!(matches!(rt.user_manager("t-unsup"), Err(ProxymanError::NotUserManager)));
+            .expect_err("unknown inbound protocol must fail, not warn-skip");
+        assert!(
+            err.to_string().contains("unknown inbound protocol"),
+            "error should name the protocol gate: {err}"
+        );
+        assert!(!rt.contains("t-unsup"), "failed start must roll back the slot");
 
-        // 摘除配对：命中一次后二次摘除 = HandlerNotFound（miss 路径也对照）。
-        rt.remove_inbound("t-unsup").expect("registered tag must remove");
-        assert!(!rt.contains("t-unsup"));
+        // 摘除 miss 路径对照（HandlerNotFound）
         assert!(matches!(rt.remove_inbound("t-unsup"), Err(ProxymanError::HandlerNotFound(_))));
 
         // 畸形 settings（非法 JSON）经 loopback builder：parse_loopback_config

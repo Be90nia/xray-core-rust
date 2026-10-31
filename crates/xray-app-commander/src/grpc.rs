@@ -671,21 +671,23 @@ impl ProtoRoutingService for RoutingServiceImpl {
         &self,
         request: Request<prouter::AddRuleRequest>,
     ) -> Result<Response<prouter::AddRuleResponse>, Status> {
-        // Go routingServer.AddRule（command.go:56-61）：config TypedMessage →
-        // RoutingRule → router.AddRule(config, shouldAppend)。
-        // shouldAppend=false 的前插语义由 Router::add_rule 的 append 实现吸收
-        //（domain 层当前仅 append，ponytail 注记）。
+        // Go routingServer.AddRule（command.go:56-61）→ `Router.AddRule(config, shouldAppend)`
+        // → `ReloadRules(config, shouldAppend)`：载荷是**整份** `xray.app.router.Config`
+        // （rule[] + balancingRule[]），不是单条 RoutingRule；`shouldAppend=false`
+        // = 整体替换规则集（bd 9c8k6 ① ②——旧实现只解单条 RoutingRule 且恒追加）。
         let req = request.into_inner();
         let tm = req
             .config
             .ok_or_else(|| Status::invalid_argument("AddRuleRequest.config is required"))?;
-        let rule = xray_proto::xray::app::router::RoutingRule::decode(tm.value.as_slice())
-            .map_err(|e| Status::invalid_argument(format!("decode RoutingRule: {e}")))?;
-        let rule_tag = rule.rule_tag.clone();
-        if rule_tag.is_empty() {
-            return Err(Status::invalid_argument("RoutingRule.rule_tag is required"));
+        if tm.r#type != "xray.app.router.Config" {
+            return Err(Status::invalid_argument(format!(
+                "AddRuleRequest.config type must be xray.app.router.Config, got {:?}",
+                tm.r#type
+            )));
         }
-        self.service.add_rule(rule_tag, rule).map_err(router_status)?;
+        let config = xray_proto::xray::app::router::Config::decode(tm.value.as_slice())
+            .map_err(|e| Status::invalid_argument(format!("decode xray.app.router.Config: {e}")))?;
+        self.service.add_rules(&config, req.should_append).map_err(router_status)?;
         Ok(Response::new(prouter::AddRuleResponse {}))
     }
 
@@ -1289,10 +1291,12 @@ mod tests {
         };
         rule.target_tag =
             Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
+        // Go 载荷 = 整份 xray.app.router.Config（bd 9c8k6 ②）
+        let cfg = xray_proto::xray::app::router::Config { rule: vec![rule], ..Default::default() };
         svc.add_rule(Request::new(prouter::AddRuleRequest {
             config: Some(TypedMessage {
-                r#type: "xray.app.router.RoutingRule".into(),
-                value: rule.encode_to_vec(),
+                r#type: "xray.app.router.Config".into(),
+                value: cfg.encode_to_vec(),
             }),
             should_append: true,
         }))
@@ -1783,10 +1787,11 @@ mod tests {
         };
         rule.target_tag =
             Some(xray_proto::xray::app::router::routing_rule::TargetTag::Tag("direct".into()));
+        let cfg = xray_proto::xray::app::router::Config { rule: vec![rule], ..Default::default() };
         svc.add_rule(Request::new(prouter::AddRuleRequest {
             config: Some(TypedMessage {
-                r#type: "xray.app.router.RoutingRule".into(),
-                value: rule.encode_to_vec(),
+                r#type: "xray.app.router.Config".into(),
+                value: cfg.encode_to_vec(),
             }),
             should_append: true,
         }))
@@ -1798,7 +1803,7 @@ mod tests {
             svc.list_rule(Request::new(prouter::ListRuleRequest {})).await.unwrap().into_inner();
         assert!(resp.rules.iter().any(|r| r.rule_tag == "rule-1"));
 
-        // 空 rule_tag → InvalidArgument
+        // 载荷类型不对（旧 bug 的 xray.app.router.RoutingRule 形态）→ InvalidArgument
         let err = svc
             .add_rule(Request::new(prouter::AddRuleRequest {
                 config: Some(TypedMessage {

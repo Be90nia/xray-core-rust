@@ -43,18 +43,56 @@ impl HttpSession {
     }
 }
 
+/// 会话表条目上限（票 3zbwx）。
+///
+/// session id 由客户端自选，`upsert` 又是「来者即建」——不设门则可被无凭据请求
+/// 无限灌大表（每条含 UploadQueue），30s reap 之前即吃满内存。上限取 1024：单
+/// 客户端正常只用 1 条会话，1024 条足以覆盖大量真实客户端的聚合。
+pub const DEFAULT_MAX_SESSIONS: usize = 1024;
+
+/// session id 长度上限（票 3zbwx）。
+///
+/// 服务端把 id 当归一化键用，长度无界会让每条请求的键分配跟着无界（path /
+/// query / cookie 携带的 id 长度完全由对端决定）。
+pub const MAX_SESSION_ID_LEN: usize = 128;
+
+/// `upsert` 失败原因（会话数达上限）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionUpsertError {
+    /// 表中条目数已达上限且这是新 id。
+    TooManySessions,
+}
+
+/// 校验客户端自选的 session id：非空、长度有界、可打印 ASCII。
+///
+/// 不约束具体字符集——`sessionIDTable` 允许客户端配置任意 ASCII 字母表
+/// （含 `!@#` 之类），故只挡控制字符与超长。
+#[must_use]
+pub fn is_valid_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= MAX_SESSION_ID_LEN
+        && session_id.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// 会话表：session_id → Arc````<HttpSession>````。
 ///
 /// 对应 Go `requestHandler.sessions sync.Map` + `sessionMu sync.Mutex`。
-/// `upsert` 实现 get-or-create + 30s 自动 reap。
+/// `upsert` 实现 get-or-create + 30s 自动 reap，并强制 [`DEFAULT_MAX_SESSIONS`] 门。
 pub struct SessionMap {
     inner: Mutex<HashMap<String, Arc<HttpSession>>>,
+    /// 条目数上限（新 id 超出即 [`SessionUpsertError::TooManySessions`]）。
+    max_sessions: usize,
 }
 
 impl SessionMap {
-    /// 构造空会话表。
+    /// 构造空会话表（上限 [`DEFAULT_MAX_SESSIONS`]）。
     pub fn new() -> Self {
-        Self { inner: Mutex::new(HashMap::new()) }
+        Self::with_max_sessions(DEFAULT_MAX_SESSIONS)
+    }
+
+    /// 构造带自定义上限的空会话表（测试/容量调优用）。
+    pub fn with_max_sessions(max_sessions: usize) -> Self {
+        Self { inner: Mutex::new(HashMap::new()), max_sessions: max_sessions.max(1) }
     }
 
     /// 获取已有会话（不创建）。用于 GET 标记 fully_connected。
@@ -67,23 +105,30 @@ impl SessionMap {
     /// 对应 Go `upsertSession`：如果 session 已存在返回已有；否则创建新 session
     /// 并 spawn 一个 30s 定时器——如果 30s 内 GET 未到达（`isFullyConnected` 未关闭），
     /// 删除 session 并关闭 upload_queue。
+    ///
+    /// 强制 [`DEFAULT_MAX_SESSIONS`] 门（票 3zbwx）：新 id 且表已满 →
+    /// [`SessionUpsertError::TooManySessions`]，调用方必须显式回错误（fail-visible），
+    /// 不得静默丢弃。已在表的 id 不受门影响（避免满了以后连正常会话都用不了）。
     pub async fn upsert(
         self: &Arc<Self>,
         session_id: &str,
         max_buffered_posts: usize,
-    ) -> Arc<HttpSession> {
+    ) -> Result<Arc<HttpSession>, SessionUpsertError> {
         // fast path
         {
             let map = self.inner.lock().await;
             if let Some(s) = map.get(session_id) {
-                return Arc::clone(s);
+                return Ok(Arc::clone(s));
             }
         }
         // slow path
         let mut map = self.inner.lock().await;
         // double-check
         if let Some(s) = map.get(session_id) {
-            return Arc::clone(s);
+            return Ok(Arc::clone(s));
+        }
+        if map.len() >= self.max_sessions {
+            return Err(SessionUpsertError::TooManySessions);
         }
         let session = Arc::new(HttpSession::new(max_buffered_posts));
         map.insert(session_id.to_string(), Arc::clone(&session));
@@ -109,7 +154,7 @@ impl SessionMap {
             }
         });
 
-        session
+        Ok(session)
     }
 
     /// 删除会话（GET 结束后调用）。
@@ -140,17 +185,42 @@ mod tests {
     #[tokio::test]
     async fn upsert_creates_and_reuses_session() {
         let map = Arc::new(SessionMap::new());
-        let s1 = map.upsert("sess-1", 30).await;
-        let s2 = map.upsert("sess-1", 30).await;
+        let s1 = map.upsert("sess-1", 30).await.expect("首建会话");
+        let s2 = map.upsert("sess-1", 30).await.expect("复用会话");
         assert!(Arc::ptr_eq(&s1, &s2));
     }
 
     #[tokio::test]
     async fn upsert_different_sessions() {
         let map = Arc::new(SessionMap::new());
-        let s1 = map.upsert("a", 30).await;
-        let s2 = map.upsert("b", 30).await;
+        let s1 = map.upsert("a", 30).await.expect("会话 a");
+        let s2 = map.upsert("b", 30).await.expect("会话 b");
         assert!(!Arc::ptr_eq(&s1, &s2));
+    }
+
+    /// 3zbwx：新 id 达上限即拒，已存在的 id 不受门影响。
+    #[tokio::test]
+    async fn upsert_rejects_new_ids_over_capacity() {
+        let map = Arc::new(SessionMap::with_max_sessions(2));
+        map.upsert("a", 10).await.expect("会话 a");
+        map.upsert("b", 10).await.expect("会话 b");
+        assert_eq!(
+            map.upsert("c", 10).await.err(),
+            Some(SessionUpsertError::TooManySessions),
+            "第 3 个新 id 必须被上限拒绝"
+        );
+        assert!(map.upsert("a", 10).await.is_ok(), "已存在 id 必须仍可用");
+        assert!(map.get("c").await.is_none(), "被拒 id 不得落表");
+    }
+
+    /// 3zbwx：id 校验边界（空 / 超长 / 控制字符拒；自定义字母表放行）。
+    #[test]
+    fn session_id_validation() {
+        assert!(is_valid_session_id("1c1c1c1c-8f8f-4a4a-9b9b-2f2f2f2f2f2f"));
+        assert!(is_valid_session_id("abc123!@#"), "自定义 sessionIDTable 字母表必须放行");
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id(&"a".repeat(MAX_SESSION_ID_LEN + 1)));
+        assert!(!is_valid_session_id("bad\nid"));
     }
 
     #[tokio::test]
@@ -162,14 +232,14 @@ mod tests {
     #[tokio::test]
     async fn get_returns_some_after_upsert() {
         let map = Arc::new(SessionMap::new());
-        map.upsert("x", 10).await;
+        map.upsert("x", 10).await.expect("会话 x");
         assert!(map.get("x").await.is_some());
     }
 
     #[tokio::test]
     async fn remove_deletes_session() {
         let map = Arc::new(SessionMap::new());
-        map.upsert("x", 10).await;
+        map.upsert("x", 10).await.expect("会话 x");
         map.remove("x").await;
         assert!(map.get("x").await.is_none());
     }
@@ -177,7 +247,7 @@ mod tests {
     #[tokio::test]
     async fn session_reaped_after_30s_without_get() {
         let map = Arc::new(SessionMap::new());
-        let _s = map.upsert("reap-me", 10).await;
+        let _s = map.upsert("reap-me", 10).await.expect("会话 reap-me");
         // Simulate timeout by using a very short sleep — the real timer is 30s,
         // but we can't wait that long in a test. Instead test the reap logic
         // directly by checking that the session exists before remove.

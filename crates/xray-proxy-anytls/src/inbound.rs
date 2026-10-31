@@ -111,6 +111,17 @@ impl InboundHandler for AnytlsInboundHandler {
     }
 
     async fn start(&self) -> std::result::Result<(), InboundError> {
+        // bz800：无口令 = 完全不校验认证帧 = 零认证开放代理（anytls 是 Rust 独有
+        // 协议，无 Go 可对照；装配期 fail-visible，不接受"缺口令就放行"）。
+        match self.password.as_deref() {
+            Some(p) if !p.is_empty() => {},
+            _ => {
+                return Err(InboundError::ListenError(
+                    "anytls inbound requires settings.password (empty/absent means no authentication)"
+                        .to_string(),
+                ));
+            },
+        }
         let mut slot = self.slot.lock().await;
         if slot.is_some() {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
@@ -208,7 +219,9 @@ mod tests {
     }
 
     fn make_handler() -> AnytlsInboundHandler {
+        // bz800：handler 无口令即拒启，故测试基准 handler 必须带口令。
         AnytlsInboundHandler::new("test", "127.0.0.1:0".parse().unwrap(), make_tls_acceptor())
+            .with_password(Some("test-pw".into()))
     }
 
     #[test]
@@ -335,31 +348,26 @@ mod tests {
         handler.close().await.unwrap();
     }
 
-    /// 未配密码（None）时保持旧语义：任意/无校验连接可用。
+    /// bz800：未配密码（None/空串）→ **拒启**（旧语义"任意连接可用"是零认证
+    /// 开放代理，已被本票反转；期望原文改动见票面）。
     #[tokio::test]
-    async fn handler_without_password_allows_connection() {
-        use std::time::Duration;
-
-        use crate::socks::SocksAddr;
-
-        let echo = start_echo_server().await;
-        let (acceptor, cert_der) = make_tls_acceptor_with_cert();
+    async fn handler_without_password_rejects_start() {
+        let (acceptor, _cert_der) = make_tls_acceptor_with_cert();
         let handler =
             AnytlsInboundHandler::new("anytls-nopw", "127.0.0.1:0".parse().unwrap(), acceptor);
-        handler.start().await.unwrap();
-        let server_addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
+        let err =
+            handler.start().await.expect_err("no-password anytls inbound must refuse to start");
+        assert!(
+            err.to_string().contains("settings.password"),
+            "error should name the missing credential, got: {err}"
+        );
+        assert_eq!(handler.port(), 0, "refused start must not bind a port");
 
-        let client = make_client(server_addr, "whatever", &cert_der);
-        let mut conn =
-            client.dial(&SocksAddr::from_socket(echo)).await.expect("dial without server password");
-        conn.write_all(b"hi").await.expect("write");
-        let mut buf = [0u8; 2];
-        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut buf))
-            .await
-            .expect("read within timeout")
-            .expect("echo read");
-        assert_eq!(&buf, b"hi");
-        client.close().await.ok();
-        handler.close().await.unwrap();
+        // 空串口令与缺失同义：同样拒启。
+        let (acceptor2, _) = make_tls_acceptor_with_cert();
+        let empty =
+            AnytlsInboundHandler::new("anytls-emptypw", "127.0.0.1:0".parse().unwrap(), acceptor2)
+                .with_password(Some(String::new()));
+        assert!(empty.start().await.is_err(), "empty password must also refuse to start");
     }
 }

@@ -27,10 +27,16 @@ const OPT_DATA: u8 = 1;
 const NETWORK_UDP: u8 = 2;
 const MIN_META_LEN: usize = 4;
 const GLOBAL_ID_LEN: usize = 8;
-/// Go `common/xudp/xudp.go:100`：`length+666 > buf.Size(8192) → continue`，等价上限
-/// `8192-666 = 7526`。超限帧静默跳过（Go 同语义）；且 7526 < u16::MAX 保证帧
-/// length 字段（`data.len() as u16`）不截断。
-const MAX_DATA_LEN: usize = 8_192 - 666;
+/// 载荷上限 = u16 上限（帧 `data_len` 字段宽度的物理极限）。
+///
+/// 历史值 `8192-666 = 7526` 抄自 Go `common/xudp/xudp.go:100`
+/// （`length+666 > buf.Size`）——但那是 **Go wire 侧**（mux 帧承载）的约束，
+/// Rust 的 XUDP 帧只跑**内部 dispatch link**（freedom/dns/hysteria/tuic/ss/wg
+/// 六族消费），隧道/mux 的 wire 表示已改由各协议自己的 framing 层负责。
+/// 照抄该值会让 >7526B 的 UDP 应答在写侧被静默跳过（bd zu7tk：socks5 UDP
+/// 7600B 起全无回包，Go 侧 8000B 正常）。超限帧仍静默跳过（Go 同语义）；
+/// 7526 < 65535 之外的超限在 UDP 面上不可达（单数据报 ≤ 65507）。
+const MAX_DATA_LEN: usize = u16::MAX as usize;
 
 /// XUDP 帧编解码错误
 #[derive(thiserror::Error, Debug)]
@@ -660,12 +666,32 @@ mod tests {
         assert_eq!(pkt.data(), b"data");
     }
 
-    // ── Go parity：MAX_DATA_LEN = buf.Size - 666 = 7526（xudp.go:100）──────
+    // ── 载荷上限 = u16 上限（内部 link 专属；bd zu7tk 撤回 Go wire 侧 7526 抄值）──
 
     #[test]
-    fn max_data_len_matches_go_baseline() {
-        // Go: `length+666 > buf.Size(8192) → continue`，等价上限 8192-666。
-        assert_eq!(MAX_DATA_LEN, 7_526);
+    fn max_data_len_is_u16_ceiling() {
+        // 历史值 7526 来自 Go **wire 侧** `length+666 > buf.Size(8192)`；Rust 的
+        // XUDP 帧只跑内部 dispatch link（隧道/mux 的 wire 表示由各协议 framing
+        // 层负责），照抄会让 >7526B 的 UDP 应答在写侧被静默跳过（socks5 UDP
+        // 7600B 起全无回包）。上限取 data_len 字段宽度极限。
+        assert_eq!(MAX_DATA_LEN, usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn test_large_packet_roundtrip_past_old_7526_limit() {
+        // 8000B（Go 侧正常回显的档位）必须能装帧并读回逐字节一致
+        let dest = ipv4_dest("127.0.0.1", 80);
+        let mut buf = Vec::new();
+        let payload = vec![0xCD_u8; 8_000];
+        {
+            let mut writer = PacketWriter::new(&mut buf, dest.clone(), test_global_id());
+            writer.write_packet(&payload).expect("8000B written");
+        }
+
+        let mut reader = PacketReader::new(Cursor::new(buf));
+        let pkt = reader.read_packet().expect("read").expect("some");
+        assert_eq!(pkt.data(), &payload[..]);
+        assert!(reader.read_packet().expect("eof").is_none());
     }
 
     #[test]
@@ -685,7 +711,7 @@ mod tests {
         assert_eq!(
             pkt.data().len(),
             MAX_DATA_LEN,
-            "7526 通过；7527 静默跳过（Go continue 同语义）"
+            "上限通过；上限+1 静默跳过（Go continue 同语义）"
         );
         assert!(reader.read_packet().expect("eof").is_none());
     }

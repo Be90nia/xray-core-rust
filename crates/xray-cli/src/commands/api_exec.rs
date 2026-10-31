@@ -172,6 +172,12 @@ fn build_typed_message(type_name: &str, settings: Option<&serde_json::Value>) ->
 }
 
 /// 构建 AddRule 的 TypedMessage（路由规则）。
+///
+/// bd 9c8k6 ②：Go `api adrules` 走 `infra/conf.RouterConfig.Build()` 成
+/// `xray.app.router.Config`（rule[] + balancingRule[]）+ `serial.ToTypedMessage`。
+/// 旧实现把 type_url 写成**不存在**的 `xray.app.router.RoutingConfig`、value 是
+/// JSON —— 服务端按 protobuf 解必失败。这里复用生产装配同一解析器
+/// （`xray_core::wiring::parse_routing_json_to_proto`）产出 proto 再编码。
 fn build_rule_typed_message(json_data: &[u8]) -> Result<TypedMessage, CliError> {
     let config: serde_json::Value = serde_json::from_slice(json_data)
         .map_err(|e| CliError::InvalidArgument(format!("failed to parse JSON config: {e}")))?;
@@ -180,10 +186,13 @@ fn build_rule_typed_message(json_data: &[u8]) -> Result<TypedMessage, CliError> 
         .get("routing")
         .ok_or_else(|| CliError::InvalidArgument("config did not have \"routing\" field".into()))?;
 
-    Ok(TypedMessage {
-        r#type: "xray.app.router.RoutingConfig".to_string(),
-        value: serde_json::to_vec(routing).unwrap_or_default(),
-    })
+    let routing_json = serde_json::to_vec(routing)
+        .map_err(|e| CliError::InvalidArgument(format!("re-encode routing field: {e}")))?;
+    let proto = xray_core::wiring::parse_routing_json_to_proto(&routing_json)
+        .map_err(|e| CliError::InvalidArgument(format!("build routing config: {e}")))?;
+
+    use prost::Message as _;
+    Ok(TypedMessage { r#type: "xray.app.router.Config".to_string(), value: proto.encode_to_vec() })
 }
 
 /// 打印 gRPC 响应。proto 消息不实现 serde::Serialize，用 Debug 输出。
@@ -659,7 +668,8 @@ pub async fn execute_source_ip_block(args: &SourceIpBlockArgs) -> Result<(), Cli
     });
 
     let config = serde_json::to_vec(&routing_json).unwrap_or_default();
-    let typed = TypedMessage { r#type: "xray.app.router.RoutingConfig".to_string(), value: config };
+    // 同 adrules 路径：整份 xray.app.router.Config（bd 9c8k6 ②）
+    let typed = build_rule_typed_message(&config)?;
 
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();

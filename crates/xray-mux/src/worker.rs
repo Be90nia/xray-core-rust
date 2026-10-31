@@ -9,6 +9,7 @@ use std::sync::{
 
 use tokio::{sync::watch, time::Duration};
 use tracing::{debug, warn};
+use xray_app_dispatcher::udp_session::{XudpFramingWriter, XudpUnframingReader};
 use xray_buf::{
     buffer::Buffer,
     io::{Reader, Writer},
@@ -375,6 +376,13 @@ impl ServerWorker {
                 return Err(ServerError::DispatchFailed(format!("XUDP dispatch: {}", e)));
             },
         };
+        // bd t0ls1：内部 dispatch link 跑 XUDP 帧、mux data 段跑裸载荷。XUDP
+        // 会话在边界上转换——否则被派发 outbound（freedom 等按帧解析）拿到裸
+        // 报文解帧失败静默丢包（Go 客户端 cone 模式默认走 mux → 上游 0 字节）。
+        let link = Link {
+            reader: Box::new(XudpUnframingReader::new(link.reader)),
+            writer: Box::new(XudpFramingWriter::new(link.writer, target.clone())),
+        };
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
         // ponytail: miss 路径建新上游；hit 路径复用旧上游（zv9l 已对齐 Go
         // server.go:216-260），两条路径在此汇合收尾。
@@ -717,6 +725,29 @@ mod tests {
 
     use super::*;
 
+    /// t0ls1：XUDP 会话的 dispatch link 上行 = XUDP 帧流（内部表示），
+    /// 拆回逐包裸载荷用于断言。
+    fn xudp_payloads(raw: &[u8]) -> Vec<Vec<u8>> {
+        let mut cur = std::io::Cursor::new(raw);
+        let mut pr = xray_xudp::packet::PacketReader::new(&mut cur);
+        let mut got = Vec::new();
+        while let Ok(Some(p)) = pr.read_packet() {
+            got.push(p.data().to_vec());
+        }
+        got
+    }
+
+    /// 构造 XUDP New 帧（link 侧表示；客户端上行写的就是这个）。
+    fn xudp_frame(payload: &[u8], dest: &Destination) -> Vec<u8> {
+        let mut f = Vec::new();
+        xray_xudp::packet::FrameMetadata::new_udp(dest.address().clone(), dest.port(), [5u8; 8])
+            .write_to(&mut f)
+            .unwrap();
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
     struct MockDispatcher;
     #[async_trait::async_trait]
     impl Dispatcher for MockDispatcher {
@@ -1052,8 +1083,9 @@ mod tests {
             let (dest, mut pay, _server) = process_one_frame(frame).await;
 
             assert_eq!(dest.network(), Network::UDP);
+            // t0ls1：dispatch link 上行 = XUDP 帧（内部表示），载荷逐字节还原
             let got = read_payload(&mut pay).await;
-            assert_eq!(got, b"first-udp-packet");
+            assert_eq!(xudp_payloads(&got), vec![b"first-udp-packet".to_vec()]);
         }
 
         /// 普通路径：New + UDP（无 global_id）→ handle_normal_new Packet 会话，
@@ -1233,13 +1265,14 @@ mod tests {
 
             let (req_rd, req_wr) = pipe::new();
             let (resp_rd, resp_wr) = pipe::new();
-            // 先写上行 payload（探针窗口内就绪）→ fetch_input 首读即得数据，
+            // 先写上行（link 侧表示 = XUDP 帧，t0ls1）→ fetch_input 首读即得数据，
             // New 帧携带内联 data + GlobalID 同批下发（Go XUDP 线形态；空 New
             // 按 Go frame.go:216 语义不带 GlobalID，服务端按普通 packet 路径）。
             let mut req = req_wr;
-            req.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
-                b"dns-query".to_vec(),
-            )))
+            req.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(xudp_frame(
+                b"dns-query",
+                &udp_target(),
+            ))))
             .await
             .expect("write uplink");
 
@@ -1268,16 +1301,21 @@ mod tests {
                 server.xudp_manager.get(&gid).await.expect("XUDP entry keyed by client GlobalID");
             assert_eq!(entry.status, XudpStatus::Active, "entry must be Active after assembly");
 
-            // 上行：New 内联 data → 到达"上游"读端
+            // 上行：New 内联 data → 到达"上游"读端（XUDP 帧内载荷逐字节还原）
             let got = read_all(&mut up_r).await;
-            assert_eq!(got, b"dns-query", "uplink must reach dispatch target");
+            assert_eq!(
+                xudp_payloads(&got),
+                vec![b"dns-query".to_vec()],
+                "uplink must reach dispatch target"
+            );
 
-            // 下行：上游响应 → 泵任务读真 I/O → Keep 帧 → 客户端 resp 读端
+            // 下行：上游响应（link 侧表示 = XUDP 帧）→ 泵任务读真 I/O → Keep 帧 → 客户端
             let mut resp = resp_rd;
             let mut pong = w_down;
-            pong.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(
-                b"dns-answer".to_vec(),
-            )))
+            pong.write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(xudp_frame(
+                b"dns-answer",
+                &udp_target(),
+            ))))
             .await
             .expect("write downlink");
             let _ = pong.close();
@@ -1286,7 +1324,11 @@ mod tests {
                     .await
                     .expect("downlink within timeout")
                     .expect("read ok");
-            assert_eq!(back.to_vec(), b"dns-answer", "upstream response must flow back via pump");
+            assert_eq!(
+                xudp_payloads(&back.to_vec()),
+                vec![b"dns-answer".to_vec()],
+                "upstream response must flow back via pump (link 侧为 XUDP 帧)"
+            );
 
             // 收尾：客户端半关闭 → End → server session 摘除
             let _ = req.close();
@@ -1336,11 +1378,13 @@ mod tests {
             // 第二次不应再触发 dispatcher.recv（unbounded 单元素已消费）
             assert!(rx.try_recv().is_err(), "second New must reuse, not re-dispatch");
             // 旧上行读端：两条 payload 通过同一管道到达，pipe 在 read_multi_buffer
-            // 上一次性返回所有可读字节，故一次 read 就能拿到两个 payload 拼接。
+            // 上一次性返回所有可读字节，故一次 read 就能拿到两个 XUDP 帧（t0ls1：
+            // dispatch link 上行恒为 XUDP 帧），拆帧后载荷次序不变。
             // 验证关键：复用路径下 dispatcher 不被第二次调用（try_recv 已断言）。
             let combined = read_all(&mut up_r).await;
             assert_eq!(
-                combined, b"req-1req-2",
+                xudp_payloads(&combined),
+                vec![b"req-1".to_vec(), b"req-2".to_vec()],
                 "both packets arrive at the single upstream via reuse"
             );
 
@@ -1361,7 +1405,8 @@ mod tests {
                 .expect("keep frame processed");
             let tail = read_all(&mut up_r).await;
             assert_eq!(
-                tail, b"keep-data",
+                xudp_payloads(&tail),
+                vec![b"keep-data".to_vec()],
                 "Keep with new sessionID must reach the reused upstream (bd zv9l)"
             );
         }

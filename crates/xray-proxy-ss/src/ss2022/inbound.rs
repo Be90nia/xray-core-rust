@@ -34,6 +34,7 @@ use crate::{
             CipherKind2022, decrypt_identity_header, derive_psk, derive_session_subkey, ecb_block,
             psk_from_base64, psk_identity,
         },
+        packet::TIMESTAMP_TOLERANCE_SECS,
         replay::{REPLAY_WINDOW, SaltReplayFilter},
     },
     stream::SSStream,
@@ -80,7 +81,10 @@ pub struct Ss2022Inbound {
     psk: Vec<u8>,
     kind: CipherKind2022,
     email: String,
-    /// 时间戳容忍窗口（秒），默认 30。
+    /// 时间戳容忍窗口（秒）——唯一来源 [`TIMESTAMP_TOLERANCE_SECS`]（30）。
+    ///
+    /// Go `stream.go:257/:434` 与 `packet.go:157` 同为硬编码 `diff > 30`，Go 侧
+    /// **没有任何配置项**（bd p45qd：对齐默认值，不自造配置面）。
     timestamp_tolerance: u64,
     /// 明文 salt 重放过滤器（sing `replay.NewSimple(60s)` 语义，check 即注册）。
     replay: SaltReplayFilter,
@@ -100,7 +104,7 @@ impl Ss2022Inbound {
             psk,
             kind,
             email: email.into(),
-            timestamp_tolerance: 30,
+            timestamp_tolerance: TIMESTAMP_TOLERANCE_SECS as u64,
             replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
     }
@@ -191,7 +195,7 @@ impl MultiUserInbound {
             psk,
             kind,
             users: Arc::new(Mutex::new(users)),
-            timestamp_tolerance: 30,
+            timestamp_tolerance: TIMESTAMP_TOLERANCE_SECS as u64,
             replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
     }
@@ -279,6 +283,13 @@ impl MultiUserInbound {
     pub fn users_count(&self) -> usize {
         self.users.lock().len()
     }
+
+    /// 用户 (email, level) 快照（GetInboundUsers 的列表面，Go `GetUsers` 同语义；
+    /// PSK 不回吐——凭据不经管理面外泄）。
+    #[must_use]
+    pub fn user_emails(&self) -> Vec<(String, u32)> {
+        self.users.lock().iter().map(|(u, _)| (u.email.clone(), u.level)).collect()
+    }
 }
 
 // ============================================================================
@@ -340,7 +351,7 @@ impl RelayInbound {
         for d in &mut destinations {
             d.key = derive_psk(&d.key, kind)?;
         }
-        Ok(Self { psk, kind, destinations, timestamp_tolerance: 30 })
+        Ok(Self { psk, kind, destinations, timestamp_tolerance: TIMESTAMP_TOLERANCE_SECS as u64 })
     }
 
     /// 处理中继入站 TCP 连接（SIP022 relay，对齐 sing-shadowsocks relay.go）：

@@ -30,7 +30,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use xray_app_dispatcher::DispatchHandler;
+use xray_app_dispatcher::{
+    DispatchHandler,
+    udp_session::{XudpFramingWriter, XudpUnframingReader},
+};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::{
     net::{address::Address as XAddress, destination::Destination, network::Network, port::Port},
@@ -368,6 +371,20 @@ async fn handle_session(
         },
     };
 
+    // UoT v2（bd yfcnr）：magic 目标 = UDP-over-TCP 会话，不是可解析的域名。
+    // 旧实现把它当域名交给 dispatcher 解析 → 必失败（UDP 面全废）。
+    if let SocksAddr::Domain(host, _) = &target {
+        if crate::uot::is_magic(host) {
+            let Some(handler) = dispatch else {
+                SERVER_LOG.warn("anytls uot: inbound without dispatcher cannot serve UDP");
+                finish_session(&session, kill_tx).await;
+                return;
+            };
+            serve_uot_session(session, handler, kill_tx, fx, buf[consumed..n].to_vec()).await;
+            return;
+        }
+    }
+
     if let Some(handler) = dispatch {
         // 生产路径：dispatcher/router 分发。
         // Link 的 reader 用 InitialedReader{consumed 前缀 + duplex read_half}
@@ -415,6 +432,72 @@ async fn handle_session(
         }
         finish_session(&session, kill_tx).await;
     }
+}
+
+/// UoT v2 服务端会话：读 `Request` → 单目标 UDP dispatch。
+///
+/// wire：`[2B BE len][payload]`（isConnect=true 单目标形态，见 [`crate::uot`]）。
+/// 内部 link 仍是 XUDP 帧（freedom 等消费者按帧解析），故两侧各套一层表示
+/// 转换（bd t0ls1 同一组契约）。
+async fn serve_uot_session(
+    session: Arc<Session>,
+    handler: Arc<dyn DispatchHandler>,
+    kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    fx: Arc<FxScope>,
+    mut pre: Vec<u8>,
+) {
+    let (is_connect, uot_dest, used) = loop {
+        match crate::uot::decode_request(&pre) {
+            Ok(Some(v)) => break v,
+            Ok(None) => {
+                let mut more = vec![0u8; 512];
+                match session.read(&mut more).await {
+                    Ok(0) | Err(_) => {
+                        SERVER_LOG.debug("anytls uot: request head EOF");
+                        finish_session(&session, kill_tx).await;
+                        return;
+                    },
+                    Ok(m) => pre.extend_from_slice(&more[..m]),
+                }
+            },
+            Err(e) => {
+                SERVER_LOG.warn(format!("anytls uot: bad request header: {e}"));
+                finish_session(&session, kill_tx).await;
+                return;
+            },
+        }
+    };
+    if !is_connect {
+        // ponytail: 每包自带目标（cone 语义）需要逐包路由决策；本实现按单目标
+        // 会话处理。要支持 cone 时改为按包目标分发（sing 的 isConnect=false 形态）。
+        SERVER_LOG.warn("anytls uot: isConnect=false (per-packet destination) unsupported");
+        finish_session(&session, kill_tx).await;
+        return;
+    }
+    pre.drain(..used);
+
+    let (xaddr, port) = match &uot_dest {
+        SocksAddr::Domain(h, p) => (XAddress::Domain(h.clone()), *p),
+        SocksAddr::Ipv4(a) => (XAddress::IPv4(*a.ip()), a.port()),
+        SocksAddr::Ipv6(a) => (XAddress::IPv6(*a.ip()), a.port()),
+    };
+    let dest = Destination::new(xaddr, Port::new(port), Network::UDP);
+
+    let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
+    let (rd_half, wr_half) = tokio::io::split(client_io);
+    fx.spawn_tracked(pump_session_to_duplex(session.clone(), server_io))
+        .expect("internal FxScope is never closed");
+    let link = Link::new(
+        Box::new(XudpUnframingReader::new(Box::new(crate::uot::LengthFramedReader::new(
+            InitialedReader::new(pre, rd_half),
+        )))),
+        Box::new(XudpFramingWriter::new(
+            Box::new(crate::uot::LengthFramedWriter::new(wr_half)),
+            dest.clone(),
+        )),
+    );
+    handler.dispatch(&dest, link).await;
+    finish_session(&session, kill_tx).await;
 }
 
 /// 会话流结束收尾：按协议发 FIN + 标记本地半关，然后 shutdown 底层 TCP。

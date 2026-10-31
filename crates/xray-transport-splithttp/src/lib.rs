@@ -79,6 +79,7 @@ pub mod h1_conn;
 pub mod h3_client;
 pub mod hub;
 pub mod mux;
+pub(crate) mod pool_stream;
 pub mod register;
 pub mod transport;
 pub mod upload_queue;

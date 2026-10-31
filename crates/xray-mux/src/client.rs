@@ -23,6 +23,7 @@ use tokio::{
     time::Duration,
 };
 use tracing::debug;
+use xray_app_dispatcher::udp_session::{XudpFramingWriter, XudpUnframingReader};
 use xray_buf::{
     buffer::Buffer,
     io::{Reader, Writer},
@@ -434,6 +435,16 @@ impl ClientWorker {
         }
         let Some(session) = self.session_manager.allocate(&self.strategy).await else {
             return false;
+        };
+        // bd t0ls1：内部 dispatch link 跑 XUDP 帧、mux data 段跑裸载荷。
+        // UDP 会话在边界上做表示转换（下行 carrier 载荷 → 裹帧，上行 link 帧 → 剥帧）。
+        let link = if dest.network() == Network::UDP {
+            Link {
+                reader: Box::new(XudpUnframingReader::new(link.reader)),
+                writer: Box::new(XudpFramingWriter::new(link.writer, dest.clone())),
+            }
+        } else {
+            link
         };
         session.set_input(BufferedReader::new(link.reader)).await;
         // client demux 直写（Go client.go:363 s.output = 裸 link.Writer，无

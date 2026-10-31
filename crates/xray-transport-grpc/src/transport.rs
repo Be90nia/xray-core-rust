@@ -37,6 +37,15 @@ use xray_transport::{
 
 use crate::config::Config;
 
+/// 服务端 h2 允许的对端并发流数（票 2xgln）。
+///
+/// 不设时 hyper/h2 取 `usize::MAX`：单 TCP 可无限开流，每流一份 handler 状态 +
+/// 收流窗，一个连接即把内存打满。取值对齐 Go `net/http` h2 服务端缺省
+/// `MaxConcurrentStreams = 250`（splithttp 侧同值）。注意 Go grpc-go 服务端缺省
+/// 是 MaxUint32（不设上限），故此门是 Rust 侧加固：它只发在 SETTINGS 里，对端
+/// （grpc-go / Rust h2 client）按 SETTINGS 排队，互通语义不受影响。
+const H2_MAX_CONCURRENT_STREAMS: u32 = 250;
+
 /// gRPC :authority 判定（Go dial.go:147-153，票 0tnw）。
 ///
 /// 三级回退：一级 `grpcSettings.Authority`；二级只看 tlsConfig 的 serverName
@@ -771,7 +780,10 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     builder
         .initial_window_size(16 * 1024 * 1024)
         .initial_connection_window_size(32 * 1024 * 1024)
-        .max_send_buffer_size(16 * 1024 * 1024);
+        .max_send_buffer_size(16 * 1024 * 1024)
+        // 票 2xgln：对端并发流上限（见常量注释）。h2 侧据此发 SETTINGS，并对
+        // 越限的 HEADERS 回 RST_STREAM(REFUSED_STREAM)。
+        .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
     // bd lfeu：handshake 对发完 preface 即静默/hard-close 的对端无限等待
     // （N-1 fd 泄漏族，同 724cc20 ws serve_h2_reject 30s 兜底形态）。
     // 合法握手毫秒级完成，30s 仅覆盖慢链路重传窗。
@@ -1721,5 +1733,130 @@ mod tests {
         // paused：显式快进越过 30s 兜底窗，timeout Elapsed → accept_h2 返回。
         tokio::time::advance(Duration::from_secs(31)).await;
         serve.await.expect("accept_h2 must return after handshake timeout");
+    }
+
+    // ===== 2xgln：h2 并发流上限（raw h2 客户端，忽略 SETTINGS 才能越限）=====
+
+    const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const EMPTY_SETTINGS: [u8; 9] = [0, 0, 0, 0x04, 0x00, 0, 0, 0, 0];
+    const SETTINGS_ACK: [u8; 9] = [0, 0, 0, 0x04, 0x01, 0, 0, 0, 0];
+
+    struct RawFrame {
+        kind: u8,
+        sid: u32,
+        payload: Vec<u8>,
+    }
+
+    async fn read_raw_frame(s: &mut tokio::net::TcpStream) -> io::Result<RawFrame> {
+        let mut hdr = [0u8; 9];
+        s.read_exact(&mut hdr).await?;
+        let len = ((hdr[0] as usize) << 16) | ((hdr[1] as usize) << 8) | hdr[2] as usize;
+        let sid = u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
+        let mut payload = vec![0u8; len];
+        s.read_exact(&mut payload).await?;
+        Ok(RawFrame { kind: hdr[3], sid, payload })
+    }
+
+    /// 最小 HPACK：全字面量、无索引、不更新动态表。
+    ///
+    /// 编码要点（RFC 7541 §6.2.2 "Literal Header Field without Indexing — New
+    /// Name"）：首字节 `0x00`（pattern 0000 + 4 位索引 0 = 新名字），随后名字与值
+    /// 各为 7 位前缀字符串字面量（H=0，≤127 时单字节长度）。
+    fn push_literal(block: &mut Vec<u8>, name: &str, value: &str) {
+        assert!(name.len() < 127 && value.len() < 127, "测试只编短头字段（免 varint）");
+        block.push(0x00);
+        block.push(name.len() as u8);
+        block.extend_from_slice(name.as_bytes());
+        block.push(value.len() as u8);
+        block.extend_from_slice(value.as_bytes());
+    }
+
+    fn raw_headers_frame(stream_id: u32, path: &str) -> Vec<u8> {
+        let mut block = Vec::new();
+        for (name, value) in [
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", path),
+            (":authority", "h"),
+            ("content-type", "application/grpc"),
+        ] {
+            push_literal(&mut block, name, value);
+        }
+        let len = block.len();
+        let mut f = vec![0u8; 9];
+        f[0] = (len >> 16) as u8;
+        f[1] = (len >> 8) as u8;
+        f[2] = len as u8;
+        f[3] = 0x01; // HEADERS
+        f[4] = 0x04; // END_HEADERS（不带 END_STREAM → 流保持活跃）
+        f[5..9].copy_from_slice(&stream_id.to_be_bytes());
+        f.extend_from_slice(&block);
+        f
+    }
+
+    /// 2xgln：gRPC 服务端 SETTINGS 声明 MAX_CONCURRENT_STREAMS=250，第 251 条流被
+    /// RST_STREAM(REFUSED_STREAM)。
+    #[tokio::test]
+    async fn h2_server_advertises_and_enforces_max_concurrent_streams() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 持住每条流的连接：流保持活跃，才能越限（否则响应即关流，计数回落）。
+        let held: Arc<std::sync::Mutex<Vec<Box<dyn xray_transport::connection::Connection>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held_srv = Arc::clone(&held);
+        let handler: ConnHandler = Arc::new(move |conn| {
+            held_srv.lock().expect("held 锁").push(conn);
+        });
+        let serve = tokio::spawn(async move {
+            let (tcp, peer) = listener.accept().await.unwrap();
+            accept_h2(tcp, handler, None, false, peer, &[], 7200, 20, false).await;
+        });
+
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(H2_PREFACE).await.unwrap();
+        s.write_all(&EMPTY_SETTINGS).await.unwrap();
+
+        let settings = tokio::time::timeout(Duration::from_secs(5), read_raw_frame(&mut s))
+            .await
+            .expect("服务端 SETTINGS 必须在 5s 内到达")
+            .expect("读 SETTINGS");
+        assert_eq!(settings.kind, 0x04, "首帧必须是 SETTINGS");
+        let mut max_concurrent = None;
+        for chunk in settings.payload.chunks_exact(6) {
+            let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+            if id == 3 {
+                max_concurrent = Some(u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]));
+            }
+        }
+        assert_eq!(max_concurrent, Some(250), "SETTINGS_MAX_CONCURRENT_STREAMS 必须为 250");
+        s.write_all(&SETTINGS_ACK).await.unwrap();
+
+        for i in 0..251u32 {
+            s.write_all(&raw_headers_frame(2 * i + 1, "/svc/Tun")).await.expect("写 HEADERS");
+        }
+
+        let refused = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let f = read_raw_frame(&mut s).await.ok()?;
+                if f.kind == 0x03 && f.payload.len() >= 4 {
+                    let code = u32::from_be_bytes([
+                        f.payload[0],
+                        f.payload[1],
+                        f.payload[2],
+                        f.payload[3],
+                    ]);
+                    return Some((f.sid, code));
+                }
+            }
+        })
+        .await
+        .expect("RST_STREAM 必须在 15s 内到达")
+        .expect("连接不得提前断开");
+
+        assert_eq!(refused.1, 7, "越限流必须 RST_STREAM(REFUSED_STREAM=7)，实际 {refused:?}");
+        assert_eq!(refused.0, 501, "被拒的必须是第 251 条流（id=501）");
+
+        drop(s);
+        let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
     }
 }

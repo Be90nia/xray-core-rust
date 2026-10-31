@@ -101,6 +101,19 @@ impl RoutingService {
         self.router()?.add_rule(rule_tag, proto)
     }
 
+    /// 按整份 `router.Config` 重载规则（Go `routingServer.AddRule` 的真语义）。
+    ///
+    /// bd 9c8k6 ①②：gRPC `AddRuleRequest.config` 是 `xray.app.router.Config`
+    /// （rule[] + balancingRule[]），不是单条 `RoutingRule`；`should_append=false`
+    /// = **整体替换**规则集，`true` = 追加。委托 [`Router::reload_rules`]。
+    pub fn add_rules(
+        &self,
+        config: &xray_proto::xray::app::router::Config,
+        should_append: bool,
+    ) -> Result<(), RouterError> {
+        self.router()?.reload_rules(config, should_append)
+    }
+
     /// 获取平衡器原则目标（对应 Go `routingServer.GetBalancerInfo` 之 principle
     /// 字段，即 `(*RoundRobinStrategy).GetPrincipleTarget` 等）。
     ///

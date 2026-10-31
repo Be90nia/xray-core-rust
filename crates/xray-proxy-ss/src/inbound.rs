@@ -10,7 +10,7 @@ use std::io;
 use crate::{
     config::MemoryAccount,
     protocol::RequestHeader,
-    server::{Server, read_request},
+    server::{PrefixedReader, Server, read_request_multi},
     stream::SSStream,
     validator::{MemoryUser, Validator},
 };
@@ -57,31 +57,25 @@ impl SsInbound {
         &self.server.validator
     }
 
-    /// 处理入站 TCP 连接：读 IV + 解密首帧 + 解析目标地址 → 返回目标头 + 加密流。
+    /// 处理入站 TCP 连接：读首包匹配用户 + 解密首帧 + 解析目标地址 → 返回目标头 + 加密流。
     ///
-    /// 底层调 [`read_request`]。当前以 validator 中**第一个用户**的 account 作为解密 key
-    /// （SS AEAD 单用户场景）；多用户场景 dispatcher 应自行遍历 validator 匹配 account，
-    /// 然后直接调 [`read_request`]。
+    /// 底层调 [`read_request_multi`]：按 validator 逐用户试解首包（Go
+    /// `ReadTCPSession`），多用户配置下 N 个用户都能认证，不再是"只认第一个"。
     ///
     /// # Errors
     /// 返回 [`io::Error`]（`ErrorKind::Other`）当：
-    /// - validator 无用户配置
+    /// - 无用户能解首包（错误口令 / 未知客户端；对应 Go ErrNotFound）
     /// - SS 协议解析失败（IV/首帧读取、AEAD 初始化、地址解析）
-    pub async fn handle_conn<C>(&self, conn: C) -> io::Result<(RequestHeader, SSStream<C>)>
+    pub async fn handle_conn<C>(
+        &self,
+        conn: C,
+    ) -> io::Result<(RequestHeader, SSStream<PrefixedReader<C>>)>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
-        let user = self
-            .server
-            .validator
-            .get_all()
-            .into_iter()
-            .next()
-            .ok_or_else(|| io::Error::other("no SS user configured"))?;
-
         // 反探测种子（对应 Go validator.GetBehaviorSeed，ReadTCPSession 入参）。
         let seed = self.server.validator.behavior_seed();
-        read_request(conn, &user.account, &user.email, seed)
+        read_request_multi(conn, &self.server.validator, seed)
             .await
             .map_err(|e| io::Error::other(e.to_string()))
     }
@@ -178,5 +172,64 @@ mod tests {
             Ok(_) => unreachable!("expected error"),
         };
         assert_eq!(err.kind(), io::ErrorKind::Other, "SS error wrapped as Other");
+    }
+
+    /// 多用户：**每个**用户都能握手（不只是 validator 里第一个）。
+    ///
+    /// 回归 bd u4efe N1：旧实现 `get_all()[0]` 只取首用户 → 第 2 个用户静默连不上。
+    /// 两个账户用不同口令 + 不同 cipher，确保匹配真的按用户逐个试解。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_multi_user_each_user_authenticates() {
+        let mk = |ct: CipherType, pw: &str| {
+            let p = ProtoAccount {
+                password: pw.to_string(),
+                cipher_type: ct.as_i32(),
+                iv_check: false,
+            };
+            MemoryAccount::from_proto(&p).expect("account")
+        };
+        let ua = mk(CipherType::Aes128Gcm, "pw-user-a");
+        let ub = mk(CipherType::Aes256Gcm, "pw-user-b");
+        let ib = std::sync::Arc::new(SsInbound::with_users(vec![
+            MemoryUser::new("a@ss.test", ua.clone()),
+            MemoryUser::new("b@ss.test", ub.clone()),
+        ]));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let listener_addr = listener.local_addr().unwrap();
+
+        // 服务端：两条连接各自握手 → 读 1 个 chunk 回显 → 回 email。
+        let ib_server = std::sync::Arc::clone(&ib);
+        let server = xray_common::testing::spawn("ss-multi-user-accept", async move {
+            let mut emails = Vec::new();
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().await.expect("accept");
+                let (header, mut ss) = ib_server.handle_conn(conn).await.expect("handshake");
+                let body = ss.read_chunk().await.expect("read body").expect("body chunk");
+                ss.write_chunk(&body).await.expect("echo");
+                ss.flush().await.expect("flush");
+                emails.push(header.user.email);
+            }
+            emails
+        });
+
+        for account in [ua, ub] {
+            let client =
+                crate::client::Client::new(account, "127.0.0.1".to_string(), listener_addr.port());
+            let mut stream = client
+                .dial_target_for_proxy(
+                    &xray_common::net::address::Address::Domain("echo.test".to_string()),
+                    9527,
+                )
+                .await
+                .expect("dial");
+            stream.write_chunk(b"ping").await.expect("write");
+            stream.flush().await.expect("flush");
+            let resp = stream.read_chunk().await.expect("read").expect("resp chunk");
+            assert_eq!(&resp, b"ping", "每用户都能走通加密回环");
+        }
+
+        let emails = server.await.expect("server join");
+        assert_eq!(emails, vec!["a@ss.test".to_string(), "b@ss.test".to_string()]);
     }
 }

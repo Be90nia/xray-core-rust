@@ -28,6 +28,7 @@ use tokio::{
     net::{TcpStream, UdpSocket},
 };
 use xray_buf::{
+    buffer::Buffer,
     io::{Reader, Writer},
     multi::MultiBuffer,
 };
@@ -370,6 +371,8 @@ async fn pump_response(
     mut writer: Box<dyn Writer>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
+    // 响应帧 scratch（容量跨包复用；bd 1fm1l）
+    let mut frame: Vec<u8> = Vec::with_capacity(1024);
     loop {
         let n = match relay.recv(&mut buf).await {
             Ok(n) => n,
@@ -378,15 +381,16 @@ async fn pump_response(
         let Some((source, payload)) = parse_relay_frame(&buf[..n], &frag_dropped) else {
             continue;
         };
-        let mut frame = Vec::with_capacity(n + 64);
-        let mut pw = PacketWriter::new(&mut frame, socks_to_destination(source), global_id);
-        if pw.write_packet(payload).is_err() {
-            return Ok(());
+        frame.clear();
+        {
+            let mut pw = PacketWriter::new(&mut frame, socks_to_destination(source), global_id);
+            if pw.write_packet(payload).is_err() {
+                return Ok(());
+            }
         }
-        drop(pw);
 
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&frame);
+        // 零拷贝移交（Buffer::from_vec = Frozen，不回池也不复制）
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(std::mem::take(&mut frame)));
         if writer.write_multi_buffer(mb).await.is_err() {
             return Ok(()); // writer 关闭
         }

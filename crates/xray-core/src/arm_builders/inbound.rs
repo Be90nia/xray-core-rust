@@ -30,15 +30,17 @@ use xray_transport::{connection::Connection as _, system_listener::InboundTcpLis
 use crate::{
     inbound::{
         DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, PeekAhead, SsInboundMode,
-        build_tls_acceptor, build_trojan_fallbacks, build_trojan_users, build_vless_decryption,
-        build_vless_fallbacks, build_vless_validator, build_vmess_validator, handshake_timeout_for,
-        inbound_tcpmask, inbound_udpmask, is_transport_listener_protocol,
-        parse_anytls_tls_acceptor, parse_blackhole_inbound_response, parse_dns_inbound_config,
-        parse_dokodemo_settings, parse_freedom_inbound_dest, parse_http_config,
-        parse_hysteria_inbound_config, parse_loopback_config, parse_naive_inbound_settings,
-        parse_reality_config, parse_socks_http_configs, parse_socks_server_config,
-        parse_ss_inbound_config, parse_tuic_inbound_config, parse_wireguard_inbound_config,
-        register_ss_user_manager, serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http,
+        build_tls_acceptor, build_trojan_fallbacks, build_trojan_users,
+        build_trojan_validator_shared, build_vless_decryption, build_vless_fallbacks,
+        build_vless_validator, build_vmess_validator, handshake_timeout_for, inbound_tcpmask,
+        inbound_udpmask, is_transport_listener_protocol, parse_anytls_tls_acceptor,
+        parse_blackhole_inbound_response, parse_dns_inbound_config, parse_dokodemo_settings,
+        parse_freedom_inbound_dest, parse_http_config, parse_hysteria_inbound_config,
+        parse_loopback_config, parse_naive_inbound_settings, parse_reality_config,
+        parse_socks_http_configs, parse_socks_server_config, parse_ss_inbound_config,
+        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_ss_user_manager,
+        register_trojan_user_manager, register_vless_user_manager, register_vmess_user_manager,
+        register_wg_user_manager, serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http,
         serve_mixed, serve_mixed_conn, serve_reality_trojan, serve_reality_vless, serve_ss,
         serve_unix_listener, spawn_inbound_serve, spawn_transport_listener_inbound,
         ss_legacy_pipeline, ss_mode_conn_pipeline, transport_conn_addrs,
@@ -151,9 +153,12 @@ pub(crate) async fn build_vless_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    api: Option<&InboundRuntime>,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let validator: Arc<dyn VlessValidator> = build_vless_validator(&ib.entry.data)?;
+    // bd hl8q6：用户热更接线（validator 与 serve loop 共享同一 Arc）
+    register_vless_user_manager(api, &ib.tag, &validator);
     // ENC decryption（Go inbound.go:104-114 handler.decryption）：settings
     // 级 "mlkem768x25519plus.*" 字符串 → handler 级共享 ServerInstance。
     let decryption = build_vless_decryption(&ib.entry.data, Arc::clone(&plugin_ctx))?;
@@ -228,9 +233,14 @@ pub(crate) async fn build_trojan_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    api: Option<&InboundRuntime>,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let users = build_trojan_users(&ib.entry.data)?;
+    // bd hl8q6：trojan 用户热更——validator 由 builder 造、与 serve 循环共享。
+    let validator: Arc<xray_proxy_trojan::Validator> =
+        build_trojan_validator_shared(&users).map_err(std::io::Error::other)?;
+    register_trojan_user_manager(api, &ib.tag, &validator);
     // Trojan fallback：解析 JSON fallbacks 数组构建决策树
     // （dest 数字/缺失对齐 Go trojan.go:151-198，解析失败即启动失败）
     let fallbacks = build_trojan_fallbacks(&ib.entry.data)?;
@@ -242,7 +252,7 @@ pub(crate) async fn build_trojan_inbound(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
         let on_conn = trojan_transport_on_conn(
-            ib, &ohm, &policy, &settings, users, fallbacks, bind_addr, addr,
+            ib, &ohm, &policy, &settings, validator, fallbacks, bind_addr, addr,
         )?;
         return spawn_transport_listener_inbound(
             &plugin_ctx,
@@ -268,17 +278,20 @@ pub(crate) async fn build_trojan_inbound(
             )?)
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，reality 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
-        tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
-        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
-            serve_reality_trojan(
-                listener,
-                ohm,
-                users,
-                fallbacks,
-                reality,
-                handshake_timeout_for(&policy, 0),
-            )
-            .await
+        tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_key_count(), fallback = %reality.fallback_dest, "trojan+reality inbound listening");
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+            let validator = Arc::clone(&validator);
+            async move {
+                serve_reality_trojan(
+                    listener,
+                    ohm,
+                    validator,
+                    fallbacks,
+                    reality,
+                    handshake_timeout_for(&policy, 0),
+                )
+                .await
+            }
         })))
     } else {
         let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
@@ -289,7 +302,7 @@ pub(crate) async fn build_trojan_inbound(
             )?)
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
-        tracing::info!(tag = %ib.tag, addr = %addr, users = users.len(), tls = tls.is_some(), "trojan inbound listening");
+        tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_key_count(), tls = tls.is_some(), "trojan inbound listening");
         Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
             let plugin_ctx = Arc::clone(&plugin_ctx);
             async move {
@@ -297,7 +310,7 @@ pub(crate) async fn build_trojan_inbound(
                     plugin_ctx,
                     listener,
                     ohm,
-                    users,
+                    validator,
                     fallbacks,
                     tls,
                     handshake_timeout_for(&policy, 0),
@@ -314,9 +327,12 @@ pub(crate) async fn build_vmess_inbound(
     policy: Option<Arc<dyn xray_features::policy::PolicyManager>>,
     shutdown_token: CancellationToken,
     addr: &str,
+    api: Option<&InboundRuntime>,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let validator = build_vmess_validator(&ib.entry.data)?;
+    // bd hl8q6：用户热更接线（validator 与 serve loop 共享同一 Arc）
+    register_vmess_user_manager(api, &ib.tag, &validator, &ib.entry.data);
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     if is_transport_listener_protocol(&settings.protocol) {
@@ -667,8 +683,13 @@ pub(crate) async fn build_wireguard_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
+    addr: &str,
+    api: Option<&InboundRuntime>,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
+    // `addr` 未消费（wireguard 自管 UDP 端口，Go 同：listen_port 由 settings 给）；
+    // 参数保留与其它 builder 同形。
+    let _ = addr;
     let (config, listen_port) = parse_wireguard_inbound_config(&ib.entry.data)?;
     let dispatch = ohm.get_default_handler().ok_or_else(|| {
         std::io::Error::other("wireguard inbound requires a default outbound handler")
@@ -677,6 +698,9 @@ pub(crate) async fn build_wireguard_inbound(
         xray_proxy_wireguard::WireguardInboundHandler::new(&ib.tag, &config, listen_port, dispatch)
             .await
             .map_err(|e| std::io::Error::other(format!("wireguard inbound: {e}")))?;
+    // bd hl8q6：用户热更接线（注册表与 accept loop 共享同一 Arc）。
+    let handler = Arc::new(handler);
+    register_wg_user_manager(api, &ib.tag, &handler);
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
     })))
@@ -828,7 +852,8 @@ pub(crate) fn trojan_transport_on_conn(
     ohm: &Arc<SimpleOhm>,
     policy: &Option<Arc<dyn xray_features::policy::PolicyManager>>,
     settings: &xray_transport::dialer::StreamSettings,
-    users: std::collections::HashMap<String, xray_proxy_trojan::MemoryUser>,
+    // bd hl8q6：validator 由装配层构造并共享（用户热更句柄）。
+    validator: Arc<xray_proxy_trojan::Validator>,
     fallbacks: Option<Arc<xray_proxy_trojan::fallback::FallbackPolicy>>,
     fallback_addr: std::net::SocketAddr,
     ident: &str,
@@ -836,12 +861,6 @@ pub(crate) fn trojan_transport_on_conn(
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
-    let validator = Arc::new(xray_proxy_trojan::Validator::new());
-    for (_, user) in users {
-        if let Err(e) = validator.add(user) {
-            tracing::warn!(error = %e, "skip duplicate user during trojan transport inbound init");
-        }
-    }
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
     Ok(Arc::new(move |conn| {
@@ -1213,12 +1232,14 @@ pub(crate) fn unix_trojan_transport(
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     let users = build_trojan_users(&ctx.ib.entry.data)?;
     let fallbacks = build_trojan_fallbacks(&ctx.ib.entry.data)?;
+    // bd hl8q6：validator 由装配层构造并共享（用户热更句柄）。
+    let validator = build_trojan_validator_shared(&users).map_err(std::io::Error::other)?;
     trojan_transport_on_conn(
         ctx.ib,
         ctx.ohm,
         ctx.policy,
         ctx.settings,
-        users,
+        validator,
         fallbacks,
         uds_fallback_addr(),
         ctx.ident,
@@ -1340,6 +1361,7 @@ pub(crate) fn vless_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.policy,
         ctx.shutdown_token,
         ctx.addr,
+        ctx.api,
         Arc::new(ctx.plugin_ctx),
     ))
 }
@@ -1351,6 +1373,7 @@ pub(crate) fn trojan_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.policy,
         ctx.shutdown_token,
         ctx.addr,
+        ctx.api,
         Arc::new(ctx.plugin_ctx),
     ))
 }
@@ -1362,6 +1385,7 @@ pub(crate) fn vmess_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.policy,
         ctx.shutdown_token,
         ctx.addr,
+        ctx.api,
         Arc::new(ctx.plugin_ctx),
     ))
 }
@@ -1436,7 +1460,14 @@ pub(crate) fn naive_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn wireguard_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_wireguard_inbound(ctx.ib, ctx.ohm, ctx.shutdown_token, Arc::new(ctx.plugin_ctx)))
+    Box::pin(build_wireguard_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        ctx.api,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn dns_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {

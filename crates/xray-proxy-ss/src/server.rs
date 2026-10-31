@@ -3,13 +3,20 @@
 //! Process 流程依赖 `routing::Dispatcher` + `udp::Dispatcher` + `session::Inbound`
 //! 等基础设施，当前留 trait 接口 + Noop 实现。
 //!
-//! [`read_request`] 提供单用户场景的 TCP 首帧读取 + SSStream 构造。
+//! [`read_request`] 提供单用户场景的 TCP 首帧读取 + SSStream 构造；
+//! [`read_request_multi`] 是多用户入口（Go `ReadTCPSession(validator, reader)`）。
 
-use tokio::io::AsyncReadExt;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use xray_common::drain::Drainer as _;
 
 use crate::{
     config::MemoryAccount,
-    error::Result,
+    error::{Result, SsError},
     protocol::{RequestHeader, read_address_port_ss},
     stream::SSStream,
     validator::{MemoryUser, RequestCommand, Validator},
@@ -157,26 +164,7 @@ pub async fn read_request<C>(
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    use xray_common::drain::{BehaviorSeedLimitedDrainer, Drainer as _};
-
-    // 反探测 drainer（bd 7me，对应 Go ReadTCPSession protocol.go:59）：
-    // 失败时按 seed 派生预算排空连接，使攻击者无法从关闭时机判断认证结果。
-    let drainer = BehaviorSeedLimitedDrainer::new(behavior_seed as i64, 16 + 38, 3266, 64);
-
-    /// 失败路径统一：排空后返回原错误（4s deadline 防客户端不关连接时服务端挂起，
-    /// 对齐 Go SetReadDeadline(handshake)，与 vmess inbound 同模式）。
-    async fn bail(
-        drainer: &BehaviorSeedLimitedDrainer,
-        conn: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        err: crate::error::SsError,
-    ) -> crate::error::SsError {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
-            xray_common::drain::Drainer::drain(drainer, conn),
-        )
-        .await;
-        crate::error::SsError::Io(err.to_string())
-    }
+    let drainer = new_drainer(behavior_seed);
 
     // 读 IV
     let iv_size = account.cipher.iv_size() as usize;
@@ -238,6 +226,111 @@ where
         .map_err(|e| crate::error::SsError::Io(e.to_string()))?;
 
     Ok((header, stream))
+}
+
+/// 反探测 drainer（bd 7me，对应 Go ReadTCPSession protocol.go:59）。
+///
+/// 失败时按 seed 派生预算排空连接，使攻击者无法从关闭时机判断认证结果。
+fn new_drainer(behavior_seed: u64) -> xray_common::drain::BehaviorSeedLimitedDrainer {
+    xray_common::drain::BehaviorSeedLimitedDrainer::new(behavior_seed as i64, 16 + 38, 3266, 64)
+}
+
+/// 失败路径统一：排空后返回原错误（4s deadline 防客户端不关连接时服务端挂起，
+/// 对齐 Go SetReadDeadline(handshake)，与 vmess inbound 同模式）。
+async fn bail(
+    drainer: &xray_common::drain::BehaviorSeedLimitedDrainer,
+    conn: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    err: SsError,
+) -> SsError {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        xray_common::drain::Drainer::drain(drainer, conn),
+    )
+    .await;
+    SsError::Io(err.to_string())
+}
+
+/// 预读字节先出、其后透传底层连接的读包装。
+///
+/// 对应 Go `FullReader`（protocol.go:38-53）：多用户认证必须先读首包若干字节
+/// 逐个试解，命中后把这些字节"回放"给正常解码流程，避免二次读网络。
+/// 写方向直连底层（预读字节只属读侧）。
+pub struct PrefixedReader<C> {
+    prefix: std::io::Cursor<Vec<u8>>,
+    inner: C,
+}
+
+impl<C> PrefixedReader<C> {
+    /// 以 `prefix` 为预读字节包装 `inner`。
+    #[must_use]
+    pub fn new(prefix: Vec<u8>, inner: C) -> Self {
+        Self { prefix: std::io::Cursor::new(prefix), inner }
+    }
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for PrefixedReader<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.prefix.position() < this.prefix.get_ref().len() as u64 {
+            return Pin::new(&mut this.prefix).poll_read(cx, buf);
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for PrefixedReader<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// 多用户 TCP 首帧读取：先匹配用户再走 [`read_request`]。
+///
+/// 对应 Go `ReadTCPSession(validator, reader)`（protocol.go:56-140）：读 50 字节
+/// 首包 → `validator.Get` 逐个试解匹配用户（AEAD 解 size chunk 成功即命中）→
+/// 命中字节回放后按该用户账户解码首帧。匹配失败/IV 重复同样走 drainer 排空。
+///
+/// # Errors
+/// - [`SsError::UserNotFound`]：无用户可解首包（错误口令/未知客户端）。
+/// - [`SsError::IvNotUnique`]：命中用户的 IV 已见过（`iv_check`）。
+/// - 其余同 [`read_request`]。
+pub async fn read_request_multi<C>(
+    mut conn: C,
+    validator: &Validator,
+    behavior_seed: u64,
+) -> Result<(RequestHeader, SSStream<PrefixedReader<C>>)>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let drainer = new_drainer(behavior_seed);
+    // Go 固定读 50 字节（protocol.go:70）：够覆盖最大 IV(24) + size chunk(18)。
+    let mut prefix = vec![0u8; 50];
+    if let Err(e) = conn.read_exact(&mut prefix).await {
+        return Err(bail(&drainer, &mut conn, e.into()).await);
+    }
+    drainer.acknowledge_receive(prefix.len());
+    let user = match validator.get(&prefix, RequestCommand::Tcp) {
+        Ok(r) => r.user,
+        Err(e) => return Err(bail(&drainer, &mut conn, e).await),
+    };
+    // 预读字节整体回放：read_request 会从头部重新读 IV（与 Go FullReader 同款）。
+    read_request(PrefixedReader::new(prefix, conn), &user.account, &user.email, behavior_seed).await
 }
 
 #[cfg(test)]

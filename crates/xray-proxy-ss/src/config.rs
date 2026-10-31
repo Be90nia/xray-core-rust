@@ -336,9 +336,14 @@ impl MemoryAccount {
     /// 从 proto Account 转换为运行时账户，对应 Go `Account.AsAccount()`。
     ///
     /// # Errors
+    /// - [`SsError::EmptyPassword`]：password 为空串（Go conf 层拒启；空串口令
+    ///   会让凭据退化成公开常量 `KDF("")`，故在这一处统一拦下——所有调用方 共用此入口）。
     /// - [`SsError::InvalidCipherType`]：cipher_type 不是已知值。
     /// - 透传 `Cipher::from_type` 错误。
     pub fn from_proto(p: &ProtoAccount) -> Result<Self> {
+        if p.password.is_empty() {
+            return Err(SsError::EmptyPassword);
+        }
         let ct = CipherType::from_i32(p.cipher_type)
             .filter(|c| *c != CipherType::Unknown)
             .ok_or(SsError::InvalidCipherType(p.cipher_type))?;
@@ -380,6 +385,15 @@ mod tests {
 
     fn sample_proto(ct: CipherType, password: &str) -> ProtoAccount {
         ProtoAccount { password: password.to_string(), cipher_type: ct.as_i32(), iv_check: false }
+    }
+
+    /// bd u4efe：空口令在任何路径都拒（Go shadowsocks.go:71-73 硬错）。
+    /// 空串口令 → `KDF("")` 公开常量 → 任何人可代理上网，必须 fail-visible。
+    #[test]
+    fn from_proto_rejects_empty_password() {
+        let err = MemoryAccount::from_proto(&sample_proto(CipherType::Aes128Gcm, ""))
+            .expect_err("empty password must be rejected");
+        assert!(matches!(err, SsError::EmptyPassword), "got {err:?}");
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub mod outbound;
 pub mod plugin;
 pub mod server;
 pub mod socks;
+pub mod uot;
 
 pub use client::{AnytlsClient, AnytlsConn, ClientConfig};
 pub use dispatcher::{AnytlsConnection, make_dial_fn as make_anytls_dial_fn};
@@ -46,3 +47,4 @@ pub use outbound::AnytlsOutboundHandler;
 pub use plugin::{AnytlsLifecycle, AnytlsPlugin};
 pub use server::AnytlsMockServer;
 pub use socks::SocksAddr;
+pub use uot::{LEGACY_MAGIC_ADDRESS, MAGIC_ADDRESS};

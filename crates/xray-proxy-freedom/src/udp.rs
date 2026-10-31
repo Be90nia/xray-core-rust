@@ -27,6 +27,7 @@ use std::{
 
 use tokio::net::UdpSocket;
 use xray_buf::{
+    buffer::Buffer,
     io::{Reader, Writer},
     multi::MultiBuffer,
 };
@@ -181,7 +182,7 @@ fn dynamic_udp_strategy(
 ///
 /// IP 地址直接转换；Domain 按 strategy 解析（bd 2yj2）：有策略走
 /// [`lookup_for_ip`] 家族过滤随机选一（Force\* 失败硬错，Use\* 失败降级
-/// 系统 resolver）；AsIs 走系统 DNS。
+/// 系统 resolver）；AsIs 走系统 DNS（族偏好 IPv4，对齐 Go `favoriteAddrFamily`）。
 async fn resolve_socket_addr(
     dest: &Destination,
     strategy: xray_transport::sockopt::DomainStrategy,
@@ -194,6 +195,8 @@ async fn resolve_socket_addr(
             if strategy.has_strategy() {
                 match xray_transport::system_dialer::lookup_for_ip(domain, strategy, None).await {
                     Ok(ips) if !ips.is_empty() => {
+                        // 策略族过滤已生效（lookup_for_ip 按 strategy 过滤），
+                        // 多 A 记录随机择一保留（Go :608-612 同形态）。
                         use rand::seq::IndexedRandom;
                         return Ok(SocketAddr::new(
                             *ips.choose(&mut rand::rng()).expect("non-empty"),
@@ -212,12 +215,23 @@ async fn resolve_socket_addr(
                 }
             }
             let lookup = format!("{domain}:{port}");
-            tokio::net::lookup_host(&lookup)
-                .await?
-                .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "DNS resolve failed"))
+            let addrs: Vec<IpAddr> =
+                tokio::net::lookup_host(&lookup).await?.map(|sa| sa.ip()).collect();
+            if addrs.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "DNS resolve failed"));
+            }
+            Ok(SocketAddr::new(pick_preferring(addrs, true), port))
         },
     }
+}
+
+/// 从 IP 候选里优先取 `prefer_v4` 族，其次取首个任意族。
+///
+/// bd 1ksxu D3：UDP socket 一旦按某族建立，向另一族的地址 `send_to` 必失败
+/// （Go 同样以 `favoriteAddrFamily` 消解该问题）。
+fn pick_preferring(ips: Vec<IpAddr>, prefer_v4: bool) -> IpAddr {
+    let fallback = *ips.first().expect("callers guard non-empty");
+    ips.into_iter().find(|ip| ip.is_ipv4() == prefer_v4).unwrap_or(fallback)
 }
 
 /// 请求方向：从 link.reader 读 XUDP 帧 → socket.send_to。
@@ -289,6 +303,7 @@ async fn resolve_udp_domain(
     domain: &str,
     port: u16,
     strategy: xray_transport::sockopt::DomainStrategy,
+    prefer_v4: bool,
 ) -> io::Result<IpAddr> {
     if strategy.has_strategy() {
         if let Ok(ips) = xray_transport::system_dialer::lookup_for_ip(domain, strategy, None).await
@@ -304,9 +319,17 @@ async fn resolve_udp_domain(
             ));
         }
     }
-    tokio::net::lookup_host((domain, port)).await?.next().map(|sa| sa.ip()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("DNS resolve failed for {domain}"))
-    })
+    // 无策略：系统解析后按 socket 族择优（bd 1ksxu D3：旧实现取首址，v6 在前
+    // 时会撞 socket 族不符 → send_to 必败，帧被静默丢弃）
+    let addrs: Vec<IpAddr> =
+        tokio::net::lookup_host((domain, port)).await?.map(|sa| sa.ip()).collect();
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("DNS resolve failed for {domain}"),
+        ));
+    }
+    Ok(pick_preferring(addrs, prefer_v4))
 }
 
 /// 单次帧解析结果（z7ya：区分「半帧」与「协议层终止帧」）。
@@ -377,6 +400,7 @@ async fn parse_and_send(
                             &domain,
                             effective.port().value(),
                             policy.domain_strategy,
+                            default_target.is_ipv4(),
                         )
                         .await
                         {
@@ -386,8 +410,10 @@ async fn parse_and_send(
                             },
                             Err(e) => {
                                 // 丢帧继续（Go :627-630 b.Release(); continue；
-                                // Force* 失败同样丢帧——Go :625-628 注释）
-                                crate::FREEDOM_LOG.debug(format!(
+                                // Force* 失败同样丢帧——Go :625-628 注释）。
+                                // bd 1ksxu D3：丢帧提级 warning —— 静默丢弃在
+                                // 上层表现为「DNS 超时/QUIC 卡死」，无从定位。
+                                crate::FREEDOM_LOG.warn(format!(
                                     "freedom: udp frame dropped, resolve failed: {e} domain={domain}"
                                 ));
                                 return Ok(FrameParse::Progress);
@@ -478,6 +504,8 @@ async fn pump_response(
     policy: &UdpPolicy,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
+    // 响应帧 scratch（容量跨包复用）
+    let mut frame: Vec<u8> = Vec::with_capacity(1024);
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -504,16 +532,17 @@ async fn pump_response(
                 .debug(format!("freedom: udp response blocked by final rule source={source}"));
             continue;
         }
-        // 用同步 PacketWriter 装帧
-        let mut frame = Vec::with_capacity(n + 64);
-        let mut pw = PacketWriter::new(&mut frame, source, global_id);
-        if pw.write_packet(&buf[..n]).is_err() {
-            return Ok(());
+        // 装帧进会话 scratch → `Buffer::from_vec` 零拷贝移交（bd 1fm1l：
+        // 免旧路径的「Vec 分配 + merge_bytes 再拷一次」）
+        frame.clear();
+        {
+            let mut pw = PacketWriter::new(&mut frame, source, global_id);
+            if pw.write_packet(&buf[..n]).is_err() {
+                return Ok(());
+            }
         }
-        drop(pw);
 
-        let mut mb = MultiBuffer::new();
-        mb.merge_bytes(&frame);
+        let mb = MultiBuffer::from_buffer(Buffer::from_vec(std::mem::take(&mut frame)));
         if writer.write_multi_buffer(mb).await.is_err() {
             return Ok(()); // writer 关闭
         }

@@ -81,6 +81,14 @@ pub(crate) const H2_SERVER_INITIAL_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 /// 服务端 h2 每流发送缓冲原静态值（16MiB）。
 pub(crate) const H2_SERVER_MAX_SEND_BUF_SIZE: usize = 16 * 1024 * 1024;
 
+/// 服务端 h2 允许的对端并发流数（票 2xgln）。
+///
+/// 对齐 Go `net/http` h2 服务端缺省 `MaxConcurrentStreams = 250`（xray hub 用
+/// `http.Server` + `SetUnencryptedHTTP2(true)`，故 Go 侧实际生效值即 250）。
+/// 不设时 hyper/h2 取 `usize::MAX`：单 TCP 可无限开流，每流一份 handler 状态
+/// + 收流窗（16MiB），一个连接即把内存打满。250 留足真实 xmux 并发余量。
+pub(crate) const H2_MAX_CONCURRENT_STREAMS: u32 = 250;
+
 /// SplitHTTP 监听入口（listener registry 注册的目标）。
 ///
 /// 镜像 Go `ListenXH`：isH3（alpn==["h3"]）走 QUIC，其余走 TCP + TLS/REALITY 包装。
@@ -568,7 +576,10 @@ async fn serve_http_conn<S>(
             // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
             // bd rjzw2：值改由 RTT 阶梯驱动，保底 = 16MB/32MB。
             .initial_stream_window_size(win.stream_window)
-            .initial_connection_window_size(win.connection_window);
+            .initial_connection_window_size(win.connection_window)
+            // 票 2xgln：对端并发流上限（Go net/http h2 缺省 250）。h2 侧据此
+            // 发 SETTINGS，并对越限的 HEADERS 回 RST_STREAM(REFUSED_STREAM)。
+            .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
         // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
         // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
         let _ = builder.serve_connection(io, svc).await;

@@ -23,12 +23,23 @@
 //! outbound relay EOF 退出）。若后续出现长生命周期无控制连接的 UDP 入站
 //! （tun/fakeDNS），再补 idle deadline。
 
-use std::{io, sync::Arc};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use xray_buf::io::{new_reader, new_writer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use xray_buf::{
+    buffer::Buffer,
+    io::{Reader, Writer, new_reader, new_writer},
+    multi::MultiBuffer,
+};
 use xray_common::net::destination::Destination;
-use xray_transport::link::Link;
+use xray_transport::{connection::Connection, link::Link};
 use xray_xudp::packet::{FrameMetadata, PacketError, PacketReader};
 
 use crate::DispatchHandler;
@@ -38,6 +49,19 @@ const DUPLEX_BUF: usize = 256 * 1024;
 
 /// 单个 UDP 数据报上限。
 const MAX_DATAGRAM: usize = 65535;
+
+/// 响应读缓冲（会话期常驻）。取池化 Buffer 档 8KiB 而非 64KiB：帧解析走
+/// `accum` 增量重组，大报文天然分多次读入——每会话常驻从 64KiB 降到 8KiB
+/// （bd tini5：1200 会话 × 64KiB ≈ 65MB 常驻）。
+const RECV_BUF: usize = 8 * 1024;
+
+/// 进程级并发 UDP dispatch 会话上限（bd tini5：会话无上限即内存无上限）。
+/// 4096 × (8KiB 读缓冲 + duplex 2×256KiB 上限) 属可控量级；超限 fail-visible
+/// （调用方拿 io 错误而不是静默丢包）。
+const MAX_UDP_SESSIONS: usize = 4096;
+
+/// 当前存活会话数（`Inner::drop` 归还）。
+static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// 已建立的 dispatch link 状态。
 struct Inner {
@@ -52,10 +76,18 @@ struct Inner {
     /// 响应读缓冲（会话期常驻：栈数组会把本 future 撑到 64KiB，构造期在调用方
     /// poll 栈上留同尺寸临时量 → 击穿 2MiB 线程栈；常驻还省掉每包一次分配）。
     buf: Vec<u8>,
+    /// 请求帧序列化 scratch（清空复用容量，免每包一次 `Vec` 分配）。
+    frame: Vec<u8>,
     /// 首帧 GlobalID（随机 8 字节，对应 Go xudp）。
     global_id: [u8; 8],
     /// 是否已发送 New 帧。
     new_sent: bool,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// UDP dispatch 会话：inbound 包流 ↔ dispatcher XUDP 帧 Link 桥。
@@ -88,22 +120,24 @@ impl UdpDispatchSession {
             return Ok(());
         }
         if self.inner.is_none() {
-            self.establish(dest.clone());
+            self.establish(dest.clone())?;
         }
         let inner = self.inner.as_mut().expect("established above");
 
-        let mut frame = Vec::with_capacity(payload.len() + 666);
         let meta = if inner.new_sent {
             FrameMetadata::keep_udp(dest.address().clone(), dest.port())
         } else {
             inner.new_sent = true;
             FrameMetadata::new_udp(dest.address().clone(), dest.port(), inner.global_id)
         };
-        meta.write_to(&mut frame)
+        // 帧序列化进会话常驻 scratch（clear 复用容量，免每包一次分配）
+        let Inner { frame, req, .. } = inner;
+        frame.clear();
+        meta.write_to(frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
-        inner.req.write_all(&frame).await
+        req.write_all(frame).await
     }
 
     /// 接收一个响应数据报 `(来源, payload)`。
@@ -153,7 +187,18 @@ impl UdpDispatchSession {
     }
 
     /// 建立到 outbound 的 dispatch link（两条 duplex：请求/响应）。
-    fn establish(&mut self, dest: Destination) {
+    ///
+    /// 并发会话数受 [`MAX_UDP_SESSIONS`] 约束：超限返回 `io::Error`
+    /// （fail-visible，不静默丢弃数据报）。
+    fn establish(&mut self, dest: Destination) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        let live = LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
+        if live > MAX_UDP_SESSIONS {
+            LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other(format!(
+                "udp dispatch sessions exceeded {MAX_UDP_SESSIONS}"
+            )));
+        }
         let (req_local, req_link) = tokio::io::duplex(DUPLEX_BUF);
         let (resp_link, resp_local) = tokio::io::duplex(DUPLEX_BUF);
         let link = Link::new(new_reader(req_link), new_writer(resp_link));
@@ -171,10 +216,504 @@ impl UdpDispatchSession {
             req: req_local,
             resp: resp_local,
             accum: Vec::new(),
-            buf: vec![0u8; MAX_DATAGRAM],
+            buf: vec![0u8; RECV_BUF],
+            frame: Vec::with_capacity(666),
             global_id: rand::random(),
             new_sent: false,
         });
+        Ok(())
+    }
+}
+
+// ========== Link 表示转换（隧道 / mux 跨实现边界，bd t0ls1） ==========
+//
+// 两套互不兼容的内部表示：
+// - **内部 dispatch link**（本文件 `UdpDispatchSession` 写入、freedom/dns/ hysteria/tuic/ss/wg
+//   六族消费）跑的是 **XUDP 帧**（自带 per-packet 目标 + GlobalID）。
+// - **隧道 wire / mux carrier** 跑的是 **裸载荷**（Go `transport/internet/udp/dispatcher.go:117`
+//   形态；VLESS/VMess plain 模式 `[2B len]` 前缀、Trojan `[addr][len][CRLF]`、mux data 段）。
+//
+// 旧实现把 link 字节流原样搬到 wire（帧头一起上线 → 对端把整帧当载荷），
+// 跨实现双向皆废（见 `reports/audit-2026-10-31-perf-mem-wiring/round4/Verify-XUDP.md`）。
+// 本节的四个适配件在**边界**上做表示转换，内部 link 契约不变。
+
+/// 探测到的 XUDP 帧边界。
+///
+/// 帧线格式（`xray-xudp/src/packet.rs`）：`[2B meta_len][meta][?2B data_len][data]`，
+/// data 段仅在 `opt & OPT_DATA` 置位时存在。载荷偏移由 meta_len 直接算出，
+/// **不解析地址**——拆帧路径零分配、零摊平。
+struct FrameHead {
+    /// 帧头字节数（含 2B data_len，若存在）。
+    header_len: usize,
+    data_len: usize,
+}
+
+/// meta 段上限：XUDP meta 含域名地址时最长 ~270B，512 足量。超限即判流损坏，
+/// 避免对垃圾字节无限等一个 64KiB meta。
+const MAX_XUDP_META: usize = 512;
+
+/// 在字节切片上探测一个完整 XUDP 帧。`Ok(None)` = 数据不足一帧。
+fn probe_xudp_frame(data: &[u8]) -> Result<Option<FrameHead>, PacketError> {
+    if data.len() < 6 {
+        return Ok(None);
+    }
+    let meta_len = usize::from(u16::from_be_bytes([data[0], data[1]]));
+    if !(MIN_META_LEN..=MAX_XUDP_META).contains(&meta_len) {
+        return Err(PacketError::MetadataTooShort(meta_len));
+    }
+    if data.len() < 2 + meta_len {
+        return Ok(None);
+    }
+    // meta 布局：[2B len][2B session][1B status][1B opt]… → opt 在 data[5]
+    if data[5] & 1 == 0 {
+        // 无 data 段的控制帧（End/KeepAlive）：整帧跳过
+        return Ok(Some(FrameHead { header_len: 2 + meta_len, data_len: 0 }));
+    }
+    if data.len() < 4 + meta_len {
+        return Ok(None);
+    }
+    let data_len = usize::from(u16::from_be_bytes([data[2 + meta_len], data[3 + meta_len]]));
+    if data.len() < 4 + meta_len + data_len {
+        return Ok(None);
+    }
+    Ok(Some(FrameHead { header_len: 4 + meta_len, data_len }))
+}
+
+/// XUDP 帧长度字段下界（`[2B session][1B status][1B opt]`）。
+const MIN_META_LEN: usize = 4;
+
+/// 池化 Buffer 装一段拷贝（免 `to_vec` 扁平化禁忌；容量按需，超池档走裸分配）。
+fn buffer_from_slice(src: &[u8]) -> Buffer {
+    let mut b = Buffer::with_capacity(src.len().max(1));
+    let n = b.write_from(src);
+    debug_assert_eq!(n, src.len(), "Buffer 容量足够装下整段载荷");
+    b
+}
+
+/// 帧解析错误 → link 读错误（拆帧路径的流损坏一律 fail-visible）。
+fn frame_err(e: PacketError) -> xray_buf::io::Error {
+    xray_buf::io::Error::ReadError(format!("xudp frame: {e}"))
+}
+
+/// XUDP 上行拆帧器：把 Link 字节流切回逐包裸载荷。
+///
+/// 帧完整落在单次输入内时**零拷贝**（直接在入参切片上切，仅回调切片）；
+/// 只有跨 Buffer 边界的半帧才并入 `accum` 留待下次（一次拷贝）。
+#[derive(Debug, Default)]
+pub struct XudpUnframer {
+    /// 跨 Buffer 的半帧残留（常态空）。
+    accum: Vec<u8>,
+}
+
+impl XudpUnframer {
+    /// 新建拆帧器。
+    #[must_use]
+    pub fn new() -> Self {
+        Self { accum: Vec::new() }
+    }
+
+    /// 是否有未成帧的残留字节。
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        !self.accum.is_empty()
+    }
+
+    /// 把一段裸字节并入残留（调用方已自行切走完整帧时用）。
+    fn push_tail(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.accum.extend_from_slice(bytes);
+        }
+    }
+
+    /// 喂入一段字节；每个完整数据帧回调 `(meta 字节, 载荷)`。
+    ///
+    /// `meta` 为 `[2B meta_len][meta body]`（可直接喂 `FrameMetadata::from_bytes`）。
+    pub fn feed<F>(&mut self, bytes: &[u8], mut emit: F) -> Result<(), PacketError>
+    where
+        F: FnMut(&[u8], &[u8]),
+    {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // 无残留 → 直接在入参切片上切（零拷贝）；有残留 → 并进 accum 一次性切。
+        if self.accum.is_empty() {
+            let mut off = 0;
+            while let Some(h) = probe_xudp_frame(&bytes[off..])? {
+                let end = off + h.header_len + h.data_len;
+                if h.data_len > 0 {
+                    emit(&bytes[off..off + h.header_len - 2], &bytes[off + h.header_len..end]);
+                }
+                off = end;
+            }
+            self.push_tail(&bytes[off..]);
+            return Ok(());
+        }
+        self.accum.extend_from_slice(bytes);
+        let mut off = 0;
+        while let Some(h) = probe_xudp_frame(&self.accum[off..])? {
+            let end = off + h.header_len + h.data_len;
+            if h.data_len > 0 {
+                emit(
+                    &self.accum[off..off + h.header_len - 2],
+                    &self.accum[off + h.header_len..end],
+                );
+            }
+            off = end;
+        }
+        if off > 0 {
+            self.accum.drain(..off);
+        }
+        Ok(())
+    }
+}
+
+/// 解析帧头里的目标地址（trojan 上行按包目标用；vless/vmess plain 模式忽略）。
+pub fn xudp_frame_target(meta: &[u8]) -> Result<Option<Destination>, PacketError> {
+    let (m, _) = FrameMetadata::from_bytes(meta)?;
+    Ok(m.target().cloned())
+}
+
+/// XUDP 下行裹帧器：逐包裸载荷 → XUDP 帧头（New 首帧 → Keep 后续）。
+///
+/// 回程目标只能取会话目标（wire 上不携带响应来源，与 Go plain 模式同局限）；
+/// 支持 per-packet 目标覆盖（trojan 每包自描述地址）。
+pub struct XudpReframer {
+    dest: Destination,
+    global_id: [u8; 8],
+    new_sent: bool,
+}
+
+impl XudpReframer {
+    /// 以会话目标构造；GlobalID 每会话随机（对齐 `UdpDispatchSession`）。
+    #[must_use]
+    pub fn new(dest: Destination) -> Self {
+        Self { dest, global_id: rand::random(), new_sent: false }
+    }
+
+    /// 生成下一响应帧头（meta + 2B 载荷长度）写入 `out`（清空后写）。
+    pub fn write_header(
+        &mut self,
+        payload_len: usize,
+        target: Option<&Destination>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), PacketError> {
+        let dest = target.unwrap_or(&self.dest);
+        let meta = if self.new_sent {
+            FrameMetadata::keep_udp(dest.address().clone(), dest.port())
+        } else {
+            self.new_sent = true;
+            FrameMetadata::new_udp(dest.address().clone(), dest.port(), self.global_id)
+        };
+        out.clear();
+        meta.write_to(out)?;
+        out.extend_from_slice(&(payload_len.min(usize::from(u16::MAX)) as u16).to_be_bytes());
+        Ok(())
+    }
+}
+
+/// Link 上行剥帧读端：把 XUDP 帧流交付为逐包裸载荷（一包一 Buffer）。
+///
+/// 一包一 Buffer 是 mux `TransferType::Packet` 写端的硬前提（它按 Buffer
+/// 切帧——多包同 Buffer 会被拼进同一帧、单包跨 Buffer 会被拆成多帧）。
+pub struct XudpUnframingReader {
+    inner: Box<dyn Reader>,
+    unframer: XudpUnframer,
+}
+
+impl XudpUnframingReader {
+    /// 包装内层读端。
+    #[must_use]
+    pub fn new(inner: Box<dyn Reader>) -> Self {
+        Self { inner, unframer: XudpUnframer::new() }
+    }
+}
+
+impl Reader for XudpUnframingReader {
+    fn read_multi_buffer(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<MultiBuffer>> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                let mut out = MultiBuffer::new();
+                // 残留半帧在补入更多字节前切不出东西 → 先读一批
+                let mb = self.inner.read_multi_buffer().await?;
+                if mb.is_empty() {
+                    return Ok(MultiBuffer::new()); // 内层 EOF
+                }
+                for mut buf in mb.into_buffers() {
+                    if self.unframer.pending() {
+                        // 半帧路径：并入 accum 后整段切（拷贝）
+                        self.unframer
+                            .feed(buf.bytes(), |_, payload| {
+                                out.push(buffer_from_slice(payload));
+                            })
+                            .map_err(frame_err)?;
+                        continue;
+                    }
+                    // 常态路径：Buffer 原地剥头 + split_to 取载荷（零拷贝）
+                    loop {
+                        match probe_xudp_frame(buf.bytes()).map_err(frame_err)? {
+                            Some(h) => {
+                                buf.advance(h.header_len);
+                                let payload = buf.split_to(h.data_len);
+                                if !payload.is_empty() {
+                                    out.push(payload);
+                                }
+                            },
+                            None => {
+                                self.unframer.push_tail(buf.bytes());
+                                break;
+                            },
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        })
+    }
+}
+
+/// Link 下行裹帧写端：每次 `write_multi_buffer` = 一个数据报。
+///
+/// 调用方按包写（mux Keep 帧 / 隧道 wire 包），故一次调用即一帧；载荷
+/// Buffer 原样挂到帧头之后（零拷贝，仅帧头进池化 Buffer）。
+pub struct XudpFramingWriter {
+    inner: Box<dyn Writer>,
+    reframer: XudpReframer,
+    scratch: Vec<u8>,
+}
+
+impl XudpFramingWriter {
+    /// 以会话目标包装内层写端。
+    #[must_use]
+    pub fn new(inner: Box<dyn Writer>, dest: Destination) -> Self {
+        Self { inner, reframer: XudpReframer::new(dest), scratch: Vec::with_capacity(64) }
+    }
+}
+
+impl Writer for XudpFramingWriter {
+    fn write_multi_buffer(
+        &mut self,
+        mb: MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+        Box::pin(async move {
+            if mb.is_empty() {
+                return Ok(());
+            }
+            if mb.len() > usize::from(u16::MAX) {
+                return Err(xray_buf::io::Error::WriteError(format!(
+                    "xudp frame payload {} exceeds u16 length",
+                    mb.len()
+                )));
+            }
+            self.reframer
+                .write_header(mb.len(), None, &mut self.scratch)
+                .map_err(|e| xray_buf::io::Error::WriteError(format!("xudp frame header: {e}")))?;
+            let mut frame = Buffer::new();
+            {
+                let spare = frame.writable_bytes();
+                let n = self.scratch.len();
+                assert!(n <= spare.len(), "xudp frame header exceeds buffer capacity");
+                spare[..n].copy_from_slice(&self.scratch);
+                frame.advance_write(n);
+            }
+            let mut out = MultiBuffer::with_capacity(mb.buffer_count() + 1);
+            out.push(frame);
+            for buf in mb.into_buffers() {
+                out.push(buf);
+            }
+            self.inner.write_multi_buffer(out).await
+        })
+    }
+
+    fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+        self.inner.shutdown_flush()
+    }
+}
+
+/// 「XUDP link 表示 ↔ `[2B BE len][裸载荷]` wire 表示」适配连接。
+///
+/// 覆盖两种 wire 帧格式完全相同的承载：
+/// - **VLESS UDP**（Go `MultiLengthPacketWriter`/`LengthPacketReader`）；
+/// - **AnyTLS UoT v2**（sing `common/uot` `isConnect=true` 模式：`[2B len][payload]`）。
+///
+/// 上行：link 的 XUDP 帧逐包剥成裸载荷，按 `[2B len][payload]` 写 wire（零额外
+/// 拷贝——载荷切片直接进 wire 缓冲）；下行：wire 的 `[2B len][payload]` 逐包裹回
+/// XUDP 帧写 link（载荷原地留在读缓冲，按段交付，帧头先行）。
+pub struct XudpWireConn<C> {
+    inner: C,
+    /// 上行剥帧：XUDP 帧流 → 裸载荷
+    unframer: XudpUnframer,
+    /// 下行裹帧：裸载荷 → XUDP 帧流
+    reframer: XudpReframer,
+    /// 读侧缓冲：`rview == 0` 时为原始 wire 字节（攒帧），`rview > 0` 时
+    /// `rbuf[..rview]` 为当前包尚未交付的 payload。
+    rbuf: Vec<u8>,
+    rview: usize,
+    /// 待发的 XUDP 帧头（meta + 2B 载荷长度）
+    hdr: Vec<u8>,
+    hpos: usize,
+    /// 待写完的 wire 帧（UDP 帧不可分，部分写时缓存剩余）
+    wpending: Vec<u8>,
+    wpos: usize,
+    /// 本轮 poll_write 已收下的字节数（返回 Pending 后重入不再重复喂）
+    fed: usize,
+}
+
+impl<C> XudpWireConn<C> {
+    /// 以会话目标构造（wire 不携带回程来源，回程帧目标取它）。
+    #[must_use]
+    pub fn new(inner: C, dest: Destination) -> Self {
+        Self {
+            inner,
+            unframer: XudpUnframer::new(),
+            reframer: XudpReframer::new(dest),
+            rbuf: Vec::new(),
+            rview: 0,
+            hdr: Vec::with_capacity(64),
+            hpos: 0,
+            wpending: Vec::new(),
+            wpos: 0,
+            fed: 0,
+        }
+    }
+}
+
+impl<C: AsyncRead + Unpin> AsyncRead for XudpWireConn<C> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            // 1) 待发的 XUDP 帧头优先（帧头必须排在载荷之前）
+            if this.hpos < this.hdr.len() {
+                let n = (this.hdr.len() - this.hpos).min(buf.remaining());
+                buf.put_slice(&this.hdr[this.hpos..this.hpos + n]);
+                this.hpos += n;
+                return Poll::Ready(Ok(()));
+            }
+            // 2) 当前包有未交付 payload → 先交付（ReadBuf 满时保留剩余，不丢数据）
+            if this.rview > 0 {
+                let n = this.rview.min(buf.remaining());
+                buf.put_slice(&this.rbuf[..n]);
+                this.rbuf.drain(..n);
+                this.rview -= n;
+                return Poll::Ready(Ok(()));
+            }
+            // 3) 攒帧：够帧头且够 payload → 剥前缀、裹 XUDP 帧头后交付
+            if this.rbuf.len() >= 2 {
+                let len = usize::from(u16::from_be_bytes([this.rbuf[0], this.rbuf[1]]));
+                if this.rbuf.len() >= 2 + len {
+                    this.rbuf.drain(..2);
+                    // 空载荷帧会让下游 PacketReader 判流结束，直接跳过
+                    if len == 0 {
+                        continue;
+                    }
+                    let mut hdr = std::mem::take(&mut this.hdr);
+                    let res = this.reframer.write_header(len, None, &mut hdr);
+                    this.hdr = hdr;
+                    this.hpos = 0;
+                    res.map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("udp wire: XUDP 应答帧头: {e}"),
+                        )
+                    })?;
+                    this.rview = len;
+                    continue;
+                }
+            }
+            // 4) 不足一帧 → 从 inner 补读
+            let mut tmp = [0u8; 8192];
+            let mut rb = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut rb)? {
+                Poll::Ready(()) => {
+                    let filled = rb.filled();
+                    if filled.is_empty() {
+                        return if this.rbuf.is_empty() {
+                            Poll::Ready(Ok(())) // EOF：干净关闭
+                        } else {
+                            Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "udp wire: truncated frame",
+                            )))
+                        };
+                    }
+                    this.rbuf.extend_from_slice(filled);
+                },
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for XudpWireConn<C> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // 上一轮已收下 buf（Pending 重入）→ 只排干，不再重复喂
+        if this.fed == 0 {
+            let mut framed = std::mem::take(&mut this.wpending);
+            framed.clear();
+            this.wpos = 0;
+            let fed = buf.len();
+            let res = this.unframer.feed(buf, |_, payload| {
+                framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                framed.extend_from_slice(payload);
+            });
+            this.wpending = framed;
+            res.map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("udp wire: XUDP 帧解析: {e}"))
+            })?;
+            this.fed = fed;
+        }
+        // 排干 pending 帧（UDP 帧不可分）
+        while this.wpos < this.wpending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut this.inner).poll_write(cx, &this.wpending[this.wpos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "udp wire: frame write stalled",
+                )));
+            }
+            this.wpos += n;
+        }
+        let fed = this.fed;
+        this.fed = 0;
+        this.wpending.clear();
+        this.wpos = 0;
+        Poll::Ready(Ok(fed))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<C: Connection> Connection for XudpWireConn<C> {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        self.inner.local_addr()
     }
 }
 
@@ -240,6 +779,114 @@ pub(crate) mod tests {
 
     fn udp_dest(ip: [u8; 4], port: u16) -> Destination {
         Destination::udp(Address::IPv4(Ipv4Addr::from(ip)), Port::new(port))
+    }
+
+    // ── t0ls1：Link 表示转换（XUDP 帧 ↔ 裸载荷）──
+
+    fn udp_frame(payload: &[u8], ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        FrameMetadata::new_udp(udp_dest(ip, port).address().clone(), Port::new(port), [7u8; 8])
+            .write_to(&mut f)
+            .unwrap();
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// 按 `chunk` 给定的分段长度循环喂入拆帧器，返回切出的载荷。
+    fn unframe_in_chunks(stream: &[u8], chunk: impl Fn(usize) -> usize) -> Vec<Vec<u8>> {
+        let mut uf = XudpUnframer::new();
+        let mut got = Vec::new();
+        let mut off = 0;
+        let mut i = 0;
+        while off < stream.len() {
+            let n = chunk(i).clamp(1, stream.len() - off);
+            uf.feed(&stream[off..off + n], |_, payload| got.push(payload.to_vec())).unwrap();
+            off += n;
+            i += 1;
+        }
+        assert!(!uf.pending(), "完整流喂完后不得留半帧");
+        got
+    }
+
+    /// 拆帧结果对分段方式不变：整段、1 字节、3 字节碎片、对半切结果一致。
+    #[test]
+    fn xudp_unframer_segmentation_invariant() {
+        let mut stream = udp_frame(b"first-payload", [8, 8, 8, 8], 53);
+        stream.extend_from_slice(&udp_frame(b"p2", [1, 0, 0, 1], 443));
+        let expect = vec![b"first-payload".to_vec(), b"p2".to_vec()];
+
+        assert_eq!(unframe_in_chunks(&stream, |_| stream.len()), expect, "整段喂入");
+        assert_eq!(unframe_in_chunks(&stream, |_| 1), expect, "1 字节碎片");
+        assert_eq!(unframe_in_chunks(&stream, |_| 3), expect, "3 字节碎片（错位帧边界）");
+        let half = stream.len() / 2;
+        assert_eq!(
+            unframe_in_chunks(&stream, |i| if i == 0 { half } else { stream.len() }),
+            expect
+        );
+    }
+
+    /// 空载荷帧与残留不串包：喂入半帧时拆帧器只留残留、不吐包。
+    #[test]
+    fn xudp_unframer_holds_partial_frame() {
+        let mut frame = udp_frame(b"abcd", [8, 8, 8, 8], 53);
+        let head = frame.len() - 2;
+        let mut uf = XudpUnframer::new();
+        let mut got = Vec::new();
+        uf.feed(&frame[..head], |_, p| got.push(p.to_vec())).unwrap();
+        assert!(got.is_empty(), "半帧不得交付");
+        assert!(uf.pending(), "半帧必须留残留");
+        frame.drain(..head);
+        uf.feed(&frame, |_, p| got.push(p.to_vec())).unwrap();
+        assert_eq!(got, vec![b"abcd".to_vec()]);
+        assert!(!uf.pending());
+    }
+
+    /// 写端裹帧 → 读端拆帧往返：首帧 New、后续 Keep，载荷逐字节一致。
+    #[tokio::test]
+    async fn xudp_framing_writer_roundtrip_new_then_keep() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Writer for Capture {
+            fn write_multi_buffer(
+                &mut self,
+                mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+                Box::pin(async move {
+                    let mut g = self.0.lock();
+                    for b in mb.iter() {
+                        g.extend_from_slice(b.bytes());
+                    }
+                    Ok(())
+                })
+            }
+        }
+
+        let cap = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut w = XudpFramingWriter::new(
+            Box::new(Capture(std::sync::Arc::clone(&cap))),
+            udp_dest([8, 8, 8, 8], 53),
+        );
+        for payload in [b"dns-query".as_slice(), b"second".as_slice()] {
+            let mut mb = MultiBuffer::new();
+            mb.push(xray_buf::buffer::Buffer::from_vec(payload.to_vec()));
+            w.write_multi_buffer(mb).await.unwrap();
+        }
+
+        let bytes = cap.lock().clone();
+        let (first, _) = FrameMetadata::from_bytes(&bytes).unwrap();
+        assert_eq!(first.status(), xray_xudp::packet::FrameStatus::New, "首帧必须是 New");
+        assert!(first.global_id().is_some(), "New 帧必须带 GlobalID");
+        assert_eq!(first.target(), Some(&udp_dest([8, 8, 8, 8], 53)), "帧目标 = 会话目标");
+        let h1 = probe_xudp_frame(&bytes).unwrap().expect("首帧完整");
+        let (second, _) = FrameMetadata::from_bytes(&bytes[h1.header_len + h1.data_len..]).unwrap();
+        assert_eq!(second.status(), xray_xudp::packet::FrameStatus::Keep, "后续帧必须是 Keep");
+
+        // 拆帧还原：载荷逐字节一致（New/Keep 都是数据帧）
+        assert_eq!(
+            unframe_in_chunks(&bytes, |_| bytes.len()),
+            vec![b"dns-query".to_vec(), b"second".to_vec()]
+        );
     }
 
     /// q1r4q：把不连续 Buffer 片段链暴露为 `io::Read`，让 `PacketReader`

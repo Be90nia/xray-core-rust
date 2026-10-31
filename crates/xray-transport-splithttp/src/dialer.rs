@@ -13,7 +13,6 @@ use tokio::{
     sync::Semaphore,
     task::JoinSet,
 };
-use tokio_util::io::ReaderStream;
 
 use crate::{
     client::{DefaultDialerClient, ReqBody, hyper_err_to_io, make_stream_body},
@@ -21,6 +20,7 @@ use crate::{
     connection::{DownloadBody, SplitConn},
     error::{Result, SplitHttpError},
     h3_client::H3Conn,
+    pool_stream::{PoolStream, UPLINK_CHUNK},
 };
 
 /// 统一上传连接类型（packet-up / stream-up / stream-one mode 共用）。
@@ -226,8 +226,8 @@ pub async fn dial_stream_up(
     session_id: String,
 ) -> Result<PacketUpConn> {
     // 1. 创建上传 pipe
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
-    let upload_stream = ReaderStream::new(pipe_server);
+    let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
+    let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     // 2. POST upload（不等响应）
     let (_, remote, local) =
@@ -266,8 +266,8 @@ pub async fn dial_stream_one(
     session_id: String,
 ) -> Result<PacketUpConn> {
     // 1. 创建上传 pipe
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
-    let upload_stream = ReaderStream::new(pipe_server);
+    let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
+    let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     let (response_opt, remote, local) =
         client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
@@ -509,8 +509,8 @@ pub async fn dial_h3_stream_up(
     session_id: String,
 ) -> Result<PacketUpConn> {
     // 1. 创建上传 pipe
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
-    let upload_stream = ReaderStream::new(pipe_server);
+    let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
+    let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     // 2. POST upload（upload_only=true）
     let (_, remote, local) =
@@ -543,8 +543,8 @@ pub async fn dial_h3_stream_one(
     session_id: String,
 ) -> Result<PacketUpConn> {
     // 1. 创建上传 pipe
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
-    let upload_stream = ReaderStream::new(pipe_server);
+    let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
+    let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     // 2. POST upload + GET download（upload_only=false）
     let (dl_opt, remote, local) =
@@ -683,9 +683,9 @@ where
     // 整体错位 1 字节 → 服务端 ML-KEM decapsulate 失败 → RST → 客户端 early eof）。
     // sing-box idle-RST 场景由调用方 dial 后立即写首包（如 ENC clientHello 2388B）
     // 自然满足，无 DATA 帧延迟窗口。
-    let (pipe_client, pipe_server) = tokio::io::duplex(8192);
+    let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
 
-    let upload_stream = ReaderStream::new(pipe_server);
+    let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     // 构造 RequestMeta + hyper Request（stream-one body 通过 streaming body 发送）
     let meta = config.build_stream_request_meta(&base_uri, &session_id, Some(Vec::new()))?;

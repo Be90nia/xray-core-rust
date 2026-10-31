@@ -20,7 +20,10 @@ use std::{
 };
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use xray_app_dispatcher::default::DialFn;
+use xray_app_dispatcher::{
+    default::DialFn,
+    udp_session::{XudpReframer, XudpUnframer, xudp_frame_target},
+};
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::{
     connection::Connection,
@@ -153,19 +156,49 @@ pub fn make_dial_fn(config: Arc<TrojanOutboundConfig>) -> DialFn {
 /// Trojan UDP 分帧连接：把字节流 write 按 Trojan UDP 帧格式包装、read 剥帧。
 ///
 /// 对应 Go `protocol.go::PacketWriter`/`PacketReader`。每帧：
+/// `[addr+port][2B len][CRLF][payload]`。
+///
+/// **两套表示**（bd t0ls1）：内部 dispatch link 跑 XUDP 帧，Trojan wire 跑裸
+/// 载荷 + 自描述目标。上行剥帧（目标取帧头，退回请求头目标），下行按 wire
+/// 帧自带地址裹回 XUDP 帧。
 struct TrojanUdpFramedConn {
     inner: Box<dyn Connection>,
+    /// 会话目标（请求头目标；上行帧无目标时兜底）
     addr: Address,
     port: u16,
+    /// 上行剥帧：XUDP 帧流 → 裸载荷
+    unframer: XudpUnframer,
+    /// 下行裹帧：裸载荷 → XUDP 帧流
+    reframer: XudpReframer,
     rbuf: Vec<u8>,
+    /// 当前帧载荷尚未交付的字节数（载荷留在 rbuf 头部）
+    rview: usize,
+    /// 待发的 XUDP 帧头（meta + 2B 载荷长度）
+    hdr: Vec<u8>,
+    hpos: usize,
     /// 待写完的帧（UDP 帧不可分，部分写时缓存剩余）
     wpending: Vec<u8>,
     wpos: usize,
+    /// 本轮 poll_write 已收下的字节数（返回 Pending 后重入不再重复喂）
+    fed: usize,
 }
 
 impl TrojanUdpFramedConn {
     fn new(inner: Box<dyn Connection>, addr: Address, port: u16) -> Self {
-        Self { inner, addr, port, rbuf: Vec::new(), wpending: Vec::new(), wpos: 0 }
+        Self {
+            inner,
+            reframer: XudpReframer::new(Destination::udp(addr.clone(), Port::new(port))),
+            addr,
+            port,
+            unframer: XudpUnframer::new(),
+            rbuf: Vec::new(),
+            rview: 0,
+            hdr: Vec::with_capacity(64),
+            hpos: 0,
+            wpending: Vec::new(),
+            wpos: 0,
+            fed: 0,
+        }
     }
 }
 
@@ -176,7 +209,37 @@ impl AsyncWrite for TrojanUdpFramedConn {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        // 1. 先把 pending 帧写完（UDP 帧不可分）
+        // 上一轮已收下 buf（Pending 重入）→ 只排干，不再重复喂
+        if this.fed == 0 {
+            // 剥 XUDP 帧，按包构 Trojan UDP 帧（wire 每包自描述目标）
+            let fallback_addr = this.addr.clone();
+            let fallback_port = this.port;
+            let mut framed = std::mem::take(&mut this.wpending);
+            framed.clear();
+            this.wpos = 0;
+            let fed = buf.len();
+            let mut frame_err: Option<String> = None;
+            let res = this.unframer.feed(buf, |meta, payload| {
+                let target = xudp_frame_target(meta).ok().flatten();
+                let (addr, port) = match target {
+                    Some(d) => (d.address().clone(), d.port().value()),
+                    None => (fallback_addr.clone(), fallback_port),
+                };
+                if let Err(e) = crate::protocol::write_udp_packet(&mut framed, &addr, port, payload)
+                {
+                    frame_err = Some(format!("{e}"));
+                }
+            });
+            this.wpending = framed;
+            if let Some(e) = frame_err {
+                return Poll::Ready(Err(io::Error::other(format!("trojan udp: {e}"))));
+            }
+            res.map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("trojan udp: XUDP 帧解析: {e}"))
+            })?;
+            this.fed = fed;
+        }
+        // 排干 pending 帧（UDP 帧不可分）
         while this.wpos < this.wpending.len() {
             let n = std::task::ready!(
                 Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
@@ -189,25 +252,11 @@ impl AsyncWrite for TrojanUdpFramedConn {
             }
             this.wpos += n;
         }
-        // 2. 构造新帧并整帧写出
-        let chunk = &buf[..buf.len().min(crate::protocol::MAX_LENGTH)];
-        this.wpending = Vec::with_capacity(chunk.len() + 32);
-        crate::protocol::write_udp_packet(&mut this.wpending, &this.addr, this.port, chunk)
-            .map_err(|e| io::Error::other(format!("trojan udp: {e}")))?;
+        let fed = this.fed;
+        this.fed = 0;
+        this.wpending.clear();
         this.wpos = 0;
-        while this.wpos < this.wpending.len() {
-            let n = std::task::ready!(
-                Pin::new(&mut *this.inner).poll_write(cx, &this.wpending[this.wpos..])
-            )?;
-            if n == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "trojan udp: frame write stalled",
-                )));
-            }
-            this.wpos += n;
-        }
-        Poll::Ready(Ok(chunk.len()))
+        Poll::Ready(Ok(fed))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -226,16 +275,47 @@ impl AsyncRead for TrojanUdpFramedConn {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         loop {
-            // 缓冲里有完整帧 → 剥帧返回 payload
+            // 1) 待发的 XUDP 帧头优先（帧头必须排在载荷之前）
+            if self.hpos < self.hdr.len() {
+                let n = (self.hdr.len() - self.hpos).min(buf.remaining());
+                buf.put_slice(&self.hdr[self.hpos..self.hpos + n]);
+                self.hpos += n;
+                return Poll::Ready(Ok(()));
+            }
+            // 2) 当前帧载荷未交付完 → 交付（载荷留在 rbuf 头部）
+            if self.rview > 0 {
+                let n = self.rview.min(buf.remaining());
+                buf.put_slice(&self.rbuf[..n]);
+                self.rbuf.drain(..n);
+                self.rview -= n;
+                return Poll::Ready(Ok(()));
+            }
+            // 3) 缓冲里有完整帧 → 剥帧、裹 XUDP 帧头（目标取 wire 自带地址）
             if !self.rbuf.is_empty() {
-                match crate::protocol::parse_udp_packet_stream(&self.rbuf) {
-                    Ok(Some((_addr, _port, payload, consumed))) => {
-                        let n = payload.len().min(buf.remaining());
-                        buf.put_slice(&payload[..n]);
-                        // 剩余 payload（buf 满时截断的部分）保留在缓冲头部
-                        let keep_from = consumed - payload.len() + n;
-                        self.rbuf.drain(..keep_from);
-                        return Poll::Ready(Ok(()));
+                let parsed = crate::protocol::parse_udp_packet_stream(&self.rbuf);
+                match parsed {
+                    Ok(Some((addr, port, payload, consumed))) => {
+                        let payload_len = payload.len();
+                        let header_len = consumed - payload_len;
+                        let target = Destination::udp(addr, Port::new(port));
+                        // 先丢弃 wire 帧头（payload 留在 rbuf 头部），再裹帧头
+                        self.rbuf.drain(..header_len);
+                        if payload_len == 0 {
+                            continue;
+                        }
+                        let mut hdr = std::mem::take(&mut self.hdr);
+                        self.reframer.write_header(payload_len, Some(&target), &mut hdr).map_err(
+                            |e| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("trojan udp: XUDP 应答帧头: {e}"),
+                                )
+                            },
+                        )?;
+                        self.hdr = hdr;
+                        self.hpos = 0;
+                        self.rview = payload_len;
+                        continue;
                     },
                     Ok(None) => {}, // 数据不足一帧，继续从 inner 读
                     // 致命帧错误（ATYP 非法 / payload 超限）→ 终止会话；
@@ -316,8 +396,28 @@ mod tests {
         assert_eq!(Arc::strong_count(&cfg), 2);
     }
 
-    /// UDP 分帧 roundtrip：duplex 模拟 Trojan 服务器，验证
-    /// write → [addr][len][CRLF][payload] 帧、read → 剥帧还原。
+    /// 构造一帧 XUDP New（link 侧表示；trojan crate 不依赖 xray-xudp，手拼线格式）。
+    fn xudp_frame(payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_be_bytes()); // session id
+        body.push(1); // status = New
+        body.push(1); // opt = Data
+        body.push(2); // network = UDP
+        body.extend_from_slice(&53u16.to_be_bytes()); // port（PortThenAddress）
+        body.push(1); // atyp = IPv4
+        body.extend_from_slice(&[8, 8, 8, 8]);
+        body.extend_from_slice(&[3u8; 8]); // GlobalID
+        let mut f = Vec::new();
+        f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        f.extend_from_slice(&body);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// UDP 分帧 roundtrip（bd t0ls1）：duplex 模拟 Trojan 服务器。
+    /// write: link 侧 XUDP 帧 → wire `[addr][len][CRLF][裸载荷]`；
+    /// read: wire 裸载荷 → link 侧 XUDP 帧（载荷逐字节还原）。
     #[tokio::test]
     async fn udp_framed_conn_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -330,8 +430,8 @@ mod tests {
         );
         let mut framed = conn;
 
-        // write 一个 packet → wire 上应是合法 Trojan UDP 帧
-        framed.write_all(b"query-payload").await.unwrap();
+        // write 一个 link 帧 → wire 上应是合法 Trojan UDP 帧（载荷不含 XUDP 帧头）
+        framed.write_all(&xudp_frame(b"query-payload")).await.unwrap();
         framed.flush().await.unwrap();
         let mut wire = vec![0u8; 256];
         let n = server_side.read(&mut wire).await.unwrap();
@@ -339,16 +439,39 @@ mod tests {
         let (addr, port, payload, consumed) = crate::protocol::parse_udp_packet(wire).unwrap();
         assert_eq!(addr, Address::from_ipv4_bytes([8, 8, 8, 8]));
         assert_eq!(port, 53);
-        assert_eq!(payload, b"query-payload");
+        assert_eq!(payload, b"query-payload", "wire 载荷必须是裸载荷");
         assert_eq!(consumed, n, "整帧消费");
 
-        // server 回一帧 → framed.read 剥帧得 payload
+        // server 回一帧裸载荷 → framed.read **分段**交付 XUDP 帧（AsyncRead 契约：
+        // 先交帧头、载荷留到后续 poll），故累积读到整帧再断言（不得为迁就测试改
+        // poll_read 的交付粒度）。
         let mut resp = Vec::new();
         crate::protocol::write_udp_packet(&mut resp, &addr, 53, b"answer-payload").unwrap();
         server_side.write_all(&resp).await.unwrap();
-        let mut out = vec![0u8; 128];
-        let rn = framed.read(&mut out).await.unwrap();
-        assert_eq!(&out[..rn], b"answer-payload");
+
+        async fn read_until(framed: &mut TrojanUdpFramedConn, got: &mut Vec<u8>, need: usize) {
+            while got.len() < need {
+                let mut tmp = [0u8; 512];
+                let n = framed.read(&mut tmp).await.expect("read");
+                assert!(n > 0, "EOF before {need} bytes (got {})", got.len());
+                got.extend_from_slice(&tmp[..n]);
+            }
+        }
+
+        let mut got: Vec<u8> = Vec::new();
+        read_until(&mut framed, &mut got, 2).await;
+        let meta_len = u16::from_be_bytes([got[0], got[1]]) as usize;
+        read_until(&mut framed, &mut got, 4 + meta_len).await;
+        let data_len = u16::from_be_bytes([got[2 + meta_len], got[3 + meta_len]]) as usize;
+        read_until(&mut framed, &mut got, 4 + meta_len + data_len).await;
+
+        assert_eq!(got[4], 1, "首个应答帧必须是 New");
+        assert_eq!(data_len, b"answer-payload".len(), "data_len 与实际载荷一致");
+        assert_eq!(
+            &got[4 + meta_len..4 + meta_len + data_len],
+            b"answer-payload",
+            "XUDP 载荷逐字节还原"
+        );
     }
 
     /// 致命帧（ATYP 非法）→ read 返回 Err 终止会话，而非静默吞错挂死

@@ -23,8 +23,10 @@ use hyper::{Method, Request, Response, StatusCode, body::Frame};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 
 use super::{
-    HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap, dl_stream::DlStream,
+    HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap,
+    dl_stream::DlStream,
     meta::extract_meta,
+    session::{SessionUpsertError, is_valid_session_id},
 };
 use crate::{
     config::{
@@ -142,6 +144,17 @@ where
 
     // 4. 提取 session + seq
     let meta = extract_meta(&req, &ctx.config, &ctx.base_path);
+
+    // 票 3zbwx：session id 由客户端自选且直接充当会话表键——长度/字符面必须设界，
+    // 否则超长 id 让每条请求的键分配跟着对端可控放大（Go 无此门：表也无限大）。
+    if !meta.session_id.is_empty() && !is_valid_session_id(&meta.session_id) {
+        crate::hot_log!(
+            tracing::Level::WARN,
+            "len={} rejected malformed session id",
+            meta.session_id.len()
+        );
+        return status_response(StatusCode::BAD_REQUEST);
+    }
 
     // 5. Padding 提取 + 校验（Go hub.go:141-148 + xpadding.go IsPaddingValid： 缺失/空/超长一律
     //    400，无豁免分支——H3b 修复）。
@@ -282,18 +295,25 @@ where
         Err(_) => return status_response(StatusCode::INTERNAL_SERVER_ERROR),
     };
 
-    let payload =
-        match tokio::time::timeout(PACKET_UP_TIMEOUT, extract_packet_payload(req, ctx)).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(st)) => return status_response(st),
-            Err(_) => return status_response(StatusCode::REQUEST_TIMEOUT),
-        };
+    let payload = match tokio::time::timeout(
+        PACKET_UP_TIMEOUT,
+        extract_packet_payload(req, ctx, ctx.sc_max_each_post_bytes),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(st)) => return status_response(st),
+        Err(_) => return status_response(StatusCode::REQUEST_TIMEOUT),
+    };
 
     if payload.len() > ctx.sc_max_each_post_bytes {
         return status_response(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
+    let session = match ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await {
+        Ok(s) => s,
+        Err(e) => return session_error_response(e),
+    };
     let push = tokio::time::timeout(
         PACKET_UP_TIMEOUT,
         session.upload_queue.push(Packet::new(payload, seq)),
@@ -317,7 +337,10 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
+    let session = match ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await {
+        Ok(s) => s,
+        Err(e) => return session_error_response(e),
+    };
     let queue = Arc::clone(&session.upload_queue);
 
     // 后台任务：把 request body 切片为有序 packet，push 到 UploadQueue
@@ -369,7 +392,10 @@ where
     let has_session = !session_id.is_empty();
     if has_session {
         // stream-down: UploadQueue → upload_tx
-        let session = ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await;
+        let session = match ctx.sessions.upsert(session_id, ctx.max_buffered_posts).await {
+            Ok(s) => s,
+            Err(e) => return session_error_response(e),
+        };
         session.mark_fully_connected(); // 禁用 30s reap
         let queue = Arc::clone(&session.upload_queue);
         let sessions = Arc::clone(&ctx.sessions);
@@ -546,6 +572,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for GuardedReader<R> {
 async fn extract_packet_payload<B>(
     req: Request<B>,
     ctx: &HandlerContext,
+    max_body: usize,
 ) -> Result<Vec<u8>, StatusCode>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
@@ -565,11 +592,50 @@ where
         payload.extend_from_slice(&extract_cookie_payload(headers, key));
     }
     if placement == PLACEMENT_AUTO || placement == PLACEMENT_BODY {
-        let bytes = body.collect().await.map_err(|_| StatusCode::BAD_REQUEST)?.to_bytes();
+        // Go hub.go:288-300：先按 ContentLength 预检，再按上限读（`io.LimitReader`
+        // max+1）。旧实现直接 `body.collect()` 再判长——2 GB body 会整读进内存
+        // （实测 RSS 2.6 GB），零凭据即可打挂。超限一律 413，绝不先收后判。
+        if content_length(headers).is_some_and(|len| len > max_body as u64) {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        let bytes = read_body_limited(body, max_body).await?;
         payload.extend_from_slice(&bytes);
     }
 
     Ok(payload)
+}
+
+/// `Content-Length`（缺失/非法 → `None`；此时一律走限读路径）。
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// 按上限读 body：每次读之前判「本次读会不会越界」，越界即 413。
+///
+/// 对齐 Go `io.LimitReader(body, max+1)` + 事后 `len(payload) > max` 判长的
+/// 结果语义，但峰值驻留 = `max` 字节（不是 `max+1`，更不是对端声明的大小）。
+async fn read_body_limited<B>(mut body: B, max: usize) -> Result<Vec<u8>, StatusCode>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let frame = match body.frame().await {
+            None => break,
+            Some(Ok(f)) => f,
+            // 读腿出错（对端中断/协议错）→ 400，与 Go readErr → BadRequest 一致。
+            Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
+        };
+        let Some(data) = frame.data_ref() else { continue };
+        if data.len() > max - buf.len() {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        buf.extend_from_slice(data);
+    }
+    Ok(buf)
 }
 
 /// 从 `{key}-{i}` header 序列提取并 base64 解码。
@@ -728,6 +794,22 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
 /// 构造空 body 状态响应。
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
     Response::builder().status(status).body(empty_body()).expect("fixed status + empty body")
+}
+
+/// 建会话被拒 → fail-visible 响应（票 3zbwx）。
+///
+/// Go 无会话上限（`sync.Map` 无限增长），故状态码取 429 而非复用 Go 某分支；
+/// 关键是「明确回错误 + 日志可见」，绝不静默丢包或假装成功。
+fn session_error_response(err: SessionUpsertError) -> Response<BoxBody<Bytes, io::Error>> {
+    match err {
+        SessionUpsertError::TooManySessions => {
+            crate::hot_log!(
+                tracing::Level::WARN,
+                "session table full (max reached), rejecting new session"
+            );
+            status_response(StatusCode::TOO_MANY_REQUESTS)
+        },
+    }
 }
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
@@ -1140,5 +1222,154 @@ mod tests {
         let mut body = resp.into_body();
         let frame = tokio::time::timeout(std::time::Duration::from_secs(3), body.frame()).await;
         assert!(matches!(frame, Ok(None)), "empty stream must EOF without frames, got {frame:?}");
+    }
+
+    // ===== dct2d：packet-up body 限额（收集前拒绝）=====
+
+    /// 按需产块并记录已产出字节的 body：用来证明「服务端读了多少」。
+    struct ChunkCounter {
+        frames_left: usize,
+        chunk: usize,
+        served: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for ChunkCounter {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            if self.frames_left == 0 {
+                return Poll::Ready(None);
+            }
+            self.frames_left -= 1;
+            self.served.fetch_add(self.chunk, std::sync::atomic::Ordering::Relaxed);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![0u8; self.chunk])))))
+        }
+    }
+
+    const TEST_MAX_POST: usize = 1_000_000;
+
+    /// dct2d：`Content-Length` 超限必须在读 body 之前 413（Go hub.go:290）。
+    #[tokio::test]
+    async fn packet_up_oversized_content_length_rejected_before_read() {
+        let ctx = make_ctx("");
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = ChunkCounter { frames_left: 1, chunk: 64 * 1024, served: Arc::clone(&served) };
+        let req = Request::builder()
+            .method(Method::POST)
+            .header(http::header::CONTENT_LENGTH, "2000000000")
+            .body(body)
+            .unwrap();
+
+        let res = extract_packet_payload(req, &ctx, TEST_MAX_POST).await;
+        assert_eq!(res.err(), Some(StatusCode::PAYLOAD_TOO_LARGE), "超限 Content-Length 必须 413");
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "预检拒绝时不得读任何 body 字节"
+        );
+    }
+
+    /// dct2d：无真 Content-Length（chunked）时按上限读——超限即停，绝不先整读。
+    #[tokio::test]
+    async fn packet_up_body_read_stops_at_limit() {
+        let ctx = make_ctx("");
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        const CHUNK: usize = 64 * 1024;
+        let body = ChunkCounter {
+            frames_left: 48, // 3 MiB 可用，上限 1 MiB
+            chunk: CHUNK,
+            served: Arc::clone(&served),
+        };
+        let req = Request::builder().method(Method::POST).body(body).unwrap();
+
+        let res = extract_packet_payload(req, &ctx, TEST_MAX_POST).await;
+        assert_eq!(res.err(), Some(StatusCode::PAYLOAD_TOO_LARGE));
+        let read = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read <= TEST_MAX_POST + CHUNK,
+            "越限即停：最多读到 limit + 一块，实际读 {read} 字节"
+        );
+    }
+
+    /// dct2d 边界：正好等于上限的 body 必须收（不误伤合法最大包）。
+    #[tokio::test]
+    async fn packet_up_body_exactly_at_limit_accepted() {
+        let ctx = make_ctx("");
+        let req = Request::builder()
+            .method(Method::POST)
+            .body(Full::new(Bytes::from(vec![7u8; TEST_MAX_POST])))
+            .unwrap();
+        let payload = extract_packet_payload(req, &ctx, TEST_MAX_POST).await.expect("上限内必须收");
+        assert_eq!(payload.len(), TEST_MAX_POST);
+    }
+
+    /// dct2d：先头后体也守住总量（header payload 占满预算时 body 不再放行）。
+    #[tokio::test]
+    async fn packet_up_combined_payload_over_limit_rejected() {
+        let ctx = make_ctx("");
+        // 默认 placement=body：header/cookie 不参与，这里验证 body 一次性超过 max。
+        let req = Request::builder()
+            .method(Method::POST)
+            .body(Full::new(Bytes::from(vec![7u8; TEST_MAX_POST + 1])))
+            .unwrap();
+        assert_eq!(
+            extract_packet_payload(req, &ctx, TEST_MAX_POST).await.err(),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+    }
+
+    // ===== 3zbwx：session id 校验 + 会话数上限 =====
+
+    fn padded_post(uri_path: &str) -> Request<Full<Bytes>> {
+        let uri = format!("{uri_path}?x_padding={}", "X".repeat(200));
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("Host", "h")
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
+    /// 3zbwx：超长 session id（>128）必须 400，不得进表。
+    #[tokio::test]
+    async fn oversize_session_id_rejected_400() {
+        let ctx = make_ctx("");
+        let long_id = "a".repeat(crate::hub::session::MAX_SESSION_ID_LEN + 1);
+        let req = padded_post(&format!("/{long_id}/0"));
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "超长 session id 必须 400");
+        assert!(ctx.sessions.get(&long_id).await.is_none(), "被拒 id 不得落表");
+    }
+
+    /// 3zbwx：合法 id 正常放行（自定义 sessionIDTable 字母表含符号也放行）。
+    #[tokio::test]
+    async fn printable_session_id_accepted() {
+        let ctx = make_ctx("");
+        let req = padded_post("/abc-123_X/0");
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// 3zbwx：会话表满后新 id 明确 429（fail-visible），已有 id 仍可继续。
+    #[tokio::test]
+    async fn session_table_full_rejects_new_ids_with_429() {
+        let mut ctx = make_ctx("");
+        ctx.sessions = Arc::new(SessionMap::with_max_sessions(1));
+
+        let resp =
+            dispatch_request(padded_post("/sess-a/0"), "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp =
+            dispatch_request(padded_post("/sess-b/0"), "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "第 2 个新 id 必须 429");
+
+        let resp =
+            dispatch_request(padded_post("/sess-a/1"), "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK, "已有 id 不受上限影响");
     }
 }
