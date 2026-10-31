@@ -173,7 +173,12 @@ impl InboundHandler for TrojanServer {
                             let validator = validator.clone();
                             let fallbacks = fallbacks.clone();
                             let fx = Arc::clone(&fx_conns);
-                            fx.spawn_tracked(async move {
+                            // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+                            xray_frame::compat::spawn_reaping(
+                                &fx,
+                                &SERVER_LOG,
+                                "trojan conn",
+                                async move {
                                 let mut recorder = RecordingStream {
                                     inner: stream,
                                     buf: Vec::with_capacity(256),

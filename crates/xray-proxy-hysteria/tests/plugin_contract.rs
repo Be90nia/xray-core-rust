@@ -237,7 +237,7 @@ async fn ambiguous_and_empty_settings_fail_fast_at_build() {
 /// 逐毫秒领取配额下界恒 1 = 零 flake（挂钟回拨走停走 armor，保序不变）。
 #[test]
 fn l4_behavior_conn_id_present_unique_monotonic() {
-    let ctx = xray_frame::contract_assert::contract_test_context("hysteria");
+    let ctx = xray_frame::contract_assert::contract_test_context(HysteriaPlugin::default().name());
     xray_frame::assert_conn_id_present!(ctx, 1);
     let ids: Vec<u128> = (0..8)
         .map(|_| {
@@ -263,7 +263,7 @@ async fn l4_behavior_deadline_effective() {
 #[test]
 fn l4_behavior_log_fields_quadruple_masked() {
     xray_frame::assert_log_fields!(
-        domain: "hysteria",
+        domain: HysteriaPlugin::default().name(),
         conn_id: 0x1234u128,
         stage: "Handshake",
         peer: "203.0.113.7:443",
@@ -276,7 +276,23 @@ fn l4_behavior_log_fields_quadruple_masked() {
 /// （borrowed = 0 且零溢出丢弃）。
 #[test]
 fn l4_behavior_pool_discipline_balances() {
-    let pool =
-        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
-    xray_frame::assert_pool_discipline!(pool, 4);
+    use std::sync::Arc;
+
+    use xray_frame::{
+        Plugin as _,
+        pool::{BufferPool, ManagedBufferPool, XrayBufPool},
+    };
+
+    // 池由装配根注入真实 ctx，借/还走 `ctx.pool()`（插件唯一拿得到的口）——
+    // 夹具自造池直接借还测的是夹具本身（bd amynv）。
+    let plugin = HysteriaPlugin::default();
+    let shared = Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8));
+    let mut ctx = xray_frame::contract_assert::contract_test_context(plugin.name());
+    ctx.set_pool(Arc::clone(&shared) as Arc<dyn BufferPool>);
+
+    let borrowed: Vec<_> =
+        (0..4).map(|_| ctx.pool().acquire(1024).expect("池借出（max=8）")).collect();
+    assert_eq!(shared.metrics().borrowed, 4, "借出必须记在装配根注入的同一个池上");
+    drop(borrowed);
+    xray_frame::contract_assert::assert_pool_settled("l4:pool:hysteria", shared.metrics());
 }

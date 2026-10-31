@@ -271,6 +271,11 @@ async fn dial_splithttp(
             // bd rjzw2：握手前 RTT 探针（一次性 TCP connect 计时，DNS 在计时外；
             // 失败 → None → 阶梯回落静态保底，永不劣于现状）。独立于数据连接。
             // bench/诊断可用 XRAY_H2_RTT_HINT_MS 强制（此时跳过探针）。
+            //
+            // ⚠️ bd vkirx①：这条探针就是抓包看到的「stream-one 每会话多 1 条零字节
+            // TCP」（Rust 2 条 vs Go 1 条）的唯一来源——Go 用握手指令内 RTT，Rust 另
+            // 拨一条 SYN 再丢弃。互认不受影响，但多一个可指纹化的 SYN；要清零就得
+            // 用带内 RTT 测量替代（跟踪票口径，不在本轮）。
             let rtt_hint =
                 crate::flow_window::resolve_rtt(&dial_target.host, dial_target.port).await;
             let client = Arc::new(DefaultDialerClient::new(
@@ -406,9 +411,28 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
 
     // downloadSettings 是嵌套 StreamConfig：取其中 splithttpSettings 递归解析
     // ponytail: 只取 splithttpSettings 子对象；TLS/security 归 stream 层管，这里不碰。
-    let download_settings = obj.get("downloadSettings").and_then(|ds| {
-        ds.get("splithttpSettings").and_then(|v| parse_splithttp_config(Some(v)).ok()).map(Box::new)
-    });
+    //
+    // ⚠️ bd x0f0r（**未接线，显式告警**）：Go `dialer.go:355-362` 用 downloadSettings
+    // 的完整 StreamConfig（dest/tls/reality + 协议段）另建下载侧 HTTP 客户端；
+    // Rust `Config` 只携带协议段，下载仍走主客户端 + 主 host/path。此处 warn +
+    // 解析错误硬报（此前 `.ok()` 连坏配置都吞掉），避免「配了下行通道却静默失效」。
+    let download_settings = match obj.get("downloadSettings") {
+        None => None,
+        Some(ds) => {
+            let inner = ds.get("splithttpSettings").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "downloadSettings must be a StreamConfig object carrying splithttpSettings",
+                )
+            })?;
+            crate::LOG.warn(
+                "splithttpSettings.downloadSettings is parsed but NOT applied: download still uses \
+                 the main channel (host/path/TLS). Go builds a separate download client from the \
+                 full downloadSettings StreamConfig — wiring tracked as a follow-up (bd x0f0r)",
+            );
+            Some(Box::new(parse_splithttp_config(Some(inner))?))
+        },
+    };
 
     Ok(Config {
         host: get_str("host"),

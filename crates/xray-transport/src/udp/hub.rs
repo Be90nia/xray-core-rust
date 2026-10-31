@@ -411,57 +411,80 @@ async fn start_recv_loop_tproxy_linux(
     let mut cmsg_buf = [MaybeUninit::<u8>::zeroed(); CMSG_BUF_LEN];
 
     loop {
-        tokio::select! {
-            biased;
-            _ = close_notify.notified() => break,
-            res = socket.readable() => {
-                if let Err(e) = res {
-                    crate::hot_log!(tracing::Level::WARN, "error={e} udp hub readable failed");
+        // 借用面：`msg` 独占借用 `data_buf`/`cmsg_buf`，且 `MsgHdrMut` 内持裸指针
+        // 非 `Send`——必须在块内结束借用、结果以数据形式带出，绝不能跨 `.await`
+        // 持有（`FxScope::spawn_tracked` 要求 `Future: Send`）。
+        enum Attempt {
+            Packet { n: usize, control_len: usize, source: Option<SocketAddr> },
+            WouldBlock,
+        }
+        let attempt = {
+            let mut iov = [MaybeUninitSlice::new(&mut data_buf)];
+            let mut name = empty_sockaddr();
+            let mut msg = MsgHdrMut::new()
+                .with_addr(&mut name)
+                .with_buffers(&mut iov)
+                .with_control(&mut cmsg_buf);
+
+            // 必须经 `try_io` 调 `recvmsg`：tokio 的 readiness 缓存**只由 try_io /
+            // async_io 在 syscall 返回 WouldBlock 时清除**。旧写法（`readable().await`
+            // 之后借 `SockRef` 直调 `recvmsg`）不清缓存——收到首包后每轮 `readable()`
+            // 立即 Ready、`recvmsg` 恒 WouldBlock → `continue` = 热自旋：多线程
+            // runtime 烧满一核，current_thread runtime（`#[tokio::test]` 默认形态）
+            // 被整个饿死（bd jf1wv 实测：wall 10s 烧 user 8.09 + sys 1.90）。回归门 =
+            // 本 crate `tests/udp_tproxy_chain.rs` 的三条 chain/starve 用例。
+            match socket.try_io(tokio::io::Interest::READABLE, || {
+                SockRef::from(&*socket).recvmsg(&mut msg, 0)
+            }) {
+                Ok(n) => {
+                    let control_len = msg.control_len();
+                    Attempt::Packet { n, control_len, source: name.as_socket() }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Attempt::WouldBlock,
+                Err(e) => {
+                    crate::hot_log!(tracing::Level::WARN, "error={e} failed to recvmsg UDP");
                     break;
-                }
-                let mut iov = [MaybeUninitSlice::new(&mut data_buf)];
-                let mut name = empty_sockaddr();
-                let mut msg = MsgHdrMut::new()
-                    .with_addr(&mut name)
-                    .with_buffers(&mut iov)
-                    .with_control(&mut cmsg_buf);
-                // tokio UdpSocket: AsFd → SockRef 借用底层 fd（不取所有权）。
-                let sock_ref = SockRef::from(socket);
-                match sock_ref.recvmsg(&mut msg, 0) {
-                    Ok(n) => {
-                        if n == 0 {
-                            continue;
-                        }
-                        // 先拷出 control_len，释放 msg 对 name/cmsg_buf 的可变借用。
-                        let control_len = msg.control_len();
-                        let source = name.as_socket();
-                        let target = parse_orig_dst_from_cmsg(&cmsg_buf, control_len);
-                        // SAFETY: n 为 recvmsg 返回的已接收字节数，data_buf 容量 ≥ n
-                        let payload = unsafe {
-                            std::slice::from_raw_parts(data_buf.as_ptr() as *const u8, n).to_vec()
-                        };
-                        let packet = UdpPacket {
-                            payload,
-                            source: source.unwrap_or_else(|| {
-                                SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
-                            }),
-                            target,
-                        };
-                        // channel 满时丢弃。
-                        if tx.try_send(packet).is_err() {
-                            crate::hot_log!(DEBUG, "UDP hub cache full, dropping packet");
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // 伪唤醒，重新等 readable。
-                        continue;
-                    }
-                    Err(e) => {
-                        crate::hot_log!(tracing::Level::WARN, "error={e} failed to recvmsg UDP");
-                        break;
-                    }
-                }
+                },
             }
+        };
+
+        match attempt {
+            Attempt::WouldBlock => {
+                // `try_io` 已在 WouldBlock 时清掉缓存：这次 `readable()` 才真的会
+                // 挂起等内核事件；close 信号可随时打断（与旧 select 形态等价）。
+                tokio::select! {
+                    biased;
+                    _ = close_notify.notified() => break,
+                    res = socket.readable() => {
+                        if let Err(e) = res {
+                            crate::hot_log!(tracing::Level::WARN, "error={e} udp hub readable failed");
+                            break;
+                        }
+                        continue;
+                    },
+                }
+            },
+            Attempt::Packet { n, control_len, source } => {
+                if n == 0 {
+                    continue;
+                }
+                let target = parse_orig_dst_from_cmsg(&cmsg_buf, control_len);
+                // SAFETY: n 为 recvmsg 返回的已接收字节数，data_buf 容量 ≥ n
+                let payload = unsafe {
+                    std::slice::from_raw_parts(data_buf.as_ptr() as *const u8, n).to_vec()
+                };
+                let packet = UdpPacket {
+                    payload,
+                    source: source.unwrap_or_else(|| {
+                        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                    }),
+                    target,
+                };
+                // channel 满时丢弃。
+                if tx.try_send(packet).is_err() {
+                    crate::hot_log!(DEBUG, "UDP hub cache full, dropping packet");
+                }
+            },
         }
     }
 }

@@ -105,13 +105,19 @@ impl InboundHandler for FreedomInboundHandler {
                 let handler = Arc::clone(&handler);
                 let dest = dest.clone();
                 let fx = Arc::clone(&fx_conns);
-                fx.spawn_tracked(async move {
-                    use xray_buf::io::{new_reader, new_writer};
-                    use xray_transport::link::Link;
-                    let (read_half, write_half) = tokio::io::split(stream);
-                    let link = Link::new(new_reader(read_half), new_writer(write_half));
-                    let _ = handler.dispatch(&dest, link).await;
-                })
+                // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+                xray_frame::compat::spawn_reaping(
+                    &fx,
+                    &crate::FREEDOM_LOG,
+                    "freedom conn",
+                    async move {
+                        use xray_buf::io::{new_reader, new_writer};
+                        use xray_transport::link::Link;
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        let link = Link::new(new_reader(read_half), new_writer(write_half));
+                        let _ = handler.dispatch(&dest, link).await;
+                    },
+                )
                 .expect("internal FxScope is never closed");
             }
         })

@@ -648,13 +648,24 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
     let (cleaned, path_ed) = extract_ed_from_path(&path);
     path = cleaned;
+    // bd vkirx③：`wsSettings.ed` 是 **Rust 独有 JSON 键**——Go `WebSocketConfig`
+    // （infra/conf/transport_method.go:618-624）无该字段，Go 只认 path 里的 `?ed=`。
+    // 同一份配置在 Go 是空操作、在这里会改 wire（Sec-WebSocket-Protocol 头），
+    // 故显式告警（保留功能：early data 本身有效）。
+    if obj.contains_key("ed") {
+        crate::LOG.warn(
+            "wsSettings.ed is a Rust-only JSON key (Go 26.10.17 only honors `?ed=` inside \
+             wsSettings.path); this changes the wire (Sec-WebSocket-Protocol header)",
+        );
+    }
     if let Some(e) = path_ed {
         ed = e;
     }
     // Go：headers 里的 host（大小写不敏感）提升为 Host 字段并从 headers 删除。
-    let mut header = parse_headers(obj.get("header"))
-        .or_else(|| parse_headers(obj.get("headers")))
-        .unwrap_or_default();
+    let mut header = match parse_headers(obj.get("header"))? {
+        Some(h) => h,
+        None => parse_headers(obj.get("headers"))?.unwrap_or_default(),
+    };
 
     if let Some(host_key) = header.keys().find(|k| k.eq_ignore_ascii_case("host")).cloned() {
         let v = header.remove(&host_key).unwrap_or_default();
@@ -669,18 +680,25 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
+///
+/// 非 string 值 → 硬错：Go `WebSocketConfig.Headers map[string]string`
+/// （infra/conf/transport_method.go:621）在 JSON 解码期就失败；静默丢 header
+/// 会让伪装/鉴权头在 wire 上凭空消失（bd x0f0r）。
 fn parse_headers(
     v: Option<&serde_json::Value>,
-) -> Option<std::collections::HashMap<String, String>> {
-    let obj = v?.as_object()?;
+) -> io::Result<Option<std::collections::HashMap<String, String>>> {
+    let Some(obj) = v.and_then(serde_json::Value::as_object) else { return Ok(None) };
     let mut map = std::collections::HashMap::with_capacity(obj.len());
     for (k, val) in obj {
-        if let Some(s) = val.as_str() {
-            map.insert(k.clone(), s.to_string());
-        }
-        // 非 string 值跳过（与 Go proto JSON 解析对未知字段的容忍一致）。
+        let Some(s) = val.as_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("wsSettings header {k:?} must be a string, got {val}"),
+            ));
+        };
+        map.insert(k.clone(), s.to_string());
     }
-    Some(map)
+    Ok(Some(map))
 }
 
 /// [`WsError`] → 共享 accept 分类（`xray_transport::accept_policy`）。
@@ -783,12 +801,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_ws_config_skips_non_string_header_values() {
+    fn parse_ws_config_rejects_non_string_header_values() {
+        // bd x0f0r：Go `WebSocketConfig.Headers map[string]string` 解码即失败 →
+        // Rust 硬错，不再静默丢 header（伪装/鉴权头凭空消失）。
         let v: serde_json::Value =
             serde_json::from_str(r#"{"headers":{"good":"v","bad":123}}"#).unwrap();
-        let cfg = parse_ws_config(Some(&v)).unwrap();
-        assert_eq!(cfg.header.len(), 1);
-        assert_eq!(cfg.header.get("good").unwrap(), "v");
+        let err = parse_ws_config(Some(&v)).expect_err("non-string header must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("\"bad\""), "error must name the key: {err}");
     }
 
     /// 对齐 Go `WebSocketConfig.Build`：`path:"/ws?ed=2048"` → ed=2048, path="/ws"。

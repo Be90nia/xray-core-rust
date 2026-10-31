@@ -527,24 +527,16 @@ fn policy_system_to_proto(
         buffer: None,
     }
 }
-/// 解析 Go duration 字符串（如 `"1m"`, `"30s"`, `"500ms"`）为毫秒。
-/// 不支持复合形式（如 `"1m30s"`）；解析失败返回 `None`。
+/// 解析 Go duration 字符串（如 `"1m"`、`"30s"`、`"1m30s"`）为毫秒。
+///
+/// 走 [`crate::wiring::parse_go_duration_str`]（Go `duration.Duration` 语法全集：
+/// 复合段 `"1m30s"` / `"2h45m"`、小数、`ns/us/ms/s/m/h`）——本函数此前只认单段
+/// 数字+单位，`"1m30s"` 静默回落默认 50s（bd x0f0r）。
 fn parse_go_duration_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let split_pos = s.bytes().rposition(|b| !b.is_ascii_alphabetic())?;
-    let (num_part, unit) = (&s[..=split_pos], &s[split_pos + 1..]);
-    let num: f64 = num_part.parse().ok()?;
-    let ms = match unit {
-        "ms" => num,
-        "s" => num * 1_000.0,
-        "m" => num * 60_000.0,
-        "h" => num * 3_600_000.0,
-        _ => return None,
-    };
-    Some(ms as i64)
+    let ns = crate::wiring::parse_go_duration_str(s)?;
+    // 亚毫秒（Go 接受 `"500us"`）向上取 1ms：截断成 0 会被上层当成「未配置 →
+    // 默认 50s」，正是本票要修的静默回落。
+    Some(if ns > 0 && ns < 1_000_000 { 1 } else { ns / 1_000_000 })
 }
 
 /// 为 routing/stats 创建 Default*Feature 工厂。
@@ -1022,29 +1014,6 @@ fn version_factory() -> FeatureFactory {
             message: format!("version constraint not satisfied: {e}"),
         })?;
         Ok(Arc::new(feature) as Arc<dyn Feature>)
-    })
-}
-
-#[allow(dead_code)] // noop factory 备件：给将来想挂 noop 的 kind 留（历史 stub 同款）
-/// 极简 no-op Feature；`feature_name()` 返回 `"simple"`。
-/// 给将来想挂 noop factory 的 kind 留个备件（与历史 stub 同款语义）。
-struct SimpleFeature {
-    name: String,
-}
-
-impl xray_features::Feature for SimpleFeature {
-    fn feature_name(&self) -> &'static str {
-        "simple"
-    }
-}
-
-#[allow(dead_code)] // 同上 noop factory 备件（api/metrics 挂载点）
-/// 为 api/metrics
-/// 创建 SimpleFeature 工厂（实现 Feature trait 的最简 no-op）。
-fn simple_feature_factory(kind: &'static str) -> FeatureFactory {
-    let kind = kind.to_string();
-    Arc::new(move |_data: &[u8]| {
-        Ok(Arc::new(SimpleFeature { name: kind.clone() }) as Arc<dyn Feature>)
     })
 }
 
@@ -1634,6 +1603,11 @@ mod tests {
         assert_eq!(parse_go_duration_ms("1m"), Some(60_000));
         assert_eq!(parse_go_duration_ms("1h"), Some(3_600_000));
         assert_eq!(parse_go_duration_ms("500ms"), Some(500));
+        // bd x0f0r：复合段 / 亚毫秒 / 负值（Go `duration.Duration` 全集）
+        assert_eq!(parse_go_duration_ms("1m30s"), Some(90_000));
+        assert_eq!(parse_go_duration_ms("2h45m"), Some(9_900_000));
+        assert_eq!(parse_go_duration_ms("1.5h"), Some(5_400_000));
+        assert_eq!(parse_go_duration_ms("500us"), Some(1), "亚毫秒不得截断成 0（0=回落默认）");
         assert_eq!(parse_go_duration_ms(""), None);
         assert_eq!(parse_go_duration_ms("invalid"), None);
     }

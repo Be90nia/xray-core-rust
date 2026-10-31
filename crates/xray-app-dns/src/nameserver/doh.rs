@@ -284,9 +284,14 @@ impl DohNameServer {
         // h2 连接驱动迁 FxScope 托管（P1-11 坑约束 5）——闸关（查询过入口检查
         // 后才被 close 的竞态窗）拒新：连接驱动随之丢弃，本次查询按错误收场，
         // 不裸 spawn、不 panic。
-        let _spawned = fx
-            .spawn_tracked(h2_conn)
-            .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
+        // 每次查询 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计查询数增长。
+        let _spawned = xray_frame::compat::spawn_reaping(
+            fx,
+            &xray_frame::compat::log(),
+            "dns doh h2 conn",
+            h2_conn,
+        )
+        .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
         h2 = deadline

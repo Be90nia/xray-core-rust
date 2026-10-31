@@ -155,13 +155,13 @@ impl TuicMockServer {
             };
             let pwd = password.clone();
             let fx_task = Arc::clone(&fx);
-            self.fx
-                .spawn_tracked(async move {
-                    if let Err(e) = handle_connection(incoming, uuid, &pwd, &fx_task).await {
-                        SERVER_LOG.warn(format!("tuic mock server connection error: {e:?}"));
-                    }
-                })
-                .expect("internal FxScope is never closed");
+            // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+            xray_frame::compat::spawn_reaping(&fx, &SERVER_LOG, "tuic mock conn", async move {
+                if let Err(e) = handle_connection(incoming, uuid, &pwd, &fx_task).await {
+                    SERVER_LOG.warn(format!("tuic mock server connection error: {e:?}"));
+                }
+            })
+            .expect("internal FxScope is never closed");
         }
         Ok(())
     }
@@ -265,14 +265,19 @@ async fn handle_bi_frame(
                 return;
             };
             // B6（bd t975）：per-flow relay 任务经组件自持 scope 托管。
+            // 每 relay spawn 前先收割（bd 86i4h 阶段2）：条目不随流数增长。
             let fx_relay = Arc::clone(fx);
-            fx_relay
-                .spawn_tracked(async move {
+            xray_frame::compat::spawn_reaping(
+                &fx_relay,
+                &SERVER_LOG,
+                "tuic mock relay",
+                async move {
                     if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await {
                         SERVER_LOG.debug(format!("tuic relay {target}: {e:?}"));
                     }
-                })
-                .expect("internal FxScope is never closed");
+                },
+            )
+            .expect("internal FxScope is never closed");
         },
         Ok((_, _, _)) => {},
         Err(e) => {
@@ -520,9 +525,14 @@ impl UdpAssocTable {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let dispatcher = self.dispatcher.clone();
             // B6（bd t975）：per-assoc 会话任务经组件自持 scope 托管。
-            self.fx
-                .spawn_tracked(udp_assoc_task(assoc_id, dispatcher, rx))
-                .expect("internal FxScope is never closed");
+            // 每 assoc spawn 前先收割（bd 86i4h 阶段2）：条目不随 assoc 数增长。
+            xray_frame::compat::spawn_reaping(
+                &self.fx,
+                &SERVER_LOG,
+                "tuic udp assoc",
+                udp_assoc_task(assoc_id, dispatcher, rx),
+            )
+            .expect("internal FxScope is never closed");
             tx
         });
         if tx.try_send(item).is_err() {

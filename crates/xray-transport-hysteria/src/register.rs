@@ -325,7 +325,30 @@ fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config>
 
     let auth = obj.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let masq_type = obj.get("masqType").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let udp_idle_timeout = obj.get("udpIdleTimeout").and_then(|x| x.as_i64()).unwrap_or(60);
+    // Go infra/conf HysteriaConfig.Build（transport_method.go:768-782）：0 或缺省
+    // 一律落 60；非 0 时强制 [2,600]，越界硬错。此前 Rust 只做 `unwrap_or(60)`
+    // ——显式 `0` 保留 0 秒、`1`/`700` 静默接受，两处都与 Go 相反（bd x0f0r）。
+    let udp_idle_timeout = match obj.get("udpIdleTimeout") {
+        None | Some(serde_json::Value::Null) => 60,
+        Some(v) => {
+            let n = v.as_i64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "hysteriaSettings.udpIdleTimeout: expected an integer (seconds)",
+                )
+            })?;
+            if n == 0 {
+                60
+            } else if !(2..=600).contains(&n) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("UdpIdleTimeout must be between 2 and 600, got {n}"),
+                ));
+            } else {
+                n
+            }
+        },
+    };
     let version = obj.get("version").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
 
     let mut config = Config { auth, masq_type, udp_idle_timeout, version, ..Config::default() };
@@ -396,6 +419,25 @@ mod tests {
         let cfg = parse_hysteria_config(None).unwrap();
         assert_eq!(cfg.auth, "");
         assert_eq!(cfg.udp_idle_timeout, 60);
+    }
+
+    /// bd x0f0r：`udpIdleTimeout` 对齐 Go `HysteriaConfig.Build`
+    /// （transport_method.go:768-777）——显式 0 落 60，非 0 强制 [2,600]。
+    #[test]
+    fn parse_hysteria_config_udp_idle_timeout_matches_go_bounds() {
+        let parse = |json: &str| {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            parse_hysteria_config(Some(&v))
+        };
+        assert_eq!(parse(r#"{"udpIdleTimeout":0}"#).unwrap().udp_idle_timeout, 60);
+        assert_eq!(parse(r#"{"udpIdleTimeout":2}"#).unwrap().udp_idle_timeout, 2);
+        assert_eq!(parse(r#"{"udpIdleTimeout":600}"#).unwrap().udp_idle_timeout, 600);
+        for bad in
+            [r#"{"udpIdleTimeout":1}"#, r#"{"udpIdleTimeout":601}"#, r#"{"udpIdleTimeout":-5}"#]
+        {
+            assert!(parse(bad).is_err(), "{bad} must be rejected (Go: between 2 and 600)");
+        }
+        assert!(parse(r#"{"udpIdleTimeout":"60"}"#).is_err(), "非整数必须硬错，不得静默回落");
     }
 
     #[test]

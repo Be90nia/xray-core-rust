@@ -289,7 +289,7 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
 
 #[test]
 fn l4_conn_id_present() {
-    l4_run_conn_id_fixture("freedom");
+    l4_run_conn_id_fixture(FreedomPlugin::default().name());
 }
 
 /// 夹具三（坑约束 10；11 N/A → secrets 表传空）：target 前缀 `xray_frame::freedom`
@@ -297,7 +297,7 @@ fn l4_conn_id_present() {
 #[test]
 fn l4_log_fields() {
     xray_frame::assert_log_fields!(
-        domain: "freedom",
+        domain: FreedomPlugin::default().name(),
         conn_id: 0x1234u128,
         stage: "Dial",
         peer: "203.0.113.7:443",
@@ -309,7 +309,23 @@ fn l4_log_fields() {
 /// 条款 4 适用（直连面走 buf，受 BufferPool 接缝约束）。
 #[test]
 fn l4_pool_discipline() {
-    let pool =
-        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
-    xray_frame::assert_pool_discipline!(pool, 4);
+    use std::sync::Arc;
+
+    use xray_frame::{
+        Plugin as _,
+        pool::{BufferPool, ManagedBufferPool, XrayBufPool},
+    };
+
+    // 池由装配根注入真实 ctx，借/还走 `ctx.pool()`（插件唯一拿得到的口）——
+    // 夹具自造池直接借还测的是夹具本身（bd amynv）。
+    let plugin = FreedomPlugin::default();
+    let shared = Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8));
+    let mut ctx = xray_frame::contract_assert::contract_test_context(plugin.name());
+    ctx.set_pool(Arc::clone(&shared) as Arc<dyn BufferPool>);
+
+    let borrowed: Vec<_> =
+        (0..4).map(|_| ctx.pool().acquire(1024).expect("池借出（max=8）")).collect();
+    assert_eq!(shared.metrics().borrowed, 4, "借出必须记在装配根注入的同一个池上");
+    drop(borrowed);
+    xray_frame::contract_assert::assert_pool_settled("l4:pool:freedom", shared.metrics());
 }

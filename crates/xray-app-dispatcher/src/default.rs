@@ -2159,9 +2159,9 @@ impl SimpleOhm {
         }
     }
 
-    /// 对应 Go `outbound.Manager.AddHandler`。当前运行时装配走 `snapshot()`/构造器，
-    /// 显式调用方仅 xray-app-reverse bridge 的备用注册路径——保留 API 完整性。
-    #[allow(dead_code)] // reverse bridge 备用注册路径生产可达性待接线，API 对位 Go AddHandler
+    /// 对应 Go `outbound.Manager.AddHandler`。生产调用点：
+    /// `xray-core` `register_outbounds`（`functions.rs`）、动态 AddOutbound
+    /// （`outbound.rs`）、`xray-cli` framework 装配（`framework.rs`）。
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
         // S3/S4：影子选择面与生产注册同源派生（同一次 add 调用），无第二套清单。
         // 顺序契约：先影子后旧表——影子是生产选择面，先入可保证「生产可见性」

@@ -71,6 +71,36 @@ pub struct Link {
     pub writer: Box<dyn Writer>,
 }
 
+/// 是否为**内部（控制面）目标**：域名地址 + 端口 0。
+///
+/// Xray 的内部通道用「域名 + 端口 0」标记（Go `app/reverse/portal.go:241`
+/// `UDP(DomainAddress("reverse"), 0)` 控制流、`bridge.go:116`
+/// `TCP(DomainAddress(domain), 0)` bridge 通道）：端口 0 不是可投递的网络目标，
+/// 这类会话永不进入 outbound，载荷契约由控制面自己定义——reverse 控制帧就是
+/// **裸 protobuf**（Go 对端同款）。
+pub(crate) fn is_internal_target(dest: &Destination) -> bool {
+    dest.address().as_domain().is_some() && dest.port().value() == 0
+}
+
+/// mux wire（裸载荷）↔ 内部 dispatch link（XUDP 帧）的边界转换（bd t0ls1）。
+///
+/// 客户端（app 侧 link ↔ wire）与服务端（wire ↔ dispatch link）两侧同形：
+/// 内部 dispatch link 的契约是 XUDP 帧（freedom/dns/hysteria/tuic/ss/wg 按帧
+/// 解析），mux wire 是裸载荷（Go `transport/internet/udp/dispatcher.go` 形态）。
+///
+/// 两类会话**不做**转换：
+/// - 非 UDP（TCP 流无帧概念）；
+/// - 内部目标（见 [`is_internal_target`]）：控制面自定义裸载荷语义，裹帧即垃圾。
+pub(crate) fn xudp_boundary_link(link: Link, dest: &Destination) -> Link {
+    if dest.network() != Network::UDP || is_internal_target(dest) {
+        return link;
+    }
+    Link {
+        reader: Box::new(XudpUnframingReader::new(link.reader)),
+        writer: Box::new(XudpFramingWriter::new(link.writer, dest.clone())),
+    }
+}
+
 // ========== WorkerPicker trait ==========
 
 /// Worker 选择器 trait。
@@ -437,15 +467,9 @@ impl ClientWorker {
             return false;
         };
         // bd t0ls1：内部 dispatch link 跑 XUDP 帧、mux data 段跑裸载荷。
-        // UDP 会话在边界上做表示转换（下行 carrier 载荷 → 裹帧，上行 link 帧 → 剥帧）。
-        let link = if dest.network() == Network::UDP {
-            Link {
-                reader: Box::new(XudpUnframingReader::new(link.reader)),
-                writer: Box::new(XudpFramingWriter::new(link.writer, dest.clone())),
-            }
-        } else {
-            link
-        };
+        // UDP 会话在边界上做表示转换（下行 carrier 载荷 → 裹帧，上行 link 帧 → 剥帧）；
+        // 内部目标（reverse 控制流等）保持裸载荷，见 [`xudp_boundary_link`]。
+        let link = xudp_boundary_link(link, dest);
         session.set_input(BufferedReader::new(link.reader)).await;
         // client demux 直写（Go client.go:363 s.output = 裸 link.Writer，无
         // 缓冲包装）：会话存活期间 Keep 数据必须即时到达 app 端。池化帧
@@ -884,8 +908,12 @@ impl ClientWorkerFactory for DialingWorkerFactory {
         let dest = ClientWorker::mux_destination();
         let w = Arc::clone(&worker);
         // 闸关不可达：内部 scope 无 close 调用（任务随 carrier 断开/worker 关闭自终止）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每 carrier spawn 前先收割（bd 86i4h 阶段2）：条目不随累计 carrier 数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "mux carrier",
+            async move {
                 let done = w.done_rx();
                 tokio::select! {
                     // carrier 结束（underlying.dispatch 返回）→ Go client.go:164 c.Close()
@@ -896,8 +924,9 @@ impl ClientWorkerFactory for DialingWorkerFactory {
                 w.close();
                 uplink_writer.interrupt();
                 downlink_writer.interrupt();
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
 
         worker
     }

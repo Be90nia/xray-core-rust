@@ -592,8 +592,12 @@ impl ProtoRoutingService for RoutingServiceImpl {
         // 发布契约：channel 消息为 Arc<xray_proto RoutingContext>（Go 端为
         // routing.Route；本仓路由发布方尚未接线，此处固定消息类型）。
         // 闸关不可达：内部 scope 无 close 调用（泵随订阅流结束自终止）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每订阅 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计订阅数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "commander routing stats",
+            async move {
                 while let Some(msg) = sub.recv().await {
                     let Some(rc) = msg.downcast_ref::<prouter::RoutingContext>() else {
                         let _ = tx
@@ -606,8 +610,9 @@ impl ProtoRoutingService for RoutingServiceImpl {
                         break;
                     }
                 }
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
         Ok(Response::new(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 
@@ -882,8 +887,7 @@ pub(crate) enum ListenSpec {
     /// TCP 地址（`:8080` 简写补 `0.0.0.0`）。
     Tcp(SocketAddr),
     /// Unix domain socket 路径（`/` 或 `@` 前缀；Go commander.go:81-82）。
-    #[allow(dead_code)]
-    // Go Commander.Start 的 unix listen 形态，当前 gRPC 接线仅 TCP，变体保留待接线
+    /// 生产构造/消费见 `commander.rs` 的 listen 分派（`Some(Ok(ListenSpec::Unix(_)))`）。
     Unix(String),
 }
 
@@ -1583,9 +1587,9 @@ mod tests {
                 })),
                 outbound_provider: None,
                 inbound_registrar: Some(Arc::new(MockRegistrar(Arc::clone(&state)))),
-                outbound_registrar: None,
                 inbound_remover: Some(Arc::new(MockRemover(Arc::clone(&state)))),
                 outbound_remover: None,
+                outbound_registrar: None,
                 op_decoder: Some(Arc::new(MockOpDecoder)),
                 factory: Some(Arc::new(MockFactory)),
             });

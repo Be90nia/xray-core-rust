@@ -165,8 +165,12 @@ impl PortalOutbound {
         let d = dest.clone();
         let inbound = reverse_mux_inbound(access);
         // 闸关不可达：内部 scope 无 close 调用（任务随 dispatch 会话结束自终止）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "reverse portal conn",
+            async move {
                 worker
                     .client()
                     .dispatch_with_source(
@@ -176,8 +180,9 @@ impl PortalOutbound {
                         inbound,
                     )
                     .await;
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
         Ok(())
     }
 }

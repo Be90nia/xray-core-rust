@@ -9,7 +9,6 @@ use std::sync::{
 
 use tokio::{sync::watch, time::Duration};
 use tracing::{debug, warn};
-use xray_app_dispatcher::udp_session::{XudpFramingWriter, XudpUnframingReader};
 use xray_buf::{
     buffer::Buffer,
     io::{Reader, Writer},
@@ -278,16 +277,10 @@ impl ServerWorker {
         // bd t0ls1：mux data 段对所有 UDP 会话都是裸载荷（client 侧
         // `dispatch_with_source` 对 UDP 无条件裹/剥帧），内部 dispatch link 契约
         // 却是 XUDP 帧（freedom/dns/hysteria/tuic/ss/wg 按帧解析）。无 GlobalID
-        // 的 UDP 会话（cone 关 / 无入站源）原先只在 `handle_xudp_new` 转换，
-        // 裸报文被下游当帧解析失败静默丢包 → 上行通了没有回程。
-        let link = if target.network() == Network::UDP {
-            Link {
-                reader: Box::new(XudpUnframingReader::new(link.reader)),
-                writer: Box::new(XudpFramingWriter::new(link.writer, target.clone())),
-            }
-        } else {
-            link
-        };
+        // 的 UDP 会话（cone 关 / 无入站源）也必须在边界转换，否则裸报文被下游
+        // 当帧解析失败静默丢包 → 上行通了没有回程。内部目标（reverse 控制流）
+        // 保持裸载荷，见 [`crate::client::xudp_boundary_link`]。
+        let link = crate::client::xudp_boundary_link(link, &target);
         let tt = if target.network() == Network::UDP {
             TransferType::Packet
         } else {
@@ -392,10 +385,8 @@ impl ServerWorker {
         // bd t0ls1：内部 dispatch link 跑 XUDP 帧、mux data 段跑裸载荷。XUDP
         // 会话在边界上转换——否则被派发 outbound（freedom 等按帧解析）拿到裸
         // 报文解帧失败静默丢包（Go 客户端 cone 模式默认走 mux → 上游 0 字节）。
-        let link = Link {
-            reader: Box::new(XudpUnframingReader::new(link.reader)),
-            writer: Box::new(XudpFramingWriter::new(link.writer, target.clone())),
-        };
+        // 内部目标（reverse 控制流）保持裸载荷，见 [`crate::client::xudp_boundary_link`]。
+        let link = crate::client::xudp_boundary_link(link, &target);
         // XUDP 恒为 Packet：直写（禁缓冲），New 帧内联 data 转发到 dispatch 目标
         // ponytail: miss 路径建新上游；hit 路径复用旧上游（zv9l 已对齐 Go
         // server.go:216-260），两条路径在此汇合收尾。
@@ -1114,6 +1105,28 @@ mod tests {
             // dispatch link 上行恒为 XUDP 帧（载荷逐字节还原）。
             let got = read_payload(&mut pay).await;
             assert_eq!(xudp_payloads(&got), vec![b"tiny".to_vec()]);
+        }
+
+        /// 内部目标（域名 + 端口 0，如 reverse 控制流的 `reverse:0` UDP）：
+        /// 载荷契约由控制面自己定义（裸 protobuf），**不做** XUDP 帧转换——
+        /// 帧化会让对端 `ProtoControl::decode` 读到帧头垃圾，且破坏与 Go
+        /// reverse 的互通（Go 侧同样是裸 protobuf）。
+        #[tokio::test]
+        async fn udp_internal_target_new_frame_stays_raw() {
+            let internal = Destination::new(
+                Address::new_domain("reverse".to_string()),
+                Port::new(0),
+                Network::UDP,
+            );
+            // 带 GlobalID 的 New（cone 场景下控制流仍可能被标记为 XUDP）
+            let mut meta = FrameMetadata::new_session(12, internal.clone());
+            meta.set_global_id([3u8; 8]);
+            let frame = new_frame_with_data(meta, b"ctl-proto-raw");
+
+            let (dest, mut pay, _server) = process_one_frame(frame).await;
+
+            assert_eq!(dest, internal);
+            assert_eq!(read_payload(&mut pay).await, b"ctl-proto-raw", "内部目标必须保持裸载荷");
         }
 
         /// 普通路径：New + TCP Stream 会话小首帧也即时送达。bd 6z8。

@@ -1,15 +1,12 @@
 //! XUDP 集成测试
 //!
 //! 覆盖 Write→Read 往返、GlobalID+Writer 集成、多帧混合流、
-//! XudpSession+Manager 联动、Go 兼容性等场景。
+//! Go 兼容性等场景。
 
 use std::io::Cursor;
 
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
-use xray_xudp::{
-    extension::{XudpManager, XudpStatus},
-    packet::{FrameMetadata, FrameStatus, PacketReader, PacketWriter},
-};
+use xray_xudp::packet::{FrameMetadata, FrameStatus, PacketReader, PacketWriter};
 
 // ========== 辅助函数 ==========
 
@@ -195,49 +192,6 @@ fn test_multi_frame_mixed_stream() {
 
     // 流结束
     assert!(reader.read_packet().expect("eof").is_none(), "stream should end");
-}
-
-/// 测试 XudpSession 与 XudpManager 联动
-///
-/// 通过 XudpManager 创建会话，验证 get_or_create/remove/cleanup_expired 联动。
-#[test]
-fn test_xudp_session_manager_integration() {
-    let mgr = XudpManager::new();
-
-    // 初始状态
-    assert!(mgr.is_empty(), "manager should start empty");
-    assert_eq!(mgr.len(), 0, "initial length should be 0");
-
-    // 创建第一个会话
-    let id1 = [10u8; 8];
-    let status1 = mgr.get_or_create(id1);
-    assert_eq!(status1, XudpStatus::Initializing, "new session should be Initializing");
-    assert_eq!(mgr.len(), 1, "one session after first create");
-
-    // 创建第二个会话
-    let id2 = [20u8; 8];
-    let status2 = mgr.get_or_create(id2);
-    assert_eq!(status2, XudpStatus::Initializing, "new session should be Initializing");
-    assert_eq!(mgr.len(), 2, "two sessions after second create");
-
-    // 再次获取已存在的会话（返回相同状态）
-    let status1_again = mgr.get_or_create(id1);
-    assert_eq!(status1_again, XudpStatus::Initializing, "existing session returns same status");
-    assert_eq!(mgr.len(), 2, "length unchanged for existing session");
-
-    // 删除会话
-    assert!(mgr.remove(&id1), "remove should succeed for existing session");
-    assert!(!mgr.remove(&id1), "remove should fail for non-existing session");
-    assert_eq!(mgr.len(), 1, "one session after removal");
-
-    // 清理过期会话（新会话不会过期）
-    let removed = mgr.cleanup_expired();
-    assert_eq!(removed, 0, "no expired sessions to clean up");
-    assert_eq!(mgr.len(), 1, "length unchanged after cleanup");
-
-    // 删除剩余会话
-    assert!(mgr.remove(&id2), "remove remaining session");
-    assert!(mgr.is_empty(), "manager should be empty after all removals");
 }
 
 /// 测试 KeepAlive 帧穿插数据帧时 Reader 自动跳过

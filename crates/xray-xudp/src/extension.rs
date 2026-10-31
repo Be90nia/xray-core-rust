@@ -2,11 +2,7 @@
 //!
 //! Provides XUDP session management and Mux extension types.
 
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 /// XUDP session status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +45,7 @@ pub struct XudpSession {
 
 #[allow(
     clippy::disallowed_methods,
-    reason = "XUDP 会话 TTL 判定；XudpSession/XudpManager 为纯协议结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
+    reason = "XUDP 会话 TTL 判定；XudpSession 为纯协议结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
 )]
 impl XudpSession {
     /// Create a new XUDP session with the given Global ID.
@@ -74,72 +70,6 @@ impl XudpSession {
     /// Mark the session as expiring.
     pub fn expire_session(&mut self) {
         self.status = XudpStatus::Expiring;
-    }
-}
-
-/// Global XUDP session manager.
-///
-/// Manages XUDP sessions across Mux connections.
-/// Periodically cleans up expired sessions.
-pub struct XudpManager {
-    sessions: Mutex<HashMap<[u8; 8], XudpSession>>,
-}
-
-#[allow(
-    clippy::disallowed_methods,
-    reason = "XUDP 会话 TTL 判定；XudpSession/XudpManager 为纯协议结构无 ctx 注入面（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
-)]
-impl XudpManager {
-    /// Create a new XUDP manager.
-    pub fn new() -> Self {
-        Self { sessions: Mutex::new(HashMap::new()) }
-    }
-
-    /// Get or create an XUDP session for the given Global ID.
-    pub fn get_or_create(&self, global_id: [u8; 8]) -> XudpStatus {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(session) = sessions.get_mut(&global_id) {
-            if session.is_expired() {
-                session.status = XudpStatus::Initializing;
-                session.expire = Instant::now() + Duration::from_secs(60);
-            }
-            session.status
-        } else {
-            let session = XudpSession::new(global_id);
-            let status = session.status;
-            sessions.insert(global_id, session);
-            status
-        }
-    }
-
-    /// Remove an XUDP session.
-    pub fn remove(&self, global_id: &[u8; 8]) -> bool {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.remove(global_id).is_some()
-    }
-
-    /// Clean up expired sessions.
-    pub fn cleanup_expired(&self) -> usize {
-        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let before = sessions.len();
-        sessions.retain(|_, session| !session.is_expired());
-        before - sessions.len()
-    }
-
-    /// Return the number of active sessions.
-    pub fn len(&self) -> usize {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
-    /// Check if there are no sessions.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl Default for XudpManager {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -180,56 +110,6 @@ mod tests {
         let mut session = XudpSession::new(id);
         session.expire_session();
         assert_eq!(session.status, XudpStatus::Expiring);
-    }
-
-    #[test]
-    fn test_xudp_manager_new() {
-        let mgr = XudpManager::new();
-        assert!(mgr.is_empty());
-        assert_eq!(mgr.len(), 0);
-    }
-
-    #[test]
-    fn test_xudp_manager_get_or_create() {
-        let mgr = XudpManager::new();
-        let id = [42u8; 8];
-        let status = mgr.get_or_create(id);
-        assert_eq!(status, XudpStatus::Initializing);
-        assert_eq!(mgr.len(), 1);
-        // Second call returns existing
-        let status2 = mgr.get_or_create(id);
-        assert_eq!(status2, XudpStatus::Initializing);
-        assert_eq!(mgr.len(), 1);
-    }
-
-    #[test]
-    fn test_xudp_manager_remove() {
-        let mgr = XudpManager::new();
-        let id = [42u8; 8];
-        mgr.get_or_create(id);
-        assert!(mgr.remove(&id));
-        assert!(mgr.is_empty());
-        assert!(!mgr.remove(&id)); // already removed
-    }
-
-    #[test]
-    fn test_xudp_manager_cleanup() {
-        let mgr = XudpManager::new();
-        let id1 = [1u8; 8];
-        let id2 = [2u8; 8];
-        mgr.get_or_create(id1);
-        mgr.get_or_create(id2);
-        assert_eq!(mgr.len(), 2);
-        // None expired yet
-        let removed = mgr.cleanup_expired();
-        assert_eq!(removed, 0);
-        assert_eq!(mgr.len(), 2);
-    }
-
-    #[test]
-    fn test_xudp_manager_default() {
-        let mgr = XudpManager::default();
-        assert!(mgr.is_empty());
     }
 
     #[test]

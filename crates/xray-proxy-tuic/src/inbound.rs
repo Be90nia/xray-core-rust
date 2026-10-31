@@ -246,7 +246,8 @@ impl InboundHandler for TuicInboundHandler {
                 let t = tag.clone();
                 let dispatch = dispatch.clone();
                 let fx_task = Arc::clone(&fx);
-                fx.spawn_tracked(async move {
+                // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+                xray_frame::compat::spawn_reaping(&fx, &INBOUND_LOG, "tuic conn", async move {
                     if let Err(e) =
                         handle_connection(incoming, uuid, &pwd, dispatch, &fx_task).await
                     {
@@ -387,12 +388,17 @@ async fn handle_bi_frame(
                         xray_buf::io::new_writer(send_bi),
                     );
                     // B6（bd t975）：per-flow dispatch 任务经组件 scope 托管。
+                    // 每 flow spawn 前先收割（bd 86i4h 阶段2）：条目不随流数增长。
                     let fx_flow = Arc::clone(fx);
-                    fx_flow
-                        .spawn_tracked(async move {
+                    xray_frame::compat::spawn_reaping(
+                        &fx_flow,
+                        &INBOUND_LOG,
+                        "tuic flow",
+                        async move {
                             let _ = handler.dispatch(&dest, link).await;
-                        })
-                        .expect("internal FxScope is never closed");
+                        },
+                    )
+                    .expect("internal FxScope is never closed");
                 } else {
                     INBOUND_LOG.warn(format!("tuic inbound: unsupported addr: {addr:?}"));
                 }
@@ -403,14 +409,19 @@ async fn handle_bi_frame(
                     return;
                 };
                 let fx_relay = Arc::clone(fx);
-                fx_relay
-                    .spawn_tracked(async move {
+                // 每 relay spawn 前先收割（bd 86i4h 阶段2）：条目不随流数增长。
+                xray_frame::compat::spawn_reaping(
+                    &fx_relay,
+                    &INBOUND_LOG,
+                    "tuic relay",
+                    async move {
                         if let Err(e) = relay_to_tcp(target, send_bi, recv_bi, initial_bytes).await
                         {
                             INBOUND_LOG.debug(format!("tuic relay {target}: {e:?}"));
                         }
-                    })
-                    .expect("internal FxScope is never closed");
+                    },
+                )
+                .expect("internal FxScope is never closed");
             }
         },
         Ok((_, _, _)) => {},

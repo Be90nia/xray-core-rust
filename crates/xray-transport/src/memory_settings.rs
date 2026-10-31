@@ -57,18 +57,6 @@ pub struct UdpmaskManagerConfig {
     pub masks: Vec<MaskEntry>,
 }
 
-/// UDP 跳端口 + 区间配置（对应 Go `QuicParamsConfig.UdpHop` JSON）。
-///
-/// Go 字段是 `UdpHop { Ports []uint32, IntervalMin int64, IntervalMax int64 }`，
-/// JSON 形态 ports 是 list/range，interval 是 `{from, to}`。本结构保留 JSON
-/// 形状而非 proto 形状，方便后续 to_proto() 一站式转换。
-#[derive(Debug, Clone, Default)]
-pub struct UdpHopConfig {
-    pub ports: Vec<u32>,
-    pub interval_min: i64,
-    pub interval_max: i64,
-}
-
 /// QUIC 流参数配置块（对应 Go `QuicParamsConfig` JSON 形态）。
 ///
 /// 字段集合与 `infra/conf/transport_internet.go:620-635` 一致；缺省字段为
@@ -87,7 +75,6 @@ pub struct QuicParamsConfig {
     /// Brutal 丢包补偿开关（Go `transport_finalmask.go:999` json `brutalDisableLossCompensation`；
     /// splithttp/hysteria dialer `UseBrutal` 第三参消费）。
     pub brutal_disable_loss_compensation: bool,
-    pub udp_hop: UdpHopConfig,
     pub init_stream_receive_window: u64,
     pub max_stream_receive_window: u64,
     pub init_connection_receive_window: u64,
@@ -209,7 +196,25 @@ pub fn parse_quic_params_config(
     let get_u64 = |k: &str| obj.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
     let get_i64 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
     let get_bool = |k: &str| obj.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
-    let udp_hop = parse_udp_hop(obj.get("udpHop"))?;
+    // `quicParams.udpHop` 不是 Go 键：Go `QuicParamsConfig`（transport_finalmask.go:1177-1195）
+    // 无该字段，UDP 跳端口的唯一开关是 `finalmask.udp[{ "type": "udphop", ... }]`
+    // （Rust 已在 `finalmask::build_udphop_config` 接）。此前这里解析并因
+    // `interval < 5` 硬拒启——方向与 Go 相反（Go 对该键静默忽略、照常启动），
+    // bd x0f0r。改为 warn 后忽略。
+    if let Some(udp_hop) = obj.get("udpHop") {
+        crate::LOG.warn(format!(
+            "finalmask.quicParams.udpHop={udp_hop} is ignored: Go 26.10.17 QuicParams has no such \
+             field; use finalmask.udp[{{type:\"udphop\", settings:{{ports,interval}}}}] instead"
+        ));
+    }
+    // 旧拼写 `disablePathMtuDiscovery`（小写 t）不是 Go 键，Go 侧静默忽略；
+    // 本仓曾按它读取导致 `disablePathMTUDiscovery` 恒不生效（bd x0f0r W1）。
+    if obj.contains_key("disablePathMtuDiscovery") {
+        crate::LOG.warn(
+            "finalmask.quicParams.disablePathMtuDiscovery is ignored: Go key is \
+             \"disablePathMTUDiscovery\" (MTU uppercase)",
+        );
+    }
     // Go QuicParamsConfig 另有 disableChromeParrot/disableGSO/disableStatelessReset
     // （transport_finalmask.go:1191,1192,1194；消费 dialer.go/hub.go 的 quic-go
     // Transport 旋钮）。quinn 无等价旋钮（ChromeParrot 是 quic-go 内部 parrot、
@@ -223,117 +228,17 @@ pub fn parse_quic_params_config(
         brutal_up: get_str("brutalUp"),
         brutal_down: get_str("brutalDown"),
         brutal_disable_loss_compensation: get_bool("brutalDisableLossCompensation"),
-        udp_hop,
         init_stream_receive_window: get_u64("initStreamReceiveWindow"),
         max_stream_receive_window: get_u64("maxStreamReceiveWindow"),
         init_connection_receive_window: get_u64("initConnectionReceiveWindow"),
         max_connection_receive_window: get_u64("maxConnectionReceiveWindow"),
         max_idle_timeout: get_i64("maxIdleTimeout"),
         keep_alive_period: get_i64("keepAlivePeriod"),
-        disable_path_mtu_discovery: get_bool("disablePathMtuDiscovery"),
+        // Go 键名是 `disablePathMTUDiscovery`（MTU 全大写，transport_finalmask.go:1188）；
+        // 旧拼写 `disablePathMtuDiscovery` 不是 Go 键，按未知键 warn（bd x0f0r W1）。
+        disable_path_mtu_discovery: get_bool("disablePathMTUDiscovery"),
         max_incoming_streams: get_i64("maxIncomingStreams"),
     }))
-}
-
-fn parse_udp_hop(v: Option<&serde_json::Value>) -> io::Result<UdpHopConfig> {
-    let Some(obj) = v else { return Ok(UdpHopConfig::default()) };
-    let obj = obj.as_object().ok_or_else(|| invalid("udpHop: expected an object"))?;
-    // ports: list/range → flatten to Vec<u32>（Go PortList.Build().Ports()）
-    let ports = match obj.get("ports") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(v) => parse_port_list(v)?,
-    };
-    // interval: {from, to} → (i64, i64)。Go UDPHop.Build（7780db9b）：
-    // 双零 → 默认 (30, 30)；From < 5 → 硬错（Go errors.New("interval must be at least 5")）。
-    let (mut interval_min, mut interval_max) = parse_int32_range(obj.get("interval"))?;
-    if interval_min == 0 && interval_max == 0 {
-        interval_min = 30;
-        interval_max = 30;
-    } else if interval_min < 5 {
-        return Err(invalid("interval must be at least 5"));
-    }
-    Ok(UdpHopConfig { ports, interval_min, interval_max })
-}
-fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
-    // Go PortList 形态：string `"443,8000-8002"`（common.go:243-275），
-    // 内部 items 是 int 单端口或 "from-to" 区间，"," 分隔。
-    // 也支持 JSON number（单端口速记）/ array（向后兼容）。
-    let mut out = Vec::new();
-    if let Some(s) = v.as_str() {
-        for item in s.split(',') {
-            let t = item.trim();
-            if t.is_empty() {
-                continue;
-            }
-            if let Some(idx) = t.find('-') {
-                let from_s = &t[..idx];
-                let to_s = &t[idx + 1..];
-                let from: u32 = from_s
-                    .parse()
-                    .map_err(|_| invalid(format!("ports: invalid range start {from_s:?}")))?;
-                let to: u32 = to_s
-                    .parse()
-                    .map_err(|_| invalid(format!("ports: invalid range end {to_s:?}")))?;
-                if from > to {
-                    return Err(invalid(format!("ports: range start > end ({from}>{to})")));
-                }
-                for p in from..=to {
-                    out.push(p);
-                }
-            } else {
-                let p: u32 =
-                    t.parse().map_err(|_| invalid(format!("ports: invalid port {t:?}")))?;
-                out.push(p);
-            }
-        }
-        return Ok(out);
-    }
-    if let Some(n) = v.as_u64() {
-        if n > u32::MAX as u64 {
-            return Err(invalid("ports: out of u32 range"));
-        }
-        return Ok(vec![n as u32]);
-    }
-    let arr = v.as_array().ok_or_else(|| invalid("ports: expected string, number, or array"))?;
-    for item in arr {
-        match item {
-            serde_json::Value::Number(n) => {
-                let p = n.as_u64().ok_or_else(|| invalid("ports: not a u32"))?;
-                if p > u32::MAX as u64 {
-                    return Err(invalid("ports: out of u32 range"));
-                }
-                out.push(p as u32);
-            },
-            serde_json::Value::Object(_) => {
-                let (from, to) = parse_int32_range(Some(item))?;
-                if from < 0 || to < 0 || from > u32::MAX as i64 || to > u32::MAX as i64 {
-                    return Err(invalid("ports: range out of u32 range"));
-                }
-                for p in from.max(0) as u32..=to.max(0) as u32 {
-                    out.push(p);
-                }
-            },
-            _ => return Err(invalid("ports: expected number or {from,to} object")),
-        }
-    }
-    Ok(out)
-}
-
-fn parse_int32_range(v: Option<&serde_json::Value>) -> io::Result<(i64, i64)> {
-    let Some(v) = v else { return Ok((0, 0)) };
-    match v {
-        serde_json::Value::Number(n) => {
-            let x = n.as_i64().ok_or_else(|| invalid("range: not an i64"))?;
-            Ok((x, x))
-        },
-        serde_json::Value::Object(o) => {
-            let from = o.get("from").and_then(|v| v.as_i64()).unwrap_or(0);
-            let to = o.get("to").and_then(|v| v.as_i64()).unwrap_or(from);
-            Ok((from, to))
-        },
-        serde_json::Value::Null => Ok((0, 0)),
-        _ => Err(invalid("range: expected number or {from,to} object")),
-    }
 }
 
 fn parse_download_settings(
@@ -454,17 +359,13 @@ mod tests {
                     "brutalUp": "100 mbps",
                     "brutalDown": "50 mbps",
                     "brutalDisableLossCompensation": true,
-                    "udpHop": {
-                        "ports": "443,8000-8002",
-                        "interval": { "from": 10, "to": 30 }
-                    },
                     "initStreamReceiveWindow": 16384,
                     "maxStreamReceiveWindow": 32768,
                     "initConnectionReceiveWindow": 49152,
                     "maxConnectionReceiveWindow": 65536,
                     "maxIdleTimeout": 30,
                     "keepAlivePeriod": 10,
-                    "disablePathMtuDiscovery": true,
+                    "disablePathMTUDiscovery": true,
                     "maxIncomingStreams": 64
                 }
             }
@@ -478,15 +379,13 @@ mod tests {
         assert_eq!(q.brutal_down, "50 mbps");
         // Go transport_finalmask.go:999 json `brutalDisableLossCompensation`
         assert!(q.brutal_disable_loss_compensation);
-        assert_eq!(q.udp_hop.ports, vec![443, 8000, 8001, 8002]);
-        assert_eq!(q.udp_hop.interval_min, 10);
-        assert_eq!(q.udp_hop.interval_max, 30);
         assert_eq!(q.init_stream_receive_window, 16384);
         assert_eq!(q.max_stream_receive_window, 32768);
         assert_eq!(q.init_connection_receive_window, 49152);
         assert_eq!(q.max_connection_receive_window, 65536);
         assert_eq!(q.max_idle_timeout, 30);
         assert_eq!(q.keep_alive_period, 10);
+        // Go 键名 `disablePathMTUDiscovery`（MTU 全大写）——bd x0f0r W1
         assert!(q.disable_path_mtu_discovery);
         assert_eq!(q.max_incoming_streams, 64);
     }
@@ -502,48 +401,30 @@ mod tests {
         let q = m.quic_params.unwrap();
         assert_eq!(q.congestion, "");
         assert!(!q.debug);
-        assert_eq!(q.udp_hop.ports, Vec::<u32>::new());
         assert_eq!(q.init_stream_receive_window, 0);
     }
 
+    /// bd x0f0r：`quicParams.udpHop` 不是 Go 键（Go `QuicParamsConfig`
+    /// transport_finalmask.go:1177-1195 无此字段）——出现时 warn 忽略，
+    /// **不得**再因 `interval < 5` 拒启（此前方向与 Go 相反）。
     #[test]
-    fn quic_params_udp_hop_with_only_ports() {
+    fn quic_params_udp_hop_is_ignored_not_rejected() {
         let m = to_memory_stream_config(Some(&json!({
-            "finalmask": {"quicParams": {"udpHop": {"ports": [443]}}}
+            "finalmask": {"quicParams": {"udpHop": {"interval": 3, "ports": "443"}}}
+        })))
+        .expect("Go accepts this key by ignoring it; Rust must not reject");
+        let q = m.quic_params.expect("quic_params present");
+        assert_eq!(q.congestion, "");
+    }
+
+    /// bd x0f0r W1：拼错的 `disablePathMtuDiscovery`（小写 t）不是 Go 键。
+    #[test]
+    fn quic_params_misspelled_disable_path_mtu_discovery_is_ignored() {
+        let m = to_memory_stream_config(Some(&json!({
+            "finalmask": {"quicParams": {"disablePathMtuDiscovery": true}}
         })))
         .unwrap();
-        let q = m.quic_params.unwrap();
-        assert_eq!(q.udp_hop.ports, vec![443]);
-        // Go UDPHop.Build（7780db9b）：双零 interval → 默认 (30, 30)。
-        assert_eq!(q.udp_hop.interval_min, 30);
-        assert_eq!(q.udp_hop.interval_max, 30);
-    }
-
-    #[test]
-    fn quic_params_udp_hop_interval_below_5_rejected() {
-        // Go UDPHop.Build（7780db9b）：From < 5 → "interval must be at least 5"。
-        // 显式 interval=3。
-        let m = to_memory_stream_config(Some(&json!({
-            "finalmask": {"quicParams": {"udpHop": {"interval": 3}}}
-        })));
-        let err = m.expect_err("interval 3 must be rejected").to_string();
-        assert!(err.contains("interval must be at least 5"), "got: {err}");
-        // From=0 且 To=10：非双零不触发默认 → From=0 < 5 硬错（Go 同语义）。
-        let m = to_memory_stream_config(Some(&json!({
-            "finalmask": {"quicParams": {"udpHop": {"interval": {"from": 0, "to": 10}}}}
-        })));
-        let err = m.expect_err("interval from=0 must be rejected").to_string();
-        assert!(err.contains("interval must be at least 5"), "got: {err}");
-    }
-
-    #[test]
-    fn quic_params_udp_hop_malformed_interval_is_hard_error() {
-        // 非 interval 合法形态 → parse_int32_range 错误传播（Go Int32Range unmarshal 失败即错，
-        // 不静默回落默认池）。
-        let m = to_memory_stream_config(Some(&json!({
-            "finalmask": {"quicParams": {"udpHop": {"interval": "soon"}}}
-        })));
-        assert!(m.is_err(), "malformed interval must propagate, not silently default");
+        assert!(!m.quic_params.unwrap().disable_path_mtu_discovery);
     }
 
     // ===== DownloadSettings 解析（bd 44s 第 4 块）=====

@@ -72,10 +72,14 @@ impl DnsInbound {
         let timer = Arc::new(ActivityTimer::new(self.handler.timeout));
         let mut done = timer.done_signal();
         let run_timer = Arc::clone(&timer);
-        let ticker = self
-            .fx
-            .spawn_tracked(async move { run_timer.run().await })
-            .expect("internal FxScope is never closed");
+        // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+        let ticker = xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "dns tcp conn timer",
+            async move { run_timer.run().await },
+        )
+        .expect("internal FxScope is never closed");
         let result = async {
             loop {
                 let query = tokio::select! {

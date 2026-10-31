@@ -231,7 +231,7 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
 
 #[test]
 fn l4_conn_id_present() {
-    l4_run_conn_id_fixture("blackhole");
+    l4_run_conn_id_fixture(BlackholePlugin::default().name());
 }
 
 /// 夹具二（坑约束 2）：deadline 双入口（with_deadline / HandshakeDeadline::guard）
@@ -247,7 +247,7 @@ async fn l4_deadline_effective() {
 #[test]
 fn l4_log_fields() {
     xray_frame::assert_log_fields!(
-        domain: "blackhole",
+        domain: BlackholePlugin::default().name(),
         conn_id: 0x1234u128,
         stage: "Accept",
         peer: "203.0.113.7:443",

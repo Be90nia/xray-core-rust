@@ -325,7 +325,13 @@ impl TcpWorker {
         if self.closed.load(Ordering::SeqCst) {
             // 闸关不可达：内部 scope 无 close 调用（closed 走本短路，不关 scope）。
             // closed 短路：返回立即结束的占位句柄（无实际任务体）。
-            return self.fx.spawn_tracked(async {}).expect("internal FxScope is never closed");
+            return xray_frame::compat::spawn_reaping(
+                &self.fx,
+                &xray_frame::compat::log(),
+                "proxyman conn closed",
+                async {},
+            )
+            .expect("internal FxScope is never closed");
         }
 
         let tag = self.tag.clone();
@@ -351,11 +357,16 @@ impl TcpWorker {
 
         let timer_loop = Arc::clone(&activity_timer);
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "proxyman conn timer",
+            async move {
                 timer_loop.run().await;
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
 
         // IO 活动装饰器：每次读/写就绪即重置空闲窗口（Go 代理 IO 循环 Update）。
         // proxy 是黑盒 trait，活动信号在 Connection 层拦截——有 IO 即有活动。
@@ -366,8 +377,12 @@ impl TcpWorker {
         let close_notify = Arc::clone(&self.close_notify);
 
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "proxyman tcp conn",
+            async move {
                 let inbound_conn = InboundConn::Tcp(tracked);
                 tokio::select! {
                     result = proxy.process(Network::TCP, inbound_conn, session, dispatcher) => {
@@ -654,8 +669,12 @@ impl UdpWorker {
         // bd mvsc：process task 挂 close_notify，worker close 时随 select 退出
         let close_notify = Arc::clone(&self.close_notify);
         // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每 UDP 会话 spawn 前先收割（bd 86i4h 阶段2）：条目不随会话数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "proxyman udp session",
+            async move {
                 let inbound_conn = InboundConn::Udp(session);
                 tokio::select! {
                     r = proxy.process(Network::UDP, inbound_conn, session_ctx, dispatcher) => {
@@ -667,8 +686,9 @@ impl UdpWorker {
                         // worker close：结构化收尾
                     }
                 }
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
 
         // 响应泵（Go worker.go `for p := range conn.writing { hub.WriteTo }`）：
         // proxy write_packet → 本循环 → hub.send_to(session.source) 回客户端。
@@ -676,8 +696,12 @@ impl UdpWorker {
         if let Some(hub) = hub {
             let close_notify = Arc::clone(&self.close_notify);
             // 闸关不可达：内部 scope 无 close 调用（停机走 close_notify）。
-            self.fx
-                .spawn_tracked(async move {
+            // 每会话 spawn 前先收割（bd 86i4h 阶段2）：条目不随会话数增长。
+            xray_frame::compat::spawn_reaping(
+                &self.fx,
+                &xray_frame::compat::log(),
+                "proxyman udp pump",
+                async move {
                     let mut outbound_rx = outbound_rx;
                     loop {
                         tokio::select! {

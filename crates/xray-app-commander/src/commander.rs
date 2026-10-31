@@ -249,8 +249,6 @@ pub struct Commander {
     listen: Option<String>,
     services: RwLock<Vec<Arc<dyn Service>>>,
     running: AtomicBool,
-    /// outbound 模式下使用的 handler 注册器（由上层注入）。
-    outbound_registrar: Option<Arc<dyn crate::outbound::HandlerManager>>,
     /// HandlerService gRPC 操作的共享 handler 注册中心。
     handler_registry: Arc<OutboundHandlerRegistry>,
     /// gRPC server 后台 task 句柄（listen 模式启动后持有，close 时 abort）。
@@ -293,7 +291,6 @@ impl Commander {
             listen,
             services: RwLock::new(Vec::new()),
             running: AtomicBool::new(false),
-            outbound_registrar: None,
             handler_registry: Arc::new(OutboundHandlerRegistry::new()),
             grpc_task: Mutex::new(None),
             fx: Arc::new(FxScope::new()),
@@ -327,12 +324,6 @@ impl Commander {
     /// 监听地址（`None` 走 outbound 模式）。
     pub fn listen(&self) -> Option<&str> {
         self.listen.as_deref()
-    }
-
-    /// 设置 outbound handler 注册器（ outbound 模式下使用）。
-    /// 要求对象同时实现 `OutboundRegistrar` 与 [`crate::outbound::HandlerManager`]。
-    pub fn set_outbound_registrar(&mut self, registrar: Arc<dyn crate::outbound::HandlerManager>) {
-        self.outbound_registrar = Some(registrar);
     }
 
     /// 注入 StatsService gRPC 后端。`&self`（内部 RwLock）：上层在
@@ -459,18 +450,10 @@ impl Commander {
                 tracing::info!("commander would listen on `{addr}` (actual bind deferred)");
             },
             None => {
-                // outbound 模式：若已注入 outbound_registrar，注册自身 handler
-                if let Some(ref _reg) = self.outbound_registrar {
-                    tracing::info!(
-                        "commander in outbound mode (tag=`{}`) — outbound handler register delegated",
-                        self.tag
-                    );
-                } else {
-                    tracing::info!(
-                        "commander in outbound mode (tag=`{}`) — no outbound registrar injected",
-                        self.tag
-                    );
-                }
+                tracing::info!(
+                    "commander in outbound mode (tag=`{}`) — no listen address configured",
+                    self.tag
+                );
             },
         }
         Ok(())
@@ -740,36 +723,6 @@ impl Commander {
     }
 }
 
-impl crate::outbound::HandlerManager for Commander {
-    fn add_handler(
-        &self,
-        handler: Arc<dyn xray_features::outbound::OutboundHandler>,
-    ) -> Result<(), CommanderError> {
-        match self.outbound_registrar.as_ref() {
-            Some(reg) => reg.add_handler(handler),
-            None => {
-                Err(CommanderError::OutboundRegisterFailed("no outbound registrar injected".into()))
-            },
-        }
-    }
-
-    fn remove_handler(&self, tag: &str) -> Result<(), CommanderError> {
-        match self.outbound_registrar.as_ref() {
-            Some(reg) => reg.remove_handler(tag),
-            None => {
-                Err(CommanderError::OutboundRegisterFailed("no outbound registrar injected".into()))
-            },
-        }
-    }
-
-    fn list_handlers(&self) -> Vec<String> {
-        match self.outbound_registrar.as_ref() {
-            Some(reg) => reg.list_handlers(),
-            None => Vec::new(),
-        }
-    }
-}
-
 impl std::fmt::Debug for Commander {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Commander")
@@ -777,7 +730,6 @@ impl std::fmt::Debug for Commander {
             .field("listen", &self.listen)
             .field("service_count", &self.service_count())
             .field("running", &self.running())
-            .field("has_outbound_registrar", &self.outbound_registrar.is_some())
             .finish()
     }
 }
@@ -1047,7 +999,6 @@ mod tests {
         assert!(s.contains("tag"));
         assert!(s.contains("api"));
         assert!(s.contains("service_count: 1"));
-        assert!(s.contains("has_outbound_registrar: false"));
     }
     // --- NoopRegistrar ---
 

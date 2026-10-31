@@ -379,6 +379,7 @@ pub(crate) fn wrap_dial_with_send_through(
 /// `target_strategy` 有效（非 AsIs）时先经 [`wrap_dial_with_target_strategy`]
 /// 包装 dial_fn（bd bqm）。
 #[allow(clippy::type_complexity)] // 返回类型即三组件装配形态
+#[allow(clippy::too_many_arguments, reason = "装配期一次性参数搬运：tag/dial/proxy_chain/target_strategy/dns/send_through/level/policy 各自来自不同配置面，聚成 struct 只是把参数搬到字段，不减少耦合")]
 pub(crate) fn wrap_bridge(
     tag: String,
     dial_fn: xray_app_dispatcher::default::DialFn,
@@ -386,8 +387,12 @@ pub(crate) fn wrap_bridge(
     target_strategy: Option<DomainStrategy>,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
     send_through: Option<&xray_transport::system_dialer::SendThroughSpec>,
-    // sm80③/czwu：session policy（Go freedom.go:393）。非 freedom 出站固定
-    // level 0（出站无 per-outbound userLevel，仅 freedom settings 有）。
+    // 出站腿的 user level：Go vless/vmess outbound 用 `request.User.Level` 查档
+    // （vless/outbound.go:291、vmess/outbound.go:136），其余协议无该面 → 0。
+    level: u32,
+    // sm80③/czwu：session policy（Go freedom.go:393）。freedom 走
+    // settings.userLevel（`build_freedom_outbound` 自算），此处是 vless/vmess
+    // 之外的固定档位（0）。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> std::result::Result<
     (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
@@ -404,7 +409,8 @@ pub(crate) fn wrap_bridge(
     };
     let bridge = Arc::new(DialBridge::new(tag, dial_fn));
     if let Some(pm) = policy_manager {
-        bridge.with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, 0).timeout);
+        bridge
+            .with_policy(xray_features::policy::PolicyManager::policy_for_level(pm, level).timeout);
     }
     let handler = Arc::clone(&bridge) as Arc<dyn DispatchHandler>;
     let bridge_ref = if proxy_chain_tag.is_some() { Some(bridge) } else { None };

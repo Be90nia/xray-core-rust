@@ -867,12 +867,26 @@ impl ShadowsocksOutboundSettings {
             }
             // Go :243-244：uot/uotVersion → UdpOverTcp 字段映射（int→uint32 环绕语义
             // 与 Go 一致：负数经 `as u32` 回绕）。
+            //
+            // ⚠️ bd x0f0r：`uot`/`uotVersion` **不是 Go 26.10.17 的键**
+            // （`proxy/shadowsocks_2022/config.proto` 的 `ClientConfig` 无该字段，
+            // 全仓 grep `uot` 零命中）——这是本仓独有的 SS2022 UoT 扩展。开着它
+            // 连 Go 服务端会因对端不认 UoT 而 UDP 全废，故显式告警。
+            let udp_over_tcp = server.uot.unwrap_or(false);
+            if udp_over_tcp {
+                tracing::warn!(
+                    target: "xray_conf",
+                    uot_version = server.uot_version.unwrap_or(0),
+                    "shadowsocks_2022 \"uot\" is a Rust-only extension: Go 26.10.17 has no such key \
+                     and its servers do not speak UDP-over-TCP — expect UDP to fail against Go peers"
+                );
+            }
             return Ok(ShadowsocksClientBuild::Ss2022 {
                 address,
                 port: server.port,
                 method,
                 key,
-                udp_over_tcp: server.uot.unwrap_or(false),
+                udp_over_tcp,
                 udp_over_tcp_version: server.uot_version.unwrap_or(0) as u32,
             });
         }

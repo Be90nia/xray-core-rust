@@ -139,17 +139,18 @@ impl InboundHandler for SocksServer {
                             let tag = tag.clone();
                             let config = config.clone();
                             let fx = Arc::clone(&fx_conns);
-                            let log = log.clone();
-                            fx.spawn_tracked(async move {
+                            let log_conn = log.clone();
+                            // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
+                            xray_frame::compat::spawn_reaping(&fx, &log, "socks conn", async move {
                                 match socks_handshake(&mut stream, &config, Some(bound)).await {
                                     Ok(addr) => {
-                                        log.info(format!(
+                                        log_conn.info(format!(
                                             "SOCKS5 handshake succeeded tag={tag} peer={peer} dest={addr:?}"
                                         ));
                                         // 切片3: dispatch to outbound handler
                                     },
                                     Err(e) => {
-                                        log.warn(format!(
+                                        log_conn.warn(format!(
                                             "handshake failed tag={tag} peer={peer} error={e}"
                                         ));
                                     },
@@ -747,6 +748,56 @@ mod tests {
         if let Ok(Ok(_)) = result {
             panic!("listener should be closed after close()");
         }
+    }
+
+    /// bd 86i4h 阶段2：每连接任务终局 + close 后零在途。
+    ///
+    /// `FxScope` 不暴露生命周期集条目数（`try_reap` 只回 panic/cancelled 载荷），
+    /// 故「条目随下次 spawn 出集」的判别落在进程面 e2e
+    /// （`scripts/86i4h_stage2_reap_e2e.py` 的 `live_bytes / 连接数`）与
+    /// `xray_frame::compat` 的机制单测；本测试只锁「40 条真实连接跑完不残留任务」。
+    #[tokio::test]
+    async fn conn_tasks_terminate_and_close_leaves_zero_in_flight() {
+        use std::time::Duration;
+        let server = SocksServer::new("test-reap", ServerConfig::default());
+        server.start().await.unwrap();
+        let port = server.bound_port().await;
+
+        // 40 条**完成握手**的连接：证明连接任务真的被 accept 并跑完
+        // （否则判别器空转——只数条目不数连接 = 假绿）。
+        let mut served = 0u32;
+        for _ in 0..40u32 {
+            let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)).await else { continue };
+            socks5_client_noauth_connect(&mut c, "127.0.0.1:1").await.unwrap();
+            drop(c);
+            served += 1;
+        }
+        assert_eq!(served, 40, "40 条连接必须全部完成握手（判别器前提）");
+
+        // 等连接任务全部终局（`in_flight` 只计在途；accept loop 自身占 1）。
+        for _ in 0..400 {
+            if server.fx.in_flight() <= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.fx.in_flight() <= 1,
+            "每连接任务必须终局，实余 {} 个在途",
+            server.fx.in_flight()
+        );
+
+        let leftover = server.fx.try_reap();
+        assert!(leftover.is_empty(), "连接任务不得留 panic/cancelled 载荷：{leftover:?}");
+
+        server.close().await.unwrap();
+        for _ in 0..200 {
+            if server.fx.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(server.fx.in_flight(), 0, "close 后不得残留任务");
     }
 
     #[tokio::test]

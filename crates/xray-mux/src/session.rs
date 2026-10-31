@@ -730,9 +730,15 @@ impl XUDPManager {
                     };
                     for (xudp, _id) in expired {
                         // 闸关不可达：同上（中断子任务随 scope 收口）。
-                        fx.spawn_tracked(async move {
-                            xudp.interrupt().await;
-                        })
+                        // 每条目 spawn 前先收割（bd 86i4h 阶段2）：条目不随条目数增长。
+                        xray_frame::compat::spawn_reaping(
+                            &fx,
+                            &xray_frame::compat::log(),
+                            "mux xudp interrupt",
+                            async move {
+                                xudp.interrupt().await;
+                            },
+                        )
                         .expect("internal FxScope is never closed");
                     }
                 }

@@ -208,7 +208,7 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
 
 #[test]
 fn l4_conn_id_present() {
-    l4_run_conn_id_fixture("trojan");
+    l4_run_conn_id_fixture(TrojanPlugin::default().name());
 }
 
 /// 夹具二（坑约束 2）：deadline 双入口（with_deadline / HandshakeDeadline::guard）
@@ -224,7 +224,7 @@ async fn l4_deadline_effective() {
 #[test]
 fn l4_log_fields() {
     xray_frame::assert_log_fields!(
-        domain: "trojan",
+        domain: TrojanPlugin::default().name(),
         conn_id: 0x1234u128,
         stage: "Handshake",
         peer: "203.0.113.7:443",
@@ -236,9 +236,25 @@ fn l4_log_fields() {
 /// 夹具四（坑约束 4/9）：借 N 还 N → PoolMetrics 配平（borrowed=0 且零溢出丢弃）。
 #[test]
 fn l4_pool_discipline() {
-    let pool =
-        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
-    xray_frame::assert_pool_discipline!(pool, 4);
+    use std::sync::Arc;
+
+    use xray_frame::{
+        Plugin as _,
+        pool::{BufferPool, ManagedBufferPool, XrayBufPool},
+    };
+
+    // 池由装配根注入真实 ctx，借/还走 `ctx.pool()`（插件唯一拿得到的口）——
+    // 夹具自造池直接借还测的是夹具本身（bd amynv）。
+    let plugin = TrojanPlugin::default();
+    let shared = Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8));
+    let mut ctx = xray_frame::contract_assert::contract_test_context(plugin.name());
+    ctx.set_pool(Arc::clone(&shared) as Arc<dyn BufferPool>);
+
+    let borrowed: Vec<_> =
+        (0..4).map(|_| ctx.pool().acquire(1024).expect("池借出（max=8）")).collect();
+    assert_eq!(shared.metrics().borrowed, 4, "借出必须记在装配根注入的同一个池上");
+    drop(borrowed);
+    xray_frame::contract_assert::assert_pool_settled("l4:pool:trojan", shared.metrics());
 }
 
 // ── L4 真实实例夹具（bd 2zi1o）──

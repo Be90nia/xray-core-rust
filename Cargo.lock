@@ -5621,6 +5621,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]
@@ -5787,6 +5788,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-mux",
  "xray-proto",
  "xray-transport",
@@ -5809,6 +5811,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-mux",
  "xray-proto",
  "xray-proxy-freedom",
@@ -6187,6 +6190,7 @@ dependencies = [
  "xray-buf",
  "xray-common",
  "xray-features",
+ "xray-frame",
  "xray-transport",
  "xray-xudp",
 ]

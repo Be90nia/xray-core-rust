@@ -202,7 +202,7 @@ fn l4_run_conn_id_fixture(plugin: &'static str) {
 
 #[test]
 fn l4_conn_id_present() {
-    l4_run_conn_id_fixture("http");
+    l4_run_conn_id_fixture(HttpPlugin::default().name());
 }
 
 /// 夹具三（坑约束 10；11 N/A → secrets 表传空）：target 前缀 `xray_frame::http`
@@ -210,7 +210,7 @@ fn l4_conn_id_present() {
 #[test]
 fn l4_log_fields() {
     xray_frame::assert_log_fields!(
-        domain: "http",
+        domain: HttpPlugin::default().name(),
         conn_id: 0x1234u128,
         stage: "Accept",
         peer: "203.0.113.7:443",

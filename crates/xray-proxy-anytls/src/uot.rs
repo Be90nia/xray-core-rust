@@ -149,9 +149,11 @@ impl Writer for LengthFramedWriter {
     ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), BufError>> + Send + '_>>
     {
         Box::pin(async move {
-            if mb.is_empty() {
-                return Ok(());
-            }
+            // 零长载荷也要写出 `0x0000` 帧头：uot wire = `[2B BE len][payload]`，
+            // 长度前缀**无条件先写**（对齐 Go/sing uot）。早先的 `mb.is_empty() →
+            // return Ok(())` 把空 datagram 变成「对端等帧头、本端不发」的永久挂起
+            // （wave1 yfcnr 遗留；`tests` 的 length_framed_roundtrip 空载荷分支即
+            // 因此挂死），且等于空 datagram 静默丢包。
             if mb.len() > usize::from(u16::MAX) {
                 return Err(BufError::WriteError(format!(
                     "uot frame payload {} exceeds u16 length",
@@ -262,5 +264,22 @@ mod tests {
             }
             assert_eq!(out, payload, "帧边界与载荷逐字节一致");
         }
+    }
+
+    /// 空 datagram 的 wire 证据（回归门）：`write_multi_buffer(空)` 必须**真的写出**
+    /// 2 字节 `0x0000` 帧头，而不是「本端不发、对端等帧头」的永久挂起
+    /// （旧 `mb.is_empty() → return Ok(())` 的挂死形态；对齐 Go uot 无条件写长度前缀）。
+    #[tokio::test]
+    async fn empty_datagram_emits_zero_length_frame_on_wire() {
+        let (a, mut peer) = tokio::io::duplex(64);
+        let mut w = LengthFramedWriter::new(a);
+        w.write_multi_buffer(MultiBuffer::new()).await.expect("空载荷必须写出 0x0000 帧");
+
+        let mut hdr = [0u8; 2];
+        tokio::time::timeout(std::time::Duration::from_secs(5), peer.read_exact(&mut hdr))
+            .await
+            .expect("对端必须在期限内收到帧头（写端吞帧 = 本用例红）")
+            .expect("read hdr");
+        assert_eq!(hdr, [0u8, 0], "零长载荷的 wire 形态 = 2 字节 0x0000 帧头");
     }
 }

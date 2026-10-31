@@ -296,13 +296,19 @@ impl InboundHandler for HysteriaInboundHandler {
                     let disp = Arc::clone(disp);
                     let stream_clone = Arc::clone(&stream);
                     let fx = Arc::clone(&fx_closures);
-                    // 组件自持 FxScope 记账（B6）：TCP 会话任务，scope drop 兜底 abort。
-                    fx.spawn_tracked(async move {
-                        if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
-                            INBOUND_LOG
-                                .warn(format!("hysteria inbound tcp stream error error={e}"));
-                        }
-                    })
+                    // 每 stream spawn 前先收割（bd 86i4h 阶段2）：
+                    // 条目不随累计 stream 数增长。
+                    xray_frame::compat::spawn_reaping(
+                        &fx,
+                        &INBOUND_LOG,
+                        "hysteria tcp stream",
+                        async move {
+                            if let Err(e) = handle_tcp_stream(stream_clone, disp).await {
+                                INBOUND_LOG
+                                    .warn(format!("hysteria inbound tcp stream error error={e}"));
+                            }
+                        },
+                    )
                     .expect("internal FxScope is never closed");
                 }
             });
@@ -316,13 +322,19 @@ impl InboundHandler for HysteriaInboundHandler {
                 Arc::new(move |sess: Arc<InterConn>| {
                     let disp = Arc::clone(&disp);
                     let fx = Arc::clone(&fx_closures);
-                    // 组件自持 FxScope 记账（B6）：UDP 会话任务，scope drop 兜底 abort。
-                    fx.spawn_tracked(async move {
-                        if let Err(e) = handle_udp_session(sess, disp).await {
-                            INBOUND_LOG
-                                .warn(format!("hysteria inbound udp session error error={e}"));
-                        }
-                    })
+                    // 每 session spawn 前先收割（bd 86i4h 阶段2）：
+                    // 条目不随累计 session 数增长。
+                    xray_frame::compat::spawn_reaping(
+                        &fx,
+                        &INBOUND_LOG,
+                        "hysteria udp session",
+                        async move {
+                            if let Err(e) = handle_udp_session(sess, disp).await {
+                                INBOUND_LOG
+                                    .warn(format!("hysteria inbound udp session error error={e}"));
+                            }
+                        },
+                    )
                     .expect("internal FxScope is never closed");
                 }) as Arc<dyn Fn(Arc<InterConn>) + Send + Sync>
             });

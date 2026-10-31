@@ -163,14 +163,44 @@ async fn inbound_handler_produced_by_plugin() {
 /// cfg 门控**，所有平台都编译执行：非 Linux 上 `fake_udp` 可调且返回 Err
 /// （对齐 Go `fakeudp_other.go` 的 `!linux`），证明门控语义面存在而非被裁掉；
 /// Linux 上两态皆合法（`IP_TRANSPARENT` 需 CAP_NET_ADMIN，syscall 层裁决）。
-#[test]
-fn tproxy_gate_is_runtime_semantics_not_compiled_away() {
+///
+/// **必须是 `#[tokio::test]`**：`fake_udp_linux` 末尾走 `tokio::net::UdpSocket::from_std`，
+/// 需要 reactor。裸 `#[test]` 在**特权**环境（root + CAP_NET_ADMIN，即生产 VPS 形态）
+/// 越过了 EPERM 分支直达 `from_std` → `panic!("there is no reactor running")`；
+/// 非特权 CI 里 setsockopt 先 EPERM 返回，永远到不了那一行 → CI 绿、生产红（假绿）。
+#[tokio::test]
+async fn tproxy_gate_is_runtime_semantics_not_compiled_away() {
     let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
     let result = xray_proxy_dokodemo::fakeudp::fake_udp(addr, 0);
     #[cfg(target_os = "linux")]
     {
-        // Linux：有 CAP_NET_ADMIN → Ok，无 → Err；仅断言调用面存在不 panic。
-        let _ = result;
+        // 两个合法态：特权 → Ok（且必须是**本 reactor 可用**的真 socket）；
+        // 非特权 → PermissionDenied（syscall 裁决）。任何第三种态 = 缺陷。
+        match result {
+            Ok(sock) => {
+                let bound = sock.local_addr().expect("fake_udp 产物必须已 bind");
+                assert_eq!(bound.ip(), addr.ip(), "IP_TRANSPARENT 必须绑到请求的本地地址");
+                // reactor 归属的证据：真的能在这个 runtime 里收发。
+                let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("peer bind");
+                let peer_addr = peer.local_addr().expect("peer addr");
+                sock.send_to(b"tproxy-probe", peer_addr).await.expect("fake socket send");
+                let mut buf = [0u8; 32];
+                let (n, from) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    peer.recv_from(&mut buf),
+                )
+                .await
+                .expect("fake socket 必须在当前 reactor 内可写")
+                .expect("peer recv");
+                assert_eq!(&buf[..n], b"tproxy-probe");
+                assert_eq!(from, bound, "回包源地址 = 透明 socket 自身绑定地址");
+            },
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "非特权下 fake_udp 必须因权限被拒（EPERM/EACCES），而不是任何其他错误: {e}"
+            ),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -238,11 +268,22 @@ fn l4_log_fields() {
     );
 }
 
-/// 夹具四（坑约束 4/9）：借 N 还 N → PoolMetrics 配平（borrowed=0 且零溢出丢弃）。
-/// 条款 4 适用（PM 拍板 2026-10-24：转发数据面走 buf，受 BufferPool 接缝约束）。
+/// 夹具四（坑约束 4/9）：**经插件能力句柄借还**——池由装配根 `set_pool` 注入真实
+/// `PluginContext`，借/还都走 `ctx.pool()`（插件唯一拿得到的口），记账断言落在
+/// 同一个池实例上。旧形态「夹具自造池 + 直接借还」测的是夹具本身、插件从未出场
+/// （bd amynv）。
 #[test]
 fn l4_pool_discipline() {
-    let pool =
-        xray_frame::pool::ManagedBufferPool::new(xray_frame::pool::XrayBufPool::new(8, 8), 8, 8);
-    xray_frame::assert_pool_discipline!(pool, 4);
+    use xray_frame::pool::{BufferPool, ManagedBufferPool, XrayBufPool};
+
+    let plugin = DokodemoPlugin::default();
+    let shared = Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8));
+    let mut ctx = xray_frame::contract_assert::contract_test_context(plugin.name());
+    ctx.set_pool(Arc::clone(&shared) as Arc<dyn BufferPool>);
+
+    let borrowed: Vec<_> =
+        (0..4).map(|_| ctx.pool().acquire(1024).expect("池借出（max=8）")).collect();
+    assert_eq!(shared.metrics().borrowed, 4, "借出必须记在装配根注入的同一个池上");
+    drop(borrowed);
+    xray_frame::contract_assert::assert_pool_settled("l4:pool:dokodemo-door", shared.metrics());
 }

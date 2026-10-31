@@ -139,16 +139,36 @@ fn build_h3_transport_config(
     // bd wz2b W4：None/0（quicParams 缺省）原不设 → quinn 缺省流收窗 1.25MB
     // （STREAM_RWND）高 BDP 钉 1.25MB/RTT@169ms≈7.4MB/s。缺省显式 16/32MB
     // （quic crate config.rs 同款），quicParams 显式值仍优先。
+    //
+    // bd x0f0r W2：Go `dialer.go:165-170` 同时消费 `Max*Window`（quic-go 的窗口
+    // 动态增长**上限**，Initial 只是起点）。quinn 的 `stream_receive_window` /
+    // `receive_window` 语义正是「上限」，故 Max>0 时优先 Max，其次 Initial。
     let (mut stream_win, mut conn_win) = (16u64 * 1024 * 1024, 32u64 * 1024 * 1024);
     if let Some(qp) = quic_params {
         if qp.init_stream_receive_window > 0 {
             stream_win = qp.init_stream_receive_window;
         }
+        if qp.max_stream_receive_window > 0 {
+            stream_win = qp.max_stream_receive_window;
+        }
         if qp.init_connection_receive_window > 0 {
             conn_win = qp.init_connection_receive_window;
         }
+        if qp.max_connection_receive_window > 0 {
+            conn_win = qp.max_connection_receive_window;
+        }
     }
     let mut transport_config = quinn::TransportConfig::default();
+    // Go `dialer.go:168` MaxIncomingStreams（对端可发起的双向流上限；0 = 不动 quinn 缺省 100）。
+    if let Some(n) = quic_params.map(|qp| qp.max_incoming_streams).filter(|n| *n > 0) {
+        let n = u64::try_from(n).map_err(|_| {
+            SplitHttpError::Hyper("maxIncomingStreams out of u64 range".to_string())
+        })?;
+        transport_config.max_concurrent_bidi_streams(
+            quinn::VarInt::from_u64(n)
+                .map_err(|e| SplitHttpError::Hyper(format!("maxIncomingStreams VarInt: {e}")))?,
+        );
+    }
     transport_config.stream_receive_window(
         quinn::VarInt::from_u64(stream_win)
             .map_err(|e| SplitHttpError::Hyper(format!("stream_window VarInt: {e}")))?,
@@ -1012,6 +1032,30 @@ mod tests {
         let dbg = format!("{:?}", build_h3_transport_config(&cfg, Some(&qp)).unwrap());
         assert!(dbg.contains("max_idle_timeout: Some(60000)"), "{dbg}");
         assert!(dbg.contains("keep_alive_interval: Some(20s)"), "{dbg}");
+    }
+
+    /// bd x0f0r W2：`maxStreamReceiveWindow` / `maxConnectionReceiveWindow` /
+    /// `maxIncomingStreams` 必须真的落进 quinn `TransportConfig`（Go
+    /// `dialer.go:165-170` 同面），且 Max 优先于 Initial（quinn 该字段是窗口上限）。
+    #[test]
+    fn h3_transport_config_wires_max_windows_and_incoming_streams() {
+        let cfg = Config::default();
+        let qp = qp_from_json(
+            "bbr",
+            r#","initStreamReceiveWindow":16384,"maxStreamReceiveWindow":4194304,
+                "initConnectionReceiveWindow":16384,"maxConnectionReceiveWindow":8388608,
+                "maxIncomingStreams":256"#,
+        );
+        let dbg = format!("{:?}", build_h3_transport_config(&cfg, Some(&qp)).unwrap());
+        assert!(dbg.contains("stream_receive_window: 4194304"), "{dbg}");
+        assert!(dbg.contains("receive_window: 8388608"), "{dbg}");
+        assert!(dbg.contains("max_concurrent_bidi_streams: 256"), "{dbg}");
+
+        // 只给 Initial（无 Max）→ Initial 生效；缺省 → 16/32MB + quinn 缺省流上限。
+        let qp_init = qp_from_json("bbr", r#","initStreamReceiveWindow":1048576"#);
+        let dbg = format!("{:?}", build_h3_transport_config(&cfg, Some(&qp_init)).unwrap());
+        assert!(dbg.contains("stream_receive_window: 1048576"), "{dbg}");
+        assert!(dbg.contains("max_concurrent_bidi_streams: 100"), "0 = 不动 quinn 缺省: {dbg}");
     }
 
     /// bd fgzb：`XRAY_H3_ZERO_RTT` 开关语义——未设/空/其他值 = 开（对齐 Go

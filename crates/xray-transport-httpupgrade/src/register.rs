@@ -597,26 +597,34 @@ fn parse_httpupgrade_config(json: Option<&serde_json::Value>) -> io::Result<Conf
         obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
 
     // header / headers 二选一（proto JSON 用 "header"，用户配置常写 "headers"）。
-    let header = parse_headers(obj.get("header"))
-        .or_else(|| parse_headers(obj.get("headers")))
-        .unwrap_or_default();
+    let header = match parse_headers(obj.get("header"))? {
+        Some(h) => h,
+        None => parse_headers(obj.get("headers"))?.unwrap_or_default(),
+    };
 
     Ok(Config { host, path, header, accept_proxy_protocol, ed })
 }
 
 /// 把 JSON 子对象解析为 `HashMap<String, String>`。非 object 或缺失返回 `None`。
+///
+/// 非 string 值 → 硬错：Go `HttpUpgradeConfig.Headers map[string]string`
+/// （infra/conf/transport_method.go:663）在 JSON 解码期就失败；静默丢 header
+/// 会让伪装/鉴权头在 wire 上凭空消失（bd x0f0r）。
 fn parse_headers(
     v: Option<&serde_json::Value>,
-) -> Option<std::collections::HashMap<String, String>> {
-    let obj = v?.as_object()?;
+) -> io::Result<Option<std::collections::HashMap<String, String>>> {
+    let Some(obj) = v.and_then(serde_json::Value::as_object) else { return Ok(None) };
     let mut map = std::collections::HashMap::with_capacity(obj.len());
     for (k, val) in obj {
-        if let Some(s) = val.as_str() {
-            map.insert(k.clone(), s.to_string());
-        }
-        // 非 string 值跳过（与 Go proto JSON 解析对未知字段的容忍一致）。
+        let Some(s) = val.as_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("httpupgradeSettings header {k:?} must be a string, got {val}"),
+            ));
+        };
+        map.insert(k.clone(), s.to_string());
     }
-    Some(map)
+    Ok(Some(map))
 }
 
 /// 读 `tlsSettings.fingerprint`（空 = 未配置）。Go `tls.GetFingerprint` 的
@@ -753,12 +761,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_httpupgrade_config_skips_non_string_header_values() {
+    fn parse_httpupgrade_config_rejects_non_string_header_values() {
+        // bd x0f0r：Go `Headers map[string]string` 解码即失败 → Rust 硬错，
+        // 不再静默丢 header（wire 上头凭空消失）。
         let v: serde_json::Value =
             serde_json::from_str(r#"{"headers":{"good":"v","bad":123}}"#).unwrap();
-        let cfg = parse_httpupgrade_config(Some(&v)).unwrap();
-        assert_eq!(cfg.header.len(), 1);
-        assert_eq!(cfg.header.get("good").unwrap(), "v");
+        let err = parse_httpupgrade_config(Some(&v)).expect_err("non-string header must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("\"bad\""), "error must name the key: {err}");
     }
 
     #[test]

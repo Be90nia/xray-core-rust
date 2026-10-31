@@ -213,8 +213,12 @@ fn spawn_session(
     // + `abort reader`（reader 任务内本地 sock Arc 立即 drop，关闭 socket）。
     // `Arc::ptr_eq` 防 close→新建同名 dest 后被旧 timer 误删（移除前 ptr 比对）。
     // 闸关不可达：scope 归 UdpRelay 独占，无 close 调用（停机走 close/timer 自回收）。
-    let timer = scope
-        .spawn_tracked(async move {
+    // 每会话 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计会话数增长。
+    let timer = xray_frame::compat::spawn_reaping(
+        scope,
+        &xray_frame::compat::log(),
+        "udp relay session timer",
+        async move {
             loop {
                 let since = last_refresh.lock().elapsed();
                 if since >= idle_timeout {
@@ -237,8 +241,9 @@ fn spawn_session(
                     entry.reader.abort();
                 }
             }
-        })
-        .expect("internal FxScope is never closed");
+        },
+    )
+    .expect("internal FxScope is never closed");
 
     (reader, timer)
 }

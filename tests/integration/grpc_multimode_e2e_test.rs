@@ -2,7 +2,7 @@
 //!
 //! 4 variants verified through full xray-core `start_full` path:
 //!   1. gRPC + single mode (no TLS) — basic GunService/Tun
-//!   2. gRPC + TLS (self-signed + allowInsecure)
+//!   2. gRPC + TLS (服务端现场自签 cert/key + 客户端 allowInsecure)
 //!   3. gRPC + multiMode (TunMulti path)
 //!   4. gRPC + custom path ("/A/B/Tun" serviceName)
 //!
@@ -136,6 +136,28 @@ fn socks_inbound(port: u16) -> BuiltInbound {
     }
 }
 
+/// 服务端 TLS 配置补显式证书（bd mwvwd，波2 G6）：自签回退已删——`security=tls`
+/// 的服务端**缺 `tlsSettings.certificates` 即每条连接握手失败**（对齐 Go 语义）。
+/// 故 TLS 变体给服务端灌一对现场生成的自签 cert/key；客户端配置保持不变
+/// （`allowInsecure:true` 只作用于客户端验链）。
+fn server_settings_with_cert(client_settings: &serde_json::Value) -> serde_json::Value {
+    let mut server = client_settings.clone();
+    if server.get("security").and_then(|v| v.as_str()) != Some("tls") {
+        return server;
+    }
+    let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+        .expect("generate self-signed cert");
+    let tls = server
+        .get_mut("tlsSettings")
+        .and_then(|v| v.as_object_mut())
+        .expect("security=tls requires tlsSettings object on the server side");
+    tls.insert(
+        "certificates".into(),
+        serde_json::json!([{ "certificate": [cert_pem], "key": [key_pem] }]),
+    );
+    server
+}
+
 async fn run_grpc_e2e(grpc_settings: serde_json::Value, payload: &[u8]) {
     let echo_addr = start_echo().await;
 
@@ -146,7 +168,9 @@ async fn run_grpc_e2e(grpc_settings: serde_json::Value, payload: &[u8]) {
         let mut server_cfg = BuiltConfig::default();
         server_cfg.inbounds.push(vless_inbound(vless_port, "vless-grpc-mm-in"));
         server_cfg.outbounds.push(freedom_outbound());
-        server_cfg.inbounds[0].stream_settings_json = Some(grpc_settings.clone());
+        // 服务端：TLS 变体自动补自签证书（缺证书 = 每条连接握手失败，bd mwvwd）
+        server_cfg.inbounds[0].stream_settings_json =
+            Some(server_settings_with_cert(&grpc_settings));
         match start_full(&server_cfg).await {
             Ok((si, so, sh)) => break (vless_port, si, so, sh),
             Err(e) if xray_common::testing::is_addr_in_use_err(&e) => continue,

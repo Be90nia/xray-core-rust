@@ -347,8 +347,10 @@ async fn wg_accept_loop(
                 handle: event.handle,
             };
             // spawn 中继 task（smoltcp socket ↔ duplex）——组件自持 FxScope
-            // 记账（B6 t975），scope drop 兜底 abort。
-            fx.spawn_tracked(relay.run()).expect("internal FxScope is never closed");
+            // 记账（B6 t975），scope drop 兜底 abort；每条 TCP 连接先收割
+            // （bd 86i4h 阶段2），条目不随累计连接数增长。
+            xray_frame::compat::spawn_reaping(&fx, &crate::WG_LOG, "wg tcp relay", relay.run())
+                .expect("internal FxScope is never closed");
 
             // spawn dispatch（link → outbound），挂 per-user 上下文
             // （Go server.go:352-364：GetUserByAddr(隧道内源) →
@@ -369,12 +371,17 @@ async fn wg_accept_loop(
             };
             let dispatch = Arc::clone(&dispatch);
             // B6（bd t975）：per-conn dispatch 任务经组件自持 scope 托管。
+            // 每连接先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
             let fx_dispatch = Arc::clone(&fx);
-            fx_dispatch
-                .spawn_tracked(async move {
+            xray_frame::compat::spawn_reaping(
+                &fx_dispatch,
+                &crate::WG_LOG,
+                "wg tcp dispatch",
+                async move {
                     dispatch.dispatch_with_access(&dest, link, access).await;
-                })
-                .expect("internal FxScope is never closed");
+                },
+            )
+            .expect("internal FxScope is never closed");
         }
 
         // 内层 UDP：drain 全部转发监听的待收数据报并路由到 per-源会话。
@@ -493,15 +500,14 @@ fn forward_wg_udp_datagram(
     }
     let (cmd_tx, cmd_rx) = mpsc::channel(WG_UDP_QUEUE_CAP);
     // 组件自持 FxScope 记账（B6 t975）：UDP 快路 per-源会话任务（首包路径 spawn，
-    // Go udp forwarder 语义），scope drop 兜底 abort。
-    fx.spawn_tracked(run_wg_udp_session(
-        Arc::clone(dispatch),
-        cmd_rx,
-        Arc::clone(netstack),
-        src,
-        dest,
-        payload,
-    ))
+    // Go udp forwarder 语义），scope drop 兜底 abort；每个新会话先收割
+    // （bd 86i4h 阶段2），条目不随累计会话数增长。
+    xray_frame::compat::spawn_reaping(
+        fx,
+        &crate::WG_LOG,
+        "wg udp session",
+        run_wg_udp_session(Arc::clone(dispatch), cmd_rx, Arc::clone(netstack), src, dest, payload),
+    )
     .expect("internal FxScope is never closed");
     map.insert(src, WgUdpSession { cmd_tx, last_used_nanos: now });
 }

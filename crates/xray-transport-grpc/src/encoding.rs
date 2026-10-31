@@ -55,25 +55,6 @@ pub enum CompressionEncoding {
     Gzip,
 }
 
-impl CompressionEncoding {
-    /// 从 `grpc-encoding` header 值解析。
-    ///
-    /// 返回 `None` 表示不识别或不支持（如 "identity"、"snappy"、"deflate"）。
-    pub fn from_header(value: &str) -> Option<Self> {
-        match value {
-            "gzip" => Some(Self::Gzip),
-            _ => None,
-        }
-    }
-
-    /// 返回对应的 `grpc-encoding` header 值。
-    pub fn as_header(self) -> &'static str {
-        match self {
-            Self::Gzip => "gzip",
-        }
-    }
-}
-
 /// 解压 gRPC frame payload。
 ///
 /// `compressed=1` 时 payload 是压缩后的 protobuf，需先解压再解码 Hunk。

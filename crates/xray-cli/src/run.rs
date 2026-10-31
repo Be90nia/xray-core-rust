@@ -281,7 +281,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 ///
 /// 用于 `--unix` 启动期校验：`--unix` 仅对 XHTTP inbound 有意义。
 /// 至少一个 inbound 的 streamSettings.network == "splithttp" 即返回 true。
-#[allow(dead_code)] // 保留：供后续 XHTTP 启动校验使用
+#[cfg(unix)] // 唯一调用点在 `--unix` 启动期校验（run.rs 内 `#[cfg(unix)]` 块）
 fn config_uses_splithttp(config: &xray_conf::config::Config) -> bool {
     let inbounds = &config.inbound_configs;
     inbounds.iter().any(|ib| {
@@ -724,6 +724,7 @@ mod tests {
     /// inbound 一律返回 false。该函数供 `--unix` 启动期校验调用，无单测时
     /// 任何字段读取路径回归都可能被忽略。
     #[test]
+    #[cfg(unix)] // config_uses_splithttp 本身是 #[cfg(unix)]（唯一调用点在 --unix 启动期校验）
     fn config_uses_splithttp_only_for_splithttp_inbound() {
         // 空 inbound 配置 → false
         let cfg = xray_conf::config::Config::default();

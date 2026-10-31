@@ -59,9 +59,5 @@ pub const FLOW_XRV: &str = "xtls-rprx-vision";
 /// VLESS 反向代理固定域名（对应 Go `v1.rvs.cool`）。
 pub const RVS_DOMAIN: &str = "v1.rvs.cool";
 
-// 反向代理 + 预连接公共导出（bridge/portal 注册与监控）
+// 反向代理公共导出（bridge/portal 注册与监控）
 pub use inbound::reverse::{PortalConfig, ReverseRegistry};
-pub use outbound::{
-    preconnect::{PreConnectConfig, PreConnectPool},
-    reverse::{ReverseConnState, ReverseMonitor},
-};

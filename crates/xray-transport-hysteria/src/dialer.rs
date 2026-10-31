@@ -347,21 +347,6 @@ impl ClientManager {
         client
     }
 
-    /// 清理 Inactive client（对应 Go `clientManager.clean()`）。
-    pub fn clean_inactive(&self) {
-        let mut g = self.clients.lock();
-        let to_remove: Vec<_> = g
-            .iter()
-            .filter(|(_, c)| c.status() == Status::Inactive)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in to_remove {
-            if let Some(c) = g.remove(&k) {
-                c.close();
-            }
-        }
-    }
-
     /// 当前 client 数。
     #[allow(clippy::len_without_is_empty)] // len 语义为连接计数
     pub fn len(&self) -> usize {

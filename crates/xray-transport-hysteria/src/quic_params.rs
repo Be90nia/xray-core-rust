@@ -83,23 +83,15 @@ pub fn parse_quic_params(
         },
     }
 
-    // udpHop（Go :2191-2192 校验 + :2227-2231 转换）
-    let mut hop = UdpHop::default();
-    if let Some(h) = obj.get("udpHop") {
-        if !h.is_object() {
-            return Err(invalid("udpHop: expected an object"));
-        }
-        if let Some(ports) = h.get("ports") {
-            hop.ports = parse_port_list(ports)?;
-        }
-        if let Some(interval) = h.get("interval") {
-            let (from, to) = parse_int32_range(interval)?;
-            if (from != 0 && from < 5) || (to != 0 && to < 5) {
-                return Err(invalid("Interval must be at least 5"));
-            }
-            hop.interval_min = from;
-            hop.interval_max = to;
-        }
+    // `udpHop` 不是 Go 键：Go `QuicParamsConfig`（infra/conf/transport_finalmask.go:1177-1195）
+    // 无该字段，UDP 跳端口的唯一开关是 `finalmask.udp[{"type":"udphop",...}]`
+    // （Rust 已在 `finalmask::build_udphop_config` 接）。此前这里解析并因
+    // `interval < 5` 硬拒启 → 与 Go 反向（Go 静默忽略该键、照常启动），bd x0f0r。
+    if obj.contains_key("udpHop") {
+        crate::LOG.warn(
+            "finalmask.quicParams.udpHop is ignored: Go 26.10.17 QuicParams has no such field; \
+             use finalmask.udp[{\"type\":\"udphop\",...}] instead",
+        );
     }
 
     // 窗口 ≥16384（Go :2195-2205）
@@ -141,7 +133,9 @@ pub fn parse_quic_params(
             .get("brutalDisableLossCompensation")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        udp_hop: Some(hop),
+        // `udp_hop` 保持 proto 零值（Go 26.10.17 QuicParams 无该字段，跳端口由
+        // `finalmask.udp[{type:"udphop"}]` 承担）——bd x0f0r。
+        udp_hop: None,
         init_stream_receive_window: get_u64("initStreamReceiveWindow"),
         max_stream_receive_window: get_u64("maxStreamReceiveWindow"),
         init_conn_receive_window: get_u64("initConnectionReceiveWindow"),
@@ -180,59 +174,6 @@ fn parse_bandwidth_bps(s: &str) -> io::Result<u64> {
     };
     // Go :490 `uint64(val*float64(mul)) / 8`：先截断再整除。
     Ok((val * mul as f64) as u64 / 8)
-}
-
-fn parse_port_list(v: &serde_json::Value) -> io::Result<Vec<u32>> {
-    let mut out = Vec::new();
-    let mut push_range = |from: u32, to: u32| -> io::Result<()> {
-        if !(1..=65_535).contains(&from) || !(1..=65_535).contains(&to) {
-            return Err(invalid("invalid port"));
-        }
-        out.extend(from..=to);
-        Ok(())
-    };
-    match v {
-        serde_json::Value::Number(n) => {
-            let p = n.as_u64().ok_or_else(|| invalid("invalid port"))? as u32;
-            push_range(p, p)?;
-        },
-        serde_json::Value::String(s) => {
-            for part in s.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                if let Some((a, b)) = part.split_once('-') {
-                    let from: u32 = a.trim().parse().map_err(|_| invalid("invalid port range"))?;
-                    let to: u32 = b.trim().parse().map_err(|_| invalid("invalid port range"))?;
-                    push_range(from.min(to), from.max(to))?;
-                } else {
-                    let p: u32 = part.parse().map_err(|_| invalid("invalid port"))?;
-                    push_range(p, p)?;
-                }
-            }
-        },
-        _ => return Err(invalid("invalid port")),
-    }
-    Ok(out)
-}
-
-fn parse_int32_range(v: &serde_json::Value) -> io::Result<(i64, i64)> {
-    let (from, to) = match v {
-        serde_json::Value::Number(n) => {
-            let n = n.as_i64().ok_or_else(|| invalid("invalid interval"))?;
-            (n, n)
-        },
-        serde_json::Value::String(s) => {
-            let (a, b) = s.split_once('-').ok_or_else(|| invalid("invalid interval"))?;
-            let from: i64 = a.trim().parse().map_err(|_| invalid("invalid interval"))?;
-            let to: i64 = b.trim().parse().map_err(|_| invalid("invalid interval"))?;
-            (from, to)
-        },
-        _ => return Err(invalid("invalid interval")),
-    };
-    // Go Int32Range.ensureOrder（common.go:332-338）
-    Ok((from.min(to), from.max(to)))
 }
 
 fn invalid(msg: impl AsRef<str>) -> io::Error {
@@ -295,7 +236,6 @@ mod tests {
                 "bbrProfile": "aggressive",
                 "brutalUp": "100 mbps",
                 "brutalDown": "500 mbps",
-                "udpHop": {"ports": "20800-20802,20810", "interval": "10-20"},
                 "initStreamReceiveWindow": 16384,
                 "maxStreamReceiveWindow": 65536,
                 "initConnectionReceiveWindow": 32768,
@@ -311,10 +251,6 @@ mod tests {
         assert_eq!(p.bbr_profile, "aggressive");
         assert_eq!(p.brutal_up, 13_107_200);
         assert_eq!(p.brutal_down, 65_536_000);
-        let hop = p.udp_hop.expect("udp_hop");
-        assert_eq!(hop.ports, vec![20800, 20801, 20802, 20810]);
-        assert_eq!(hop.interval_min, 10);
-        assert_eq!(hop.interval_max, 20);
         assert_eq!(p.init_stream_receive_window, 16384);
         assert_eq!(p.max_stream_receive_window, 65536);
         assert_eq!(p.init_conn_receive_window, 32768);
@@ -337,17 +273,12 @@ mod tests {
         let p = parse_quic_params(Some(&v)).unwrap().unwrap();
         assert_eq!(p.bbr_profile, "standard");
         assert_eq!(p.congestion, "");
-        // udpHop ports 单数字 + interval 单数字（Go PortList/Int32Range 数字分支）
+        // bd x0f0r：`quicParams.udpHop` 不是 Go 键 → warn 忽略，不再解析/校验。
         let v = fm(r#"{"quicParams":{"udpHop":{"ports":20800,"interval":7}}}"#);
-        let p = parse_quic_params(Some(&v)).unwrap().unwrap();
-        let hop = p.udp_hop.unwrap();
-        assert_eq!(hop.ports, vec![20800]);
-        assert_eq!((hop.interval_min, hop.interval_max), (7, 7));
-        // interval "20-10" 交换保序（Go ensureOrder）
-        let v = fm(r#"{"quicParams":{"udpHop":{"interval":"20-10"}}}"#);
-        let p = parse_quic_params(Some(&v)).unwrap().unwrap();
-        let hop = p.udp_hop.unwrap();
-        assert_eq!((hop.interval_min, hop.interval_max), (10, 20));
+        let p = parse_quic_params(Some(&v)).expect("Go ignores this key").unwrap();
+        assert!(p.udp_hop.is_none(), "udpHop 不得再进 proto（Go 无该字段）");
+        let v = fm(r#"{"quicParams":{"udpHop":{"interval":3}}}"#);
+        assert!(parse_quic_params(Some(&v)).is_ok(), "interval<5 不再拒启（Go 对该键静默忽略）");
     }
 
     // ===== parse_quic_params：校验（Go :2153-2215 逐条） =====
@@ -369,9 +300,8 @@ mod tests {
         bad(r#"{"quicParams":{"brutalUp":"64 kbps"}}"#);
         // brutalDown < 65536（Go :2176-2177）
         bad(r#"{"quicParams":{"brutalDown":"1000"}}"#);
-        // udpHop interval < 5（Go :2191-2192）
-        bad(r#"{"quicParams":{"udpHop":{"interval":3}}}"#);
-        bad(r#"{"quicParams":{"udpHop":{"interval":"10-4"}}}"#);
+        // bd x0f0r（G11）：`udpHop` **不是** Go 键 → 不再拒启（Go 静默忽略、照常启动）。
+        // 旧断言（interval<5 → Err）已反转，见 `udphop_key_is_ignored_not_rejected`。
         // 四个窗口 < 16384（Go :2195-2205）
         bad(r#"{"quicParams":{"initStreamReceiveWindow":1024}}"#);
         bad(r#"{"quicParams":{"maxStreamReceiveWindow":1024}}"#);
@@ -387,12 +317,43 @@ mod tests {
         bad(r#"{"quicParams":{"maxIncomingStreams":4}}"#);
         // 非法带宽单位 / ports 越界
         bad(r#"{"quicParams":{"brutalUp":"100 psi"}}"#);
-        bad(r#"{"quicParams":{"udpHop":{"ports":"70000"}}}"#);
-        bad(r#"{"quicParams":{"udpHop":{"ports":0}}}"#);
+        // udpHop 的 ports 同理：整键忽略，不校验（反转门同上）。
         // 非法带宽（数字类型——Go Bandwidth 底层 string，数字 unmarshal 失败）
         bad(r#"{"quicParams":{"brutalUp":100}}"#);
         // quicParams 非对象
         bad(r#"{"quicParams":"fast"}"#);
+    }
+
+    /// bd x0f0r 的**反转回归门**：`quicParams.udpHop` 整键被忽略——无论内部字段多离谱
+    /// 都不得拒启、也不得进 proto（Go 26.10.17 `QuicParamsConfig`
+    /// `infra/conf/transport_finalmask.go:1177-1195` 无该字段；UDP 跳端口的唯一开关是
+    /// `finalmask.udp[{"type":"udphop",...}]`）。
+    ///
+    /// warn 发射点在 `quic_params.rs:90-93`（`crate::LOG.warn`）。**本用例不做日志捕获**：
+    /// tracing callsite interest 是进程级缓存，同二进制并行用例可把它缓存成 Never 导致偶发
+    /// 空捕获（本仓已踩过），故语义断言落在「接受 + `udp_hop` 恒 None + 相邻键不受影响」。
+    #[test]
+    fn udphop_key_is_ignored_not_rejected() {
+        for json in [
+            r#"{"quicParams":{"udpHop":{"interval":3}}}"#,
+            r#"{"quicParams":{"udpHop":{"interval":"10-4"}}}"#,
+            r#"{"quicParams":{"udpHop":{"ports":"70000"}}}"#,
+            r#"{"quicParams":{"udpHop":{"ports":0}}}"#,
+            r#"{"quicParams":{"udpHop":{"bogus":{"deep":true}}}}"#,
+            r#"{"quicParams":{"udpHop":"not-an-object"}}"#,
+        ] {
+            let v = fm(json);
+            let parsed = parse_quic_params(Some(&v))
+                .unwrap_or_else(|e| panic!("{json}: udpHop 必须被忽略而非拒启: {e}"));
+            let p = parsed.expect("quicParams 段存在");
+            assert!(p.udp_hop.is_none(), "{json}: udp_hop 不得进 proto（Go 无该字段）");
+        }
+
+        // 与相邻键共存：只吞 udpHop，其余照常解析（防止「整段短路」式修复）。
+        let v = fm(r#"{"quicParams":{"udpHop":{"interval":1},"maxIdleTimeout":30}}"#);
+        let p = parse_quic_params(Some(&v)).expect("必须接受").expect("段存在");
+        assert!(p.udp_hop.is_none());
+        assert_eq!(p.max_idle_timeout, 30, "相邻键照常解析");
     }
 
     #[test]

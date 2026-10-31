@@ -1,20 +1,24 @@
 //! RuleSet 外部规则加载
 //!
-//! 对应 Go `app/router/rule_set.go`。
+//! **Rust 扩展件（不对应任何 Go 实现）**：Go 26.10.17 全仓 `git grep -i ruleset`
+//! **零命中**（`app/router/` 无 `rule_set.go`，`infra/conf/router.go` 无 `ruleSet`
+//! 键，proto `RoutingRule` 无该字段）——本模块是本仓自造件，此前文件头写的
+//! 「对应 Go `app/router/rule_set.go`」是错误溯源（bd 7kp03 已更正）。
 //!
-//! Go xray-core v1.8+ 支持 `rule_set` 配置，引用外部规则文件：
+//! 形态参考 sing-box 的 `rule_set` 约定（本仓自造，非 Go 兼容面）：
 //! ```json
 //! "rule_set": [
 //!   { "tag": "geosite", "type": "file", "format": "json", "path": "geosite.json" }
 //! ]
 //! ```
 //!
-//! 路由规则通过 `rule_set:tag` 引用加载的规则集合。
+//! ## 当前状态（接线面）
 //!
-//! ## 当前状态
+//! `xray-conf` / `xray-core::wiring` 均**不解析** `rule_set` 键，本模块当前无生产
+//! 消费点（仅自身单测）。保留为基础件：将来接路由时需要它。
 //!
-//! Proto `RoutingRule` 无 `rule_set` 字段（proto 版本较早）。
-//! 本模块实现独立的加载 + 注册基础设施，待 proto 更新后接入 Router。
+//! 兼容纪律：Go 对未知配置键是「静默忽略」，因此 `Remote`（远程下载，未实现）
+//! 走 **warn + 跳过**，不再 `Err` 拒启——「Go 忽略、Rust 拒启」属兼容性破坏。
 //!
 //! ## 用法
 //!
@@ -86,10 +90,18 @@ impl RuleSetRegistry {
 
     /// 加载 RuleSet 文件并缓存。
     ///
-    /// 仅 `File` + `Json` 格式实现；`Remote` 返回 `Err`。
+    /// 仅 `File` + `Json` 格式实现。`Remote`（远程下载未实现）按 Go「未知配置
+    /// 键静默忽略」纪律 **warn + 跳过**，不拒启（bd 7kp03）。
     pub fn load(&self, cfg: &RuleSetConfig) -> Result<(), RouterError> {
         if cfg.rule_set_type == RuleSetType::Remote {
-            return Err(RouterError::Other("remote rule_set download not implemented".into()));
+            tracing::warn!(
+                target: "xray_router",
+                tag = %cfg.tag,
+                url = %cfg.url,
+                "rule_set type=remote is not supported (download not implemented) — skipped, \
+                 Go 26.10.17 ignores unknown keys instead of failing startup"
+            );
+            return Ok(());
         }
 
         let loaded = load_json_rule_set(Path::new(&cfg.path))?;
@@ -222,7 +234,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_ruleset_not_implemented() {
+    fn remote_ruleset_is_skipped_not_rejected() {
+        // bd 7kp03：Go 对不认识的配置键是静默忽略，Rust 不得因「未实现的 remote」
+        // 拒启（同一份配置 Go 能跑、Rust 起不来 = 兼容性破坏）。
         let reg = RuleSetRegistry::new();
         let cfg = RuleSetConfig {
             tag: "remote".into(),
@@ -231,7 +245,9 @@ mod tests {
             path: String::new(),
             url: "https://example.com/rules.json".into(),
         };
-        assert!(reg.load(&cfg).is_err());
+        reg.load(&cfg).expect("remote must be skipped (warn), not fail");
+        // 跳过 = 未注册，取用时报「未加载」而不是「下载失败」。
+        assert!(reg.get_domains("remote").is_err());
     }
 
     #[test]

@@ -86,12 +86,14 @@ struct Shared {
 
 impl Shared {
     /// 托管 spawn 唯一口：内部 scope 无 close 调用（fail-visible 不可达分支）。
+    /// 每次 spawn 前先收割（bd 86i4h 阶段2）：punch 会话数增长不滞留条目。
     fn spawn<F, T>(&self, fut: F) -> skeleton_infra::fx::Spawned<T>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.fx.spawn_tracked(fut).expect("internal FxScope is never closed")
+        xray_frame::compat::spawn_reaping(&self.fx, &xray_frame::compat::log(), "realm task", fut)
+            .expect("internal FxScope is never closed")
     }
 
     /// dispatcher 是否应退出。

@@ -194,3 +194,64 @@ impl DispatchHandler for NoopDispatch {
         Box::pin(async {})
     }
 }
+
+// ── L4 行为夹具（bd amynv：夹具必须持**真实插件实例**，断言落在插件拿得到的口上）──
+// wireguard 此前一个 l4_* 都没有，而契约声明「12 条全适用」= 声明面与执行面脱钩。
+
+/// 夹具一（坑约束 3）：conn_id 非零/唯一/单调——ctx 域取自**实例** `name()`：
+/// 合成字面量一旦与插件名漂移（改名/漏改），本条即红。
+#[test]
+fn l4_behavior_conn_id_present_unique_monotonic() {
+    let ctx = xray_frame::contract_assert::contract_test_context(WireguardPlugin::default().name());
+    xray_frame::assert_conn_id_present!(ctx, 1);
+    let ids: Vec<u128> = (0..8)
+        .map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            ctx.next_conn_id()
+        })
+        .collect();
+    xray_frame::contract_assert::assert_conn_id_sequence("wireguard", ids);
+}
+
+/// 夹具二（坑约束 2）：框架 deadline 原语在本 runtime 下真会掐断超时
+/// （插件的握手步骤不在夹具的 work 闭包里——属 bd amynv 残余，不在此假称覆盖）。
+#[tokio::test]
+async fn l4_behavior_deadline_effective() {
+    xray_frame::assert_deadline_effective!(std::time::Duration::from_millis(100), || async {
+        tokio::task::yield_now().await;
+    })
+    .await;
+}
+
+/// 夹具三（坑约束 10/11）：target 域取自实例 `name()`，四元组齐全 + secrets 掩码。
+#[test]
+fn l4_behavior_log_fields_quadruple_masked() {
+    xray_frame::assert_log_fields!(
+        domain: WireguardPlugin::default().name(),
+        conn_id: 0x1234u128,
+        stage: "Handshake",
+        peer: "203.0.113.7:443",
+        dest: "example.com:80",
+        secrets: ["wireguard-secret-redacted"]
+    );
+}
+
+/// 夹具四（坑约束 4/9）：池由装配根 `set_pool` 注入真实 `PluginContext`，
+/// 借/还走 `ctx.pool()`（插件唯一拿得到的口），记账断言落在同一个池实例上。
+#[test]
+fn l4_behavior_pool_discipline_balances() {
+    use std::sync::Arc;
+
+    use xray_frame::pool::{BufferPool, ManagedBufferPool, XrayBufPool};
+
+    let plugin = WireguardPlugin::default();
+    let shared = Arc::new(ManagedBufferPool::new(XrayBufPool::new(8, 8), 8, 8));
+    let mut ctx = xray_frame::contract_assert::contract_test_context(plugin.name());
+    ctx.set_pool(Arc::clone(&shared) as Arc<dyn BufferPool>);
+
+    let borrowed: Vec<_> =
+        (0..4).map(|_| ctx.pool().acquire(1024).expect("池借出（max=8）")).collect();
+    assert_eq!(shared.metrics().borrowed, 4, "借出必须记在装配根注入的同一个池上");
+    drop(borrowed);
+    xray_frame::contract_assert::assert_pool_settled("l4:pool:wireguard", shared.metrics());
+}

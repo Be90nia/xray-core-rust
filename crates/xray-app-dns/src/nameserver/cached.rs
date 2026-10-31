@@ -369,12 +369,19 @@ pub fn pull<S: CachedNameserver + 'static>(
     let server_name = cache.name.clone();
     let spawned = fx.map(|fx| {
         let task_fqdn = fqdn.clone();
-        fx.spawn_tracked(async move {
-            // 许可生命周期 = 本次刷新任务：任务结束（超时/完成）即释放。
-            let _permit = permit;
-            let _ = tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &task_fqdn, option))
-                .await;
-        })
+        // 每次刷新 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计刷新数增长。
+        xray_frame::compat::spawn_reaping(
+            &fx,
+            &xray_frame::compat::log(),
+            "dns serveStale refresh",
+            async move {
+                // 许可生命周期 = 本次刷新任务：任务结束（超时/完成）即释放。
+                let _permit = permit;
+                let _ =
+                    tokio::time::timeout(PULL_TIMEOUT, fetch(server.as_ref(), &task_fqdn, option))
+                        .await;
+            },
+        )
     });
     match spawned {
         Some(Ok(_)) => {},

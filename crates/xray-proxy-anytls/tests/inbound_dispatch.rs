@@ -103,9 +103,16 @@ async fn inbound_dispatches_via_router() {
         ohm.get_default_handler().unwrap();
 
     // 4. AnyTLS inbound（with_dispatch）
+    //
+    // bd bz800（波1，P1 安全票）：无口令 = 零认证，故产品侧对 `settings.password`
+    // 缺失/空串**拒启**（`AnytlsInboundHandler::start` → `InboundError::ListenError`）。
+    // 本测试因此必须显式灌口令（与 client 侧 `"test-password"` 对齐）——这是产品
+    // 校验变严的预期结果，不是测试要绕过的障碍。
+    const PASSWORD: &str = "test-password";
     let handler =
         AnytlsInboundHandler::new("anytls-in", "127.0.0.1:0".parse().unwrap(), tls_acceptor)
-            .with_dispatch(dispatch);
+            .with_dispatch(dispatch)
+            .with_password(Some(PASSWORD.to_string()));
     handler.start().await.expect("anytls inbound start");
     let inbound_port = handler.port();
     assert!(inbound_port > 0, "inbound must bind ephemeral port");
@@ -114,7 +121,7 @@ async fn inbound_dispatches_via_router() {
     let client_config = ClientConfig::new(
         format!("127.0.0.1:{inbound_port}"),
         "localhost",
-        "test-password",
+        PASSWORD,
         make_client_config(&cert_der),
     );
     let client = AnytlsClient::new(

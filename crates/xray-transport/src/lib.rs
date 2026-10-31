@@ -28,7 +28,7 @@
 
 //! ## 未实现（留 stub）
 //! `sockopt` / `tcp` / `udp` / `headers` / `finalmask` / `pipe` / `config` /
-//! `filelocker` / `browser_dialer` / `tagged` / `memory_settings`
+//! `filelocker` / `tagged` / `memory_settings`
 //! 这些模块依赖 Phase 4+ 未就绪的 `outbound.Manager` / `session.Outbound` /
 //! `policy.BufferPolicyFromContext` / 平台特定 syscall，留待具体传输实现 crate 处理。
 //!
@@ -84,7 +84,6 @@ pub mod system_listener;
 
 // 以下模块依赖 Phase 4+ 才会出现的 features（dns/outbound/policy 等），当前为 stub。
 #[cfg(feature = "browser-dialer")]
-pub mod browser_dialer;
 pub mod config;
 pub mod filelocker;
 pub mod finalmask;

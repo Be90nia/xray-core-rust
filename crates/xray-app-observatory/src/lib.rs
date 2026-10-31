@@ -18,7 +18,6 @@
 //! ## 核心业务
 //!
 //! - [`status::StatusStore`]：状态集合的更新 + 清理算法（纯逻辑）
-//! - [`error_collector::ErrorCollector`]：错误累积
 //! - [`burst::HealthPingRtts`]：环形缓冲 + statistics（avg/deviation/min/max）
 //! - [`burst::HealthPingSettings`]：默认值校验
 //! - [`observer::Observer`]：探测编排
@@ -28,7 +27,6 @@ pub mod burst_feature;
 pub mod command;
 pub mod config;
 pub mod error;
-pub mod error_collector;
 pub mod feature;
 pub mod observer;
 pub mod status;
@@ -50,7 +48,6 @@ pub use config::{
     ObservationResult, ObservatoryConfig, OutboundStatus, ProbeResult,
 };
 pub use error::{ObservatoryError, at_error, at_warning};
-pub use error_collector::ErrorCollector;
 pub use feature::ObservatoryFeature;
 pub use observer::{
     FixedProbeExecutor, HttpProbeExecutor, NoopOutboundSelector, Observer, OutboundSelector,

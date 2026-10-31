@@ -147,6 +147,9 @@ pub(crate) fn build_vless_outbound(
     BuildError,
 > {
     let config = parse_vless_config(&ob.entry.data)?;
+    // bd x0f0r：出站 user level → 出站腿 policy 档位（Go vless/outbound.go:291
+    // `ForLevel(request.User.Level)`；此前恒 level 0 = 出站档位配置静默失效）。
+    let level = config.level;
     let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
     let dial_fn = xray_proxy_vless::make_vless_dial_fn(Arc::new(config));
     wrap_bridge(
@@ -156,6 +159,7 @@ pub(crate) fn build_vless_outbound(
         target_strategy,
         dns,
         send_through,
+        level,
         policy_manager,
     )
 }
@@ -182,6 +186,7 @@ pub(crate) fn build_trojan_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -279,6 +284,9 @@ pub(crate) fn build_vmess_outbound(
     BuildError,
 > {
     let config = xray_proxy_vmess::parse_vmess_config(&ob.entry.data)?;
+    // bd x0f0r：出站 user level → 出站腿 policy 档位（Go vmess/outbound.go:136
+    // `ForLevel(request.User.Level)`）。
+    let level = config.level;
     let config = config.with_stream_settings(parse_stream_settings(&ob.stream_settings_json));
     let dial_fn = xray_proxy_vmess::make_vmess_dial_fn(Arc::new(config), plugin_ctx);
     wrap_bridge(
@@ -288,6 +296,7 @@ pub(crate) fn build_vmess_outbound(
         target_strategy,
         dns,
         send_through,
+        level,
         policy_manager,
     )
 }
@@ -315,6 +324,7 @@ pub(crate) fn build_shadowsocks_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -391,6 +401,7 @@ pub(crate) fn build_hysteria_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -425,6 +436,7 @@ pub(crate) fn build_anytls_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -579,6 +591,7 @@ pub(crate) fn build_wireguard_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -646,6 +659,7 @@ pub(crate) fn build_http_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -671,6 +685,7 @@ pub(crate) fn build_naive_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -696,6 +711,7 @@ pub(crate) fn build_dokodemo_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }
@@ -721,6 +737,7 @@ pub(crate) fn build_tun_outbound(
         target_strategy,
         dns,
         send_through,
+        0,
         policy_manager,
     )
 }

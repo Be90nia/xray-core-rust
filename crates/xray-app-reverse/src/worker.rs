@@ -554,12 +554,17 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         // up_w 随控制流任务存活（Go Link{Writer: uplinkWriter} 被 goroutine 持有），
         // 任务结束 drop → up_r EOF → mux session 收尾。
         // 闸关不可达：内部 scope 无 close 调用（任务随控制流 EOF 自终止）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每控制流 spawn 前先收割（bd 86i4h 阶段2）：条目不随会话数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "reverse internal conn",
+            async move {
                 Self::handle_internal_conn(me, Box::new(dn_r)).await;
                 drop(up_w);
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
         Ok(MuxLink { reader: Box::new(up_r), writer: Box::new(dn_w) })
     }
 
@@ -584,8 +589,12 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
         let transport_link = TransportLink::new(Box::new(read_b), Box::new(write_a));
         let dispatcher = Arc::clone(&self.dispatcher);
         // 闸关不可达：内部 scope 无 close 调用（错误留痕后任务自终止）。
-        self.fx
-            .spawn_tracked(async move {
+        // 每流 spawn 前先收割（bd 86i4h 阶段2）：条目不随流数增长。
+        xray_frame::compat::spawn_reaping(
+            &self.fx,
+            &xray_frame::compat::log(),
+            "reverse inbound dispatch",
+            async move {
                 if let Err(e) = dispatcher
                     .dispatch_link_inbound(
                         &dest,
@@ -602,8 +611,9 @@ impl xray_mux::worker::Dispatcher for BridgeWorker {
                         "reverse bridge inbound dispatch failed"
                     );
                 }
-            })
-            .expect("internal FxScope is never closed");
+            },
+        )
+        .expect("internal FxScope is never closed");
         Ok(MuxLink { reader: Box::new(read_a), writer: Box::new(write_b) })
     }
 }
