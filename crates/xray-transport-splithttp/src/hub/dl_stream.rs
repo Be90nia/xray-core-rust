@@ -27,31 +27,45 @@ use xray_common::alloc_site;
 /// 池化块大小（= 下行 duplex 缓冲 `DUPLEX_BUF`）。
 const CHUNK: usize = super::handler::DUPLEX_BUF;
 
-/// 每流常驻块上限。h2 单流在飞载荷受发送缓冲约束（本仓钉每流 send 400 KiB ≈ 7 块），
-/// 8 块覆盖常态峰值；池未命中或超出上限的块退回按帧分配（不泄漏）。
-/// 实测残余 0.20 MB/MB（改前 1.00）：取块未命中 + `Bytes::from_owner` 每帧一个
-/// owner 包装分配（~72 B，API 固有）。
-const POOL_MAX: usize = 8;
+/// 硬上限 = 本流 h2 在飞块数上界：hyper 每连接 send_buf 缺省 16 MB（窗保底同值），
+/// 一个块至多对应 send_buf 里一个待写帧，加读腿/编码中各 1 块余量。实际池容量按
+/// 本流观测的在飞峰值自适应到该上限（见 `PoolState::put`）。
+const POOL_MAX: usize = 16 * 1024 * 1024 / CHUNK + 2;
 
-/// 空闲块池。归还可能发生在 hyper 的任意 worker 线程，故加锁。
+/// 空闲块账本。归还可能发生在 hyper 的任意 worker 线程，故加锁。
 #[derive(Default)]
 struct BufPool {
-    free: Mutex<Vec<Vec<u8>>>,
+    state: Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    free: Vec<Vec<u8>>,
+    /// 当前在外（hyper 持有未归还）的块数。
+    live: usize,
+    /// 本流观测的在飞峰值 = 池容量依据。
+    peak: usize,
 }
 
 impl BufPool {
     fn take(&self) -> Vec<u8> {
-        self.free
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop()
-            .unwrap_or_else(|| vec![0; CHUNK])
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.live += 1;
+        if st.live > st.peak {
+            st.peak = st.live;
+        }
+        st.free.pop().unwrap_or_else(|| vec![0; CHUNK])
     }
 
     fn put(&self, buf: Vec<u8>) {
-        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
-        if free.len() < POOL_MAX {
-            free.push(buf);
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.live = st.live.saturating_sub(1);
+        // 容量 = 本流观测峰值（封顶 POOL_MAX）：突发排空后的块整批留池，供下一
+        // 突发复用——否则每个「send_buf 填充满→排空」周期都逐帧重分配 64 KiB
+        //（bd 9eu4a：客户端提速后突发深度 >8，旧固定容量把池打成逐帧 churn）。
+        // 驻留 ≤ 本流 send_buf 本就要占的量，且只在真突发过的流上发生。
+        if st.free.len() < st.peak.min(POOL_MAX) {
+            st.free.push(buf);
         }
     }
 }
@@ -152,6 +166,6 @@ mod tests {
         writer.await.expect("写任务不 panic");
 
         assert_eq!(got, expected, "字节内容与顺序必须完整");
-        assert!(!pool.free.lock().expect("池锁未中毒").is_empty(), "块必须归还池");
+        assert!(!pool.state.lock().expect("池锁未中毒").free.is_empty(), "块必须归还池");
     }
 }
