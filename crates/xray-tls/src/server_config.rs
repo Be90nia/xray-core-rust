@@ -14,8 +14,7 @@ use rustls::{
 
 use crate::{
     certificate::{
-        EntryUsage, entry_certs_and_key, entry_usage, extract_cert_names,
-        generate_self_signed_cert, pem_private_key,
+        EntryUsage, entry_certs_and_key, entry_usage, extract_cert_names, pem_private_key,
     },
     config::security_params,
 };
@@ -155,7 +154,8 @@ impl ResolvesServerCert for SniCertResolver {
 /// # 证书来源
 /// - `certificates[].certificateFile + keyFile`：可配置多张（启用 SNI 选择）
 /// - 顶层 `cert` + `key`：单张内联 PEM（anytls 等用）
-/// - 均缺失：回退自签名证书（`localhost` / `127.0.0.1`），便于本地与测试。
+/// - 均缺失：**不自签**（Go 语义：启动成功但每条连接报 `tls: no certificates
+///   configured`）——构建期只 warn，握手由空 resolver 拒绝。
 ///
 /// # 热重载 / OCSP ticker
 /// 对应 Go `setupOcspTicker` 的后台热重载 + OCSP 刷新当前留作 TODO：
@@ -195,15 +195,20 @@ pub fn build_server_config(
     // 证书级键（ocspStapling/oneTimeLoading/buildChain）在 certificates[] 条目内
     // 解析（Go TLSCertConfig），见 cert_entry_flags / any_cert_ocsp_stapling。
 
-    let mut entries = build_named_cert_keys(&json)?;
+    let entries = build_named_cert_keys(&json)?;
 
-    // 无证书配置：回退自签名（保证 TLS 服务端总能启动，对齐 REALITY 的可用性）
+    // 缺证书不再自签（bd mwvwd F2）：Go 服务端没证书时每条连接都失败
+    // （`tls: no certificates configured`），而旧实现每次启动现生成一张 rcgen
+    // 自签证书把握手"打通"——漏配证书的入站看起来是通的，客户端却永远验不过。
+    // 这里保持 Go 语义（启动成功、逐连接失败）并在启动期显式告警；证书由
+    // `certificates[]` / 顶层 `cert`+`key` 提供。
     if entries.is_empty() {
-        let (cert_pem, key_pem) = generate_self_signed_cert(&["localhost", "127.0.0.1"])?;
-        entries.push(NamedCertKey::from_cert_der(
-            pem_certs(cert_pem.as_bytes())?,
-            pem_key(key_pem.as_bytes())?,
-        )?);
+        tracing::warn!(
+            target: "xray_tls::server_config",
+            security,
+            "no TLS certificate configured (certificates[] / cert+key): every handshake \
+             will fail with 'no server certificate chain resolved' (Go: tls: no certificates configured)"
+        );
     }
 
     // minVersion/maxVersion/cipherSuites/curvePreferences → 自定义 provider + 版本列表
@@ -231,6 +236,11 @@ pub fn build_server_config(
     // alpn：对齐 Go GetTLSConfig——NextProtos 取 tlsSettings.alpn，
     // 为空时默认 ["h2", "http/1.1"]（WS/httpupgrade 依赖 http/1.1，gRPC 依赖 h2）。
     config.alpn_protocols = parse_alpn(&json)?;
+
+    // 套件协商按**服务端**偏好序（Go crypto/tls 服务端语义）。rustls 缺省
+    // `ignore_client_order=false` 时跟随客户端 offered 顺序 → 同一客户端连 Go 版与
+    // Rust 版服务端会拿到不同套件（ServerHello 可判定实现，bd mwvwd F3）。
+    config.ignore_client_order = true;
 
     // pwh6: masterKeyLog — Go KeyLogWriter（config.go:467-474）：string 路径
     // 直接追加写 NSS 行；bool true（Rust 历史方言）走 SSLKEYLOGFILE env。
@@ -558,11 +568,33 @@ mod tests {
         assert!(build_server_config("tls", Some(&json)).is_err());
     }
 
-    #[test]
-    fn tls_without_certificates_falls_back_to_self_signed() {
-        // 无证书配置 → 回退自签名（不再报错），保证服务端可启动
-        let config = build_server_config("tls", Some(&serde_json::json!({}))).unwrap();
-        assert!(config.is_some());
+    /// bd mwvwd F2：缺证书不再自签——配置能构建（Go 也是启动成功），但每条连接
+    /// 握手失败（Go `tls: no certificates configured`）。旧实现每次启动现生成
+    /// rcgen 自签证书把握手"打通"，漏配证书的入站看起来是通的。
+    #[tokio::test]
+    async fn no_certificates_fail_handshake() {
+        let config = build_server_config("tls", Some(&serde_json::json!({})))
+            .unwrap()
+            .expect("config builds (Go parses it too; failure is per-connection)");
+        let cc = crate::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({"allowInsecure": true})),
+            "localhost",
+        )
+        .unwrap()
+        .unwrap();
+
+        let (a, b) = tokio::io::duplex(4096);
+        let accept = async {
+            tokio_rustls::TlsAcceptor::from(config).accept(a).await.map_err(io::Error::other)
+        };
+        let connect = async {
+            let name = rustls_pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            tokio_rustls::TlsConnector::from(cc).connect(name, b).await.map_err(io::Error::other)
+        };
+        let (sr, cr) = tokio::join!(accept, connect);
+        assert!(sr.is_err(), "no certificate configured must fail the handshake");
+        assert!(cr.is_err(), "client must see the handshake failure");
     }
 
     #[test]

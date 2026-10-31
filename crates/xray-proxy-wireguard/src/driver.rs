@@ -60,6 +60,10 @@ const UDP_RECV_BUF_SIZE: usize = 65535;
 /// 原始 WG 数据报队列容量（Go readQueue 为无缓冲 chan；此处有界背压）。
 const READ_QUEUE_CAP: usize = 1024;
 
+/// 拨号连接单次写入上限（bd cinni：写无界 = 半死连接永久占住发送路径）。
+/// Go 侧 UDP `WriteTo` 不阻塞，5s 已远超正常排队延迟。
+const DIALED_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 原始 WG 数据报（reserved 已清零）+ 来源地址。
 type WgDatagram = (Vec<u8>, SocketAddr);
 
@@ -94,12 +98,24 @@ pub struct DialedUdp {
     ctx: Arc<PluginContext>,
     /// WG peer endpoint（UDP，IP 已解析）。
     dest: Destination,
-    /// 当前连接写半边；`None` = 未连接/已死，下次 send 重拨。
-    writer: AsyncMutex<Option<tokio::io::WriteHalf<Box<dyn Connection>>>>,
+    /// 当前连接；`None` = 未连接/已死，下次 send 重拨。**sync 锁只在取槽/
+    /// 置槽瞬间持有，绝不跨 await**（bd cinni：旧实现单把异步锁跨拨号与
+    /// `write_all`，读侧判死要同一把锁 → 互锁 → 死连接继续写、永不重拨）。
+    conn: Mutex<Option<Arc<ConnWriter>>>,
+    /// 拨号单飞：N 个 worker 并发 send 只拨一条连接。
+    dialing: AsyncMutex<()>,
     /// 读 task 入队句柄（[`WgDriver::with_transport`] 注入）。
     queue_tx: Mutex<Option<mpsc::Sender<WgDatagram>>>,
     /// 关停信号（main_loop 注入；`None` 时读 task 不受关停控制）。
     shutdown: Mutex<Option<watch::Receiver<bool>>>,
+}
+
+/// 一条拨号连接的写半边。
+///
+/// 槽里存 `Arc`：读侧判死可以就地作废旧连接，不必等仍在飞的写入（写侧只
+/// 持本连接自己的写锁，与槽锁无关）。
+struct ConnWriter {
+    write: AsyncMutex<tokio::io::WriteHalf<Box<dyn Connection>>>,
 }
 
 impl DialedUdp {
@@ -109,9 +125,18 @@ impl DialedUdp {
             dialer,
             ctx,
             dest,
-            writer: AsyncMutex::new(None),
+            conn: Mutex::new(None),
+            dialing: AsyncMutex::new(()),
             queue_tx: Mutex::new(None),
             shutdown: Mutex::new(None),
+        }
+    }
+
+    /// 作废槽里的连接——仅当槽里仍是它（否则会误清重拨后的新连接）。
+    fn drop_conn(&self, dead: &Arc<ConnWriter>) {
+        let mut slot = self.conn.lock();
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, dead)) {
+            *slot = None;
         }
     }
 
@@ -124,45 +149,81 @@ impl DialedUdp {
     }
 
     /// 拨号 + spawn 读 task（Go bind.go:126-166 connectTo：dial → 读 goroutine → readQueue）。
-    async fn connect(
-        self: Arc<Self>,
-    ) -> std::result::Result<tokio::io::WriteHalf<Box<dyn Connection>>, String> {
+    ///
+    /// 单飞：并发 send 只拨一条连接（槽已有则直接复用）。
+    async fn connect(self: Arc<Self>) -> std::result::Result<Arc<ConnWriter>, String> {
+        let _single = self.dialing.lock().await;
+        if let Some(c) = self.conn.lock().clone() {
+            return Ok(c);
+        }
         let conn = (self.dialer)(&self.dest).await?;
         let (read, write) = tokio::io::split(conn);
+        let cw = Arc::new(ConnWriter { write: AsyncMutex::new(write) });
+        // 先置槽再 spawn 读 task：读侧判死（drop_conn）必然发生在置槽之后，
+        // 死连接不会被读侧漏掉而留在槽里（否则下次 send 拿死连接继续黑洞）。
+        *self.conn.lock() = Some(Arc::clone(&cw));
         let d = Arc::clone(&self);
+        let read_conn = Arc::clone(&cw);
         // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
         self.ctx
             .spawn(async move {
-                d.read_loop(read).await;
+                d.read_loop(read, read_conn).await;
             })
             .expect("plugin ctx FxScope is never closed (assembly-owned)");
-        Ok(write)
+        Ok(cw)
+    }
+
+    /// 槽里是否仍是这条连接（等待写锁期间可能已被读侧/他人判死）。
+    fn is_current(&self, conn: &Arc<ConnWriter>) -> bool {
+        self.conn.lock().as_ref().is_some_and(|c| Arc::ptr_eq(c, conn))
     }
 
     /// 发送一个 WG 数据报（XUDP 帧，target = WG endpoint）。
+    ///
+    /// 临界区只有「取槽」与「本连接写锁」两段，拨号与 `write_all` 都在锁外；
+    /// 写入有界（[`DIALED_WRITE_TIMEOUT`]），超时即作废连接让下次 send 重拨。
     pub(crate) async fn send(self: Arc<Self>, wg: &[u8]) -> std::result::Result<(), String> {
-        let mut guard = self.writer.lock().await;
-        if guard.is_none() {
-            *guard = Some(Arc::clone(&self).connect().await?);
-        }
         let mut frame = Vec::with_capacity(wg.len() + 64);
         let mut pw = PacketWriter::new(&mut frame, self.dest.clone(), [0u8; 8]);
         pw.write_packet(wg).map_err(|e| format!("wg dialed xudp frame: {e}"))?;
-        let res = match guard.as_mut() {
-            Some(w) => w.write_all(&frame).await,
-            None => unreachable!("connect() filled writer"),
+        let cached = self.conn.lock().clone();
+        let conn = match cached {
+            Some(c) => c,
+            None => Arc::clone(&self).connect().await?,
         };
-        if res.is_err() {
-            *guard = None; // 连接死——下次 send 重拨
+        let res = {
+            let mut w = conn.write.lock().await;
+            // 等写锁期间本连接可能已被判死：不再往死连接写，否则每个等待者
+            // 各付一次写超时、串行堆叠。
+            if self.is_current(&conn) {
+                Some(tokio::time::timeout(DIALED_WRITE_TIMEOUT, w.write_all(&frame)).await)
+            } else {
+                None
+            }
+        };
+        match res {
+            Some(Ok(Ok(()))) => Ok(()),
+            Some(Ok(Err(e))) => {
+                self.drop_conn(&conn); // 连接死——下次 send 重拨
+                Err(format!("wg dialed conn write: {e}"))
+            },
+            Some(Err(_)) => {
+                self.drop_conn(&conn);
+                Err(format!("wg dialed conn write stalled > {DIALED_WRITE_TIMEOUT:?}"))
+            },
+            None => Err("wg dialed conn already retired".to_string()),
         }
-        res.map_err(|e| format!("wg dialed conn write: {e}"))
     }
 
     /// 读循环：XUDP 帧 → readQueue（Go connectTo 的读 goroutine，bind.go:133-163）。
     ///
-    /// reserved 清零在入队前（Go bind.go:145-149）。连接 EOF/错误 → 清空 writer
-    /// 促使下次 send 重拨。
-    async fn read_loop(self: Arc<Self>, mut read: tokio::io::ReadHalf<Box<dyn Connection>>) {
+    /// reserved 清零在入队前（Go bind.go:145-149）。连接 EOF/错误 → 作废槽内
+    /// 连接促使下次 send 重拨（槽锁不跨 await，在飞写入不受影响）。
+    async fn read_loop(
+        self: Arc<Self>,
+        mut read: tokio::io::ReadHalf<Box<dyn Connection>>,
+        conn: Arc<ConnWriter>,
+    ) {
         let Some(tx) = self.queue_tx.lock().clone() else {
             return;
         };
@@ -199,13 +260,13 @@ impl DialedUdp {
                 let (mut payload, _) = pkt.into_parts();
                 clear_reserved(&mut payload);
                 if tx.send((payload, src)).await.is_err() {
-                    *self.writer.lock().await = None;
+                    self.drop_conn(&conn);
                     return;
                 }
                 acc.drain(..consumed);
             }
         }
-        *self.writer.lock().await = None; // 连接死——下次 send 重拨
+        self.drop_conn(&conn); // 连接死——下次 send 重拨
     }
 }
 
@@ -958,6 +1019,227 @@ mod tests {
             .expect("queue timeout")
             .expect("queued datagram");
         assert_eq!(payload, vec![1u8, 0, 0, 0, 5, 5, 5], "reserved 清零（Go bind.go:145-149）");
+    }
+
+    /// bd cinni：半死连接（读侧 EOF、写侧永久挂住）不得让发送路径停在锁上。
+    ///
+    /// 旧实现单把异步锁跨拨号与 `write_all`：读侧判死要同一把锁，而第一笔写
+    /// 永不返回 → 后续 send 全部堵死、连接永不重拨（静默黑洞）。本测试要求
+    /// 「第一笔写仍挂住时，第二笔 send 能立刻重拨并送达」。
+    #[tokio::test]
+    async fn dialed_send_not_stalled_by_dead_connection_write() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncRead, AsyncWrite};
+
+        /// 读侧立即 EOF、写侧永久 `Pending`（对端不收包也不关连接）。
+        struct StalledConn;
+
+        impl AsyncRead for StalledConn {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(())) // EOF
+            }
+        }
+
+        impl AsyncWrite for StalledConn {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl Connection for StalledConn {
+            fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let dials = Arc::new(AtomicUsize::new(0));
+        let (live_client, mut live_peer) = tokio::io::duplex(64 * 1024);
+        let live_slot: Arc<AsyncMutex<Option<tokio::io::DuplexStream>>> =
+            Arc::new(AsyncMutex::new(Some(live_client)));
+        let dialer: DialFn = {
+            let dials = Arc::clone(&dials);
+            Arc::new(move |_dest: &Destination| {
+                let n = dials.fetch_add(1, Ordering::SeqCst);
+                let live_slot = Arc::clone(&live_slot);
+                Box::pin(async move {
+                    if n == 0 {
+                        return Ok(Box::new(StalledConn) as Box<dyn Connection>);
+                    }
+                    match live_slot.lock().await.take() {
+                        Some(c) => {
+                            Ok(Box::new(xray_transport::connection::DuplexConnection::new(c))
+                                as Box<dyn Connection>)
+                        },
+                        None => Err("unexpected extra dial".to_string()),
+                    }
+                })
+            })
+        };
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([203, 0, 113, 9]),
+            Port::new(51820),
+            Network::UDP,
+        );
+        let dialed = Arc::new(DialedUdp::new(test_ctx(), dialer, dest.clone()));
+        let (tx, _rx) = mpsc::channel(16);
+        dialed.set_queue_tx(tx);
+
+        // 第一笔 send 拨到半死连接：写永久挂住（旧实现此时持有整把 writer 锁）
+        let first = tokio::spawn(Arc::clone(&dialed).send(&[1, 2, 3]));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!first.is_finished(), "半死连接上的写入应挂住");
+
+        // 读侧已 EOF → 槽作废（不等在飞写）→ 第二笔 send 立刻重拨成功
+        tokio::time::timeout(Duration::from_secs(2), Arc::clone(&dialed).send(&[4, 5, 6]))
+            .await
+            .expect("第二笔 send 不得被死连接堵住")
+            .expect("重拨成功");
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "死连接被作废后重拨（旧实现永不重拨）");
+        first.abort();
+
+        // 帧落到新连接对端
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), live_peer.read(&mut buf))
+            .await
+            .expect("wire read timeout")
+            .expect("wire read");
+        let pkt = PacketReader::new(std::io::Cursor::new(&buf[..n]))
+            .read_packet()
+            .expect("parse frame")
+            .expect("one packet");
+        assert_eq!(pkt.data(), &[4, 5, 6], "payload 落在重拨后的连接");
+    }
+
+    /// bd cinni 压测（并发面）：N 路并发 send 打在同一条半死连接上——
+    /// ① 无挂死：全部在有界时间内返回错误（旧实现第一笔写永久持锁，后续全堵）；
+    /// ② 拨号单飞：并发首次拨号只产生一条连接；
+    /// ③ 判死后水位不再重复付超时（迟到的等待者立即拿到 retired 错误）。
+    #[tokio::test]
+    async fn dialed_send_concurrent_stalled_writes_bounded_and_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncRead, AsyncWrite};
+
+        /// 连接活着（读侧 pending，不 EOF）、对端不收包 → 写永久 `Pending`。
+        struct HalfDeadConn {
+            /// 对端句柄保活：drop 即 EOF（本重试语义要"活着但没收包"）。
+            _peer: tokio::io::DuplexStream,
+        }
+
+        impl AsyncRead for HalfDeadConn {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending // 无下行数据也不 EOF
+            }
+        }
+
+        impl AsyncWrite for HalfDeadConn {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending // 对端从不读，缓冲永不满/永不接受
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        impl Connection for HalfDeadConn {
+            fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        const CONCURRENCY: usize = 8;
+        let dials = Arc::new(AtomicUsize::new(0));
+        let dialer: DialFn = {
+            let dials = Arc::clone(&dials);
+            Arc::new(move |_dest: &Destination| {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let (_ours, peer) = tokio::io::duplex(8);
+                    Ok(Box::new(HalfDeadConn { _peer: peer }) as Box<dyn Connection>)
+                })
+            })
+        };
+        let dest = Destination::new(
+            Address::from_ipv4_bytes([203, 0, 113, 77]),
+            Port::new(51820),
+            Network::UDP,
+        );
+        let dialed = Arc::new(DialedUdp::new(test_ctx(), dialer, dest));
+        let (tx, _rx) = mpsc::channel(16);
+        dialed.set_queue_tx(tx);
+
+        // 并发首发：同时进入 send（同一轮调度内 fetch 槽 → 触发单飞拨号）
+        let mut tasks = Vec::with_capacity(CONCURRENCY);
+        for i in 0..CONCURRENCY {
+            let d = Arc::clone(&dialed);
+            tasks.push(tokio::spawn(async move { d.send(&[i as u8, 1, 2]).await }));
+        }
+        let mut errs = 0usize;
+        // 有界等待：单连接一次写超时 + 余量；旧实现此处置永久挂死。
+        let deadline = tokio::time::timeout(DIALED_WRITE_TIMEOUT + Duration::from_secs(5), async {
+            for t in tasks {
+                let r = t.await.expect("task must not panic");
+                assert!(r.is_err(), "半死连接上的 send 必须报错");
+                errs += 1;
+            }
+        });
+        deadline.await.expect("并发 send 不得挂死（bd cinni）");
+        assert_eq!(errs, CONCURRENCY, "每路 send 都有明确错误返回，无静默成功");
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "并发首次拨号单飞：只拨一条连接（无重复连接泄漏）"
+        );
     }
 
     /// 双 driver 真握手贯穿 worker 池（num_workers=2 两侧）——证明多 worker

@@ -147,6 +147,40 @@ pub(crate) async fn build_mixed_inbound(
     })))
 }
 
+/// portal 侧反向接入选项（bd nip4p）：settings 里的 user `reverse.tag` →
+/// `enable_reverse` + registry（tag → `v1.rvs.cool`）+ 出站解析面 `ohm`。
+///
+/// 对应 Go `proxy/vless/inbound/inbound.go:191-215 GetReverse`：portal 侧的
+/// portal outbound handler 由反向装配（[`crate::reverse`]）登记进 ohm，本函数
+/// 只做入站侧三个开关的赋值；handler 不在场即拒启（配置声明了 reverse、
+/// 却无人接 Rvs 的静默失效形态必须消失）。
+fn apply_vless_reverse(
+    options: &mut VlessInboundOptions,
+    settings: &[u8],
+    ohm: &Arc<SimpleOhm>,
+) -> std::io::Result<()> {
+    let tags = crate::reverse::vless_inbound_reverse_tags(settings);
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let registry = xray_proxy_vless::ReverseRegistry::new();
+    for tag in &tags {
+        registry
+            .add_reverse(xray_proxy_vless::PortalConfig::new(tag.clone()))
+            .map_err(|e| std::io::Error::other(format!("vless reverse tag `{tag}`: {e}")))?;
+        if ohm.get_handler(tag).is_none() {
+            return Err(std::io::Error::other(format!(
+                "vless reverse tag `{tag}`: portal outbound handler not registered \
+                 (reverse assembly missing)"
+            )));
+        }
+    }
+    options.enable_reverse = true;
+    options.reverse_registry = Some(Arc::new(registry));
+    options.reverse_ohm = Some(Arc::clone(ohm));
+    Ok(())
+}
+
 pub(crate) async fn build_vless_inbound(
     ib: &BuiltInbound,
     ohm: Arc<SimpleOhm>,
@@ -168,6 +202,10 @@ pub(crate) async fn build_vless_inbound(
         handshake_timeout: Some(handshake_timeout_for(&policy, 0)),
         ..Default::default()
     };
+    // portal 侧反向接入（bd nip4p）：用户 `reverse.tag` 即 portal tag（Go
+    // `inbound.go:191-215 GetReverse`）。三件缺一即拒启——配置写了 reverse 却
+    // 收 Rvs 时只 warn+close 的静默失效形态必须消失。
+    apply_vless_reverse(&mut options, &ib.entry.data, &ohm)?;
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     // splithttp 入站 AllowedNetwork（Go proxyman inbound.go:177-179）
@@ -590,8 +628,15 @@ pub(crate) async fn build_hysteria_inbound(
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
     })?;
+    // bd a3tos：finalmask 必须取 `streamSettings.finalmask` 子对象——此前误传整个
+    // streamSettings，`parse_udp_obfs`/`parse_quic_params` 读的顶层 `udp`/
+    // `quicParams` 键永不命中 → 配了 obfs 的 hysteria2 入站照样裸 QUIC 收包，
+    // 非法混淆配置也不报错。取法与出站侧（`arm_builders/outbound.rs` 的
+    // `StreamSettings.finalmask_json`）同源。
+    let stream =
+        xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
     let (config, factory) =
-        parse_hysteria_inbound_config(&ib.entry.data, bind_addr, ib.stream_settings_json.as_ref())?;
+        parse_hysteria_inbound_config(&ib.entry.data, bind_addr, stream.finalmask_json.as_ref())?;
     let dispatch = ohm.get_default_handler().ok_or_else(|| {
         std::io::Error::other("hysteria inbound requires a default outbound handler")
     })?;
@@ -903,6 +948,11 @@ pub(crate) fn vmess_transport_on_conn(
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+    // bd txtpo：反重放历史的 30s 周期清理（Go task.Periodic）。托管 ctx 就地构造
+    // （同 ss_transport_on_conn），由返回的 ConnHandler 闭包保活——监听器结束即
+    // 随 scope 收口，任务不会活得比 inbound 久。
+    let cleanup_ctx = Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
+    history.start_cleanup(&cleanup_ctx);
     // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
     let is_drain = !settings.is_tls();
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
@@ -911,6 +961,8 @@ pub(crate) fn vmess_transport_on_conn(
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
+        // 保活：清理任务挂在 cleanup_ctx 的 scope 上，闭包在监听器存活期间持有它。
+        let _cleanup_ctx = Arc::clone(&cleanup_ctx);
         #[allow(
             clippy::disallowed_methods,
             reason = "inbound 连接处理任务（vmess，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
@@ -1085,6 +1137,8 @@ pub(crate) fn unix_vmess_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
     let UnixInboundCtx { ib, policy, settings, listener, handler, plugin_ctx, .. } = ctx;
     let validator = build_vmess_validator(&ib.entry.data)?;
     let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
+    // bd txtpo：反重放历史的 30s 周期清理（Go task.Periodic），随本 inbound 停机取消。
+    history.start_cleanup(&plugin_ctx);
     // security 已 gate 为 none → 与裸 TCP 分支同为 drain 语义。
     let is_drain = !settings.is_tls();
     tracing::info!(tag = %ib.tag, "vmess (uds) inbound listening");
@@ -1210,11 +1264,12 @@ pub(crate) fn unix_vless_transport(
         ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
     }
     let decryption = build_vless_decryption(&ctx.ib.entry.data, Arc::new(ctx_builder))?;
-    let options = VlessInboundOptions {
+    let mut options = VlessInboundOptions {
         decryption: decryption.clone(),
         handshake_timeout: Some(handshake_timeout_for(ctx.policy, 0)),
         ..Default::default()
     };
+    apply_vless_reverse(&mut options, &ctx.ib.entry.data, ctx.ohm)?;
     vless_transport_on_conn(
         ctx.ib,
         ctx.ohm,

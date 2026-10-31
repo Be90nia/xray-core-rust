@@ -507,8 +507,22 @@ impl FinalRuleConfig {
             },
         };
         let networks = v.get("network").map(json_network_list).unwrap_or_default();
-        let port_list = v.get("port").and_then(json_port_list);
-        let ip = v.get("ip").map(json_ip_rules).unwrap_or_default();
+        // bd 5w5z0：port/ip 的非法项必须**硬错**（Go 在解码期 `PortRange.UnmarshalJSON`
+        // / `geodata.ParseIPRules` 就报错）。旧实现逐项 `continue`/`filter_map(ok)`
+        // 丢弃，丢空后 `port_list=None` / `ip=None` = **匹配所有**——一条笔误
+        // （`ip:["not-an-ip"]`、`port:"18500,bad"`）把规则从"精确"翻转成"全阻断"。
+        let port_list = match v.get("port") {
+            Some(p) if !p.is_null() => Some(json_port_list(p).map_err(|e| {
+                crate::error::FreedomError::InvalidConfig(format!("finalRule port: {e}"))
+            })?),
+            _ => None,
+        };
+        let ip = match v.get("ip") {
+            Some(ip) if !ip.is_null() => json_ip_rules(ip).map_err(|e| {
+                crate::error::FreedomError::InvalidConfig(format!("finalRule ip: {e}"))
+            })?,
+            _ => Vec::new(),
+        };
         let block_delay = v.get("blockDelay").and_then(json_int32_range);
         Ok(Self { action, networks, port_list, ip, block_delay })
     }
@@ -531,47 +545,56 @@ fn json_network_list(v: &serde_json::Value) -> Vec<i32> {
     let tokens: Vec<String> = match v {
         serde_json::Value::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
         serde_json::Value::Array(a) => {
-            a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect()
+            a.iter().map(|x| x.as_str().unwrap_or_default().trim().to_string()).collect()
         },
-        _ => Vec::new(),
+        // 类型不符（数组/字符串都不是）：Go 解码期硬错；此处退化为 Unknown
+        // （永不命中），绝不退化成空表（空表 = 匹配全部）。
+        _ => vec![String::new()],
     };
     tokens
         .into_iter()
-        .filter_map(|t| match t.to_ascii_lowercase().as_str() {
-            "tcp" => Some(xray_proto::xray::common::net::Network::Tcp as i32),
-            "udp" => Some(xray_proto::xray::common::net::Network::Udp as i32),
-            "unix" => Some(xray_proto::xray::common::net::Network::Unix as i32),
-            _ => None,
+        // 未知 token 按 Go `Network.Build`（infra/conf/common.go:79-90）映射
+        // `Unknown`（索引 0，永不命中 TCP/UDP）。**不得丢弃**：丢空后
+        // `networks` 为空 → `FinalRule::build` 走 ALL_NETWORKS，规则从"永不命中"
+        // 翻成"匹配全部网络"（bd 5w5z0）。
+        .map(|t| match t.to_ascii_lowercase().as_str() {
+            "tcp" => xray_proto::xray::common::net::Network::Tcp as i32,
+            "udp" => xray_proto::xray::common::net::Network::Udp as i32,
+            "unix" => xray_proto::xray::common::net::Network::Unix as i32,
+            _ => xray_proto::xray::common::net::Network::Unknown as i32,
         })
         .collect()
 }
 
 /// Go `PortList`：`"443,80-90"` 字符串 / 数字数组 / 混合数组 → proto `PortList`。
-fn json_port_list(v: &serde_json::Value) -> Option<xray_proto::xray::common::net::PortList> {
+///
+/// 每个条目都必须解析成功（Go `PortRange.UnmarshalJSON` 对非法端口范围直接
+/// 报错 → 配置拒启）。旧实现 `continue` 丢项，丢空后返回 `None` = **匹配所有
+/// 端口**（bd 5w5z0）。
+fn json_port_list(
+    v: &serde_json::Value,
+) -> std::result::Result<xray_proto::xray::common::net::PortList, String> {
     let items: Vec<String> = match v {
         serde_json::Value::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
         serde_json::Value::Array(a) => a
             .iter()
             .map(|x| match x {
-                serde_json::Value::String(s) => s.trim().to_string(),
-                serde_json::Value::Number(n) => n.to_string(),
-                _ => String::new(),
+                serde_json::Value::String(s) => Ok(s.trim().to_string()),
+                serde_json::Value::Number(n) => Ok(n.to_string()),
+                _ => Err(format!("port entry is not a string or number: {x}")),
             })
-            .collect(),
+            .collect::<std::result::Result<Vec<_>, _>>()?,
         serde_json::Value::Number(n) => vec![n.to_string()],
-        _ => return None,
+        other => return Err(format!("port list must be a string, number or array: {other}")),
     };
     let mut range = Vec::new();
     for item in items {
-        let Some((from, to)) = parse_port_range_str(&item) else {
-            continue;
-        };
+        let (from, to) = parse_port_range_str(&item)
+            .filter(|(_, to)| *to <= u32::from(u16::MAX))
+            .ok_or_else(|| format!("invalid port range: {item}"))?;
         range.push(xray_proto::xray::common::net::PortRange { from, to });
     }
-    if range.is_empty() {
-        return None;
-    }
-    Some(xray_proto::xray::common::net::PortList { range })
+    Ok(xray_proto::xray::common::net::PortList { range })
 }
 
 /// `"443"` / `"80-90"` → (from, to)。解析失败返回 `None`。
@@ -587,29 +610,51 @@ fn parse_port_range_str(s: &str) -> Option<(u32, u32)> {
 }
 
 /// Go `StringList` IP 规则：`["10.0.0.0/8", "fc00::/7", "1.2.3.4"]` → proto `IpRule`
-/// 列表（Custom CIDR；裸 IP 视为 /32 或 /128）。无法解析的项跳过。
-fn json_ip_rules(v: &serde_json::Value) -> Vec<xray_proto::xray::common::geodata::IpRule> {
+/// 列表（Custom CIDR；裸 IP 视为 /32 或 /128）。
+///
+/// 每个条目都必须可解析（Go `geodata.ParseIPRules` 对非法 IP / 非法前缀直接
+/// 报错 → 拒启）。旧实现 `filter_map(ok)` 丢项，丢空后 `ip = None` = **匹配所有
+/// 地址**——`ip:["not-an-ip"]` 会把一条精确规则翻转成全阻断（bd 5w5z0）。
+///
+/// `geoip:` 前缀规则本期不支持（Go 经 `geodata.IPReg` 装载资产）：显式报错拒启，
+/// 不得静默丢弃（丢空 = 匹配所有）。
+fn json_ip_rules(
+    v: &serde_json::Value,
+) -> std::result::Result<Vec<xray_proto::xray::common::geodata::IpRule>, String> {
     let items: Vec<&str> = match v {
         serde_json::Value::String(s) => s.split(',').map(|t| t.trim()).collect(),
-        serde_json::Value::Array(a) => {
-            a.iter().filter_map(|x| x.as_str().map(|s| s.trim())).collect()
-        },
-        _ => return Vec::new(),
+        serde_json::Value::Array(a) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(|s| s.trim())
+                    .ok_or_else(|| format!("ip rule entry is not a string: {x}"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        other => return Err(format!("ip rules must be a string or array: {other}")),
     };
     items
         .into_iter()
-        .filter_map(|s| {
+        .map(|s| {
+            if let Some(code) = s.strip_prefix("geoip:") {
+                return Err(format!(
+                    "geoip rule `geoip:{code}` is not supported in freedom finalRules \
+                     (asset loading unimplemented); use explicit CIDRs instead"
+                ));
+            }
             let (ip_str, prefix) = match s.split_once('/') {
-                Some((ip, p)) => (ip, Some(p.parse::<u32>().ok()?)),
+                Some((ip, p)) => {
+                    (ip, Some(p.parse::<u32>().map_err(|_| format!("invalid CIDR prefix: {s}"))?))
+                },
                 None => (s, None),
             };
-            let ip: IpAddr = ip_str.parse().ok()?;
+            let ip: IpAddr = ip_str.parse().map_err(|_| format!("invalid IP: {s}"))?;
             // 无 `/` = 单地址（/32、/128）；显式 `/0` 保留 0（全匹配）。
             let prefix = prefix.unwrap_or(match ip {
                 IpAddr::V4(_) => 32,
                 IpAddr::V6(_) => 128,
             });
-            Some(xray_proto::xray::common::geodata::IpRule {
+            Ok(xray_proto::xray::common::geodata::IpRule {
                 value: Some(ip_rule::Value::Custom(xray_proto::xray::common::geodata::CidrRule {
                     cidr: Some(xray_proto::xray::common::geodata::Cidr {
                         ip: match ip {
@@ -837,7 +882,7 @@ impl FinalRule {
             action: config.action,
             network,
             port,
-            ip: build_ip_matcher_from_rules(&config.ip),
+            ip: build_ip_matcher_from_rules(&config.ip)?,
             block_delay: config.block_delay,
         })
     }
@@ -921,24 +966,31 @@ fn to_mem_port_list(pl: &xray_proto::xray::common::net::PortList) -> MemoryPortL
     MemoryPortList::new(ranges)
 }
 
-/// 从 proto `IpRule` 列表构建 IP matcher（仅消费 Custom CIDR 变体）。
+/// 从 proto `IpRule` 列表构建 IP matcher（仅 Custom CIDR 变体）。
 ///
-/// ponytail: Geoip 变体需要 geodata loader，freedom 直连出口通常用 Custom CIDR；
-/// geoip 规则被忽略（None=不限制）。需要 geoip 时升级为 build_optimized_ip_matcher。
+/// 非 Custom 变体（Geoip / Domain 等）本期不支持（需 geodata loader）：**硬错拒启**。
+/// 旧实现静默丢弃，丢空后 `None` = 匹配所有地址 → 规则语义翻转（bd 5w5z0）。
 fn build_ip_matcher_from_rules(
     rules: &[xray_proto::xray::common::geodata::IpRule],
-) -> Option<Arc<dyn IPMatcher>> {
-    let cidrs: Vec<xray_geodata::pb::Cidr> = rules
-        .iter()
-        .filter_map(|r| match &r.value {
-            Some(ip_rule::Value::Custom(c)) => c
-                .cidr
-                .as_ref()
-                .map(|cidr| xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix)),
-            _ => None,
-        })
-        .collect();
-    if cidrs.is_empty() { None } else { Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs))) }
+) -> Result<Option<Arc<dyn IPMatcher>>> {
+    let mut cidrs: Vec<xray_geodata::pb::Cidr> = Vec::with_capacity(rules.len());
+    for r in rules {
+        let Some(ip_rule::Value::Custom(c)) = &r.value else {
+            return Err(crate::error::FreedomError::InvalidConfig(
+                "finalRule ip: non-CIDR ip rule (geoip/domain) is not supported".into(),
+            ));
+        };
+        let Some(cidr) = c.cidr.as_ref() else {
+            return Err(crate::error::FreedomError::InvalidConfig(
+                "finalRule ip: CIDR rule without cidr payload".into(),
+            ));
+        };
+        cidrs.push(xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix));
+    }
+    if cidrs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs))))
 }
 
 /// 缓存的私有 IP matcher（从 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建）。
@@ -1166,6 +1218,74 @@ pub fn block_delay(rule: &FinalRule) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== bd 5w5z0：finalRules 静默丢项 → 语义翻转（丢空 = 匹配所有） =====
+
+    /// port / ip 的非法项必须硬错（Go 解码期 `PortRange.UnmarshalJSON` /
+    /// `geodata.ParseIPRules` 硬错）。旧实现逐项丢弃，丢空后 `None` = 匹配所有
+    /// → `ip:["not-an-ip"]` 把精确规则翻转成全阻断（E1 实证：全流量黑洞、零日志）。
+    #[test]
+    fn final_rule_rejects_invalid_port_and_ip() {
+        let e = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "ip": ["not-an-ip"]
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("invalid IP"), "{e}");
+
+        let e = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "port": "18500,bad-port"
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("invalid port range"), "{e}");
+
+        // geoip 变体未实现（需 geodata loader）→ 拒启，不得静默丢弃（丢空 = 匹配所有）
+        let e = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "ip": ["geoip:cn"]
+        }))
+        .unwrap_err();
+        assert!(e.to_string().contains("geoip"), "{e}");
+
+        // 合法配置照常（不误报）
+        let c = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "allow", "port": "443,80-90", "ip": ["10.0.0.0/8"], "network": "tcp,udp"
+        }))
+        .expect("valid rule parses");
+        assert_eq!(c.ip.len(), 1);
+        assert_eq!(c.networks.len(), 2);
+        assert!(c.port_list.is_some());
+    }
+
+    /// 未知 network token → `Network::Unknown`（Go `Network.Build` 同款，永不命中），
+    /// **不得**丢空变成 ALL_NETWORKS。
+    #[test]
+    fn final_rule_unknown_network_never_widens() {
+        let c = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "network": "tpc"
+        }))
+        .expect("parse");
+        let rule = FinalRule::build(&c).expect("build");
+        assert!(!rule.match_network(1), "TCP 不得被未知 token 命中");
+        assert!(!rule.match_network(2), "UDP 不得被未知 token 命中");
+    }
+
+    /// 运行期 matcher 构建：非 CIDR 变体（geoip）硬错，不得丢弃后变 None(=匹配所有)。
+    #[test]
+    fn final_rule_geoip_ip_rule_rejected_at_build() {
+        use xray_proto::xray::common::geodata::{GeoIpRule, IpRule};
+        let c = FinalRuleConfig {
+            action: RuleAction::Block,
+            ip: vec![IpRule {
+                value: Some(ip_rule::Value::Geoip(GeoIpRule {
+                    file: String::new(),
+                    code: "cn".into(),
+                    reverse_match: false,
+                })),
+            }],
+            ..Default::default()
+        };
+        let e = FinalRule::build(&c).expect_err("geoip ip rule must be rejected");
+        assert!(e.to_string().contains("not supported"), "{e}");
+    }
 
     // ===== fragment / noises JSON 解析（Go infra/conf/freedom.go） =====
 

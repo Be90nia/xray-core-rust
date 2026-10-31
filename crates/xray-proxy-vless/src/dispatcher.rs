@@ -551,14 +551,6 @@ async fn establish_conn(
 /// `[2B BE len][裸载荷]`，见 `xray-app-dispatcher::udp_session`。
 type VlessUdpFramedConn = XudpWireConn<Box<dyn Connection>>;
 
-
-
-
-
-
-
-
-
 /// 判断错误是否为 0-RTT 票据拒绝（[`crate::encryption::TICKET_REJECTED_MSG`]）。
 fn is_ticket_rejected(e: &io::Error) -> bool {
     e.to_string().contains(crate::encryption::TICKET_REJECTED_MSG)

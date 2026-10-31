@@ -4965,10 +4965,29 @@ pub(crate) fn build_vless_validator(
             if testseed.len() < 4 {
                 testseed = cfg_testseed.clone();
             }
+            // bd nip4p：`reverse` 此前整块丢弃 → vless 入站永远看不到
+            // user.reverse，portal 侧 100% 失效。Go `infra/conf/vless.go:88-91`：
+            // 配了 reverse 但 tag 空 = 配置硬错（对齐 conf 层拒启）。
+            let reverse = match c.get("reverse") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(r) => {
+                    let tag = r.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+                    if tag.is_empty() {
+                        return Err(std::io::Error::other(
+                            r#"VLESS users: "tag" can't be empty for "reverse""#,
+                        ));
+                    }
+                    Some(xray_proto::xray::proxy::vless::Reverse {
+                        tag: tag.to_string(),
+                        sniffing: None,
+                    })
+                },
+            };
             let proto = VlessProtoAccount {
                 id: id.to_string(),
                 flow,
                 encryption: "none".to_string(),
+                reverse,
                 testseed,
                 ..Default::default()
             };

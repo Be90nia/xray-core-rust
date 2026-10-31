@@ -223,7 +223,7 @@ impl BbrSender {
     pub fn new(
         clock: Arc<dyn Clock>,
         initial_max_datagram_size: ByteCount,
-        _profile: Profile,
+        profile: Profile,
     ) -> Self {
         let initial_cwnd = INITIAL_CONGESTION_WINDOW_PACKETS * initial_max_datagram_size;
         let max_cwnd = 100 * initial_max_datagram_size; // ponytail: MaxCongestionWindowPackets = 100
@@ -240,7 +240,7 @@ impl BbrSender {
             ((rate.0 as f64) * gain) as ByteCount
         }));
 
-        let inner = BbrInner {
+        let mut inner = BbrInner {
             rtt_stats: None,
             sampler,
             mode: BbrMode::Startup,
@@ -292,6 +292,10 @@ impl BbrSender {
             bytes_in_flight: 0,
         };
 
+        // bd 37jw1：构造期应用配置的 BBR profile（Go `NewBbrSender` 同址调用
+        // `applyProfile`）。此前这里恒为标准 profile，`bbrProfile` 配置永远无效。
+        Self::apply_profile_locked(&mut inner, profile);
+
         // 同步初始 (rate, gain) 到 pacer 闭包
         *bw_state.lock() = (inner.pacing_rate, inner.pacing_gain);
 
@@ -301,7 +305,6 @@ impl BbrSender {
     }
 
     /// 应用 Profile 配置（对应 Go `applyProfile`）。
-    #[allow(dead_code)] // BBR 状态机完整翻译，profile 切换待接线
     fn apply_profile_locked(inner: &mut BbrInner, profile: Profile) {
         let cfg = config_for_profile(profile);
         inner.profile = profile;
@@ -518,6 +521,24 @@ mod tests {
         assert_eq!(s.profile(), Profile::Standard);
         assert!(s.in_slow_start());
         assert!(!s.in_recovery());
+    }
+
+    /// bd 37jw1：构造期按 `bbrProfile` 应用 gain（此前恒为 Standard，
+    /// 配置成 aggressive/conservative 全部无效）。
+    #[test]
+    fn new_sender_applies_configured_profile() {
+        for (profile, high_gain, cwnd_gain) in [
+            (Profile::Conservative, 2.25_f64, 1.75_f64),
+            (Profile::Standard, DEFAULT_HIGH_GAIN, DERIVED_HIGH_CWND_GAIN),
+            (Profile::Aggressive, 3.0, 2.25),
+        ] {
+            let s = BbrSender::new(Arc::new(DefaultClock::new()), INITIAL_PACKET_SIZE, profile);
+            assert_eq!(s.profile(), profile);
+            let inner = s.inner.lock();
+            assert!((inner.high_gain - high_gain).abs() < 1e-9, "{profile:?} high_gain");
+            assert!((inner.high_cwnd_gain - cwnd_gain).abs() < 1e-9, "{profile:?} high_cwnd_gain");
+            assert!((inner.drain_gain - 1.0 / high_gain).abs() < 1e-9, "{profile:?} drain_gain");
+        }
     }
 
     #[test]

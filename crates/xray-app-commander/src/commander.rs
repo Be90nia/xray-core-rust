@@ -496,15 +496,59 @@ impl Commander {
         let declared = |url: &str| self.services().iter().any(|s| s.type_url() == url);
         let enable_reflection = declared(api_services::REFLECTION);
         let enable_handler = declared(api_services::HANDLER);
-        let logger =
-            declared(api_services::LOGGER).then(|| self.logger_service.read().clone()).flatten();
-        let stats =
-            declared(api_services::STATS).then(|| self.stats_service.read().clone()).flatten();
-        let routing =
-            declared(api_services::ROUTING).then(|| self.routing_service.read().clone()).flatten();
-        let observatory = declared(api_services::OBSERVATORY)
-            .then(|| self.observatory_service.read().clone())
-            .flatten();
+        // bd lu37q：声明了服务但后端未注入 = 装配缺口，**启动即失败**（Go
+        // `app/router/command:139-147` 等 `RequireFeatures(callback, false)` +
+        // `common.Must`：拿不到 feature 直接 panic = 进程退出）。
+        // 旧实现 `.then(|| backend).flatten()` 静默吞 None → 声明的服务恒
+        // UNIMPLEMENTED，而后端实现齐全（routing 8 op / observatory 全无入口）。
+        //
+        // `backend_of` 同时承担「声明集 = 暴露面 allowlist」的老语义：未声明 →
+        // None（不暴露），声明了但后端缺失 → 记入 `missing`。
+        fn backend_of<T: Clone>(
+            declared: bool,
+            name: &'static str,
+            slot: &RwLock<Option<T>>,
+            missing: &mut Vec<&'static str>,
+        ) -> Option<T> {
+            if !declared {
+                return None;
+            }
+            let value = slot.read().clone();
+            if value.is_none() {
+                missing.push(name);
+            }
+            value
+        }
+        let mut missing: Vec<&'static str> = Vec::new();
+        let logger = backend_of(
+            declared(api_services::LOGGER),
+            "LoggerService",
+            &self.logger_service,
+            &mut missing,
+        );
+        let stats = backend_of(
+            declared(api_services::STATS),
+            "StatsService",
+            &self.stats_service,
+            &mut missing,
+        );
+        let routing = backend_of(
+            declared(api_services::ROUTING),
+            "RoutingService",
+            &self.routing_service,
+            &mut missing,
+        );
+        let observatory = backend_of(
+            declared(api_services::OBSERVATORY),
+            "ObservatoryService",
+            &self.observatory_service,
+            &mut missing,
+        );
+        if !missing.is_empty() {
+            // 报错文案带声明集与服务名：用户按 Go 文档声明了服务却没后端，必须
+            // 立刻看见「声明的服务不存在」而不是拿到恒 UNIMPLEMENTED。
+            return Err(CommanderError::ServiceNotRegistered { services: missing.join(", ") });
+        }
         if !enable_handler
             && logger.is_none()
             && stats.is_none()
@@ -1328,37 +1372,22 @@ mod tests {
         commander.close().unwrap();
     }
 
-    /// 声明 StatsService 但后端未注入 → 同样不暴露（无后端可注册）。
+    /// 声明 StatsService 但后端未注入 → **启动失败**（bd lu37q：对齐 Go
+    /// `RequireFeatures(..., false)` + `common.Must` 的 panic 语义）。
+    /// 旧行为是"静默不注册"，声明的服务恒 UNIMPLEMENTED 而无人知晓。
     #[tokio::test]
-    async fn listen_mode_declared_without_backend_not_exposed() {
-        use xray_proto::xray::app::stats::command::{
-            GetStatsRequest, stats_service_client::StatsServiceClient,
-        };
+    async fn listen_mode_declared_without_backend_fails_start() {
+        use xray_features::Feature as _;
 
-        let (port, commander) = start_commander_retrying(|port| {
-            let commander = Commander::new("api", Some(format!("127.0.0.1:{port}")));
-            assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
-                "StatsService",
-                api_services::STATS,
-            ))));
-            commander
-        })
-        .await;
-
-        let mut client = dial_with_retry(
-            || StatsServiceClient::connect(format!("http://127.0.0.1:{port}")),
-            "dial commander api",
-        )
-        .await;
-        let err = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            client
-                .get_stats(GetStatsRequest { name: "unit>>>gate>>>counter".into(), reset: false }),
-        )
-        .await
-        .expect("no timeout")
-        .expect_err("declared-but-backendless service must be unimplemented");
-        assert_eq!(err.code(), tonic::Code::Unimplemented, "got: {err:?}");
-        commander.close().unwrap();
+        let commander = Commander::new("api", Some("127.0.0.1:0".to_string()));
+        assert!(commander.add_service(Arc::new(DeclaredServiceMarker::new(
+            "StatsService",
+            api_services::STATS,
+        ))));
+        // bind 用 :0，不会撞端口；失败必须来自缺失后端的门。
+        let err = commander.start().expect_err("declared-but-backendless service must fail start");
+        let msg = err.to_string();
+        assert!(msg.contains("StatsService"), "error must name the service: {msg}");
+        assert!(msg.contains("no backend injected"), "unexpected error: {msg}");
     }
 }

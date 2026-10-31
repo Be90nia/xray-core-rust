@@ -314,21 +314,18 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
         )));
     }
 
-    // 2b) useSystemCA（票 5std M4）：tls security 下硬错。Go transport_security.go:319/407
-    //     （UseSystemCa → x509.SystemCertPool）；Rust TLS 栈无系统 CA 装载能力
-    //     （全仓 system_ca|useSystemCA 0 命中），静默忽略 = 实际信任库与配置
-    //     意图不一致（验证结果可能因根证书集差异而变）。非 bool 类型手误按
-    //     "已设置"拒启，不静默丢（bd zl5t 类型错误fail-loud 惯例）。
+    // 2b) useSystemCA（bd 1avs1）：已接线——`xray_tls::client_config::verifier_roots`
+    //     按 Go `loadCA(UseSystemCa)` 读 OS 信任库（`rustls-native-certs`）；缺省
+    //     （false）仍用内置根 bundle（Go `x509roots` / Rust `webpki-roots`，同源
+    //     Mozilla 根集）。只校验类型，非 bool 手误按"已设置"拒启（bd zl5t 惯例）。
     if is_tls
-        && ss.get("tlsSettings").and_then(|t| t.get("useSystemCA")).is_some_and(|v| match v {
-            serde_json::Value::Bool(b) => *b,
-            serde_json::Value::Null => false,
-            _ => true,
-        })
+        && ss
+            .get("tlsSettings")
+            .and_then(|t| t.get("useSystemCA"))
+            .is_some_and(|v| !matches!(v, serde_json::Value::Bool(_) | serde_json::Value::Null))
     {
         return Err(LintError::new(format!(
-            "{kind} '{tag}': tlsSettings.useSystemCA is not supported by this build; \
-             remove the key (Rust ships its own bundled root store)"
+            "{kind} '{tag}': tlsSettings.useSystemCA must be a boolean"
         )));
     }
 
@@ -783,45 +780,47 @@ mod tests {
         }
     }
 
-    /// 票 5std M4：tlsSettings.useSystemCA=true 硬错（Rust 无系统 CA 装载能力，
-    /// 静默忽略 = 信任库与配置意图不一致）；false/缺省放行。
+    /// bd 1avs1：tlsSettings.useSystemCA 已接线（OS 信任库）→ true/false/缺省全放行；
+    /// 非 bool 类型手误仍硬错点名（bd zl5t 类型错误 fail-loud 惯例）。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（Config 无 Debug，禁 expect_err）
-    fn strictness_rejects_use_system_ca() {
+    fn strictness_allows_use_system_ca_bool() {
         let _g = TEST_LOCK.lock();
         clear_stages();
         register_builtin_stages();
+        for value in [json!(true), json!(false), serde_json::Value::Null] {
+            let mut cfg = Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(json!({
+                        "network": "tcp", "security": "tls",
+                        "tlsSettings": {"serverName": "x", "useSystemCA": value}
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            post_process(&mut cfg).unwrap_or_else(|e| panic!("useSystemCA={value} must pass: {e}"));
+        }
+
+        // 类型手误（字符串）→ 硬错点名字段
         let mut cfg = Config {
             outbound_configs: vec![crate::config::OutboundDetourConfig {
                 protocol: "vless".into(),
                 tag: "ob".into(),
                 stream_settings: Some(json!({
                     "network": "tcp", "security": "tls",
-                    "tlsSettings": {"serverName": "x", "useSystemCA": true}
+                    "tlsSettings": {"serverName": "x", "useSystemCA": "yes"}
                 })),
                 ..Default::default()
             }],
             ..Default::default()
         };
-        let err = post_process(&mut cfg).err().expect("useSystemCA=true must be rejected");
+        let err = post_process(&mut cfg).err().expect("non-bool useSystemCA must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("useSystemCA"), "got: {msg}");
-        assert!(msg.contains("not supported"), "got: {msg}");
-
-        // false / 缺省不受影响。
-        let mut cfg = Config {
-            outbound_configs: vec![crate::config::OutboundDetourConfig {
-                protocol: "vless".into(),
-                tag: "ob".into(),
-                stream_settings: Some(json!({
-                    "network": "tcp", "security": "tls",
-                    "tlsSettings": {"serverName": "x", "useSystemCA": false}
-                })),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        post_process(&mut cfg).expect("useSystemCA=false must pass");
+        assert!(msg.contains("boolean"), "got: {msg}");
     }
 
     /// 票 037f：Go 有 Rust 无的 streamSettings 顶层键（masqueSettings/

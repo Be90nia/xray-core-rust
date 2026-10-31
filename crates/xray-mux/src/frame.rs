@@ -656,8 +656,23 @@ impl FrameMetadata {
                 // Go frame.go:212 提前返回：source/local 帧不再读 GlobalID
                 return Ok(meta);
             }
-            // 解析 GlobalID（New + Data + UDP + 剩余>=8）
-            if meta.has_data() && meta.is_udp_target() && body.len().saturating_sub(offset) >= 8 {
+            // 解析 GlobalID。
+            //
+            // 写侧（`write_bytes_into` / Go frame.go:100 `else if b.UDP != nil`）
+            // 只要 New + UDP 目标就写 8B GlobalID，与 `OPTION_DATA` 无关；读侧
+            // Go 只在 `OptionData` 时读（frame.go:215「data essential」探针语义）。
+            // 两侧不对称：无内联数据的 New 帧（mux client 首包探测超时 →
+            // meta-only New）写入的 GlobalID 读不回来 → 服务端 global_id=None
+            // 落 `handle_normal_new`，而 t0ls1 之后 mux wire 是裸载荷、XUDP
+            // 边界转换只在 XUDP 路径做 → 派发出的 outbound 拿到裸报文解帧失败
+            // （cone 会话整条失联）。
+            //
+            // 有内联数据：保持 Go 语义（剩余 >= 8）。无内联数据：只在**恰好**
+            // 8 字节时读——meta 段在目标地址后除 GlobalID 外无其它字段，长度
+            // 精确等于 8 即该帧必是 gid 帧。
+            let remaining = body.len().saturating_sub(offset);
+            let gid_present = if meta.has_data() { remaining >= 8 } else { remaining == 8 };
+            if meta.is_udp_target() && gid_present {
                 let mut gid = [0u8; 8];
                 gid.copy_from_slice(&body[offset..offset + 8]);
                 meta.global_id = Some(gid);
@@ -784,6 +799,32 @@ mod tests {
         assert!(parsed.is_udp_target());
         assert!(parsed.global_id().is_some());
         assert_eq!(*parsed.global_id().unwrap(), gid);
+    }
+
+    /// 无内联数据（`OPTION_DATA` 未置）的 New + UDP 帧：写侧照 Go
+    /// frame.go:100 写 GlobalID，读侧必须同样读回（否则 mux client 首包探测
+    /// 超时发出的 meta-only New 会让服务端丢失 GlobalID → 落普通 packet 路径
+    /// 拿到裸载荷，cone 会话整条失联）。
+    #[test]
+    fn test_new_udp_frame_with_global_id_and_no_data_roundtrip() {
+        let target = Destination::udp(Address::ipv4(Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        // meta-only New（mux client 首包探测超时路径）：无 OPTION_DATA
+        let mut meta = FrameMetadata::new(9, SessionStatus::New, Bitmask::default());
+        meta.set_target(target);
+        let gid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        meta.set_global_id(gid);
+
+        let bytes = meta.to_bytes().unwrap();
+        let (parsed, _) = FrameMetadata::read_from_bytes(&bytes).expect("parse should succeed");
+
+        assert!(!parsed.has_data(), "meta-only New frame carries no OPTION_DATA");
+        assert_eq!(parsed.global_id(), Some(&gid));
+        // 无 GlobalID 的 meta-only New 帧不得凭空拼出 gid
+        let mut plain = FrameMetadata::new(9, SessionStatus::New, Bitmask::default());
+        plain.set_target(parsed.target().unwrap().clone());
+        let (plain_parsed, _) =
+            FrameMetadata::read_from_bytes(&plain.to_bytes().unwrap()).expect("parse ok");
+        assert_eq!(plain_parsed.global_id(), None);
     }
 
     /// Reverse-mux New 帧样例：source+local 逐字节对拍 + 两种 flag 解析

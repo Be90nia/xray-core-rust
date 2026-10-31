@@ -1842,16 +1842,25 @@ mod tests {
         let timeout = tokio::time::Duration::from_secs(60);
         tokio::time::timeout(timeout, async {
             // 服务端 A：0-RTT 开（stateful + 64K）；服务端 B：缺省（无状态 ticketer）。
+            // 证书显式给（bd mwvwd F2 后缺证书不再自签 → 握手必失败）。
+            let (cert_pem, key_pem) =
+                crate::certificate::generate_self_signed_cert(&[SNI]).expect("self-signed cert");
             let cfg_ed = crate::server_config::build_server_config(
                 "tls",
-                Some(&serde_json::json!({"allowEarlyData": true})),
+                Some(&serde_json::json!({
+                    "allowEarlyData": true,
+                    "cert": cert_pem,
+                    "key": key_pem,
+                })),
             )
             .unwrap()
             .unwrap();
-            let cfg_plain =
-                crate::server_config::build_server_config("tls", Some(&serde_json::json!({})))
-                    .unwrap()
-                    .unwrap();
+            let cfg_plain = crate::server_config::build_server_config(
+                "tls",
+                Some(&serde_json::json!({"cert": cert_pem, "key": key_pem})),
+            )
+            .unwrap()
+            .unwrap();
             let acceptor_ed = StdArc::new(tokio_rustls::TlsAcceptor::from(cfg_ed));
             let acceptor_plain = StdArc::new(tokio_rustls::TlsAcceptor::from(cfg_plain));
 

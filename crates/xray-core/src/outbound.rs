@@ -49,7 +49,6 @@ use xray_common::{
     uuid::UUID,
 };
 use xray_conf::{BuiltConfig, BuiltOutbound};
-use xray_features::Result;
 // mux outbound：client 数据路径
 use xray_mux::client::{
     DialingWorkerFactory, IncrementalWorkerPicker, MAX_DISPATCH_RETRY, UnderlyingSlot,
@@ -160,8 +159,15 @@ pub fn inbound_default_rules(
 /// 从 BuiltConfig 注册 outbound handlers 到 SimpleOhm。
 ///
 /// 遍历 `built.outbounds`，按协议名创建 DialBridge 注册到 `ohm`。
-/// 第一个 outbound 或 tag 为 `"direct"` 的设为 default（与 Go `SetDefaultHandler` 语义一致）。
-/// 不支持的协议或配置解析失败均 warn 跳过（不返回错误，不阻止其他 outbound 注册）。
+/// 第一个注册成功的 outbound 设为 default（Go `proxyman/outbound:109-111` 语义）。
+///
+/// # 失败语义（bd o91s4）
+///
+/// 任一条目构造失败（未支持协议 / 配置非法）**整配置拒启**（返回 `Err`）。Go
+/// 在 `infra/conf` 解码期即硬错（未知协议名、settings 类型错、非法 uuid 等
+/// 132 条 C 系列差异，bd 0bzcd），warn+skip 的旧行为会让默认出站前移——用户
+/// 以为在走代理，实际明文直连（E1 实证：vless id 非法 → WARN skip → 兜底出站
+/// 成为默认 → sink ACCEPT）。
 ///
 /// ## 代理链（Proxy Chain）
 ///
@@ -183,7 +189,7 @@ pub fn register_outbounds(
     // 非 freedom 出站查 level 0；freedom 按 settings.userLevel 查档位
     // （Go freedom.go:222-225 h.policy()）。None = SessionDefault。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
-) -> Result<()> {
+) -> std::result::Result<(), BuildError> {
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
@@ -219,21 +225,9 @@ pub fn register_outbounds(
                     "outbound registered"
                 );
             },
-            Err(BuildError::Unsupported(protocol)) => {
-                tracing::warn!(
-                    tag = %ob.tag,
-                    protocol = %protocol,
-                    "outbound protocol not yet supported, skipping"
-                );
-            },
-            Err(BuildError::Parse(e)) => {
-                tracing::warn!(
-                    tag = %ob.tag,
-                    protocol = %ob.entry.kind,
-                    error = %e,
-                    "failed to parse outbound config, skipping"
-                );
-            },
+            // bd o91s4：任一条目失败即整配置拒启（Go 解码期硬错）。warn+skip
+            // 会让默认出站前移 → 用户以为在代理实际明文直连。
+            Err(e) => return Err(e.with_tag(&ob.tag, &ob.entry.kind)),
         }
     }
 
@@ -460,10 +454,38 @@ pub fn built_outbound_from_proto(
     )
     .map_err(|e| BuildError::Parse(e.to_string()))?;
     let mut stream_settings_json = None;
+    let mut send_through = None;
+    let mut proxy_settings_json = None;
+    let mut mux_json = None;
+    let mut target_strategy = None;
     if let Some(sender) = &cfg.sender_settings {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&sender.value) {
-            stream_settings_json = v.get("streamSettings").cloned();
+        // bd ucjcl：senderSettings 除 streamSettings 外的字段此前硬写 None（静默丢弃）
+        // → API 动态添加的出站绕过 sendThrough/mux/targetStrategy。
+        // TypedMessage 约定见上：value 是 JSON（`xray-cli` `api_exec.rs` 同款）。
+        let v: serde_json::Value = serde_json::from_slice(&sender.value).map_err(|e| {
+            BuildError::Parse(format!("senderSettings is not JSON (TypedMessage convention): {e}"))
+        })?;
+        stream_settings_json = v.get("streamSettings").cloned();
+        // `sendThrough`（本仓 CLI 形态）或 `viaCidr`（Go SenderConfig 同义键）。
+        send_through = v
+            .get("sendThrough")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("viaCidr").and_then(|x| x.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        // `via`（IPOrDomain，bytes 走 base64）：未实现 → 显式拒启而非静默丢弃。
+        if v.get("via").is_some_and(|x| !x.is_null()) {
+            return Err(BuildError::Parse(
+                "senderSettings.via is not supported yet; use sendThrough/viaCidr".into(),
+            ));
         }
+        proxy_settings_json = v.get("proxySettings").filter(|x| !x.is_null()).cloned();
+        mux_json = v.get("multiplexSettings").filter(|x| !x.is_null()).cloned();
+        target_strategy = v
+            .get("targetStrategy")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
     }
     Ok(BuiltOutbound {
         entry: xray_conf::BuiltEntry {
@@ -471,13 +493,11 @@ pub fn built_outbound_from_proto(
             data: serde_json::to_vec(&proxy_json).map_err(|e| BuildError::Parse(e.to_string()))?,
         },
         tag: cfg.tag.clone(),
-        send_through: None,
+        send_through,
         stream_settings_json,
-        proxy_settings_json: None,
-        mux_json: None,
-        // proto sender_settings 的 targetStrategy（i32 枚举）→ 字符串的逆向
-        // 映射未实现（gRPC AddOutbound 携带该字段的场景待补，bd bqm 差异项）
-        target_strategy: None,
+        proxy_settings_json,
+        mux_json,
+        target_strategy,
     })
 }
 
@@ -499,11 +519,11 @@ impl ApiOutboundRuntime {
 
 impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
     fn add_outbound(&self, cfg: &OutboundHandlerConfigProto) -> std::result::Result<(), String> {
-        let ob = built_outbound_from_proto(cfg).map_err(|e| format!("{e:?}"))?;
+        let ob = built_outbound_from_proto(cfg).map_err(|e| e.to_string())?;
         if self.ohm.get_handler(&cfg.tag).is_some() {
             return Err(format!("existing tag found: {}", cfg.tag));
         }
-        let handler = build_single_outbound(&ob).map_err(|e| format!("{e:?}"))?;
+        let handler = build_single_outbound(&ob).map_err(|e| e.to_string())?;
         self.ohm.add(&cfg.tag, handler);
         Ok(())
     }
@@ -515,15 +535,6 @@ impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
     fn list_outbound_tags(&self) -> Vec<String> {
         self.ohm.list_tags()
     }
-}
-
-/// 从 `proxy_settings_json` 提取代理链 tag。
-///
-/// 对应 Go `senderSettings.ProxySettings.Tag`。
-/// JSON 格式：`{"tag": "proxy-out", "transportLayerProxy": true/false}`
-fn parse_proxy_chain_tag(proxy_settings_json: Option<&serde_json::Value>) -> Option<String> {
-    let json = proxy_settings_json?;
-    json.get("tag").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from)
 }
 
 /// 从 `BuiltOutbound.mux_json` 解析 per-tag UDP443（QUIC over XUDP）策略。
@@ -677,7 +688,21 @@ pub(crate) fn build_protocol_handler(
     (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
     BuildError,
 > {
-    let proxy_chain_tag = parse_proxy_chain_tag(ob.proxy_settings_json.as_ref());
+    // bd jwg8y：`outbound.proxySettings`（应用层代理链）在 Go 26.10.17 已移除
+    // （infra/conf/xray.go:322-324 `PrintRemovedFeatureError` → 拒启）。
+    // `transportLayer: true` 形态在 xray-conf 装配期已折算成
+    // `sockopt.dialerProxy` 并清空本键，能走到这里 = 用户仍在使用已删功能。
+    // Rust 继续消费即"复活已删功能"：同份配置一跑一拒，且链式语义与
+    // dialerProxy 并存会出现两套代理链账本。
+    if ob.proxy_settings_json.is_some() {
+        return Err(BuildError::Parse(
+            "outbound \"proxySettings\" has been removed; use \"streamSettings.sockopt.dialerProxy\""
+                .to_string(),
+        ));
+    }
+    // 应用层代理链 tag 恒 None：`proxySettings` 已被上面的门拒启（bd jwg8y），
+    // 唯一幸存的链形态是 `sockopt.dialerProxy`（transport 层，走 DIALER_PROXY_HOOK）。
+    let proxy_chain_tag: Option<String> = None;
     // targetStrategy（bd bqm）：字符串 → 枚举；AsIs（无策略）不包装
     // （Go handler.go:184 `HasStrategy()` 门控）
     let target_strategy =
@@ -1057,11 +1082,12 @@ pub(crate) fn parse_trojan_config(
              Multiple endpoints in \"servers\" should use multiple Trojan outbounds and routing balancer instead"
         ));
     }
-    // Trojan Flow 已移除（Go infra/conf/trojan.go:73-75，遍历全部 servers）。
-    // Rust 保留现行为：warn + 忽略该字段继续解析。
+    // Trojan Flow 已移除（Go infra/conf/trojan.go:73-75 遍历全部 servers 硬错，
+    // `PrintRemovedFeatureError` 无迁移目标）。bd jwg8y：warn+忽略 = 已删功能
+    // 在 Rust 侧只"半复活"，此处与 Go 对齐拒启。
     for server in servers {
         if let Some(w) = trojan_flow_removed_warning(server) {
-            xray_common::log::warning(w);
+            return Err(w);
         }
     }
     let first = servers.first().ok_or_else(|| "servers array is empty".to_string())?;
@@ -1133,10 +1159,11 @@ pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig
     }
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("freedom settings JSON: {e}")))?;
-    // 单数 noise 字段已移除（Go infra/conf/freedom.go:145-147）。
-    // Rust 保留现行为：warn + 忽略该字段（仅解析 noises 复数形式）。
+    // 单数 `noise` 已移除（Go infra/conf/freedom.go:145-147 `PrintRemovedFeatureError`
+    // → 解码期拒启）。bd jwg8y：warn+忽略 = 已删功能在 Rust 侧"半复活"（配置一侧
+    // 跑一侧拒，且用户以为噪声生效）。此处拒启。
     if let Some(w) = freedom_noise_removed_warning(&v) {
-        xray_common::log::warning(w);
+        return Err(std::io::Error::other(w));
     }
     // targetStrategy 非空则优先（Go freedom.go:62-64），否则回退 domainStrategy。
     let strategy_raw = v
@@ -3244,15 +3271,28 @@ pub(crate) fn parse_dokodemo_config(
     ))
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum BuildError {
+    #[error("outbound protocol `{0}` is not supported")]
     Unsupported(String),
+    #[error("{0}")]
     Parse(String),
 }
 
 impl From<String> for BuildError {
     fn from(s: String) -> Self {
         Self::Parse(s)
+    }
+}
+
+impl BuildError {
+    /// 附上出站条目上下文（tag + 协议名），供装配期拒启的错误消息定位到条目
+    /// （bd o91s4：fail-fast 报错必须指得出是哪一条配置错了）。
+    fn with_tag(self, tag: &str, protocol: &str) -> Self {
+        match self {
+            Self::Unsupported(_) => self,
+            Self::Parse(m) => Self::Parse(format!("outbound `{tag}` ({protocol}): {m}")),
+        }
     }
 }
 
@@ -3264,6 +3304,69 @@ mod tests {
     use xray_conf::{BuiltConfig, BuiltEntry, BuiltOutbound};
 
     use super::*;
+
+    /// bd ucjcl（DC-2）：`AddOutbound` 的 `senderSettings` 除 streamSettings 外的字段
+    /// 必须全部映射（此前硬写 None → sendThrough 不生效 = 绑定地址泄漏面）。
+    #[test]
+    fn built_outbound_from_proto_maps_all_sender_settings() {
+        use xray_proto::xray::common::serial::TypedMessage;
+
+        let cfg = OutboundHandlerConfigProto {
+            tag: "dyn-out".into(),
+            proxy_settings: Some(TypedMessage {
+                r#type: "xray.proxy.freedom.Config".into(),
+                value: br#"{"domainStrategy":"AsIs"}"#.to_vec(),
+            }),
+            sender_settings: Some(TypedMessage {
+                r#type: "xray.app.proxyman.SenderConfig".into(),
+                value: br#"{
+                    "sendThrough": "192.0.2.123",
+                    "streamSettings": {"network": "tcp"},
+                    "multiplexSettings": {"enabled": true, "concurrency": 4},
+                    "targetStrategy": "UseIP"
+                }"#
+                .to_vec(),
+            }),
+            expire: 0,
+            comment: String::new(),
+        };
+        let ob = built_outbound_from_proto(&cfg).expect("proto config maps");
+        assert_eq!(ob.tag, "dyn-out");
+        assert_eq!(ob.entry.kind, "freedom");
+        assert_eq!(ob.send_through.as_deref(), Some("192.0.2.123"), "sendThrough 必须透传");
+        assert!(ob.stream_settings_json.is_some(), "streamSettings 保持原行为");
+        assert_eq!(
+            ob.mux_json.as_ref().and_then(|m| m.get("concurrency")).and_then(|c| c.as_i64()),
+            Some(4),
+            "multiplexSettings 必须透传"
+        );
+        assert_eq!(ob.target_strategy.as_deref(), Some("UseIP"), "targetStrategy 必须透传");
+    }
+
+    /// `viaCidr`（Go SenderConfig 同义键）同样进 sendThrough；`via` 未实现 → 拒。
+    #[test]
+    fn built_outbound_from_proto_send_through_and_via() {
+        use xray_proto::xray::common::serial::TypedMessage;
+
+        let make = |sender: &str| OutboundHandlerConfigProto {
+            tag: "o".into(),
+            proxy_settings: Some(TypedMessage {
+                r#type: "xray.proxy.freedom.Config".into(),
+                value: b"{}".to_vec(),
+            }),
+            sender_settings: Some(TypedMessage {
+                r#type: "xray.app.proxyman.SenderConfig".into(),
+                value: sender.as_bytes().to_vec(),
+            }),
+            expire: 0,
+            comment: String::new(),
+        };
+        let ob = built_outbound_from_proto(&make(r#"{"viaCidr":"10.0.0.5/24"}"#)).expect("viaCidr");
+        assert_eq!(ob.send_through.as_deref(), Some("10.0.0.5/24"));
+        let err = built_outbound_from_proto(&make(r#"{"via":{"ip":"wAACew=="}}"#))
+            .expect_err("via must be rejected until implemented");
+        assert!(err.to_string().contains("via"), "unexpected error: {err}");
+    }
 
     /// G14：dns_idle_timeout_for 按 level 查 policy 档位；无 manager 显式回退
     /// SessionDefault 300s（warn 一次，不静默）。
@@ -3625,26 +3728,26 @@ mod tests {
         assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
 
-    /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun outbound 构建 →
-    /// `BuildError::Unsupported` → register_outbounds warn+跳过（不硬错，
-    /// handler 不注册；kind 本身仍全平台注册，见 register.rs 测试）。
+    /// bd b8i 对称面 + bd o91s4：不支持平台（Windows/macOS 等）tun outbound 构建
+    /// → `BuildError::Unsupported` → 整配置**拒启**（不再 warn+跳过；跳过会让默认
+    /// 出站前移，用户以为在走隧道实际直连）。
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
     #[test]
-    fn tun_outbound_skipped_on_unsupported_platform() {
+    fn tun_outbound_rejected_on_unsupported_platform() {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
-
-        assert!(
-            ohm.get_handler("tun-out").is_none(),
-            "tun outbound must be skipped (warn) on unsupported platforms"
-        );
+        let err = register_outbounds(&built, &ohm, None, None, None)
+            .expect_err("tun on unsupported platform must reject the config");
+        let msg = err.to_string();
+        assert!(msg.contains("only supported on"), "error must state the platform gate: {msg}");
     }
 
+    /// bd o91s4：配置解析失败必须拒启（Go 解码期硬错），不得 warn+skip——
+    /// E1 实证：vless id 非法 → 旧行为 WARN skip → 兜底出站成为默认 → 明文直连。
     #[test]
-    fn register_vless_invalid_uuid_skipped() {
+    fn register_vless_invalid_uuid_rejected() {
         let settings = r#"{
             "vnext": [{
                 "address": "example.com",
@@ -3656,9 +3759,11 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "bad-vless", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
-
-        assert!(ohm.get_handler("bad-vless").is_none(), "invalid uuid should skip");
+        let err = register_outbounds(&built, &ohm, None, None, None)
+            .expect_err("invalid vless uuid must reject the config");
+        let msg = err.to_string();
+        assert!(msg.contains("bad-vless"), "error must name the tag: {msg}");
+        assert!(msg.contains("vless"), "error must name the protocol: {msg}");
     }
 
     #[test]
@@ -4038,6 +4143,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"{"noises":[]}"#).unwrap();
         assert!(freedom_noise_removed_warning(&v).is_none());
         assert!(freedom_noise_removed_warning(&serde_json::json!({})).is_none());
+        // bd jwg8y：单数 noise 在装配期**拒启**（不再 warn+忽略）
+        let err = parse_freedom_config(br#"{"noise":{"lengthMin":100}}"#)
+            .expect_err("removed `noise` key must reject the outbound");
+        assert!(err.to_string().contains("noise = { ... }"), "unexpected error: {err}");
     }
 
     /// 装配接线：freedom settings JSON 的 destinationOverride / proxyProtocol /
@@ -4244,8 +4353,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_trojan_config_with_flow_still_parses() {
-        // warn + skip 不阻断：flow 字段被忽略，其余字段正常解析。
+    fn parse_trojan_config_with_flow_rejected() {
+        // bd jwg8y：Flow for Trojan 已移除（Go trojan.go:73-75）→ 拒启，不再忽略字段。
         let data = r#"{
             "servers": [{
                 "address": "trojan.example.com",
@@ -4254,9 +4363,8 @@ mod tests {
                 "flow": "xtls-rprx-vision"
             }]
         }"#;
-        let config = parse_trojan_config(data.as_bytes()).unwrap();
-        assert_eq!(config.server_port.value(), 443);
-        assert_eq!(config.account.password, "secret");
+        let err = parse_trojan_config(data.as_bytes()).expect_err("trojan flow must reject");
+        assert!(err.contains("Flow for Trojan"), "unexpected error: {err}");
     }
 
     /// Go infra/conf/trojan.go:57-58：servers 必须恰一个成员，多端点用 routing balancer。
@@ -4567,12 +4675,11 @@ mod tests {
     }
 
     /// 包装行为：mux enabled 的 freedom 出站构建出 MuxBridge（tag 不变、
-    /// underlying 已回填），bridge_ref 仍返回给 Phase 2 代理链。
+    /// underlying 已回填）。`proxySettings` 已移除（bd jwg8y）→ chain tag 恒 None。
     #[tokio::test]
     async fn mux_enabled_freedom_outbound_wraps_in_mux_bridge() {
         let ob = BuiltOutbound {
             mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
-            proxy_settings_json: Some(serde_json::json!({"tag": "chain-out"})),
             ..make_outbound("freedom", "muxed", "{}")
         };
         let (handler, bridge_ref, chain_tag) = super::try_build_handler(
@@ -4585,8 +4692,10 @@ mod tests {
         )
         .expect("build muxed freedom handler");
         assert_eq!(handler.tag(), "muxed", "wrapper keeps outbound tag");
-        assert_eq!(chain_tag.as_deref(), Some("chain-out"));
-        assert!(bridge_ref.is_some(), "Phase 2 proxy chain ref preserved");
+        assert_eq!(chain_tag, None, "proxySettings removed → no application-layer chain");
+        // 应用层代理链移除后 arm builder 不再回填 DialBridge 引用（Phase 2 链回填
+        // 已无消费方）；MuxBridge 包装本身照旧。
+        assert!(bridge_ref.is_none(), "no chain tag → no Phase 2 dial bridge ref");
         // 包装类型可由 Debug 名识别（MuxBridge 手写 Debug 以结构名开头）
         assert!(
             format!("{handler:?}").starts_with("MuxBridge"),
@@ -4712,42 +4821,22 @@ mod tests {
         task.abort();
     }
 
+    /// bd o91s4：settings 缺必需字段（socks 无 servers）→ 拒启（Go 解码/构建期硬错）。
     #[test]
-    fn register_socks_missing_servers_skipped() {
+    fn register_socks_missing_servers_rejected() {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "bad-socks", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
-        assert!(ohm.get_handler("bad-socks").is_none());
+        let err = register_outbounds(&built, &ohm, None, None, None)
+            .expect_err("socks without servers must reject the config");
+        assert!(err.to_string().contains("bad-socks"), "error must name the tag: {err}");
     }
 
+    /// bd jwg8y：`proxySettings` 在 Go 26.10.17 已移除（infra/conf/xray.go:322-324
+    /// `PrintRemovedFeatureError`）→ Rust 同样拒启，不再建应用层代理链。
+    /// 幸存的链形态是 `streamSettings.sockopt.dialerProxy`（transport 层）。
     #[test]
-    fn parse_proxy_chain_tag_extracts_tag() {
-        let json: serde_json::Value =
-            serde_json::json!({ "tag": "proxy-out", "transportLayerProxy": true });
-        assert_eq!(parse_proxy_chain_tag(Some(&json)), Some("proxy-out".to_string()));
-    }
-
-    #[test]
-    fn parse_proxy_chain_tag_empty_string_returns_none() {
-        let json: serde_json::Value =
-            serde_json::json!({ "tag": "", "transportLayerProxy": false });
-        assert_eq!(parse_proxy_chain_tag(Some(&json)), None);
-    }
-
-    #[test]
-    fn parse_proxy_chain_tag_missing_tag_returns_none() {
-        let json: serde_json::Value = serde_json::json!({ "transportLayerProxy": true });
-        assert_eq!(parse_proxy_chain_tag(Some(&json)), None);
-    }
-
-    #[test]
-    fn parse_proxy_chain_tag_none_input_returns_none() {
-        assert_eq!(parse_proxy_chain_tag(None), None);
-    }
-
-    #[test]
-    fn register_outbound_with_proxy_chain_tag() {
+    fn register_outbound_with_proxy_settings_rejected() {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("freedom", "proxy-out", "{}"));
         let mut ob = make_outbound("freedom", "chain-out", "{}");
@@ -4755,10 +4844,11 @@ mod tests {
         built.outbounds.push(ob);
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
-
-        assert!(ohm.get_handler("proxy-out").is_some(), "proxy-out should be registered");
-        assert!(ohm.get_handler("chain-out").is_some(), "chain-out should be registered");
+        let err = register_outbounds(&built, &ohm, None, None, None)
+            .expect_err("proxySettings must reject the config (removed in Go 26.10.17)");
+        let msg = err.to_string();
+        assert!(msg.contains("proxySettings"), "error must name the key: {msg}");
+        assert!(msg.contains("dialerProxy"), "error must point at the replacement: {msg}");
     }
 
     // ===== TUIC outbound 配置解析 + TLS 验证（bd 7p0） =====
@@ -5550,9 +5640,13 @@ mod tests {
     }
 
     /// e2e（mcq5/#6742）：freedom 配 finalRules block-all + 链式出站
-    /// （① proxySettings.tag 直配 ② transportLayer 注入 sockopt.dialerProxy）→
-    /// finalRules 不生效（freedom 非最终出站，Go freedom.go:193-198 Init 早退 +
-    /// :263-265 defaultRule=nil），流量经链路正常到达目标。
+    /// （`proxySettings.transportLayer: true` → 装配期折算成
+    /// `sockopt.dialerProxy`，Go xray.go:316-327）→ finalRules 不生效
+    /// （freedom 非最终出站，Go freedom.go:193-198 Init 早退 + :263-265
+    /// defaultRule=nil），流量经链路正常到达目标。
+    ///
+    /// 裸 `proxySettings.tag`（应用层链）形态已移除（bd jwg8y，Go 26.10.17 拒启）——
+    /// 只剩 transportLayer 一条链路径。
     #[tokio::test]
     async fn freedom_final_rules_ignored_when_chained_via_dialer_proxy() {
         use xray_buf::multi::MultiBuffer;
@@ -5568,7 +5662,10 @@ mod tests {
                     String::new(),
                 )
             } else {
-                (r#", "proxySettings": {"tag": "socks-out"}"#.to_string(), String::new())
+                (
+                    String::new(),
+                    r#", "streamSettings": {"sockopt": {"dialerProxy": "socks-out"}}"#.to_string(),
+                )
             };
             let json = format!(
                 r#"{{"outbounds": [

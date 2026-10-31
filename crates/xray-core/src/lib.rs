@@ -66,6 +66,8 @@ pub mod inbound;
 pub mod instance;
 pub mod outbound;
 pub mod register;
+// bd nip4p：VLESS Reverse Proxy 装配（bridge/portal 编排件接线）。
+pub(crate) mod reverse;
 // T1.1：Instance::close 停机编排桥（feature 门 `shutdown-coordinator`，默认开；关=旧逆序循环）。
 pub mod router;
 #[cfg(feature = "shutdown-coordinator")]

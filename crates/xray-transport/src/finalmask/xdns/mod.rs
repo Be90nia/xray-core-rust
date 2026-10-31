@@ -433,4 +433,53 @@ mod tests {
             .unwrap();
         assert_eq!(&cbuf[..cn], b"pong");
     }
+
+    /// 53 字节 DNS 查询：解码后 13 字节，`[8]=0xC3`（flag8=3 且分片位），
+    /// 但分片头 `[12..15)` 越界。无凭据、无需客户端实现即可构造。
+    fn short_fragment_query() -> Vec<u8> {
+        let decoded = [0x02u8, 0, 0, 0, 0, 0, 0, 0, 0xC3, 0, 0, 0, 0];
+        let prefix = super::base32::encode_lower(&decoded);
+        assert_eq!(prefix.len(), 21, "13 字节 base32 无 padding = 21 字符");
+        // 头：id / flags(标准查询) / qd=1 / an=ns=ar=0
+        let mut q = vec![0x12u8, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        q.push(u8::try_from(prefix.len()).unwrap());
+        q.extend_from_slice(&prefix);
+        for label in ["t", "example", "com"] {
+            q.push(u8::try_from(label.len()).unwrap());
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0); // 根
+        q.extend_from_slice(&16u16.to_be_bytes()); // qtype TXT
+        q.extend_from_slice(&1u16.to_be_bytes()); // qclass IN
+        q
+    }
+
+    /// bd itd0p：短分片 query（解码 13 字节，缺 `[12..15)` 分片头）曾让
+    /// `server_read` 在 `decoded[13]` 索引越界 panic → recv 任务死亡 →
+    /// 隧道永久失聪（其后每次重传都超时、不自动恢复）。
+    ///
+    /// 断言：连续 3 次都必须拿到 DNS 响应（QR 置位）——任务存活即证明。
+    #[tokio::test]
+    async fn short_fragment_query_keeps_recv_task_alive() {
+        let (ca, sa) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let (sb, ab) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let raw: Arc<dyn UdpIo> =
+            Arc::new(PipeEnd { peer: sb, inbox: tokio::sync::Mutex::new(sa) });
+        let server_pipe: Arc<dyn UdpIo> =
+            Arc::new(PipeEnd { peer: ca, inbox: tokio::sync::Mutex::new(ab) });
+        let _server = server::XdnsConnServer::new(server_pipe, &test_config()).unwrap();
+
+        let query = short_fragment_query();
+        assert_eq!(query.len(), 53, "票面复现包：单个 53 字节 DNS 查询");
+        for round in 0..3 {
+            raw.send_to(&query, "127.0.0.1:53".parse().unwrap()).await.unwrap();
+            let mut buf = [0u8; 4096];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(3), raw.recv_from(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("round {round}: 无应答（recv 任务已 panic 死亡）"))
+                .unwrap();
+            assert!(n >= 12, "round {round}: 响应至少 12 字节 DNS 头，实际 {n}");
+            assert_eq!(buf[2] & 0x80, 0x80, "round {round}: QR 位必须置位");
+        }
+    }
 }

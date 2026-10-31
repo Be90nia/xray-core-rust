@@ -226,8 +226,10 @@ async fn arm_lookup_inbound_loopback_entry_matches_table_value() {
 }
 
 /// 表未命中必须显式可见（表是唯一构造路径，无 match 可回落）：未注册协议得
-/// outbound `Err(Unsupported(协议名))` / inbound `Ok(None)`（warn 后跳过），绝不
-/// 静默构造 handler。
+/// outbound `Err(Unsupported(协议名))` / inbound `Err(InvalidInput, "unknown
+/// inbound protocol: …")`（bd vdl95 fail-visible：Go「unknown protocol」硬错，
+/// 旧行为 warn+skip 会让节点静默消失、端口无监听而管理员无感），绝不静默构造
+/// handler。
 #[tokio::test]
 async fn arm_lookup_missing_key_fails_visible() {
     const UNKNOWN: &str = "no-such-protocol";
@@ -254,7 +256,17 @@ async fn arm_lookup_missing_key_fails_visible() {
     };
     let spawned =
         spawn_one_inbound(&ib, Arc::new(SimpleOhm::new()), None, CancellationToken::new(), None)
-            .await
-            .expect("unsupported inbound must skip, not error");
-    assert!(spawned.is_none(), "{UNKNOWN}: inbound miss must skip without spawning");
+            .await;
+    match spawned {
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "got: {e}");
+            assert!(
+                e.to_string().contains(&format!("unknown inbound protocol: {UNKNOWN}")),
+                "error must name the protocol: {e}"
+            );
+        },
+        Ok(spawned) => panic!(
+            "{UNKNOWN}: inbound table miss must fail-visible (bd vdl95), got Ok({spawned:?})"
+        ),
+    }
 }

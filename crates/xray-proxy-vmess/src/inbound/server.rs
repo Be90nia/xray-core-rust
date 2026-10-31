@@ -160,6 +160,8 @@ pub async fn serve_vmess(
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let history = Arc::new(SessionHistory::new());
+    // bd txtpo：反重放历史的 30s 周期清理（Go task.Periodic），随本 inbound 停机取消。
+    history.start_cleanup(&ctx);
 
     crate::VMESS_LOG.info(format!("vmess inbound listening addr={}", listener.local_addr()?));
 

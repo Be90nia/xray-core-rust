@@ -34,6 +34,13 @@ pub enum CommanderError {
     /// 注册器（registrar）操作错误。来自 [`GrpcServerRegistrar`](crate::GrpcServerRegistrar) 实现。
     #[error("registrar error: {0}")]
     Registrar(String),
+
+    /// `api.services` 声明了服务但后端未注入（bd lu37q）。
+    ///
+    /// 对应 Go `RequireFeatures(callback, false)` + `common.Must`：拿不到 feature
+    /// 即 panic（进程退出），而不是注册一个恒 UNIMPLEMENTED 的空服务。
+    #[error("api service(s) declared but no backend injected: {services}")]
+    ServiceNotRegistered { services: String },
 }
 
 /// 警告日志辅助。

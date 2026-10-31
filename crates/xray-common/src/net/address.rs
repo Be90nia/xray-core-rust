@@ -138,6 +138,29 @@ impl From<IpAddr> for Address {
     }
 }
 
+/// 域名字段携带的 IP 字面量 → [`IpAddr`]；不是 IP 形态返回 `None`。
+///
+/// 对应 Go `protocol.maybeIPPrefix` + `net.ParseAddress`
+/// （`common/protocol/address.go:213-217` 的 Domain 分支）：线格式用
+/// `ATYP=Domain`（VLESS/SOCKS5 同）送来 `"1.2.3.4"` / `"[::1]"` 时必须归一化成
+/// IP，否则 routing `ip` 条件永不命中（屏蔽/分流规则被绕过，bd f2ap9）。
+///
+/// 语义逐条对齐 Go：首字节非 `[` 且非数字 → 不是 IP（快速排除普通域名）；
+/// `[v6]` 去括号；首/尾非字母数字时 `TrimSpace`（Go `ParseAddress` 同款）。
+#[must_use]
+pub fn ip_literal(s: &str) -> Option<IpAddr> {
+    let first = *s.as_bytes().first()?;
+    if first != b'[' && !first.is_ascii_digit() {
+        return None;
+    }
+    let inner = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(s);
+    let inner = match inner.as_bytes() {
+        [f, .., l] if f.is_ascii_alphanumeric() && l.is_ascii_alphanumeric() => inner,
+        _ => inner.trim(),
+    };
+    inner.parse::<IpAddr>().ok()
+}
+
 impl std::str::FromStr for Address {
     type Err = String;
 

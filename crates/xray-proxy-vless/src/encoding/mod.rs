@@ -32,9 +32,14 @@
 pub mod client;
 pub mod server;
 
+use std::net::IpAddr;
+
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use xray_common::net::{address::Address, port::Port};
+use xray_common::net::{
+    address::{Address, ip_literal},
+    port::Port,
+};
 use xray_proto::xray::proxy::vless::encoding::Addons;
 
 use crate::error::{Result, VlessError};
@@ -171,7 +176,13 @@ pub async fn read_address_port<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(
             let mut buf = vec![0u8; len_buf[0] as usize];
             reader.read_exact(&mut buf).await.map_err(VlessError::Io)?;
             let domain = String::from_utf8(buf).map_err(|_| VlessError::InvalidRequestAddress)?;
-            Address::Domain(domain)
+            // f2ap9：对齐 Go `addressParser.readAddress`（address.go:213-217）——
+            // 域名字段携带 IP 字面量时归一化成 IP，否则 routing `ip` 规则永不命中。
+            match ip_literal(&domain) {
+                Some(IpAddr::V4(ip)) => Address::IPv4(ip),
+                Some(IpAddr::V6(ip)) => Address::IPv6(ip),
+                None => Address::Domain(domain),
+            }
         },
         addr_type::IPV6 => {
             let mut buf = [0u8; 16];
@@ -350,6 +361,40 @@ mod tests {
         assert_eq!(got_port.value(), 8080);
         assert!(got_addr.is_domain());
         assert_eq!(got_addr.as_domain(), Some("www.example.com"));
+    }
+
+    /// f2ap9：`ATYP=Domain` 携带 IP 字面量必须归一化成 IP。
+    ///
+    /// Go `common/protocol/address.go:213-217`（`addressParser.readAddress` 的
+    /// Domain 分支）：`maybeIPPrefix` 命中且 `ParseAddress` 解出 IP 时返回 IP。
+    /// 归一化缺失 → 目标以 `Address::Domain("8.8.8.8")` 进入 routing →
+    /// `ip` 规则永不命中，屏蔽被绕过。
+    #[test]
+    fn test_read_address_normalizes_domain_form_ip_literal() {
+        let build = |host: &str, port: u16| {
+            let mut buf = port.to_be_bytes().to_vec();
+            buf.push(addr_type::DOMAIN);
+            buf.push(u8::try_from(host.len()).unwrap());
+            buf.extend_from_slice(host.as_bytes());
+            buf
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let mut cursor = Cursor::new(build("8.8.8.8", 53));
+        let (addr, port) =
+            rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
+        assert_eq!(addr, Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(port.value(), 53);
+
+        let mut cursor = Cursor::new(build("[2001:db8::1]", 443));
+        let (addr, _) = rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
+        let want: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(addr, Address::IPv6(want));
+
+        // 非 IP 形态的域名保持域名
+        let mut cursor = Cursor::new(build("www.example.com", 80));
+        let (addr, _) = rt.block_on(async move { read_address_port(&mut cursor).await.unwrap() });
+        assert_eq!(addr, Address::Domain("www.example.com".to_string()));
     }
 
     #[test]

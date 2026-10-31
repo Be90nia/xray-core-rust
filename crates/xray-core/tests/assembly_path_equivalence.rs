@@ -17,8 +17,8 @@
 //! 依赖本 crate —— 集成测试既跨不过 crate 可见性，也跨不过依赖环。故本测试的
 //! 直接观测面是两侧的**权威数据源**：生产 = `arm_builders` 的构造表（纯数据，
 //! 唯一构造路径），框架 = `family_catalog` 的协议 arm 表（注册集的派生源）；再
-//! 加一条生产侧**运行时**探针把 ② 失败语义差钉死（生产路静默跳过是可直接观测
-//! 的行为，正是本票的关键发现）。
+//! 加一条生产侧**运行时**探针把 ② 失败语义差钉死（zhvi3 发现时生产路是静默跳过，
+//! bd o91s4 之后改为断言「生产路也必须拒启」，差异只剩时机/文案）。
 //!
 //! shortcut: ③ 的框架侧 fail-visible 行为只有源码级证据（数据源层面无键可观测），
 //! 真机端到端在 `--features framework-assembly` 的 e2e 里；升级时机 = 框架路转
@@ -281,7 +281,9 @@ fn assembly_path_difference_ledger() {
     rows.push(classify_inbound(&prod_in, FRAMEWORK_SRC));
     rows.push(LedgerRow {
         class: Class::FailureSemantics,
-        item: "坏段/缺段：生产路 warn+skip 静默丢弃 / 框架路整链 Err → fail-visible 门只在框架路"
+        // bd o91s4 收口后：两路都 fail-visible，只剩时机/文案差异（不是行为差）。
+        item: "坏段/缺段：两路均启动前拒启；差异仅时机（生产 register_outbounds 构造期 / \
+               框架插件 build 期）与错误文案"
             .to_string(),
         known: true,
     });
@@ -333,12 +335,15 @@ fn unknown_difference_is_reported_not_absorbed() {
     );
 }
 
-/// ② 失败语义差的运行时证据：生产路对未支持协议 **warn + skip**，不返回错误。
+/// ② 失败语义差的运行时证据：两路对「未知协议」**都**在启动前失败（bd o91s4 之后
+/// 生产路也 fail-visible），差异只剩失败时机与文案（生产 = `register_outbounds`
+/// 构造期；框架 = 插件 build 期）。
 ///
-/// 这是本票关键发现：默认可执行文件里没有「缺段/坏段 → 启动前 fail-visible」的
-/// 门，该门只在框架路（插件 build 失败 → 整链 Err）生效。
+/// 本票（zhvi3）发现时的原始状态是生产路 warn + skip（默认可执行文件里没有
+/// 「缺段/坏段 → 启动前 fail-visible」的门）；o91s4 把该门补上后，此探针改为
+/// 断言「生产路必须报错且错误点名条目」。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_path_skips_unsupported_outbound_silently() {
+async fn production_path_rejects_unsupported_outbound() {
     let cfg = Config::from_json_str(
         &serde_json::json!({
             "log": {"loglevel": "warning"},
@@ -364,10 +369,10 @@ async fn production_path_skips_unsupported_outbound_silently() {
     );
 
     let ohm = SimpleOhm::new();
-    register_outbounds(&built, &ohm, None, None, None)
-        .expect("生产路不因未支持协议返回错误（warn + skip）");
-
+    let err = register_outbounds(&built, &ohm, None, None, None)
+        .expect_err("生产路必须对未支持协议拒启（bd o91s4，对齐 Go conf 解码期硬错）");
+    assert!(err.to_string().contains("no-such-protocol"), "错误必须点名协议：{err}");
+    // 拒启语义：不得留下「部分注册」的假可用表（默认出站前移是本票的原始危害）。
     let tags = ohm.list_tags();
-    assert!(tags.iter().any(|t| t == "direct"), "受支持的出站必须注册，实际 {tags:?}");
-    assert!(!tags.iter().any(|t| t == "ghost"), "未支持协议必须静默丢弃，实际 {tags:?}");
+    assert!(!tags.iter().any(|t| t == "ghost"), "未知协议不得注册，实际 {tags:?}");
 }

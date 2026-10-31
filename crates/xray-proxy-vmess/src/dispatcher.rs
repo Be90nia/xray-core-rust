@@ -641,14 +641,8 @@ impl AsyncWrite for VmessUdpConn {
             this.wpos = 0;
             let mut encode_err: Option<std::io::Error> = None;
             let parse_err = {
-                let Self {
-                    unframer,
-                    req_cipher,
-                    req_size_parser,
-                    req_padding,
-                    up_nonce,
-                    ..
-                } = this;
+                let Self { unframer, req_cipher, req_size_parser, req_padding, up_nonce, .. } =
+                    this;
                 unframer
                     .feed(buf, |_, payload| {
                         if encode_err.is_some() {

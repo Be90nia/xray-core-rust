@@ -315,6 +315,30 @@ fn json_string_list(json: &serde_json::Value, key: &str) -> Vec<String> {
     }
 }
 
+/// Go 默认套件偏好序。
+///
+/// AES-NI 可用时 Go 的 **服务端**按 `crypto/tls/cipher_suites.go` 的表序选套件
+/// （TLS1.3: AES128-GCM → CHACHA20 → AES256-GCM；TLS1.2: ECDHE-*-AES128-GCM 打头），
+/// 而 Go **客户端**恒走 utls Chrome 模板（`GetFingerprint("")` = `HelloChrome_Auto`），
+/// 抓包实测 wire 序为 AES128 → AES256 → CHACHA20（`reports/.../fix/tmp/e1_hello_results.json`）。
+/// rustls 一份 provider 列表同时充当客户端 offer 序与服务端选序，取**实测 wire 序**
+/// （1301,1302,1303）：两轴首选都是 AES128 ⇒ 服务端协商结果与 Go 一致（ServerHello
+/// 不可区分，bd mwvwd F3），客户端 offered 顺序也与 Go 逐项相同。
+fn go_cipher_suite_preference() -> Vec<SupportedCipherSuite> {
+    use rustls::crypto::ring::cipher_suite as cs;
+    vec![
+        cs::TLS13_AES_128_GCM_SHA256,
+        cs::TLS13_AES_256_GCM_SHA384,
+        cs::TLS13_CHACHA20_POLY1305_SHA256,
+        cs::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        cs::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        cs::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        cs::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ]
+}
+
 /// 组装 `minVersion`/`maxVersion`/`cipherSuites`/`curvePreferences` →
 /// 自定义 [`rustls::crypto::CryptoProvider`] + 协议版本列表。
 ///
@@ -328,12 +352,20 @@ fn json_string_list(json: &serde_json::Value, key: &str) -> Vec<String> {
 /// - 名字全不可用导致过滤结果为空 → 保留 provider 默认并 warn。
 ///
 /// kx 组按用户顺序排列（对齐 Go `CurvePreferences` 语义）；
-/// 套件保持 ring 默认序（Go `CipherSuites` 也按映射表顺序追加）。
+/// 套件缺省序见 [`go_cipher_suite_preference`]（对齐 Go），用户 `cipherSuites` 覆盖之。
+///
+/// # minVersion/maxVersion 口径（bd mwvwd F5 拍板：保留硬门）
+/// Go 的 client 侧版本门**恒不生效**——`dialer.go:73` 只要 `GetFingerprint` 非空
+/// （空串也返回 `HelloChrome_Auto`）就走 utls，`supported_versions` 由模板固定；
+/// Rust 的 btls 指纹路径同样被模板覆盖，rustls 路径则真生效。**本仓选择保留硬门**：
+/// 用户写了 `minVersion: "1.3"` 就该被告知服务端不足，而不是静默降到 1.2；
+/// 需要"跟 Go 一样忽略"的场景写 `fingerprint` 即可（两条路径行为在此分开且各有用例）。
 pub(crate) fn security_params(
     json: &serde_json::Value,
 ) -> (StdArc<rustls::crypto::CryptoProvider>, Vec<&'static SupportedProtocolVersion>) {
     let mut provider = rustls::crypto::ring::default_provider();
-
+    // 套件序按 Go 偏好重排（用户 cipherSuites 覆盖在下面）。
+    provider.cipher_suites = go_cipher_suite_preference();
     // cipherSuites：冒号分隔的 Go 套件名（L448-458）。
     if let Some(spec) = json.get("cipherSuites").and_then(|v| v.as_str()) {
         if !spec.is_empty() {
@@ -420,6 +452,37 @@ pub(crate) fn security_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 套件偏好序（bd mwvwd F3）----
+
+    /// 缺省 provider 的套件序 = Go 偏好序：TLS1.3 以 AES-128-GCM 打头，
+    /// TLS1.2 以 ECDHE-ECDSA-AES128-GCM 打头（ServerHello 与 Go 服务端同款）。
+    #[test]
+    fn cipher_suite_preference_matches_go() {
+        let (provider, _versions) = security_params(&serde_json::json!({}));
+        let suites: Vec<_> = provider.cipher_suites.iter().map(|s| s.suite()).collect();
+        assert_eq!(
+            suites,
+            vec![
+                rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+                rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ]
+        );
+        // 用户 cipherSuites 仍然覆盖缺省序
+        let (custom, _) =
+            security_params(&serde_json::json!({"cipherSuites": "TLS_CHACHA20_POLY1305_SHA256"}));
+        assert_eq!(
+            custom.cipher_suites.iter().map(|s| s.suite()).collect::<Vec<_>>(),
+            vec![rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256]
+        );
+    }
 
     // ---- parse_curve_name ----
 

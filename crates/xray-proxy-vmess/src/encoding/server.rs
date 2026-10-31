@@ -12,6 +12,7 @@
 
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -50,27 +51,51 @@ pub struct SessionId {
 }
 /// 会话历史（对应 Go `SessionHistory`）。
 ///
-/// Go 端 `SessionHistory` 用 `task.Periodic(30s)` 周期清理过期 session；本实现
-/// 之前用 lazy retain 每次 add 全表扫描 O(n)（s3fj：高峰 100k 连接每条新连接付
-/// O(100k) 扫描 + 全局 Mutex 持有拉长）。改为启动时 spawn 一次性后台任务，
-/// 周期 30s（对齐 Go）做 retain——add_if_not_exists 不再做扫描，只查过期项。
+/// Go 端 `SessionHistory` 用 `task.Periodic(30s)` 周期清理过期 session。本实现
+/// 同样**只在装配点**（[`SessionHistory::start_cleanup`]，随 inbound 停机取消）
+/// 起 30s 周期 retain；`add_if_not_exists` 只做一次哈希查找，不做任何全表扫描
+/// （bd s3fj / txtpo：旧实现的阈值惰性扫描在 1 万条后是每连接 O(n)）。
 pub struct SessionHistory {
     inner: Mutex<HashMap<SessionId, Instant>>,
     ttl: Duration,
 }
 
 /// 周期清理间隔（对齐 Go `task.Periodic(30s)`）。
-#[allow(dead_code)] // Go 对齐常量：清理接线随 dispatcher 稳定批次跟进
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 impl SessionHistory {
-    /// 创建空 history，TTL=3 分钟（对应 Go `time.Minute * 3`），启动周期清理任务。
+    /// 创建空 history，TTL=3 分钟（对应 Go `time.Minute * 3`）。
     ///
-    /// ponytail: 周期任务与 history 同生命周期；如需显式停止可换 `AbortHandle`。
-    /// 本结构只在 ServerSession 中持引用，进程退出时 task 自动 drop，无泄漏。
+    /// 清理任务不在构造函数里起（结构无 ctx 注入面）：生产装配点在
+    /// [`SessionHistory::start_cleanup`] 显式接线。
     #[must_use]
     pub fn new() -> Self {
         Self { inner: Mutex::new(HashMap::new()), ttl: Duration::from_secs(180) }
+    }
+
+    /// 装配期调用：起 30s 周期清理任务（Go `SessionHistory` 的 `task.Periodic`）。
+    ///
+    /// 任务落装配点 `ctx.spawn`（坑约束 5：随 inbound 停机取消）。持 `Weak`：
+    /// history 释放后循环自然退出，不需要额外停机信令。
+    pub fn start_cleanup(self: &Arc<Self>, ctx: &xray_frame::PluginContext) {
+        let weak = Arc::downgrade(self);
+        ctx.spawn(async move {
+            let mut ticker = tokio::time::interval(CLEANUP_INTERVAL);
+            // Go time.Ticker 丢 tick 不补发
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let Some(history) = weak.upgrade() else { return };
+                history.retain_expired();
+            }
+        })
+        .expect("plugin ctx FxScope is never closed (assembly-owned)");
+    }
+
+    /// 丢弃过期条目（Go `SessionHistory.clean`）。
+    fn retain_expired(&self) {
+        let now = xray_frame::compat::clock().now_instant();
+        self.inner.lock().retain(|_, expire| *expire > now);
     }
 
     /// 用自定义 TTL。
@@ -82,10 +107,6 @@ impl SessionHistory {
     /// 添加 session，若已存在且未过期则返回 false（拒绝）。
     pub fn add_if_not_exists(&self, session: SessionId) -> bool {
         let mut inner = self.inner.lock();
-        // s3fj：当前实现仍 lazy retain（O(n)），但不再每次扫描——只在 map size 超过
-        // `RETAIN_THRESHOLD`（10000）时触发一次清理；均摊 O(1)。生产环境真正周期清理
-        // 待 `spawn_cleanup` 后台任务上线（依赖字段重构，见 fn 内注释）。
-        const RETAIN_THRESHOLD: usize = 10_000;
         // 713x6 台账：lazy retain 防膨胀的单调钟读数；`SessionHistory` 纯数据结构
         // 无 ctx 字段（装配点 serve_vmess 有 ctx 但结构无注入面），迁 Clock 需改
         // pub new/with_ttl 契约 + 全部测试构造点（测试面不动），故留台账。
@@ -94,9 +115,6 @@ impl SessionHistory {
             reason = "SessionHistory 纯数据结构无 ctx 注入面；过期判定的单调钟读数（713x6 台账：结构性不可达→出口已就位 xray-frame::compat::clock，待迁）"
         )]
         let now = Instant::now();
-        if inner.len() >= RETAIN_THRESHOLD {
-            inner.retain(|_, expire| *expire > now);
-        }
         if let Some(expire) = inner.get(&session) {
             if *expire > now {
                 return false;
@@ -764,6 +782,28 @@ mod tests {
     fn aes_gcm_hardware_detection_is_callable() {
         // 对应 Go HasAESGCMHardwareSupport — 运行时 AES-NI+PCLMULQDQ 检测
         let _supported: bool = has_aes_gcm_hardware_support();
+    }
+
+    /// bd txtpo：周期清理的实质动作 = `retain_expired`（30s 任务只是驱动它）。
+    /// 过期条目被丢弃、未过期条目保留。
+    #[test]
+    fn session_history_retain_expired_drops_only_expired() {
+        let h = SessionHistory::with_ttl(Duration::from_millis(1));
+        let expired = SessionId { user: [1u8; 16], key: [2u8; 16], nonce: [3u8; 16] };
+        assert!(h.add_if_not_exists(expired));
+        std::thread::sleep(Duration::from_millis(10));
+        let live = SessionId { user: [4u8; 16], key: [5u8; 16], nonce: [6u8; 16] };
+        assert!(h.add_if_not_exists(live), "过期条目可重新加入");
+        h.retain_expired();
+        assert_eq!(h.len(), 1, "只保留未过期条目");
+    }
+
+    /// 装配点接线存在性：`start_cleanup` 在装配根 scope 上起周期任务（不 panic）。
+    #[tokio::test]
+    async fn session_history_start_cleanup_spawns_on_plugin_ctx() {
+        let ctx = xray_frame::PluginContext::for_plugin("vmess-session-history");
+        let h = Arc::new(SessionHistory::with_ttl(Duration::from_millis(1)));
+        h.start_cleanup(&ctx);
     }
     use xray_common::uuid::UUID;
 

@@ -19,6 +19,8 @@ subtle = "2"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
+# useSystemCA（Go loadCA(true) → x509.SystemCertPool）读 OS 信任库；已在 Cargo.lock
+rustls-native-certs = "0.8"
 rustls-pki-types = { workspace = true }
 
 # OCSP stapling（对应 Go crypto/x509 + ocsp；自动获取并装订 OCSP 响应到 TLS 握手）

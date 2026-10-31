@@ -23,6 +23,8 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use xray_common::net::address::ip_literal;
+
 use crate::error::{Result, SocksError};
 
 // ===== 协议版本常量 =====
@@ -234,18 +236,26 @@ pub fn parse_address_port(bytes: &[u8]) -> Result<(SocksAddr, usize)> {
                 )));
             }
             let domain_bytes = &bytes[offset..offset + len];
-            // 81uq：字符集校验，对齐 Go isValidDomain（仅 0-9 a-z A-Z - . _）。
-            // 见函数 doc。
-            if !is_valid_domain_bytes(domain_bytes) {
-                return Err(SocksError::InvalidFrame(format!(
-                    "invalid domain name: {len} bytes at offset {offset}"
-                )));
-            }
             let domain = std::str::from_utf8(domain_bytes)
-                .map_err(|e| SocksError::InvalidFrame(format!("domain utf8 error: {e}")))?
-                .to_string();
+                .map_err(|e| SocksError::InvalidFrame(format!("domain utf8 error: {e}")))?;
             offset += len;
-            Host::Domain(domain)
+            // f2ap9：对齐 Go `addressParser.readAddress`（address.go:213-217）——
+            // 域名字段携带 IP 字面量时先归一化成 IP（先于字符集校验，Go 同序），
+            // 否则 routing `ip` 规则永不命中，屏蔽/分流被绕过。
+            match ip_literal(domain) {
+                Some(IpAddr::V4(ip)) => Host::Ipv4(ip),
+                Some(IpAddr::V6(ip)) => Host::Ipv6(ip),
+                None => {
+                    // 81uq：字符集校验，对齐 Go isValidDomain（仅 0-9 a-z A-Z - . _）。
+                    // 见函数 doc。
+                    if !is_valid_domain_bytes(domain_bytes) {
+                        return Err(SocksError::InvalidFrame(format!(
+                            "invalid domain name: {len} bytes at offset {offset}"
+                        )));
+                    }
+                    Host::Domain(domain.to_string())
+                },
+            }
         },
         other => {
             return Err(SocksError::InvalidFrame(format!("unknown atyp: {other:#x}")));
@@ -450,6 +460,38 @@ mod tests {
             other => panic!("expected Domain, got {other:?}"),
         }
         assert_eq!(parsed.port, 443);
+    }
+
+    /// f2ap9：`ATYP=Domain` 携带 IP 字面量必须归一化成 IP。
+    ///
+    /// Go `common/protocol/address.go:213-217`：domain 字段首字节命中
+    /// `maybeIPPrefix` 且 `ParseAddress` 解出 IP 时返回 IP 地址。归一化缺失 →
+    /// 目标以 `Address::Domain("1.2.3.4")` 进入 routing → `ip` 规则永不命中。
+    #[test]
+    fn parse_normalizes_domain_form_ip_literal() {
+        // "1.2.3.4"（域名字段形态的 IPv4）
+        let mut bytes = vec![ATYP_DOMAIN, 7];
+        bytes.extend_from_slice(b"1.2.3.4");
+        bytes.extend_from_slice(&8080u16.to_be_bytes());
+        let (parsed, consumed) = parse_address_port(&bytes).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(parsed.host, Host::Ipv4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(parsed.port, 8080);
+
+        // "[::1]"（域名字段形态的 IPv6，Go ParseAddress 去括号）
+        let mut bytes = vec![ATYP_DOMAIN, 5];
+        bytes.extend_from_slice(b"[::1]");
+        bytes.extend_from_slice(&53u16.to_be_bytes());
+        let (parsed, _) = parse_address_port(&bytes).unwrap();
+        assert_eq!(parsed.host, Host::Ipv6(Ipv6Addr::LOCALHOST));
+
+        // "1.2.3.4.example.com" 不是 IP 字面量 → 保持域名
+        let host = "1.2.3.4.example.com";
+        let mut bytes = vec![ATYP_DOMAIN, u8::try_from(host.len()).unwrap()];
+        bytes.extend_from_slice(host.as_bytes());
+        bytes.extend_from_slice(&443u16.to_be_bytes());
+        let (parsed, _) = parse_address_port(&bytes).unwrap();
+        assert_eq!(parsed.host, Host::Domain(host.into()));
     }
 
     // ===== encode/decode UDP packet =====

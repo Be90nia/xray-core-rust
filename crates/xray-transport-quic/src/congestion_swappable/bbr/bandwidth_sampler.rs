@@ -162,6 +162,7 @@ impl BandwidthSampler {
         bytes_in_flight: ByteCount,
         is_retransmittable: bool,
     ) {
+        self.remove_obsolete_packets(packet_number);
         self.total_bytes_sent += bytes;
         if is_retransmittable {
             let state = SendTimeState::new(
@@ -212,7 +213,12 @@ impl BandwidthSampler {
         self.app_limited_packets.insert(packet_number, ());
     }
 
-    pub fn remove_obsolete_packets(&mut self, _less_than: PacketNumber) {}
+    pub fn remove_obsolete_packets(&mut self, less_than: PacketNumber) {
+        // bd 37jw1：原为空体。本实现里发包状态由 ack/loss 路径（`on_congestion_event`）
+        // 逐个退役，只有 app-limited 标记是"写入后无人回收"的账：不清理会随
+        // app-limited(空闲期) 发包数无界增长。用发包水位线按需回收。
+        self.app_limited_packets.retain(|pn, ()| *pn >= less_than);
+    }
 
     pub fn advance_round(&mut self) {
         self.round_trip_count += 1;
@@ -239,6 +245,24 @@ mod tests {
         assert_eq!(s.total_bytes_sent(), 500);
         s.on_packet_sent(200, 2, 300, 800, false);
         assert_eq!(s.total_bytes_sent(), 800);
+    }
+
+    /// bd 37jw1：`remove_obsolete_packets` 原为空体，app-limited 标记只写不回收。
+    /// 发包水位推进后旧标记必须被丢弃，且在飞状态（sent_packets）不受影响。
+    #[test]
+    fn remove_obsolete_packets_prunes_app_limited_marks_only() {
+        let mut s = BandwidthSampler::new(10);
+        s.on_packet_sent(100, 10, 500, 500, true);
+        s.on_app_limited(20);
+        s.on_app_limited(25);
+        assert_eq!(s.app_limited_packets.len(), 2);
+        s.on_packet_sent(200, 21, 500, 1000, true);
+        assert_eq!(
+            s.app_limited_packets.keys().copied().collect::<Vec<_>>(),
+            vec![25],
+            "水位线（21）以下的标记被回收，以上的保留"
+        );
+        assert_eq!(s.sent_packets.len(), 2, "在飞发包状态不被水位线清理");
     }
 
     #[test]

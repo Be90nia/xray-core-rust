@@ -133,6 +133,13 @@ impl From<xray_conf::ConfError> for CoreFunctionError {
     }
 }
 
+impl From<crate::outbound::BuildError> for CoreFunctionError {
+    fn from(e: crate::outbound::BuildError) -> Self {
+        // bd o91s4：outbound 条目构造失败 = 装配期配置错（Go 解码期硬错）→ InstanceInit。
+        CoreFunctionError::InstanceInit(format!("outbound registration failed: {e}"))
+    }
+}
+
 /// 装配期已装入日志掩码表的凭据全集（进程级）。
 ///
 /// udf `ChannelRegistry::set_secrets` 是**替换**语义：多次装配（配置重载 /
@@ -281,7 +288,14 @@ async fn start_full_dispatched(
 
     // Routing 自动接入：routing app 存在时优先完整 RouterAdapter（rich RoutingContext
     // + DNS resolved 选路 + balancer selector 接真实 ohm + observatory 观测器）；
-    // 失败回退 PatternRouter；否则走纯 default outbound 路径。
+    // 无 routing app 时走纯 default outbound 路径。
+    //
+    // bd vaye2：路由配置非法/资产缺失一律**拒启**（Go `infra/conf` Build 期硬错）。
+    // 旧实现对 Geodata 以外的错误 warn + 回退 `PatternRouter`（domain→Exact、
+    // balancerTag 丢弃、port/network 规则全丢），再失败则 (None, None) 无路由——
+    // 访问控制静默失效（E1：`port:"18500,bad-port"` 后屏蔽规则不生效、流量直连）。
+    // 适配器句柄保留：commander RoutingService 注入（bd lu37q）需要同一个 Router。
+    let mut routing_adapter: Option<Arc<crate::wiring::RouterAdapter>> = None;
     let (routing_router, dns_router) = if let Some(r) = routing_override {
         let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(Arc::clone(&r)))
             as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
@@ -295,42 +309,16 @@ async fn start_full_dispatched(
                     instance
                         .get_feature::<xray_app_observatory::ObservatoryFeature>()
                         .map(|f| Arc::new(crate::wiring::ObservatoryProviderBridge(f)) as Arc<_>);
-                match crate::wiring::build_router_adapter_from_json_with_ohm(
-                    &a.data, &ohm, observer,
-                ) {
-                    Ok(adapter) => {
-                        let routing = Arc::clone(&adapter)
-                            as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-                        let dns_side = Arc::clone(&adapter) as Arc<dyn DispatchRouter>;
-                        (Some(routing), Some(dns_side))
-                    },
-                    Err(e) => {
-                        // bd il49：配置引用 geo 规则但资产缺失 → 拒启（对齐 Go
-                        // Build 失败即拒启）。回退 PatternRouter 会把 geosite:/geoip:
-                        // 规则静默降级为永不命中的字面量，分流意图完全丢失。
-                        if let crate::wiring::WiringError::Geodata(msg) = &e {
-                            return Err(CoreFunctionError::InstanceInit(format!(
-                                "router init failed: {msg}"
-                            )));
-                        }
-                        tracing::warn!(
-                            error = %e,
-                            "full Router init failed, falling back to PatternRouter"
-                        );
-                        match crate::router::PatternRouter::from_json(&a.data) {
-                            Ok(r) => {
-                                let r: Arc<dyn DispatchRouter> = Arc::new(r);
-                                let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(
-                                    Arc::clone(&r),
-                                ))
-                                    as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-                                let dns_side = Arc::clone(&r) as Arc<dyn DispatchRouter>;
-                                (Some(bridge), Some(dns_side))
-                            },
-                            Err(_) => (None, None),
-                        }
-                    },
-                }
+                let adapter =
+                    crate::wiring::build_router_adapter_from_json_with_ohm(&a.data, &ohm, observer)
+                        .map_err(|e| {
+                            CoreFunctionError::InstanceInit(format!("router init failed: {e}"))
+                        })?;
+                routing_adapter = Some(Arc::clone(&adapter));
+                let routing =
+                    Arc::clone(&adapter) as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
+                let dns_side = Arc::clone(&adapter) as Arc<dyn DispatchRouter>;
+                (Some(routing), Some(dns_side))
             },
             None => (None, None),
         }
@@ -518,7 +506,30 @@ async fn start_full_dispatched(
             inbounds: Arc::clone(&inbound_runtime),
             ohm: Arc::clone(&ohm),
         }));
+        // bd lu37q：RoutingService / ObservatoryService 后端注入（此前全仓零生产
+        // 调用点 → `api.services` 声明了也只暴露 UNIMPLEMENTED，而后端实现齐全）。
+        // 对应 Go `app/router/command` :139-147 / `app/observatory/command` :31-33
+        // 的 `RequireFeatures(..., false)`：拿不到 feature 即启动失败（不是静默不注册）。
+        if let Some(adapter) = routing_adapter.as_ref() {
+            commander.set_routing_service(Arc::new(
+                xray_app_router::command::RoutingService::with_router(Arc::clone(adapter.inner())),
+            ));
+        }
+        if let Some(f) = instance.get_feature::<xray_app_observatory::ObservatoryFeature>() {
+            commander.set_observatory_service(Arc::new(
+                xray_app_observatory::command::DefaultObservatoryService::new(Arc::new(
+                    ObservatorySnapshotProvider(f),
+                )),
+            ));
+        }
     }
+
+    // bd nip4p：反向编排装配（VLESS Reverse Proxy 是 v26 唯一的反向形态——legacy
+    // `reverse` app 配置已被 Go 移除）。bridge tag 取自 vless 出站 user，portal tag
+    // 取自 vless 入站 user；必须在 `instance.start` 之前建好 feature（portal handler
+    // 要在入站开始收 Rvs 之前登记进出站表，`instance.start` 先于 spawn_inbounds），
+    // 缺 deps / 非法 tag 即启动失败（Go `core.RequireFeatures` 同款硬错）。
+    crate::reverse::install_vless_reverse(&mut instance, built, &ohm, &dispatcher)?;
 
     instance.start()?;
     let handles = spawn_inbounds(built, &inbound_runtime)
@@ -576,6 +587,23 @@ const RECEIVER_CONFIG_TYPE_URL: &str = "xray.app.proxyman.ReceiverConfig";
 struct ApiHandlerService {
     inbounds: Arc<crate::inbound::InboundRuntime>,
     ohm: Arc<SimpleOhm>,
+}
+
+/// commander `ObservatoryService` 后端桥（bd lu37q）：`ObservatoryFeature` 的观测
+/// 快照 → `xray_app_observatory::command::ObservationProvider`。
+///
+/// 两个同名 trait 分属 router（leastping 数据源）与 observatory command（gRPC），
+/// 不能互相 impl；这里是 xray-core 装配层的最小桥（同 [`crate::wiring::
+/// ObservatoryProviderBridge`] 的定位）。
+struct ObservatorySnapshotProvider(Arc<xray_app_observatory::ObservatoryFeature>);
+
+impl xray_app_observatory::command::ObservationProvider for ObservatorySnapshotProvider {
+    fn get_observation(
+        &self,
+    ) -> Result<xray_app_observatory::ObservationResult, xray_app_observatory::ObservatoryError>
+    {
+        Ok(self.0.observer().get_observation())
+    }
 }
 
 impl ApiHandlerService {
@@ -3281,9 +3309,14 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use xray_proxy_vless::encryption::vision_conn::VisionConn;
 
-        let server_cfg = xray_tls::server_config::build_server_config("tls", None)
-            .unwrap()
-            .expect("server tls config");
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let server_cfg = xray_tls::server_config::build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "cert": cert_pem, "key": key_pem })),
+        )
+        .unwrap()
+        .expect("server tls config");
         let client_cfg = xray_tls::client_config::build_client_config(
             "tls",
             Some(&serde_json::json!({ "allowInsecure": true })),
@@ -3442,9 +3475,14 @@ mod tests {
     async fn repro_h1_rustls_only_tcp_512k() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let server_cfg = xray_tls::server_config::build_server_config("tls", None)
-            .unwrap()
-            .expect("server tls config");
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let server_cfg = xray_tls::server_config::build_server_config(
+            "tls",
+            Some(&serde_json::json!({ "cert": cert_pem, "key": key_pem })),
+        )
+        .unwrap()
+        .expect("server tls config");
         let client_cfg = xray_tls::client_config::build_client_config(
             "tls",
             Some(&serde_json::json!({ "allowInsecure": true })),

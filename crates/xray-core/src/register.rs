@@ -937,10 +937,25 @@ fn geodata_factory() -> FeatureFactory {
 /// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go
 /// `infra/conf/geodata.go:48-71` Build() 语义校验：cron 非法 / asset url
 /// 非 https / asset file 本地缺失 → `ConfigInvalid` 硬错（bd onx4：启动期致命）。
-/// cron 为空则原样放行（start 时不调度，与 Go `if config.Cron == ""` 等价）。
+/// cron 为空则原样放行（start 时不调度，与 Go `if config.cron == ""` 等价）。
+///
+/// bd 3nt18：`geodata.outbound` 目前在 Rust 侧**无接线**（`RealAssetDownloader`
+/// 不带 dispatcher，Go `app/geodata/geodata.go:28-40` 走 tagged dispatcher）——
+/// 配了它仍会直连 GitHub 下载 = 出口 IP 暴露 + 墙内失败，且零日志。既然消费不了，
+/// 该键出现即拒启（fail-visible），不做"读进来扔掉"。
 fn map_geodata_config(
     json_cfg: xray_conf::app_config::GeodataConfig,
 ) -> Result<xray_app_geodata::GeodataConfig, FeatureError> {
+    let outbound = json_cfg.outbound.unwrap_or_default();
+    if !outbound.is_empty() {
+        return Err(FeatureError::ConfigInvalid {
+            name: "geodata",
+            message: format!(
+                "geodata.outbound `{outbound}` is not wired in this build (asset downloads \
+                 always dial directly); remove the key or download assets out-of-band"
+            ),
+        });
+    }
     let mut assets = Vec::new();
     for a in json_cfg.assets.unwrap_or_default() {
         let url = a.url.unwrap_or_default();
@@ -962,7 +977,8 @@ fn map_geodata_config(
     }
     let config = xray_app_geodata::GeodataConfig {
         cron: json_cfg.cron.unwrap_or_default(),
-        outbound: json_cfg.outbound.unwrap_or_default(),
+        // 上面已拒非空 `outbound`；此处恒空（下载器不接 dispatcher，bd 3nt18）。
+        outbound: String::new(),
         assets,
     };
     if !config.cron.is_empty() {
@@ -1182,25 +1198,35 @@ mod tests {
     /// 真正映射进运行时配置（此前解析后弃用 `_json_cfg`，恒 default 空值，
     /// 自动更新静默永不发生）。
     #[test]
-    fn geodata_mapping_captures_cron_outbound_assets() {
+    fn geodata_mapping_captures_cron_and_assets() {
         let dir = default_asset_dir();
         std::fs::create_dir_all(&dir).expect("asset dir should create");
         let asset_file = dir.join("xei2-test-geo.dat");
         std::fs::write(&asset_file, b"test").expect("asset file should write");
 
         let json: xray_conf::app_config::GeodataConfig = serde_json::from_str(
-            r#"{"cron":"0 0 11 9 *","outbound":"worker",
+            r#"{"cron":"0 0 11 9 *",
                 "assets":[{"url":"https://example.com/geoip.dat","file":"xei2-test-geo.dat"}]}"#,
         )
         .expect("json should parse");
         let cfg = map_geodata_config(json).expect("valid config should map");
         assert_eq!(cfg.cron, "0 0 11 9 *");
-        assert_eq!(cfg.outbound, "worker");
+        assert!(cfg.outbound.is_empty(), "outbound 无接线 → 恒空（bd 3nt18）");
         assert_eq!(cfg.assets.len(), 1);
         assert_eq!(cfg.assets[0].url, "https://example.com/geoip.dat");
         assert_eq!(cfg.assets[0].file, "xei2-test-geo.dat");
 
         let _ = std::fs::remove_file(&asset_file);
+    }
+
+    /// bd 3nt18：`geodata.outbound` 无接线（下载器不接 dispatcher）→ 出现即拒启，
+    /// 不得"读进来扔掉"后仍直连下载（IP 暴露 + 墙内失败）。
+    #[test]
+    fn geodata_mapping_rejects_unwired_outbound() {
+        let json: xray_conf::app_config::GeodataConfig =
+            serde_json::from_str(r#"{"outbound":"worker"}"#).expect("json should parse");
+        let err = map_geodata_config(json).expect_err("unwired outbound must fail");
+        assert!(err.to_string().contains("geodata.outbound"), "unexpected error: {err}");
     }
 
     /// cron 非法 → Build 期硬错，对齐 Go infra/conf `invalid geodata cron`。

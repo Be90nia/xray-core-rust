@@ -275,6 +275,19 @@ impl ServerWorker {
             self.dispatcher.dispatch(target.clone()).await
         }
         .map_err(|e| ServerError::DispatchFailed(format!("dispatch to {}: {}", target, e)))?;
+        // bd t0ls1：mux data 段对所有 UDP 会话都是裸载荷（client 侧
+        // `dispatch_with_source` 对 UDP 无条件裹/剥帧），内部 dispatch link 契约
+        // 却是 XUDP 帧（freedom/dns/hysteria/tuic/ss/wg 按帧解析）。无 GlobalID
+        // 的 UDP 会话（cone 关 / 无入站源）原先只在 `handle_xudp_new` 转换，
+        // 裸报文被下游当帧解析失败静默丢包 → 上行通了没有回程。
+        let link = if target.network() == Network::UDP {
+            Link {
+                reader: Box::new(XudpUnframingReader::new(link.reader)),
+                writer: Box::new(XudpFramingWriter::new(link.writer, target.clone())),
+            }
+        } else {
+            link
+        };
         let tt = if target.network() == Network::UDP {
             TransferType::Packet
         } else {
@@ -1097,8 +1110,10 @@ mod tests {
 
             let (_dest, mut pay, _server) = process_one_frame(frame).await;
 
+            // t0ls1：无 GlobalID 的 UDP 会话同样在 mux 边界做表示转换，
+            // dispatch link 上行恒为 XUDP 帧（载荷逐字节还原）。
             let got = read_payload(&mut pay).await;
-            assert_eq!(got, b"tiny");
+            assert_eq!(xudp_payloads(&got), vec![b"tiny".to_vec()]);
         }
 
         /// 普通路径：New + TCP Stream 会话小首帧也即时送达。bd 6z8。

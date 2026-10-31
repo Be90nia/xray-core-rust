@@ -6,13 +6,16 @@
 //! - `allowInsecure` / `alpn`
 //! - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
 //!   `crate::config::security_params`，rustls 边界项 warn 后降级）
-//! - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
-//!   `getCertPool` → `loadSelfCertPool`）
+//! - 信任根（对应 Go `getCertPool`）：`disableSystemRoot` → 只用 `certificates[]`； `useSystemCA` →
+//!   OS 信任库；缺省 → 内置根 bundle（Go `x509roots` / Rust `webpki-roots`，同源 Mozilla
+//!   根集）；`certificates[]` 一律追加进根池
 //! - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
 //!   `PinnedServerCertVerifier`）
+//! - `verifyPeerCertByName`：证书名验证（Go v26 新增，逗号分隔多名；单独配置时走 CA 验链 +
+//!   名匹配，与 pin 互不冲突）
 //! - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
 //!
-//! ECH 留待 115 另 issue；`verifyPeerCertByName` 未实现（Go v26 新增，暂无需求）。
+//! ECH 留待 115 另 issue。
 
 use std::{io, sync::Arc};
 
@@ -61,13 +64,14 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 /// - `allowInsecure` / `alpn`
 /// - `minVersion` / `maxVersion` / `cipherSuites` / `curvePreferences` （经
 ///   `crate::config::security_params`，rustls 边界项 warn 后降级）
-/// - `disableSystemRoot` + `certificates[]`：自定义 CA 信任根替代 webpki-roots （对应 Go
-///   `getCertPool` → `loadSelfCertPool`）
+/// - 信任根（对应 Go `getCertPool`）：`disableSystemRoot` → 只用 `certificates[]`； `useSystemCA` →
+///   OS 信任库；缺省 → 内置根 bundle（Go `x509roots` / Rust `webpki-roots`，同源 Mozilla
+///   根集）；`certificates[]` 一律追加进根池
 /// - `pinnedPeerCertSha256`：证书钉扎（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`，见
 ///   `PinnedServerCertVerifier`）
 /// - `certificates[]` 带 key 条目：客户端身份证书（mTLS 双向握手；Go 无此能力， Rust 扩展）
-/// - `verifyPeerCertByName`（Go v26 新增）：以字符串而非 SNI 主机名做证书验证， 用于 ECH/PSK
-///   等握手阶段 SNI 与真实服务名不一致的场景。
+/// - `verifyPeerCertByName`（Go v26 新增）：以名字列表（逗号分隔）而非 SNI 做证书验证， 用于
+///   ECH/PSK 等握手阶段 SNI 与真实服务名不一致的场景；单独配置时走 CA 验链 + 名匹配。
 /// - `masterKeyLog`（Go `tls.Config.KeyLogWriter` 等价）/ `enableSessionResumption` （Go
 ///   `SessionTicketsDisabled` 等价）：pwh6 字段族增量。
 ///
@@ -140,15 +144,10 @@ pub fn build_client_config(
         .and_then(|m| m.get("enableSessionResumption"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    // verifyPeerCertByName：Go v26 新增——以字符串而非 SNI 主机名做证书验证。
+    // verifyPeerCertByName：Go v26 新增——以名字（可多名）而非 SNI 做证书验证。
     // 用法：ECH/PSK 等握手阶段 SNI 与真实服务名不一致场景，对 ECH inner SNI
-    // 暴露的真实服务做校验。Rust 端把字符串传给 PinnedServerCertVerifier 的
-    // verify_server_cert 替代默认 SNI 校验。空字符串=保持默认 SNI 校验。
-    let verify_peer_cert_by_name = obj
-        .and_then(|m| m.get("verifyPeerCertByName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // 暴露的真实服务做校验。空=保持默认 SNI 校验。
+    let verify_peer_cert_by_name = parse_verify_peer_cert_by_name(&json);
 
     // echSockopt（Go transport_security.go:318 `echSockopt`）：Go 唯一消费点是
     // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的 DialSystem 连接 sockopt）。
@@ -170,16 +169,18 @@ pub fn build_client_config(
         .with_protocol_versions(&versions)
         .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
 
+    // 信任根先算：pin/vcn 分支里的第二段名验证要用同一份根池（Go `RootCAs`）。
+    let roots = verifier_roots(&json)?;
     let builder = if allow_insecure {
         builder.dangerous().with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
     } else if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
-        // pwh6: verifyPeerCertByName 与 pinnedPeerCertSha256 互不冲突，可同时配；
-        // 任一非空都走 PinnedServerCertVerifier（已实现 verify_chain 逻辑）。
+        // bd idtl1：vcn-only（无 pin）是合法配置——Go 的 pin 段在
+        // `PinnedPeerCertSha256 == nil` 时整段跳过，vcn 段用 RootCAs 验链+验名。
         builder.dangerous().with_custom_certificate_verifier(Arc::new(
-            PinnedServerCertVerifier::new(pins, verify_peer_cert_by_name),
+            PinnedServerCertVerifier::new(pins, verify_peer_cert_by_name, Arc::new(roots)),
         ))
     } else {
-        builder.with_root_certificates(verifier_roots(&json)?)
+        builder.with_root_certificates(roots)
     };
 
     let mut cfg = match identity {
@@ -225,9 +226,17 @@ pub fn build_client_config(
     Ok(Some(Arc::new(cfg)))
 }
 
-/// 客户端验证器信任根选择：`disableSystemRoot=true` → `certificates[]` 全部
-/// 证书作自定义 CA（对应 Go `loadSelfCertPool`，不筛 usage）；否则 webpki-roots
-/// （Go 用系统根，Rust 沿用既有 webpki-roots 决策）。
+/// 客户端信任根（对应 Go `getCertPool`，`transport/internet/tls/config.go:366`）。
+///
+/// Go 的三档（`config_other.go` / `config_windows.go`）：
+/// 1. `disableSystemRoot=true` → `loadSelfCertPool()`：**只**信 `certificates[]`。
+/// 2. `useSystemCA=true` → `loadCA(true)` = `x509.SystemCertPool()`（失败回落 bundle）， 再追加
+///    `certificates[]`。
+/// 3. 缺省 → `loadCA(false)` = Go 内置的 `x509roots` bundle（Mozilla 根集），再追加
+///    `certificates[]` —— 与 Rust `webpki-roots` 同源，故 Rust 缺省用 webpki-roots 等价。
+///
+/// 注意 Go 三档**都**追加 `certificates[]`（1 是"只"用它们），因此自带 CA 的配置
+/// 不需要 `disableSystemRoot` 也能验过。
 fn verifier_roots(json: &serde_json::Value) -> io::Result<RootCertStore> {
     let disable = json
         .as_object()
@@ -235,12 +244,33 @@ fn verifier_roots(json: &serde_json::Value) -> io::Result<RootCertStore> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if disable {
-        custom_root_store(json)
-    } else {
-        let mut store = RootCertStore::empty();
-        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Ok(store)
+        return custom_root_store(json);
     }
+    let mut store = RootCertStore::empty();
+    if json.get("useSystemCA").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let native = rustls_native_certs::load_native_certs();
+        for err in &native.errors {
+            tracing::warn!(
+                target: "xray_tls::client_config",
+                error = %err,
+                "useSystemCA: failed to read part of the OS root store"
+            );
+        }
+        for cert in native.certs {
+            // 单条根证书不被接受只影响该条（同 Go 逐条 AppendCertsFromPEM 容错）
+            let _ = store.add(cert);
+        }
+        if store.is_empty() {
+            tracing::warn!(
+                target: "xray_tls::client_config",
+                "useSystemCA: OS root store yielded no usable cert; every chain will fail"
+            );
+        }
+    } else {
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    add_json_certs(&mut store, json)?;
+    Ok(store)
 }
 
 /// 按安全配置构建**服务端证书验证器**（btls 指纹路径回接验证用，pz6c）。
@@ -270,19 +300,31 @@ pub fn build_server_cert_verifier(
         return Ok(None);
     }
     let pins = parse_pinned_hashes(&json)?;
-    let verify_peer_cert_by_name = json
-        .as_object()
-        .and_then(|m| m.get("verifyPeerCertByName"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let verify_peer_cert_by_name = parse_verify_peer_cert_by_name(&json);
+    let roots = Arc::new(verifier_roots(&json)?);
     if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
-        return Ok(Some(Arc::new(PinnedServerCertVerifier::new(pins, verify_peer_cert_by_name))));
+        return Ok(Some(Arc::new(PinnedServerCertVerifier::new(
+            pins,
+            verify_peer_cert_by_name,
+            roots,
+        ))));
     }
-    let verifier = WebPkiServerVerifier::builder(Arc::new(verifier_roots(&json)?))
+    let verifier = WebPkiServerVerifier::builder(roots)
         .build()
         .map_err(|e| io::Error::other(format!("webpki verifier: {e}")))?;
     Ok(Some(verifier))
+}
+
+/// `verifyPeerCertByName`：逗号分隔多名（Go `infra/conf/transport_security.go:382-390`
+/// 逐段 `TrimSpace` 去空）。缺失/非字符串/空串 → 空列表 = 不启用名验证。
+fn parse_verify_peer_cert_by_name(json: &serde_json::Value) -> Vec<String> {
+    json.as_object()
+        .and_then(|m| m.get("verifyPeerCertByName"))
+        .and_then(|v| v.as_str())
+        .map(|spec| {
+            spec.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `disableSystemRoot=true` 时的信任根：`certificates[]` 全部条目的证书
@@ -295,6 +337,15 @@ pub fn build_server_cert_verifier(
 /// 加载期即报错，不在信任根构建层静默吞掉。
 fn custom_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
     let mut store = RootCertStore::empty();
+    add_json_certs(&mut store, json)?;
+    Ok(store)
+}
+
+/// 把 `certificates[]` 全部条目的证书追加进根池（Go `getCertPool` 各档的
+/// `pool.AppendCertsFromPEM(cert.Certificate)` 循环，不筛 usage）。
+///
+/// 条目非法（内联类型错/内容缺失/PEM 无证书块）→ 传播错误（配置加载期 fail-fast）。
+fn add_json_certs(store: &mut RootCertStore, json: &serde_json::Value) -> io::Result<()> {
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
             let (certs, _) = entry_certs_and_key(entry)?;
@@ -305,7 +356,7 @@ fn custom_root_store(json: &serde_json::Value) -> io::Result<RootCertStore> {
             }
         }
     }
-    Ok(store)
+    Ok(())
 }
 
 /// 解析 `pinnedPeerCertSha256`：逗号分隔 hex 字符串（容忍 OpenSSL 冒号格式）。
@@ -375,17 +426,19 @@ fn client_identity(
     Ok(None)
 }
 
-/// 证书钉扎 verifier（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`）。
+/// 证书钉扎 / 名验证 verifier（对应 Go `RandCarrier.verifyPeerCert` + `verifyChain`）。
 ///
-/// 语义与 Go 一致：
-/// 1. pin 命中**叶子** → 直接通过（Go `foundLeaf` 即 `return nil`，不查链/有效期/主机名）。
-/// 2. pin 命中链中 **CA** → 以该 CA 为唯一信任根做完整 webpki 验证 （链构建 + 签名 + 有效期 +
-///    主机名，对应 Go foundCA 分支的 `certs[0].Verify`）。
-/// 3. 无命中 → 拒绝（"peer cert is unrecognized"）。
+/// 语义与 Go 一致（两段式，第二段只在 pin 未直接放行时跑）：
+/// 1. `pinnedPeerCertSha256` **非空**才走 pin 段：命中**叶子** → 直接通过（Go `foundLeaf` 即
+///    `return nil`，不查链/有效期/主机名）；命中链中 **CA** → 该 CA 成为唯一信任根； 无命中 →
+///    拒绝（`peer cert is unrecognized`）。**pin 为空时整段跳过**——Go `PinnedPeerCertSha256 == nil`
+///    时不进 pin 分支（bd idtl1：旧实现把空 pin 当"无命中"， 导致只配 vcn 的配置一律被拒）。
+/// 2. `verifyPeerCertByName` 非空 → 对**每个名字**做完整 webpki 验证（链 + 签名 + 有效期 +
+///    主机名，对应 Go `certs[0].Verify(Roots=CAs, DNSName=name)`），全部失败才拒。 无 vcn 但 pin
+///    命中 CA → 用握手 SNI（Go "Pinning CA" 分支）。
 ///
-/// pwh6: 附加 `verify_peer_cert_by_name`（Go `verifyPeerCertByName` v26 新增）：
-/// 非空时替代默认 SNI 做证书主机名校验。ECH 等握手阶段 SNI 与真实服务名不一致
-/// 场景：对 ECH inner SNI 暴露的真实服务名做校验。空=默认 SNI 校验。
+/// 信任根：`roots` = 配置的根池（[`verifier_roots`]，即 Go `r.RootCAs`）；pin 命中 CA 时
+/// 换成该 CA。
 ///
 /// 握手签名验证是**真实验证**（委托 ring provider），与
 /// [`NoCertificateVerification`] 的全过语义不同——钉扎不降低握手完整性。
@@ -393,13 +446,19 @@ fn client_identity(
 struct PinnedServerCertVerifier {
     /// 每项 32 字节 SHA-256。
     pins: Vec<Vec<u8>>,
-    /// Go `verifyPeerCertByName` 等价——非空时替代 SNI 做主机名校验。
-    verify_peer_cert_by_name: String,
+    /// Go `verifyPeerCertByName` 等价——非空时替代 SNI 做主机名校验（可多名）。
+    verify_peer_cert_by_name: Vec<String>,
+    /// 名验证段的信任根（Go `r.RootCAs` = `getCertPool()`）。
+    roots: Arc<RootCertStore>,
 }
 
 impl PinnedServerCertVerifier {
-    fn new(pins: Vec<Vec<u8>>, verify_peer_cert_by_name: String) -> Self {
-        Self { pins, verify_peer_cert_by_name }
+    fn new(
+        pins: Vec<Vec<u8>>,
+        verify_peer_cert_by_name: Vec<String>,
+        roots: Arc<RootCertStore>,
+    ) -> Self {
+        Self { pins, verify_peer_cert_by_name, roots }
     }
 }
 impl ServerCertVerifier for PinnedServerCertVerifier {
@@ -411,53 +470,79 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        // pwh6: verifyPeerCertByName 非空时替代默认 SNI——ECH/PSK 场景
-        // 握手阶段 SNI 与真实服务名不一致。pin 命中叶子分支照过；命中 CA
-        // 分支用 vcn 重新构造 ServerName 走 webpki 主机名校验。
-        let effective_name = if self.verify_peer_cert_by_name.is_empty() {
-            server_name.clone()
-        } else {
-            ServerName::try_from(self.verify_peer_cert_by_name.as_str())
-                .map_err(|e| rustls::Error::General(format!("verifyPeerCertByName: {e}")))?
-        };
-        // [叶子, 中间证书...] 的 hash/is_ca 输入（对应 Go verifyPeerCert 的 certs）
-        let mut hashes = vec![generate_cert_hash(end_entity)];
-        let mut is_ca = vec![false];
-        for cert in intermediates {
-            hashes.push(generate_cert_hash(cert));
-            is_ca.push(
-                x509_parser::parse_x509_certificate(cert.as_ref())
-                    .map(|(_, c)| c.is_ca())
-                    .unwrap_or(false),
-            );
+        // 第一段：pin。Go `PinnedPeerCertSha256 == nil` → 整段跳过（bd idtl1）。
+        let mut roots = Arc::clone(&self.roots);
+        if !self.pins.is_empty() {
+            // [叶子, 中间证书...] 的 hash/is_ca 输入（对应 Go verifyPeerCert 的 certs）
+            let mut hashes = vec![generate_cert_hash(end_entity)];
+            let mut is_ca = vec![false];
+            for cert in intermediates {
+                hashes.push(generate_cert_hash(cert));
+                is_ca.push(
+                    x509_parser::parse_x509_certificate(cert.as_ref())
+                        .map(|(_, c)| c.is_ca())
+                        .unwrap_or(false),
+                );
+            }
+            match verify_chain(&hashes, &is_ca, &self.pins) {
+                (VerifyResult::FoundLeaf, _) => return Ok(ServerCertVerified::assertion()),
+                (VerifyResult::FoundCa, Some(idx)) => {
+                    // verify_chain 的索引含叶子（0），中间证书从 1 起
+                    let ca = intermediates.get(idx - 1).ok_or_else(|| {
+                        rustls::Error::General("pinned CA index out of range".into())
+                    })?;
+                    let mut store = RootCertStore::empty();
+                    store
+                        .add(ca.clone())
+                        .map_err(|e| rustls::Error::General(format!("pinned CA: {e}")))?;
+                    roots = Arc::new(store);
+                },
+                _ => {
+                    return Err(rustls::Error::General(
+                        "peer cert is unrecognized (against pinnedPeerCertSha256)".into(),
+                    ));
+                },
+            }
         }
 
-        match verify_chain(&hashes, &is_ca, &self.pins) {
-            (VerifyResult::FoundLeaf, _) => Ok(ServerCertVerified::assertion()),
-            (VerifyResult::FoundCa, Some(idx)) => {
-                // verify_chain 的索引含叶子（0），中间证书从 1 起
-                let ca = intermediates
-                    .get(idx - 1)
-                    .ok_or_else(|| rustls::Error::General("pinned CA index out of range".into()))?;
-                let mut store = RootCertStore::empty();
-                store
-                    .add(ca.clone())
-                    .map_err(|e| rustls::Error::General(format!("pinned CA: {e}")))?;
-                let verifier = WebPkiServerVerifier::builder(Arc::new(store))
-                    .build()
-                    .map_err(|e| rustls::Error::General(format!("pinned CA verifier: {e}")))?;
-                verifier.verify_server_cert(
+        // 第二段：名验证。
+        if !self.verify_peer_cert_by_name.is_empty() {
+            // 多名逐个试，任一通过即放行（Go `for _, opts.DNSName = range ...`）
+            let verifier = WebPkiServerVerifier::builder(roots)
+                .build()
+                .map_err(|e| rustls::Error::General(format!("vcn verifier: {e}")))?;
+            let mut last_err = None;
+            for name in &self.verify_peer_cert_by_name {
+                let server_name = ServerName::try_from(name.clone()).map_err(|e| {
+                    rustls::Error::General(format!("verifyPeerCertByName {name}: {e}"))
+                })?;
+                match verifier.verify_server_cert(
                     end_entity,
                     intermediates,
-                    &effective_name,
+                    &server_name,
                     ocsp_response,
                     now,
+                ) {
+                    Ok(verified) => return Ok(verified),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            return Err(last_err.unwrap_or_else(|| {
+                rustls::Error::General(
+                    "peer cert is invalid (against root CAs and verifyPeerCertByName)".into(),
                 )
-            },
-            _ => Err(rustls::Error::General(
-                "peer cert is unrecognized (against pinnedPeerCertSha256)".into(),
-            )),
+            }));
         }
+        if self.pins.is_empty() {
+            // 无 pin 也无 vcn：本 verifier 不该被装上（build_client_config 走
+            // with_root_certificates）。对齐 Go 末行 `return nil`：不重复验。
+            return Ok(ServerCertVerified::assertion());
+        }
+        // pin 命中 CA 且未配 vcn → 用握手 SNI 验链（Go "Pinning CA" 分支）
+        let verifier = WebPkiServerVerifier::builder(roots)
+            .build()
+            .map_err(|e| rustls::Error::General(format!("pinned CA verifier: {e}")))?;
+        verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
     }
 
     fn verify_tls12_signature(
@@ -838,6 +923,39 @@ mod tests {
         assert!(!cfg.alpn_protocols.is_empty());
     }
 
+    /// bd 1avs1：`useSystemCA=true` 读 OS 信任库（Go `loadCA(true)` → `x509.SystemCertPool`）；
+    /// 缺省仍是内置根 bundle（Go `x509roots` / Rust `webpki-roots`）。
+    #[test]
+    fn verifier_roots_use_system_ca_loads_os_store() {
+        let os_certs = rustls_native_certs::load_native_certs().certs.len();
+        assert!(os_certs > 0, "OS root store must yield certs on this platform");
+
+        let system = verifier_roots(&serde_json::json!({"useSystemCA": true})).unwrap();
+        assert!(!system.is_empty(), "useSystemCA=true must load OS roots");
+
+        let bundled = verifier_roots(&serde_json::json!({})).unwrap();
+        assert_eq!(
+            bundled.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len(),
+            "default roots = bundled Mozilla set (Go x509roots equivalent)"
+        );
+    }
+
+    /// bd 1avs1：`certificates[]` 在**缺省**根池上追加（Go `getCertPool` 三档都
+    /// `AppendCertsFromPEM`，自带 CA 不必配 `disableSystemRoot`）。
+    #[test]
+    fn verifier_roots_appends_certificates_to_bundle() {
+        let (ca, _key) = make_ca("Append Root CA");
+        let store =
+            verifier_roots(&serde_json::json!({"certificates": [{"certificate": ca.pem()}]}))
+                .unwrap();
+        assert_eq!(
+            store.len(),
+            webpki_roots::TLS_SERVER_ROOTS.len() + 1,
+            "configured CA must be appended to the bundled roots"
+        );
+    }
+
     #[test]
     fn client_identity_picks_keyed_entry() {
         let (c1, _) = test_leaf_pem("nokey.example.com");
@@ -895,6 +1013,28 @@ mod tests {
 
     type Duplex = tokio::io::DuplexStream;
 
+    /// 服务端配置缺证书时补一张自签（SAN=sni）。
+    ///
+    /// bd mwvwd F2 后服务端不再自签（缺证书 = 每条连接握手失败，见
+    /// `server_config::tests::no_certificates_fail_handshake`），本 helper 只负责让
+    /// 与证书无关的用例（版本门/套件/曲线/ALPN）能握上手。
+    fn with_self_signed(mut json: serde_json::Value, san: &str) -> serde_json::Value {
+        let has_cert = json.get("cert").is_some()
+            || json
+                .get("certificates")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| !arr.is_empty());
+        if has_cert {
+            return json;
+        }
+        let (cert_pem, key_pem) =
+            crate::certificate::generate_self_signed_cert(&[san]).expect("self-signed cert");
+        let obj = json.as_object_mut().expect("server json must be an object");
+        obj.insert("cert".to_string(), serde_json::Value::String(cert_pem));
+        obj.insert("key".to_string(), serde_json::Value::String(key_pem));
+        json
+    }
+
     /// 在 `tokio::io::duplex` 上做一次真实 TLS 握手，返回 (服务端结果, 客户端结果)。
     async fn handshake_pair(
         server_json: serde_json::Value,
@@ -904,6 +1044,7 @@ mod tests {
         io::Result<tokio_rustls::server::TlsStream<Duplex>>,
         io::Result<tokio_rustls::client::TlsStream<Duplex>>,
     ) {
+        let server_json = with_self_signed(server_json, sni);
         let sc =
             crate::server_config::build_server_config("tls", Some(&server_json)).unwrap().unwrap();
         let cc = build_client_config("tls", Some(&client_json), sni).unwrap().unwrap();
@@ -1075,6 +1216,132 @@ mod tests {
         .await;
         assert!(cr2.is_err(), "pinned CA path must verify server name");
         drop(sr2);
+    }
+
+    // ===== bd idtl1: verifyPeerCertByName 单独配置（无 pin）=====
+
+    /// `verifyPeerCertByName` 逗号分隔多名 / 去空 / 去空白（Go SplittingSeq 语义）。
+    #[test]
+    fn vcn_parse_multiple_names() {
+        let names = parse_verify_peer_cert_by_name(&serde_json::json!({
+            "verifyPeerCertByName": " a.example , ,b.example,"
+        }));
+        assert_eq!(names, vec!["a.example".to_string(), "b.example".to_string()]);
+        assert!(parse_verify_peer_cert_by_name(&serde_json::json!({})).is_empty());
+        assert!(
+            parse_verify_peer_cert_by_name(&serde_json::json!({"verifyPeerCertByName": ""}))
+                .is_empty()
+        );
+    }
+
+    /// 只配 vcn（无 pin）：链按配置根验过 + 主机名按 vcn 匹配 → 成功。
+    ///
+    /// 修复前：空 pin 走 `verify_chain(.., &[])` → `CertNotFound` → 任何证书都拒
+    /// （Go 在 `PinnedPeerCertSha256 == nil` 时整段跳过 pin 分支）。
+    #[tokio::test]
+    async fn e2e_vcn_only_verifies_chain_and_name() {
+        let (ca, ca_key) = make_ca("vcn Root CA");
+        let (leaf_pem, leaf_key) = issue_leaf("real.service.example", &ca, &ca_key);
+        let mut chain = leaf_pem;
+        chain.push('\n');
+        chain.push_str(&ca.pem());
+
+        // 握手 SNI 故意与证书名不同：只有 vcn 能放行（ECH/PSK 场景）
+        let (sr, cr) = handshake_pair(
+            serde_json::json!({"certificates": [{"certificate": chain, "key": leaf_key}]}),
+            serde_json::json!({
+                "verifyPeerCertByName": "real.service.example",
+                "certificates": [{"certificate": ca.pem()}],
+            }),
+            "wrong.sni.example",
+        )
+        .await;
+        let client = cr.expect("vcn-only handshake must pass (chain + name via vcn)");
+        assert_eq!(client.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+        drop(sr);
+    }
+
+    /// 多名逗号分隔：任一命中即放行（Go `for _, opts.DNSName = range` 语义）。
+    #[tokio::test]
+    async fn e2e_vcn_multiple_names_any_match() {
+        let (ca, ca_key) = make_ca("vcn Multi CA");
+        let (leaf_pem, leaf_key) = issue_leaf("real.service.example", &ca, &ca_key);
+        let mut chain = leaf_pem;
+        chain.push('\n');
+        chain.push_str(&ca.pem());
+
+        let (_sr, cr) = handshake_pair(
+            serde_json::json!({"certificates": [{"certificate": chain, "key": leaf_key}]}),
+            serde_json::json!({
+                "verifyPeerCertByName": "nope.example, real.service.example",
+                "certificates": [{"certificate": ca.pem()}],
+            }),
+            "wrong.sni.example",
+        )
+        .await;
+        assert!(cr.is_ok(), "any matching vcn name must pass");
+    }
+
+    /// vcn 名不匹配 → 拒（证明名验证真的跑了，不是"有 vcn 就放行"）。
+    #[tokio::test]
+    async fn e2e_vcn_only_rejects_wrong_name() {
+        let (ca, ca_key) = make_ca("vcn Name CA");
+        let (leaf_pem, leaf_key) = issue_leaf("real.service.example", &ca, &ca_key);
+        let mut chain = leaf_pem;
+        chain.push('\n');
+        chain.push_str(&ca.pem());
+
+        let (_sr, cr) = handshake_pair(
+            serde_json::json!({"certificates": [{"certificate": chain, "key": leaf_key}]}),
+            serde_json::json!({
+                "verifyPeerCertByName": "other.example",
+                "certificates": [{"certificate": ca.pem()}],
+            }),
+            "wrong.sni.example",
+        )
+        .await;
+        let err = cr.expect_err("vcn mismatch must fail").to_string();
+        assert!(err.contains("not valid for name"), "got: {err}");
+    }
+
+    /// vcn 名匹配但链不受信（自签叶子，客户端只配 vcn）→ 拒。
+    /// 这是 idtl1 的安全属性：vcn 分支必须**同时**验链，不得退化成"只看名字"。
+    #[tokio::test]
+    async fn e2e_vcn_only_rejects_untrusted_chain() {
+        let (leaf_pem, leaf_key) = test_leaf_pem("real.service.example");
+        let (_sr, cr) = handshake_pair(
+            serde_json::json!({"certificates": [{"certificate": leaf_pem, "key": leaf_key}]}),
+            serde_json::json!({"verifyPeerCertByName": "real.service.example"}),
+            "wrong.sni.example",
+        )
+        .await;
+        let err = cr.expect_err("vcn must still verify the chain").to_string();
+        assert!(err.contains("certificate"), "got: {err}");
+    }
+
+    /// bd mwvwd F3：服务端按**自身**偏好序选套件（Go crypto/tls 语义），
+    /// 不跟随客户端 offered 顺序——客户端只把 AES-256 排在前时仍协商 AES-128。
+    #[tokio::test]
+    async fn e2e_server_prefers_own_cipher_order() {
+        let (sr, cr) = handshake_pair(
+            serde_json::json!({"minVersion": "1.3"}),
+            serde_json::json!({
+                "allowInsecure": true,
+                "minVersion": "1.3",
+                // 客户端偏好序反转（AES-256 在前）
+                "cipherSuites":
+                    "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256",
+            }),
+            "localhost",
+        )
+        .await;
+        let client = cr.expect("handshake must succeed");
+        sr.expect("server side ok");
+        assert_eq!(
+            client.get_ref().1.negotiated_cipher_suite().map(|s| s.suite()),
+            Some(rustls::CipherSuite::TLS13_AES_128_GCM_SHA256),
+            "server preference must win over client order (Go parity)"
+        );
     }
 
     #[tokio::test]

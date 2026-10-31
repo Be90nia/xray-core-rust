@@ -196,12 +196,14 @@ impl Feature for ReverseFeature {
             message: e.to_string(),
         };
         let Some(deps) = self.deps.read().clone() else {
-            // 未注入依赖（对应 Go RequireFeatures 失败）：warn + 跳过
-            tracing::warn!(
-                target: "xray_app_reverse",
-                "reverse feature start skipped: no dispatcher/registrar injected"
-            );
-            return Ok(());
+            // bd nip4p：缺依赖 = 装配 bug（Go `core.RequireFeatures` 失败即硬错）。
+            // 旧行为是 warn + Ok(())——配置通过、启动通过、运行期反向静默无效，
+            // 正是本票要根除的静默失效形态，改为 fail-visible。
+            return Err(FeatureError::StartFailed {
+                name: "ReverseFeature",
+                message: "no dispatcher/registrar injected (assembly must call set_deps)"
+                    .to_string(),
+            });
         };
         if self.started.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -517,11 +519,14 @@ mod feature_tests {
     }
 
     #[test]
-    fn feature_start_without_deps_warns_and_skips() {
+    fn feature_start_without_deps_fails_visible() {
         let feature = ReverseFeature::new(sample_config());
-        // 无依赖：warn + Ok（对应 Go RequireFeatures 失败场景的安全降级）
-        feature.start().expect("start skipped without deps");
-        feature.close().expect("close");
+        // bd nip4p：缺依赖不再静默跳过——装配 bug 必须在启动期炸出来
+        let err = feature.start().unwrap_err();
+        assert!(
+            matches!(&err, FeatureError::StartFailed { message, .. } if message.contains("set_deps")),
+            "missing deps must fail visibly: {err:?}"
+        );
     }
 
     #[tokio::test]

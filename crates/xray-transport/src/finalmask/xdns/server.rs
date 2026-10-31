@@ -37,6 +37,11 @@ use super::{
 const MAX_RESPONSE_DELAY: Duration = Duration::from_secs(1);
 const REC_QUEUE_CAP: usize = 255;
 const UDP_READ_BUF: usize = 4096;
+/// 分片包的最小解码长度：`[12]fragID [13]idx [14]n` 三字节头 + 可为空的数据段。
+///
+/// Go 用 `[255]byte` 定长数组规避 `decoded[13]`/`decoded[14]` 越界，但其
+/// `decoded[15:n]` 在 `n < 15` 时同样越界 panic（上游同缺陷，不复刻）。
+const FRAG_MIN_DECODED_LEN: usize = 15;
 
 /// 错误即时响应（Go `resp` struct in server.go）。
 struct DrResp {
@@ -242,9 +247,11 @@ async fn server_read(state: &ServerState, buf: &[u8], addr: SocketAddr) {
     }
     // 首字节低 2bit qtype 匹配 + [8]&0x3F ∈ {3,8} + 形态长度校验
     let flag8 = decoded[8] & 0x3F;
+    let fragmented = decoded[8] & 0xC0 == 0xC0;
     if type_map_(decoded[0] & 3) != msg.question[0].qtype
         || (flag8 != 3 && flag8 != 8)
         || (flag8 == 3 && n < 9 + 3 + 1)
+        || (flag8 == 3 && fragmented && n < FRAG_MIN_DECODED_LEN)
         || (flag8 == 8 && n != 9 + 8)
     {
         decref(state, ok_header(msg), addr);
@@ -263,10 +270,18 @@ async fn server_read(state: &ServerState, buf: &[u8], addr: SocketAddr) {
     if flag8 == 8 {
         return; // poll 包无 payload
     }
-    let payload: Vec<u8> = if decoded[8] & 0xC0 == 0xC0 {
-        // 分片：[12]fragID [13]idx [14]n + 数据
-        let key = super::frag::FragKey::new(client_id, decoded[12]);
-        let out = state.frag.feed(key, decoded[13], decoded[14], &decoded[15..n]).await;
+    let payload: Vec<u8> = if fragmented {
+        // 分片：[12]fragID [13]idx [14]n + 数据。走 get() 而非索引——长度门已挡
+        // n < FRAG_MIN_DECODED_LEN，但索引越界会打崩 recv 任务（Go 同点在
+        // `decoded[15:n]` 越界 panic），这里短路而非 panic（bd itd0p）。
+        let Some((frag_id, frag_idx, frag_n)) = decoded.get(12..15).map(|h| (h[0], h[1], h[2]))
+        else {
+            decref(state, ok_header(msg), addr);
+            return;
+        };
+        let key = super::frag::FragKey::new(client_id, frag_id);
+        let out =
+            state.frag.feed(key, frag_idx, frag_n, decoded.get(15..).unwrap_or_default()).await;
         if out.is_empty() {
             return;
         }
