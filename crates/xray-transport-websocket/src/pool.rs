@@ -9,12 +9,16 @@
 //! 预连接；交付出去的连接承载过任何会话数据即绝不回池（used = 不可归还）——
 //! 交付侧无归还代码路径，预连接只由补拨任务（replenish：acquire/现拨后 spawn
 //! 后台拨号）存入，维持每 key ≤ `max_idle_per_key` 条。每条会话拿到的新鲜
-//! 连接 wire 行为与现拨一致，只是免了握手。默认 `max_idle_per_key=12`（Chrome
-//! 6/host × 多 host burst 上限）；显式 `pool_size=0` 关闭池化。
+//! 连接 wire 行为与现拨一致，只是免了握手。**默认关闭**（`max_idle_per_key=0`
+//! 不预连接，与 Go 26.10.17 行为一致——Go 无池，bd s8eio）；显式
+//! `pool_size>0` 才启用，启用后每 key ≤ `max_idle_per_key` 条（Chrome 6/host
+//! × 多 host burst 上限 = 12 的调参值仍作为文档化建议保留）。
 //!
 //! ## 业界对照
 //!
-//! - Go xray-core v26.9.9：**无 ws 客户端连接池**（仅 vless testpre 协议级）—— 本仓独立创新空间。
+//! - Go xray-core v26.10.17：**无 ws 客户端连接池**（`websocket/dialer.go` 每次 Dial 现拨；全仓仅
+//!   `common/bytespool` 内存池与 fakedns LRU，与本机制无关）。 故本池默认关 = 基准行为；开启属 Rust
+//!   独有优化（服务端可见连接数会随池深上升）。
 //! - nginx upstream keepalive / envoy ws filter：按 upstream:port 复用连接（同
 //!   为「预连接」语义——上游连接归还前必须保证干净）。
 //!
@@ -111,12 +115,11 @@ impl PoolKey {
 /// 池配置。
 #[derive(Debug, Clone)]
 pub struct WsPoolConfig {
-    /// 每 key 最大空闲连接数。`0` = 关闭池化。
+    /// 每 key 最大空闲连接数。`0` = 关闭池化（默认）。
     ///
-    /// ponytail: 默认 12 = 对齐 Chrome 6/host 限制 + 整页多 host 的 burst 上限
-    /// （实测一页 50+ subresource、Chrome 6 并发/host = 池瞬间打空——3 默认池
-    /// 命中率 40%、12 命中率 ~95%）；3（首版）= Chrome 6/host 的 1/2，命中率
-    /// 不足；12 对齐 Chrome 6/host × 2 host 同时访问的峰值。
+    /// 默认 0（bd s8eio）：Go 26.10.17 无池，预连接是只会握手不传数据的额外
+    /// 服务端连接；需省握手的用户显式配 `poolSize`。调参参考：Chrome 6/host ×
+    /// 多 host burst（实测一页 50+ subresource）下 12 命中率 ~95%（3 → ~40%）。
     pub max_idle_per_key: usize,
     /// 空闲连接最大存活时间（秒）。
     pub max_idle_duration: Duration,
@@ -127,13 +130,59 @@ impl Default for WsPoolConfig {
         // TTL 10s（2026-10-16 根治）：CDN 边缘 idle 切断窗口 ~100s（CF），30s
         // 时代实测 vl-ws-cdn 复用死连接（个位数/0.x 回归）——10s 令死亡窗口≈0，
         // 浏览器秒级并发复用命中率不受损。
-        Self { max_idle_per_key: 12, max_idle_duration: Duration::from_secs(10) }
+        //
+        // bd s8eio：默认关池（0 = 不预连接，对齐 Go 无池）。
+        Self { max_idle_per_key: 0, max_idle_duration: Duration::from_secs(10) }
     }
 }
 
 struct PoolEntry {
     conn: Box<dyn Connection>,
     last_used: Instant,
+}
+
+/// 池内统计快照（诊断面）。
+///
+/// `keys` 含**空 key**——空 key 是泄漏信号（条目被摘光后 key 未随之摘除）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    /// 当前 key 数。
+    pub keys: usize,
+    /// 当前空闲连接条目数。
+    pub entries: usize,
+}
+
+/// 扫除周期 = TTL/4，钳在 `[100ms, 30s]`。
+///
+/// TTL 极小也要能及时回收（否则测试/短 TTL 场景回收滞后一个 TTL）；TTL 极大时
+/// 无需频繁扫（扫本身是 O(key 数) 的锁内遍历）。
+fn sweep_interval(max_idle_duration: Duration) -> Duration {
+    (max_idle_duration / 4).clamp(Duration::from_millis(100), Duration::from_secs(30))
+}
+
+/// 扫除过期条目并摘除**空 key**（FIFO：先入先过期）。返回被摘除的条目数。
+///
+/// 与 `try_acquire` 的惰性扫除同一判据（`now - last_used > max_idle_duration`）——
+/// 后台任务只是把「按 key 惰性扫」扩成「周期全量扫」，不改变复用窗口。
+fn sweep_expired(
+    map: &mut HashMap<PoolKey, VecDeque<PoolEntry>>,
+    max_idle_duration: Duration,
+    now: Instant,
+) -> usize {
+    let mut removed = 0usize;
+    map.retain(|_, entry| {
+        while let Some(front) = entry.front() {
+            if now.duration_since(front.last_used) > max_idle_duration {
+                entry.pop_front();
+                removed += 1;
+            } else {
+                break;
+            }
+        }
+        // 空 key 一并摘除（修前：条目被扫光后 key 永久留在表里）。
+        !entry.is_empty()
+    });
+    removed
 }
 
 /// 非阻塞活性探测：一次 `poll_read`（noop waker）。
@@ -161,22 +210,28 @@ fn probe_conn_alive(conn: &mut Box<dyn Connection>) -> bool {
 pub struct WsConnectionPool {
     inner: Arc<Mutex<HashMap<PoolKey, VecDeque<PoolEntry>>>>,
     /// pool 配置：`parking_lot::Mutex` 保护（同步、轻量、非阻塞）。
-    config: parking_lot::Mutex<WsPoolConfig>,
+    ///
+    /// `Arc` 化：后台扫除任务要读 TTL（TTL 可被 `reconfigure_global_pool` 改），
+    /// 用 `Weak` 持配置句柄——池 drop 后任务自动退出，不延长池寿命。
+    config: Arc<parking_lot::Mutex<WsPoolConfig>>,
     /// 标记 `init_config` 是否已调用过一次（用 `OnceLock` 实现一次性配置）：
     /// 首个 inbound 配置生效，后续 inbound 配置不覆盖（单进程池容量固定）。
     config_init: std::sync::OnceLock<()>,
     /// 每 key 补拨 in-flight 计数（拨号中、尚未入池的预连接）。
     /// 与 `inner` 的 idle 条数共同受 `max_idle_per_key` 上限约束。
     preconnect_inflight: parking_lot::Mutex<HashMap<PoolKey, usize>>,
+    /// 后台扫除任务只启动一次（`OnceLock` 幂等闸）。
+    sweeper_started: std::sync::OnceLock<()>,
 }
 
 impl WsConnectionPool {
     pub fn new(config: WsPoolConfig) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
-            config: parking_lot::Mutex::new(config),
+            config: Arc::new(parking_lot::Mutex::new(config)),
             config_init: std::sync::OnceLock::new(),
             preconnect_inflight: parking_lot::Mutex::new(HashMap::new()),
+            sweeper_started: std::sync::OnceLock::new(),
         }
     }
 
@@ -194,20 +249,67 @@ impl WsConnectionPool {
         self.config.lock()
     }
 
+    /// 池内统计快照（诊断面）。
+    ///
+    /// key 数含**空 key**——空 key 是泄漏信号（条目被摘光后 key 未随之摘除）。
+    pub async fn stats(&self) -> PoolStats {
+        let guard = self.inner.lock().await;
+        PoolStats { keys: guard.len(), entries: guard.values().map(VecDeque::len).sum() }
+    }
+
+    /// 启动后台扫除任务（幂等：整进程每池一次）。
+    ///
+    /// 修前只有 `try_acquire(同一 key)` 会扫过期条目（bd il9lh MW-4）——**长期不再
+    /// 访问的 key，其空闲条目与 key 本身永不释放**（每 key 至多 `max_idle_per_key`
+    /// 条 socket 常驻）。本任务给出真正的回收路径：周期性扫**全部** key，摘除
+    /// 过期条目并连带摘除空 key。
+    ///
+    /// 持 `Weak`（inner + config）：池 drop 后 `upgrade` 失败 → 任务自行退出，
+    /// 不延长池寿命、不留孤儿任务。
+    fn ensure_sweeper(&self) {
+        self.sweeper_started.get_or_init(|| {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                // 无 runtime 上下文（同步调用方）：不启任务，惰性扫除路径仍在。
+                return;
+            };
+            let inner = Arc::downgrade(&self.inner);
+            let config = Arc::downgrade(&self.config);
+            handle.spawn(async move {
+                loop {
+                    let interval = {
+                        let Some(cfg) = config.upgrade() else { return };
+                        let ttl = cfg.lock().max_idle_duration;
+                        sweep_interval(ttl)
+                    };
+                    tokio::time::sleep(interval).await;
+                    let (Some(inner), Some(cfg)) = (inner.upgrade(), config.upgrade()) else {
+                        return;
+                    };
+                    let ttl = cfg.lock().max_idle_duration;
+                    let mut map = inner.lock().await;
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "连接池 idle 过期扫描墙钟取时；Clock 端口注入待 bd 39hko"
+                    )]
+                    let now = Instant::now();
+                    sweep_expired(&mut map, ttl, now);
+                }
+            });
+        });
+    }
+
     /// 是否已通过 `init_config` 初始化过一次。
     pub fn config_initialized(&self) -> bool {
         self.config_init.get().is_some()
     }
 
     /// 一次性初始化 `max_idle_per_key`（按 `Config::pool_size`）。后续调用 no-op。
-    /// ponytail: 多 outbound 首个生效；race 罕见（同时刻首+首次 config 都启
-    /// → 选大者，符合 Chrome 6/host 设计的"上限 = 至少满足最大并发方")。
     pub fn init_config(&self, max_idle_per_key: usize) {
+        // ponytail: 一次性（首个 wsSettings 生效）——多 outbound 的不同 poolSize
+        // 不合并、不重配；要按 outbound 独立容量需把池从全局改成 per-outbound
+        // 句柄（届时 `config_init` 一并删）。
         let _ = self.config_init.get_or_init(|| {
-            let mut cfg = self.config.lock();
-            if cfg.max_idle_per_key < max_idle_per_key {
-                cfg.max_idle_per_key = max_idle_per_key;
-            }
+            self.config.lock().max_idle_per_key = max_idle_per_key;
         });
     }
 
@@ -216,32 +318,53 @@ impl WsConnectionPool {
         if !self.enabled() {
             return None;
         }
+        self.ensure_sweeper();
         let (max_idle_duration, _) = {
             let cfg = self.config.lock();
             (cfg.max_idle_duration, cfg.max_idle_per_key)
         };
         let mut guard = self.inner.lock().await;
-        let entry = guard.get_mut(key)?;
         #[allow(
             clippy::disallowed_methods,
             reason = "连接池 idle 过期扫描墙钟取时；Clock 端口注入待 bd 39hko"
         )]
         let now = Instant::now();
         // 从头扫除过期（FIFO：先入先过期）。
-        while let Some(front) = entry.front() {
-            if now.duration_since(front.last_used) > max_idle_duration {
-                entry.pop_front();
-            } else {
-                break;
+        {
+            let entry = guard.get_mut(key)?;
+            while let Some(front) = entry.front() {
+                if now.duration_since(front.last_used) > max_idle_duration {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
             }
+        }
+        // 条目被扫光 → key 变空 → 一并摘除（修前：空 key 永久留在表里）。
+        if guard.get(key).is_some_and(VecDeque::is_empty) {
+            guard.remove(key);
+            return None;
         }
         // 取出循环：idle 期间被对端关闭的连接（close 帧/EOF）当场丢弃，继续取
         // 下一条——探测是唯一可靠的死活判据（TTL 拦不住 10s 内的主动 close）。
-        while let Some(e) = entry.pop_front() {
+        loop {
+            let popped = {
+                let Some(entry) = guard.get_mut(key) else { break };
+                entry.pop_front()
+            };
+            let Some(e) = popped else { break };
             let mut conn = e.conn;
             if probe_conn_alive(&mut conn) {
+                // 取走了最后一条 → key 变空 → 一并摘除（空 key 不留）。
+                if guard.get(key).is_some_and(VecDeque::is_empty) {
+                    guard.remove(key);
+                }
                 return Some(conn);
             }
+        }
+        // 取空后 key 变空 → 摘除。
+        if guard.get(key).is_some_and(VecDeque::is_empty) {
+            guard.remove(key);
         }
         None
     }
@@ -258,17 +381,28 @@ impl WsConnectionPool {
             }
             cfg.max_idle_per_key
         };
+        self.ensure_sweeper();
         let mut guard = self.inner.lock().await;
-        let entry = guard.entry(key).or_default();
-        if entry.len() >= max_idle_per_key {
-            // 池满，conn 在此 drop——下个 caller 自拨。
-            return;
-        }
         #[allow(
             clippy::disallowed_methods,
             reason = "连接池 entry last_used 锚点；Clock 端口注入待 bd 39hko"
         )]
-        entry.push_back(PoolEntry { conn, last_used: Instant::now() });
+        let last_used = Instant::now();
+        // 容量判定先于建条目：池满时**不建空 key**（修前 `entry().or_default()`
+        // 先建 key 再判满，多出永不回收的空条目）。
+        {
+            let Some(entry) = guard.get_mut(&key) else {
+                let mut fresh = VecDeque::new();
+                fresh.push_back(PoolEntry { conn, last_used });
+                guard.insert(key, fresh);
+                return;
+            };
+            if entry.len() >= max_idle_per_key {
+                // 池满，conn 在此 drop——下个 caller 自拨。
+                return;
+            }
+            entry.push_back(PoolEntry { conn, last_used });
+        }
     }
 
     /// 抢一个预连接补拨名额：`idle + in-flight < max_idle_per_key` 时记账并放行。
@@ -303,7 +437,8 @@ impl WsConnectionPool {
     }
 }
 
-/// 全局单例池。配置来自 `Config::pool_size`（默认 12）。
+/// 全局单例池。初始配置 = [`WsPoolConfig::default`]（**关池**，bd s8eio）；
+/// 首个 `poolSize>0` 的 wsSettings 经 [`WsConnectionPool::init_config`] 打开。
 ///
 /// ponytail: 全局而非 per-outbound 池化——同一进程多 outbound 共享同 (host,
 /// port, path) 的空闲 ws 连接，命中率高于 per-outbound（单 outbound 用户少）。
@@ -313,10 +448,10 @@ pub fn global_pool() -> Arc<WsConnectionPool> {
     POOL.clone()
 }
 
-/// 重新配置全局池（覆盖默认 12 / 10s）。
+/// 重新配置全局池（测试/显式开关用；`max_idle_per_key=0` 即关池）。
 ///
-/// ponytail: 由 `register_dialer` 在解析首个 wsSettings 时调用一次；后续配置
-/// 覆盖不传播——多 outbound 各取 pool_size=12 实测足够，不需要 runtime 调优。
+/// ponytail: 生产拨号路径不走本函数（走 `init_config` 一次性生效）；此处的
+/// 覆盖会绕开一次性闸门，仅测试与运维手动开关使用。
 pub fn reconfigure_global_pool(max_idle_per_key: usize, max_idle_duration: Duration) {
     let pool = global_pool();
     *pool.config_mut() = WsPoolConfig { max_idle_per_key, max_idle_duration };
@@ -329,7 +464,7 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncReadExt, DuplexStream};
     use xray_transport::connection::DuplexConnection;
 
     use super::*;
@@ -353,6 +488,12 @@ mod tests {
         PoolKey::new("other", 443, "/", None, None)
     }
 
+    /// 机制测试用的启用态配置：12 条上限（**默认已关池**，bd s8eio——池测试必须
+    /// 显式开启才测得到补拨/取还语义）。
+    fn pool_cfg_12() -> WsPoolConfig {
+        WsPoolConfig { max_idle_per_key: 12, ..WsPoolConfig::default() }
+    }
+
     #[tokio::test]
     async fn pool_disabled_returns_none() {
         let pool =
@@ -363,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_acquire_returns_released_in_fifo() {
-        let pool = WsConnectionPool::new(WsPoolConfig::default());
+        let pool = WsConnectionPool::new(pool_cfg_12());
         pool.release(key1(), mock_conn()).await;
         let got = pool.try_acquire(&key1()).await;
         assert!(got.is_some());
@@ -384,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_different_keys_isolated() {
-        let pool = WsConnectionPool::new(WsPoolConfig::default());
+        let pool = WsConnectionPool::new(pool_cfg_12());
         pool.release(key1(), mock_conn()).await;
         pool.release(key2(), mock_conn()).await;
         assert!(pool.try_acquire(&key1()).await.is_some());
@@ -394,7 +535,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_sni_or_fp_difference_isolates() {
-        let pool = WsConnectionPool::new(WsPoolConfig::default());
+        let pool = WsConnectionPool::new(pool_cfg_12());
         let k_default = PoolKey::new("h", 443, "/", None, None);
         let k_with_sni = PoolKey::new("h", 443, "/", Some("cdn.example.com".into()), None);
         let k_with_fp = PoolKey::new("h", 443, "/", None, Some("chrome".into()));
@@ -413,6 +554,78 @@ mod tests {
         pool.release(key1(), mock_conn()).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(pool.try_acquire(&key1()).await.is_none(), "expired entry must be swept");
+    }
+
+    /// bd il9lh MW-4：**不访问任何 key** 时 idle 条目也必须被回收——修前唯一的回收
+    /// 路径是 `try_acquire(同一 key)`，长期不用的 key 的空闲连接与 key 永不释放。
+    ///
+    /// 断言两件事：① 池内条目/键归零；② **socket 级**——条目被 drop ⇒ 对端读到
+    /// EOF（连接真被关闭，不是只删了计数）。
+    #[tokio::test]
+    async fn idle_entries_reclaimed_without_any_access() {
+        let pool = WsConnectionPool::new(WsPoolConfig {
+            max_idle_per_key: 3,
+            max_idle_duration: Duration::from_millis(200),
+        });
+        let (a, mut peer_a) = tokio::io::duplex(64);
+        let (b, mut peer_b) = tokio::io::duplex(64);
+        pool.release(key1(), Box::new(DuplexConnection::new(a))).await;
+        pool.release(key2(), Box::new(DuplexConnection::new(b))).await;
+        assert_eq!(pool.stats().await.entries, 2, "two idle entries must be pooled");
+
+        // 全程不调用 try_acquire：只等 TTL + 扫除周期。
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let stats = pool.stats().await;
+        assert_eq!(stats.entries, 0, "idle entries must be reclaimed without access");
+        assert_eq!(stats.keys, 0, "emptied keys must be removed too");
+
+        let mut buf = [0u8; 1];
+        assert_eq!(peer_a.read(&mut buf).await.unwrap_or(0), 0, "peer must see EOF");
+        assert_eq!(peer_b.read(&mut buf).await.unwrap_or(0), 0, "peer must see EOF");
+    }
+
+    /// 空 key 不摘（修前）：条目被取光后 key 仍留在表里（每访问过的 key 累积一条
+    /// 空条目，永不回收）。
+    #[tokio::test]
+    async fn key_removed_when_last_entry_taken() {
+        let pool = WsConnectionPool::new(pool_cfg_12());
+        pool.release(key1(), mock_conn()).await;
+        assert_eq!(pool.stats().await.keys, 1);
+        assert!(pool.try_acquire(&key1()).await.is_some());
+        assert_eq!(pool.stats().await.keys, 0, "emptied key must be removed from the map");
+    }
+
+    /// 复用率不下降（后台扫除不得误伤未过期的条目）：TTL 内的 release→acquire
+    /// 循环必须 100% 命中。
+    #[tokio::test]
+    async fn reuse_within_ttl_keeps_hit_rate() {
+        let pool = WsConnectionPool::new(WsPoolConfig {
+            max_idle_per_key: 4,
+            max_idle_duration: Duration::from_millis(500),
+        });
+        let mut hits = 0usize;
+        for _ in 0..20 {
+            pool.release(key1(), mock_conn()).await;
+            if pool.try_acquire(&key1()).await.is_some() {
+                hits += 1;
+            }
+        }
+        assert_eq!(hits, 20, "reuse within TTL must stay 100%");
+    }
+
+    /// 扫除任务已跑过（周期 250ms）但条目未过 TTL（1s）→ 条目必须存活（不得把
+    /// 回收做成「更激进」而拉低复用率）。
+    #[tokio::test]
+    async fn sweeper_keeps_entries_within_ttl() {
+        let pool = WsConnectionPool::new(WsPoolConfig {
+            max_idle_per_key: 2,
+            max_idle_duration: Duration::from_secs(1),
+        });
+        pool.release(key1(), mock_conn()).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(pool.stats().await.entries, 1, "entry within TTL must survive the sweeper");
+        assert!(pool.try_acquire(&key1()).await.is_some(), "entry must still be reusable");
     }
 
     /// 补拨名额：idle + in-flight 受 max_idle_per_key 上限约束（virgin-connection
@@ -445,7 +658,7 @@ mod tests {
     /// end_preconnect 释放名额（含重复调用饱和不减）。
     #[tokio::test]
     async fn end_preconnect_releases_slot_idempotently() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         assert!(pool.begin_preconnect(&key1()).await);
         pool.end_preconnect(&key1());
         // 重复 end 不下溢（名额计数不出现负值语义）。
@@ -460,7 +673,7 @@ mod tests {
     /// ——2026-10-17 生产事故回归（"Sending after closing"）。
     #[tokio::test]
     async fn probe_admits_alive_and_discards_dead_preconnections() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         // 活连接：对端持有 → 无 EOF → probe 放行。
         let (a, keep): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
         let _keep = keep;
@@ -543,7 +756,7 @@ mod tests {
     /// 全部命中库存，0 冷拨。
     #[tokio::test]
     async fn burst_12_full_stock_never_cold_dials() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         prefill(&pool, &key1(), 12).await;
         assert_eq!(concurrent_take_misses(pool, key1(), 12).await, 0);
     }
@@ -551,7 +764,7 @@ mod tests {
     /// 票面验收（bd lmjw）：单页 15 连接场景握手 ≤3——12 库存吸收后仅 ≤3 路现拨。
     #[tokio::test]
     async fn burst_15_handshakes_within_ticket_budget() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         prefill(&pool, &key1(), 12).await;
         let misses = concurrent_take_misses(pool, key1(), 15).await;
         assert!(misses <= 3, "15-conn page must cold-dial ≤3, got {misses}");
@@ -562,7 +775,7 @@ mod tests {
     /// 序补满库存，下一波 12 并发全命中——冷拨回退路径本身不受容量策略影响。
     #[tokio::test]
     async fn empty_pool_cold_start_then_replenish_refills_next_wave() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         assert_eq!(concurrent_take_misses(pool.clone(), key1(), 12).await, 12);
         for _ in 0..12 {
             assert!(pool.begin_preconnect(&key1()).await);
@@ -576,7 +789,7 @@ mod tests {
     /// ≤ max_idle_per_key 不变量在并发下不被击穿），入池恰好 12 条不超额。
     #[tokio::test]
     async fn concurrent_replenish_gate_admits_exactly_capacity() {
-        let pool = Arc::new(WsConnectionPool::new(WsPoolConfig::default()));
+        let pool = Arc::new(WsConnectionPool::new(pool_cfg_12()));
         let admitted = Arc::new(AtomicUsize::new(0));
         #[allow(clippy::disallowed_methods, reason = "测试：并发 replenish 任务")]
         let handles: Vec<_> = (0..16)

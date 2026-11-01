@@ -712,7 +712,9 @@ impl ProtoRoutingService for RoutingServiceImpl {
         let rules = self.service.list_rule().map_err(router_status)?;
         let rules = rules
             .into_iter()
-            .map(|t| prouter::ListRuleItem { tag: String::new(), rule_tag: t })
+            // bd o1a9p：对齐 Go `ListRuleItem{tag=outboundTag, ruleTag}`
+            // （command.go:73-77）——`tag` 此前恒空，Go 客户端按 tag 过滤/展示会漏。
+            .map(|(tag, rule_tag)| prouter::ListRuleItem { tag, rule_tag })
             .collect();
         Ok(Response::new(prouter::ListRuleResponse { rules }))
     }
@@ -1802,10 +1804,12 @@ mod tests {
         .await
         .unwrap();
 
-        // ListRule 可见新增规则 tag
+        // ListRule 可见新增规则 tag，且出站 tag 一并回填（bd o1a9p，对齐 Go
+        // ListRuleItem{tag, ruleTag}）。
         let resp =
             svc.list_rule(Request::new(prouter::ListRuleRequest {})).await.unwrap().into_inner();
-        assert!(resp.rules.iter().any(|r| r.rule_tag == "rule-1"));
+        let item = resp.rules.iter().find(|r| r.rule_tag == "rule-1").expect("rule-1 listed");
+        assert_eq!(item.tag, "direct", "outboundTag must round-trip through ListRule");
 
         // 载荷类型不对（旧 bug 的 xray.app.router.RoutingRule 形态）→ InvalidArgument
         let err = svc

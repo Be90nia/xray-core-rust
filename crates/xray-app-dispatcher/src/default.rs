@@ -354,6 +354,11 @@ pub struct AccessContext {
     pub email: String,
     /// 入站 tag（由 InboundDispatchHandler 填充）。
     pub inbound_tag: String,
+    /// 入站协议名（Go `session.Inbound.Name`：`"socks"`/`"dokodemo-door"`/
+    /// `"shadowsocks"`/`"tun"`/`"vless"`/…）。消费点：XUDP GlobalID 派生的
+    /// 入站白名单（Go `xudp.GetGlobalID`，`common/xudp/xudp.go:69-70`——仅
+    /// dokodemo-door/socks/shadowsocks/tun 四族派生）。空串 = 未提供（不派生）。
+    pub inbound_name: String,
     /// 认证用户策略层级（对应 Go `user.Level`，用于 per-user policy 查询）。
     pub level: u32,
     /// 允许的网络类型（Go `session.ContextWithAllowedNetwork`，context.go:152-154）：
@@ -396,6 +401,7 @@ impl std::fmt::Debug for AccessContext {
             .field("from", &self.from)
             .field("email", &self.email)
             .field("inbound_tag", &self.inbound_tag)
+            .field("inbound_name", &self.inbound_name)
             .field("level", &self.level)
             .field("allowed_network", &self.allowed_network)
             .field("local", &self.local)
@@ -2127,6 +2133,12 @@ pub struct SimpleOhm {
     /// 进程级全局表会让多 Instance/多测试同名 tag 互踩（实测
     /// integration_sniffing 成对互串），故归属实例。
     shadow: parking_lot::RwLock<HandlerRegistry>,
+    /// 注册表**变更**串行闸（bd 9c8k6 ③）：`add`/`remove`/`add_if_absent` 三者
+    /// 共用，保证「查重 + 插入」落在同一临界区——并发同 tag 只允许一个赢家，
+    /// 输家拿到明确失败（不再 check-then-act 静默覆盖）。
+    ///
+    /// 锁序纪律：变更闸恒为**第一把**锁（表锁在其内按固定序取）⇒ 无锁序反转。
+    mutation: parking_lot::Mutex<()>,
 }
 
 impl SimpleOhm {
@@ -2136,6 +2148,7 @@ impl SimpleOhm {
             default: parking_lot::RwLock::new(None),
             tagged: parking_lot::RwLock::new(new_handler_registry()),
             shadow: parking_lot::RwLock::new(new_handler_registry()),
+            mutation: parking_lot::Mutex::new(()),
         }
     }
 
@@ -2156,6 +2169,8 @@ impl SimpleOhm {
             default: parking_lot::RwLock::new(self.default.read().clone()),
             tagged: parking_lot::RwLock::new((*self.tagged.read()).clone()),
             shadow: parking_lot::RwLock::new((*self.shadow.read()).clone()),
+            // 快照是独立实例：变更闸各自独立（快照的变更不影响源表，反之亦然）。
+            mutation: parking_lot::Mutex::new(()),
         }
     }
 
@@ -2163,6 +2178,8 @@ impl SimpleOhm {
     /// `xray-core` `register_outbounds`（`functions.rs`）、动态 AddOutbound
     /// （`outbound.rs`）、`xray-cli` framework 装配（`framework.rs`）。
     pub fn add(&self, tag: &str, handler: Arc<dyn DispatchHandler>) {
+        // 变更闸：与 `remove`/`add_if_absent` 串行（查重+插入同临界区）。
+        let _gate = self.mutation.lock();
         // S3/S4：影子选择面与生产注册同源派生（同一次 add 调用），无第二套清单。
         // 顺序契约：先影子后旧表——影子是生产选择面，先入可保证「生产可见性」
         // 不晚于旧表（错序会出现「旧表有、生产拒」的瞬时回归）。
@@ -2170,10 +2187,48 @@ impl SimpleOhm {
         insert_handler(&mut self.tagged.write(), tag, handler);
     }
 
+    /// 原子「不存在才插入」（bd 9c8k6 ③）：查重与插入落在**同一临界区**，
+    /// 并发同 tag 只允许一个赢家，其余拿到明确失败（`existing tag found: <tag>`）。
+    ///
+    /// 与 [`Self::add`]（upsert，覆盖语义）的区别：动态 AddOutbound 必须用本
+    /// 形态——旧实现 `get_handler` 查重 + `add` 插入分两步，并发同 tag 两个请求
+    /// 都会通过查重，后者**静默覆盖**前者的 handler。
+    ///
+    /// # Errors
+    ///
+    /// - tag 已存在 → `existing tag found: <tag>`（调用方转 409/AlreadyExists）
+    /// - 注册表满（udf `BoundedRegistry` Reject 策略）→ 显式 Err，不静默丢 handler
+    pub fn add_if_absent(
+        &self,
+        tag: &str,
+        handler: Arc<dyn DispatchHandler>,
+    ) -> Result<(), String> {
+        // 变更闸：第一把锁（表锁在其内）⇒ 与 add/remove 无锁序反转。
+        let _gate = self.mutation.lock();
+        let mut shadow = self.shadow.write();
+        let mut tagged = self.tagged.write();
+        if tagged.get(tag).is_some() {
+            return Err(format!("existing tag found: {tag}"));
+        }
+        // 先影子后旧表（与 `add` 同序：影子是生产选择面）。
+        shadow
+            .insert(tag.to_string(), Arc::clone(&handler))
+            .map_err(|e| format!("outbound handler registry full: {e}"))?;
+        if let Err(e) = tagged.insert(tag.to_string(), handler) {
+            // 旧表插入失败 → 回滚影子，保持两表一致（不留半注册状态）。
+            shadow.remove(tag);
+            return Err(format!("outbound handler registry full: {e}"));
+        }
+        Ok(())
+    }
+
     /// 移除 tag 对应的 handler。对应 Go `outbound.Manager.RemoveHandler`：
     /// default handler 的 tag 与之相同时 default 一并清空。
     /// 返回 tag 是否存在（不存在 = no-op，由调用方决定是否报错）。
     pub fn remove(&self, tag: &str) -> bool {
+        // 变更闸：与 `add`/`add_if_absent` 串行（避免 remove 落在 add_if_absent 的
+        // 查重与插入之间）。
+        let _gate = self.mutation.lock();
         // udf `remove<Q: Borrow<Q>>`：String 键以 `&str` 借用摘除，零分配
         // （改前每次摘除 1 次 `to_string()` 堆分配）。
         let existed = self.tagged.write().remove(tag).is_some();

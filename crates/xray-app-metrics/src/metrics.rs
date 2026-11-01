@@ -205,6 +205,28 @@ impl OutboundRegistrar for RecordingOutboundRegistrar {
     }
 }
 
+/// 生产实现：dispatcher `SimpleOhm` 后端（对应 Go `ohm.RemoveHandler` +
+/// `ohm.AddHandler`，metrics.go:82-94）。
+///
+/// `add` 把 [`Outbound`] 包成 [`MetricsDispatchHandler`] 注册进出站表——路由规则
+/// `outboundTag` 命中该 tag 的连接即被灌进 metrics HTTP server（Go
+/// outbound.go:66-84 Dispatch 语义）。`remove` 按 tag 注销（不存在 = no-op，
+/// 对齐 Go `RemoveHandler` 的容忍语义）。
+pub struct SimpleOhmOutboundRegistrar(pub Arc<xray_app_dispatcher::default::SimpleOhm>);
+
+impl OutboundRegistrar for SimpleOhmOutboundRegistrar {
+    fn remove(&self, tag: &str) -> Result<(), MetricsError> {
+        self.0.remove(tag);
+        Ok(())
+    }
+
+    fn add(&self, outbound: Arc<Outbound>) -> Result<(), MetricsError> {
+        let tag = outbound.tag().to_string();
+        self.0.add(&tag, Arc::new(crate::outbound::MetricsDispatchHandler::new(outbound)));
+        Ok(())
+    }
+}
+
 /// MetricsHandler：metrics crate 的主入口。
 ///
 /// 不持有 stats/observability/http 实例的引用，而是把这些依赖作为 trait 参数
@@ -360,8 +382,8 @@ fn escape_value(s: &str) -> String {
 /// ## 行为
 /// - `start_http_listen`: 绑定 `listen` 地址，spawn accept loop， 每个 conn task 解析请求行后返回
 ///   `200 OK` + Prometheus 文本。 仅处理 `GET /metrics`；其他路径返回 `404 Not Found`。
-/// - `serve_outbound`: 当前 stub（仅 log），真实实现需等 dispatcher 切片3 把
-///   OutboundListener.accept 桥接到 tokio task。
+/// - `serve_outbound`: 从 `OutboundListener` accept 连接（tag 形态——dispatcher 经路由规则灌入的 cnc
+///   连接，bd 0z7zt）走同一 HTTP 处理逻辑。
 ///
 /// ## 优雅关闭
 /// `TokioHttpServer::shutdown()` 通过 Notify 唤醒所有 task，等待 5s 超时。
@@ -524,12 +546,17 @@ impl MetricsHttpServer for TokioHttpServer {
 }
 
 /// 处理单个 HTTP/1.1 连接：解析 method+path 路由到 `/metrics` 与 `/debug/*` 端点，未知返回 404。
-async fn serve_one(
-    mut stream: tokio::net::TcpStream,
+///
+/// 对流类型泛型：`tokio::net::TcpStream`（listen 形态）与
+/// `ContentNetworkConnection`（tag 形态，dispatcher Link 伪装）共用同一处理逻辑。
+async fn serve_one<S>(
+    mut stream: S,
     stats: Arc<dyn StatsCollector>,
     obs: Option<Arc<dyn ObservationCollector>>,
     shutdown: Arc<tokio::sync::Notify>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = [0u8; 1024];
     let body: &[u8] = tokio::select! {
@@ -586,22 +613,27 @@ fn not_found_response() -> String {
 
 /// 处理从 OutboundListener 接受的 BoxedConn。
 ///
-/// 期望 conn 内部是 `tokio::net::TcpStream`（或任何可 AsyncRead+AsyncWrite 的类型），
-/// 目前仅支持 TcpStream。若类型不匹配则静默丢弃（与 Go 版一致）。
+/// 支持两种生产形态（bd 0z7zt）：
+/// - `tokio::net::TcpStream`：listen 形态直连（测试/直监听路径）；
+/// - `xray_transport::cnc::ContentNetworkConnection`：**tag 形态**——dispatcher 把 Link
+///   伪装成的连接（Go `cnc.NewConnection`，outbound.go:78-80）。
+///
+/// 其余类型 warn 后丢弃（连接随即 Drop 关闭对端）。
 async fn serve_boxed_conn(
     conn: crate::outbound::BoxedConn,
     stats: Arc<dyn StatsCollector>,
     obs: Option<Arc<dyn ObservationCollector>>,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
-    let stream = match conn.downcast::<tokio::net::TcpStream>() {
-        Ok(s) => *s,
-        Err(_) => {
-            tracing::warn!(target: "xray_app_metrics", "serve_boxed_conn: unsupported conn type, expected TcpStream");
-            return;
-        },
+    // downcast 吃所有权：tag 形态（生产路径）先试，回落 listen 形态，未命中走兜底。
+    let fallback = match conn.downcast::<xray_transport::cnc::ContentNetworkConnection>() {
+        Ok(c) => return serve_one(c, stats, obs, shutdown).await,
+        Err(other) => other,
     };
-    serve_one(stream, stats, obs, shutdown).await;
+    if let Ok(s) = fallback.downcast::<tokio::net::TcpStream>() {
+        return serve_one(*s, stats, obs, shutdown).await;
+    }
+    tracing::warn!(target: "xray_app_metrics", "serve_boxed_conn: unsupported conn type, conn dropped");
 }
 
 #[cfg(test)]

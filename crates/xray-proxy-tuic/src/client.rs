@@ -312,7 +312,7 @@ impl TuicClient {
             })?,
         ));
         let mut transport = quinn::TransportConfig::default();
-        transport.datagram_receive_buffer_size(Some(8 * 1024));
+        transport.datagram_receive_buffer_size(Some(TUIC_DATAGRAM_RECV_BUFFER));
         // bd wp9o：quinn 缺省 1.25MB 流收窗高 BDP 钉——显式 16MB 流窗 + 32MB 连接窗。
         apply_default_windows(&mut transport);
         apply_congestion_to_transport(&mut transport, congestion_control, brutal_up_bps);
@@ -419,6 +419,15 @@ impl TuicClient {
         self.multiplexed.recv_datagram().await
     }
 }
+
+/// QUIC DATAGRAM 接收缓冲大小（client / server 同值）。
+///
+/// native（DATAGRAM）UDP 模式按 spec 把大 UDP 载荷切成 ~1200B 的 datagram 片，
+/// 到达端必须能一次收下整组片才能重组——旧值 8KB 装不下一个 64KB UDP 载荷的
+/// 分片组（≈55 片 × 1200B ≈ 64KB），突发到达即被 quinn **静默丢 datagram**
+/// → 对端重组永不完成 → 大包超时（bd j7de2 F4）。
+/// 取 256KB = 最大 UDP 载荷（65507B）的 4 倍，留突发裕量。
+pub const TUIC_DATAGRAM_RECV_BUFFER: usize = 256 * 1024;
 
 /// 把 CC 配置预装进 TransportConfig（s8ti）。
 ///

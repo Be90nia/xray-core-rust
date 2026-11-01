@@ -151,6 +151,31 @@ impl XmuxConfig {
 
 // ===== Config =====
 
+/// 下载侧通道配置（对应 Go `splithttp.Config.DownloadSettings` = 完整 StreamConfig）。
+///
+/// Go 侧（`transport/internet/splithttp/dialer.go:355-404`）用 `downloadSettings`
+/// 的**完整 StreamConfig** 另建一个下载侧 HTTP 客户端：
+/// - `dest2` = 它的 address/port（下载侧**自己的**拨号目标）
+/// - `tlsConfig2` / `realityConfig2` = 它的 security（下载侧自己的 TLS/REALITY）
+/// - `httpVersion2` = 它的 ALPN 推出的 HTTP 版本（下载侧可以与主通道不同，如主 h2 下载 h3）
+/// - `config2` = 它的 `splithttpSettings`（下载侧自己的 host/path/query）
+///
+/// Rust 侧承载三段，**复用既有承载面**（不另造配置体系）：
+/// - 协议段 → [`Config`]（下载侧 `splithttpSettings`）
+/// - 传输层段 → 下载侧 StreamConfig 的原始 JSON（network/security/tlsSettings/
+///   realitySettings/sockopt/finalmask），拨号时经
+///   [`xray_transport::dialer::StreamSettings::from_json`] 转成既有承载类型
+/// - 拨号目标 → [`Destination`]（下载侧 address/port）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadSettings {
+    /// 下载侧 splithttp 协议段（下载侧自己的 host/path/query/session id 表）。
+    pub config: Box<Config>,
+    /// 下载侧 StreamConfig 原始 JSON（= Go `downloadSettings` 的那个对象）。
+    pub stream_json: serde_json::Value,
+    /// 下载侧拨号目标（下载侧自己的 address/port）。
+    pub destination: xray_common::net::destination::Destination,
+}
+
 /// SplitHTTP 主配置。对应 proto `xray.transport.internet.splithttp.Config`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
@@ -178,8 +203,12 @@ pub struct Config {
     pub sc_stream_up_server_secs: Option<RangeConfig>,
     /// xmux 多路复用配置。
     pub xmux: Option<XmuxConfig>,
-    /// 下载流配置（嵌套 Config，用于独立配置下行连接）。
-    pub download_settings: Option<Box<Config>>,
+    /// 下载流配置（Go `splithttp.Config.DownloadSettings` = 完整 StreamConfig）。
+    ///
+    /// Go `infra/conf/transport_method.go:295`：`DownloadSettings *StreamConfig`——
+    /// 嵌套的**完整** StreamConfig（address/port/method/security/tls/reality + 协议段）；
+    /// `dialer.go:355-404` 用它**另建**下载侧 HTTP 客户端（独立 dest/tls/host/path）。
+    pub download_settings: Option<Box<DownloadSettings>>,
     /// 是否启用 X-Padding 混淆模式。
     pub x_padding_obfs_mode: bool,
     /// X-Padding key（混淆模式用）。

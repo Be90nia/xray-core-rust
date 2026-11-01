@@ -21,7 +21,7 @@ use crate::{
     client::{DefaultDialerClient, DialTarget},
     config::Config,
     dialer,
-    h3_client::H3Conn,
+    h3_client::{H3Conn, LazyH3Conn},
     transport::listen_splithttp,
 };
 
@@ -161,6 +161,26 @@ async fn dial_splithttp(
     let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
         settings.finalmask_json.as_ref(),
     )?);
+    // 下载侧通道（Go `dialer.go:355-404`）：配了 `downloadSettings` 就**另建**一个下载侧
+    // HTTP 客户端（独立 dest/tls/host/path/ALPN）——上行仍走主客户端。
+    //
+    // Go 侧该分支在 `dialer.go:355`（`if transportConfiguration.DownloadSettings != nil`），
+    // 构造 `memory2`（完整 StreamConfig）→ dest2/tlsConfig2/config2 → `httpClient2`。
+    let download_side = match config.download_settings.as_ref() {
+        None => None,
+        Some(ds) => Some(build_download_side(ds, sockopt).await?),
+    };
+
+    // 池 key 的配置内容片段（Go 用 MemoryStreamConfig 指针身份；Rust 用内容）。
+    let security_json_key =
+        settings.security_json.as_ref().map(|v| v.to_string()).unwrap_or_default();
+    let transport_json_key =
+        settings.transport_json.as_ref().map(|v| v.to_string()).unwrap_or_default();
+    let sockopt_json_key =
+        settings.sockopt_json.as_ref().map(|v| v.to_string()).unwrap_or_default();
+    let finalmask_json_key =
+        settings.finalmask_json.as_ref().map(|v| v.to_string()).unwrap_or_default();
+
     let packet_conn = if http_version == "3" {
         if !fp_name.is_empty() {
             crate::LOG.warn(format!(
@@ -176,28 +196,48 @@ async fn dial_splithttp(
             )
         })?;
         // SNI: config.host 优先，缺失用 dest 地址（对齐 Go `requestURL.Host` fallback）。
-        let server_name = if !config.host.is_empty() { config.host.as_str() } else { &default_sni };
+        // owned String：xmux 池单元的工厂是 'static 闭包（借用不能进 'static）。
+        let server_name: String =
+            if !config.host.is_empty() { config.host.clone() } else { default_sni.clone() };
         // finalmask.quicParams（对应 Go streamSettings.QuicParams；CC + 窗口字段。
         // 缺省时 connect_with_quic_params 仍默认 BBR——对齐 dialer.go:161-164 PR #5711）。
         let quic_params = xray_transport::memory_settings::parse_quic_params_config(
             settings.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
         )?;
-        let h3_conn = H3Conn::connect_with_quic_params(
-            config.clone(),
-            socket_addr,
-            server_name,
-            rustls_config,
-            quic_params.as_ref(),
-            sockopt,
-        )
-        .await
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("splithttp H3 connect failed: {e}"),
-            )
-        })?;
-        dialer::dial_h3(h3_conn, config, scheme, &host, has_reality).await.map_err(|e| {
+        let h3_conn = {
+            // xmux 接线（bd s42cg）：Go 的 h3 也经 `getHTTPClient` 的 xmux manager
+            // 复用（`dialer.go:63-79`）——Rust 侧此前每拨新建一条 QUIC 连接。
+            // 池单元是 [`LazyH3Conn`]（握手推迟到首次使用，对齐 Go 的 lazy transport）。
+            let xmux_config = config.xmux.clone().unwrap_or_default();
+            let key = crate::mux::xmux_manager_key(
+                dest,
+                &[
+                    &settings.security,
+                    &security_json_key,
+                    &transport_json_key,
+                    &sockopt_json_key,
+                    &finalmask_json_key,
+                ],
+            );
+            let pool_config = config.clone();
+            let pool_sockopt = sockopt.clone();
+            let manager = crate::mux::H3_MANAGERS.get_or(&key, || {
+                Arc::new(crate::mux::XmuxManager::new(xmux_config, move || {
+                    LazyH3Conn::new(
+                        pool_config.clone(),
+                        socket_addr,
+                        server_name.clone(),
+                        rustls_config.clone(),
+                        quic_params.clone(),
+                        pool_sockopt.clone(),
+                    )
+                }))
+            });
+            manager.get_xmux_client()
+        };
+        dialer::dial_h3(h3_conn, download_side.as_ref(), config, scheme, &host, has_reality)
+            .await
+            .map_err(|e| {
             io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("splithttp H3 dial failed: {e}"),
@@ -210,16 +250,12 @@ async fn dial_splithttp(
         // 对应 Go `splithttp/dialer.go::Dial` 在 `reality.UClient(conn, ...)` 闭包里
         // 包 TCP 触发的同一行为，Rust 端拆分到 splithttp 路径专用。
         if has_reality {
-            // bd rjzw2：真实 TCP connect 计时 = RTT 探针（SYN→SYN-ACK ≈ 1 RTT，
-            // 零额外握手；含 DNS 解析时偏大 = 窗偏大的安全方向）。
-            let dial_started = xray_frame::compat::clock().now_instant();
             let tcp_conn = dial_system(dest, sockopt).await.map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("splithttp reality dial_system: {e}"),
                 )
             })?;
-            let rtt_hint = Some(dial_started.elapsed());
             let remote_addr = tcp_conn.remote_addr().ok().flatten();
             let local_addr = tcp_conn.local_addr().ok().flatten();
             // finalmask（bd dppv）：TCP 后、REALITY TLS 前（Go dialContext 层序）。
@@ -241,16 +277,14 @@ async fn dial_splithttp(
             // (line 314-318) 对齐。
             let base_uri = format!("{scheme}://{host}{path}", path = config.normalized_path());
             let session_id = String::new();
-            dialer::dial_reality_stream_one(
-                tls_stream, remote, local, base_uri, session_id, config, rtt_hint,
-            )
-            .await
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("splithttp reality stream-one: {e}"),
-                )
-            })?
+            dialer::dial_reality_stream_one(tls_stream, remote, local, base_uri, session_id, config)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("splithttp reality stream-one: {e}"),
+                    )
+                })?
         } else {
             // HTTP/1.1 / HTTP/2 path（hyper + hyper-rustls）。
             // Bug A: TCP 必须恒拨 `dest`，URL authority（config.host）仅作 Host 头；
@@ -268,28 +302,46 @@ async fn dial_splithttp(
                     .unwrap_or("")
                     .to_string(),
             };
-            // bd rjzw2：握手前 RTT 探针（一次性 TCP connect 计时，DNS 在计时外）。
-            // ⚠️ 阶梯已撤（flow_window 模块头）：探针结果**只进定窗日志**，不再影响
-            // 任何窗值——窗组恒为静态保底。bench/诊断可用 XRAY_H2_RTT_HINT_MS 强制
-            // （此时跳过探针）。
-            //
-            // ⚠️ bd vkirx①：这条探针就是抓包看到的「stream-one 每会话多 1 条零字节
-            // TCP」（Rust 2 条 vs Go 1 条）的唯一来源——Go 用握手指令内 RTT，Rust 另
-            // 拨一条 SYN 再丢弃。互认不受影响，但多一个可指纹化的 SYN 且现在零收益
-            // （只喂日志）；清掉它要动本处调用 + `resolve_rtt`/`probe_rtt`
-            // （跟踪票口径，不在本轮）。
-            let rtt_hint =
-                crate::flow_window::resolve_rtt(&dial_target.host, dial_target.port).await;
-            let client = Arc::new(DefaultDialerClient::new(
-                config.clone(),
-                rustls_config,
-                dial_target,
-                fingerprint,
-                settings.security_json.clone(),
-                Some(Arc::clone(&tcpmask)),
-                rtt_hint,
-            ));
-            dialer::dial(client, config, scheme, &host, has_reality).await.map_err(|e| {
+            // bd vkirx①（lf51l 已清）：此前的握手前 RTT 探针（`resolve_rtt` 一次性
+            // TCP）就是抓包看到的「stream-one 每会话多 1 条零字节 TCP」（Rust 2 条 vs
+            // Go 1 条）的唯一来源；阶梯撤掉后它零消费者，已整体删除（Go 本无此机制）。
+            // xmux 接线（bd s42cg）：Go `getHTTPClient`（dialer.go:47-79）经
+            // `globalDialerMap` + `XmuxManager.GetXmuxClient` **复用** HTTP 客户端；
+            // Rust 侧此前每拨现建（dialer.rs 对 mux:: 零引用）⇒ 每条代理连接一条新
+            // TCP。接线后：客户端按 xmux 五维判定从池里取（新建 ≤ maxConnections，
+            // 之后按 maxConcurrency 随机选），复用即**复用底层 TCP 连接**。
+            let client = {
+                let xmux_config = config.xmux.clone().unwrap_or_default();
+                let key = crate::mux::xmux_manager_key(
+                    dest,
+                    &[
+                        &settings.security,
+                        &security_json_key,
+                        &transport_json_key,
+                        &sockopt_json_key,
+                        &finalmask_json_key,
+                    ],
+                );
+                let pool_config = config.clone();
+                let pool_tcpmask = Arc::clone(&tcpmask);
+                let pool_security_json = settings.security_json.clone();
+                let manager = crate::mux::H2_MANAGERS.get_or(&key, || {
+                    Arc::new(crate::mux::XmuxManager::new(xmux_config, move || {
+                        Arc::new(DefaultDialerClient::new(
+                            pool_config.clone(),
+                            rustls_config.clone(),
+                            dial_target.clone(),
+                            fingerprint,
+                            pool_security_json.clone(),
+                            Some(Arc::clone(&pool_tcpmask)),
+                        ))
+                    }))
+                });
+                manager.get_xmux_client()
+            };
+            dialer::dial(client, download_side.as_ref(), config, scheme, &host, has_reality)
+                .await
+                .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     format!("splithttp dial failed: {e}"),
@@ -302,6 +354,144 @@ async fn dial_splithttp(
     // Tcpmask（Go hub.go:546-549 同款排除）。
     Ok(Box::new(packet_conn.into_sync_reader()))
 }
+/// 构建下载侧通道（Go `dialer.go:355-404` 的 `httpClient2` / `requestURL2`）。
+///
+/// Go 用 `downloadSettings` 的**完整 StreamConfig** 另建下载侧 HTTP 客户端：
+/// - `dest2` = 下载侧 address/port（自己的拨号目标）
+/// - `tlsConfig2` / `realityConfig2` = 下载侧自己的 security
+/// - `httpVersion2` = 下载侧自己的 ALPN 推出的 HTTP 版本（可与主通道不同）
+/// - `config2` = 下载侧 `splithttpSettings`（自己的 host/path/query）
+///
+/// Rust 侧承载见 [`crate::config::DownloadSettings`]（协议段 + 原始 StreamConfig JSON
+/// + 拨号目标），本函数把它转成「下载侧客户端 + 下载侧 base_uri」。
+async fn build_download_side(
+    ds: &crate::config::DownloadSettings,
+    sockopt: &SocketOptions,
+) -> io::Result<dialer::DownloadSide> {
+    let dl_config = Arc::new((*ds.config).clone());
+    let stream = xray_transport::dialer::StreamSettings::from_json(Some(&ds.stream_json));
+    let has_tls = matches!(stream.security.as_str(), "tls" | "reality");
+    let has_reality = stream.security == "reality";
+    let scheme = if has_tls { "https" } else { "http" };
+    // host 三级回落（Go dialer.go:377-390）：下载侧 splithttpSettings.host →
+    // TLS serverName → 下载侧目标地址。
+    let sni = stream
+        .security_json
+        .as_ref()
+        .and_then(|j| j.get("serverName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let dl_host = if !dl_config.host.is_empty() {
+        dl_config.host.clone()
+    } else if !sni.is_empty() {
+        sni.clone()
+    } else {
+        ds.destination.address().to_string()
+    };
+    let base_uri = dialer::build_request_url(
+        scheme,
+        &dl_host,
+        &dl_config.normalized_path(),
+        &dl_config.normalized_query(),
+    );
+
+    // 下载侧 TLS（自己的 tlsSettings/realitySettings）+ 自己的 ALPN → HTTP 版本。
+    let tls_config = xray_tls::client_config::build_client_config(
+        &stream.security,
+        stream.security_json.as_ref(),
+        &dl_host,
+    )?;
+    let rustls_config = match tls_config {
+        Some(cfg) => (*cfg).clone(),
+        None => {
+            xray_common::ensure_default_crypto_provider();
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth()
+        },
+    };
+    let next_protocol: Vec<String> = rustls_config
+        .alpn_protocols
+        .iter()
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .collect();
+    let http_version = dialer::decide_http_version(has_tls, has_reality, &next_protocol);
+
+    let client = if http_version == "3" {
+        // h3 下载侧：独立 QUIC 连接（Go `dest2.Network = UDP` + 独立 tlsConfig2）。
+        let socket_addr = resolve_dest_socket_addr(&ds.destination).await.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "splithttp downloadSettings H3 dial: DNS resolve failed for {}",
+                    ds.destination.address()
+                ),
+            )
+        })?;
+        let quic_params = xray_transport::memory_settings::parse_quic_params_config(
+            stream.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
+        )?;
+        let h3 = H3Conn::connect_with_quic_params(
+            dl_config.clone(),
+            socket_addr,
+            &dl_host,
+            rustls_config,
+            quic_params.as_ref(),
+            sockopt,
+        )
+        .await
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("splithttp downloadSettings H3 connect failed: {e}"),
+            )
+        })?;
+        dialer::DownloadClient::H3(h3)
+    } else {
+        let fp_name = stream
+            .security_json
+            .as_ref()
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get("fingerprint"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let fingerprint = if has_tls && !has_reality && !fp_name.is_empty() {
+            Some(xray_tls::fingerprint::get_fingerprint(fp_name).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid downloadSettings fingerprint: {e}"),
+                )
+            })?)
+        } else {
+            None
+        };
+        let dl_tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+            stream.finalmask_json.as_ref(),
+        )?);
+        let dial_target = DialTarget {
+            host: ds.destination.address().to_string(),
+            port: ds.destination.port().value(),
+            sni: sni.clone(),
+        };
+        dialer::DownloadClient::H2(Arc::new(DefaultDialerClient::new(
+            dl_config.clone(),
+            rustls_config,
+            dial_target,
+            fingerprint,
+            stream.security_json.clone(),
+            Some(Arc::clone(&dl_tcpmask)),
+        )))
+    };
+
+    crate::hot_log!(
+        DEBUG,
+        "downloadSettings wired: base_uri={base_uri} dest={} http_version={http_version}",
+        ds.destination
+    );
+    Ok(dialer::DownloadSide { client, base_uri })
+}
+
 /// 将 [`Destination`] 解析为 [`SocketAddr`]（quinn/H3 需要；域名走系统 DNS）。
 ///
 /// 对应 Go `internet.DialSystem` 中 `dest.Network == UDP` 的域名解析。
@@ -315,6 +505,38 @@ async fn resolve_dest_socket_addr(dest: &Destination) -> Option<SocketAddr> {
             tokio::net::lookup_host((d.as_str(), port)).await.ok()?.next()
         },
     }
+}
+
+/// 解析 `downloadSettings` 的拨号目标（address + port）。
+///
+/// Go `infra/conf/transport_internet.go:50-52`：`StreamConfig{Address *Address; Port uint16}`；
+/// `Address` 的 JSON 是**字符串**（`common.go:53-67`：`env:` 前缀读环境变量，其余按
+/// `net.ParseAddress` 解析）。
+///
+/// 缺 address 或 port 时 Go 在 `dialer.go:369 dest2 := *memory2.Destination` 处
+/// **空指针 panic**——Rust 侧改为配置期硬错（fail-visible，不 panic）。
+fn parse_download_destination(
+    ds: &serde_json::Map<String, serde_json::Value>,
+) -> io::Result<Destination> {
+    let raw = ds.get("address").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let address = match raw.strip_prefix("env:") {
+        Some(key) => std::env::var(key).unwrap_or_default(),
+        None => raw.to_string(),
+    };
+    let port = ds.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+    if address.is_empty() || port == 0 || port > u16::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "downloadSettings must carry \"address\" and \"port\" (Go: nil Destination panics)",
+        ));
+    }
+    let addr: xray_common::net::address::Address = address.parse().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("downloadSettings.address is invalid: {e}"),
+        )
+    })?;
+    Ok(Destination::tcp(addr, xray_common::net::port::Port::new(port as u16)))
 }
 
 /// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。
@@ -395,44 +617,73 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
     // maxConnections {3,3}, hMaxRequestTimes {600,900}, hMaxReusableSecs {1800,3000}。
     // 上一版 anti-TSPU 前默认 6；本次同步对齐 3（commit 18e28390）。
     let xmux = match obj.get("xmux").and_then(|x| x.as_object()) {
-        Some(m) if !m.is_empty() => Some(crate::config::XmuxConfig {
+        Some(m) if !m.is_empty() => crate::config::XmuxConfig {
             max_concurrency: m.get("maxConcurrency").and_then(parse_range),
             max_connections: m.get("maxConnections").and_then(parse_range),
             c_max_reuse_times: m.get("cMaxReuseTimes").and_then(parse_range),
             h_max_request_times: m.get("hMaxRequestTimes").and_then(parse_range),
             h_max_reusable_secs: m.get("hMaxReusableSecs").and_then(parse_range),
             h_keep_alive_period: m.get("hKeepAlivePeriod").and_then(|x| x.as_i64()).unwrap_or(0),
-        }),
-        _ => Some(crate::config::XmuxConfig {
+        },
+        _ => crate::config::XmuxConfig {
             max_connections: Some(crate::config::RangeConfig::new(3, 3)),
             h_max_request_times: Some(crate::config::RangeConfig::new(600, 900)),
             h_max_reusable_secs: Some(crate::config::RangeConfig::new(1800, 3000)),
             ..Default::default()
-        }),
+        },
     };
 
-    // downloadSettings 是嵌套 StreamConfig：取其中 splithttpSettings 递归解析
-    // ponytail: 只取 splithttpSettings 子对象；TLS/security 归 stream 层管，这里不碰。
+    // Go `infra/conf/transport_method.go:458-460`：`maxConnections` 与
+    // `maxConcurrency` **互斥**（同时配 → 配置期硬错）——两者语义相冲（前者限池
+    // 容量、后者限单池并发）。Go 缺省预设只给 maxConnections，故缺省不触发 ✓。
+    if xmux.max_connections.as_ref().is_some_and(|r| r.to > 0)
+        && xmux.max_concurrency.as_ref().is_some_and(|r| r.to > 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "maxConnections cannot be specified together with maxConcurrency",
+        ));
+    }
+
+    // downloadSettings 是嵌套 StreamConfig（Go `infra/conf/transport_method.go:295`
+    // `DownloadSettings *StreamConfig`）：**完整** StreamConfig——address/port/method/
+    // security/tls/reality + `splithttpSettings` 协议段。
     //
-    // ⚠️ bd x0f0r（**未接线，显式告警**）：Go `dialer.go:355-362` 用 downloadSettings
-    // 的完整 StreamConfig（dest/tls/reality + 协议段）另建下载侧 HTTP 客户端；
-    // Rust `Config` 只携带协议段，下载仍走主客户端 + 主 host/path。此处 warn +
-    // 解析错误硬报（此前 `.ok()` 连坏配置都吞掉），避免「配了下行通道却静默失效」。
+    // Go `dialer.go:355-404` 用它另建下载侧 HTTP 客户端（独立 dest/tls/host/path）；
+    // Rust 侧同款接线（bd x0f0r 收口）：协议段解析为嵌套 [`Config`]，传输层段保留
+    // 原始 JSON（拨号时经 `StreamSettings::from_json` 转既有承载类型），拨号目标解析为
+    // [`Destination`]。
+    //
+    // Go `transport_method.go:508-511`：**stream-one 模式禁止配 downloadSettings**
+    // （配置期硬错）——下行在 stream-one 下是主通道 POST 的响应，下载侧客户端用不上。
     let download_settings = match obj.get("downloadSettings") {
         None => None,
         Some(ds) => {
+            if get_str("mode") == "stream-one" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Can not use \"downloadSettings\" in \"stream-one\" mode.",
+                ));
+            }
+            let ds_obj = ds.as_object().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "downloadSettings must be a StreamConfig object carrying splithttpSettings",
+                )
+            })?;
             let inner = ds.get("splithttpSettings").ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "downloadSettings must be a StreamConfig object carrying splithttpSettings",
                 )
             })?;
-            crate::LOG.warn(
-                "splithttpSettings.downloadSettings is parsed but NOT applied: download still uses \
-                 the main channel (host/path/TLS). Go builds a separate download client from the \
-                 full downloadSettings StreamConfig — wiring tracked as a follow-up (bd x0f0r)",
-            );
-            Some(Box::new(parse_splithttp_config(Some(inner))?))
+            let config = parse_splithttp_config(Some(inner))?;
+            let destination = parse_download_destination(ds_obj)?;
+            Some(Box::new(crate::config::DownloadSettings {
+                config: Box::new(config),
+                stream_json: ds.clone(),
+                destination,
+            }))
         },
     };
 
@@ -528,7 +779,7 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         sc_max_buffered_posts: get_i64("scMaxBufferedPosts"),
         sc_stream_up_server_secs: get_range("scStreamUpServerSecs"),
         server_max_header_bytes: get_i64("serverMaxHeaderBytes") as i32,
-        xmux,
+        xmux: Some(xmux),
         download_settings,
     })
 }
@@ -547,7 +798,13 @@ fn default_xhttp_config() -> Config {
     }
 }
 
-/// Parse a RangeConfig from JSON: either `{"from":N,"to":N}` or a single integer.
+/// Parse a RangeConfig from JSON.
+///
+/// Go `infra/conf/common.go` `Int32Range.UnmarshalJSON` 只认两种形态：**字符串**
+/// `"1-2"` / `"7"`，或**裸整数** `7`——`{from,to}` 对象在 Go 侧是硬错
+/// （"Invalid integer range, expected either string of form \"1-2\" or plain integer."）。
+/// 本函数按 Go 的两种形态解析；另保留对象形态作为 Rust 侧**宽松超集**（既有配置与
+/// 内部用例依赖；写反不会静默跨端漂移——Go 会报错）。
 fn parse_range(v: &serde_json::Value) -> Option<crate::config::RangeConfig> {
     if let Some(obj) = v.as_object() {
         let from = obj.get("from").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
@@ -556,6 +813,19 @@ fn parse_range(v: &serde_json::Value) -> Option<crate::config::RangeConfig> {
     } else if let Some(n) = v.as_i64() {
         let n = n as i32;
         Some(crate::config::RangeConfig::new(n, n))
+    } else if let Some(s) = v.as_str() {
+        // Go `ParseRangeString`："7" → (7,7)；"1-2" → (1,2)。
+        // shortcut: 负数为分隔符的形态（Go "-114-514" → (-114,514)）不解析——
+        // splithttp 各范围字段无负数语义，需要时按 Go `splitFromSecondDash` 补齐。
+        let s = s.trim();
+        if let Ok(n) = s.parse::<i64>() {
+            let n = n as i32;
+            return Some(crate::config::RangeConfig::new(n, n));
+        }
+        let (left, right) = s.split_once('-')?;
+        let from = left.trim().parse::<i64>().ok()? as i32;
+        let to = right.trim().parse::<i64>().ok()? as i32;
+        Some(crate::config::RangeConfig::new(from, to))
     } else {
         None
     }
@@ -632,11 +902,27 @@ mod tests {
         assert!(xm.h_max_request_times.is_none());
     }
 
+    /// Go `infra/conf/transport_method.go:458-460`：`maxConnections` 与 `maxConcurrency`
+    /// 同时配 → 配置期硬错（两者语义相冲：前者限池容量、后者限单池并发）。
+    #[test]
+    fn parse_xmux_rejects_concurrency_with_connections() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"xmux":{"maxConcurrency":{"from":1,"to":4},"maxConnections":{"from":2,"to":8}}}"#,
+        )
+        .unwrap();
+        let err = parse_splithttp_config(Some(&v)).expect_err("must reject");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("cannot be specified together"),
+            "unexpected message: {err}"
+        );
+    }
+
     #[test]
     fn parse_splithttp_config_all_fields() {
         // 对齐 Go SplitHTTPConfig 30 字段全量对拍
         let v: serde_json::Value = serde_json::from_str(
-            r#"{"host":"h.com","path":"/p","mode":"stream-one",
+            r#"{"host":"h.com","path":"/p","mode":"stream-up",
                "xPaddingBytes":{"from":100,"to":200},
                "xPaddingObfsMode":true,"xPaddingKey":"k","xPaddingHeader":"X",
                "xPaddingPlacement":"header","xPaddingMethod":"garble",
@@ -644,10 +930,11 @@ mod tests {
                "seqPlacement":"query","seqKey":"seq","uplinkDataPlacement":"query",
                "uplinkDataKey":"d","uplinkChunkSize":{"from":1000,"to":2000},
                "scStreamUpServerSecs":{"from":1,"to":2},"serverMaxHeaderBytes":8192,
-               "xmux":{"maxConcurrency":{"from":1,"to":4},"maxConnections":{"from":2,"to":8},
+               "xmux":{"maxConnections":{"from":2,"to":8},
                        "cMaxReuseTimes":{"from":3,"to":3},"hMaxRequestTimes":{"from":5,"to":6},
                        "hMaxReusableSecs":{"from":7,"to":8},"hKeepAlivePeriod":30},
-               "downloadSettings":{"splithttpSettings":{"host":"dl.example.com","path":"/dl"}}}"#,
+               "downloadSettings":{"address":"dl.example.com","port":8443,
+                   "splithttpSettings":{"host":"dl.example.com","path":"/dl"}}}"#,
         )
         .unwrap();
         let cfg = parse_splithttp_config(Some(&v)).unwrap();
@@ -669,11 +956,15 @@ mod tests {
         assert_eq!(cfg.sc_stream_up_server_secs.as_ref().unwrap().to, 2);
         assert_eq!(cfg.server_max_header_bytes, 8192);
         let xm = cfg.xmux.as_ref().unwrap();
-        assert_eq!(xm.max_concurrency.as_ref().unwrap().to, 4);
+        // maxConcurrency 与 maxConnections 互斥（Go transport_method.go:458-460 硬错），
+        // 全字段用例只配后者；互斥本身由 `parse_xmux_rejects_concurrency_with_connections` 覆盖。
+        assert_eq!(xm.max_connections.as_ref().unwrap().to, 8);
         assert_eq!(xm.h_keep_alive_period, 30);
         let dl = cfg.download_settings.as_ref().unwrap();
-        assert_eq!(dl.host, "dl.example.com");
-        assert_eq!(dl.path, "/dl");
+        assert_eq!(dl.config.host, "dl.example.com");
+        assert_eq!(dl.config.path, "/dl");
+        assert_eq!(dl.destination.port().value(), 8443);
+        assert_eq!(dl.destination.address().to_string(), "dl.example.com");
     }
 
     /// 票 037f：scMaxEachPostBytes JSON 灌入（此前只走 proto，JSON 恒默认 1MB）。
@@ -825,6 +1116,32 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(r#"{"from":100,"to":200}"#).unwrap();
         let r = parse_range(&v).unwrap();
         assert_eq!((r.from, r.to), (100, 200));
+    }
+
+    /// Go `Int32Range.UnmarshalJSON` 的字符串形态：`"1-2"` → (1,2)、`"7"` → (7,7)。
+    /// 修前 Rust 只认对象/裸整数 ⇒ 用户按 Go 文档写的 xmux 范围被**静默忽略**。
+    #[test]
+    fn parse_range_from_go_string_forms() {
+        let two: serde_json::Value = serde_json::from_str(r#""100-200""#).unwrap();
+        let r = parse_range(&two).unwrap();
+        assert_eq!((r.from, r.to), (100, 200));
+
+        let one: serde_json::Value = serde_json::from_str(r#""600""#).unwrap();
+        let r = parse_range(&one).unwrap();
+        assert_eq!((r.from, r.to), (600, 600));
+    }
+
+    /// Go 字符串形态经 `parse_splithttp_config` 落到 xmux 五维（端到端解析路径）。
+    #[test]
+    fn parse_xmux_go_string_forms_reach_fields() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"xmux":{"maxConnections":"3","hMaxRequestTimes":"600-900"}}"#)
+                .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).unwrap();
+        let xm = cfg.xmux.as_ref().expect("xmux present");
+        assert_eq!(xm.max_connections.unwrap().to, 3);
+        let h = xm.h_max_request_times.unwrap();
+        assert_eq!((h.from, h.to), (600, 900));
     }
 
     #[test]

@@ -34,8 +34,8 @@ use crate::{
     config::MetricsConfig,
     error::MetricsError,
     metrics::{
-        MetricsHandler, ObservationCollector, RecordingOutboundRegistrar, StatsCollector,
-        TokioHttpServer,
+        MetricsHandler, ObservationCollector, OutboundRegistrar, RecordingOutboundRegistrar,
+        StatsCollector, TokioHttpServer,
     },
 };
 
@@ -53,7 +53,12 @@ pub struct MetricsFeature {
     http_server: TokioHttpServer,
     stats: parking_lot::RwLock<Arc<dyn StatsCollector>>,
     obs: parking_lot::RwLock<Option<Arc<dyn ObservationCollector>>>,
-    registrar: Arc<RecordingOutboundRegistrar>,
+    /// 出站注册面（bd 0z7zt）：默认 [`RecordingOutboundRegistrar`]（只记账不接线，
+    /// 测试态）；装配面经 [`MetricsFeature::set_outbound_registrar`] 注入
+    /// `SimpleOhmOutboundRegistrar` 后，tag 形态才真正挂进出站表（Go
+    /// metrics.go:82-94 ohm.AddHandler）。RwLock：Instance 持 `Arc<MetricsFeature>`
+    /// 时装配点只有 `&self`（同 stats/obs 注入形态）。
+    registrar: parking_lot::RwLock<Arc<dyn OutboundRegistrar>>,
     started: AtomicBool,
 }
 
@@ -65,9 +70,17 @@ impl MetricsFeature {
             http_server: TokioHttpServer::new(),
             stats: parking_lot::RwLock::new(Arc::new(EmptyStats)),
             obs: parking_lot::RwLock::new(None),
-            registrar: Arc::new(RecordingOutboundRegistrar::new()),
+            registrar: parking_lot::RwLock::new(Arc::new(RecordingOutboundRegistrar::new())),
             started: AtomicBool::new(false),
         }
+    }
+
+    /// 注入出站注册面（bd 0z7zt，应在 `start` 前调用；内部 RwLock，start 前生效）。
+    ///
+    /// 生产装配（`xray-core/functions.rs`）注入 `SimpleOhmOutboundRegistrar`，
+    /// 对应 Go `NewMetricsHandler` RequireFeatures 拿 `outbound.Manager`。
+    pub fn set_outbound_registrar(&self, registrar: Arc<dyn OutboundRegistrar>) {
+        *self.registrar.write() = registrar;
     }
 
     /// 注入 stats 收集器（应在 `start` 前调用）。
@@ -120,7 +133,8 @@ impl Feature for MetricsFeature {
         }
         let stats = self.stats.read().clone();
         let obs = self.obs.read().clone();
-        self.handler.start(&self.http_server, stats, obs, self.registrar.as_ref()).map_err(
+        let registrar = self.registrar.read().clone();
+        self.handler.start(&self.http_server, stats, obs, registrar.as_ref()).map_err(
             |e: MetricsError| xray_features::FeatureError::StartFailed {
                 name: "metrics",
                 message: format!("{e}"),
@@ -129,7 +143,7 @@ impl Feature for MetricsFeature {
     }
 
     fn close(&self) -> xray_features::Result<()> {
-        self.started.store(false, Ordering::SeqCst);
+        let was_started = self.started.swap(false, Ordering::SeqCst);
         // 通知 http_server 释放后台 task（5s timeout）。
         let closer = self.http_server.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -141,6 +155,14 @@ impl Feature for MetricsFeature {
             drop(closer);
         }
         self.handler.close();
+        // bd 0z7zt：Go metrics.go:113-118 Close 时 `ohm.RemoveHandler(tag)`（容忍
+        // 失败仅 LogInfo）。仅对真实启动过且配了 tag 的实例反注册。
+        if was_started {
+            let tag = &self.handler.config().tag;
+            if !tag.is_empty() {
+                let _ = self.registrar.read().remove(tag);
+            }
+        }
         Ok(())
     }
 }

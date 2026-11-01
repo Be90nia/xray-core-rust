@@ -98,10 +98,12 @@ impl MasqType {
         match self {
             Self::NotFound => std::sync::Arc::new(NotFoundMasqHandler),
             Self::File(dir) => std::sync::Arc::new(FileMasqHandler::new(dir.clone())),
-            // Go 用 httputil.ReverseProxy 真反代（ErrorHandler 502）；本实现保持
-            // 503 类兜底响应（任务授权 "proxy 503 类"），url/rewrite_host/insecure
-            // 暂不消费（ponytail: 接入 hyper 反代时再扩展）。
-            Self::Proxy { .. } => std::sync::Arc::new(ProxyMasqHandler),
+            // Go "proxy" 分支：httputil.ReverseProxy 真反代（hub.go:219-265）——
+            // 上游 URL 解析失败 → handler 固定回 502（fail-visible；Go 侧是
+            // Listen 期报错，本仓构造面无错误出口）。
+            Self::Proxy { url, rewrite_host, insecure } => {
+                std::sync::Arc::new(ProxyMasqHandler::new(url, *rewrite_host, *insecure))
+            },
             Self::String { body, headers, status_code } => std::sync::Arc::new(StringMasqHandler {
                 body: body.clone(),
                 headers: headers.clone(),
@@ -126,6 +128,40 @@ pub trait MasqueradeHandler: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
     >;
+
+    /// 完整请求入口（反代面需要 query / Host / body）。
+    ///
+    /// 默认实现退化为 [`Self::serve`]（既有 404/file/string handler 零改动）；
+    /// 「proxy」分支覆写本方法做真反代（Go `httputil.ReverseProxy` 透传
+    /// method/path+query/头/body）。bd 4zcki。
+    fn serve_request(
+        &self,
+        req: MasqRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MasqResponse> + Send>> {
+        // 默认实现退化为 serve()（`serve` 本身返回 'static future，无需借 self）。
+        self.serve(&req.method, &req.path, &req.headers)
+    }
+}
+
+/// masquerade 响应（status + headers + body）。
+pub type MasqResponse = (u16, HashMap<String, String>, Vec<u8>);
+
+/// masquerade 请求完整形态（Go `*http.Request` 的 method / URL / Header / Body）。
+///
+/// 与 [`MasqueradeHandler::serve`] 的三参形态并存：后者是历史接口（无 query/
+/// body/Host），反代面用本结构。
+#[derive(Debug, Clone, Default)]
+pub struct MasqRequest {
+    /// 请求方法（Go `r.Method`）。
+    pub method: String,
+    /// 请求目标（path + 可选 `?query`；Go `r.URL.RequestURI()`）。
+    pub path: String,
+    /// 请求头（Go `r.Header`；h3 下 `:authority` 不在其中，见 [`Self::host`]）。
+    pub headers: HashMap<String, String>,
+    /// 原始请求 Host（Go `r.Host`；h3 = `:authority`，HTTP/1.1 = Host 头）。
+    pub host: String,
+    /// 请求体（Go `r.Body`；h3 数据帧汇总）。
+    pub body: Vec<u8>,
 }
 
 /// 默认 NotFound 实现（对应 Go `http.NotFoundHandler()`）。
@@ -299,36 +335,13 @@ impl MasqueradeHandler for StringMasqHandler {
     }
 }
 
-/// Proxy masquerade 实现（对应 Go `"proxy"` 分支的兜底行为）。
+/// Proxy masquerade 实现（对应 Go `"proxy"` 分支 `httputil.ReverseProxy`）。
 ///
-/// Go 的 proxy masquerade 反向代理到 `MasqUrl`；当目标不可达时回退 503。
-/// 本实现采用 ponytail 策略：直接返回 HTTP 503（Service Unavailable），
-/// 覆盖任务需求"Proxy: 返回 HTTP 503"。完整反向代理（含 rewrite_host/insecure）
-/// 在接入 hyper 反向代理后扩展。
-#[derive(Debug, Clone, Default)]
-pub struct ProxyMasqHandler;
-
-impl MasqueradeHandler for ProxyMasqHandler {
-    fn serve(
-        &self,
-        _method: &str,
-        _path: &str,
-        _headers: &HashMap<String, String>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = (u16, HashMap<String, String>, Vec<u8>)> + Send>,
-    > {
-        Box::pin(async {
-            (
-                503,
-                HashMap::from([(
-                    "Content-Type".to_string(),
-                    "text/plain; charset=utf-8".to_string(),
-                )]),
-                b"Service Unavailable".to_vec(),
-            )
-        })
-    }
-}
+/// 实现见 [`crate::masq_proxy`]：反代到 `MasqUrl`，`MasqUrlRewriteHost` 控制
+/// Host 头是否改写为上游 authority（Go 默认 false = 保留客户端原始 Host），
+/// `MasqUrlInsecure` 跳过上游 TLS 证书校验；上游不可达/出错 → 502（Go
+/// `ErrorHandler`）。
+pub use crate::masq_proxy::ProxyMasqHandler;
 
 /// Hysteria auth 请求信息（对应 Go `httpHandler.AuthHTTP` 输入）。
 #[derive(Debug, Clone)]
@@ -651,13 +664,14 @@ mod tests {
         assert_eq!(body, b"custom body");
     }
 
+    /// bd 4zcki：proxy 分支不再是 503 兜底——真反代到 `MasqUrl`；上游不可达 →
+    /// Go `ErrorHandler` 的 502。（旧行为「503 兜底」已随反代实装移除。）
     #[tokio::test]
-    async fn proxy_masq_handler_returns_503() {
-        let h = ProxyMasqHandler;
-        let (status, headers, body) = h.serve("GET", "/proxy", &HashMap::new()).await;
-        assert_eq!(status, 503);
-        assert_eq!(body, b"Service Unavailable");
-        assert_eq!(headers.get("Content-Type"), Some(&"text/plain; charset=utf-8".to_string()));
+    async fn proxy_masq_handler_proxies_to_upstream_or_502() {
+        // 上游不可达（端口无监听）→ 502
+        let h = ProxyMasqHandler::new("http://127.0.0.1:1/", false, false);
+        let (status, _, _) = h.serve("GET", "/proxy", &HashMap::new()).await;
+        assert_eq!(status, 502, "上游不可达 → Go ErrorHandler 的 502（非 503 兜底）");
     }
 
     #[test]
@@ -723,7 +737,8 @@ mod tests {
         let p =
             MasqType::Proxy { url: "https://e.com".into(), rewrite_host: false, insecure: false }
                 .build_handler();
-        assert_eq!(p.serve("GET", "/", &HashMap::new()).await.0, 503);
+        // proxy = 真反代（bd 4zcki）：上游不可达 → 502（Go ErrorHandler）
+        assert_eq!(p.serve("GET", "/", &HashMap::new()).await.0, 502);
         let s = MasqType::String { body: "ok".into(), headers: HashMap::new(), status_code: 200 }
             .build_handler();
         let (status, _, body) = s.serve("GET", "/", &HashMap::new()).await;

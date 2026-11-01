@@ -180,7 +180,7 @@ pub struct RemoveUserArgs {
     #[command(flatten)]
     pub api: ApiSharedArgs,
     /// 入站 tag。
-    #[arg(short, long = "tag")]
+    #[arg(long = "tag")]
     pub tag: String,
     /// 用户邮箱列表。
     #[arg(required = true)]
@@ -193,7 +193,7 @@ pub struct InboundUserArgs {
     #[command(flatten)]
     pub api: ApiSharedArgs,
     /// 入站 tag。
-    #[arg(short, long = "tag")]
+    #[arg(long = "tag")]
     pub tag: String,
     /// 用户邮箱。
     #[arg(short, long = "email")]
@@ -206,7 +206,7 @@ pub struct InboundUserCountArgs {
     #[command(flatten)]
     pub api: ApiSharedArgs,
     /// 入站 tag。
-    #[arg(short, long = "tag")]
+    #[arg(long = "tag")]
     pub tag: String,
 }
 

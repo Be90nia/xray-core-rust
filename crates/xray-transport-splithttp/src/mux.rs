@@ -276,7 +276,6 @@ use parking_lot::Mutex as PMutex;
 pub struct ManagerPool<C: XmuxConn + 'static> {
     map: PMutex<HashMap<String, Arc<XmuxManager<C>>>>,
 }
-
 impl<C: XmuxConn + 'static> ManagerPool<C> {
     pub fn new() -> Self {
         Self { map: PMutex::new(HashMap::new()) }
@@ -310,6 +309,75 @@ impl<C: XmuxConn + 'static> Default for ManagerPool<C> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ===== 接线：真实客户端的 xmux 适配 + 进程级 manager 池（bd s42cg） =====
+
+use std::sync::LazyLock;
+
+use crate::{client::DefaultDialerClient, h3_client::H3Conn};
+
+/// h2（hyper）客户端作为 xmux 连接单元（Go `XmuxConn` = `DialerClient`）。
+///
+/// `is_closed` = 客户端自身的 closed 标志（连接级错误后置位 ⇒ 该条目被池清理）。
+impl XmuxConn for Arc<DefaultDialerClient> {
+    fn is_closed(&self) -> bool {
+        (**self).is_closed()
+    }
+}
+
+/// h3（QUIC）客户端作为 xmux 连接单元。
+impl XmuxConn for Arc<H3Conn> {
+    fn is_closed(&self) -> bool {
+        (**self).is_closed()
+    }
+}
+
+/// h2 侧进程级 manager 池（对应 Go `globalDialerMap`）。
+///
+/// key = [`xmux_manager_key`]（目标 + 影响客户端构造的配置内容）。
+pub static H2_MANAGERS: LazyLock<ManagerPool<Arc<DefaultDialerClient>>> =
+    LazyLock::new(ManagerPool::new);
+
+/// h3 侧进程级 manager 池（对应 Go `globalDialerMap` 的 h3 分支）。
+///
+/// 池单元 = [`crate::h3_client::LazyH3Conn`]（**惰性**建连的 QUIC/H3 连接）——
+/// Go 的 h3 xmux 单元是 `http3.Transport`（只造 transport，握手推迟到首次请求）✓。
+pub static H3_MANAGERS: LazyLock<ManagerPool<crate::h3_client::LazyH3Conn>> =
+    LazyLock::new(ManagerPool::new);
+
+/// 把一个已建好的连接包装成 xmux 池单元（默认 xmux 配置 ⇒ 无限复用）。
+///
+/// 供**直连/测试**路径使用（生产路径走 manager 池）：拨号函数现在收
+/// `Arc<XmuxClient<C>>`（连接 + 五维计数一体，对齐 Go `*XmuxClient`）。
+#[must_use]
+pub fn wrap_xmux_client<C: XmuxConn + Clone + 'static>(conn: C) -> Arc<XmuxClient<C>> {
+    XmuxManager::new(XmuxConfig::default(), move || conn.clone()).get_xmux_client()
+}
+
+/// xmux manager 的池 key（目标 + 影响客户端构造的配置）。
+///
+/// Go 的 key 是 `dialerConf{dest, *MemoryStreamConfig}`——**指针身份**（每个 outbound
+/// 一个 `MemoryStreamConfig` ⇒ 每 outbound 一个 manager）。Rust 侧拨号入口拿到的是
+/// **克隆**的 `StreamSettings`（`register.rs:33`），无稳定身份 ⇒ 用**内容** key
+/// （目标 + 安全层 + 协议层 JSON）。
+///
+/// 差异登记：两个**配置内容完全相同**的 outbound 在 Rust 侧会共用一个 manager（Go 侧
+/// 不会）。影响面可控——传输层在路由层之下（路由在拨号前已定），共享的只是同目标
+/// 的底层连接；不同 dest / 不同 security / 不同协议配置必然分池。
+#[must_use]
+pub fn xmux_manager_key(
+    dest: &xray_common::net::destination::Destination,
+    parts: &[&str],
+) -> String {
+    let mut key = dest.address().to_string();
+    key.push(':');
+    key.push_str(&dest.port().value().to_string());
+    for p in parts {
+        key.push('|');
+        key.push_str(p);
+    }
+    key
 }
 
 #[cfg(test)]
@@ -452,6 +520,89 @@ mod tests {
         let _ = manager2.get_xmux_client();
         // 第 2 次：上次留下的是 closed → 清理 → 池又空 → 再新建。池里只有这 1 个新的。
         assert_eq!(manager2.pool_size(), 1);
+    }
+
+    /// 五维判定逐条（Go `mux.go:89-146` 规格）：
+    ///
+    /// - `maxConnections = N`：前 N 次取用各建一个 client，第 N+1 次**复用**（不新建）。
+    /// - `cMaxReuseTimes = N`：client 的 `leftUsage = N-1` ⇒ 复用 N-1 次后被淘汰。
+    /// - `hMaxRequestTimes = N`：`LeftRequests = N` ⇒ 扣满 N 次后被淘汰。
+    /// - `hMaxReusableSecs = N`：`UnreusableAt = now + N s` ⇒ 到点后被淘汰。
+    /// - `maxConcurrency = N`：`Running < N` 才算候选（见上方既有用例）。
+    #[test]
+    fn max_connections_grows_then_reuses() {
+        let mut config = XmuxConfig::default();
+        config.max_connections = Some(crate::config::RangeConfig::new(2, 2));
+        let manager = XmuxManager::new(config, make_factory());
+
+        let c1 = manager.get_xmux_client();
+        let c2 = manager.get_xmux_client();
+        assert_eq!(manager.pool_size(), 2, "未达 maxConnections 前每次新建");
+        assert_ne!(Arc::as_ptr(&c1) as usize, Arc::as_ptr(&c2) as usize);
+
+        // 第 3 次：已达上限 ⇒ 复用池中某个（不再新建）。
+        let c3 = manager.get_xmux_client();
+        assert_eq!(manager.pool_size(), 2, "达 maxConnections 后不得再新建");
+        assert!(
+            [Arc::as_ptr(&c1) as usize, Arc::as_ptr(&c2) as usize]
+                .contains(&(Arc::as_ptr(&c3) as usize)),
+            "达上限后必须复用已有 client"
+        );
+    }
+
+    /// `cMaxReuseTimes = 2`：client 建好后 `leftUsage = 1` ⇒ 复用 1 次后（leftUsage=0）
+    /// 下次取用时被淘汰并新建（Go `leftUsage == 0` 淘汰条件）。
+    #[test]
+    fn c_max_reuse_times_evicts_after_exhaustion() {
+        let mut config = XmuxConfig::default();
+        config.c_max_reuse_times = Some(crate::config::RangeConfig::new(2, 2));
+        let manager = XmuxManager::new(config, make_factory());
+
+        let c1 = manager.get_xmux_client();
+        assert_eq!(c1.left_usage(), 1, "Go: leftUsage = cMaxReuseTimes - 1");
+        let c2 = manager.get_xmux_client();
+        assert_eq!(Arc::as_ptr(&c1) as usize, Arc::as_ptr(&c2) as usize, "应复用同一 client");
+        assert_eq!(c1.left_usage(), 0, "复用一次后 leftUsage 归零");
+        // 下一次：leftUsage == 0 ⇒ 淘汰 + 新建。
+        let c3 = manager.get_xmux_client();
+        assert_ne!(Arc::as_ptr(&c1) as usize, Arc::as_ptr(&c3) as usize, "leftUsage 耗尽后须新建");
+    }
+
+    /// `hMaxRequestTimes = 2`：`LeftRequests = 2`，扣满后淘汰（Go 条件
+    /// `LeftRequests.Load() <= 0`）。
+    #[test]
+    fn h_max_request_times_evicts_after_requests_exhausted() {
+        let mut config = XmuxConfig::default();
+        config.h_max_request_times = Some(crate::config::RangeConfig::new(2, 2));
+        let manager = XmuxManager::new(config, make_factory());
+
+        let c1 = manager.get_xmux_client();
+        assert_eq!(c1.left_requests(), 2);
+        c1.dec_left_requests();
+        assert_eq!(c1.left_requests(), 1);
+        c1.dec_left_requests();
+        assert_eq!(c1.left_requests(), 0);
+        // 扣满 ⇒ 下次取用时淘汰 + 新建。
+        let c2 = manager.get_xmux_client();
+        assert_ne!(Arc::as_ptr(&c1) as usize, Arc::as_ptr(&c2) as usize, "请求数耗尽后须新建");
+    }
+
+    /// `hMaxReusableSecs = 1`：`UnreusableAt = now + 1s`，到点后淘汰（Go 条件
+    /// `now.After(UnreusableAt)`）。
+    #[tokio::test]
+    async fn h_max_reusable_secs_evicts_after_expiry() {
+        let mut config = XmuxConfig::default();
+        config.h_max_reusable_secs = Some(crate::config::RangeConfig::new(1, 1));
+        let manager = XmuxManager::new(config, make_factory());
+
+        let c1 = manager.get_xmux_client();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let c2 = manager.get_xmux_client();
+        assert_ne!(
+            Arc::as_ptr(&c1) as usize,
+            Arc::as_ptr(&c2) as usize,
+            "超过 hMaxReusableSecs 后须淘汰旧 client"
+        );
     }
 
     /// `c_max_reuse_times` 设置后应正确初始化 `left_usage`。

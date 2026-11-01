@@ -334,8 +334,9 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     }
 
     // ===== 预连接池（virgin-connection pool，bd k9qg → ss-ws 池票修订）=====
-    // 池启用条件：`Config::pool_size > 0`（默认 12，对齐 Chrome 6/host × 多 host
-    // burst 上限）。key 必须包含能区分握手细节的字段（host/port/path/sni/
+    // 池启用条件：`Config::pool_size > 0`（**默认 0 = 关池，与 Go 26.10.17 对齐**
+    // ——Go ws dialer 无任何预热/复用；bd s8eio）。显式 `wsSettings.poolSize`
+    // 才启用。key 必须包含能区分握手细节的字段（host/port/path/sni/
     // fingerprint）——任意字段不同 = 不能复用（TLS 握手 / WS 升级 / SNI 校验
     // 阶段已不同）。
     let pool_key = PoolKey {
@@ -418,7 +419,7 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
 /// 池的 `begin_preconnect` 名额闸门把关——池满时多余的 spawn 任务立刻被闸门
 /// 拒绝，零额外开销。Chrome 整页 burst（>5 个 subresource 同时打开）场景下，
 /// 单条 replenish 任务跟不上拨号节拍；fanout=3 让 burst 后第一波后续 dial
-/// 拿到预连接的命中率从 ~40% 提升到 ~80%（与池默认 12 容量叠加生效）。
+/// 拿到预连接的命中率从 ~40% 提升到 ~80%（与 `poolSize` 容量叠加生效）。
 ///
 /// 设计约束：virgin-only / used 永不回池红线由 [`spawn_replenish`] 内 `release`
 /// 路径守住，本函数仅在 `spawn_replenish` 之外多发起若干拨号线——每条仍是
@@ -623,7 +624,7 @@ fn hex_val(c: u8) -> Option<u8> {
 /// - `header` 或 `headers`：`map<string,string>`（同时支持两种 key 兼容客户端配置）
 /// - `ed`：u32（Early Data 长度）
 /// - `heartbeatPeriod`：u32（秒，camelCase 对齐 proto JSON）
-/// - `poolSize`：u32（连接池空闲上限，0=关池；缺省沿用 `Config::default` = 3）
+/// - `poolSize`：u32（预连接池空闲上限，**缺省 0 = 关池，与 Go 无池对齐**；显式非 0 才启用）
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
@@ -640,9 +641,9 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     // Bug-B（bd cqyj）：缺省 30s 心跳；显式 0 = 关闭。
     let heartbeat_period =
         obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).map(|v| v as u32).unwrap_or(30);
-    // ponytail: poolSize 缺省 → Config::default() 的 12（启用池化）；显式 0 = 关池。
-    // 与 `Config::default()` 一致，避免每个 outbound 都要在 JSON 里写 poolSize。
-    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(12) as u32;
+    // bd s8eio：poolSize 缺省 → 0（关池，与 `Config::default()` 一致）。Go 无池
+    // 机制，预连接是服务端可见的额外握手连接（不传数据），故须显式 opt-in。
+    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -743,12 +744,12 @@ mod tests {
         assert_eq!(cfg.heartbeat_period, 30);
     }
 
-    /// poolSize 默认 12（启用池化；Chrome 6/host × 多 host burst 上限）。
+    /// bd s8eio：poolSize 缺省 = 0（关池，与 Go 26.10.17 无池对齐）。
     #[test]
-    fn parse_ws_config_pool_size_default_12() {
+    fn parse_ws_config_pool_size_default_off() {
         let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws"}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
-        assert_eq!(cfg.pool_size, 12);
+        assert_eq!(cfg.pool_size, 0);
     }
 
     /// poolSize=0 显式关池。
@@ -1240,7 +1241,8 @@ mod tests {
 
         let settings = StreamSettings {
             protocol: "websocket".to_string(),
-            transport_json: Some(serde_json::json!({"path": "/ws"})),
+            // bd s8eio：池默认关（对齐 Go 无池）——本测试测池语义，显式开启。
+            transport_json: Some(serde_json::json!({"path": "/ws", "poolSize": 12})),
             ..Default::default()
         };
         let accepted = Arc::new(AtomicUsize::new(0));

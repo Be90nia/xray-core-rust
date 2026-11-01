@@ -47,6 +47,44 @@ fn conn_with_download(
     conn
 }
 
+/// 下载侧客户端（h1/h2 或 h3）。
+///
+/// 由**下载侧自己的** ALPN 决定（Go `dialer.go:377`：
+/// `httpVersion2 := decideHTTPVersion(tlsConfig2, realityConfig2)`）——下载侧可以用
+/// 与主通道不同的 HTTP 版本（如主 h2、下行 h3）。
+pub enum DownloadClient {
+    /// h1/h2（hyper）客户端。
+    H2(Arc<DefaultDialerClient>),
+    /// h3（QUIC）客户端。
+    H3(Arc<H3Conn>),
+}
+
+impl DownloadClient {
+    /// 打开下载流（GET，无 body）。
+    pub async fn open_stream(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        close: Option<crate::client::CloseSignal>,
+    ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
+        match self {
+            Self::H2(c) => c.open_stream(base_uri, session_id, None, close).await,
+            Self::H3(c) => c.open_stream(base_uri, session_id, None, close).await,
+        }
+    }
+}
+
+/// 下载侧通道（Go `downloadSettings` 另建的客户端 + 它自己的 host/path）。
+///
+/// Go `dialer.go:355-404`：配了 `downloadSettings` 时，下行走**另一个** HTTP 客户端
+/// （独立 dest/tls/host/path），上行仍走主客户端。本结构承载该「另一个客户端」。
+pub struct DownloadSide {
+    /// 下载侧客户端。
+    pub client: DownloadClient,
+    /// 下载侧 base_uri（下载侧自己的 host/path/query）。
+    pub base_uri: String,
+}
+
 /// packet-up 上行 in-flight POST 上限（背压门）。
 ///
 /// Go `dialer.go:517` 每个 chunk 起一个 goroutine 投递，主循环对 `DefaultDialerClient`
@@ -94,7 +132,8 @@ const MAX_INFLIGHT_POSTS: usize = 4;
     reason = "墙钟取时：POST 间隔判定（Go dialer.go:511 `time.Since(lastWrite)`，本 fn 2 处）；spawn 站点已逐点登记（bd f17zu）"
 )]
 pub async fn dial_packet_up(
-    client: Arc<DefaultDialerClient>,
+    client: Arc<crate::mux::XmuxClient<Arc<DefaultDialerClient>>>,
+    download: Option<&DownloadSide>,
     base_uri: String,
     session_id: String,
     sc_max_each_post_bytes: usize,
@@ -102,11 +141,18 @@ pub async fn dial_packet_up(
 ) -> Result<PacketUpConn> {
     // 1. GET 下载流（stream-down，lazy reader——POST 上传任务见下）。
     // close 信号：SplitConn drop（连接关闭）即终止 GET——hyper 连接按不可复用
-    // 处理（h1 关 TCP / h2 RST_STREAM），服务端据此清理会话与桥接链（Go
+    // 处理（h1 关 TCP / h2 RST_STREAM），服务端据此清理会话和桥接链（Go
     // `splitConn.onClose` 语义）。缺失此传播 = 服务端全链永挂（bd s10 fd 泄漏）。
+    //
+    // 下载侧通道（Go `dialer.go:400-405`）：配了 `downloadSettings` 时 GET 走**下载侧**
+    // 客户端 + 它自己的 host/path（`httpClient2` / `requestURL2`），否则走主客户端。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_body, remote, local) =
-        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
+    // xmux 计数（Go `XmuxClient.LeftRequests.Add(-1)`）：每个 splithttp 请求扣一次。
+    client.dec_left_requests();
+    let (download_body, remote, local) = match download {
+        Some(d) => d.client.open_stream(&d.base_uri, &session_id, Some(close_rx)).await?,
+        None => client.conn.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?,
+    };
 
     // 2. 创建上传 pipe（buffer 略大于 max_post 以吸收短期 burst）
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -115,6 +161,8 @@ pub async fn dial_packet_up(
     // 3. spawn 后台上行泵：读 pipe → 并发 POST packet（seq 单调，见 MAX_INFLIGHT_POSTS）
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
+    let conn = Arc::clone(&client.conn);
+    let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面上传泵（packet-up pipe→并发 POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
@@ -175,12 +223,15 @@ pub async fn dial_packet_up(
             }
             last_write = std::time::Instant::now();
 
-            let client = Arc::clone(&client);
+            let conn = Arc::clone(&conn);
+            let xmux_client = Arc::clone(&xmux_client);
             let base_uri = base_uri_for_task.clone();
             let session_id = session_id_for_task.clone();
             posts.spawn(async move {
                 let _permit = permit;
-                client.post_packet(&base_uri, &session_id, &seq_str, payload).await
+                // Go dialer.go:512：每个 POST 扣一次 LeftRequests（≤0 即换连接）。
+                xmux_client.dec_left_requests();
+                conn.post_packet(&base_uri, &session_id, &seq_str, payload).await
             });
         }
 
@@ -199,7 +250,11 @@ pub async fn dial_packet_up(
     });
 
     let conn = conn_with_download(download_body, pipe_client, remote, local);
+    // xmux Running 计数（Go `AddRunning`/`DoneRunning`）：连接存活期占一个并发槽。
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
     conn.set_on_close(move || {
+        xmux_client.dec_open_usage();
         let _ = close_tx.send(());
     });
     Ok(conn)
@@ -221,7 +276,8 @@ pub async fn dial_packet_up(
 ///
 /// stream-up 适合 HTTP/2 流式上传，CDN 不支持时分包 packet-up 更稳。
 pub async fn dial_stream_up(
-    client: Arc<DefaultDialerClient>,
+    client: Arc<crate::mux::XmuxClient<Arc<DefaultDialerClient>>>,
+    download: Option<&DownloadSide>,
     base_uri: String,
     session_id: String,
 ) -> Result<PacketUpConn> {
@@ -229,17 +285,28 @@ pub async fn dial_stream_up(
     let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
     let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
-    // 2. POST upload（不等响应）
+    // 2. POST upload（不等响应）——Go dialer.go:443-445：POST 扣一次 LeftRequests。
+    client.dec_left_requests();
     let (_, remote, local) =
-        client.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
+        client.conn.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
 
     // 3. 独立 GET 下载流（close 信号同 dial_packet_up——断连传播终止 GET）
+    //
+    // 下载侧通道（Go `dialer.go:400-405`）：配了 `downloadSettings` 时 GET 走**下载侧**
+    // 客户端 + 它自己的 host/path。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_body, _, _) =
-        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
+    // Go dialer.go:434-436：下行 GET 扣一次 LeftRequests。
+    client.dec_left_requests();
+    let (download_body, _, _) = match download {
+        Some(d) => d.client.open_stream(&d.base_uri, &session_id, Some(close_rx)).await?,
+        None => client.conn.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?,
+    };
 
     let conn = conn_with_download(download_body, pipe_client, remote, local);
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
     conn.set_on_close(move || {
+        xmux_client.dec_open_usage();
         let _ = close_tx.send(());
     });
     Ok(conn)
@@ -261,7 +328,7 @@ pub async fn dial_stream_up(
 ///
 /// stream-one 是 REALITY 友好模式（单连接看起来像正常 HTTPS）。
 pub async fn dial_stream_one(
-    client: Arc<DefaultDialerClient>,
+    client: Arc<crate::mux::XmuxClient<Arc<DefaultDialerClient>>>,
     base_uri: String,
     session_id: String,
 ) -> Result<PacketUpConn> {
@@ -269,15 +336,23 @@ pub async fn dial_stream_one(
     let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
     let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
+    // Go dialer.go:425-427：POST 扣一次 LeftRequests。
+    client.dec_left_requests();
     let (response_opt, remote, local) =
-        client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
+        client.conn.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
     let download_body = response_opt.ok_or_else(|| {
         crate::error::SplitHttpError::Hyper(
             "stream-one upload_only=false must return response stream".into(),
         )
     })?;
 
-    Ok(conn_with_download(download_body, pipe_client, remote, local))
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
+    conn.set_on_close(move || {
+        xmux_client.dec_open_usage();
+    });
+    Ok(conn)
 }
 // ===== 切片 F: dial() 统一入口 + dispatch 辅助函数 =====
 
@@ -357,8 +432,10 @@ pub fn build_request_url(scheme: &str, host: &str, path: &str, query: &str) -> S
 ///   `tls_config`（REALITY 用 watfaq-rustls `with_reality()` patch 注入）。Go 在 `dialContext`
 ///   闭包里 `reality.UClient(conn, ...)` 包装 TCP conn；Rust 因 hyper-rustls 自管 TLS 握手，REALITY
 ///   注入点移到 `RustlsClientConfig` 构造阶段。 留 VPS REALITY 切片 F2 实际接入验证。
-/// - **DownloadSettings**：当前 `has_download_settings=false` 固定（stream-up via DownloadSettings
-///   是 splithttp 高级特性，留切片 F2 接入）。
+/// - **DownloadSettings**：已接线（Go `dialer.go:355-404`）——配了 `downloadSettings` 时
+///   **另建**下载侧 HTTP 客户端（独立 dest/tls/host/path/ALPN），下行走该客户端，
+///   上行仍走主客户端；`auto` + REALITY + downloadSettings → mode 推断为 `stream-up` （Go
+///   `dialer.go:339-345`）。
 /// - **浏览器拨号器**：Go `browser_dialer.HasBrowserDialer()` 分支未实现 （ponytail: YAGNI，浏览器
 ///   JS dialer 与 Rust 客户端场景不匹配）。
 /// - **H3**：本函数仅走 H1/H2。HTTP/3 由 [`dial_h3`] 处理，`register.rs::dial_splithttp` 根据
@@ -377,7 +454,8 @@ pub fn build_request_url(scheme: &str, host: &str, path: &str, query: &str) -> S
 /// - [`SplitHttpError::InvalidUrl`]：未知 `mode`
 /// - 子函数错误透传（[`dial_packet_up`] / [`dial_stream_up`] / [`dial_stream_one`]）
 pub async fn dial(
-    client: Arc<DefaultDialerClient>,
+    client: Arc<crate::mux::XmuxClient<Arc<DefaultDialerClient>>>,
+    download: Option<&DownloadSide>,
     config: Arc<Config>,
     scheme: &str,
     host: &str,
@@ -397,10 +475,17 @@ pub async fn dial(
             let sc_min = config.normalized_sc_min_posts_interval_ms();
             // H11：Go dialer.go:464 maxUploadSize 每连接 rand() 采样一次
             // （此前恒取 from——自定义 range 下性能坍塌 + 定长流量指纹）。
-            dial_packet_up(client, base_uri, session_id, sc_max.rand().max(1) as usize, sc_min)
-                .await
+            dial_packet_up(
+                client,
+                download,
+                base_uri,
+                session_id,
+                sc_max.rand().max(1) as usize,
+                sc_min,
+            )
+            .await
         },
-        "stream-up" => dial_stream_up(client, base_uri, session_id).await,
+        "stream-up" => dial_stream_up(client, download, base_uri, session_id).await,
         "stream-one" => dial_stream_one(client, base_uri, session_id).await,
         other => Err(SplitHttpError::InvalidUrl(format!("unknown splithttp mode: {other}"))),
     }
@@ -420,17 +505,27 @@ pub async fn dial(
     clippy::disallowed_methods,
     reason = "墙钟取时：POST 间隔判定（Go dialer.go:511 `time.Since(lastWrite)`，本 fn 2 处）；spawn 站点已逐点登记（bd f17zu）"
 )]
-pub async fn dial_h3_packet_up(
-    client: Arc<H3Conn>,
+pub async fn dial_h3_packet_up<C>(
+    client: Arc<crate::mux::XmuxClient<C>>,
+    download: Option<&DownloadSide>,
     base_uri: String,
     session_id: String,
     sc_max_each_post_bytes: usize,
     sc_min_posts_interval_ms: RangeConfig,
-) -> Result<PacketUpConn> {
+) -> Result<PacketUpConn>
+where
+    C: crate::h3_client::H3ClientLike + crate::mux::XmuxConn + 'static,
+{
     // 1. GET 下载流（close 信号 + 连接级关闭见下方 on_close 注释）。
+    //
+    // 下载侧通道（Go `dialer.go:400-405`）：配了 `downloadSettings` 时 GET 走**下载侧**
+    // 客户端（可能是 h2，即使主通道是 h3）+ 它自己的 host/path。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_body, remote, local) =
-        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
+    client.dec_left_requests();
+    let (download_body, remote, local) = match download {
+        Some(d) => d.client.open_stream(&d.base_uri, &session_id, Some(close_rx)).await?,
+        None => client.conn.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?,
+    };
 
     // 2. 创建上传 pipe
     let pipe_buf = sc_max_each_post_bytes.saturating_mul(2).max(8192);
@@ -440,6 +535,7 @@ pub async fn dial_h3_packet_up(
     let base_uri_for_task = base_uri.clone();
     let session_id_for_task = session_id.clone();
     let client_for_task = Arc::clone(&client);
+    let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面上传泵（H3 packet-up pipe→POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
@@ -464,7 +560,10 @@ pub async fn dial_h3_packet_up(
             let seq_str = seq.to_string();
             seq += 1;
 
+            // Go dialer.go:512：每个 POST 扣一次 LeftRequests。
+            xmux_client.dec_left_requests();
             if let Err(e) = client_for_task
+                .conn
                 .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
                 .await
             {
@@ -488,13 +587,17 @@ pub async fn dial_h3_packet_up(
     });
 
     let conn = conn_with_download(download_body, pipe_client, remote, local);
-    // 连接关闭：终止 GET 下载流 + 显式关闭 QUIC 连接（H3Conn 与 QUIC 连接一一
-    // 对应，对齐 Go dialer.go:229-231 AfterFunc 的 `tr.Close(); pktConn.Close()`）
-    // ——客户端 UDP fd 立即释放，服务端 QUIC 连接立即终结，不等 30s idle timeout
-    // （bd s12 RSS/fd 泄漏根因之一）。
-    let h3_for_close = Arc::clone(&client);
+    // 连接关闭：终止 GET 下载流 + 释放并发槽位。
+    //
+    // **不关 QUIC 连接**（bd s42cg）：Go `dialer.go:409-419` 的 `splitConn.onClose`
+    // 只做 `DoneRunning()`——`tr.Close()` 在 `Dial` 闭包里挂在 **QUIC 连接的**
+    // context 上（`dialer.go:232`），不是挂在代理连接上。xmux 池化后 `H3Conn` 被
+    // 多条代理连接共享，此处关它 = 池单元即刻报废（实测 4 次拨号 = 4 次 QUIC
+    // 握手，复用归零）。空闲连接由 quinn idle timeout + 池的 `is_closed` 淘汰回收。
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
     conn.set_on_close(move || {
-        h3_for_close.close();
+        xmux_client.dec_open_usage();
         let _ = close_tx.send(());
     });
     Ok(conn)
@@ -503,28 +606,42 @@ pub async fn dial_h3_packet_up(
 /// H3 stream-up mode 拨号：POST streaming body 上传 + 独立 GET 下载。
 ///
 /// 与 [`dial_stream_up`] 对应，但走 H3 over QUIC。
-pub async fn dial_h3_stream_up(
-    client: Arc<H3Conn>,
+pub async fn dial_h3_stream_up<C>(
+    client: Arc<crate::mux::XmuxClient<C>>,
+    download: Option<&DownloadSide>,
     base_uri: String,
     session_id: String,
-) -> Result<PacketUpConn> {
+) -> Result<PacketUpConn>
+where
+    C: crate::h3_client::H3ClientLike + crate::mux::XmuxConn + 'static,
+{
     // 1. 创建上传 pipe
     let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
     let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
-    // 2. POST upload（upload_only=true）
+    // 2. POST upload（upload_only=true）——Go dialer.go:443-445：POST 扣一次 LeftRequests。
+    client.dec_left_requests();
     let (_, remote, local) =
-        client.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
+        client.conn.open_stream_uploading(&base_uri, &session_id, upload_stream, true).await?;
 
     // 3. 独立 GET 下载（close 信号同 dial_h3_packet_up——断连传播 + 连接级关闭）
+    //
+    // 下载侧通道（Go `dialer.go:400-405`）：配了 `downloadSettings` 时 GET 走**下载侧**
+    // 客户端 + 它自己的 host/path。
     let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-    let (download_body, _, _) =
-        client.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?;
+    // Go dialer.go:434-436：下行 GET 扣一次 LeftRequests。
+    client.dec_left_requests();
+    let (download_body, _, _) = match download {
+        Some(d) => d.client.open_stream(&d.base_uri, &session_id, Some(close_rx)).await?,
+        None => client.conn.open_stream(&base_uri, &session_id, None, Some(close_rx)).await?,
+    };
 
     let conn = conn_with_download(download_body, pipe_client, remote, local);
-    let h3_for_close = Arc::clone(&client);
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
     conn.set_on_close(move || {
-        h3_for_close.close();
+        // 同 [`dial_h3_packet_up`]：只释放并发槽，不关共享的池单元。
+        xmux_client.dec_open_usage();
         let _ = close_tx.send(());
     });
     Ok(conn)
@@ -537,23 +654,42 @@ pub async fn dial_h3_stream_up(
 ///
 /// H12：对齐 Go stream-one 单连接语义（dialer.go:469-479）——此前用 POST+GET
 /// 双 stream 实现，服务端会多出一条连接。
-pub async fn dial_h3_stream_one(
-    client: Arc<H3Conn>,
+pub async fn dial_h3_stream_one<C>(
+    client: Arc<crate::mux::XmuxClient<C>>,
     base_uri: String,
     session_id: String,
-) -> Result<PacketUpConn> {
+) -> Result<PacketUpConn>
+where
+    C: crate::h3_client::H3ClientLike + crate::mux::XmuxConn + 'static,
+{
     // 1. 创建上传 pipe
     let (pipe_client, pipe_server) = tokio::io::duplex(UPLINK_CHUNK);
     let upload_stream = PoolStream::new(pipe_server, UPLINK_CHUNK);
 
     // 2. POST upload + GET download（upload_only=false）
+    // Go dialer.go:425-427：POST 扣一次 LeftRequests。
+    client.dec_left_requests();
     let (dl_opt, remote, local) =
-        client.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
+        client.conn.open_stream_uploading(&base_uri, &session_id, upload_stream, false).await?;
     let download_body = dl_opt.ok_or_else(|| {
         SplitHttpError::Hyper("h3 stream-one upload_only=false must return download stream".into())
     })?;
 
-    Ok(conn_with_download(download_body, pipe_client, remote, local))
+    let conn = conn_with_download(download_body, pipe_client, remote, local);
+    // 生命周期锚（bd 1xfap + bd s42cg）：H3Conn 必须活到连接结束。
+    //
+    // H3Conn 内持 h3 `SendRequest`（h3 crate：最后一个 SendRequest drop 即以
+    // `H3_NO_ERROR / "Connection closed by client"` 关连接）。**池化后由 xmux
+    // 池持有**：`XmuxClient.conn`（`Arc<LazyH3Conn>` → `Arc<H3Conn>`）活到所有
+    // 拨号释放，故此处不需要（也**不该**）调 `conn.close()`——那是共享 QUIC
+    // 连接的关闭口，逐连接调用会让池单元报废（Go `dialer.go:409-419` onClose
+    // 只做 `DoneRunning()`）。
+    client.inc_open_usage();
+    let xmux_client = Arc::clone(&client);
+    conn.set_on_close(move || {
+        xmux_client.dec_open_usage();
+    });
+    Ok(conn)
 }
 
 /// H3 统一拨号入口。
@@ -568,14 +704,18 @@ pub async fn dial_h3_stream_one(
 /// - `scheme`: URL scheme（H3 通常 `\"https\"`，因 QUIC + TLS）
 /// - `host`: URL host
 /// - `has_reality`: 是否启用 REALITY（影响默认 mode 推断）
-pub async fn dial_h3(
-    client: Arc<H3Conn>,
+pub async fn dial_h3<C>(
+    client: Arc<crate::mux::XmuxClient<C>>,
+    download: Option<&DownloadSide>,
     config: Arc<Config>,
     scheme: &str,
     host: &str,
     has_reality: bool,
-) -> Result<PacketUpConn> {
-    let mode = resolve_mode(&config.mode, has_reality, false);
+) -> Result<PacketUpConn>
+where
+    C: crate::h3_client::H3ClientLike + crate::mux::XmuxConn + 'static,
+{
+    let mode = resolve_mode(&config.mode, has_reality, config.download_settings.is_some());
     let session_id =
         if mode == "stream-one" { String::new() } else { config.generate_session_id() };
     let base_uri =
@@ -588,10 +728,17 @@ pub async fn dial_h3(
             let sc_max = config.normalized_sc_max_each_post_bytes();
             let sc_min = config.normalized_sc_min_posts_interval_ms();
             // H11：同 dial_packet_up——每连接 rand() 采样。
-            dial_h3_packet_up(client, base_uri, session_id, sc_max.rand().max(1) as usize, sc_min)
-                .await
+            dial_h3_packet_up(
+                client,
+                download,
+                base_uri,
+                session_id,
+                sc_max.rand().max(1) as usize,
+                sc_min,
+            )
+            .await
         },
-        "stream-up" => dial_h3_stream_up(client, base_uri, session_id).await,
+        "stream-up" => dial_h3_stream_up(client, download, base_uri, session_id).await,
         "stream-one" => dial_h3_stream_one(client, base_uri, session_id).await,
         other => Err(SplitHttpError::InvalidUrl(format!("unknown splithttp mode (h3): {other}"))),
     }
@@ -624,8 +771,6 @@ pub async fn dial_h3(
 /// - `base_uri`: 完整 URL
 /// - `session_id`: uuid 字符串（stream-one 时为空）
 /// - `config`: splithttp 配置（构造 RequestMeta）
-/// - `rtt_hint`: bd rjzw2 RTT 探针结果（调用方计时真实 `dial_system` connect），**只进
-///   定窗日志**：h2 窗组恒为静态保底（阶梯已撤，见 `flow_window` 模块头）
 ///
 /// # Errors
 ///
@@ -638,7 +783,6 @@ pub async fn dial_reality_stream_one<S>(
     base_uri: String,
     session_id: String,
     config: Arc<Config>,
-    rtt_hint: Option<std::time::Duration>,
 ) -> Result<PacketUpConn>
 where
     S: AsyncReadTrait + AsyncWriteTrait + Unpin + Send + 'static,
@@ -655,8 +799,8 @@ where
     // 上行 1MB→16MB 与服务端对称（bd wz2b：服务端收窗放大后 send buf 成次级钉，
     // 4MB/RTT@169ms≈23.7MB/s < 25 判据）。
     let mut builder = http2::Builder::new(TokioExecutor::new());
-    // bd rjzw2：三参数 = 静态保底（RTT 阶梯已撤，见 flow_window 模块头）。
-    let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
+    // 窗组 = 静态保底（RTT 阶梯已撤；探针已删，见 flow_window 模块头）。
+    let win = crate::flow_window::client_windows();
     builder
         .timer(hyper_util::rt::TokioTimer::new())
         .initial_stream_window_size(win.stream_window)
@@ -819,9 +963,9 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
-        let result = dial(client, config, "http", "h", false).await;
+        let client = crate::mux::wrap_xmux_client(client);
+        let result = dial(client, None, config, "http", "h", false).await;
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("unknown mode should fail, got Ok"),
@@ -868,7 +1012,7 @@ mod tests {
         assert_eq!(resolve_mode("packet-up", true, true), "packet-up");
     }
 
-    /// 集成：mock HTTP/1 server + download_settings (Box<Config>) → dial_packet_up
+    /// 集成：mock HTTP/1 server + download_settings → dial_packet_up
     /// 应当主 path 在 client/GET 收到响应。
     /// 此处不进真实 tunnel：仅 smoke 验证 dial 完成且 reader 拿到 download。
     #[tokio::test]
@@ -877,7 +1021,23 @@ mod tests {
         // 不连真实服务器（用未知端口）。此测试仅覆盖 dial_splithttp 的下载 client
         // 构建路径不上 panic，且 connect 失败被透传出来。
         // 实装下由 mock_server.rs 覆盖真端到端；本测试为单元层 coverage。
-        let dl = Config { host: "dl-host".into(), path: "/d/".into(), ..Default::default() };
+        let dl = crate::config::DownloadSettings {
+            config: Box::new(Config {
+                host: "dl-host".into(),
+                path: "/d/".into(),
+                ..Default::default()
+            }),
+            stream_json: serde_json::json!({
+                "network": "splithttp",
+                "splithttpSettings": { "host": "dl-host", "path": "/d/" },
+                "address": "127.0.0.1",
+                "port": 1,
+            }),
+            destination: xray_common::net::destination::Destination::tcp(
+                "127.0.0.1".parse::<xray_common::net::address::Address>().expect("addr"),
+                xray_common::net::port::Port::new(1),
+            ),
+        };
         let main = Arc::new(Config {
             host: "main-host".into(),
             path: "/m/".into(),
@@ -959,7 +1119,6 @@ mod tests {
             "https://example.com/ws".to_string(),
             String::new(),
             config,
-            None,
         )
         .await;
         let mut conn = result.expect("dial_reality_stream_one failed");

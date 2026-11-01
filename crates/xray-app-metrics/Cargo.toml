@@ -10,6 +10,12 @@ socket2 = { workspace = true }
 xray-common = { path = "../xray-common" }
 xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
+# bd 0z7zt：tag 形态暴露接线——DispatchHandler 适配器（Link → cnc Conn → listener）
+# 需要 xray-transport 的 Link/ContentNetworkConnection；注册进生产出站表需要
+# xray-app-dispatcher 的 DispatchHandler/SimpleOhm。两者均 workspace 内 path 依赖
+# （commander 同款模式：xray-app-commander/src/server.rs:186-275），无循环依赖。
+xray-transport = { path = "../xray-transport" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 # B6（bd t975）：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-dns（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
@@ -21,3 +27,5 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# bd 0z7zt：tag 形态 e2e 测试构造 Link（`xray_buf::io::new_reader/new_writer`）。
+xray-buf = { path = "../xray-buf" }

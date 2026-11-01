@@ -100,7 +100,7 @@ impl TuicMockServer {
         let server_crypto_arc = Arc::new(quic_server_cfg);
 
         let mut transport = quinn::TransportConfig::default();
-        transport.datagram_receive_buffer_size(Some(8 * 1024));
+        transport.datagram_receive_buffer_size(Some(crate::client::TUIC_DATAGRAM_RECV_BUFFER));
         let mut server_cfg = quinn::ServerConfig::with_crypto(server_crypto_arc);
         server_cfg.transport_config(Arc::new(transport));
 
@@ -439,16 +439,42 @@ pub(crate) enum ReplySink {
 
 impl ReplySink {
     /// 以 Packet 帧格式（VER + TYPE + 负载）回写一个响应。
+    ///
+    /// native（DATAGRAM）模式：单 datagram 有容量上限（~1200B），响应超过即
+    /// 必须按 TUIC v5 spec 分片（同 pkt_id、FRAG_TOTAL、FRAG_ID 0-based、仅首片
+    /// 带地址），否则 `send_datagram` 直接报错 → 响应静默丢（bd j7de2 F4：
+    /// ≥1190B 起丢）。quic（uni stream）模式：流可靠有序，整包直发。
     async fn write_packet(&mut self, pkt: &Packet) -> Result<()> {
-        let mut out = BytesMut::with_capacity(pkt.encoded_len());
-        out.put_u8(crate::protocol::VERSION);
-        out.put_u8(type_code::PACKET);
-        pkt.write_payload(&mut out)?;
         match self {
             ReplySink::Dgram(c) => {
-                c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
+                let Some(max) = c.max_datagram_size() else {
+                    return Err(TuicError::QuinnSendDatagram(
+                        quinn::SendDatagramError::UnsupportedByPeer,
+                    ));
+                };
+                // 帧头开销：VER+TYPE(2) + ASSOC(2)+PKT(2)+FRAG_TOTAL(1)+FRAG_ID(1)+SIZE(2)
+                let frag_payload = max.saturating_sub(10 + pkt.addr.encoded_len()).max(1);
+                let frags = if pkt.data.len() <= frag_payload {
+                    vec![pkt.clone()]
+                } else {
+                    crate::udp::build_native_fragments(
+                        pkt.assoc_id,
+                        pkt.pkt_id,
+                        &pkt.addr,
+                        pkt.data.clone(),
+                        frag_payload,
+                    )?
+                };
+                for frag in frags {
+                    let out = crate::udp::encode_packet_frame(&frag)?;
+                    c.send_datagram(out.freeze()).map_err(TuicError::QuinnSendDatagram)?;
+                }
             },
             ReplySink::Uni(c) => {
+                let mut out = BytesMut::with_capacity(pkt.encoded_len());
+                out.put_u8(crate::protocol::VERSION);
+                out.put_u8(type_code::PACKET);
+                pkt.write_payload(&mut out)?;
                 let mut uni = c.open_uni().await?;
                 uni.write_all(&out).await?;
                 let _ = uni.finish();
@@ -564,14 +590,6 @@ async fn udp_assoc_task(
 
 /// 直连模式（mock）：assoc 生命周期内单个 UdpSocket（cone 出口）。
 /// direct 模式（mock server / 直连）：每包直接 `udp.send_to`。
-///
-/// 面 3 步 3 例外：`Sleep::reset` 只收 `tokio::time::Instant`，而
-/// `xray_frame::deadline::Budget` 刻意不外露绝对时刻（双源统一入口的构造约束）
-/// → fn 内 2 处 idle reset 留原形态，待 Budget 补 timer-arm 面再收。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（迁移跟踪 bd 23vrp：Budget 补 timer-arm 面后迁）"
-)]
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
     let log = &*SERVER_LOG;
     let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
@@ -584,8 +602,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
     let mut sink: Option<ReplySink> = None;
     let mut cur_pkt_id: u16 = 0;
     let mut resp_buf = vec![0u8; 65_536];
-    let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
-    tokio::pin!(idle);
+    let mut idle = xray_frame::deadline::Budget::tokio().arm_timer(UDP_ASSOC_IDLE);
     loop {
         tokio::select! {
             item = rx.recv() => {
@@ -600,7 +617,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                         } else {
                             log.debug(format!("tuic udp assoc {assoc_id} resolve failed: {dest:?}"));
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                        idle.reset(UDP_ASSOC_IDLE);
                     }
                     None => break, // Dissociate 或表清理
                 }
@@ -619,7 +636,7 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                                 log.debug(format!("tuic udp assoc {assoc_id} reply: {e:?}"));
                             }
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                        idle.reset(UDP_ASSOC_IDLE);
                     }
                     Err(e) => {
                         log.debug(format!("tuic udp assoc {assoc_id} recv: {e:?}"));
@@ -627,19 +644,12 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                     }
                 }
             }
-            _ = &mut idle => break, // 60s 空闲淘汰
+            _ = idle.expired() => break, // 60s 空闲淘汰
         }
     }
 }
 
 /// dispatch 模式（生产）：[`UdpDispatchSession`] 路由，域名透传由 outbound 解析。
-///
-/// 面 3 步 3 例外：同 `udp_assoc_direct`（fn 内 2 处 idle reset 由本条 fn 级
-/// allow 统一登记）——Budget 不外露绝对时刻，`Sleep::reset` 只能收 tokio Instant。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "面 3 步 3 例外：Budget 无绝对时刻面，Sleep::reset 只能收 tokio Instant（迁移跟踪 bd 23vrp：Budget 补 timer-arm 面后迁）"
-)]
 async fn udp_assoc_dispatch(
     assoc_id: u16,
     dispatcher: Arc<dyn DispatchHandler>,
@@ -649,8 +659,7 @@ async fn udp_assoc_dispatch(
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut sink: Option<ReplySink> = None;
     let mut cur_pkt_id: u16 = 0;
-    let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
-    tokio::pin!(idle);
+    let mut idle = xray_frame::deadline::Budget::tokio().arm_timer(UDP_ASSOC_IDLE);
     loop {
         tokio::select! {
             item = rx.recv() => {
@@ -662,7 +671,7 @@ async fn udp_assoc_dispatch(
                             log.debug(format!("tuic udp assoc {assoc_id} dispatch send: {e:?}"));
                             break;
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                        idle.reset(UDP_ASSOC_IDLE);
                     }
                     None => break, // Dissociate 或表清理
                 }
@@ -682,7 +691,7 @@ async fn udp_assoc_dispatch(
                                 log.debug(format!("tuic udp assoc {assoc_id} reply: {e:?}"));
                             }
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
+                        idle.reset(UDP_ASSOC_IDLE);
                     }
                     Ok(None) => break, // outbound 关闭
                     Err(e) => {
@@ -693,7 +702,7 @@ async fn udp_assoc_dispatch(
                     }
                 }
             }
-            _ = &mut idle => break, // 60s 空闲淘汰
+            _ = idle.expired() => break, // 60s 空闲淘汰
         }
     }
 }
@@ -978,6 +987,33 @@ mod udp_assoc_tests {
         .expect("native send_recv timed out")
         .expect("native send_recv failed");
         assert_eq!(resp, payload);
+        client.close(0u32.into(), b"");
+    }
+
+    /// bd j7de2 F4：native 模式大报必须完整往返（server 响应侧按 TUIC v5 spec
+    /// 分片：同 pkt_id、FRAG_TOTAL、FRAG_ID 0-based、仅首片带地址）。
+    /// 修前：响应整包塞进单个 QUIC DATAGRAM → 超过单 datagram 容量（约 1183B）
+    /// → `send_datagram` 报错 → 静默丢 → 客户端超时。
+    #[tokio::test]
+    async fn native_datagram_large_payload_roundtrips() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let echo_addr = start_udp_echo().await;
+        let (client, _server) = connect_mock("native-large").await;
+
+        let assoc = client.dial_udp(0x0D22);
+        let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+        for size in [1200usize, 1500, 4000, 20_000] {
+            let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let resp = tokio::time::timeout(
+                Duration::from_secs(10),
+                assoc.send_recv_native(target.clone(), &payload, None),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("native {size}B send_recv timed out"))
+            .unwrap_or_else(|e| panic!("native {size}B send_recv failed: {e:?}"));
+            assert_eq!(resp.len(), size, "native {size}B 响应长度必须一致");
+            assert_eq!(resp, payload, "native {size}B 响应必须逐字节一致");
+        }
         client.close(0u32.into(), b"");
     }
 

@@ -22,7 +22,7 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf},
     net::{TcpStream, UdpSocket},
     task::JoinHandle,
 };
@@ -221,10 +221,17 @@ impl InboundConnMeta for MaybeTcpMaskConn<TcpStream> {
 /// （行为与 dppv 之前逐字节一致）；mask 生效或传输自身无 peek 能力（UDS
 /// `Box<dyn Connection>`）时把读到的明文留在 `peeked`、由
 /// [`tokio::io::AsyncRead`] 优先回放。
+///
+/// 同时充当混合入站的**缓冲读器**（`AsyncBufRead`，见其下 impl）：HTTP 请求头按
+/// Go `bufio.NewReaderSize(..., 8KB)` 语义块读，多读的字节留在 `peeked` 里继续
+/// 供给请求体 / 下一请求 / 隧道。
 pub(crate) struct PeekAhead<S> {
     conn: S,
     peeked: Vec<u8>,
 }
+
+/// [`PeekAhead`] 每次 `fill_buf` 从底层取的块大小（Go `bufio.NewReaderSize(_, buf.Size)` = 8192）。
+const PEEK_AHEAD_FILL_CHUNK: usize = 8192;
 
 impl<S> PeekAhead<S> {
     pub(crate) fn new(conn: S) -> Self {
@@ -268,6 +275,40 @@ impl<S: tokio::io::AsyncRead + Unpin> AsyncRead for PeekAhead<S> {
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut this.conn).poll_read(cx, buf)
+    }
+}
+
+/// `AsyncBufRead`：块读进 `peeked` 再回放。
+///
+/// HTTP 请求头解析按 Go `bufio.Reader` 语义需要一个「能多读、多读字节留在自己
+/// 手里」的读器（bd y5cy9）：`fill_buf` 一次读 8KB 块，`consume` 只丢已解析的
+/// 部分，行后多余字节继续留在 `peeked`——后续请求体读、下一 keep-alive 请求、
+/// CONNECT 隧道都从同一个 buffer 续读，[`InboundConnMeta::into_link_io`] 也已有
+/// 「peeked 非空则连缓冲一起交给读侧」的处理。
+impl<S: tokio::io::AsyncRead + Unpin> AsyncBufRead for PeekAhead<S> {
+    fn poll_fill_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<&[u8]>> {
+        let this = self.get_mut();
+        if this.peeked.is_empty() {
+            let mut chunk = [0u8; PEEK_AHEAD_FILL_CHUNK];
+            let mut read_buf = ReadBuf::new(&mut chunk);
+            match std::pin::Pin::new(&mut this.conn).poll_read(cx, &mut read_buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    this.peeked.extend_from_slice(read_buf.filled());
+                },
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+        std::task::Poll::Ready(Ok(&this.peeked))
+    }
+
+    fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        let n = amt.min(this.peeked.len());
+        this.peeked.drain(..n);
     }
 }
 
@@ -426,7 +467,17 @@ async fn handle_udp_associate(
     handler: Arc<dyn DispatchHandler>,
     idle: std::time::Duration,
 ) -> std::io::Result<()> {
+    // bd kol4a：UDP relay 携带入站源 + 协议名（Go `session.Inbound`：Source +
+    // Name）→ 出站 `MuxBridge` 按 `xudp.GetGlobalID` 语义派生 GlobalID，mux
+    // 服务端按 GlobalID 复用 cone 会话（同源多目标共享单条 UDP 通道）。
+    //
+    // 源地址 = **首个被接受数据报的源**（Go `server.go:243`
+    // `newInbound.Source = net.DestinationFromAddr(conn.RemoteAddr())`），
+    // 建会话时尚不可知（ASSOCIATE 请求里的地址只是 expectedRemote 的初值，
+    // 域名/未指定时端口为 0）→ 首包到达后经 `set_access` 装填；此时
+    // dispatch link 尚未建立（首包 `send_packet` 才 `establish`）。
     let mut session = UdpDispatchSession::new(handler);
+    let mut access_applied = false;
     // 收包缓冲走堆（栈数组会把本 future 撑到 64KiB，构造期在调用方 poll 栈上留
     // 同尺寸临时量 → 击穿 2MiB 线程栈；与全仓 UDP 缓冲的 vec! 形态同款）。
     let mut buf = vec![0u8; 65535];
@@ -455,6 +506,15 @@ async fn handle_udp_associate(
                 };
                 // 只在被接受的数据报上续期（对齐 Go：被丢弃的来源不 c.Timer.Update()）
                 idle_deadline = Budget::tokio().deadline(idle);
+                if !access_applied {
+                    // 首包已锁定 expectedRemote = 本数据报源（Go `changeRemote.Do`）
+                    access_applied = true;
+                    session.set_access(xray_app_dispatcher::AccessContext {
+                        from: relay.expected_addr().to_string(),
+                        inbound_name: "socks".to_string(),
+                        ..xray_app_dispatcher::AccessContext::default()
+                    });
+                }
                 // 解码 SOCKS5 UDP 请求帧 → (目标地址, payload)
                 let (dest_addr, payload) = match decode_udp_packet(&buf[..n]) {
                     Ok(v) => v,
@@ -728,7 +788,7 @@ pub async fn serve_http(
     tracing::info!(addr = %listener.local_addr()?, "http proxy inbound listening");
     loop {
         // finalmask.tcp：accept 后立即套上（mask 在 HTTP 握手之前）
-        let (mut stream, peer) = match listener.accept_masked().await {
+        let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "http accept failed");
@@ -743,6 +803,10 @@ pub async fn serve_http(
         plugin_ctx
             .spawn(async move {
                 let ctx = task_ctx;
+                // 缓冲读器归连接（Go `bufio.NewReaderSize(readerOnly{conn}, buf.Size)`）：
+                // 请求头块读多出来的字节属于请求体 / 下一请求 / CONNECT 隧道，必须随
+                // 同一个读器交给后续阶段（bd y5cy9；`into_link_io` 已处理 peeked 非空）。
+                let mut stream = PeekAhead::new(stream);
                 // Go Process 的 Start 循环：keep-alive 连接逐请求回环读请求头。
                 loop {
                     // 1. handshake（按 userLevel 对应 policy 的 handshake 超时限制，
@@ -1825,7 +1889,12 @@ async fn dokodemo_peer_relay(
     hub: Arc<xray_transport::udp::hub::UdpHub>,
     overridden: bool,
 ) {
-    let mut session = UdpDispatchSession::new(handler);
+    let mut session =
+        UdpDispatchSession::new(handler).with_access(xray_app_dispatcher::AccessContext {
+            from: peer.to_string(),
+            inbound_name: "dokodemo-door".to_string(),
+            ..xray_app_dispatcher::AccessContext::default()
+        });
     #[cfg(target_os = "linux")]
     let mut fake_cache = FakeResponderCache::default();
     #[cfg(not(target_os = "linux"))]
@@ -2377,7 +2446,13 @@ async fn ss_udp_client_relay(
     handler: Arc<dyn DispatchHandler>,
 ) {
     use xray_proxy_ss::protocol::encode_udp_packet_into;
-    let mut session = UdpDispatchSession::new(handler);
+    // bd kol4a：源 + 协议名随 relay 下传（GlobalID 白名单族 "shadowsocks"）。
+    let mut session =
+        UdpDispatchSession::new(handler).with_access(xray_app_dispatcher::AccessContext {
+            from: client.to_string(),
+            inbound_name: "shadowsocks".to_string(),
+            ..xray_app_dispatcher::AccessContext::default()
+        });
     // 回包加密 account：跟随最近请求的用户（Go 按 client NAT entry 记 user）
     let mut account: Option<xray_proxy_ss::config::MemoryAccount> = None;
     // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
@@ -2625,7 +2700,14 @@ async fn ss2022_udp_client_relay(
     mut rx: tokio::sync::mpsc::Receiver<(Destination, Vec<u8>, SocketAddr)>,
     handler: Arc<dyn DispatchHandler>,
 ) {
-    let mut dispatch = UdpDispatchSession::new(handler);
+    // bd kol4a：源 + 协议名随 relay 下传（GlobalID 白名单族 "shadowsocks"）。
+    // client 随每包更新（最新源地址），会话建立取首包源——Go udpNat entry 同语义。
+    let mut dispatch =
+        UdpDispatchSession::new(handler).with_access(xray_app_dispatcher::AccessContext {
+            from: client.to_string(),
+            inbound_name: "shadowsocks".to_string(),
+            ..xray_app_dispatcher::AccessContext::default()
+        });
     // 回包帧编码 scratch（每包复用，AUDIT-PERF-003）
     let mut enc = Vec::with_capacity(2048);
     let mut plain = Vec::with_capacity(2048);
@@ -3352,6 +3434,36 @@ impl ApiUserManager for WgUserManager {
             .into_iter()
             .map(|u| user_proto(&u.email, u.level))
             .collect()
+    }
+}
+
+/// hysteria 用户管理（bd ctiwx）：委托 [`MultiUserValidator`]（与 serve loop 共享
+/// 同一 `Arc`，增删对后续连接立即生效——Go `proxy/hysteria/server.go:62-75`）。
+///
+/// account 载荷沿本文件既有约定：gRPC `AlterInbound` 入口已把 wire 上的
+/// `hysteria.account.Account{auth}` proto 经 `account::normalize_user_account`
+/// 规范成内部 JSON `{"auth": …}`，此处按 JSON 消费。
+struct HysteriaUserManager(Arc<xray_proxy_hysteria::MultiUserValidator>);
+
+impl ApiUserManager for HysteriaUserManager {
+    fn add_user(&self, user: &ProtoUser) -> Result<(), ProxymanError> {
+        let js = account_json(user)?;
+        let auth = account_str(&js, "auth")?;
+        let u =
+            xray_proxy_hysteria::HysteriaUser::new(user.email.clone(), auth).with_level(user.level);
+        self.0.add(&u).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn remove_user(&self, email: &str) -> Result<(), ProxymanError> {
+        self.0.remove(email).map_err(|e| ProxymanError::UserParse(e.to_string()))
+    }
+
+    fn get_user(&self, email: &str) -> Option<ProtoUser> {
+        self.0.list().into_iter().find(|u| u.email == email).map(|u| u.to_proto_user())
+    }
+
+    fn list_users(&self) -> Vec<ProtoUser> {
+        self.0.list().into_iter().map(|u| u.to_proto_user()).collect()
     }
 }
 
@@ -4348,6 +4460,7 @@ pub(crate) fn is_transport_listener_protocol(protocol: &str) -> bool {
             | "http"
             | "kcp"
             | "mkcp"
+            | "quic"
             | "httpupgrade"
             | "splithttp"
             | "xhttp"
@@ -4506,6 +4619,18 @@ pub(crate) fn register_wg_user_manager(
 ) {
     let Some(api) = api else { return };
     api.register_user_manager(tag, Arc::new(WgUserManager(Arc::clone(handler))));
+}
+
+/// hysteria 用户热更登记（bd ctiwx）：仅 `users[]` 多用户形态有用户面（validator
+/// 与 hub serve loop 共享同一 `Arc`）；单 `auth` 形态无用户表，不登记——`api
+/// adu/rmu` 按 `NotUserManager` 明确拒绝（ss2022 单用户同款口径）。
+pub(crate) fn register_hysteria_user_manager(
+    api: Option<&InboundRuntime>,
+    tag: &str,
+    validator: &Arc<xray_proxy_hysteria::MultiUserValidator>,
+) {
+    let Some(api) = api else { return };
+    api.register_user_manager(tag, Arc::new(HysteriaUserManager(Arc::clone(validator))));
 }
 
 /// 按协议种类启动单个 inbound listener。
@@ -5662,6 +5787,7 @@ pub(crate) fn parse_hysteria_inbound_config(
 ) -> std::io::Result<(
     xray_proxy_hysteria::HysteriaConfig,
     Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory>,
+    Vec<xray_proxy_hysteria::HysteriaUser>,
 )> {
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("hysteria inbound settings JSON: {e}")))?;
@@ -5674,6 +5800,35 @@ pub(crate) fn parse_hysteria_inbound_config(
         }
     }
     let auth = v.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    // users[]（Go infra/conf/hysteria.go:33-43 HysteriaUserConfig{auth,level,email}；
+    // `clients` 在 JSON 出现（含空数组）时整体覆盖 users——Go :52-54，与本仓 CLI
+    // `extract_users_from_inbound` 同口径）。
+    let users_src = match v.get("clients").and_then(|x| x.as_array()) {
+        Some(_) => v.get("clients"),
+        None => v.get("users"),
+    };
+    let mut users = Vec::new();
+    if let Some(arr) = users_src.and_then(|x| x.as_array()) {
+        for u in arr {
+            let auth =
+                u.get("auth").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).ok_or_else(
+                    || std::io::Error::other("hysteria users[] entry requires non-empty `auth`"),
+                )?;
+            users.push(xray_proxy_hysteria::HysteriaUser {
+                email: u.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                auth: auth.to_string(),
+                level: u.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            });
+        }
+    }
+    // bd ctiwx：单 auth（本仓既有扩展形态）与 users[]（Go 26.10.17 唯一形态）
+    // **互斥**——两者同时出现属配置歧义，硬错不静默选一。
+    if !auth.is_empty() && !users.is_empty() {
+        return Err(std::io::Error::other(
+            "hysteria: `auth` and `users[]` are mutually exclusive (Go hysteria2 server config \
+             uses users[]; drop `auth` or use users[])",
+        ));
+    }
     let server_name =
         v.get("server_name").and_then(|x| x.as_str()).unwrap_or("hysteria").to_string();
     // 真实 quinn server adapter：自签证书（或配置 cert/key PEM），ALPN h3 由 listen() 设置
@@ -5709,7 +5864,7 @@ pub(crate) fn parse_hysteria_inbound_config(
     let obfs = xray_transport_hysteria::salamander_socket::parse_udp_obfs(finalmask_json)?;
     let factory: Arc<dyn xray_transport_hysteria::hub::HysteriaListenerFactory> =
         Arc::new(QuinnListenerFactory::new(Arc::new(server_config)).with_obfs(obfs));
-    Ok((config, factory))
+    Ok((config, factory, users))
 }
 
 /// 构造 hysteria QUIC server 用的 rustls `ServerConfig`。
@@ -6939,7 +7094,7 @@ mod tests {
 
         // string 类：content/headers/statusCode 全解析
         let data = br#"{"auth":"t","masquerade":{"type":"string","content":"hi","headers":{"X-A":"1"},"statusCode":418}}"#;
-        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        let (config, _factory, _users) = parse_hysteria_inbound_config(data, addr, None).unwrap();
         match config.masq.as_ref().unwrap() {
             MasqType::String { body, headers, status_code } => {
                 assert_eq!(body, "hi");
@@ -6951,7 +7106,7 @@ mod tests {
 
         // file 类
         let data = br#"{"masquerade":{"type":"file","dir":"/var/www"}}"#;
-        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        let (config, _factory, _users) = parse_hysteria_inbound_config(data, addr, None).unwrap();
         assert_eq!(config.masq.as_ref().unwrap(), &MasqType::File("/var/www".into()));
 
         // 未知类型 → parse 错误（Go hub.go:252-253 "unknown masq type"）
@@ -6960,7 +7115,7 @@ mod tests {
 
         // 无 masquerade → None（零行为变化）
         let data = br#"{"auth":"t"}"#;
-        let (config, _factory) = parse_hysteria_inbound_config(data, addr, None).unwrap();
+        let (config, _factory, _users) = parse_hysteria_inbound_config(data, addr, None).unwrap();
         assert!(config.masq.is_none());
     }
 
@@ -13097,5 +13252,423 @@ mod tests {
         rt.remove_inbound("aa-order").expect("cleanup");
         rt.remove_inbound("zz-order").expect("cleanup");
         assert!(rt.list().is_empty());
+    }
+}
+
+/// bd 9c8k6 ④：`register_user_manager` 不得复活已删 tag。
+///
+/// 旧实现是 remove+insert（把 slot 摘掉再插回）：与 `RemoveInbound` 交错时会把
+/// **已删**的 tag 重新插回注册表 ⇒ 入站"复活"（listener 已停，槽位却回到表内：
+/// `ListInbounds` 仍列得出、`RemoveInbound` 再删一次报 HandlerNotFound）。
+///
+/// 修后就地 `get_mut` 写 `users`（查与写同一把写锁内）：tag 已被摘除 ⇒ 登记
+/// 被丢弃；tag 还在 ⇒ 用户管理器就地挂上。
+#[cfg(test)]
+mod user_manager_resurrection {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// 最小 `ApiUserManager` 替身（只用于登记路径，不参与业务断言）。
+    struct StubUserManager;
+
+    impl ApiUserManager for StubUserManager {
+        fn add_user(&self, _user: &ProtoUser) -> Result<(), ProxymanError> {
+            Ok(())
+        }
+
+        fn remove_user(&self, _email: &str) -> Result<(), ProxymanError> {
+            Ok(())
+        }
+
+        fn get_user(&self, _email: &str) -> Option<ProtoUser> {
+            None
+        }
+
+        fn list_users(&self) -> Vec<ProtoUser> {
+            Vec::new()
+        }
+    }
+
+    fn runtime() -> InboundRuntime {
+        InboundRuntime::new(
+            Arc::new(SimpleOhm::new()),
+            None,
+            CancellationToken::new(),
+            Arc::new(xray_frame::ArmScopeRegistry::new()),
+        )
+    }
+
+    /// 最小可登记的 inbound（blackhole + 端口 0）。
+    fn inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            entry: xray_conf::BuiltEntry { kind: "blackhole".into(), data: b"{}".to_vec() },
+            tag: tag.to_string(),
+            port: Some(0),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    /// 确定性用例：**先删后登记** ⇒ 已删 tag 不得复活。
+    ///
+    /// 旧实现（remove+insert）在此必红：登记把已摘掉的 slot 插回注册表。
+    #[tokio::test]
+    async fn register_user_manager_after_remove_does_not_resurrect_tag() {
+        let rt = runtime();
+        let tag = "t-resurrect";
+        rt.start_inbound(&inbound(tag)).await.expect("blackhole inbound registers");
+        assert!(rt.contains(tag));
+
+        rt.remove_inbound(tag).expect("remove must succeed");
+        assert!(!rt.contains(tag), "删除后表内不应再有该 tag");
+
+        // 删除之后到达的用户管理器登记（协议侧 accept 循环里的晚到登记）。
+        rt.register_user_manager(tag, Arc::new(StubUserManager));
+
+        assert!(!rt.contains(tag), "已删 tag 不得被登记复活");
+        assert!(rt.list().is_empty(), "注册表必须仍为空（无孤儿 slot）");
+        assert!(
+            matches!(rt.remove_inbound(tag), Err(ProxymanError::HandlerNotFound(_))),
+            "复活的话第二次删除会成功——这里必须报 HandlerNotFound"
+        );
+        assert!(
+            matches!(rt.user_manager(tag), Err(ProxymanError::HandlerNotFound(_))),
+            "已删 tag 不得还能取到用户管理器"
+        );
+    }
+
+    /// 确定性用例：**先登记后删** ⇒ 用户管理器挂上后随入站一起消失。
+    #[tokio::test]
+    async fn register_user_manager_before_remove_is_dropped_with_inbound() {
+        let rt = runtime();
+        let tag = "t-register-then-remove";
+        rt.start_inbound(&inbound(tag)).await.expect("blackhole inbound registers");
+        rt.register_user_manager(tag, Arc::new(StubUserManager));
+        assert!(rt.user_manager(tag).is_ok(), "在册入站应能取到用户管理器");
+
+        rt.remove_inbound(tag).expect("remove must succeed");
+        assert!(!rt.contains(tag));
+        assert!(rt.list().is_empty(), "注册表必须清空");
+        assert!(matches!(rt.user_manager(tag), Err(ProxymanError::HandlerNotFound(_))));
+    }
+
+    /// 并发用例：`register_user_manager` ∥ `RemoveInbound` 同 tag ⇒ 终态恒为
+    /// 「已删」（不得复活）。两条路径都拿同一把写锁，故**结果与交错顺序无关**：
+    /// 登记先落 ⇒ 随删除一起消失；删除先落 ⇒ 登记被丢弃。
+    #[tokio::test]
+    async fn register_user_manager_parallel_remove_never_resurrects() {
+        for round in 0..64 {
+            let rt = Arc::new(runtime());
+            let tag = format!("t-parallel-{round}");
+            rt.start_inbound(&inbound(&tag)).await.expect("blackhole inbound registers");
+
+            let registrar = {
+                let rt = Arc::clone(&rt);
+                let tag = tag.clone();
+                std::thread::spawn(move || {
+                    rt.register_user_manager(&tag, Arc::new(StubUserManager));
+                })
+            };
+            let remover = {
+                let rt = Arc::clone(&rt);
+                let tag = tag.clone();
+                std::thread::spawn(move || {
+                    rt.remove_inbound(&tag).expect("remove must succeed");
+                })
+            };
+            registrar.join().expect("registrar join");
+            remover.join().expect("remover join");
+
+            assert!(!rt.contains(&tag), "round {round}: 已删 tag 不得复活");
+            assert!(rt.list().is_empty(), "round {round}: 注册表必须为空");
+        }
+    }
+}
+
+/// bd hl8q6：配置期起的入站必须注册用户管理器（否则 `api adu/rmu` 恒
+/// `proxy is not a UserManager`——Go 八协议全支持，Rust 侧主用协议一度只有
+/// legacy ss 有入口）。
+///
+/// 本模块锁定两件事：
+/// 1. **注册面**：arm builder 起了 vless 入站 ⇒ `InboundRuntime` 的该 tag 必须能 取到用户管理器（把
+///    `register_vless_user_manager` 调用摘掉 ⇒ 本用例红）；
+/// 2. **立即生效面**：经 gRPC 入口的同一套规范化（proto Account → 内部 JSON）
+///    加进去的用户，**立刻**出现在与 serve loop 共享的 validator 里（不是
+///    「下次重载才生效」）；移除后立刻查不到。
+#[cfg(test)]
+mod user_manager_wiring {
+    use std::sync::Arc;
+
+    use prost::Message as _;
+    use xray_proto::xray::common::serial::TypedMessage;
+
+    use super::*;
+
+    /// vless 入站配置（一个 seed 用户）。
+    fn vless_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            entry: xray_conf::BuiltEntry {
+                kind: "vless".into(),
+                data: serde_json::to_vec(&serde_json::json!({
+                    "decryption": "none",
+                    "clients": [{
+                        "id": "27848739-7e62-4138-9fd3-098a63964b6b",
+                        "email": "seed@um.test",
+                        "level": 0
+                    }]
+                }))
+                .expect("settings serialize"),
+            },
+            tag: tag.to_string(),
+            port: Some(0),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    fn runtime() -> Arc<InboundRuntime> {
+        Arc::new(InboundRuntime::new(
+            Arc::new(SimpleOhm::new()),
+            None,
+            CancellationToken::new(),
+            Arc::new(xray_frame::ArmScopeRegistry::new()),
+        ))
+    }
+
+    /// 走 gRPC 入口同一条规范化路径构造用户（proto Account → 内部 JSON 契约）。
+    fn hot_user(email: &str, id: &str) -> ProtoUser {
+        let settings = serde_json::json!({});
+        let entry = serde_json::json!({"id": id, "email": email, "level": 0});
+        let account =
+            crate::account::account_typed_message_from_config_json("vless", &settings, &entry)
+                .expect("encode account");
+        let mut user = ProtoUser { level: 0, email: email.to_string(), account: Some(account) };
+        crate::account::normalize_user_account(&mut user).expect("normalize account");
+        user
+    }
+
+    /// 配置期起的 vless 入站 ⇒ 用户管理器已注册（摘掉注册调用即红）。
+    #[tokio::test]
+    async fn config_time_vless_inbound_registers_user_manager() {
+        let rt = runtime();
+        let tag = "t-vless-um";
+        rt.start_inbound(&vless_inbound(tag)).await.expect("vless inbound starts");
+        assert!(
+            rt.user_manager(tag).is_ok(),
+            "vless 入站必须注册用户管理器（否则 api adu/rmu 恒 NotUserManager）"
+        );
+    }
+
+    /// 各协议入站（配置期起）都必须注册用户管理器——Go 八协议全支持，Rust 侧
+    /// 缺一个就是「该协议不能热更用户」。本表覆盖当前**已注册**的四个协议；
+    /// hysteria（bd ctiwx，users[] 形态需出站表 default handler）由下方专属用例
+    /// 覆盖；masque 另说（仓内无该 crate）。
+    #[tokio::test]
+    async fn config_time_all_supported_protocols_register_user_manager() {
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "vless",
+                serde_json::json!({
+                    "decryption": "none",
+                    "clients": [{"id": "27848739-7e62-4138-9fd3-098a63964b6b", "email": "seed@um.test"}]
+                }),
+            ),
+            (
+                "vmess",
+                serde_json::json!({
+                    "clients": [{"id": "27848739-7e62-4138-9fd3-098a63964b6b", "alterId": 0, "email": "seed@um.test"}]
+                }),
+            ),
+            (
+                "trojan",
+                serde_json::json!({"clients": [{"password": "pw-um", "email": "seed@um.test"}]}),
+            ),
+            (
+                "shadowsocks",
+                serde_json::json!({"method": "aes-256-gcm", "password": "pw-um", "email": "seed@um.test"}),
+            ),
+        ];
+        for (kind, settings) in cases {
+            let rt = runtime();
+            let tag = format!("t-um-{kind}");
+            let ib = BuiltInbound {
+                entry: xray_conf::BuiltEntry {
+                    kind: kind.into(),
+                    data: serde_json::to_vec(&settings).expect("settings serialize"),
+                },
+                tag: tag.clone(),
+                port: Some(0),
+                listen: Some("127.0.0.1".to_string()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            };
+            rt.start_inbound(&ib).await.expect("inbound starts");
+            assert!(
+                rt.user_manager(&tag).is_ok(),
+                "{kind} 入站必须注册用户管理器（否则 api adu/rmu 恒 NotUserManager）"
+            );
+        }
+    }
+
+    /// 加/删用户**立刻**生效（用户进出现于与 serve loop 共享的 validator）。
+    #[tokio::test]
+    async fn vless_user_manager_add_remove_takes_effect_immediately() {
+        let rt = runtime();
+        let tag = "t-vless-um-effect";
+        rt.start_inbound(&vless_inbound(tag)).await.expect("vless inbound starts");
+        let um = rt.user_manager(tag).expect("user manager registered");
+
+        let hot = hot_user("hot@um.test", "e641f5ad-9397-41e3-bf1a-e8740dfed019");
+        um.add_user(&hot).expect("add user");
+        let got = um.get_user("hot@um.test").expect("hot user must be visible right away");
+        assert_eq!(got.email, "hot@um.test");
+        assert_eq!(um.list_users().len(), 2, "seed + hot 两名用户");
+
+        um.remove_user("hot@um.test").expect("remove user");
+        assert!(um.get_user("hot@um.test").is_none(), "移除后必须立刻查不到（对后续连接立即生效）");
+        assert_eq!(um.list_users().len(), 1);
+    }
+
+    /// 载荷形状守卫：进用户管理器的 account 必须是内部 JSON 契约（gRPC 入口的
+    /// 规范化产物）；直接塞 proto 字节会被拒（不静默当 JSON 解析）。
+    #[tokio::test]
+    async fn user_manager_rejects_raw_proto_account_payload() {
+        let rt = runtime();
+        let tag = "t-vless-um-shape";
+        rt.start_inbound(&vless_inbound(tag)).await.expect("vless inbound starts");
+        let um = rt.user_manager(tag).expect("user manager registered");
+
+        // 未规范化的 proto Account（gRPC 入口会先规范化；此处直接喂 ⇒ 必须失败）
+        let raw = TypedMessage {
+            r#type: crate::account::TYPE_VLESS.to_string(),
+            value: xray_proto::xray::proxy::vless::Account {
+                id: "e641f5ad-9397-41e3-bf1a-e8740dfed019".into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        };
+        let user = ProtoUser { level: 0, email: "raw@um.test".into(), account: Some(raw) };
+        let err = um.add_user(&user).expect_err("raw proto payload must be rejected");
+        assert!(err.to_string().contains("not JSON"), "错误应点名载荷形状，实得: {err}");
+    }
+
+    // ==================== hysteria（bd ctiwx）====================
+
+    #[derive(Debug)]
+    struct NopDispatch;
+    impl xray_app_dispatcher::DispatchHandler for NopDispatch {
+        fn tag(&self) -> &str {
+            "nop"
+        }
+
+        fn dispatch(
+            &self,
+            _dest: &Destination,
+            _link: xray_transport::link::Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// hysteria 臂要求出站表有 default handler（TCP/UDP relay 都经 dispatcher），
+    /// 测试 runtime 补一个 no-op。
+    fn hysteria_runtime() -> Arc<InboundRuntime> {
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(NopDispatch) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        Arc::new(InboundRuntime::new(
+            ohm,
+            None,
+            CancellationToken::new(),
+            Arc::new(xray_frame::ArmScopeRegistry::new()),
+        ))
+    }
+
+    fn hysteria_users_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            entry: xray_conf::BuiltEntry {
+                kind: "hysteria".into(),
+                data: serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "users": [{"auth": "seed-token", "email": "seed@um.test", "level": 0}]
+                }))
+                .expect("settings serialize"),
+            },
+            tag: tag.to_string(),
+            port: Some(0),
+            listen: Some("127.0.0.1".to_string()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    /// 走 gRPC 入口同一条规范化路径构造 hysteria 用户（proto Account → 内部 JSON）。
+    fn hysteria_hot_user(email: &str, auth: &str) -> ProtoUser {
+        let settings = serde_json::json!({});
+        let entry = serde_json::json!({"auth": auth, "email": email, "level": 3});
+        let account =
+            crate::account::account_typed_message_from_config_json("hysteria", &settings, &entry)
+                .expect("encode account");
+        let mut user = ProtoUser { level: 3, email: email.to_string(), account: Some(account) };
+        crate::account::normalize_user_account(&mut user).expect("normalize account");
+        user
+    }
+
+    /// 配置期起的 hysteria users[] 入站 ⇒ 用户管理器已注册（摘掉
+    /// `register_hysteria_user_manager` 调用即红）；adu/rmu 立即生效。
+    #[tokio::test]
+    async fn config_time_hysteria_users_inbound_registers_and_hot_updates() {
+        let rt = hysteria_runtime();
+        let tag = "t-hyst-um";
+        rt.start_inbound(&hysteria_users_inbound(tag)).await.expect("hysteria inbound starts");
+        let um = rt.user_manager(tag).expect("users[] 入站必须注册用户管理器");
+        assert_eq!(um.list_users().len(), 1, "seed user present");
+
+        // adu（gRPC 同一规范化路径）：加入 → 立刻可见（level 回程）。
+        um.add_user(&hysteria_hot_user("hot@um.test", "hot-token")).expect("add user");
+        let got = um.get_user("hot@um.test").expect("hot user listed");
+        assert_eq!(got.level, 3, "level must round-trip through list_users");
+
+        // rmu：移除 → 立刻查不到；重复移除 → 显式错（不是静默成功）。
+        um.remove_user("hot@um.test").expect("remove user");
+        assert!(um.get_user("hot@um.test").is_none());
+        assert!(um.remove_user("hot@um.test").is_err(), "double remove must be an error");
+    }
+
+    /// 单 auth 形态：无用户表 ⇒ `api adu/rmu` 显式 `NotUserManager`
+    /// （Go 该形态不存在——users[] 是唯一形态，单 auth 是本仓扩展，无用户面）。
+    #[tokio::test]
+    async fn config_time_hysteria_single_auth_has_no_user_manager() {
+        let rt = hysteria_runtime();
+        let tag = "t-hyst-single";
+        let mut ib = hysteria_users_inbound(tag);
+        ib.entry.data = serde_json::to_vec(&serde_json::json!({
+            "version": 2, "auth": "single-token"
+        }))
+        .expect("settings serialize");
+        rt.start_inbound(&ib).await.expect("hysteria inbound starts");
+        match rt.user_manager(tag) {
+            Err(ProxymanError::NotUserManager) => (),
+            Err(e) => panic!("expected NotUserManager, got: {e}"),
+            Ok(_) => panic!("single-auth must NOT be a UserManager"),
+        }
+    }
+
+    /// `auth` 与 `users[]` 同时配置 ⇒ 配置期硬错（互斥，不静默选一）。
+    #[tokio::test]
+    async fn config_time_hysteria_auth_and_users_are_mutually_exclusive() {
+        let rt = hysteria_runtime();
+        let tag = "t-hyst-both";
+        let mut ib = hysteria_users_inbound(tag);
+        ib.entry.data = serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "auth": "single-token",
+            "users": [{"auth": "t", "email": "u@x"}]
+        }))
+        .expect("settings serialize");
+        let err = rt.start_inbound(&ib).await.expect_err("must be a hard error");
+        assert!(err.to_string().contains("mutually exclusive"), "got {err}");
     }
 }

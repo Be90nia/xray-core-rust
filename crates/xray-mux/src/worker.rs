@@ -8,7 +8,7 @@ use std::sync::{
 };
 
 use tokio::{sync::watch, time::Duration};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use xray_buf::{
     buffer::Buffer,
     io::{Reader, Writer},
@@ -364,6 +364,10 @@ impl ServerWorker {
                             .xudp_hit_rebind(&old_session, meta, data.bytes(), &mut ex, link_writer)
                             .await
                         {
+                            // Go server.go:227 `errors.LogInfoInner(ctx, err, "XUDP hit ",
+                            // meta.GlobalID)`——cone 复用可观测点（同源第二条 mux
+                            // session 同 GlobalID 命中即打点，供互通探针断言）。
+                            info!("XUDP hit {:?}", global_id);
                             return Ok(());
                         }
                     }

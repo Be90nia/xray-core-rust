@@ -178,13 +178,6 @@ async fn serve_loop(
     }
 }
 
-// nn8os reaudit 台账（补登，713x6 判定：tokio 一律不迁）：连接级握手 deadline 预算走
-// tokio timer 域——tokio::time::Instant 与 tokio timeout 同钟族，与 std Clock 面禁混换；
-// 数据面热路径不迁（同 tuic udp_assoc_direct 台账形态）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "tokio 虚拟钟预算面（数据面热路径）：握手 deadline 与 timeout 同钟族，713x6 判定 tokio 一律不迁（Budget timer-arm 迁移跟踪 bd 23vrp）"
-)]
 async fn handle_conn(
     tcp: TcpStream,
     tls_acceptor: TlsAcceptor,
@@ -231,9 +224,11 @@ async fn handle_conn(
     .expect("internal FxScope is never closed");
     // 握手/首包绝对 deadline：对端 accept 后不发数据（或 TLS 后不发认证帧）时，
     // 到期关闭连接，防止静默连接永久占住任务与 fd（bd v57c）。
-    let handshake_deadline = tokio::time::Instant::now() + handshake_timeout();
+    // 握手 deadline 预算（bd 23vrp）：Budget 统一入口——绝对时刻（tokio Instant）
+    // 不再出现在本文件，虚拟推进语义由 BudgetDeadline::timeout 保留。
+    let handshake_deadline = xray_frame::deadline::Budget::tokio().deadline(handshake_timeout());
     let mut tls: TlsStream<TcpStream> =
-        match tokio::time::timeout_at(handshake_deadline, tls_acceptor.accept(tcp)).await {
+        match handshake_deadline.timeout(tls_acceptor.accept(tcp)).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
                 SERVER_LOG.debug(format!("anytls mock server TLS accept failed: {e}"));
@@ -253,9 +248,8 @@ async fn handle_conn(
     // expected 为 None 时不校验密码，但仍必须按帧格式读掉，
     // 否则 auth 字节会被 session loop 误解析为 session frame。
     let mut auth_head = [0u8; 34];
-    if let Err(e) = tokio::time::timeout_at(handshake_deadline, tls.read_exact(&mut auth_head))
-        .await
-        .unwrap_or_else(|_| {
+    if let Err(e) =
+        handshake_deadline.timeout(tls.read_exact(&mut auth_head)).await.unwrap_or_else(|_| {
             Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls auth head timeout"))
         })
     {
@@ -281,9 +275,8 @@ async fn handle_conn(
     }
     if padding0_len > 0 {
         let mut pad0 = vec![0u8; padding0_len];
-        if let Err(e) = tokio::time::timeout_at(handshake_deadline, tls.read_exact(&mut pad0))
-            .await
-            .unwrap_or_else(|_| {
+        if let Err(e) =
+            handshake_deadline.timeout(tls.read_exact(&mut pad0)).await.unwrap_or_else(|_| {
                 Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "anytls padding0 timeout"))
             })
         {
@@ -297,6 +290,9 @@ async fn handle_conn(
     let kill_tx_cell = parking_lot::Mutex::new(Some(kill_tx));
     // 闭包用独立克隆：fx 本体留给下方 session_run spawn（E0382）
     let fx_session = Arc::clone(&fx);
+    // 预算 deadline 非 Copy（Instant 时代靠 Copy 随 move 闭包复制）：Fn 闭包每次
+    // 调用要给 handle_session 一份独立 BudgetDeadline → 捕获私有克隆、调用内再克隆。
+    let handshake_deadline_for_session = handshake_deadline.clone();
     let on_new_session: Box<dyn Fn(Arc<Session>) + Send + Sync> = Box::new(move |session| {
         let dispatch = dispatch.clone();
         let kill_tx = kill_tx_cell.lock().take();
@@ -308,16 +304,24 @@ async fn handle_conn(
             &fx,
             &SERVER_LOG,
             "anytls session",
-            handle_session(fx_task, session, dispatch, kill_tx, handshake_deadline),
+            handle_session(
+                fx_task,
+                session,
+                dispatch,
+                kill_tx,
+                handshake_deadline_for_session.clone(),
+            ),
         )
         .expect("internal FxScope is never closed");
     });
     let session = Arc::new(
-        match tokio::time::timeout_at(
-            handshake_deadline,
-            new_server_session(Box::new(tls) as Box<dyn AsyncReadWrite>, on_new_session, padding),
-        )
-        .await
+        match handshake_deadline
+            .timeout(new_server_session(
+                Box::new(tls) as Box<dyn AsyncReadWrite>,
+                on_new_session,
+                padding,
+            ))
+            .await
         {
             Ok(s) => s,
             Err(_) => {
@@ -330,7 +334,8 @@ async fn handle_conn(
             },
         },
     );
-    if let Err(e) = tokio::time::timeout_at(handshake_deadline, session.ensure_started())
+    if let Err(e) = handshake_deadline
+        .timeout(session.ensure_started())
         .await
         .unwrap_or_else(|_| Err(std::io::Error::other("anytls ensure_started timeout")))
     {
@@ -355,11 +360,11 @@ async fn handle_session(
     session: Arc<Session>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    first_packet_deadline: tokio::time::Instant,
+    first_packet_deadline: xray_frame::deadline::BudgetDeadline,
 ) {
     // 1. 读 SOCKS5 target（首帧 application data）
     let mut buf = vec![0u8; 1024];
-    let n = match tokio::time::timeout_at(first_packet_deadline, session.read(&mut buf)).await {
+    let n = match first_packet_deadline.timeout(session.read(&mut buf)).await {
         Ok(Ok(n)) => n,
         Ok(Err(e)) => {
             SERVER_LOG.debug(format!("anytls mock server: read socks5 target failed: {e}"));

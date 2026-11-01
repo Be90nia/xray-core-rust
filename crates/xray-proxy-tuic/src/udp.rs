@@ -58,18 +58,27 @@ pub struct TuicUdpAssoc {
 /// quic 模式（uni-stream）响应路由器。
 ///
 /// SPEC：客户端每包 open_uni 发 Packet；server 每个响应**新开一条** uni stream
-/// 回包。本 router spawn 单个 pump task 全局 `accept_uni`，按帧内
-/// `(assoc_id, pkt_id)` 把响应配对给等待中的请求。
+/// 回包。本 router spawn 单个 pump task 全局 `accept_uni`，按帧内 `assoc_id`
+/// 把响应交给该 UDP 会话当前等待中的请求。
 ///
-/// ponytail: 一张 (assoc,pkt)→oneshot 表够用——TUIC quic 模式响应无分片
-/// （stream 可靠有序，frag_total 恒 1），无需重组器。
+/// **配对键 = `assoc_id`（UDP 会话），不是 `(assoc_id, pkt_id)`**
+/// （bd j7de2 F3）：TUIC v5 spec 定义 `PKT_ID` 为「UDP 包 ID」，用途是**分片
+/// 重组**（同一 UDP 包的多片共享 PKT_ID），**不是**请求-响应配对键——server
+/// 回包用自己的 PKT_ID 编号（第三方实现不 echo 请求的 PKT_ID）。修前按
+/// `(assoc,pkt)` 严格配对 → 第三方对端的回包全部落空（`unmatched udp resp`）
+/// → 请求超时。同 assoc 内按到达顺序 FIFO 交付（UDP 语义本就是尽力而为）。
+///
+/// ponytail: quic 模式响应无分片（stream 可靠有序，frag_total 恒 1），无需重组器。
 #[derive(Clone)]
 pub(crate) struct UniRespRouter {
     waiters: Waiters,
 }
 
-/// (assoc, pkt) → oneshot 应答表共享句柄。
-type Waiters = Arc<parking_lot::Mutex<HashMap<(u16, u16), tokio::sync::oneshot::Sender<Packet>>>>;
+/// assoc_id → 等待者 FIFO 队列（每项 = 一个待应答槽；`None` = 已超时废弃）。
+type WaiterSlot = Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Packet>>>>;
+
+/// assoc_id → 等待者队列共享句柄。
+type Waiters = Arc<parking_lot::Mutex<HashMap<u16, std::collections::VecDeque<WaiterSlot>>>>;
 
 impl UniRespRouter {
     /// 在连接建立后调用：spawn per-connection 响应 pump（连接关闭自动退出）。
@@ -92,17 +101,32 @@ impl UniRespRouter {
                 };
                 match read_response_packet(&mut uni).await {
                     Ok(pkt) => {
-                        let waiter = w.lock().remove(&(pkt.assoc_id, pkt.pkt_id));
-                        match waiter {
-                            Some(tx) => {
-                                let _ = tx.send(pkt);
-                            },
-                            None => {
-                                log.debug(format!(
-                                    "tuic: unmatched udp resp assoc={} pkt={}",
-                                    pkt.assoc_id, pkt.pkt_id
-                                ));
-                            },
+                        let mut w = w.lock();
+                        let Some(queue) = w.get_mut(&pkt.assoc_id) else {
+                            log.debug(format!(
+                                "tuic: unmatched udp resp assoc={} pkt={}",
+                                pkt.assoc_id, pkt.pkt_id
+                            ));
+                            continue;
+                        };
+                        // FIFO 交付：跳过已超时（槽空）或已断开（send 失败）的等待者
+                        let mut delivered = false;
+                        while let Some(slot) = queue.pop_front() {
+                            let tx = slot.lock().take();
+                            let Some(tx) = tx else { continue };
+                            if tx.send(pkt.clone()).is_ok() {
+                                delivered = true;
+                                break;
+                            }
+                        }
+                        if queue.is_empty() {
+                            w.remove(&pkt.assoc_id);
+                        }
+                        if !delivered {
+                            log.debug(format!(
+                                "tuic: udp resp assoc={} pkt={} had no live waiter",
+                                pkt.assoc_id, pkt.pkt_id
+                            ));
                         }
                     },
                     Err(e) => log.debug(format!("tuic: uni resp stream parse: {e:?}")),
@@ -112,7 +136,7 @@ impl UniRespRouter {
         Self { waiters }
     }
 
-    /// open_uni 发送 Packet 并等待 `(assoc_id, pkt_id)` 匹配的响应。
+    /// open_uni 发送 Packet 并等待该 `assoc_id` 会话的下一个响应。
     async fn send_and_wait(
         &self,
         conn: &quinn::Connection,
@@ -120,9 +144,8 @@ impl UniRespRouter {
         timeout: Duration,
     ) -> Result<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters.lock().insert((pkt.assoc_id, pkt.pkt_id), tx);
-        let waiters = Arc::clone(&self.waiters);
-        let key = (pkt.assoc_id, pkt.pkt_id);
+        let slot: WaiterSlot = Arc::new(parking_lot::Mutex::new(Some(tx)));
+        self.waiters.lock().entry(pkt.assoc_id).or_default().push_back(Arc::clone(&slot));
         let recv = async {
             let mut uni = conn.open_uni().await?;
             uni.write_all(Self::encode_frame(pkt)?.as_ref()).await?;
@@ -134,7 +157,8 @@ impl UniRespRouter {
             Ok(Ok(resp)) => Ok(resp.data.into()),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                waiters.lock().remove(&key);
+                // 超时：清空本槽（sender drop → 后续响应跳过本槽，不会错投）
+                *slot.lock() = None;
                 Err(TuicError::UdpTimeout(timeout))
             },
         }
@@ -145,12 +169,21 @@ impl UniRespRouter {
     /// # Errors
     /// 透传 [`Packet::write_payload`]（`data.len()` 超 u16 上限 → `PacketTooLarge`）。
     fn encode_frame(pkt: &Packet) -> Result<BytesMut> {
-        let mut buf = BytesMut::with_capacity(pkt.encoded_len() + 2);
-        buf.put_u8(VERSION);
-        buf.put_u8(type_code::PACKET);
-        pkt.write_payload(&mut buf)?;
-        Ok(buf)
+        encode_packet_frame(pkt)
     }
+}
+
+/// 将 Packet 帧序列化为 wire 格式（VER + TYPE + payload）——client/server 共用
+/// （server 响应侧分片后逐片编码，线格式单一来源）。
+///
+/// # Errors
+/// 透传 [`Packet::write_payload`]（`data.len()` 超 u16 上限 → `PacketTooLarge`）。
+pub(crate) fn encode_packet_frame(pkt: &Packet) -> Result<BytesMut> {
+    let mut buf = BytesMut::with_capacity(pkt.encoded_len() + 2);
+    buf.put_u8(VERSION);
+    buf.put_u8(type_code::PACKET);
+    pkt.write_payload(&mut buf)?;
+    Ok(buf)
 }
 
 impl TuicUdpAssoc {
@@ -273,12 +306,15 @@ impl TuicUdpAssoc {
     }
 }
 
-/// 按 native datagram 容量切分 Packet 帧（纯函数，可单测）。
+/// 按 native datagram 容量切分 Packet 帧（纯函数，可单测；server 响应侧复用）。
 ///
 /// spec（TUIC v5）：单包直接 FRAG_TOTAL=1；超长切 FRAG_TOTAL 片，同 pkt_id、
 /// FRAG_ID 0-based，**仅首片携带目标 Address**，后续片 addr=None（wire 编码
 /// `0xff`）——接收方按首片地址路由。分片为 `Bytes::slice` 零拷贝视图。
-fn build_native_fragments(
+///
+/// 总负载上界 = [`MAX_UDP_PAYLOAD`]（UDP 数据报物理上限）；每片长度仍受
+/// `frag_payload`（单 datagram 容量）约束。
+pub(crate) fn build_native_fragments(
     assoc_id: u16,
     pkt_id: u16,
     target: &Address,
@@ -288,7 +324,7 @@ fn build_native_fragments(
     if data.len() <= frag_payload {
         return Ok(vec![Packet::new(assoc_id, pkt_id, target.clone(), data)]);
     }
-    if data.len() > MAX_PACKET_PAYLOAD {
+    if data.len() > crate::protocol::packet::MAX_UDP_PAYLOAD {
         return Err(TuicError::PacketTooLarge(data.len()));
     }
     let frag_total = data.len().div_ceil(frag_payload);
@@ -348,11 +384,9 @@ pub(crate) async fn read_packet_payload(recv: &mut quinn::RecvStream) -> Result<
     let mut atyp_b = [0u8; 1];
     recv.read_exact(&mut atyp_b).await.map_err(quinn_read_exact_err)?;
     let addr = match atyp_b[0] {
-        0xff => {
-            let mut port = [0u8; 2];
-            recv.read_exact(&mut port).await.map_err(quinn_read_exact_err)?;
-            Address::None
-        },
+        // None 地址只有 1 字节（0xff）：spec「端口在域名/IP 之后」——无域名/IP
+        // 即无端口（参考实现 tuic 5.0.0-pre-alpha6 / 第三方 sing-box 同款）。
+        0xff => Address::None,
         0x00 => {
             let mut len_b = [0u8; 1];
             recv.read_exact(&mut len_b).await.map_err(quinn_read_exact_err)?;
@@ -439,5 +473,47 @@ mod tests {
         assert_eq!(frags[0].frag_id, 0);
         assert_eq!(frags[0].addr, target);
         assert_eq!(&frags[0].data[..], b"hello");
+    }
+
+    /// bd j7de2 F4 边界：单 datagram 容量 ±1 处的分片形态（阈值内 1 片、
+    /// 阈值+1 切 2 片），且分片可被对端重组器还原为原载荷。
+    #[test]
+    fn native_fragment_threshold_boundary() {
+        let target = Address::Ipv4(Ipv4Addr::new(192, 0, 2, 9), 53);
+        let cap = 64usize;
+
+        // 阈值 -1：单片
+        let one = build_native_fragments(1, 1, &target, Bytes::from(vec![1u8; cap - 1]), cap)
+            .expect("fragments");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].frag_total, 1);
+
+        // 阈值：单片（≤ 判定）
+        let at = build_native_fragments(1, 2, &target, Bytes::from(vec![2u8; cap]), cap)
+            .expect("fragments");
+        assert_eq!(at.len(), 1);
+        assert_eq!(at[0].frag_total, 1);
+
+        // 阈值 +1：切 2 片
+        let two = build_native_fragments(1, 3, &target, Bytes::from(vec![3u8; cap + 1]), cap)
+            .expect("fragments");
+        assert_eq!(two.len(), 2);
+        assert_eq!(two[0].frag_total, 2);
+        assert_eq!(two[0].frag_id, 0);
+        assert_eq!(two[1].frag_id, 1);
+        // 后续片不带地址（spec：0xff None，仅 1 字节）
+        assert_eq!(two[1].addr, Address::None);
+        assert_eq!(two[1].addr.encoded_len(), 1);
+
+        // 对端重组器还原（spec：按 frag_id 升序拼接）
+        let mut asm = crate::protocol::packet::FragmentAssembler::new();
+        let mut complete = None;
+        for frag in two {
+            complete = asm.feed(frag).expect("assemble");
+        }
+        let done = complete.expect("两片到齐必须产出完整包");
+        assert_eq!(done.data.len(), cap + 1);
+        assert!(done.data.iter().all(|b| *b == 3));
+        assert_eq!(done.addr, target);
     }
 }

@@ -54,6 +54,8 @@
 mod arm_builders;
 // W1-1a：生产装配主路的构造器注册表（xray-frame PluginRegistry 承载 arm 构造器）。
 pub(crate) mod arm_registry;
+// bd c89uy：协议账号载荷编解码（Go 线格式 proto Account ↔ 内部 JSON 契约）。
+pub mod account;
 pub mod config;
 pub mod context;
 // W1-1b：Instance::start 启动编排桥（feature 门 `shutdown-coordinator`，默认开；

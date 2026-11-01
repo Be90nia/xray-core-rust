@@ -12,7 +12,7 @@
 //! | `accept_proxy_protocol` | 服务端是否接受 PROXY protocol |
 //! | `ed` | Early Data 长度（0-RTT） |
 //! | `heartbeat_period` | 心跳 ping 周期（秒），0=不启用 |
-//! | `pool_size` | 客户端 outbound 池空闲连接上限（0=关池）；默认 12 对齐 Chrome 6/host × 多 host burst |
+//! | `pool_size` | 客户端 outbound 预连接池空闲上限（0=关池）；**默认 0 = 与 Go 26.10.17 对齐（Go 无池）**，显式 >0 才启用 |
 
 use std::collections::HashMap;
 
@@ -33,18 +33,22 @@ pub struct Config {
     pub ed: u32,
     /// 心跳 ping 周期（秒）。0 表示不发送 ping。对应 Go `heartbeatPeriod`。
     pub heartbeat_period: u32,
-    /// 客户端 outbound 连接池空闲上限。
-    /// `0` = 关闭池化（向后兼容）；`>0` = 每 (host, port, path) 最多保留
-    /// `pool_size` 条空闲连接。Bug-A 真实赢家：跨 outbound 共享 ws 空闲连接，
-    /// -500ms/页（6/host 并发）。对齐 Go 无此机制（独立创新）。
+    /// 客户端 outbound 预连接池空闲上限（Rust 独有能力，Go 无对应机制）。
+    ///
+    /// `0`（默认）= 不预连接——**与 Go 26.10.17 行为一致**：每次 Dial 现拨一条，
+    /// 服务端只看到真实会话连接。`>0` = 每 (host, port, path, sni, fingerprint)
+    /// 最多保留 `pool_size` 条「握手完成、零内层字节」的预连接（首拨后由后台
+    /// 补拨填池，省后续会话 1 RTT 握手）。
+    ///
+    /// 为何默认 0（bd s8eio）：池是 Rust 独有优化，开启后服务端可见连接数可
+    /// 达会话数 ×(1+池深)——握手完成却零流量，会撞服务端连接数上限/限流/CDN
+    /// 计费，且 Go 基准里不存在这份代价。需要省握手的用户显式配
+    /// `wsSettings.poolSize`（Go 忽略该未知键，配置仍双向兼容）。
     pub pool_size: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        // ponytail: 默认 12 = Chrome 6/host 限制 + 整页多 host 的 burst 上限
-        // （实测一页 50+ subresource、Chrome 6 并发/host = 池瞬间打空——3 默认池
-        // 命中率 40%、12 命中率 ~95%）。对齐 `WsPoolConfig::default`。
         Self {
             host: String::new(),
             path: String::new(),
@@ -55,9 +59,10 @@ impl Default for Config {
             // 缺位时 NAT/CDN 静默切断（60-180s 窗口）→ 半开死链 → 全协议假死 000。
             // JSON 显式 heartbeatPeriod:0 仍可关闭（register.rs parse 路径）。
             heartbeat_period: 30,
-            // 2026-10-19：池三道防线 + Chrome burst 默认 = 默认 12，对齐
-            // `WsPoolConfig::default`（注释同步）。
-            pool_size: 12,
+            // bd s8eio：默认 0 = 与 Go 26.10.17 对齐（Go ws dialer 无任何连接
+            // 预热/复用，每次 Dial 现拨一条）。池是 Rust 独有优化，开启后服务端
+            // 可见连接数 ×(1+池深)，故改成显式 opt-in（`wsSettings.poolSize`）。
+            pool_size: 0,
         }
     }
 }
@@ -86,9 +91,10 @@ impl Config {
             ed: p.ed,
             // Bug-B：proto3 u32 无显式 0 表达——0 视为未配置 → 默认 30s。
             heartbeat_period: if p.heartbeat_period == 0 { 30 } else { p.heartbeat_period },
-            // ponytail: 池三道防线 + Chrome burst 落地后默认 12（与
-            // Config::default() 一致）。
-            pool_size: 12,
+            // bd s8eio：proto 无 poolSize 字段（Go config.proto 只有 host/path/
+            // headers/accept_proxy_protocol/ed/heartbeatPeriod）→ proto 路径 = 未
+            // 配置 = 关池，与 `Config::default()` 一致；JSON 侧 `poolSize` 显式开。
+            pool_size: 0,
         })
     }
 

@@ -1029,7 +1029,25 @@ async fn run_udp_session(
     sessions: UdpSessions,
     entry: std::sync::Weak<UdpSessionEntry>,
 ) {
-    let mut session = UdpDispatchSession::new(dispatch);
+    // bd kol4a：源（TUN 内层源 endpoint）+ 协议名随 relay 下传（GlobalID 白名单族
+    // "tun"；Go xudp.go:69-70 白名单含 tun，Source = 内层源地址）。
+    let tun_src = std::net::SocketAddr::new(
+        match original_src.addr {
+            smoltcp::wire::IpAddress::Ipv4(v4) => {
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(v4.octets()))
+            },
+            smoltcp::wire::IpAddress::Ipv6(v6) => {
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(v6.octets()))
+            },
+        },
+        original_src.port,
+    );
+    let mut session =
+        UdpDispatchSession::new(dispatch).with_access(xray_app_dispatcher::AccessContext {
+            from: tun_src.to_string(),
+            inbound_name: "tun".to_string(),
+            ..xray_app_dispatcher::AccessContext::default()
+        });
     loop {
         tokio::select! {
             cmd = cmd_rx.recv() => match cmd {

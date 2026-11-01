@@ -35,7 +35,9 @@ use xray_buf::{
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_frame::{LogFacade, PluginContext};
 use xray_transport::link::Link;
-use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
+use xray_xudp::packet::{
+    MAX_FRAME_OVERHEAD, PacketError, parse_packet_slice, write_packet_into_buffer,
+};
 
 use crate::{
     client::{ClientConfig, SOCKS_HANDSHAKE_TIMEOUT, negotiate, read_reply_addr},
@@ -323,26 +325,27 @@ async fn pump_request(
             if accum.is_empty() {
                 break;
             }
-            let (result, consumed) = {
-                let mut cursor = std::io::Cursor::new(&accum[..]);
-                let mut pr = PacketReader::new(&mut cursor);
-                (pr.read_packet(), cursor.position() as usize)
-            };
-            match result {
-                Ok(Some(pkt)) => {
-                    accum.drain(..consumed);
-                    let (data, target) = pkt.into_parts();
-                    let dest = target.unwrap_or_else(|| default_dest.clone());
-                    let frame = encode_udp_packet(&dest_to_socks(&dest), &data);
-                    relay.send(&frame).await?;
-                },
-                // 协议层终止帧（流内非数据帧）
-                Ok(None) => return Ok(()),
+            // 借用式就地解析（bd lppdz）：载荷借用 accum，不落中间 Vec（旧的
+            // Cursor + PacketReader 路径每帧 2 次分配 + 2 次拷贝）；清理已消费
+            // 字节放在最后一次使用载荷之后。
+            let parsed = match parse_packet_slice(&accum[..]) {
+                Ok(p) => p,
                 // 半帧：读边界切开，继续追加字节而非终止
                 Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(PacketError::MetadataTooShort(_)) => return Ok(()),
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-            }
+            };
+            // 协议层终止帧（流内非数据帧）
+            let Some(pkt) = parsed else {
+                return Ok(());
+            };
+            let consumed = pkt.consumed;
+            let data = pkt.data;
+            let dest = pkt.target.unwrap_or_else(|| default_dest.clone());
+            let frame = encode_udp_packet(&dest_to_socks(&dest), data);
+            relay.send(&frame).await?;
+            // 载荷最后一次使用完毕 → 清理已消费字节
+            accum.drain(..consumed);
         }
         match reader.read_multi_buffer().await {
             Ok(mb) if !mb.is_empty() => {
@@ -371,8 +374,12 @@ async fn pump_response(
     mut writer: Box<dyn Writer>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
-    // 响应帧 scratch（容量跨包复用；bd 1fm1l）
-    let mut frame: Vec<u8> = Vec::with_capacity(1024);
+    // 响应帧缓冲（bd 1fm1l W5）：池化 Buffer 按本次载荷取层借出、随 MultiBuffer
+    // 移交后 Drop 归池——稳态每数据报 0 次堆分配（旧形态「Vec scratch + 逐包
+    // `PacketWriter::new`（scratch 构造分配）+ `mem::take` 清容量后下包 re-grow」
+    // 每包 3-4 次）。New/Keep 状态由本 pump 跨包持有；容量不足由
+    // `write_packet_into_buffer` 显式报错（不静默截断）。
+    let mut new_sent = false;
     loop {
         let n = match relay.recv(&mut buf).await {
             Ok(n) => n,
@@ -381,16 +388,22 @@ async fn pump_response(
         let Some((source, payload)) = parse_relay_frame(&buf[..n], &frag_dropped) else {
             continue;
         };
-        frame.clear();
+        // 装帧：直序进池化帧缓冲（免 PacketWriter / meta scratch 中转），
+        // MultiBuffer 移交零拷贝（池化块随下游 Drop 归池，不再走 Frozen）
+        let mut frame = Buffer::new_pooled(MAX_FRAME_OVERHEAD + 2 + payload.len());
+        if write_packet_into_buffer(
+            &mut frame,
+            &mut new_sent,
+            &socks_to_destination(source),
+            global_id,
+            payload,
+        )
+        .is_err()
         {
-            let mut pw = PacketWriter::new(&mut frame, socks_to_destination(source), global_id);
-            if pw.write_packet(payload).is_err() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
-        // 零拷贝移交（Buffer::from_vec = Frozen，不回池也不复制）
-        let mb = MultiBuffer::from_buffer(Buffer::from_vec(std::mem::take(&mut frame)));
+        let mb = MultiBuffer::from_buffer(frame);
         if writer.write_multi_buffer(mb).await.is_err() {
             return Ok(()); // writer 关闭
         }

@@ -229,9 +229,8 @@ impl HubListener {
                 // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
                 // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取静态保底
                 // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
-                // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES` / `XRAY_H2_RTT_HINT_MS`）
-                // 与 serve_http_conn 同源生效。不探针。
-                let win = crate::flow_window::server_windows_from_rtt(None);
+                // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES`）与 serve_http_conn 同源生效。
+                let win = crate::flow_window::server_windows();
                 builder
                     .http2()
                     .timer(hyper_util::rt::TokioTimer::new())
@@ -250,7 +249,7 @@ mod tests {
     /// 不探针）；未设 bench env 时逐值等于修前硬编码。削弱任一值必红。
     #[test]
     fn plaintext_serve_windows_equal_pre_fix_static() {
-        let win = crate::flow_window::server_windows_from_rtt(None);
+        let win = crate::flow_window::server_windows();
         assert_eq!(win.stream_window, 16 * 1024 * 1024, "修前 initial_stream_window_size");
         assert_eq!(win.connection_window, 32 * 1024 * 1024, "修前 initial_connection_window_size");
         assert_eq!(win.max_send_buf, 16 * 1024 * 1024, "修前 max_send_buf_size");

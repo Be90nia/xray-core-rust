@@ -859,6 +859,9 @@ async fn h3_auth(
                         (k.as_str().to_string(), v.to_str().unwrap_or_default().to_string())
                     })
                     .collect();
+                // path + query（Go `r.URL.RequestURI()`；反代面需要 query 参与
+                // 上游 URL 拼接，bd 4zcki）。
+                let path_and_query = req.uri().path_and_query().map(|s| s.as_str().to_string());
                 drop(req);
 
                 let is_auth = method == "POST"
@@ -916,7 +919,26 @@ async fn h3_auth(
                 }
 
                 // masquerade（Go hub.go:112-117：AuthHTTP false → masqHandler.ServeHTTP）
-                let (status, headers, body) = masq.serve(&method, &path, &req_headers).await;
+                // 反代面需要 body（Go `r.Body`）→ 汇总 h3 数据帧（bd 4zcki）。
+                let mut body = Vec::new();
+                {
+                    use bytes::Buf as _;
+                    while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                        while chunk.has_remaining() {
+                            let part = chunk.chunk();
+                            body.extend_from_slice(part);
+                            chunk.advance(part.len());
+                        }
+                    }
+                }
+                let masq_req = crate::hub::MasqRequest {
+                    method: method.clone(),
+                    path: path_and_query.clone().unwrap_or_else(|| path.clone()),
+                    headers: req_headers.clone(),
+                    host: host.clone(),
+                    body,
+                };
+                let (status, headers, body) = masq.serve_request(masq_req).await;
                 let mut builder = http::Response::builder().status(status);
                 for (k, v) in &headers {
                     builder = builder.header(k.as_str(), v.as_str());
@@ -996,7 +1018,19 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                             };
                             let method = req.method().to_string();
                             let path = req.uri().path().to_string();
+                            let path_and_query =
+                                req.uri().path_and_query().map(|s| s.as_str().to_string());
                             let host = req.uri().host().unwrap_or(config::URLHost).to_string();
+                            let hdrs: HashMap<String, String> = req
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| {
+                                    (
+                                        k.as_str().to_string(),
+                                        v.to_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect();
                             let auth_header = req
                                 .headers()
                                 .get(config::RequestHeaderAuth)
@@ -1037,11 +1071,27 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                                     .expect("fixed status + trusted-config header values");
                                 let _ = stream.send_response(resp).await;
                             } else {
-                                // Masquerade
+                                // Masquerade（反代面需要 body：汇总 h3 数据帧）
                                 let masq = h.masquerade();
-                                let hdrs: HashMap<String, String> = HashMap::new();
-                                let (status, headers, body) =
-                                    masq.serve(&method, &path, &hdrs).await;
+                                let mut body = Vec::new();
+                                {
+                                    use bytes::Buf as _;
+                                    while let Ok(Some(mut chunk)) = stream.recv_data().await {
+                                        while chunk.has_remaining() {
+                                            let part = chunk.chunk();
+                                            body.extend_from_slice(part);
+                                            chunk.advance(part.len());
+                                        }
+                                    }
+                                }
+                                let masq_req = crate::hub::MasqRequest {
+                                    method: method.clone(),
+                                    path: path_and_query.clone().unwrap_or_else(|| path.clone()),
+                                    headers: hdrs.clone(),
+                                    host: host.clone(),
+                                    body,
+                                };
+                                let (status, headers, body) = masq.serve_request(masq_req).await;
                                 let mut builder = http::Response::builder().status(status);
                                 for (k, v) in &headers {
                                     builder = builder.header(k.as_str(), v.as_str());
@@ -2108,6 +2158,152 @@ mod tests {
         assert_eq!((status, body.as_slice()), (200, &b"fake website"[..]));
 
         let _ = listener.close().await;
+    }
+
+    /// bd 4zcki e2e：hysteria 客户端 → Rust 服务端 masquerade(proxy) → 本地 HTTP
+    /// 上游。断言上游**确实收到请求**且 method/path/query/Host/body 符合 Go
+    /// `ReverseProxy` 语义（rewrite_host=false → 保留客户端原始 Host）。
+    #[tokio::test]
+    async fn masquerade_proxy_forwards_to_upstream() {
+        use std::sync::Arc;
+
+        ensure_crypto_provider();
+
+        let (upstream_port, seen) =
+            crate::masq_proxy::test_support::start_recording_upstream().await;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let masq = crate::hub::MasqType::Proxy {
+            url: format!("http://127.0.0.1:{upstream_port}/base"),
+            rewrite_host: false,
+            insecure: false,
+        };
+        struct MasqValidator;
+        impl crate::hub::AuthValidator for MasqValidator {
+            fn validate(&self, _auth: &str) -> Option<String> {
+                None
+            }
+
+            fn count(&self) -> usize {
+                1
+            }
+        }
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(|_| {});
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                Arc::new(crate::proto_config::Config::default()),
+                Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+                masq,
+                Some(Arc::new(MasqValidator)),
+                on_new_conn,
+                None,
+            )
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        )));
+        let conn = ep.connect(server_addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_req) =
+            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h3 client driver 任务")]
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/probe?x=1")
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "上游 200 必须经反代回传");
+        let mut body = Vec::new();
+        use bytes::Buf as _;
+        while let Some(chunk) = stream.recv_data().await.unwrap() {
+            body.extend_from_slice(chunk.chunk());
+        }
+        assert_eq!(body, b"upstream-ok", "上游响应体必须原样回传");
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1, "上游必须收到恰好一个请求");
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(seen[0].path, "/base/probe", "path = joinURLPath(目标 path, 入站 path)");
+        assert_eq!(seen[0].query, "x=1");
+        assert_eq!(seen[0].host, "localhost", "rewrite_host=false → 保留客户端原始 Host");
+        assert!(seen[0].body.is_empty(), "GET/POST 无 body 时上游收到空 body");
+
+        let _ = listener.close().await;
+    }
+
+    /// bd 4zcki Go 对照：连 **Go 26.10.17** 的 hysteria 服务端（masq=proxy），
+    /// 用非 auth 的 h3 请求打到 masquerade 面 → Go 侧反代到本地 HTTP 上游。
+    ///
+    /// 环境变量：`GO_HYSTERIA_ADDR`（Go hysteria 入站 `host:port`）。
+    /// 上游观测由 Go 侧的 recorder 落盘（`D:/tmp/go-upstream-seen.json`），
+    /// 本用例只断言响应面（Go 反代必须把上游响应原样回传）。
+    #[tokio::test]
+    #[ignore = "需要外部 Go hysteria 服务端（对照用）"]
+    async fn go_masq_proxy_roundtrip() {
+        use std::sync::Arc;
+
+        ensure_crypto_provider();
+
+        let addr: std::net::SocketAddr =
+            std::env::var("GO_HYSTERIA_ADDR").expect("GO_HYSTERIA_ADDR").parse().expect("addr");
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        )));
+        let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+        let (mut driver, mut send_req) =
+            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        #[allow(clippy::disallowed_methods, reason = "测试：h3 client driver 任务")]
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("https://localhost/probe?x=1")
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        let resp = stream.recv_response().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "Go 侧 masquerade(proxy) 必须把上游 200 回传");
+        let mut body = Vec::new();
+        use bytes::Buf as _;
+        while let Some(chunk) = stream.recv_data().await.unwrap() {
+            body.extend_from_slice(chunk.chunk());
+        }
+        assert_eq!(body, b"upstream-ok", "Go 侧上游响应体必须原样回传");
     }
 
     /// e2e masquerade（bd ect）：auth 密码错 → 伪装响应（非 403/断连）；

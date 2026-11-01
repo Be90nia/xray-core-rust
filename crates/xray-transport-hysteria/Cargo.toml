@@ -28,6 +28,13 @@ http = { workspace = true }
 hex = "0.4"
 rustls = { workspace = true, default-features = false, features = ["ring"] }
 serde_json = { workspace = true }
+# masquerade「proxy」反代（bd 4zcki）：HTTP 客户端面。全部为 workspace 既有依赖
+# （hyper/hyper-util/http-body-util/tokio-rustls/webpki-roots），无新增外部 crate。
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

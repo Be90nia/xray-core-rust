@@ -38,12 +38,13 @@ use crate::{
         parse_freedom_inbound_dest, parse_http_config, parse_hysteria_inbound_config,
         parse_loopback_config, parse_naive_inbound_settings, parse_reality_config,
         parse_socks_http_configs, parse_socks_server_config, parse_ss_inbound_config,
-        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_ss_user_manager,
-        register_trojan_user_manager, register_vless_user_manager, register_vmess_user_manager,
-        register_wg_user_manager, serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http,
-        serve_mixed, serve_mixed_conn, serve_reality_trojan, serve_reality_vless, serve_ss,
-        serve_unix_listener, spawn_inbound_serve, spawn_transport_listener_inbound,
-        ss_legacy_pipeline, ss_mode_conn_pipeline, transport_conn_addrs,
+        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_hysteria_user_manager,
+        register_ss_user_manager, register_trojan_user_manager, register_vless_user_manager,
+        register_vmess_user_manager, register_wg_user_manager, serve_dns, serve_dokodemo,
+        serve_dokodemo_udp_on, serve_http, serve_mixed, serve_mixed_conn, serve_reality_trojan,
+        serve_reality_vless, serve_ss, serve_unix_listener, spawn_inbound_serve,
+        spawn_transport_listener_inbound, ss_legacy_pipeline, ss_mode_conn_pipeline,
+        transport_conn_addrs,
     },
     outbound::dns_idle_timeout_for,
 };
@@ -623,6 +624,7 @@ pub(crate) async fn build_hysteria_inbound(
     ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
+    api: Option<&InboundRuntime>,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
@@ -635,17 +637,29 @@ pub(crate) async fn build_hysteria_inbound(
     // `StreamSettings.finalmask_json`）同源。
     let stream =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
-    let (config, factory) =
+    let (config, factory, users) =
         parse_hysteria_inbound_config(&ib.entry.data, bind_addr, stream.finalmask_json.as_ref())?;
     let dispatch = ohm.get_default_handler().ok_or_else(|| {
         std::io::Error::other("hysteria inbound requires a default outbound handler")
     })?;
+    // bd ctiwx：users[] 多用户形态——`MultiUserValidator` 与 hub serve loop 共享
+    // 同一 Arc 并登记进 gRPC 用户管理面（Go server.go:62-75 UserManager）；单
+    // auth 形态不登记（NotUserManager 拒绝，见 register_hysteria_user_manager）。
+    let multi = if users.is_empty() {
+        None
+    } else {
+        Some(Arc::new(xray_proxy_hysteria::MultiUserValidator::from_users(&users)))
+    };
+    if let Some(validator) = &multi {
+        register_hysteria_user_manager(api, &ib.tag, validator);
+    }
     let handler =
         xray_proxy_hysteria::HysteriaInboundHandler::new(&ib.tag, config, bind_addr, factory)
             .map_err(|e| std::io::Error::other(format!("hysteria inbound: {e}")))?
+            .with_multi_validator(multi.clone())
             .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(Arc::clone(&dispatch)))))
             .with_udp_dispatcher(Some(dispatch));
-    tracing::info!(tag = %ib.tag, addr = %addr, "hysteria inbound listening");
+    tracing::info!(tag = %ib.tag, addr = %addr, users = multi.as_ref().map_or(0, |v| v.count()), "hysteria inbound listening");
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
     })))
@@ -1486,6 +1500,7 @@ pub(crate) fn hysteria_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         ctx.ohm,
         ctx.shutdown_token,
         ctx.addr,
+        ctx.api,
         Arc::new(ctx.plugin_ctx),
     ))
 }

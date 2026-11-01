@@ -405,7 +405,7 @@ where
     let port = u16::from_be_bytes([buf[1], buf[2]]);
     let ip = Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]);
 
-    // 读 USERID，直到 NULL
+    // 读 USERID，直到 NULL（上限 [`SOCKS4_MAX_FIELD_BYTES`]，超限即拒握手）
     let _userid = read_until_null(stream).await?;
 
     // SOCKS4a：IP = 0.0.0.x（x≠0）→ 跟一个 null 结尾域名
@@ -432,7 +432,19 @@ where
     Ok(SocksRequest::TcpConnect(SocksAddr { host, port }))
 }
 
+/// SOCKS4 定长字段上限 = Go `buf.StackNew()` 的栈缓冲容量（`common/buf.Size` = 8192）。
+///
+/// Go `ReadUntilNull`（`proxy/socks/protocol.go:288`）每读一字节就检查 `b.IsFull()`，
+/// 写满即 `buffer overrun` 拒绝——USERID 与 SOCKS4a 域名共用同一上限。缺少这个界时
+/// 匿名入站只要持续灌非 NULL 字节就能让单连接无界吃 CPU/内存（bd dp2dm 实测 10s 内
+/// 12.44 CPU 秒、82MB 堆），故超限直接拒握手，不截断继续。
+const SOCKS4_MAX_FIELD_BYTES: usize = 8192;
+
 /// 读 null 结尾的字节串，返回 UTF-8 lossy 字符串（丢弃结尾 NULL）。
+///
+/// shortcut: 逐字节 `read_exact`（Go 从 `buf.Reader` 每次取整块，逐字节只是切片），
+/// 上限 [`SOCKS4_MAX_FIELD_BYTES`] 把单连接代价锁在 8192 次读以内；块读需要把多读的
+/// 字节回灌给 4a 域名/隧道，等入站侧有统一 pushback 读器时再升级。
 async fn read_until_null<RW>(stream: &mut RW) -> Result<String>
 where
     RW: AsyncReadExt + Unpin,
@@ -445,6 +457,11 @@ where
             break;
         }
         bytes.push(one[0]);
+        if bytes.len() >= SOCKS4_MAX_FIELD_BYTES {
+            return Err(SocksError::HandshakeFailed(format!(
+                "SOCKS4 field exceeds {SOCKS4_MAX_FIELD_BYTES} bytes (buffer overrun)"
+            )));
+        }
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -1190,12 +1207,39 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// bd dp2dm：USERID 无 NULL 终止符持续灌数据必须在 8KB 上限被拒（对齐 Go
+    /// `ReadUntilNull` 的 `buffer overrun`），不得无界吃 CPU/内存。
+    #[tokio::test]
+    async fn socks4_userid_without_terminator_rejected_at_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = ServerConfig::default();
+
+        let server = xray_common::testing::spawn("socks4-userid-cap-accept", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let r = socks4_handshake(&mut sock, &config).await;
+            // drop 前留时间让对端收 RST/FIN（Windows loopback 竞态，见 v49 教训）
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            r
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // VER=4 + CMD=CONNECT + DSTPORT(80) + DSTIP(127.0.0.1)，随后 USERID 永不给 NULL
+        client.write_all(&[0x04, 0x01, 0, 80, 127, 0, 0, 1]).await.unwrap();
+        // 服务端到上限即断链：写入中途失败属预期形态，故忽略错误
+        let flood = vec![b'u'; SOCKS4_MAX_FIELD_BYTES + 16];
+        let _ = client.write_all(&flood).await;
+
+        let err =
+            format!("{:?}", server.await.unwrap().expect_err("overlong USERID must be rejected"));
+        assert!(err.contains("buffer overrun"), "got: {err}");
+    }
+
     #[tokio::test]
     async fn udp_associate_rejected_when_udp_disabled() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let config = ServerConfig::default(); // udp_enabled: false（默认）
-
         let server = xray_common::testing::spawn(
             "udp-associate-rejected-when-udp-disabled-accept",
             async move {

@@ -315,6 +315,9 @@ where
         })
         // h2 连接级窗目标缺省同 64KB（client.rs:1395-1399 doc）；send buffer h2 缺省
         // 400KB 钉上行。16/32MB 与 splithttp dialer.rs 同批同值。
+        // 内存预算（bd s8eio）见 crate 级「内存预算（h2 流控窗）」：每连接 ≈ 32MiB
+        // 收（连接窗封顶）+ 16MiB 发 ≈ 48MiB，与并发流数无关（16MiB×流 是错算——
+        // 连接窗先封顶）；gRPC 无连接复用，并发会话数直接乘上去。
         .initial_connection_window_size(32 * 1024 * 1024)
         .max_send_buffer_size(16 * 1024 * 1024);
     let (mut send_req, mut h2_conn) = builder.handshake(conn).await.map_err(io_err)?;
@@ -776,6 +779,8 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     // bd wz2b W3：server::handshake 直调 = 零 Builder 零设置 → 收流窗/连接窗落 RFC
     // 9113 缺省 65535（全仓最狠钉：64KB/RTT@150ms≈0.43MB/s 上行）、每流 send buffer
     // h2 缺省 400KB 钉下行。显式 Builder 16MB 流窗 + 32MB 连接窗 + 16MB send buffer。
+    // 内存预算（bd s8eio）见 crate 级「内存预算（h2 流控窗）」：每连接 ≈ 32MiB 收
+    //（连接窗封顶）+ 16MiB 发 ≈ 48MiB；每个 accept 的 TCP 连接各算一份。
     let mut builder = server::Builder::new();
     builder
         .initial_window_size(16 * 1024 * 1024)

@@ -40,7 +40,7 @@ use xray_buf::{
 };
 use xray_common::net::destination::Destination;
 use xray_transport::{connection::Connection, link::Link};
-use xray_xudp::packet::{FrameMetadata, PacketError, PacketReader};
+use xray_xudp::packet::{FrameMetadata, PacketError, parse_packet_slice_at};
 
 use crate::DispatchHandler;
 
@@ -98,13 +98,37 @@ impl Drop for Inner {
 pub struct UdpDispatchSession {
     dispatcher: Arc<dyn DispatchHandler>,
     inner: Option<Inner>,
+    /// 入站 access 上下文（bd kol4a）：`establish` 时经
+    /// [`DispatchHandler::dispatch_with_access`] 下传——生产链终点
+    /// `MuxBridge::dispatch_with_access` 按它派生 XUDP GlobalID（cone 语义，
+    /// Go `xudp.GetGlobalID`）。`None` = 无源 dispatch（等价旧行为）。
+    ///
+    /// `Mutex` 而非裸 `Option`：socks ASSOCIATE 的入站源是**首个数据报的源
+    /// 地址**（Go `handleUDPPayload` 的 `conn.RemoteAddr()`），建会话时未知
+    /// → 收包后才装填（[`Self::set_access`]），此时 `establish` 尚未触发
+    /// （首包 `send_packet` 才建 link），时序安全。
+    access: parking_lot::Mutex<Option<crate::default::AccessContext>>,
 }
 
 impl UdpDispatchSession {
     /// 创建会话。`dispatcher` 为生产路由 handler 或任意支持 UDP 目标的
     /// [`DispatchHandler`]（outbound 侧须按 XUDP 帧约定消费 link，如 freedom）。
     pub fn new(dispatcher: Arc<dyn DispatchHandler>) -> Self {
-        Self { dispatcher, inner: None }
+        Self { dispatcher, inner: None, access: parking_lot::Mutex::new(None) }
+    }
+
+    /// 携带入站 access 上下文（客户端源地址 + 入站协议名）。UDP relay 调用方
+    /// 在建会话前链式调用；字段语义见 [`crate::default::AccessContext`]。
+    #[must_use]
+    pub fn with_access(self, access: crate::default::AccessContext) -> Self {
+        self.set_access(access);
+        self
+    }
+
+    /// 后置装填入站 access 上下文（建会话时源地址未知的入口用，如 socks
+    /// ASSOCIATE）。`establish` 会取走它，故必须在首包 `send_packet` 之前调用。
+    pub fn set_access(&self, access: crate::default::AccessContext) {
+        *self.access.lock() = Some(access);
     }
 
     /// 发送一个 UDP 数据报。
@@ -130,11 +154,13 @@ impl UdpDispatchSession {
             inner.new_sent = true;
             FrameMetadata::new_udp(dest.address().clone(), dest.port(), inner.global_id)
         };
-        // 帧序列化进会话常驻 scratch（clear 复用容量，免每包一次分配）
+        // 帧序列化进会话常驻 scratch（clear 复用容量，免每包一次分配）。
+        // bd 1fm1l W5：`write_bytes_into` 直写替代 `write_to`——后者走
+        // `to_bytes()`，每包多「临时 Vec + 32B 地址暂存 Buffer」两次分配；
+        // frame 此时为空，clear 语义等价（`Vec` 的 write_all 不可能失败，
+        // 原 map_err 是死分支）。
         let Inner { frame, req, .. } = inner;
-        frame.clear();
-        meta.write_to(frame)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        meta.write_bytes_into(frame);
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         frame.extend_from_slice(payload);
         req.write_all(frame).await
@@ -154,28 +180,48 @@ impl UdpDispatchSession {
         };
         loop {
             if !inner.accum.is_empty() {
-                let mut cursor = std::io::Cursor::new(&inner.accum[..]);
-                let mut pr = PacketReader::new(&mut cursor);
-                let r = pr.read_packet();
-                let consumed = cursor.position() as usize;
-                match r {
-                    Ok(Some(pkt)) => {
-                        inner.accum.drain(..consumed);
-                        let (data, target) = pkt.into_parts();
-                        let source = target.unwrap_or_else(|| inner.dest.clone());
-                        return Ok(Some((source, data)));
+                // 借用式就地解析（bd lppdz）：不再为帧头/meta 落中间 Vec（旧的
+                // Cursor + PacketReader 路径每帧 2 次分配 + 2 次拷贝）。
+                // 载荷仍需**拥有型 Vec** 返回给调用方（本 API 契约：10+ 调用方
+                // 依赖 `(Destination, Vec<u8>)`，含 xray-core 红线文件）→ 载荷
+                // 一次分配 + 一次拷贝（残留 1 分配，报告登记）。
+                let parsed = match parse_packet_slice_at(&inner.accum[..]) {
+                    (Ok(p), _) => p,
+                    (Err(PacketError::Io(e)), _)
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        // 半帧：等更多字节
+                        None
                     },
-                    Ok(None) => {}, // 帧不完整，等更多数据
-                    Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {},
-                    Err(e) => {
+                    (Err(e), consumed) => {
                         // qyn8：协议解析错误先 drain 已消费的坏帧字节再报错。
-                        // 解析错误发生时 cursor 至少消费了 2B 长度头，不 drain
+                        // 解析错误发生时至少已消费 2B 长度头，不 drain
                         // 则坏帧永久滞留 accum，容忍型调用方 continue 即在同一
                         // 字节上无限 Err（同步忙旋 100% CPU）。传输层错误不经
                         // 此路径（resp.read 的 io Err 由下方 `?` 直接传播）。
-                        inner.accum.drain(..consumed);
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                        inner.accum.drain(..consumed.min(inner.accum.len()));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        ));
                     },
+                };
+                if let Some(pkt) = parsed {
+                    let consumed = pkt.consumed;
+                    // 残留 1 分配 + 1 拷贝（bd lppdz 登记）：本 API 的返回契约是
+                    // `(Destination, Vec<u8>)`，载荷必须脱开 `accum` 独立存活
+                    // （借用与 `accum.drain` 互斥）→ 拥有型 Vec 无法零拷贝。要归零
+                    // 需改 recv_packet 签名（10+ 调用方，含 xray-core
+                    // inbound/outbound 红线文件），不属本票。
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "bd lppdz 残留：recv_packet 契约要求拥有型载荷 Vec，借用无法跨 accum.drain 存活"
+                    )]
+                    let data = pkt.data.to_vec();
+                    let target = pkt.target;
+                    inner.accum.drain(..consumed);
+                    let source = target.unwrap_or_else(|| inner.dest.clone());
+                    return Ok(Some((source, data)));
                 }
             }
             let n = inner.resp.read(&mut inner.buf[..]).await?;
@@ -204,12 +250,18 @@ impl UdpDispatchSession {
         let link = Link::new(new_reader(req_link), new_writer(resp_link));
         let udp_dest = Destination::udp(dest.address().clone(), dest.port());
         let dispatcher = Arc::clone(&self.dispatcher);
+        let access = self.access.lock().take();
         #[allow(
             clippy::disallowed_methods,
             reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
-            dispatcher.dispatch(&udp_dest, link).await;
+            // bd kol4a：有源走 dispatch_with_access（GlobalID 派生在出站
+            // MuxBridge 终点），无源保持旧 dispatch（语义不变）。
+            match access {
+                Some(access) => dispatcher.dispatch_with_access(&udp_dest, link, access).await,
+                None => dispatcher.dispatch(&udp_dest, link).await,
+            }
         });
         self.inner = Some(Inner {
             dest,
@@ -722,6 +774,8 @@ pub(crate) mod tests {
     use std::net::Ipv4Addr;
 
     use xray_common::net::{address::Address, port::Port};
+    // PacketReader 只剩测试在用（生产收包路径已换借用式 parse_packet_slice_at）
+    use xray_xudp::packet::PacketReader;
 
     use super::*;
 
@@ -936,6 +990,65 @@ pub(crate) mod tests {
             session.recv_packet().await.expect("recv failed").expect("session ended");
         assert_eq!(payload, b"dns-query");
         assert_eq!(source, dest, "echo source should carry per-packet target");
+    }
+
+    /// bd kol4a：`with_access` 的会话 establish 必须走 `dispatch_with_access`
+    /// 且原样携带 `from`/`inbound_name`（GlobalID 派生链第一环——生产链终点
+    /// `MuxBridge::dispatch_with_access` 按它们算 XUDP GlobalID）；无 access
+    /// 的会话保持旧 `dispatch`（不记次数）。
+    #[tokio::test]
+    async fn with_access_routes_through_dispatch_with_access() {
+        #[derive(Debug)]
+        struct AccessCapture {
+            seen: std::sync::Arc<parking_lot::Mutex<Vec<crate::default::AccessContext>>>,
+        }
+
+        impl DispatchHandler for AccessCapture {
+            fn tag(&self) -> &str {
+                "access-capture"
+            }
+
+            fn dispatch(&self, _dest: &Destination, _link: Link) -> crate::default::PinFuture<()> {
+                Box::pin(async move {})
+            }
+
+            fn dispatch_with_access(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+                access: crate::default::AccessContext,
+            ) -> crate::default::PinFuture<()> {
+                self.seen.lock().push(access);
+                Box::pin(async move {})
+            }
+        }
+
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let handler: Arc<dyn DispatchHandler> =
+            Arc::new(AccessCapture { seen: std::sync::Arc::clone(&seen) });
+        let mut session =
+            UdpDispatchSession::new(handler).with_access(crate::default::AccessContext {
+                from: "10.0.0.9:5555".to_string(),
+                inbound_name: "socks".to_string(),
+                ..crate::default::AccessContext::default()
+            });
+        session.send_packet(&udp_dest([8, 8, 8, 8], 53), b"probe").await.expect("send failed");
+
+        // establish 的 spawn 与断言并发——按截止时间轮询，不 sleep 固定值
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                // 内层块：MutexGuard 不得跨 await（clippy await_holding_lock）
+                let snapshot = seen.lock();
+                if !snapshot.is_empty() || std::time::Instant::now() > deadline {
+                    assert_eq!(snapshot.len(), 1, "establish 必须恰好 dispatch_with_access 一次");
+                    assert_eq!(snapshot[0].from, "10.0.0.9:5555");
+                    assert_eq!(snapshot[0].inbound_name, "socks");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     #[tokio::test]
@@ -1221,5 +1334,71 @@ pub(crate) mod tests {
         println!("q1r4q per-packet allocs: old(to_vec+Cursor)={old_pp} new(chain)={new_pp}");
         assert_eq!(old_pp, 3, "旧路径每包 3 次分配（to_vec + reader scratch + 载荷 Vec）");
         assert_eq!(new_pp, 2, "新路径每包 2 次分配（摊平分配已删，剩 scratch + 载荷）");
+    }
+
+    /// bd lppdz 分配取证：`recv_packet` 收包内层（解析一帧 + 取出载荷 + 前进
+    /// accum）的 A/B。旧路径（Cursor + `PacketReader::into_parts`）= 2 次/包
+    /// （reader scratch + 载荷 Vec）；新路径（借用式 `parse_packet_slice_at`）
+    /// 只剩载荷 `to_vec` 的 1 次——那是 `recv_packet` 返回
+    /// `(Destination, Vec<u8>)` 的契约成本（借用活不过 `accum.drain`），
+    /// 归零需改 API 签名（10+ 调用方含 xray-core 红线文件），不属本票。
+    // 取证数字须打印（同 q1r4q 先例：显式 allow + 理由）。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn recv_parse_allocs_per_packet_ab() {
+        const PACKETS: usize = 256;
+        let mut stream = Vec::new();
+        for i in 0..PACKETS {
+            let mut f = Vec::new();
+            FrameMetadata::new_udp(
+                udp_dest([10, 0, 0, (i % 254 + 1) as u8], 53).address().clone(),
+                Port::new(53),
+                [i as u8; 8],
+            )
+            .write_to(&mut f)
+            .unwrap();
+            f.extend_from_slice(&16u16.to_be_bytes());
+            f.extend_from_slice(&[0u8; 16]);
+            stream.extend_from_slice(&f);
+        }
+
+        // A（改前）：Cursor + PacketReader → into_parts → drain(position)
+        let mut accum = stream.clone();
+        let before = THREAD_ALLOCS.with(|c| c.get());
+        while !accum.is_empty() {
+            let mut cursor = std::io::Cursor::new(&accum[..]);
+            let (data, _target) = {
+                let mut pr = PacketReader::new(&mut cursor);
+                pr.read_packet().expect("read").expect("packet").into_parts()
+            };
+            let pos = cursor.position() as usize;
+            std::hint::black_box(&data);
+            accum.drain(..pos);
+        }
+        let old_allocs = THREAD_ALLOCS.with(|c| c.get()) - before;
+
+        // B（改后）：借用式解析 → 载荷 to_vec（契约成本）
+        let mut accum = stream.clone();
+        let before = THREAD_ALLOCS.with(|c| c.get());
+        while !accum.is_empty() {
+            let pkt = match parse_packet_slice_at(&accum[..]).0 {
+                Ok(Some(p)) => p,
+                other => panic!("unexpected parse result: {other:?}"),
+            };
+            let consumed = pkt.consumed;
+            let data = pkt.data.to_vec();
+            let _target = pkt.target;
+            std::hint::black_box(&data);
+            accum.drain(..consumed);
+        }
+        let new_allocs = THREAD_ALLOCS.with(|c| c.get()) - before;
+
+        let old_pp = old_allocs / PACKETS;
+        let new_pp = new_allocs / PACKETS;
+        println!(
+            "lppdz recv per-packet allocs: old(PacketReader)={old_pp} new(slice+to_vec)={new_pp}"
+        );
+        assert_eq!(old_pp, 2, "旧收包路径每包 2 次分配（reader scratch + 载荷 Vec）");
+        assert_eq!(new_pp, 1, "新收包路径每包 1 次分配（仅载荷 to_vec 契约成本）");
     }
 }

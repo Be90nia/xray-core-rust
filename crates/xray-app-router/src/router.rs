@@ -320,9 +320,14 @@ impl Router {
         Ok(())
     }
 
-    /// 列出当前规则 tag。
-    pub fn list_rules(&self) -> Vec<String> {
-        self.rules.read().iter().map(|r| r.rule_tag.clone()).collect()
+    /// 列出当前规则的 `(出站 tag, 规则 tag)`。
+    ///
+    /// 对应 Go `Router.ListRule`（router.go:193-201，`Route{outboundTag: rule.Tag,
+    /// ruleTag: rule.RuleTag}`）：balancer 规则的出站 tag 为**空串**（Go 同款——
+    /// Go `RoutingRule.TargetTag` 是 `Tag | BalancingTag` oneof，balancer 分支的
+    /// `Tag` 就是空）。
+    pub fn list_rules(&self) -> Vec<(String, String)> {
+        self.rules.read().iter().map(|r| (r.tag.clone(), r.rule_tag.clone())).collect()
     }
 
     /// 覆盖平衡器目标。
@@ -530,7 +535,7 @@ mod tests {
     fn test_add_and_remove_rule() {
         let r = Router::empty(Arc::new(NotImplementedSelector), None);
         r.add_rule("rule1".into(), simple_tag_rule("tag1", "a.com")).unwrap();
-        assert!(r.list_rules().contains(&"rule1".to_string()));
+        assert!(r.list_rules().iter().any(|(_, rt)| rt == "rule1"));
 
         // duplicate add
         assert!(matches!(
@@ -540,7 +545,7 @@ mod tests {
 
         // remove
         r.remove_rule("rule1").unwrap();
-        assert!(!r.list_rules().contains(&"rule1".to_string()));
+        assert!(r.list_rules().iter().all(|(_, rt)| rt != "rule1"));
 
         // remove non-existent
         assert!(matches!(r.remove_rule("nope"), Err(RouterError::TagNotFound)));
@@ -556,7 +561,7 @@ mod tests {
         };
         r.reload_rules(&cfg, false).expect("replace reload");
         // shouldAppend=false = 整体替换（Go ReloadRules 非 append 分支）
-        assert_eq!(r.list_rules(), vec!["r2".to_string()]);
+        assert_eq!(r.list_rules(), vec![("t2".to_string(), "r2".to_string())]);
     }
 
     /// bd 9c8k6 ①：shouldAppend=true 保留旧规则并追加（Go 语义）。
@@ -569,7 +574,10 @@ mod tests {
             ..Config::default()
         };
         r.reload_rules(&cfg, true).expect("append reload");
-        assert_eq!(r.list_rules(), vec!["r1".to_string(), "r2".to_string()]);
+        assert_eq!(
+            r.list_rules(),
+            vec![("t1".to_string(), "r1".to_string()), ("t2".to_string(), "r2".to_string())]
+        );
 
         // 追加批里与已有 ruleTag 重复 ⇒ Err（Go `duplicate ruleTag`），且规则集不变。
         let dup = Config {
@@ -577,7 +585,10 @@ mod tests {
             ..Config::default()
         };
         assert!(matches!(r.reload_rules(&dup, true), Err(RouterError::DuplicateRuleTag(_))));
-        assert_eq!(r.list_rules(), vec!["r1".to_string(), "r2".to_string()]);
+        assert_eq!(
+            r.list_rules(),
+            vec![("t1".to_string(), "r1".to_string()), ("t2".to_string(), "r2".to_string())]
+        );
     }
 
     #[test]

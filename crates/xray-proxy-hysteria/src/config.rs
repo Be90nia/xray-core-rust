@@ -431,8 +431,9 @@ impl HysteriaInboundConfig {
 /// 线程安全，内部用 Mutex 保护 users map。
 /// 支持运行时动态增删用户。
 pub struct MultiUserValidator {
-    /// auth token -> user email 映射（运行时增删）。
-    users: Mutex<HashMap<String, String>>,
+    /// auth token -> 用户（运行时增删；存全量 [`HysteriaUser`] 以支持
+    /// `GetUser`/`GetUsers` 回程携带 level，bd ctiwx）。
+    users: Mutex<HashMap<String, HysteriaUser>>,
     /// email 集合（用于去重 + Del 查找）。
     emails: Mutex<std::collections::HashSet<String>>,
 }
@@ -472,7 +473,7 @@ impl MultiUserValidator {
             emails.insert(user.email.clone());
         }
         let mut users = self.users.lock();
-        users.insert(user.auth.clone(), user.email.clone());
+        users.insert(user.auth.clone(), user.clone());
         Ok(())
     }
 
@@ -489,8 +490,7 @@ impl MultiUserValidator {
         }
         let mut users = self.users.lock();
         // 找到对应 auth 删除
-        let key_to_remove =
-            users.iter().find_map(|(k, v)| if v == email { Some(k.clone()) } else { None });
+        let key_to_remove = users.iter().find_map(|(k, v)| (v.email == email).then(|| k.clone()));
         if let Some(k) = key_to_remove {
             users.remove(&k);
         }
@@ -502,7 +502,15 @@ impl MultiUserValidator {
     /// 对应 Go `Validator.Get`。
     #[must_use]
     pub fn get(&self, auth: &str) -> Option<String> {
-        self.users.lock().get(auth).cloned()
+        self.users.lock().get(auth).map(|u| u.email.clone())
+    }
+
+    /// 枚举当前用户（对应 Go `Validator.GetAll`；顺序不保证）。
+    ///
+    /// 供 [`crate::inbound`] 侧 `ApiUserManager::list_users`/`get_user` 消费。
+    #[must_use]
+    pub fn list(&self) -> Vec<HysteriaUser> {
+        self.users.lock().values().cloned().collect()
     }
 
     /// 当前用户数。

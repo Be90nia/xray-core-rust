@@ -33,7 +33,9 @@ use xray_buf::{
 };
 use xray_common::net::{address::Address, destination::Destination, port::Port};
 use xray_transport::link::Link;
-use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
+use xray_xudp::packet::{
+    MAX_FRAME_OVERHEAD, PacketError, parse_packet_slice, write_packet_into_buffer,
+};
 
 /// XUDP GlobalID 长度（与 Go `xudp` 一致，私有常量 GLOBAL_ID_LEN=8）。
 const GLOBAL_ID_LEN: usize = 8;
@@ -365,94 +367,97 @@ async fn parse_and_send(
         return Ok(FrameParse::NeedMore);
     }
 
-    // 用 Cursor + 同步 PacketReader 解析一帧
-    let (result, consumed) = {
-        let mut cursor = std::io::Cursor::new(&accum[..]);
-        let mut pr = PacketReader::new(&mut cursor);
-        let r = pr.read_packet();
-        let pos = cursor.position() as usize;
-        (r, pos)
-    };
-
-    match result {
-        Ok(Some(pkt)) => {
-            accum.drain(..consumed);
-            let (data, udp_target) = pkt.into_parts();
-            // 逐包 override 改写（Go :596-601：地址有效替换 / 端口非 0 替换）
-            let mut effective = udp_target.unwrap_or_else(|| {
-                Destination::udp(default_target.ip().into(), Port::new(default_target.port()))
-            });
-            effective = crate::config::apply_destination_override(
-                &effective,
-                policy.destination_override.as_ref(),
-            );
-            // 域名帧逐帧解析（bd czwu①：Go :610-641，此前 fallback 会话默认目标
-            // = 静默发错主机）；解析失败丢帧继续（Go :627-630 b.Release(); continue）
-            let target = match dest_to_socket_addr(&effective) {
-                Some(sa) => sa,
-                None => {
-                    let Some(domain) = effective.address().as_domain().map(str::to_string) else {
-                        return Ok(FrameParse::Progress);
-                    };
-                    let ip = match resolved.get(&domain) {
-                        Some(ip) => *ip,
-                        None => match resolve_udp_domain(
-                            &domain,
-                            effective.port().value(),
-                            policy.domain_strategy,
-                            default_target.is_ipv4(),
-                        )
-                        .await
-                        {
-                            Ok(ip) => {
-                                resolved.insert(domain.clone(), ip);
-                                ip
-                            },
-                            Err(e) => {
-                                // 丢帧继续（Go :627-630 b.Release(); continue；
-                                // Force* 失败同样丢帧——Go :625-628 注释）。
-                                // bd 1ksxu D3：丢帧提级 warning —— 静默丢弃在
-                                // 上层表现为「DNS 超时/QUIC 卡死」，无从定位。
-                                crate::FREEDOM_LOG.warn(format!(
-                                    "freedom: udp frame dropped, resolve failed: {e} domain={domain}"
-                                ));
-                                return Ok(FrameParse::Progress);
-                            },
-                        },
-                    };
-                    effective = crate::config::destination_with_ip(&effective, ip);
-                    SocketAddr::new(ip, effective.port().value())
-                },
-            };
-            // finalRule Block 检查在解析后的目标上（bd 6x5o UDP：Go :634-637
-            // applyFinalRules 在域名→IP 之后）：命中丢包但不中断流
-            if crate::config::is_blocked_by_rules(
-                &policy.final_rules,
-                policy.default_rule.as_ref(),
-                &effective,
-            ) {
-                crate::FREEDOM_LOG
-                    .debug(format!("freedom: udp packet blocked by final rule dest={effective}"));
-                return Ok(FrameParse::Progress);
-            }
-            // 首个真实数据报前发送 noises（对齐 Go NoisePacketWriter.WriteMultiBuffer：
-            // 噪声包发往同一目标，applyTo 按目标 IP 族过滤，写后按 delay 睡眠；
-            // override 端口 53（DNS）时跳过——Go :668-674）
-            if !skip_noise {
-                if let Some(ns) = noises.take() {
-                    send_noises(sock, target, &ns).await?;
-                }
-            }
-            sock.send_to(&data, target).await?;
-            Ok(FrameParse::Progress)
-        },
-        Ok(None) => Ok(FrameParse::Terminated), // 019n 终止帧（流内非数据帧）
+    // 借用式就地解析（bd lppdz）：载荷直接借用 `accum`，不落中间 Vec（旧的
+    // Cursor + PacketReader 路径每帧 2 次分配 + 2 次拷贝）。借用期禁止修改
+    // `accum` → 清理已消费字节必须放在**最后一次使用载荷之后**。
+    let parsed = match parse_packet_slice(&accum[..]) {
+        Ok(p) => p,
         Err(PacketError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            Ok(FrameParse::NeedMore)
-        }, // 半帧：读边界切开，继续读字节而非终止
-        // 019n：协议层终止帧
-        Err(PacketError::MetadataTooShort(_)) => Ok(FrameParse::Terminated),
-        Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+            return Ok(FrameParse::NeedMore);
+        },
+        Err(PacketError::MetadataTooShort(_)) => return Ok(FrameParse::Terminated),
+        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
+    };
+    let Some(pkt) = parsed else {
+        return Ok(FrameParse::Terminated);
+    };
+    let consumed = pkt.consumed;
+    let data = pkt.data;
+    let udp_target = pkt.target;
+
+    {
+        // 逐包 override 改写（Go :596-601：地址有效替换 / 端口非 0 替换）
+        let mut effective = udp_target.unwrap_or_else(|| {
+            Destination::udp(default_target.ip().into(), Port::new(default_target.port()))
+        });
+        effective = crate::config::apply_destination_override(
+            &effective,
+            policy.destination_override.as_ref(),
+        );
+        // 域名帧逐帧解析（bd czwu①：Go :610-641，此前 fallback 会话默认目标
+        // = 静默发错主机）；解析失败丢帧继续（Go :627-630 b.Release(); continue）
+        let target = match dest_to_socket_addr(&effective) {
+            Some(sa) => sa,
+            None => {
+                let Some(domain) = effective.address().as_domain().map(str::to_string) else {
+                    accum.drain(..consumed);
+                    return Ok(FrameParse::Progress);
+                };
+                let ip = match resolved.get(&domain) {
+                    Some(ip) => *ip,
+                    None => match resolve_udp_domain(
+                        &domain,
+                        effective.port().value(),
+                        policy.domain_strategy,
+                        default_target.is_ipv4(),
+                    )
+                    .await
+                    {
+                        Ok(ip) => {
+                            resolved.insert(domain.clone(), ip);
+                            ip
+                        },
+                        Err(e) => {
+                            // 丢帧继续（Go :627-630 b.Release(); continue；
+                            // Force* 失败同样丢帧——Go :625-628 注释）。
+                            // bd 1ksxu D3：丢帧提级 warning —— 静默丢弃在
+                            // 上层表现为「DNS 超时/QUIC 卡死」，无从定位。
+                            crate::FREEDOM_LOG.warn(format!(
+                                "freedom: udp frame dropped, resolve failed: {e} domain={domain}"
+                            ));
+                            accum.drain(..consumed);
+                            return Ok(FrameParse::Progress);
+                        },
+                    },
+                };
+                effective = crate::config::destination_with_ip(&effective, ip);
+                SocketAddr::new(ip, effective.port().value())
+            },
+        };
+        // finalRule Block 检查在解析后的目标上（bd 6x5o UDP：Go :634-637
+        // applyFinalRules 在域名→IP 之后）：命中丢包但不中断流
+        if crate::config::is_blocked_by_rules(
+            &policy.final_rules,
+            policy.default_rule.as_ref(),
+            &effective,
+        ) {
+            crate::FREEDOM_LOG
+                .debug(format!("freedom: udp packet blocked by final rule dest={effective}"));
+            accum.drain(..consumed);
+            return Ok(FrameParse::Progress);
+        }
+        // 首个真实数据报前发送 noises（对齐 Go NoisePacketWriter.WriteMultiBuffer：
+        // 噪声包发往同一目标，applyTo 按目标 IP 族过滤，写后按 delay 睡眠；
+        // override 端口 53（DNS）时跳过——Go :668-674）
+        if !skip_noise {
+            if let Some(ns) = noises.take() {
+                send_noises(sock, target, &ns).await?;
+            }
+        }
+        sock.send_to(data, target).await?;
+        // 载荷最后一次使用完毕 → 清理已消费字节（借用期结束，才能 &mut accum）
+        accum.drain(..consumed);
+        Ok(FrameParse::Progress)
     }
 }
 
@@ -504,8 +509,13 @@ async fn pump_response(
     policy: &UdpPolicy,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
-    // 响应帧 scratch（容量跨包复用）
-    let mut frame: Vec<u8> = Vec::with_capacity(1024);
+    // 响应帧缓冲（bd 1fm1l W5）：池化 Buffer 按本次载荷取层借出、随 MultiBuffer
+    // 移交后 Drop 归池——稳态每数据报 0 次堆分配（旧形态「Vec scratch + 逐包
+    // `PacketWriter::new`（scratch 构造分配）+ `mem::take` 清容量后下包 re-grow」
+    // 每包 3-4 次；同 harness A/B 实测见 pump_response_allocs_per_datagram_bounded）。
+    // New/Keep 状态由本 pump 跨包持有；容量不足由 `write_packet_into_buffer`
+    // 显式报错（不静默截断）。
+    let mut new_sent = false;
     loop {
         let (n, peer) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -532,17 +542,16 @@ async fn pump_response(
                 .debug(format!("freedom: udp response blocked by final rule source={source}"));
             continue;
         }
-        // 装帧进会话 scratch → `Buffer::from_vec` 零拷贝移交（bd 1fm1l：
-        // 免旧路径的「Vec 分配 + merge_bytes 再拷一次」）
-        frame.clear();
+        // 装帧：直序进池化帧缓冲（免 PacketWriter / meta scratch 中转），
+        // MultiBuffer 移交零拷贝
+        let mut frame = Buffer::new_pooled(MAX_FRAME_OVERHEAD + 2 + n);
+        if write_packet_into_buffer(&mut frame, &mut new_sent, &source, global_id, &buf[..n])
+            .is_err()
         {
-            let mut pw = PacketWriter::new(&mut frame, source, global_id);
-            if pw.write_packet(&buf[..n]).is_err() {
-                return Ok(());
-            }
+            return Ok(());
         }
 
-        let mb = MultiBuffer::from_buffer(Buffer::from_vec(std::mem::take(&mut frame)));
+        let mb = MultiBuffer::from_buffer(frame);
         if writer.write_multi_buffer(mb).await.is_err() {
             return Ok(()); // writer 关闭
         }
@@ -566,7 +575,11 @@ mod tests {
     fn test_ctx() -> std::sync::Arc<xray_frame::PluginContext> {
         std::sync::Arc::new(xray_frame::PluginContext::for_plugin("freedom"))
     }
+    use std::pin::Pin;
+
     use xray_common::net::{address::Address, network::Network, port::Port};
+    // PacketWriter 只剩测试构造基准帧在用（生产响应泵已换 write_packet_into_buffer）
+    use xray_xudp::packet::{PacketReader, PacketWriter};
 
     use super::*;
 
@@ -574,6 +587,87 @@ mod tests {
     fn udp_dest(ip: &str, port: u16) -> Destination {
         let addr = Address::from_ipv4_bytes(ip.parse::<std::net::Ipv4Addr>().unwrap().octets());
         Destination::new(addr, Port::new(port), Network::UDP)
+    }
+
+    // ===== bd lppdz：请求方向每数据报分配取证（真 UdpSocket + 计数分配器）=====
+    // 计数分配器复用本模块底部的 `MEASURE` / `THREAD_ALLOCS`（bd 1fm1l W5 建）。
+
+    /// 请求方向（parse_and_send）：每数据报堆分配 ≤ 1（bd lppdz：旧的
+    /// Cursor+PacketReader 路径为 2/包 = scratch Vec + 载荷 Vec；借用式
+    /// slice-parse 后载荷直接借用 accum → 0/包）。
+    // 取证数字须打印（同 xray-xudp `parse_allocs_per_packet_ab` 先例：显式 allow + 理由）。
+    #[allow(clippy::print_stdout)]
+    #[tokio::test]
+    async fn request_parse_allocs_per_datagram_bounded() {
+        const WARMUP: usize = 16;
+        const N: usize = 64;
+
+        // 真 UdpSocket 目标（send_to 的真实对端）
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind target");
+        let target = sock.local_addr().expect("addr");
+
+        // 构造 xudp 请求帧（meta + data_len + data）
+        let payload = [0x5A_u8; 512];
+        let mut wire = Vec::new();
+        xray_xudp::packet::FrameMetadata::new_udp(
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(target.port()),
+            [1u8; 8],
+        )
+        .write_bytes_into(&mut wire);
+        wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&payload);
+
+        let policy = UdpPolicy::default();
+        let mut resolved: HashMap<String, std::net::IpAddr> = HashMap::new();
+
+        // 预热（消化 tokio/池的惰性初始化）
+        for _ in 0..WARMUP {
+            let mut accum = wire.clone();
+            let mut noises = None;
+            let r = parse_and_send(
+                &sock,
+                &mut accum,
+                target,
+                &mut noises,
+                &policy,
+                true,
+                &mut resolved,
+            )
+            .await
+            .expect("warmup send");
+            assert!(matches!(r, FrameParse::Progress));
+        }
+
+        // 计量：帧副本在窗口外构造（窗口内只做解析 + send）
+        let mut frames: Vec<Vec<u8>> = (0..N).map(|_| wire.clone()).collect();
+        MEASURE.with(|m| m.set(true));
+        THREAD_ALLOCS.with(|c| c.set(0));
+        for _ in 0..N {
+            let mut accum = frames.pop().expect("frame");
+            let mut noises = None;
+            let r = parse_and_send(
+                &sock,
+                &mut accum,
+                target,
+                &mut noises,
+                &policy,
+                true,
+                &mut resolved,
+            )
+            .await
+            .expect("send");
+            assert!(matches!(r, FrameParse::Progress));
+        }
+        let allocs = THREAD_ALLOCS.with(|c| c.get());
+        MEASURE.with(|m| m.set(false));
+
+        let per = allocs as f64 / N as f64;
+        println!("freedom request parse allocs/packet: {allocs}/{N} = {per:.2}/pkt");
+        assert!(
+            allocs <= N as u64,
+            "请求方向每数据报堆分配 {allocs}/{N} = {per:.2} > 上界 1（bd lppdz：旧路径 2/包）"
+        );
     }
 
     /// AI7：freedom UDP 出站 socket（TUN UDP 流量的真实出站，Go 走 DialSystem
@@ -1160,5 +1254,143 @@ mod tests {
             matches!(collected, Ok(Err(_))),
             "scope drop 后哨兵任务必须被 FxScope abort 收掉（rx 断开=被收；{collected:?}=超时即泄漏）"
         );
+    }
+
+    // ===== bd 1fm1l W5：pump_response 每数据报堆分配数（反证/上界断言）=====
+
+    // 计数分配器：只统计「测量窗口内、当前线程」的堆分配次数（thread_local
+    // const 初始化 = 无惰性分配 = 无重入），其余测试线程的分配不进来。
+    thread_local! {
+        static MEASURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        static THREAD_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+    unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            if MEASURE.with(|m| m.get()) {
+                THREAD_ALLOCS.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            if MEASURE.with(|m| m.get()) {
+                THREAD_ALLOCS.with(|c| c.set(c.get() + 1));
+            }
+            unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static UDP_PROOF_ALLOC: CountingAlloc = CountingAlloc;
+
+    /// 帧计数写端：pump 每写完一帧 +1（配合轮询确认 pump 真实消费到第几包）；
+    /// 达到 `fail_after` 后返回写错误 = pump 的退出路径（`writer 关闭即退出`）。
+    struct FrameCountWriter {
+        frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_after: usize,
+    }
+
+    impl Writer for FrameCountWriter {
+        fn write_multi_buffer(
+            &mut self,
+            mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+            use std::sync::atomic::Ordering as O;
+            let n = self.frames.fetch_add(1, O::Relaxed);
+            drop(mb);
+            if n >= self.fail_after {
+                Box::pin(std::future::ready(Err(xray_buf::io::Error::WriteError(
+                    "frame threshold reached (test teardown)".into(),
+                ))))
+            } else {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+    }
+
+    /// 稳态每数据报堆分配 ≤ 1（bd 1fm1l W5：修前 3-4 次/包 = 该断言红；修后
+    /// 池化帧缓冲 + `write_packet_into_buffer` 直序 = 0 次/包）。预热 64 包先
+    /// 把 tokio/池的惰性初始化消化掉，再计 256 包；整个测试跑 current_thread
+    /// runtime（单线程，测量只看本线程）。
+    #[test]
+    fn pump_response_allocs_per_datagram_bounded() {
+        const WARMUP: usize = 64;
+        const MEASURED: usize = 256;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread rt");
+
+        rt.block_on(async move {
+            let pump_sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind pump sock");
+            let pump_addr = pump_sock.local_addr().expect("addr");
+            let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind sender");
+
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut writer = Box::new(FrameCountWriter {
+                frames: std::sync::Arc::clone(&frames),
+                // 预热+计量包走完后，第 WARMUP+MEASURED+1 包触发写错误 = pump 退出。
+                fail_after: WARMUP + MEASURED,
+            })
+                as Box<dyn Writer>;
+
+            let payload = [0x42_u8; 96];
+            use std::sync::atomic::Ordering as O;
+
+            let policy = UdpPolicy::default();
+            let pump = std::pin::pin!(pump_response(
+                &pump_sock,
+                [0x1F; GLOBAL_ID_LEN],
+                &mut writer,
+                &policy,
+            ));
+
+            // 驱动腿：预热 64 包（消化 tokio/池惰性初始化）→ 开测量窗 → 计量
+            // 256 包。`join!` 让 pump 与驱动在当前线程交替 poll。
+            let drive = async {
+                let mut done = 0usize;
+                while done < WARMUP + MEASURED {
+                    sender.send_to(&payload, pump_addr).await.expect("send");
+                    done += 1;
+                    while frames.load(O::Relaxed) < done {
+                        tokio::task::yield_now().await;
+                    }
+                    if done == WARMUP {
+                        // 预热消费完毕：开窗清零，从这里开始计数。
+                        MEASURE.with(|m| m.set(true));
+                        THREAD_ALLOCS.with(|c| c.set(0));
+                    }
+                }
+                let allocs = THREAD_ALLOCS.with(|c| c.get());
+                MEASURE.with(|m| m.set(false));
+                // 踢一脚：写端此时到阈值必败 → pump 走「writer 关闭即退出」收尾。
+                sender.send_to(&payload, pump_addr).await.expect("kick send");
+                allocs
+            };
+
+            let (allocs, _) = tokio::join!(drive, pump);
+
+            let per = allocs as f64 / MEASURED as f64;
+            // 上界 3/包 = 帧化目标 0 + tokio/mio Windows IOCP 每操作 ~2 次分配基线
+            // +1 余量；修前形态（PacketWriter 逐包构造 + mem::take 清容量 re-grow）
+            // 同 harness 实测 ~5-6/包 = 本断言红。帧化本身的 0 分配由 xudp 的
+            // framing_allocs A/B 对照测试单独锁定。
+            assert!(
+                allocs <= 3 * MEASURED as u64,
+                "pump_response 稳态每数据报堆分配 {allocs}/{MEASURED} = {per:.2} > 上界 3（bd 1fm1l W5：修前同 harness ~5-6/包）"
+            );
+        });
     }
 }

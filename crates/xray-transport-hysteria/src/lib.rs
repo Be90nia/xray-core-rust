@@ -88,6 +88,7 @@ pub mod error;
 pub mod gecko_socket;
 pub mod hub;
 pub mod hysteria_transport;
+pub mod masq_proxy;
 pub mod proto_config;
 pub mod quic_params;
 pub mod quinn_adapter;

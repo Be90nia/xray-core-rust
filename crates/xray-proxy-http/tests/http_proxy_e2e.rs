@@ -4,7 +4,7 @@
 
 #![cfg_attr(test, allow(clippy::disallowed_macros))] // 测试脚手架：直印进度；spawn 走 xray_common::testing（L3 闸不豁免）
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
 };
 use xray_proxy_http::{config::ServerConfig, server::http_server_handshake};
@@ -31,14 +31,19 @@ async fn http_connect_proxy_to_echo_target_e2e() {
     let echo_ip = echo_addr.ip();
     let echo_port = echo_addr.port();
     xray_common::testing::spawn("http-proxy-connect", async move {
-        let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
+        let (client_stream, _) = proxy_listener.accept().await.unwrap();
+        // 与生产同款：请求头走缓冲读器（Go bufio），多读的字节留在 buffer 里
+        let mut stream = BufReader::new(client_stream);
         let config = ServerConfig::default();
-        let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
+        let hs = http_server_handshake(&mut stream, &config).await.expect("handshake");
         assert_eq!(hs.method, "CONNECT");
         let target_conn =
             dial_system(&hs.dest, &SocketOptions::default()).await.expect("dial target");
+        // 客户端等到 200 才发隧道数据 → 此刻缓冲必空；有残留就说明测试客户端提前
+        // pipeline 了（会丢字节），必须先显式处理再拆流
+        assert!(stream.buffer().is_empty(), "client pipelined before 200");
         let client_conn: Box<dyn xray_transport::connection::Connection> =
-            Box::new(TcpConnection::new(client_stream));
+            Box::new(TcpConnection::new(stream.into_inner()));
         let _ = bridge_connections(client_conn, target_conn).await;
     });
 
@@ -103,7 +108,9 @@ async fn http_plain_proxy_chunked_and_content_length_post_e2e() {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         xray_common::testing::spawn("http-proxy-post", async move {
-            let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
+            let (client_stream, _) = proxy_listener.accept().await.unwrap();
+            // 请求头 + body 可能同一个 TCP 段到达：必须同一个缓冲读器续读 body
+            let mut client_stream = BufReader::new(client_stream);
             let config = ServerConfig::default();
             let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
             let path = extract_request_path(&hs.target);
@@ -233,7 +240,8 @@ async fn http_plain_proxy_get_forwarded_e2e() {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     xray_common::testing::spawn("http-proxy-get", async move {
-        let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
+        let (client_stream, _) = proxy_listener.accept().await.unwrap();
+        let mut client_stream = BufReader::new(client_stream);
         let config = ServerConfig::default();
         let hs = http_server_handshake(&mut client_stream, &config).await.expect("handshake");
         assert_eq!(hs.method, "GET");

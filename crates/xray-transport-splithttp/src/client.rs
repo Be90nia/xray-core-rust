@@ -395,10 +395,9 @@ impl DefaultDialerClient {
     /// `[h2, http/1.1]`（builder.rs:346）；用户 alpn 已在 register.rs
     /// decide_http_version 消费（本调用之前）。btls 分支不读
     /// config.alpn_protocols（指纹 ALPN 走模板/显式覆盖），不受影响。
-    /// `rtt_hint`：bd rjzw2 RTT 探针结果（TCP connect 计时，见 `flow_window` 模块）
-    /// ——**只进定窗日志**，不参与定窗：h2 窗组恒为静态保底（RTT 阶梯已撤，理由见
-    /// `flow_window` 模块头：探测 RTT ≠ 端到端 RTT，CDN 场景下缩 send_buf 即钉吞吐）。
-    /// h2 接收窗运行时不可调（无翻倍 API），只能握手前定。
+    /// h2 接收窗运行时不可调（无翻倍 API），只能握手前定：窗组 = 静态保底
+    /// （`flow_window::client_windows()`；RTT 探针已随 lf51l 删除——阶梯撤掉后它零
+    /// 消费者，却让每条代理连接多拨一条可指纹化的一次性 TCP）。
     #[must_use]
     pub fn new(
         config: Arc<Config>,
@@ -407,7 +406,6 @@ impl DefaultDialerClient {
         fingerprint: Option<Fingerprint>,
         security_json: Option<serde_json::Value>,
         tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
-        rtt_hint: Option<std::time::Duration>,
     ) -> Self {
         // SNI 用 tlsSettings.serverName（Go WithDestination 等价：空回退 dest.host）。
         let sni = if dial.sni.is_empty() { dial.host.clone() } else { dial.sni };
@@ -447,9 +445,8 @@ impl DefaultDialerClient {
         // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
         // 1MB/RTT。32/32MB 流窗/连窗 + 16MiB send 与 stream-one dialer.rs 同批同值
         // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
-        // bd rjzw2：三参数 = 静态保底（RTT 阶梯已撤，rtt_hint 只进日志；理由见
-        // flow_window 模块头）。
-        let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
+        // 窗组 = 静态保底（RTT 阶梯已撤；探针已删，见 flow_window 模块头）。
+        let win = crate::flow_window::client_windows();
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
@@ -917,21 +914,12 @@ mod tests {
             .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
     }
 
-    /// 撤阶梯防回档：任何 RTT 下 send_buf 都等于静态保底 16MiB、流窗保持 32MB。
-    /// 33bacd22 的 RTT 阶梯曾把 CDN 边缘 RTT（~30ms）当端到端 RTT 用，8MB send_buf
-    /// / 0.2s ≈ 40MB/s 直接成为吞吐上限（实测 35MB/s）；把阶梯复原 = 本测试红。
+    /// 撤阶梯防回档（33bacd22 曾把 CDN 边缘 RTT 当端到端 RTT 用，8MB send_buf
+    /// / 0.2s ≈ 40MB/s 直接成为吞吐上限，实测 35MB/s）：定窗函数不再收 RTT，
+    /// 窗组恒等于静态保底。阶梯若借尸还魂 = 本测试红（签名编译不过）。
     #[test]
-    fn h2_windows_do_not_follow_rtt() {
-        use std::time::Duration;
-        let w = |rtt| crate::flow_window::client_windows_from_rtt(rtt);
-        // None → 静态保底（永不劣于现状）。
-        assert_eq!(w(None), crate::flow_window::CLIENT_FALLBACK);
-        for ms in [1u64, 20, 39, 40, 80, 99, 100, 200] {
-            let win = w(Some(Duration::from_millis(ms)));
-            assert_eq!(win.max_send_buf, 16 * 1024 * 1024, "rtt={ms}ms 缩了 send_buf");
-            assert_eq!(win.stream_window, 32 * 1024 * 1024, "rtt={ms}ms 缩了流窗");
-            assert_eq!(win, crate::flow_window::CLIENT_FALLBACK, "rtt={ms}ms 窗组偏离保底");
-        }
+    fn h2_windows_are_static_fallback() {
+        assert_eq!(crate::flow_window::client_windows(), crate::flow_window::CLIENT_FALLBACK);
     }
 
     /// 1f43481b 防回档：完整 TCP connector（[`DestTcpConnector`] =
@@ -1111,7 +1099,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
     }
 
@@ -1142,7 +1129,6 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
-            None,
             None,
             None,
             None,
@@ -1195,7 +1181,6 @@ mod tests {
             config,
             client_tls(cert),
             DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
-            None,
             None,
             None,
             None,

@@ -419,15 +419,11 @@ async fn handle_accepted_stream<S>(
         serve_reality_conn(stream, peer, local, rc, probe, ctx).await;
     } else if let Some(tc) = tls {
         // Go hub.go:553-556 `gotls.NewListener`
-        // bd rjzw2：TLS accept 耗时 ≈ 1 RTT（ServerHello→Finished）+ 毫秒级 CPU
-        // —— 服务端 RTT 探针。阶梯已撤：该值**只进定窗日志**（flow_window 模块头）。
-        let started = xray_frame::compat::clock().now_instant();
         if let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tc).accept(stream).await {
-            let rtt_hint = started.elapsed();
-            serve_http_conn(tls_stream, peer, ctx, Some(rtt_hint)).await;
+            serve_http_conn(tls_stream, peer, ctx).await;
         }
     } else {
-        serve_http_conn(stream, peer, ctx, None).await;
+        serve_http_conn(stream, peer, ctx).await;
     }
 }
 
@@ -516,15 +512,8 @@ async fn drive_serve_guarded(
 
 /// h1 + h2c 自动协商的 HTTP 服务。对应 Go hub.go:564-578
 /// （`protocols.SetHTTP1(true)` + `SetUnencryptedHTTP2(true)` 的 http.Server）。
-///
-/// `rtt_hint`：bd rjzw2 服务端 RTT 探针结果（TLS/REALITY accept 耗时；明文
-/// 分支 None）——**只进定窗日志**，h2 窗组恒为静态保底（阶梯已撤）。
-async fn serve_http_conn<S>(
-    stream: S,
-    peer: SocketAddr,
-    ctx: Arc<HandlerContext>,
-    rtt_hint: Option<Duration>,
-) where
+async fn serve_http_conn<S>(stream: S, peer: SocketAddr, ctx: Arc<HandlerContext>)
+where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     use hyper::service::service_fn;
@@ -546,8 +535,8 @@ async fn serve_http_conn<S>(
     // builder 由 async move 块持有：serve_connection 借用 &self，装箱 future
     // 生命周期超出本函数栈帧。
     let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-        // bd rjzw2：三参数 = 静态保底（阶梯已撤；rtt_hint 只进定窗日志）。
-        let win = crate::flow_window::server_windows_from_rtt(rtt_hint);
+        // 窗组 = 静态保底（RTT 阶梯已撤；服务端 accept 计时随之删除，lf51l）。
+        let win = crate::flow_window::server_windows();
         let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         builder
             .http1()
@@ -755,7 +744,6 @@ async fn serve_reality_conn<S>(
 
     // bd rjzw2：REALITY 握手同为 TLS 1.3 往返（≈1 RTT + 认证/HMAC 毫秒级）
     // —— 服务端 RTT 探针。阶梯已撤：该值只进定窗日志。
-    let started = xray_frame::compat::clock().now_instant();
     // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
     // 模仿消费）；默认 rustls 路径行为不变。
     let outcome = if matches!(rc.server_acceptor, xray_reality::ServerAcceptorSetting::Btls) {
@@ -805,7 +793,7 @@ async fn serve_reality_conn<S>(
             // bd frxi：探测值随连接交付（rustls 无 record 层消费点，
             // mygg 后握手记录模仿落地前仅可观察）。
             crate::LOG.debug(format!("peer={peer} max_useless_records={max_useless_records} reality verified with probe result"));
-            serve_http_conn(tls, peer, ctx, Some(started.elapsed())).await
+            serve_http_conn(tls, peer, ctx).await
         },
         Ok(RealityServerOutcome::Invalid { conn, record, reason }) => {
             crate::LOG.debug(format!(
@@ -1217,30 +1205,38 @@ mod tests {
     #[tokio::test]
     async fn h3_accept_loop_panic_is_reported() {
         let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        // udf CI 教训②：callsite interest 是进程级缓存，thread-local `subscriber::set_default`
+        // 不触发重建——本进程内其他测试先评估过该 ERROR callsite 时，本测试恒捕 0 条
+        // （多核调度序决定谁先跑，s42cg 轮侥幸绿、lf51l 轮恒红）。`set_global_default`
+        // 注册全局 dispatcher 会 bump generation，强制全部 callsite 重算 interest。
+        let _ = tracing::subscriber::set_global_default(CaptureLogs(Arc::clone(&logs)));
         let addr: SocketAddr = "127.0.0.1:8443".parse().expect("addr");
         spawn_supervised_h3_accept(addr, async { panic!("h3 accept loop exploded") });
         // 监督 task 与被监督 task 的调度次序不确定：墙钟截止轮询等到监控落日志
         // （取时走 clock 端口，裸 Instant::now 被 lint 禁）
         let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
+        // 注意：**不能**「见到任何首条日志就 break」——crate 内各 LogFacade 懒初始化的
+        // banner（INFO）可能先于监督 ERROR 落进捕获（lf51l 轮实测），必须等到**内容
+        // 匹配**的行出现或超时。
         loop {
-            if !logs.lock().expect("log capture lock").is_empty() {
-                break;
+            {
+                let got = logs.lock().expect("log capture lock");
+                if got.iter().any(|m| {
+                    m.contains("ERROR")
+                        && m.contains("splithttp-h3")
+                        && m.contains("127.0.0.1:8443")
+                        && m.contains("h3 accept loop exploded")
+                }) {
+                    break;
+                }
             }
             assert!(
                 xray_frame::compat::clock().now_instant() < deadline,
-                "accept 循环 panic 无任何日志 = 静默死亡（端口仍绑、永不 accept）"
+                "accept 循环 panic 无 error 留痕 = 静默死亡（端口仍绑、永不 accept），捕获: {:?}",
+                logs.lock().expect("log capture lock")
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let got = logs.lock().expect("log capture lock");
-        assert!(
-            got.iter().any(|m| m.contains("ERROR")
-                && m.contains("splithttp-h3")
-                && m.contains("127.0.0.1:8443")
-                && m.contains("h3 accept loop exploded")),
-            "意外退出必须 error 级留痕（含 tag/local/panic 摘要），实际: {got:?}"
-        );
     }
 
     /// 服务端 h2 keep-alive PING 接线（wp9o 形态：hyper server http2 Builder
@@ -1403,6 +1399,120 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1, "handler should see 1 conn");
         drop(send_req);
         drop(endpoint);
+    }
+
+    /// h3 + stream-one：Rust 客户端 POST（带 body）→ Rust h3 服务端 → **完整响应体**回传。
+    ///
+    /// bd 1xfap：修前 Rust h3 客户端的 stream-one 走「**发完 body 才读响应**」的顺序
+    /// 两段（h3 的 RequestStream 收发共用 `&mut self`），而服务端 stream-one 是
+    /// **边收 body 边回响应**（Go 同款全双工）——客户端在 body 发完前等不到响应，
+    /// 连接被关、下行 0 字节（curl 52 Empty reply from server）。
+    ///
+    /// 本用例锁「h3 + stream-one 必须拿到完整响应体」（64 KiB 逐字节一致）。
+    #[tokio::test]
+    async fn h3_stream_one_returns_full_response_body() {
+        ensure_provider();
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&serde_json::json!({
+            "certificate": cert_pem,
+        }))
+        .unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
+
+        // 服务端：echo 型 handler（上行读多少回多少）。
+        let count = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&count);
+        let handler: ConnHandler = Arc::new(move |mut conn: Box<dyn Connection>| {
+            let c = Arc::clone(&c2);
+            c.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let n = match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if conn.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = conn.flush().await;
+                }
+            });
+        });
+
+        let mut settings = plain_settings();
+        settings.security = "tls".into();
+        settings.security_json = Some(serde_json::json!({
+            "alpn": ["h3"],
+            "certificates": [{ "certificate": cert_pem, "key": key_pem }],
+        }));
+        settings.transport_json =
+            Some(serde_json::json!({ "path": "/xhttp", "host": "localhost" }));
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen h3");
+        let addr = listener.local_addr().unwrap();
+
+        // 客户端：真 H3Conn（生产同路径：connect → dial_h3_stream_one）。
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": pin,
+                "alpn": ["h3"],
+            })),
+            "localhost",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let client_config = Arc::new(crate::config::Config {
+            host: "localhost".into(),
+            path: "/xhttp".into(),
+            mode: "stream-one".into(),
+            ..Default::default()
+        });
+        let h3 = crate::h3_client::H3Conn::connect_with_quic_params(
+            Arc::clone(&client_config),
+            addr,
+            "localhost",
+            (*client_tls).clone(),
+            None,
+            &SocketOptions::default(),
+        )
+        .await
+        .expect("h3 connect");
+        let base_uri = crate::dialer::build_request_url(
+            "https",
+            &format!("localhost:{}", addr.port()),
+            &client_config.normalized_path(),
+            &client_config.normalized_query(),
+        );
+        let mut conn = crate::dialer::dial_h3_stream_one(
+            crate::mux::wrap_xmux_client(h3),
+            base_uri,
+            String::new(),
+        )
+        .await
+        .expect("dial h3 stream-one");
+
+        // 上行 64 KiB（服务端 echo）→ **上传不结束**（不半关写向）也必须能读到完整
+        // 下行——xhttp stream-one 的真实形态就是活流上传（Go 侧收发并发）。
+        let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        conn.write_all(&payload).await.expect("write upload");
+        let _ = conn.flush().await;
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+            .await
+            .expect("h3 stream-one download must finish while upload is still open")
+            .expect("h3 stream-one download must succeed");
+        assert_eq!(got, payload, "h3 stream-one must return the full response body");
+        assert_eq!(count.load(Ordering::SeqCst), 1, "handler should see 1 conn");
+        let _ = conn.shutdown().await;
     }
 
     /// REALITY listener 创建 + 非 REALITY 流量 fallback：

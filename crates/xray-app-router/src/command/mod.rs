@@ -72,8 +72,10 @@ impl RoutingService {
         self.router()?.remove_rule(tag)
     }
 
-    /// 列出规则 tag。委托 [`Router::list_rules`]。
-    pub fn list_rule(&self) -> Result<Vec<String>, RouterError> {
+    /// 列出当前规则的 `(出站 tag, 规则 tag)`。委托 [`Router::list_rules`]。
+    ///
+    /// 对应 Go `Router.ListRule`：balancer 规则出站 tag 为空串（Go 同款）。
+    pub fn list_rule(&self) -> Result<Vec<(String, String)>, RouterError> {
         Ok(self.router()?.list_rules())
     }
 
@@ -151,7 +153,7 @@ mod tests {
         let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
-        assert_eq!(s.list_rule().unwrap(), Vec::<String>::new());
+        assert_eq!(s.list_rule().unwrap(), Vec::<(String, String)>::new());
     }
 
     #[test]
@@ -203,8 +205,13 @@ mod tests {
             ..RoutingRule::default()
         };
         s.add_rule("rule-1".to_string(), proto).expect("add_rule");
-        let tags = s.list_rule().unwrap();
-        assert!(tags.contains(&"rule-1".to_string()));
+        let rules = s.list_rule().unwrap();
+        assert!(rules.iter().any(|(_, rt)| rt == "rule-1"));
+        // bd o1a9p：出站 tag 随规则一并返回（对齐 Go ListRuleItem{tag, ruleTag}）。
+        assert!(
+            rules.iter().any(|(tag, rt)| tag == "out-A" && rt == "rule-1"),
+            "outbound tag must round-trip, got {rules:?}"
+        );
     }
 
     /// get_principle_target: unknown balancer → BalancerNotFound 错误。

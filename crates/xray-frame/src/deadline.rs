@@ -17,7 +17,7 @@
 //! 强约束映射（模型 §2）：L3-2 禁裸 sleep、L3-5 禁 `Instant::now`——时间
 //! 读取只走 [`Clock`] 契约（装甲 #19 单调/挂钟双口分流）。
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use skeleton::clock::Clock;
 
@@ -251,6 +251,29 @@ impl Budget {
     pub fn remaining(&self, d: Duration) -> Duration {
         d.saturating_sub(self.elapsed())
     }
+
+    /// arm 一个可重置计时器（idle-reset 形态；bd 23vrp timer-arm 面）。
+    ///
+    /// 锚点 = **arm 调用时刻**（与 `Sleep::reset(Instant::now() + d)` 同语义，
+    /// 即 idle 计时业务上的「自最近一次活动起」）——不是 `Budget` 起点加 `d`；
+    /// 以预算起点为锚的形态用 [`Budget::deadline`]。溢出（荒谬时限）→ 立即
+    /// 可触发（fail-closed，同 [`Budget::deadline`]）。
+    pub fn arm_timer(&self, d: Duration) -> BudgetTimer {
+        match &self.source {
+            BudgetSource::Tokio => {
+                let now = tokio::time::Instant::now();
+                let at = now.checked_add(d).unwrap_or(now);
+                BudgetTimer {
+                    inner: TimerInner::Tokio { sleep: Box::pin(tokio::time::sleep_until(at)), at },
+                }
+            },
+            BudgetSource::Wall(clock) => {
+                let now = clock.now_instant();
+                let at = now.checked_add(d).unwrap_or(now);
+                BudgetTimer { inner: TimerInner::Wall { clock: Arc::clone(clock), at } }
+            },
+        }
+    }
 }
 
 /// 预算截止点（两源统一表达）。
@@ -352,5 +375,87 @@ async fn mint_elapsed() -> tokio::time::error::Elapsed {
     match tokio::time::timeout(Duration::ZERO, std::future::pending::<()>()).await {
         Err(elapsed) => elapsed,
         Ok(_) => unreachable!("零时长 timeout 必判负（tokio 契约）"),
+    }
+}
+
+// =========================================================================
+// 预算计时器臂（timer-arm 面，bd 23vrp）：可重置 idle timer
+// =========================================================================
+
+/// 计时器内部形态（绝对时刻不出本件，同 [`BudgetInstant`] 约束）。
+enum TimerInner {
+    /// tokio 计时器本体（`Sleep: !Unpin` → `Box::pin` 保持 [`BudgetTimer`] 可移动）。
+    Tokio {
+        sleep: Pin<Box<tokio::time::Sleep>>,
+        /// 当前锚点（arm/reset 更新；`is_expired` 判定用）。
+        at: tokio::time::Instant,
+    },
+    /// 墙钟轮询（到期由 `Clock` 决定；`at` 为墙钟锚点）。
+    Wall { clock: Arc<dyn Clock>, at: std::time::Instant },
+}
+
+/// 可重置预算计时器（idle-reset 形态）：`tokio::time::Sleep` + `Sleep::reset`
+/// 的 [`Budget`] 封装（bd 23vrp；tuic udp-assoc idle / 同族站点的迁移面）。
+///
+/// 绝对时刻只存在于本件内部（与 [`Budget`]/[`BudgetDeadline`] 同一构造约束：
+/// 经 [`Budget::arm_timer`] 构造，调用面只有 `reset(dur)` / `expired()` /
+/// `is_expired()`，无任何 `tokio::time::Instant` 出入口）。
+///
+/// - **Tokio 源**：封装 `tokio::time::Sleep`，`reset` 语义逐一对齐——已触发/
+///   未触发态均可重置；`tokio::select!` 竞争输掉（future 被 drop）后计时状态 保留在 `Sleep`
+///   本体，重进 select 不丢窗（与裸 `&mut Sleep` 完全同构）； `tokio::time::advance`
+///   虚拟推进语义完整保留。
+/// - **Wall 源**：墙钟轮询，到期判定完全由 `Clock` 决定（冻结 → 永不触发； 推进越过锚点 →
+///   触发），语义同 [`BudgetDeadline::timeout`] 的 wall 臂。
+pub struct BudgetTimer {
+    inner: TimerInner,
+}
+
+// tokio 虚拟钟计时桥本体（与 [`Budget`]/[`BudgetDeadline`] 同一唯一登记面；
+// 见上方 Budget impl 注释：713x6 裁决 tokio 面不迁 udf，墙钟走 wall(Clock) 出口）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tokio 虚拟钟计时桥本体（唯一登记面，bd 23vrp timer-arm）：arm/reset 只收 tokio Instant，接 udf Clock 即作废虚拟推进语义（713x6）；墙钟语义走 wall(Clock) 出口"
+)]
+impl BudgetTimer {
+    /// 重置计时窗口：自**此刻**起再计 `d`（idle-reset 语义——"最近一次活动起
+    /// 重新计时"；等价 `Sleep::reset(Instant::now() + d)`）。已触发/未触发态
+    /// 均可调用（tokio `Sleep::reset` 契约）。
+    pub fn reset(&mut self, d: Duration) {
+        match &mut self.inner {
+            TimerInner::Tokio { sleep, at } => {
+                // 溢出（恒非法 = 调用方给了荒谬时限）→ 锚点停在当前时刻（立即
+                // 可触发，fail-closed，同 [`Budget::deadline`] 的溢出臂）。
+                let now = tokio::time::Instant::now();
+                *at = now.checked_add(d).unwrap_or(now);
+                sleep.as_mut().reset(*at);
+            },
+            TimerInner::Wall { clock, at } => {
+                let now = clock.now_instant();
+                *at = now.checked_add(d).unwrap_or(now);
+            },
+        }
+    }
+
+    /// 等到触发（idle 到期）。可在触发前被 [`reset`](Self::reset) 重新武装
+    /// （`tokio::select!` 竞争输掉后重进本 future 不丢窗，见类型文档）。
+    pub async fn expired(&mut self) {
+        match &mut self.inner {
+            TimerInner::Tokio { sleep, .. } => sleep.as_mut().await,
+            TimerInner::Wall { clock, at } => loop {
+                if clock.now_instant() >= *at {
+                    return;
+                }
+                tokio::time::sleep(WALL_POLL_INTERVAL).await;
+            },
+        }
+    }
+
+    /// 是否已触发（Tokio 源随虚拟时间；Wall 源随 `Clock`）。
+    pub fn is_expired(&self) -> bool {
+        match &self.inner {
+            TimerInner::Tokio { at, .. } => tokio::time::Instant::now() >= *at,
+            TimerInner::Wall { clock, at } => clock.now_instant() >= *at,
+        }
     }
 }

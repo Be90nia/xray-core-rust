@@ -225,6 +225,71 @@ impl OutboundHandler for Outbound {
     }
 }
 
+/// dispatcher 适配器：把 metrics [`Outbound`] 挂进生产出站表
+/// （`xray_app_dispatcher::DispatchHandler`，bd 0z7zt）。
+///
+/// 对应 Go `app/metrics/outbound.go:59-103` 的 `Outbound`（`outbound.Handler`）：
+/// 路由规则 `outboundTag` 命中本 tag 后，dispatcher 把
+/// [`xray_transport::link::Link`] 交给 `dispatch`——Link →
+/// [`xray_transport::cnc::ContentNetworkConnection`]（on-close 信号对齐 Go
+/// `ConnectionOnClose(closeSignal)`）→ 投递内部 listener → 阻塞等连接关闭
+/// （Go `<-closeSignal.Wait()`，outbound.go:84）。
+///
+/// 实现模式与本仓已验证先例同款：`xray-app-commander/src/server.rs:186-232`
+/// （Commander tag 形态的 `OutboundHandlerImpl`）。
+pub struct MetricsDispatchHandler {
+    outbound: Arc<Outbound>,
+}
+
+impl MetricsDispatchHandler {
+    /// 包裹 metrics outbound（tag 取自 outbound）。
+    #[must_use]
+    pub fn new(outbound: Arc<Outbound>) -> Self {
+        Self { outbound }
+    }
+}
+
+impl std::fmt::Debug for MetricsDispatchHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsDispatchHandler")
+            .field("tag", &self.outbound.tag())
+            .field("closed", &self.outbound.is_closed())
+            .finish_non_exhaustive()
+    }
+}
+
+impl xray_app_dispatcher::DispatchHandler for MetricsDispatchHandler {
+    fn tag(&self) -> &str {
+        self.outbound.tag()
+    }
+
+    fn dispatch(
+        &self,
+        _dest: &Destination,
+        link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        let outbound = Arc::clone(&self.outbound);
+        let closed = self.outbound.is_closed();
+        Box::pin(async move {
+            if closed {
+                // Go outbound.go:68-72：closed → Interrupt 两侧。Rust：drop link
+                // 两半即中断（reader/writer 落地即断）。
+                return;
+            }
+            let (reader, writer) = link.into_parts();
+            let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+            let conn = xray_transport::cnc::ContentNetworkConnection::new(reader, writer)
+                .with_on_close(move || {
+                    let _ = close_tx.send(());
+                });
+            outbound.dispatch(Box::new(conn));
+            // Go outbound.go:84 `<-closeSignal.Wait()`：HTTP server 消费完连接
+            // （Drop 触发 on_close）前，本 dispatch 任务保持存活。
+            let _ = close_rx.await;
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

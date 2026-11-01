@@ -36,7 +36,8 @@ pub use error::{MetricsError, at_error, at_warning};
 pub use feature::MetricsFeature;
 pub use metrics::{
     MetricsHandler, MetricsHttpServer, NoopHttpServer, ObservationCollector, ObservationEntry,
-    ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, StatsCollector,
-    StatsSnapshot, TokioHttpServer, TrafficCount, aggregate_counters, format_prometheus,
-    parse_counter_name,
+    ObservationSnapshot, OutboundRegistrar, RecordingOutboundRegistrar, SimpleOhmOutboundRegistrar,
+    StatsCollector, StatsSnapshot, TokioHttpServer, TrafficCount, aggregate_counters,
+    format_prometheus, parse_counter_name,
 };
+pub use outbound::MetricsDispatchHandler;

@@ -256,8 +256,15 @@ mod tests {
                 buf.advance(0);
                 mb.push(std::mem::replace(&mut buf, Buffer::with_capacity(1)));
             }
-            w.write_multi_buffer(mb).await.unwrap();
-            let got = r.read_multi_buffer().await.unwrap();
+            // 本仓无 per-test 超时：写端一旦吞帧（历史形态 `mb.is_empty() → Ok(())`），
+            // 读端 read_exact 永久等 2B 帧头，整个 `--lib` 跑到 1200s 被 kill 都不出新
+            // 结果（bd 33ll3 现场）。墙钟把「挂死」变成 5s 内的红。
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                w.write_multi_buffer(mb).await.unwrap();
+                r.read_multi_buffer().await.unwrap()
+            })
+            .await
+            .expect("uot 帧往返超过 5s：写端吞帧或读端永等帧头（挂死形态）");
             let mut out = Vec::new();
             for buf in got.iter() {
                 out.extend_from_slice(buf.bytes());

@@ -1,12 +1,15 @@
 //! TUIC v5 Address 编解码（对应 tuic-core protocol/address.rs）。
 //!
 //! 编码：
-//! - `None`：`0xff` + `0x00 0x00`（端口占位）
+//! - `None`：`0xff`（**仅 1 字节**——spec：端口编码在域名/IP 之后，None 无端口）
 //! - `Domain`：`0x00` + len(1) + name + port(2)
 //! - `IPv4`：`0x01` + addr(4) + port(2)
 //! - `IPv6`：`0x02` + addr(16) + port(2)
 //!
-//! 端口 0 用于 None 地址，符合 tuic-core 约定。
+//! 参考实现 tuic 5.0.0-pre-alpha6（`Address::len()`：None=1）与第三方 sing-box
+//! （`AddressSerializer` None 分支只写类型字节）均如此；旧写法（None 带 2B 端口
+//! 占位）会让第三方解析**分片后续片**时错位 → `unexpected EOF` → 整包丢
+//! （bd j7de2 F4）。
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -58,12 +61,18 @@ impl Address {
     /// 主机地址字符串（None 返空串）。
     /// 序列化到 [`BufMut`]（对应 tuic-core marshal）。
     ///
-    /// 长度：None=3, IPv4=7, IPv6=19, Domain=1+len(domain)+2。
+    /// 长度：None=1, IPv4=7, IPv6=19, Domain=1+len(domain)+2。
+    ///
+    /// **None 只有 1 字节**（`0xff`）：TUIC v5 spec 规定「端口编码在域名/IP 之后」，
+    /// None 既无域名也无 IP → 无端口；参考实现（tuic 5.0.0-pre-alpha6
+    /// `Address::len()` = 1）与第三方 sing-box（`AddressSerializer` None 分支只写
+    /// 类型字节）均如此。本仓旧写法（`0xff` + 2B 端口占位 = 3B）会让第三方在解析
+    /// **分片的后续片**时整体错位 → 读载荷报 `unexpected EOF` → 整包被丢
+    /// （bd j7de2 F4 vs sing-box：≥1190B 起丢的根因）。
     pub fn write_to<B: BufMut>(&self, buf: &mut B) {
         match self {
             Self::None => {
                 buf.put_u8(ATYP_NONE);
-                buf.put_u16(0);
             },
             Self::Domain(name, port) => {
                 let bytes = name.as_bytes();
@@ -95,7 +104,7 @@ impl Address {
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         match self {
-            Self::None => 3,
+            Self::None => 1,
             Self::Domain(name, _) => 1 + 1 + name.len() + 2,
             Self::Ipv4(_, _) => 1 + 4 + 2,
             Self::Ipv6(_, _) => 1 + 16 + 2,
@@ -104,15 +113,12 @@ impl Address {
 
     /// 从 [`Buf`] 解析（对应 tuic-core unmarshal）。
     pub fn read_from<B: Buf>(buf: &mut B) -> Result<Self> {
-        if buf.remaining() < 3 {
-            return Err(TuicError::UnexpectedEof("address atyp+port"));
+        if buf.remaining() < 1 {
+            return Err(TuicError::UnexpectedEof("address atyp"));
         }
         let atyp = buf.get_u8();
         match atyp {
-            ATYP_NONE => {
-                let _port = buf.get_u16();
-                Ok(Self::None)
-            },
+            ATYP_NONE => Ok(Self::None),
             ATYP_DOMAIN => {
                 if buf.remaining() < 1 {
                     return Err(TuicError::UnexpectedEof("domain length"));
@@ -168,6 +174,18 @@ mod tests {
     #[test]
     fn none_roundtrip() {
         roundtrip(&Address::None);
+    }
+
+    /// bd j7de2 F4 线契约：None 地址**只有 1 字节** `0xff`（spec：端口在
+    /// 域名/IP 之后；参考实现 tuic 5.0.0-pre-alpha6 `Address::len()`=1；
+    /// 第三方 sing-box 同款）。带 2B 端口占位会让第三方在解析**分片后续片**
+    /// 时错位 → `unexpected EOF` → 整包被丢（vs sing-box ≥1190B 起丢）。
+    #[test]
+    fn none_address_is_single_type_byte() {
+        let mut buf = Vec::new();
+        Address::None.write_to(&mut buf);
+        assert_eq!(buf, vec![0xff], "None 地址必须只写类型字节");
+        assert_eq!(Address::None.encoded_len(), 1);
     }
 
     #[test]

@@ -102,6 +102,14 @@ impl TempUdpRelay {
         self.socket.local_addr()
     }
 
+    /// 当前 expectedRemote（= Go `TempUDPConn.RemoteAddr()`：首个被接受数据报的
+    /// 源地址；端口 0 表示尚未锁定）。XUDP GlobalID 的入站源取此值（bd kol4a，
+    /// Go `proxy/socks/server.go:243` `newInbound.Source =
+    /// net.DestinationFromAddr(conn.RemoteAddr())`——是 UDP 源，不是 TCP 对端）。
+    pub fn expected_addr(&self) -> SocketAddr {
+        *self.expected()
+    }
+
     fn expected(&self) -> parking_lot::MutexGuard<'_, SocketAddr> {
         self.expected.lock()
     }

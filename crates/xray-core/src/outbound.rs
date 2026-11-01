@@ -529,12 +529,16 @@ impl ApiOutboundRuntime {
 impl xray_app_commander::OutboundRuntime for ApiOutboundRuntime {
     fn add_outbound(&self, cfg: &OutboundHandlerConfigProto) -> std::result::Result<(), String> {
         let ob = built_outbound_from_proto(cfg).map_err(|e| e.to_string())?;
+        // Go `app/proxyman/command/handlers.go` AddHandler：tag 已存在即
+        // "existing tag found"（快路径，先于构建）。
         if self.ohm.get_handler(&cfg.tag).is_some() {
             return Err(format!("existing tag found: {}", cfg.tag));
         }
         let handler = build_single_outbound(&ob).map_err(|e| e.to_string())?;
-        self.ohm.add(&cfg.tag, handler);
-        Ok(())
+        // bd 9c8k6 ③：**权威**判定在 `add_if_absent` 内（查重 + 插入同一临界区）。
+        // 旧实现此处直接 `ohm.add`（upsert 覆盖）：并发同 tag 两个请求都能通过上面的
+        // 快路径查重，后者静默覆盖前者的 handler ⇒ 输家拿到"成功"但 handler 被换掉。
+        self.ohm.add_if_absent(&cfg.tag, handler)
     }
 
     fn remove_outbound(&self, tag: &str) -> std::result::Result<(), String> {
@@ -742,6 +746,14 @@ pub(crate) fn build_protocol_handler(
     Err(BuildError::Unsupported(ob.entry.kind.clone()))
 }
 
+/// XUDP GlobalID 派生的入站协议白名单（bd kol4a）。
+///
+/// 逐字对齐 Go `xudp.GetGlobalID`（`common/xudp/xudp.go:69-70`）：
+/// `inbound.Name ∈ {dokodemo-door, socks, shadowsocks, tun}` 且源为 UDP 才派生；
+/// 其余协议（vless/vmess/trojan/tuic/hysteria/wg…）在 Go 侧恒返回零值
+/// ⇒ New 帧不带 GlobalID、服务端不按 cone 复用。
+const GO_CONE_INBOUND_WHITELIST: [&str; 4] = ["dokodemo-door", "socks", "shadowsocks", "tun"];
+
 /// Mux outbound handler（mbc/nww）。
 ///
 /// 持有 mux `ClientManager`。dispatch 时 pick worker → `ClientWorker::dispatch`
@@ -888,10 +900,11 @@ impl DispatchHandler for MuxBridge {
 
     /// bd 4jyhm：带源调度（Go client.go:271 `xudp.GetGlobalID(ctx)`）——
     /// UDP 目标 + cone 启用（`xray.cone.disabled` 未设）时按入站源
-    /// （`access.from`，协议层 UDP relay 填充）计算 XUDP GlobalID 随 New 帧
-    /// 下发，服务端按 GlobalID 复用 cone 会话。TCP/无源走普通 dispatch。
-    /// Go 另按 inbound.Name 白名单（dokodemo/socks/shadowsocks/tun）过滤；
-    /// Rust 侧 UDP relay 链路必带 from，等价语义由「from 非空 + UDP dest」表达。
+    /// （`access.from`）计算 XUDP GlobalID 随 New 帧下发，服务端按 GlobalID
+    /// 复用 cone 会话。TCP/无源/非白名单入站走普通 dispatch。
+    /// 入站白名单逐字对齐 Go（`xudp.go:69-70`，见
+    /// [`GO_CONE_INBOUND_WHITELIST`]；bd kol4a 起 relay 面接线 `from` +
+    /// `inbound_name`，白名单由本方法显式判定而非「from 非空」近似）。
     fn dispatch_with_access(
         &self,
         dest: &Destination,
@@ -910,6 +923,15 @@ impl DispatchHandler for MuxBridge {
             }
         }
         if dest.network() != xray_common::net::network::Network::UDP || access.from.is_empty() {
+            return self.dispatch(dest, link);
+        }
+        // bd kol4a：入站协议白名单对齐 Go `xudp.GetGlobalID`
+        // （common/xudp/xudp.go:69-70——仅 dokodemo-door/socks/shadowsocks/tun
+        // 四族派生 GlobalID；vless/vmess/trojan 等 UDP relay 在 Go 侧返回零值）。
+        // 此前 4jyhm 以「from 非空 + UDP dest」近似；relay 接线后 from 的填写面
+        // 不再与白名单重合，白名单必须显式判定（否则 vless relay 填 from 即静默
+        // 扩大 cone 面）。
+        if !GO_CONE_INBOUND_WHITELIST.contains(&access.inbound_name.as_str()) {
             return self.dispatch(dest, link);
         }
         let dest = dest.clone();
@@ -1723,6 +1745,17 @@ impl DispatchHandler for DnsDispatchBridge {
     }
 }
 
+/// TCP 客户端回写队列容量（uwq9n）：有界即防「客户端不读」时的无界增长。
+const DNS_CLIENT_QUEUE: usize = 16;
+
+/// 客户端写者任务收到的两种消息（uwq9n）。
+enum ClientWrite {
+    /// 一个待写帧（FIFO 落序 = 生产序）。
+    Frame(xray_buf::multi::MultiBuffer),
+    /// 会话收尾：排空在队帧后 `shutdown()` 并结束。
+    Shutdown,
+}
+
 /// DNS link 分发主体（Go `Handler.Process` 的 request/response 双 loop）。
 ///
 /// 客户端侧帧格式由 `client_is_udp` 决定（Go `dns.go:163` `srcNetwork`）：
@@ -1863,7 +1896,31 @@ async fn dispatch_dns_link(
     // 空闲窗 = 注入的 policy ConnectionIdle（G14；Go dns.go:226 同值语义，
     // 每轮读超时重置 = inactivity 计时）。
 
-    let writer = Arc::new(tokio::sync::Mutex::new(link.writer));
+    // 客户端写者 = 单 owner 任务 + 帧队列（uwq9n）。修前两侧 loop 抢一把
+    // `Mutex<Box<dyn Writer>>` 且**持锁跨写 await**：客户端连上却不读响应时写
+    // 卡在不可取消的 future 里，另一侧 loop 卡在同一把锁上，于是两侧的读超时都
+    // 不再被 poll → 会话永不结束（Go 的 `writer` 无互斥，`signal.CancelAfterInactivity`
+    // 走 `task.Run` 的 ctx 直接放弃阻塞 goroutine）。改成 writer 单 owner：
+    // 生产者只入队、写者独占写，任一 loop 都不需要共享锁。
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<ClientWrite>(DNS_CLIENT_QUEUE);
+    let mut writer_task = {
+        let tag = tag.clone();
+        let mut writer = link.writer;
+        tokio::spawn(async move {
+            while let Some(msg) = client_rx.recv().await {
+                match msg {
+                    ClientWrite::Frame(mb) => {
+                        if let Err(e) = writer.write_multi_buffer(mb).await {
+                            tracing::debug!(tag = %tag, "dns client write: {e}");
+                            break;
+                        }
+                    },
+                    ClientWrite::Shutdown => break,
+                }
+            }
+            writer.shutdown();
+        })
+    };
     // lazy 上游写半连接（Go outboundConn：Write 首拨）。读半连接经 channel
     // 移交 response loop（Go connReady channel 的等价物）。
     let write_slot: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>> =
@@ -1872,7 +1929,7 @@ async fn dispatch_dns_link(
 
     // response loop：读上游 TCP 帧 → 回写客户端（Go response()，dns.go:286-304）。
     let response_loop = {
-        let writer = Arc::clone(&writer);
+        let client_tx = client_tx.clone();
         let tag = tag.clone();
         use tokio::io::AsyncReadExt as _;
         async move {
@@ -1893,15 +1950,15 @@ async fn dispatch_dns_link(
                 frames.clear();
                 decoder.feed(&buf[..n], &mut frames);
                 for frame in frames.drain(..) {
-                    let resp = match xray_proxy_dns::encode_tcp_dns_message(&frame) {
-                        Ok(f) => f,
-                        Err(_) => continue,
+                    let Ok(resp) = xray_proxy_dns::encode_tcp_dns_message(&frame) else {
+                        continue;
                     };
                     let mb = xray_buf::multi::MultiBuffer::from_buffer(
                         xray_buf::buffer::Buffer::from_vec(resp),
                     );
-                    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
-                        tracing::debug!(tag = %tag, "dns client write: {e}");
+                    // 入队背压留在本 loop（写者卡住时它停在入队处，会话由
+                    // request loop 的读超时收尾）；队列关闭 = 会话已收尾。
+                    if client_tx.send(ClientWrite::Frame(mb)).await.is_err() {
                         return;
                     }
                 }
@@ -1910,7 +1967,7 @@ async fn dispatch_dns_link(
     };
 
     // request loop：读客户端帧 → 决策（Go request()，dns.go:229-284）。
-    let writer_for_req = Arc::clone(&writer);
+    let client_tx_for_req = client_tx.clone();
     let request_loop = async move {
         let mut decoder = DnsFrameDecoder::new();
         let mut frames = Vec::new();
@@ -1931,7 +1988,7 @@ async fn dispatch_dns_link(
                     write_or_inline_upstream(
                         &write_slot,
                         &read_tx,
-                        &writer_for_req,
+                        &client_tx_for_req,
                         &tag,
                         &upstream,
                         &query,
@@ -1945,13 +2002,13 @@ async fn dispatch_dns_link(
                         tracing::debug!(tag = %tag, "dns tcp query dropped by rule");
                     },
                     Ok(xray_proxy_dns::ProcessOutcome::Respond { response }) => {
-                        write_client_frame(&writer_for_req, &tag, &response).await;
+                        write_client_frame(&client_tx_for_req, &tag, &response);
                     },
                     Ok(xray_proxy_dns::ProcessOutcome::Forward { query }) => {
                         write_or_inline_upstream(
                             &write_slot,
                             &read_tx,
-                            &writer_for_req,
+                            &client_tx_for_req,
                             &tag,
                             &upstream,
                             &query,
@@ -1962,11 +2019,11 @@ async fn dispatch_dns_link(
                     Ok(xray_proxy_dns::ProcessOutcome::Hijack { query }) => {
                         // Go: go h.handleIPQuery(...)——异步不阻塞请求循环。
                         if let Some(svc) = dns_service.clone() {
-                            let w = Arc::clone(&writer_for_req);
+                            let w = client_tx_for_req.clone();
                             let t = tag.clone();
                             tokio::spawn(async move {
                                 if let Some(resp) = handle_ip_query(&query, &svc).await {
-                                    write_client_frame(&w, &t, &resp).await;
+                                    write_client_frame(&w, &t, &resp);
                                 }
                             });
                         }
@@ -1984,21 +2041,27 @@ async fn dispatch_dns_link(
         _ = request_loop => {},
         _ = response_loop => {},
     }
-    writer.lock().await.shutdown();
+    // 收尾（Go `terminate`）：Shutdown 排在已入队帧之后 → 正常路径排空后
+    // `shutdown()`；客户端不读时写者卡在不可取消的写里，最多再等一个空闲窗
+    // 就放弃（Go 同样放弃阻塞的 response goroutine，不等它）。
+    let _ = client_tx.try_send(ClientWrite::Shutdown);
+    if tokio::time::timeout(timeout, &mut writer_task).await.is_err() {
+        writer_task.abort();
+    }
 }
 
-/// 写客户端（TCP 帧）。
-async fn write_client_frame(
-    writer: &Arc<tokio::sync::Mutex<Box<dyn xray_buf::io::Writer>>>,
-    tag: &str,
-    msg: &[u8],
-) {
+/// 入队一个客户端回写帧（TCP 帧编码）。
+///
+/// **不持锁、不阻塞**（uwq9n）：写者归单 owner 任务，这里只入队；队满（= 写者
+/// 卡在不可取消的写里，即客户端不读）丢帧留痕，绝不反压读循环——反压会让本
+/// loop 的读超时不再被 poll，正是本票的挂死形态。
+fn write_client_frame(tx: &tokio::sync::mpsc::Sender<ClientWrite>, tag: &str, msg: &[u8]) {
     let Ok(framed) = xray_proxy_dns::encode_tcp_dns_message(msg) else {
         return;
     };
     let mb = xray_buf::multi::MultiBuffer::from_buffer(xray_buf::buffer::Buffer::from_vec(framed));
-    if let Err(e) = writer.lock().await.write_multi_buffer(mb).await {
-        tracing::debug!(tag = %tag, "dns client write: {e}");
+    if let Err(e) = tx.try_send(ClientWrite::Frame(mb)) {
+        tracing::warn!(tag = %tag, "dns client write queue full/closed, response dropped: {e}");
     }
 }
 
@@ -2007,7 +2070,7 @@ async fn write_client_frame(
 async fn write_or_inline_upstream(
     write_slot: &Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
     read_tx: &tokio::sync::mpsc::Sender<tokio::net::tcp::OwnedReadHalf>,
-    writer: &Arc<tokio::sync::Mutex<Box<dyn xray_buf::io::Writer>>>,
+    client_tx: &tokio::sync::mpsc::Sender<ClientWrite>,
     tag: &str,
     upstream: &Destination,
     query: &[u8],
@@ -2018,7 +2081,7 @@ async fn write_or_inline_upstream(
     if !upstream.is_tcp() {
         // UDP 上游：内联往返（等价 Go UDPWriter/connReader 单包语义）。
         if let Some(resp) = forward_raw(query, upstream, timeout).await {
-            write_client_frame(writer, tag, &resp).await;
+            write_client_frame(client_tx, tag, &resp);
         }
         return;
     }
@@ -6360,8 +6423,11 @@ mod tests {
 
         let dest =
             Destination::udp(Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        // bd kol4a：GlobalID 派生按 Go 入站白名单判定——用例以白名单族 "socks" 表达
+        // 「生产 relay（handle_udp_associate）接线后的形态」。
         let access = xray_app_dispatcher::default::AccessContext {
             from: "10.0.0.9:5555".to_string(),
+            inbound_name: "socks".to_string(),
             ..Default::default()
         };
         // session done 永不等来（无回程），spawn 丢后半程——只关心 carrier 字节。
@@ -6478,6 +6544,89 @@ mod tests {
         let (meta, _) = xray_mux::frame::FrameMetadata::read_from_bytes(&snap[..2 + meta_len])
             .expect("parse New frame meta");
         assert_eq!(meta.global_id(), None, "TCP New frame must not carry GlobalID");
+        task.abort();
+    }
+
+    /// bd kol4a：入站协议白名单（Go `xudp.go:69-70`）——`from` 非空但
+    /// `inbound_name` 不在白名单（此处以 "vless" 表达：Go vless UDP relay
+    /// 恒零值）时 UDP New 帧不带 GlobalID。
+    #[tokio::test]
+    async fn mux_bridge_dispatch_with_access_non_whitelisted_inbound_has_no_global_id() {
+        use tokio::io::AsyncWriteExt as _;
+        #[allow(unused_imports)] // 存量清零批次
+        use xray_buf::io::{Reader as _, Writer as _};
+
+        #[derive(Debug)]
+        struct CaptureUnderlying {
+            captured: Arc<parking_lot::Mutex<Vec<u8>>>,
+        }
+        impl DispatchHandler for CaptureUnderlying {
+            fn tag(&self) -> &str {
+                "capture-underlying-gid-vless"
+            }
+
+            fn dispatch(&self, _dest: &Destination, link: Link) -> PinFuture<()> {
+                let captured = Arc::clone(&self.captured);
+                Box::pin(async move {
+                    let mut r = xray_buf::reader::BufferedReader::new(link.reader);
+                    loop {
+                        match r.read_multi_buffer().await {
+                            Ok(mb) if !mb.is_empty() => {
+                                let mut c = captured.lock();
+                                for b in mb.iter() {
+                                    c.extend_from_slice(b.bytes());
+                                }
+                            },
+                            _ => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let (bridge, _slot) = MuxBridge::new("mux-gid-vless", 4);
+        let captured: Arc<parking_lot::Mutex<Vec<u8>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        bridge.set_underlying(Arc::new(CaptureUnderlying { captured: Arc::clone(&captured) }));
+
+        let (mut child_client, child_server) = tokio::io::duplex(64 * 1024);
+        let (sr, sw) = tokio::io::split(child_server);
+        let link = Link::new(xray_buf::io::new_reader(sr), xray_buf::io::new_writer(sw));
+        child_client.write_all(b"probe").await.unwrap();
+
+        let dest =
+            Destination::udp(Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        let access = xray_app_dispatcher::default::AccessContext {
+            from: "10.0.0.9:5555".to_string(),
+            inbound_name: "vless".to_string(),
+            ..Default::default()
+        };
+        let fut = bridge.dispatch_with_access(&dest, link, access);
+        let task = tokio::spawn(fut);
+
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let s = captured.lock().clone();
+                if s.len() > 6 {
+                    let meta_len = u16::from_be_bytes([s[0], s[1]]) as usize;
+                    if s.len() >= 2 + meta_len {
+                        break s;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("carrier New frame within timeout");
+
+        let meta_len = u16::from_be_bytes([snap[0], snap[1]]) as usize;
+        let (meta, _) = xray_mux::frame::FrameMetadata::read_from_bytes(&snap[..2 + meta_len])
+            .expect("parse New frame meta");
+        assert_eq!(
+            meta.global_id(),
+            None,
+            "非白名单入站（vless）UDP New 帧不得携带 GlobalID（Go xudp.go:69-70）"
+        );
         task.abort();
     }
 
@@ -6935,5 +7084,238 @@ mod tests {
         let pkt = pr.read_packet().expect("parse resp xudp frame").expect("empty stream");
         let (data, _src) = pkt.into_parts();
         assert_eq!(data, b"tuic-udp-e2e");
+    }
+}
+
+/// uwq9n：DNS-over-TCP 客户端「连上却不读响应」的会话收尾回归 / 反证。
+///
+/// 修前两侧 loop 抢一把 `Mutex<Box<dyn Writer>>` 且**持锁跨写 await**：客户端
+/// 不读 → 写卡死在不可取消的 `write_multi_buffer` future 里 → 另一 loop 卡在
+/// 同一把锁上 → 两侧读超时都不再被 poll → 会话永不结束（本模块两条用例修前
+/// 全红：本条挂死、并发条在同进程里等不到收尾）。
+#[cfg(test)]
+mod dns_client_writer_queue {
+    use std::{
+        future::Future,
+        pin::Pin,
+        time::{Duration, Instant},
+    };
+
+    use xray_buf::{buffer::Buffer, io, multi::MultiBuffer, pipe};
+
+    use super::*;
+
+    /// 客户端 TCP 长度前缀查询帧（`Return` 规则命中 → 规则应答，不碰上游）。
+    fn query_frame() -> Vec<u8> {
+        let mut query = vec![0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in ["example", "com"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let mut frame = vec![(query.len() >> 8) as u8, query.len() as u8];
+        frame.extend_from_slice(&query);
+        frame
+    }
+
+    /// `Return` 规则 → 规则应答（Go dns.go:250-260 同分支），无需真实上游。
+    fn respond_handler(idle: Duration) -> xray_proxy_dns::Handler {
+        let cfg = xray_proxy_dns::Config {
+            rule: vec![xray_proxy_dns::DnsRuleConfig {
+                action: xray_proxy_dns::RuleAction::Return,
+                q_type: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        xray_proxy_dns::Handler::init(&cfg, idle)
+    }
+
+    /// 永不完成的写端 = 客户端不读响应（TCP send buffer 满时 `poll_write` 恒
+    /// Pending 的同一形态：写 future 不可取消）。
+    struct StalledWriter;
+
+    impl io::Writer for StalledWriter {
+        fn write_multi_buffer(
+            &mut self,
+            _mb: MultiBuffer,
+        ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn stalled_dest() -> Destination {
+        Destination::udp(Address::Domain("8.8.8.8".into()), Port::new(53))
+    }
+
+    /// 挂死会话：客户端先投一帧查询、此后既不发也不关（pipe 无 EOF → 只能靠
+    /// 空闲超时收尾），响应写端永不完成。
+    ///
+    /// 返回的 pipe 写端必须保活——drop 即 close = 给读端 EOF（会走 EOF 收尾而
+    /// 非本用例要验的空闲超时路径）。
+    async fn spawn_stalled_client(idle: Duration) -> (tokio::task::JoinHandle<()>, pipe::Writer) {
+        let (link_reader, mut client_query_tx) = pipe::new();
+        client_query_tx
+            .write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(query_frame())))
+            .await
+            .expect("seed query frame");
+        let session = tokio::spawn(dispatch_dns_link(
+            "uwq9n-stalled".into(),
+            respond_handler(idle),
+            None,
+            stalled_dest(),
+            idle,
+            false,
+            false,
+            Link::new(Box::new(link_reader), Box::new(StalledWriter)),
+        ));
+        (session, client_query_tx)
+    }
+
+    /// 反证主体：客户端连上、发一帧、永不读响应 → 会话必须在空闲窗内收尾。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_client_session_ends_within_idle_window() {
+        let idle = Duration::from_millis(300);
+        // 预算 = 读空闲窗 + 一个排空窗 + 调度余量（墙钟截止轮询，非固定 sleep）。
+        let budget = idle * 3 + Duration::from_millis(700);
+        let (session, _client_query_tx) = spawn_stalled_client(idle).await;
+
+        let start = Instant::now();
+        while !session.is_finished() {
+            assert!(
+                start.elapsed() < budget,
+                "客户端不读响应时会话必须收尾：{budget:?} 内未结束（修前挂死形态）"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        session.await.expect("dns session task must not panic");
+    }
+
+    /// 慢客户端不阻塞其它会话：挂死会话空闲窗 5s，健康会话必须在 1s 内完成一个
+    /// 完整往返（防修复引入跨会话串行——共享锁 / 全局写队列）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_session_does_not_block_healthy_session() {
+        let (stalled, _stalled_query_tx) = spawn_stalled_client(Duration::from_secs(5)).await;
+
+        let idle = Duration::from_secs(5);
+        let (link_reader, mut client_query_tx) = pipe::new();
+        let (mut client_resp_reader, link_writer) = pipe::new();
+        let healthy = tokio::spawn(dispatch_dns_link(
+            "uwq9n-healthy".into(),
+            respond_handler(idle),
+            None,
+            stalled_dest(),
+            idle,
+            false,
+            false,
+            Link::new(Box::new(link_reader), Box::new(link_writer)),
+        ));
+
+        client_query_tx
+            .write_multi_buffer(MultiBuffer::from_buffer(Buffer::from_vec(query_frame())))
+            .await
+            .expect("client query write");
+        let resp =
+            tokio::time::timeout(Duration::from_secs(1), client_resp_reader.read_multi_buffer())
+                .await
+                .expect("健康会话必须远早于挂死会话的空闲窗完成往返")
+                .expect("read response");
+
+        let mut bytes = Vec::new();
+        for b in resp.iter() {
+            bytes.extend_from_slice(b.bytes());
+        }
+        assert_eq!(
+            bytes.len(),
+            2 + u16::from_be_bytes([bytes[0], bytes[1]]) as usize,
+            "回写必须是完整长度前缀帧"
+        );
+        assert_eq!(&bytes[2..4], &[0xAB, 0xCD], "响应 ID 必须与查询一致");
+
+        healthy.abort();
+        stalled.abort();
+    }
+}
+
+/// bd 9c8k6 ③：动态 AddOutbound 的「查重 + 插入」必须原子。
+///
+/// 修前 `ApiOutboundRuntime::add_outbound` = `get_handler` 查重 + `ohm.add`
+/// 插入**两步**：并发同 tag 的两个请求都能通过查重，后者 `ohm.add` 静默覆盖
+/// 前者的 handler —— 两个调用都返回 Ok，赢家/输家无从分辨（"静默覆盖"）。
+///
+/// 修后权威判定落在 `SimpleOhm::add_if_absent`（查重与插入同一临界区）：并发同
+/// tag 恰好一个成功，其余拿到明确失败（`existing tag found: <tag>`）。
+#[cfg(test)]
+mod api_outbound_atomic_add {
+    use std::sync::Arc;
+
+    use xray_app_commander::OutboundRuntime as _;
+    use xray_proto::xray::{common::serial::TypedMessage, core::OutboundHandlerConfig};
+
+    use super::*;
+
+    /// 一个最小可建 handler 的出站配置（freedom + 空 settings）。
+    fn freedom_outbound(tag: &str) -> OutboundHandlerConfig {
+        OutboundHandlerConfig {
+            tag: tag.to_string(),
+            proxy_settings: Some(TypedMessage {
+                r#type: "xray.proxy.freedom.Config".to_string(),
+                value: b"{}".to_vec(),
+            }),
+            sender_settings: None,
+            expire: 0,
+            comment: String::new(),
+        }
+    }
+
+    /// 并发同 tag：恰好 1 成功、N-1 失败，且失败方读到明确错误。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_tag_add_outbound_exactly_one_wins() {
+        const N: usize = 8;
+        let ohm = Arc::new(SimpleOhm::new());
+        let runtime = Arc::new(ApiOutboundRuntime::new(Arc::clone(&ohm)));
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut tasks = Vec::new();
+        for _ in 0..N {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let cfg = freedom_outbound("dyn-tag");
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                runtime.add_outbound(&cfg)
+            }));
+        }
+        let mut ok = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        for task in tasks {
+            match task.await.expect("add_outbound task join") {
+                Ok(()) => ok += 1,
+                Err(e) => errs.push(e),
+            }
+        }
+        assert_eq!(ok, 1, "并发同 tag 必须恰好 1 个成功（其余明确失败）");
+        assert_eq!(errs.len(), N - 1, "其余 {N} - 1 个调用必须失败");
+        for e in &errs {
+            assert!(
+                e.contains("existing tag found"),
+                "失败方必须读到明确错误（existing tag found），实得: {e}"
+            );
+        }
+        assert!(
+            ohm.get_handler("dyn-tag").is_some(),
+            "赢家注册的 handler 必须仍在表内（不得被静默覆盖掉）"
+        );
+    }
+
+    /// 串行重复添加同 tag：第二次明确失败（不覆盖首个 handler）。
+    #[tokio::test]
+    async fn duplicate_tag_add_outbound_is_rejected_without_overwrite() {
+        let ohm = Arc::new(SimpleOhm::new());
+        let runtime = ApiOutboundRuntime::new(Arc::clone(&ohm));
+        runtime.add_outbound(&freedom_outbound("dup")).expect("first add");
+        let err = runtime.add_outbound(&freedom_outbound("dup")).expect_err("dup must fail");
+        assert!(err.contains("existing tag found"), "实得: {err}");
+        assert!(ohm.get_handler("dup").is_some(), "首个 handler 仍在表内");
     }
 }

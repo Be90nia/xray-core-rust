@@ -517,7 +517,7 @@ pub async fn execute_add_user(args: &AddUserArgs) -> Result<(), CliError> {
         if tag.is_empty() {
             continue;
         }
-        let users = extract_users_from_inbound(ib);
+        let users = extract_users_from_inbound(ib)?;
         if users.is_empty() {
             continue;
         }
@@ -766,70 +766,63 @@ pub async fn execute_online_users(args: &OnlineUsersArgs) -> Result<(), CliError
 /// 从标准 xray config JSON 提取每个 inbound 的用户列表。
 ///
 /// 对应 Go `extractInboundUsers` + 各协议的 `Build()`：支持 vmess / vless / trojan / ss /
-/// ss2022 / hysteria。每个用户构造 proto `User { level, email, account: TypedMessage }`。
+/// ss2022 / hysteria。每个用户构造 proto `User { level, email, account: TypedMessage }`，
+/// 其中 account 是 **Go 线格式的 proto Account**（bd c89uy）。
 fn extract_users_from_inbound(
     ib: &InboundHandlerConfig,
-) -> Vec<xray_proto::xray::common::protocol::User> {
-    let Some(proxy) = &ib.proxy_settings else { return Vec::new() };
-    // proxy.value 是 settings JSON 编码字节；根据 protocol 字段决定字段路径。
+) -> Result<Vec<xray_proto::xray::common::protocol::User>, CliError> {
+    let Some(proxy) = &ib.proxy_settings else { return Ok(Vec::new()) };
+    // proxy.value 是 settings JSON 编码字节；根据协议名决定用户字段路径。
     let settings: serde_json::Value = match serde_json::from_slice(&proxy.value) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    // 协议名取 type_url 的中段（"xray.proxy.<proto>.Config"）——**精确匹配**，不用
+    // `contains`：后者会让 "shadowsocks" 命中 "shadowsocks_2022"（Go 的 ss2022 走
+    // "shadowsocks" 协议名 + 2022 method，用户会被提取两遍）。
+    let Some(proto) =
+        proxy.r#type.strip_prefix("xray.proxy.").and_then(|s| s.strip_suffix(".Config"))
+    else {
+        return Ok(Vec::new());
     };
 
     // vmess/vless/trojan: settings.clients[] = { id, email, level }
     // ss/ss2022:        settings.users[]   = { email, level, password, method?, cipher? }
-    // hysteria:         settings.users[]   = { auth, email, level }（clients 非空覆盖）
-    let candidates: &[(&str, &str)] = &[
-        ("vmess", "clients"),
-        ("vless", "clients"),
-        ("trojan", "clients"),
-        ("shadowsocks", "users"),
-        ("shadowsocks_2022", "users"),
-        ("hysteria", "users"),
-    ];
-    let mut users = Vec::new();
-    for (proto, field) in candidates {
-        if !proxy.r#type.contains(proto) {
-            continue;
-        }
-        // Go HysteriaServerConfig.Build：clients 字段在 JSON 中出现（含空数组）→ 覆盖 users。
-        let field = if *proto == "hysteria" {
+    // hysteria:         settings.users[]   = { auth, email, level }
+    let field = match proto {
+        "vmess" | "vless" | "trojan" => "clients",
+        "shadowsocks" | "shadowsocks_2022" | "hysteria" => {
+            // Go `infra/conf/shadowsocks.go:46-47` / `hysteria.go`：`clients` 字段在
+            // JSON 中出现（含空数组）⇒ 整体覆盖 `users`。
             match settings.get("clients").and_then(|v| v.as_array()) {
                 Some(_) => "clients",
-                None => *field,
+                None => "users",
             }
-        } else {
-            *field
-        };
-        let Some(arr) = settings.get(field).and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for entry in arr {
-            let email = entry.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let level = entry.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            // Go hysteria 的 account 类型在 account 子包（proxy/hysteria/account/config.proto），
-            // 载荷 = proto 编码 Account{auth}（infra/conf/hysteria.go:59-63），不走 JSON 透传。
-            let account = if *proto == "hysteria" {
-                let acc = xray_proto::xray::proxy::hysteria::account::Account {
-                    auth: entry.get("auth").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                };
-                TypedMessage {
-                    r#type: "xray.proxy.hysteria.account.Account".to_string(),
-                    value: prost::Message::encode_to_vec(&acc),
-                }
-            } else {
-                let account_json = serde_json::to_vec(entry).unwrap_or_default();
-                TypedMessage { r#type: format!("xray.proxy.{proto}.Account"), value: account_json }
-            };
-            users.push(xray_proto::xray::common::protocol::User {
-                level,
-                email,
-                account: Some(account),
-            });
-        }
+        },
+        _ => return Ok(Vec::new()),
+    };
+    let Some(arr) = settings.get(field).and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut users = Vec::new();
+    for entry in arr {
+        let email = entry.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let level = entry.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        // Go 线格式（bd c89uy）：account = TypedMessage{Type: "xray.proxy.<proto>.Account",
+        // Value: 该协议 Account 的 proto 字节}（Go `infra/conf/*.go` 各协议 `Build()`
+        // 产 `serial.ToTypedMessage(&<proto>Account{…})`）。旧实现把 value 写成 JSON
+        // ⇒ Go 服务端按 proto 解必失败（"proto: not found"），Go 客户端也无法被
+        // Rust 服务端解析。
+        let account =
+            xray_core::account::account_typed_message_from_config_json(proto, &settings, entry)
+                .map_err(|e| CliError::InvalidArgument(format!("build {proto} account: {e}")))?;
+        users.push(xray_proto::xray::common::protocol::User {
+            level,
+            email,
+            account: Some(account),
+        });
     }
-    users
+    Ok(users)
 }
 
 /// 单元测试：验证协议字段路径与 User 构造。
@@ -863,7 +856,7 @@ mod tests {
                 ]
             }),
         );
-        let users = extract_users_from_inbound(&ib);
+        let users = extract_users_from_inbound(&ib).expect("extract users");
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].email, "a@x");
         assert_eq!(users[0].level, 1);
@@ -880,7 +873,7 @@ mod tests {
                 "clients": [{"id": "u", "email": "v@x", "level": 0}]
             }),
         );
-        let users = extract_users_from_inbound(&ib);
+        let users = extract_users_from_inbound(&ib).expect("extract users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, "v@x");
     }
@@ -893,7 +886,7 @@ mod tests {
                 "users": [{"email": "ss@x", "password": "p", "method": "aes-256-gcm", "level": 0}]
             }),
         );
-        let users = extract_users_from_inbound(&ib);
+        let users = extract_users_from_inbound(&ib).expect("extract users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, "ss@x");
     }
@@ -908,7 +901,7 @@ mod tests {
                 "users": [{"auth": "tok-1", "email": "hy@x", "level": 2}]
             }),
         );
-        let users = extract_users_from_inbound(&ib);
+        let users = extract_users_from_inbound(&ib).expect("extract users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, "hy@x");
         assert_eq!(users[0].level, 2);
@@ -931,7 +924,7 @@ mod tests {
                 "clients": [{"auth": "tok-2", "email": "new@x"}]
             }),
         );
-        let users = extract_users_from_inbound(&ib);
+        let users = extract_users_from_inbound(&ib).expect("extract users");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].email, "new@x");
     }
@@ -939,14 +932,14 @@ mod tests {
     #[test]
     fn extract_unknown_proto_returns_empty() {
         let ib = inbound_with_settings("socks", serde_json::json!({"foo": "bar"}));
-        assert!(extract_users_from_inbound(&ib).is_empty());
+        assert!(extract_users_from_inbound(&ib).expect("extract users").is_empty());
     }
 
     #[test]
     fn extract_missing_proxy_settings_returns_empty() {
         let ib =
             InboundHandlerConfig { tag: "x".into(), receiver_settings: None, proxy_settings: None };
-        assert!(extract_users_from_inbound(&ib).is_empty());
+        assert!(extract_users_from_inbound(&ib).expect("extract users").is_empty());
     }
 
     #[test]
@@ -959,7 +952,7 @@ mod tests {
                 value: vec![0xff, 0xfe],
             }),
         };
-        assert!(extract_users_from_inbound(&ib).is_empty());
+        assert!(extract_users_from_inbound(&ib).expect("extract users").is_empty());
     }
 
     // ===== --json 输出形态（Go showJSONResponse / balancer_info.go:56-61）=====

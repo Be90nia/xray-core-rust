@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use skeleton::clock::{Clock, MockClock};
 use xray_frame::{
     PluginContext,
-    deadline::{Budget, BudgetSource},
+    deadline::{Budget, BudgetSource, BudgetTimer},
 };
 
 #[tokio::test(start_paused = true)]
@@ -104,4 +104,88 @@ async fn wall_budget_stays_unexpired_while_clock_frozen() {
     clock.advance(Duration::from_millis(50));
     let out = deadline.timeout(async { std::future::pending::<()>().await }).await;
     assert!(out.is_err(), "推进越过截止点 → 判负");
+}
+
+// ===== BudgetTimer（timer-arm 面，bd 23vrp）：tuic/anytls 豁免迁移的测试面 =====
+
+/// 虚拟推进精确触发：arm(1s) → 999ms 未触发 → +1ms 触发（走虚拟时间轴，
+/// 非真实等待——start_paused 下真实耗时为 0）。
+#[tokio::test(start_paused = true)]
+async fn timer_arm_fires_exactly_at_virtual_deadline() {
+    let mut t = Budget::tokio().arm_timer(Duration::from_secs(1));
+    assert!(!t.is_expired(), "arm 即触发 = 假计时器");
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert!(!t.is_expired(), "999ms 未到不得触发");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(t.is_expired(), "满 1s 必须触发");
+    // 触发态下 expired() 立即完成（不挂起、不重挂）。
+    t.expired().await;
+}
+
+/// reset 重武装（tuic idle-reset 的直接语义证据）：600ms 活动包 → reset(1s)
+/// → 自 reset 起**重新计时**，不是沿用旧锚点。
+#[tokio::test(start_paused = true)]
+async fn timer_arm_reset_re_arms_window() {
+    let mut t = Budget::tokio().arm_timer(Duration::from_secs(1));
+    tokio::time::advance(Duration::from_millis(600)).await;
+    t.reset(Duration::from_secs(1));
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert!(!t.is_expired(), "reset 后 999ms 不得触发（窗口重新计时）");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(t.is_expired(), "reset 后满 1s 触发");
+    t.expired().await;
+}
+
+/// select 竞争取消安全（tuic udp_assoc 的真实 select 形态）：expired 输掉
+/// 竞争（future 被 drop）后，计时状态保留在 timer 本体——重进 select 不丢窗。
+#[tokio::test(start_paused = true)]
+async fn timer_arm_survives_select_race_cancellation() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<u8>(4);
+    let mut idle = Budget::tokio().arm_timer(Duration::from_secs(1));
+    tx.send(7).await.unwrap();
+    tokio::select! {
+        _ = idle.expired() => panic!("有活动包时不得触发"),
+        item = rx.recv() => {
+            assert_eq!(item, Some(7));
+            idle.reset(Duration::from_secs(1));
+        }
+    }
+    // 竞争输掉后窗口完整重来（若状态丢失，这里会在旧锚点误触发/永不触发）。
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert!(!idle.is_expired());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    idle.expired().await;
+}
+
+/// 触发态 reset 重武装（tuic：触发的 select 臂与 reset 臂交错时——
+/// `Sleep::reset` 契约：已触发态 reset 同样有效）。
+#[tokio::test(start_paused = true)]
+async fn timer_arm_reset_after_fire_re_arms() {
+    let mut t = Budget::tokio().arm_timer(Duration::from_millis(100));
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(t.is_expired());
+    t.reset(Duration::from_secs(1));
+    assert!(!t.is_expired(), "触发态 reset 必须重新武装");
+    tokio::time::advance(Duration::from_millis(999)).await;
+    assert!(!t.is_expired());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(t.is_expired());
+}
+
+/// Wall 源：到期判定完全由 `Clock` 决定（冻结 → 永不触发；推进 → 触发），
+/// 语义同 [`BudgetDeadline::timeout`] 的 wall 臂。
+#[tokio::test]
+async fn timer_arm_wall_source_follows_clock() {
+    let clock = Arc::new(MockClock::new());
+    let dyn_clock: Arc<dyn Clock> = clock.clone();
+    let mut t: BudgetTimer = Budget::wall(dyn_clock).arm_timer(Duration::from_secs(60));
+    // 冻结 → 真实 50ms 内不得触发（若误挂 tokio 计时器，这里会假触发）。
+    tokio::time::timeout(Duration::from_millis(50), t.expired())
+        .await
+        .expect_err("冻结墙钟不得触发");
+    clock.advance(Duration::from_secs(120));
+    // 推进 → WALL_POLL_INTERVAL 轮询间隔内检出。
+    tokio::time::timeout(Duration::from_millis(200), t.expired())
+        .await
+        .expect("墙钟推进后必须触发");
 }

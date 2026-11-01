@@ -1,5 +1,8 @@
 # Build
 /target
+# 并行代理的独立编译目录（CARGO_TARGET_DIR=target-<agent>）：只写 /target 会漏掉兄弟目录，
+# 而 /target-*/ 每个可达数十 GB，一次 git add -A 即事故。2026-11-01 卫生审计发现。
+/target-*/
 **/*.rs.bk
 *.pdb
 /target-fv/
@@ -99,3 +102,8 @@ stress-analysis-tmp/
 
 # 本地安全扫描工具二进制（osv-scanner 等；CI 侧直接下载官方 binary，不入库）2026-10-13
 tools/bin/
+
+# 审计/验证报告的临时 scratch（测试二进制 big.bin / exe / 抓包等，证据以 md 与原始文本为准）
+# 2026-11-01 卫生审计：reports 下未跟踪 scratch 曾累积 1.5GB
+reports/**/tmp/
+dist/tmp_*/

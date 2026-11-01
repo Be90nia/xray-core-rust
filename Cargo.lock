@@ -5733,9 +5733,12 @@ dependencies = [
  "tokio",
  "tracing",
  "udf-skeleton-infra",
+ "xray-app-dispatcher",
+ "xray-buf",
  "xray-common",
  "xray-features",
  "xray-proto",
+ "xray-transport",
 ]
 
 [[package]]
@@ -6840,6 +6843,9 @@ dependencies = [
  "h3-quinn",
  "hex",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "parking_lot",
  "quinn",
  "quinn-proto",
@@ -6849,7 +6855,9 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots 1.0.11",
  "xray-buf",
  "xray-common",
  "xray-frame",

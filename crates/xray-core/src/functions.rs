@@ -371,6 +371,12 @@ async fn start_full_dispatched(
         if let Some(obs) = instance.get_feature::<xray_app_observatory::ObservatoryFeature>() {
             metrics.set_obs_collector(Arc::new(ObservatoryMetricsCollector(obs)));
         }
+        // bd 0z7zt：tag 形态暴露——metrics outbound 注册进生产出站表（Go
+        // metrics.go:82-94 `ohm.RemoveHandler(tag)` + `ohm.AddHandler(&Outbound{...})`）。
+        // 路由规则 `outboundTag: <metrics tag>` 命中即把 Link 灌进 metrics HTTP server。
+        metrics.set_outbound_registrar(Arc::new(xray_app_metrics::SimpleOhmOutboundRegistrar(
+            Arc::clone(&ohm),
+        )));
     }
     // per-tag UDP443 策略（bd g35）：mux JSON → dispatch_link 前置检查
     dispatcher.udp443_policies =
@@ -681,8 +687,16 @@ impl xray_app_proxyman::command::HandlerService for ApiHandlerService {
             "xray.app.proxyman.command.AddUserOperation" => {
                 let add = ProtoAddUserOp::decode(op.value.as_slice())
                     .map_err(|e| ProxymanError::UserParse(format!("AddUserOperation: {e}")))?;
-                let user = add.user.ok_or_else(|| {
+                let mut user = add.user.ok_or_else(|| {
                     ProxymanError::UserParse("AddUserOperation requires user".into())
+                })?;
+                // bd c89uy：wire 上的 account 是 **Go 线格式的 proto Account**
+                // （`TypedMessage{Type:"xray.proxy.<proto>.Account", Value: proto 字节}`），
+                // 而入站用户管理器消费的是内部 JSON 契约 ⇒ 此处按 type_url 显式规范化
+                // （解失败即报错，不静默回落 JSON 解析；旧 Rust 客户端的 JSON 载荷按
+                // 显式判别原样透传，详见 `xray_core::account` 模块文档）。
+                crate::account::normalize_user_account(&mut user).map_err(|e| {
+                    ProxymanError::UserParse(format!("normalize account payload: {e}"))
                 })?;
                 self.inbounds.user_manager(&req.tag)?.add_user(&user)?;
             },
@@ -5997,6 +6011,186 @@ mod tests {
         assert_eq!(&resp[10..n], &payload[..], "datagram roundtrip via outbound mux");
 
         drop(client_udp);
+        drop(tcp);
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+        echo_task.abort();
+    }
+
+    /// sgdkj 回归：mux 服务端上行投递对两种 UDP 入口一视同仁。
+    ///
+    /// socks UDP ASSOCIATE 与 dokodemo-door UDP 共用同一条 relay
+    /// （`UdpDispatchSession` → `Dispatcher::dispatch` → `MuxBridge`）：cone 开时
+    /// 客户端 mux New 帧**不带** GlobalID（UDP relay 无入站 AccessContext）→ 服务端
+    /// 落 `handle_normal_new`。该路径必须把 mux 裸载荷重裹成 XUDP 帧（freedom 按帧
+    /// 解析），否则解帧失败静默丢包 → 上游 0 字节（sgdkj：rust↔rust cone=on 全端口
+    /// 上游 0 字节；Go 客户端 cone 开带 GlobalID 走 `handle_xudp_new`，故只有
+    /// rust↔rust 红）。
+    #[tokio::test]
+    async fn integration_udp_mux_uplink_delivery_both_entry_points() {
+        const SOCKS_PAYLOAD: &[u8] = b"mux-uplink-via-socks-entry";
+        const DOKODEMO_PAYLOAD: &[u8] = b"mux-uplink-via-dokodemo-entry";
+
+        // 1. 上游记录器：记下每个抵达目标的数据报（判据=逐字节对上），并回显。
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let received: StdArc<parking_lot::Mutex<Vec<Vec<u8>>>> =
+            StdArc::new(parking_lot::Mutex::new(Vec::new()));
+        let echo_seen = StdArc::clone(&received);
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        echo_seen.lock().push(buf[..n].to_vec());
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 服务端：socks inbound（mux 终止）+ freedom 全放行。
+        let (server_ports, _si, _so, sh) = start_full_retrying_eaddrinuse(1, |ports| {
+            let mut server_cfg = BuiltConfig::default();
+            server_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry { kind: "socks".into(), data: br#"{"auth":"noauth"}"#.to_vec() },
+                tag: "socks-in".into(),
+                port: Some(ports[0]),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            server_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "freedom".into(),
+                    data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
+                },
+                tag: "direct".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            });
+            server_cfg
+        })
+        .await;
+        let server_port = server_ports[0];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3. 客户端：socks-in（UDP）+ dokodemo-in（UDP→上游）两入口共用一个 mux 打开的出站（同一
+        //    carrier、同一套 mux 服务端会话）。
+        let dokodemo_settings = format!(
+            r#"{{"address":"127.0.0.1","port":{},"network":"udp","followRedirect":false}}"#,
+            echo_addr.port()
+        );
+        let (cports, _ci, _co, ch) = start_full_retrying_eaddrinuse(2, |ports| {
+            let mut client_cfg = BuiltConfig::default();
+            client_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "socks".into(),
+                    data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+                },
+                tag: "socks-in".into(),
+                port: Some(ports[0]),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            client_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "dokodemo".into(),
+                    data: dokodemo_settings.clone().into_bytes(),
+                },
+                tag: "dod-in".into(),
+                port: Some(ports[1]),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            client_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "socks".into(),
+                    data: format!(
+                        r#"{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}"#
+                    )
+                    .into_bytes(),
+                },
+                tag: "proxy".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: Some(serde_json::json!({"enabled": true, "concurrency": 8})),
+                target_strategy: None,
+            });
+            client_cfg
+        })
+        .await;
+        let (socks_port, dokodemo_port) = (cports[0], cports[1]);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut resp = vec![0u8; 65535];
+
+        // 4. 入口①：socks5 TCP 控制连接 → UDP ASSOCIATE → datagram
+        let mut tcp =
+            TcpStream::connect(("127.0.0.1", socks_port)).await.expect("connect socks control");
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut m = [0u8; 2];
+        tcp.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut assoc = [0u8; 10];
+        tcp.read_exact(&mut assoc).await.unwrap();
+        assert_eq!(assoc[1], 0x00, "UDP ASSOC success");
+        let relay_port = u16::from_be_bytes([assoc[8], assoc[9]]);
+        assert!(relay_port > 0, "relay port assigned");
+
+        let socks_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+        pkt.extend_from_slice(&ip);
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(SOCKS_PAYLOAD);
+        socks_udp.send_to(&pkt, ("127.0.0.1", relay_port)).await.expect("send udp via socks");
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), socks_udp.recv_from(&mut resp))
+                .await
+                .expect("timeout waiting for socks udp echo")
+                .expect("recv socks udp echo");
+        assert_eq!(&resp[10..n], SOCKS_PAYLOAD, "socks 入口回程载荷逐字节");
+
+        // 5. 入口②：dokodemo-door UDP（固定目标 = 上游）
+        let dok_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        dok_udp
+            .send_to(DOKODEMO_PAYLOAD, ("127.0.0.1", dokodemo_port))
+            .await
+            .expect("send udp via dokodemo");
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dok_udp.recv_from(&mut resp))
+                .await
+                .expect("timeout waiting for dokodemo udp echo")
+                .expect("recv dokodemo udp echo");
+        assert_eq!(&resp[..n], DOKODEMO_PAYLOAD, "dokodemo 入口回程载荷逐字节");
+
+        // 6. 两个入口的上行都必须逐字节抵达目标（sgdkj 的失败形态=上游 0 字节）
+        let seen = received.lock().clone();
+        assert!(
+            seen.iter().any(|p| p.as_slice() == SOCKS_PAYLOAD),
+            "socks 入口上行未抵达目标: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|p| p.as_slice() == DOKODEMO_PAYLOAD),
+            "dokodemo 入口上行未抵达目标: {seen:?}"
+        );
+
+        drop(socks_udp);
+        drop(dok_udp);
         drop(tcp);
         for h in sh.iter().chain(ch.iter()) {
             h.abort();

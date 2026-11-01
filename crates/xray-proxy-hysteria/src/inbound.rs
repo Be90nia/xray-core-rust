@@ -236,6 +236,18 @@ impl HysteriaInboundHandler {
         self.multi_validator.as_ref()
     }
 
+    /// 注入多用户验证器（builder 风格，bd ctiwx）。
+    ///
+    /// 生产装配（`parse_hysteria_inbound_config` 解析到 `users[]` 时）在
+    /// [`new`](Self::new) 单 auth 骨架上叠加本件——masq/quic_params/obfs 等
+    /// [`with_inbound_config`](Self::with_inbound_config) 不覆盖的字段因此全部保留。
+    /// `Some` 时 `start()` 的验证面走 multi_validator（优先于 `config.auth`）。
+    #[must_use]
+    pub fn with_multi_validator(mut self, validator: Option<Arc<MultiUserValidator>>) -> Self {
+        self.multi_validator = validator;
+        self
+    }
+
     /// 绑定地址。
     #[must_use]
     pub fn bind_addr(&self) -> SocketAddr {

@@ -43,7 +43,10 @@ pub struct Config {
     pub health_check_timeout: i32,
     /// 是否允许无活动 stream 时发送 keepalive（gRPC `PermitWithoutStream`）。
     pub permit_without_stream: bool,
-    /// HTTP/2 初始窗口大小（字节）。0 表示用默认值。
+    /// HTTP/2 初始窗口大小（字节，每 stream 收窗）。0 = 用 Rust 缺省 16 MiB
+    /// （Go 侧 0 落 grpc-go 缺省 64KB；差异是刻意性能修复，bd enc8x）。
+    /// 配置非 0 时按该值覆盖流窗；连接窗固定 32 MiB。内存预算见 crate 级
+    /// 「内存预算（h2 流控窗）」（每连接 ≈ 48 MiB 上界，与并发流数无关）。
     pub initial_windows_size: i32,
     /// User-Agent。支持预设别名：`"chrome"` / `"firefox"` / `"edge"` / `"golang"`。
     /// 空串等同 `"chrome"`。

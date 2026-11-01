@@ -169,9 +169,16 @@ async fn dial_h3_packet_up_end_to_end() {
         &config.normalized_query(),
     );
     let sc_max = 1_000_000usize;
-    let mut conn = dial_h3_packet_up(h3_conn, base_uri, session_id, sc_max, RangeConfig::new(0, 0))
-        .await
-        .expect("dial_h3_packet_up");
+    let mut conn = dial_h3_packet_up(
+        xray_transport_splithttp::mux::wrap_xmux_client(h3_conn),
+        None,
+        base_uri,
+        session_id,
+        sc_max,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .expect("dial_h3_packet_up");
 
     // 4. 验证下载内容
     let mut buf = vec![0u8; download_payload.len()];

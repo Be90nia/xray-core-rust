@@ -178,7 +178,6 @@ async fn dial_stream_up_via_h2_mock_server() {
         None,
         None,
         None,
-        None,
     ));
 
     // 3. dial_stream_up
@@ -189,7 +188,14 @@ async fn dial_stream_up_via_h2_mock_server() {
         &config.normalized_path(),
         &config.normalized_query(),
     );
-    let mut conn = dial_stream_up(client, base_uri, session_id).await.expect("dial_stream_up");
+    let mut conn = dial_stream_up(
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
+        base_uri,
+        session_id,
+    )
+    .await
+    .expect("dial_stream_up");
 
     // 4. 验证下载内容
     let mut buf = vec![0u8; download_payload.len()];
@@ -292,7 +298,6 @@ async fn dial_stream_one_via_h2_mock_server() {
         None,
         None,
         None,
-        None,
     ));
 
     // 3. dial_stream_one
@@ -303,7 +308,13 @@ async fn dial_stream_one_via_h2_mock_server() {
         &config.normalized_path(),
         &config.normalized_query(),
     );
-    let mut conn = dial_stream_one(client, base_uri, session_id).await.expect("dial_stream_one");
+    let mut conn = dial_stream_one(
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        base_uri,
+        session_id,
+    )
+    .await
+    .expect("dial_stream_one");
 
     // 4. 验证下载（server 在 POST 上返 download_payload）
     let mut buf = vec![0u8; download_payload.len()];

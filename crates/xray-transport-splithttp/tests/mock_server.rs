@@ -120,14 +120,21 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
         None,
         None,
         None,
-        None,
     ));
 
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
     let session_id = "test-session-1".to_string();
 
-    let conn =
-        dial_packet_up(client, base_uri, session_id, 1024, RangeConfig::new(0, 0)).await.unwrap();
+    let conn = dial_packet_up(
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
+        base_uri,
+        session_id,
+        1024,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .unwrap();
 
     let mut conn = conn;
     let mut read_buf = vec![0u8; download_payload.len()];
@@ -229,10 +236,10 @@ async fn packet_up_posts_run_concurrently_and_keep_seq_order() {
         None,
         None,
         None,
-        None,
     ));
     let mut conn = dial_packet_up(
-        client,
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
         format!("http://127.0.0.1:{}/", addr.port()),
         "conc-sess".into(),
         CHUNK,
@@ -308,7 +315,6 @@ async fn post_packet_returns_bad_status_on_500() {
         None,
         None,
         None,
-        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
@@ -352,7 +358,6 @@ async fn open_stream_get_non_200_yields_eof() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
-        None,
         None,
         None,
         None,
@@ -469,11 +474,11 @@ async fn fingerprint_btls_end_to_end_http1() {
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
         None,
-        None,
     ));
 
     let mut conn = dial_packet_up(
-        client,
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
         format!("https://127.0.0.1:{port}/"),
         "fp-sess".into(),
         1024,
@@ -507,11 +512,11 @@ async fn fingerprint_btls_end_to_end_http2() {
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
         None,
-        None,
     ));
 
     let mut conn = dial_packet_up(
-        client,
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
         format!("https://127.0.0.1:{port}/"),
         "fp-sess".into(),
         1024,
@@ -586,14 +591,19 @@ async fn conn_drop_terminates_all_http_connections() {
         None,
         None,
         None,
-        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", server_addr.port());
 
-    let mut conn =
-        dial_packet_up(client, base_uri, "drop-sess".into(), 1024, RangeConfig::new(0, 0))
-            .await
-            .unwrap();
+    let mut conn = dial_packet_up(
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
+        base_uri,
+        "drop-sess".into(),
+        1024,
+        RangeConfig::new(0, 0),
+    )
+    .await
+    .unwrap();
     let mut buf = vec![0u8; 2];
     conn.read_exact(&mut buf).await.unwrap();
     conn.write_all(b"x").await.unwrap();
@@ -713,11 +723,11 @@ async fn bridge_eof_propagates_without_conn_idle() {
         None,
         None,
         None,
-        None,
     ));
 
     let conn = dial_packet_up(
-        client,
+        xray_transport_splithttp::mux::wrap_xmux_client(client),
+        None,
         format!("http://127.0.0.1:{}/", server_addr.port()),
         "bridge-eof-sess".into(),
         1024,
@@ -872,13 +882,13 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
         None,
         None,
         None,
-        None,
     ));
 
     let mut conn = tokio::time::timeout(
         Duration::from_secs(15),
         dial_packet_up(
-            client,
+            xray_transport_splithttp::mux::wrap_xmux_client(client),
+            None,
             format!("https://127.0.0.1:{}/", server_addr.port()),
             "r2lq-h2-echo-sess".into(),
             1024,
@@ -966,7 +976,6 @@ async fn stream_up_dial_returns_while_upload_response_body_open() {
         None,
         None,
         None,
-        None,
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
     // 空 stream body：请求体立即完结，焦点在响应体永不结束
@@ -1026,7 +1035,6 @@ async fn stream_up_plain_h1_request_carries_connection_close() {
         config,
         make_tls_config(),
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
-        None,
         None,
         None,
         None,
@@ -1118,7 +1126,6 @@ async fn stream_upload_tls_h2_request_has_no_connection_header() {
         config,
         tls_config,
         DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: "127.0.0.1".into() },
-        None,
         None,
         None,
         None,

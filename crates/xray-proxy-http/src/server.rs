@@ -23,7 +23,10 @@ use std::{
 use async_trait::async_trait;
 use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -432,11 +435,18 @@ async fn serve_connection(
     tag: &str,
     peer: SocketAddr,
 ) {
+    // Go `ProcessWithFirstbyte` 的 `bufio.NewReaderSize(readerOnly{conn}, buf.Size)`：
+    // 整个连接（请求头 + body + CONNECT 隧道上行）都走同一个 8KB 缓冲读器。
+    // 缓冲里多读到的字节属于 body / 下一请求 / 隧道数据，必须随 reader 存活
+    // 交给后续阶段（bd y5cy9：此前逐字节直读流，1MB 头 = 100 万次 syscall）。
+    let mut client = BufReader::new(stream);
     loop {
         // 对应 Go Start 段的 handshake read deadline（policy 默认 60s）；
         // 超时同时覆盖"空闲等待请求头"——Go 无独立空闲超时。
-        let handshake =
-            tokio::time::timeout(REQUEST_HEADER_TIMEOUT, http_server_handshake(stream, config));
+        let handshake = tokio::time::timeout(
+            REQUEST_HEADER_TIMEOUT,
+            http_server_handshake(&mut client, config),
+        );
         let mut hs = match handshake.await {
             Err(_) => {
                 CONN_LOG.info(format!(
@@ -458,7 +468,7 @@ async fn serve_connection(
         if hs.method != "CONNECT" {
             // Go Process: keepAlive := TrimSpace(ToLower(Proxy-Connection)) == "keep-alive"
             let keep_alive_req = request_keep_alive(&hs.headers);
-            match handle_plain_http(stream, &mut hs).await {
+            match handle_plain_http(&mut client, &mut hs).await {
                 // Go: err == errWaitAnother → keepAlive ? goto Start : err = nil
                 Ok(PlainOutcome::WaitAnother) if keep_alive_req => continue,
                 Ok(PlainOutcome::WaitAnother) => {},
@@ -488,7 +498,7 @@ async fn serve_connection(
                 ));
             },
             Ok(mut upstream) => {
-                if let Err(e) = tokio::io::copy_bidirectional(stream, &mut upstream).await {
+                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
                     CONN_LOG.warn(format!(
                         "CONNECT tunnel copy failed, closing connection tag={tag} \
                          peer={peer} dest={:?} error={e}",
@@ -537,10 +547,10 @@ fn headers_indicate_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
 /// - chunked / close-delimited → 回写 close 头，body 原样透传，返回 [`PlainOutcome::Close`]；
 /// - 读响应失败 → 503 + close 头，返回 [`PlainOutcome::WaitAnother`]（对齐 Go： 503 分支不重置
 ///   `result`，`Process` 层仍按客户端 keep-alive 头决定循环）。
-async fn handle_plain_http(
-    client: &mut TcpStream,
-    hs: &mut HandshakeResult,
-) -> Result<PlainOutcome> {
+async fn handle_plain_http<S>(client: &mut S, hs: &mut HandshakeResult) -> Result<PlainOutcome>
+where
+    S: AsyncBufRead + AsyncWrite + Unpin,
+{
     // Go net/http transfer.go `parseTransferEncoding`（:631-641，Issue 12785）：
     // `!protoAtLeast(1, 1)` 时先 `delete(t.Header, "Transfer-Encoding")` 再直接
     // return——HTTP/1.0 请求声明的 Transfer-Encoding 不参与 body 定界，
@@ -568,7 +578,9 @@ async fn handle_plain_http(
     let path = extract_request_path(&hs.target);
 
     // Go: dispatcher.Dispatch(ctx, dest) —— 每请求新上游连接
-    let mut upstream = dial_destination(&hs.dest).await?;
+    // 上游响应头同样走 8KB 块读（`read_http_line` 需要 `AsyncBufRead`）；头后多读
+    // 到的字节是响应体前缀，留在 reader 里由下面各 body 分支消费（bd y5cy9）。
+    let mut upstream = BufReader::new(dial_destination(&hs.dest).await?);
 
     // requestDone：Connection: close + 请求头 + body 定长透传
     let forwarded = build_forwarded_request(&hs.method, &path, &hs.headers);
@@ -661,15 +673,32 @@ async fn handle_plain_http(
     Ok(PlainOutcome::Close)
 }
 
-/// 从请求/响应头解析 Content-Length（首个值）。缺失 → None；非法值 → 报错
-/// （静默当 0 会截断 body）。
+/// 从请求/响应头解析 Content-Length。缺失 → `None`；非法值 / 多值不一致 → 报错
+/// （静默当 0 会截断 body，静默取首个会让 body 边界与对端不一致）。
 fn parse_content_length(headers: &HashMap<String, Vec<String>>) -> Result<Option<u64>> {
-    match headers.get("content-length").and_then(|vals| vals.first()) {
-        None => Ok(None),
-        Some(v) => v.trim().parse::<u64>().map(Some).map_err(|_| {
-            HttpProxyError::InvalidRequest(format!("malformed Content-Length: {v:?}"))
-        }),
+    let Some(values) = headers.get("content-length") else { return Ok(None) };
+    let mut length: Option<u64> = None;
+    for value in values {
+        let bad = || HttpProxyError::InvalidRequest(format!("malformed Content-Length: {value:?}"));
+        let trimmed = value.trim();
+        // Go `strconv.ParseUint(v, 10, 63)`：空串 / 带符号 / 非数字 / 超 i64::MAX 全拒。
+        // `str::parse::<u64>` 恰好接受 `+5`，故先逐字节校验数字（同 xray-core
+        // `parse_content_length_value` 口径）。
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad());
+        }
+        let parsed =
+            trimmed.parse::<u64>().ok().filter(|n| *n <= i64::MAX as u64).ok_or_else(bad)?;
+        // 多值必须一致（Go `fixLength` 对 `Content-Length` 多值同样报错）：不一致是
+        // 请求/响应走私面，静默取首个会让两侧对 body 边界理解不同。
+        if length.is_some_and(|prev| prev != parsed) {
+            return Err(HttpProxyError::InvalidRequest(
+                "conflicting Content-Length headers".into(),
+            ));
+        }
+        length = Some(parsed);
     }
+    Ok(length)
 }
 
 /// 客户端请求是否要求代理级 keep-alive。
@@ -739,10 +768,11 @@ struct ResponseHead {
 
 /// 读上游响应头。1xx 中间响应头块原样透传给客户端后继续读最终响应
 /// （对齐 Go `readResponseAndHandle100Continue`）。
-async fn read_response_head(
-    upstream: &mut TcpStream,
-    client: &mut TcpStream,
-) -> Result<ResponseHead> {
+async fn read_response_head<R, W>(upstream: &mut R, client: &mut W) -> Result<ResponseHead>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
         let status_line = read_http_line(upstream).await?;
         let code = status_line
@@ -902,7 +932,11 @@ fn canonical_header_key(key: &str) -> String {
 }
 
 /// 定长透传 `n` 字节（请求/响应 body）。上游提前 EOF → 错误（静默截断不可接受）。
-async fn copy_exact_n(from: &mut TcpStream, to: &mut TcpStream, n: u64) -> std::io::Result<()> {
+async fn copy_exact_n<R, W>(from: &mut R, to: &mut W, n: u64) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = [0u8; 8192];
     let mut remaining = n;
     while remaining > 0 {
@@ -923,7 +957,11 @@ async fn copy_exact_n(from: &mut TcpStream, to: &mut TcpStream, n: u64) -> std::
 /// chunked 响应体透传：逐帧 size 行/数据/CRLF/trailer 原样转发，到终止块
 /// （size 0 + trailer 结束）为止，不等 EOF——close-delimited 兜底路径才有
 /// EOF 语义。帧字节原样透传（不解码重编码），客户端按原 transfer-encoding 解析。
-async fn forward_chunked_body(upstream: &mut TcpStream, client: &mut TcpStream) -> Result<()> {
+async fn forward_chunked_body<R, W>(upstream: &mut R, client: &mut W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
         let size_line = read_http_line(upstream).await?;
         let size =
@@ -983,7 +1021,7 @@ pub async fn http_server_handshake<RW>(
     config: &ServerConfig,
 ) -> Result<HandshakeResult>
 where
-    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+    RW: AsyncBufRead + AsyncWrite + Unpin,
 {
     // 1+2. 读请求行 + headers；协议格式错 → **断链不回响应**（Go
     // `http.ReadRequest` 失败 → `Process` 直接 return error → 连接关闭，Go 不写
@@ -1021,6 +1059,21 @@ where
         } else {
             80
         };
+    // 4.5 透明代理检查（对应 Go handlePlainHTTP proxy/http/server.go:209：
+    // `!AllowTransparent && request.URL.Host == ""` → 400 Bad Request）。
+    // target 非绝对 URI（无 scheme）等价 Go `request.URL.Host == ""`。
+    //
+    // **先于 dest 解析**（bd 0snlt）：Go 侧 `ParseHost("")` 不报错，缺 Host 头的
+    // origin-form 请求一路走到 handlePlainHTTP 才回 400；Rust 的 host 解析对空 host
+    // 直接报错 → 退化成静默断链（方向与 Go 相反）。条件与 Go 等价，故把 400 判定
+    // 提到解析之前即可两侧对齐。
+    if method != "CONNECT" && !config.allow_transparent && !target.contains("://") {
+        stream.write_all(RESPONSE_BAD_REQUEST).await?;
+        return Err(HttpProxyError::InvalidRequest(
+            "origin-form request target requires allowTransparent".into(),
+        ));
+    }
+
     let dest = if method == "CONNECT" {
         // CONNECT 的 target 是 authority-form：`http.ReadRequest` 把它包成
         // `http://host:port` 再剥掉 scheme → URL.Host = authority → 同一条规则。
@@ -1030,15 +1083,6 @@ where
             .ok_or_else(|| HttpProxyError::Protocol("missing Host header".into()))?;
         parse_host_port(&host, default_port)?
     };
-    // 4.5 透明代理检查（对应 Go handlePlainHTTP proxy/http/server.go:209：
-    // `!AllowTransparent && request.URL.Host == ""` → 400 Bad Request）。
-    // target 非绝对 URI（无 scheme）等价 Go `request.URL.Host == ""`。
-    if method != "CONNECT" && !config.allow_transparent && !target.contains("://") {
-        stream.write_all(RESPONSE_BAD_REQUEST).await?;
-        return Err(HttpProxyError::InvalidRequest(
-            "origin-form request target requires allowTransparent".into(),
-        ));
-    }
 
     // 5. 回 200（CONNECT）
     if method == "CONNECT" {
@@ -1057,7 +1101,7 @@ async fn read_request_head<RW>(
     stream: &mut RW,
 ) -> Result<(String, String, HttpVersion, HashMap<String, Vec<String>>)>
 where
-    RW: AsyncReadExt + AsyncWriteExt + Unpin,
+    RW: AsyncBufRead + Unpin,
 {
     // 读请求行（严格三段，见 [`parse_request_line`]）
     let request_line = read_http_line(stream).await?;
@@ -1115,6 +1159,12 @@ where
     if headers.get("host").is_some_and(|values| values.len() > 1) {
         return Err(HttpProxyError::Protocol("too many Host headers".into()));
     }
+    // Go 的 `http.ReadRequest` 内部就跑 `readTransfer`→`fixLength`：Content-Length
+    // 非纯十进制 / 超 i64::MAX / 多值不一致都让 ReadRequest 失败 → `Process` 断链
+    // 且**不回响应**。Rust 旧序把 CL 校验留在 handle_plain_http，于是
+    // 「origin-form + 坏 CL」会先命中 4.5 的 400——与 Go 方向相反（bd 0snlt）。
+    // 校验点前移到读头阶段后两侧一致：坏 CL 一律静默断链。
+    parse_content_length(&headers)?;
     Ok((method, target, http_version, headers))
 }
 
@@ -1131,30 +1181,50 @@ const MAX_HTTP_HEAD_BYTES: usize = 1024 * 1024;
 ///
 /// 对齐 Go `net/textproto.readLineSlice`：以 `\n` 断行（**裸 LF 合法**，RFC 7230
 /// §3.5 容忍），仅在行尾剥一个 `\r`，行内 CR 原样保留。
-async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<String> {
+/// 按**块**读底层（Go `bufio.NewReaderSize(..., buf.Size)` = 8KB 语义）：`fill_buf`
+/// 一次拿满调用方 `BufReader` 的内部缓冲，在块内切行、只 `consume` 到行尾——行后
+/// 多余字节留在 reader 里，请求 body / 下一请求 / CONNECT 隧道数据都不丢。逐字节
+/// `read` 是 1MB 头 = 100 万次 syscall（bd y5cy9），块读后同量级输入只剩 128 次调用。
+async fn read_http_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
     let mut buf = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
     loop {
-        let n = reader.read(&mut byte).await.map_err(HttpProxyError::Io)?;
-        if n == 0 {
-            if buf.is_empty() {
-                // 客户端正常关闭（EOF）不是协议错误：走 Io/UnexpectedEof，
-                // 上层不回 400 直接断链（读头中途断仍走 malformed → 400）
-                return Err(HttpProxyError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed before request",
-                )));
+        // 单块处理结果；`available` 借用在本作用域内结束，之后才能 `consume`。
+        let step = {
+            let available = reader.fill_buf().await.map_err(HttpProxyError::Io)?;
+            if available.is_empty() {
+                LineStep::Eof
+            } else if let Some(end) = available.iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..end]);
+                LineStep::Done(end + 1)
+            } else {
+                buf.extend_from_slice(available);
+                LineStep::More(available.len())
             }
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        buf.push(byte[0]);
-        if buf.len() > MAX_HTTP_HEAD_BYTES {
-            return Err(HttpProxyError::Protocol(format!(
-                "http header line exceeds {MAX_HTTP_HEAD_BYTES} bytes"
-            )));
+        };
+        match step {
+            LineStep::Done(n) => {
+                reader.consume(n);
+                break;
+            },
+            LineStep::More(n) => {
+                reader.consume(n);
+                if buf.len() > MAX_HTTP_HEAD_BYTES {
+                    return Err(HttpProxyError::Protocol(format!(
+                        "http header line exceeds {MAX_HTTP_HEAD_BYTES} bytes"
+                    )));
+                }
+            },
+            LineStep::Eof => {
+                if buf.is_empty() {
+                    // 客户端正常关闭（EOF）不是协议错误：走 Io/UnexpectedEof，
+                    // 上层不回 400 直接断链（读头中途断仍走 malformed → 400）
+                    return Err(HttpProxyError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed before request",
+                    )));
+                }
+                break;
+            },
         }
     }
     if buf.last() == Some(&b'\r') {
@@ -1163,6 +1233,13 @@ async fn read_http_line<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Strin
     // 头行按字节透传（Go 不解 UTF-8，≥0x80 原始字节合法，H06）：Latin-1 逐字节
     // 1:1 映射，写回上游/客户端时经 [`latin1_encode`] 原样还原（bd t3lzr）。
     Ok(latin1_decode(&buf))
+}
+
+/// [`read_http_line`] 单次 `fill_buf` 的处理结果：命中行尾（消费 n 字节）/ 未命中 / EOF。
+enum LineStep {
+    Done(usize),
+    More(usize),
+    Eof,
 }
 
 /// 请求行三段切分（对齐 Go `net/http/request.go:1027` `parseRequestLine` +
@@ -1477,7 +1554,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = xray_common::testing::spawn("tcp-handshake-accept", async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
             http_server_handshake(&mut stream, &config).await
         });
 
@@ -1731,6 +1809,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_http_line_leaves_bytes_after_newline_in_reader() {
+        // bd y5cy9：块读多取的字节必须留在读器里（请求体 / 下一 keep-alive 请求 /
+        // CONNECT 隧道数据都靠它续读），逐行读不得把它们吃掉。
+        let mut src = &b"GET / HTTP/1.1\r\n\r\nBODY"[..];
+        assert_eq!(read_http_line(&mut src).await.unwrap(), "GET / HTTP/1.1");
+        assert_eq!(read_http_line(&mut src).await.unwrap(), "");
+        let mut rest = Vec::new();
+        src.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"BODY");
+    }
+
+    #[tokio::test]
     async fn read_http_line_keeps_non_utf8_bytes() {
         // 读头侧：非 UTF-8 字节不得退化成 U+FFFD
         let mut src = &b"X-Bin: \xe9\xff\r\n"[..];
@@ -1902,6 +1992,44 @@ mod tests {
         assert!(result.is_err(), "origin-form should be rejected");
         assert!(resp.contains("400"), "got: {resp}");
         assert!(resp.contains("Connection: close"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn handshake_bad_content_length_closes_without_response() {
+        // bd 0snlt：坏 Content-Length 在 Go 里由 `ReadRequest`→`fixLength` 拒绝 →
+        // `Process` 断链且不回响应。Rust 旧序把校验留在 handle_plain_http，origin-form
+        // 会先命中透明代理 400（方向相反）；校验前移到读头后两侧一致（静默断链）。
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: abc\r\n\r\n";
+        let (resp, result) = tcp_handshake(req, ServerConfig::default()).await;
+        assert!(result.is_err(), "bad Content-Length must be rejected");
+        assert!(resp.is_empty(), "must close silently, got: {resp}");
+    }
+
+    #[test]
+    fn parse_content_length_matches_go_strictness() {
+        let mut h: HashMap<String, Vec<String>> = HashMap::new();
+        h.insert("content-length".into(), vec!["11".into()]);
+        assert_eq!(parse_content_length(&h).unwrap(), Some(11));
+        // Go `ParseUint` 不接受带符号
+        h.insert("content-length".into(), vec!["+5".into()]);
+        assert!(parse_content_length(&h).is_err());
+        // 多值不一致 = 走私面
+        h.insert("content-length".into(), vec!["5".into(), "6".into()]);
+        assert!(parse_content_length(&h).is_err());
+        // 多值一致可接受（Go 折叠后同值）
+        h.insert("content-length".into(), vec!["5".into(), "5".into()]);
+        assert_eq!(parse_content_length(&h).unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn handshake_origin_form_without_host_returns_400() {
+        // bd 0snlt：缺 Host 头的 origin-form 请求，Go 侧 `ParseHost("")` 不报错、一路
+        // 走到 `handlePlainHTTP` 的 `!AllowTransparent && request.URL.Host == ""` 回 400；
+        // Rust 旧序在 host 解析就报错 → 静默断链（两侧方向相反）。
+        let req = b"GET / HTTP/1.1\r\nProxy-Connection: keep-alive\r\n\r\n";
+        let (resp, result) = tcp_handshake(req, ServerConfig::default()).await;
+        assert!(result.is_err(), "missing Host must be rejected");
+        assert!(resp.contains("400 Bad Request"), "got: {resp}");
     }
 
     #[tokio::test]
@@ -2171,7 +2299,7 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        let mut server_stream = server_side.await.unwrap();
+        let mut server_stream = BufReader::new(server_side.await.unwrap());
 
         let dest = parse_host_port(&format!("127.0.0.1:{}", upstream_addr.port()), 80).unwrap();
         let mut hs = HandshakeResult {

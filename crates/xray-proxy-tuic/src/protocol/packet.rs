@@ -31,6 +31,13 @@ use crate::error::{Result, TuicError};
 /// UDP 包最大负载（bi-stream 模式下为合理上限，避免恶意 client 请求超大分配）。
 pub const MAX_PACKET_PAYLOAD: usize = 16 * 1024;
 
+/// 单个 UDP 数据报载荷上限（IPv4 头 20B + UDP 头 8B → 65535−28）。
+///
+/// 与 [`MAX_PACKET_PAYLOAD`] 分工：**分片路径的总负载**以此为界（分片后每片
+/// 仍受 [`MAX_PACKET_PAYLOAD`] 约束），单片路径仍按 [`MAX_PACKET_PAYLOAD`]。
+/// UDP 数据报本身不可能超过该值，故不构成新的无界分配面。
+pub const MAX_UDP_PAYLOAD: usize = 65_507;
+
 /// TUIC v5 Packet 帧。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {

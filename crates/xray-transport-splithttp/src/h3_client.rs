@@ -56,6 +56,206 @@ use crate::{
     error::{Result, SplitHttpError},
 };
 
+/// h3 客户端能力面（生产 = [`LazyH3Conn`]；测试 = 已建好的 `Arc<H3Conn>`）。
+///
+/// h3 拨号函数泛型地接受 `XmuxClient<C>`（`C: H3ClientLike`）：生产路径的池单元
+/// 是 [`LazyH3Conn`]（惰性建连），测试路径直接用已建好的 `Arc<H3Conn>` ✓。
+pub trait H3ClientLike: Send + Sync {
+    /// GET 下载流（`body = None`）/ 一次性 POST（`body = Some`）。
+    fn open_stream(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body: Option<Vec<u8>>,
+        close: Option<CloseSignal>,
+    ) -> impl Future<Output = Result<(DownloadBody, SocketAddr, SocketAddr)>> + Send;
+
+    /// POST streaming body（stream-up / stream-one）。
+    fn open_stream_uploading<S>(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body_stream: S,
+        upload_only: bool,
+    ) -> impl Future<Output = Result<(Option<DownloadBody>, SocketAddr, SocketAddr)>> + Send
+    where
+        S: Stream<Item = std::io::Result<Bytes>> + Send + 'static;
+
+    /// POST 一次性分包（packet-up）。
+    fn post_packet(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        seq_str: &str,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    // 刻意**不提供** `close()`：xmux 池化后连接是**共享池单元**，逐代理连接关闭它
+    // = 池单元报废（实测 h3 复用归零）。Go 的 `splitConn.onClose`（`dialer.go:409-419`）
+    // 也只做 `DoneRunning()`；QUIC 连接由 quinn idle timeout / 池淘汰 / `H3Conn::drop`
+    // 回收。需要关整条连接时走 [`H3Conn::close`]（Drop 路径已在用）。
+
+    /// 是否已关闭（xmux 池的淘汰判据之一）。
+    fn is_closed(&self) -> bool;
+}
+
+impl H3ClientLike for LazyH3Conn {
+    async fn open_stream(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body: Option<Vec<u8>>,
+        close: Option<CloseSignal>,
+    ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
+        self.get().await?.open_stream(base_uri, session_id, body, close).await
+    }
+
+    async fn open_stream_uploading<S>(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body_stream: S,
+        upload_only: bool,
+    ) -> Result<(Option<DownloadBody>, SocketAddr, SocketAddr)>
+    where
+        S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    {
+        self.get()
+            .await?
+            .open_stream_uploading(base_uri, session_id, body_stream, upload_only)
+            .await
+    }
+
+    async fn post_packet(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        seq_str: &str,
+        payload: Bytes,
+    ) -> Result<()> {
+        self.get().await?.post_packet(base_uri, session_id, seq_str, payload).await
+    }
+
+    fn is_closed(&self) -> bool {
+        crate::mux::XmuxConn::is_closed(self)
+    }
+}
+
+impl H3ClientLike for Arc<H3Conn> {
+    async fn open_stream(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body: Option<Vec<u8>>,
+        close: Option<CloseSignal>,
+    ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
+        self.open_stream(base_uri, session_id, body, close).await
+    }
+
+    async fn open_stream_uploading<S>(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        body_stream: S,
+        upload_only: bool,
+    ) -> Result<(Option<DownloadBody>, SocketAddr, SocketAddr)>
+    where
+        S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+    {
+        self.open_stream_uploading(base_uri, session_id, body_stream, upload_only).await
+    }
+
+    async fn post_packet(
+        &self,
+        base_uri: &str,
+        session_id: &str,
+        seq_str: &str,
+        payload: Bytes,
+    ) -> Result<()> {
+        self.post_packet(base_uri, session_id, seq_str, payload).await
+    }
+
+    fn is_closed(&self) -> bool {
+        crate::mux::XmuxConn::is_closed(self)
+    }
+}
+
+/// h3 侧 xmux 池条目：**惰性**建连的 QUIC/H3 连接（bd s42cg）。
+///
+/// Go 的 h3 xmux 单元 = `http3.Transport`：`createHTTPClient`（`dialer.go:155-240`）
+/// 只**造 transport**，QUIC 握手推迟到首次请求。Rust 的
+/// [`H3Conn::connect_with_quic_params`] 是**急连**（await），而
+/// [`crate::mux::XmuxManager`] 的工厂是**同步** `Fn() -> C` ⇒ 用本包装把握手推迟到
+/// 首次使用（`get_or_try_init`），语义与 Go 的 lazy transport 一致 ✓。
+///
+/// 复用效果：同一 (dest, 配置) 的多条代理连接共用**一条 QUIC 连接**（多 stream
+/// 多路复用）——即 Go xmux 的 h3 语义 ✓。
+pub struct LazyH3Conn {
+    /// 已建好的连接（首次使用后固定；建连失败不落缓存，下次重试）。
+    inner: tokio::sync::OnceCell<Arc<H3Conn>>,
+    /// 建连参数（工厂捕获，握手时用）。
+    config: Arc<Config>,
+    addr: SocketAddr,
+    server_name: String,
+    tls: RustlsClientConfig,
+    quic_params: Option<xray_transport::memory_settings::QuicParamsConfig>,
+    sockopt: xray_transport::sockopt::SocketOptions,
+}
+
+impl LazyH3Conn {
+    /// 构造池条目（不建连——握手推迟到首次 [`Self::get`]）。
+    #[must_use]
+    pub fn new(
+        config: Arc<Config>,
+        addr: SocketAddr,
+        server_name: String,
+        tls: RustlsClientConfig,
+        quic_params: Option<xray_transport::memory_settings::QuicParamsConfig>,
+        sockopt: xray_transport::sockopt::SocketOptions,
+    ) -> Self {
+        Self {
+            inner: tokio::sync::OnceCell::new(),
+            config,
+            addr,
+            server_name,
+            tls,
+            quic_params,
+            sockopt,
+        }
+    }
+
+    /// 已建立的连接（未建立则 `None`）——关闭路径同步取用（对齐 Go
+    /// `splitConn.onClose → tr.Close()`：连接已建则显式关，未建则无需关）。
+    #[must_use]
+    pub fn peek(&self) -> Option<&Arc<H3Conn>> {
+        self.inner.get()
+    }
+
+    /// 取（必要时建立）QUIC/H3 连接。
+    pub async fn get(&self) -> Result<Arc<H3Conn>> {
+        self.inner
+            .get_or_try_init(|| async {
+                H3Conn::connect_with_quic_params(
+                    self.config.clone(),
+                    self.addr,
+                    &self.server_name,
+                    self.tls.clone(),
+                    self.quic_params.as_ref(),
+                    &self.sockopt,
+                )
+                .await
+            })
+            .await
+            .cloned()
+    }
+}
+
+impl crate::mux::XmuxConn for LazyH3Conn {
+    fn is_closed(&self) -> bool {
+        self.inner.get().is_some_and(|c| (**c).is_closed())
+    }
+}
+
 /// h3 SendRequest 类型别名（h3-quinn 适配）。
 ///
 /// `h3::client::new(h3_quinn::Connection)` 返回的 `SendRequest<h3_quinn::OpenStreams, Bytes>`。
@@ -606,7 +806,7 @@ impl H3Conn {
             self.config.build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
         let post_req = Self::build_h3_request(&post_meta)?;
         let mut send_req = self.send_req.lock().await;
-        let mut upload_stream = send_req.send_request(post_req).await.map_err(|e| {
+        let upload_stream = send_req.send_request(post_req).await.map_err(|e| {
             self.mark_closed();
             SplitHttpError::Hyper(format!("h3 send_request upload: {e}"))
         })?;
@@ -617,7 +817,19 @@ impl H3Conn {
         // 多出一条连接，语义从 1 连接变 2 连接。
         let (data_tx, data_rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(16);
 
-        // spawn 上传任务：循环 read body_stream → send_data → finish → 响应处理
+        // **收发并发**（bd 1xfap）：h3 的 `RequestStream` 收发共用 `&mut self`
+        // （`send_data`/`recv_response`/`recv_data` 都要 `&mut`）——单 task 顺序两段
+        // （先发完 body 再读响应）在 xhttp stream-one 的真实形态下是死路：上传是
+        // **活流**（客户端不会先关写向），body 永不结束 ⇒ 永远读不到响应 ⇒ 下行
+        // 永挂（curl 超时）。Go 侧是并发收发：`OpenStream` 起 goroutine 跑
+        // `client.Do(req)`，http3 transport 另起 task 发 body，响应头一到即可读。
+        //
+        // 按 h3 官方 `RequestStream::split()` 拆成收发两半（服务端
+        // `serve_h3_request` 同款）：上行 task 驱动 send_half（body → finish），
+        // 下行 task 驱动 recv_half（响应头 → 响应体 → 下行流）。
+        let (mut send_half, mut recv_half) = upload_stream.split();
+
+        // spawn 上传任务：循环 read body_stream → send_data → finish
         let this = self.clone();
         let me_for_closed = Arc::downgrade(&this);
         #[allow(
@@ -629,7 +841,7 @@ impl H3Conn {
             while let Some(chunk) = body_stream.next().await {
                 match chunk {
                     Ok(b) => {
-                        if upload_stream
+                        if send_half
                             .send_data(b)
                             .await
                             .map_err(|e| SplitHttpError::Hyper(format!("upload send_data: {e}")))
@@ -649,9 +861,19 @@ impl H3Conn {
                     },
                 }
             }
-            let _ = upload_stream.finish().await;
+            let _ = send_half.finish().await;
+        });
+
+        // spawn 下行任务：响应头校验 + 响应体 → 下行流（与上行并发，见上）。
+        let this = self.clone();
+        let me_for_closed = Arc::downgrade(&this);
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行响应读取任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        )]
+        tokio::spawn(async move {
             // 响应头校验（对齐 DefaultDialerClient：非 200 → mark_closed + EOF）
-            match upload_stream.recv_response().await {
+            match recv_half.recv_response().await {
                 Ok(resp) if resp.status() == StatusCode::OK => {},
                 Ok(_) => {
                     if let Some(c) = me_for_closed.upgrade() {
@@ -671,10 +893,10 @@ impl H3Conn {
             }
             if upload_only {
                 // stream-up：drain 响应（h3 协议要求收完否则连接异常）
-                while let Ok(Some(_)) = upload_stream.recv_data().await {}
+                while let Ok(Some(_)) = recv_half.recv_data().await {}
             } else {
                 // stream-one：响应数据即下行流，转发给调用方
-                while let Ok(Some(mut buf)) = upload_stream.recv_data().await {
+                while let Ok(Some(mut buf)) = recv_half.recv_data().await {
                     let len = buf.remaining();
                     let data = buf.copy_to_bytes(len);
                     if data_tx.send(Ok(data)).await.is_err() {
@@ -742,8 +964,9 @@ where
 /// 转发，转换方式与 [`spawn_h3_recv_reader`] 相同。
 ///
 /// `close` 信号到达（[`crate::connection::SplitConn`] drop）即退出——drop
-/// `RequestStream` 触发 quinn 停止接收；配合拨号方 on_close 里的
-/// [`H3Conn::close`] 整条 QUIC 连接立即终结，对齐 Go `splitConn.onClose` 语义。
+/// `RequestStream` 触发 quinn 停止接收。整条 QUIC 连接**不**在代理连接结束时关闭
+/// （xmux 池化，见 [`H3ClientLike`] 注释）：由 quinn idle timeout / 池淘汰 /
+/// [`H3Conn`] drop 回收。
 fn spawn_h3_lazy_reader<S, B>(
     this: std::sync::Arc<H3Conn>,
     mut stream: h3::client::RequestStream<S, B>,

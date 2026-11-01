@@ -257,10 +257,17 @@ async fn wait_closed(closed: &mut watch::Receiver<bool>) {
 /// `ConnScope` 级联取消在途连接。裸 token cancel（不经宿主 close）形态由各 arm
 /// 的停机监视任务兜底（消费方自建），本表只承载宿主编排面。
 ///
+/// **同 tag upsert**（bd il9lh MW-5）：本表是**每宿主实例一份**，tag 是入站身份
+/// （宿主 slot 表按 tag 唯一，重复 tag 直接 `AlreadyExists`）——同名多条 = 重复
+/// 而非「多实例」。gRPC `AddInbound` 每次「`RemoveInbound` + 同 tag `AddInbound`」
+/// 会在表里留下 1 条永久条目（本表只增不减 → 每重启一次 +1，条目永不回收）。
+/// 故登记按 tag upsert：旧条目摘除、新的挂到登记序末尾（`close_all_reverse` 仍是
+/// 「后登记先关」= 后起的 arm 先停）。
+///
 /// 登记泄漏口径：条目仅在 `close_all_reverse` 出清；宿主未 close 即退出 = 随表
 /// drop（arm scope 及其任务随之结束，语义等同既有 Arc 归零 Drop 兜底）。
 pub struct ArmScopeRegistry {
-    /// 登记序 = 装配序；(tag, scope)。close 幂等，重复登记/重复关闭均无害。
+    /// 登记序 = 装配序；(tag, scope)。close 幂等，重复关闭均无害。
     entries: std::sync::Mutex<Vec<(String, Arc<ArmScope>)>>,
 }
 
@@ -270,11 +277,29 @@ impl ArmScopeRegistry {
         Self { entries: std::sync::Mutex::new(Vec::new()) }
     }
 
-    /// 登记一个 arm scope（装配序追加；同 scope 重复登记仅多一条幂等条目）。
+    /// 登记一个 arm scope（**同 tag upsert**：旧条目替换、新的挂登记序末尾）。
+    ///
+    /// 语义澄清见类型文档：同名 = 重复登记（gRPC 重启同 tag 入站），不是多实例。
+    /// 旧条目被替换时**显式 close**（幂等）：移除路径（`RemoveInbound` → per-inbound
+    /// token cancel → 停机监视 `shutdown_timeout`）已关过一次时本调用无害；未关
+    /// 时则避免它成为宿主 close 编排表外的孤儿 arm（表外 = 宿主停机不再关它）。
+    /// 同一 scope 重复登记 = 幂等，**不关闸**（否则刚登记的 arm 当场被关）。
+    ///
+    /// 并发：全段在同一把毒锁容忍的互斥锁内完成（无 await、无锁序交叉）——
+    /// gRPC 并发 `AddInbound`/`RemoveInbound` 不引入竞态或死锁。
     pub fn register(&self, tag: impl Into<String>, scope: Arc<ArmScope>) {
+        let tag = tag.into();
         // 毒锁容忍（装配/停机期不得因别处 panic 拒绝登记或拒关停）：
         // 同 arm_builders intern 表先例，poison = 数据仍自洽（纯 Vec）直接取用。
-        self.entries.lock().unwrap_or_else(|e| e.into_inner()).push((tag.into(), scope));
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = guard.iter().position(|(t, _)| *t == tag) {
+            let (_, old) = guard.remove(pos);
+            if !Arc::ptr_eq(&old, &scope) {
+                old.close();
+                tracing::debug!(tag = %tag, "arm scope replaced (same tag re-registered)");
+            }
+        }
+        guard.push((tag, scope));
     }
 
     /// 逆序（后装配先关）显式 close 全部并清空登记，返回关闭条数（日志锚）。
@@ -306,5 +331,100 @@ impl Default for ArmScopeRegistry {
 impl std::fmt::Debug for ArmScopeRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArmScopeRegistry").field("registered", &self.registered()).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bd il9lh MW-5：同 tag 连续登记 K 次 → 表内恒 1 条（修前 = K 条永久条目），
+    /// 且**最后登记的** scope 才是存活的那条。
+    #[test]
+    fn register_same_tag_upserts_single_entry() {
+        let reg = ArmScopeRegistry::new();
+        let mut scopes = Vec::new();
+        for _ in 0..5 {
+            let scope = ArmScope::new();
+            reg.register("in-1", Arc::clone(&scope));
+            scopes.push(scope);
+        }
+        assert_eq!(reg.registered(), 1, "same tag must upsert, not append");
+        // 被替换的旧 scope 已显式 close（不留孤儿 arm）。
+        for old in &scopes[..scopes.len() - 1] {
+            assert!(old.is_closed(), "replaced scope must be closed");
+        }
+        // 最后登记的那条仍开着（未被误关）。
+        assert!(!scopes.last().expect("non-empty").is_closed(), "latest scope must stay open");
+    }
+
+    /// 同一 scope 重复登记 = 幂等：**不得**把刚登记的 arm 关掉。
+    #[test]
+    fn register_same_scope_twice_keeps_it_open() {
+        let reg = ArmScopeRegistry::new();
+        let scope = ArmScope::new();
+        reg.register("in-1", Arc::clone(&scope));
+        reg.register("in-1", Arc::clone(&scope));
+        assert_eq!(reg.registered(), 1);
+        assert!(!scope.is_closed(), "same-scope re-register must not close it");
+    }
+
+    /// 不同 tag 各自成条（upsert 不得误伤多入站场景）。
+    #[test]
+    fn register_distinct_tags_keep_all_entries() {
+        let reg = ArmScopeRegistry::new();
+        reg.register("in-1", ArmScope::new());
+        reg.register("in-2", ArmScope::new());
+        assert_eq!(reg.registered(), 2);
+        assert_eq!(reg.close_all_reverse(), 2);
+        assert_eq!(reg.registered(), 0);
+    }
+
+    /// 并发登记同 tag：N 线程 × M 次 → 终态恒 1 条（无竞态/死锁）。
+    #[test]
+    fn concurrent_register_same_tag_keeps_single_entry() {
+        let reg = std::sync::Arc::new(ArmScopeRegistry::new());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let reg = std::sync::Arc::clone(&reg);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        reg.register("in-1", ArmScope::new());
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("register thread must not panic");
+        }
+        assert_eq!(reg.registered(), 1, "concurrent same-tag register must upsert");
+    }
+
+    /// 并发登记 + 注销（`close_all_reverse`）：不得死锁/ panic；终态条目数 ≤ 1。
+    #[test]
+    fn concurrent_register_and_close_all_no_deadlock() {
+        let reg = std::sync::Arc::new(ArmScopeRegistry::new());
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let reg = std::sync::Arc::clone(&reg);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    reg.register(format!("in-{i}"), ArmScope::new());
+                }
+            }));
+        }
+        let closer = {
+            let reg = std::sync::Arc::clone(&reg);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    reg.close_all_reverse();
+                }
+            })
+        };
+        for h in handles {
+            h.join().expect("register thread must not panic");
+        }
+        closer.join().expect("close thread must not panic");
+        assert!(reg.registered() <= 4, "entries must stay bounded, got {}", reg.registered());
     }
 }
