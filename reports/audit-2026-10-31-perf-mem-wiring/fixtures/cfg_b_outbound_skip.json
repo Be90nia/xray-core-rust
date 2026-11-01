@@ -1,0 +1,64 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 19001,
+      "settings": {
+        "auth": "noauth",
+        "udp": false
+      }
+    },
+    {
+      "tag": "masque-in",
+      "protocol": "masque",
+      "listen": "127.0.0.1",
+      "port": 19002,
+      "settings": {}
+    },
+    {
+      "tag": "ss2022-in",
+      "protocol": "shadowsocks_2022",
+      "listen": "127.0.0.1",
+      "port": 19003,
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 1,
+            "users": [
+              {
+                "id": "not-a-uuid",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "tag": "m",
+      "protocol": "masque",
+      "settings": {}
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}

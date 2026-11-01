@@ -1,0 +1,14 @@
+[package]
+name = "fxretain"
+version = "0.0.0"
+edition = "2021"
+
+# 独立 workspace：不并入主仓 workspace（只读复核资产）。
+[workspace]
+
+[dependencies]
+tokio = { version = "1.53", features = ["full"] }
+skeleton-infra = { package = "udf-skeleton-infra", path = "../../../../../crates/udf-frame/skeleton-infra", features = ["tokio", "memgov"] }
+
+[profile.release]
+debug = false

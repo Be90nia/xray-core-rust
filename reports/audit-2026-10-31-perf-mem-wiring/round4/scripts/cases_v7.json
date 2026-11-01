@@ -1,0 +1,18 @@
+[
+  {"name":"v7_udphop_interval_string","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":"30-60","ports":[443]}}]}}},
+  {"name":"v7_udphop_interval_int","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":30,"ports":[443]}}]}}},
+  {"name":"v7_udphop_interval_obj","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":{"from":30,"to":60},"ports":[443]}}]}}},
+  {"name":"v7_udphop_ports_string","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":"30-60","ports":"443,8000-8002"}}]}}},
+  {"name":"v7_udphop_remotePorts_string","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":"30-60","remotePorts":"53,443"}}]}}},
+  {"name":"v7_freedom_fragment_interval_string","path":["outbounds",0,"settings","fragment"],"value":{"packets":"tlshello","length":"10-20","interval":"30-60","maxSplit":"1-3"}},
+  {"name":"v7_freedom_noise_delay_string","path":["outbounds",0,"settings","noises"],"value":[{"type":"str","packet":"aGVsbG8=","delay":"10-20","applyTo":"ip"}]},
+  {"name":"v7_freedom_finalrule_blockDelay_string","path":["outbounds",0,"settings","finalRules"],"value":[{"action":"block","blockDelay":"30-90"}]},
+  {"name":"v7_splithttp_xmux_maxConcurrency_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","xmux":{"maxConcurrency":"1-4","maxConnections":"2-8","cMaxReuseTimes":"3","hMaxRequestTimes":"5-6","hMaxReusableSecs":"7-8"}}}},
+  {"name":"v7_splithttp_scMaxEachPostBytes","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","scMaxEachPostBytes":1000000,"scMinPostsIntervalMs":30,"scMaxBufferedPosts":30}}},
+  {"name":"v7_splithttp_noGRPCHeader_only","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","noGRPCHeader":true}}},
+  {"name":"v7_route_port_range_string","path":["routing"],"value":{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"out-1","port":"80,443,1000-2000"}]}},
+  {"name":"v7_route_localPort_string","path":["routing"],"value":{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"out-1","localPort":"8000-9000"}]}},
+  {"name":"v7_route_sourcePort_string","path":["routing"],"value":{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"out-1","sourcePort":"53"}]}},
+  {"name":"v7_kcp_congestion_bool","path":["inbounds",0,"streamSettings"],"value":{"network":"kcp","kcpSettings":{"mtu":1350,"congestion":false,"seed":"s"}}},
+  {"name":"v7_kcp_congestion_string","path":["inbounds",0,"streamSettings"],"value":{"network":"kcp","kcpSettings":{"mtu":1350,"congestion":"bbr","seed":"s"}}}
+]

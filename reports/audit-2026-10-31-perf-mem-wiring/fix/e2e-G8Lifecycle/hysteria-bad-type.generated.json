@@ -1,0 +1,35 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "tag": "hy-in",
+      "listen": "127.0.0.1",
+      "port": 28543,
+      "protocol": "hysteria",
+      "settings": {
+        "version": 2,
+        "auth": "test-pass"
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "finalmask": {
+          "udp": [
+            {
+              "type": "bogus",
+              "settings": {}
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "freedom-out",
+      "protocol": "freedom",
+      "settings": {}
+    }
+  ]
+}

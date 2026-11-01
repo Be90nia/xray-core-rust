@@ -1,0 +1,2942 @@
+{
+ "conf": [
+  {
+   "struct": "LogConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 17,
+   "fields": [
+    {
+     "rust": "loglevel",
+     "rename": null,
+     "aliases": [],
+     "line": 19
+    },
+    {
+     "rust": "access",
+     "rename": null,
+     "aliases": [],
+     "line": 22
+    },
+    {
+     "rust": "error",
+     "rename": null,
+     "aliases": [],
+     "line": 25
+    },
+    {
+     "rust": "dns_log",
+     "rename": null,
+     "aliases": [],
+     "line": 28
+    },
+    {
+     "rust": "mask_address",
+     "rename": null,
+     "aliases": [],
+     "line": 31
+    },
+    {
+     "rust": "format",
+     "rename": null,
+     "aliases": [],
+     "line": 34
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "PolicyLevel",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 44,
+   "fields": [
+    {
+     "rust": "handshake",
+     "rename": null,
+     "aliases": [],
+     "line": 46
+    },
+    {
+     "rust": "conn_idle",
+     "rename": null,
+     "aliases": [
+      "conn_idle"
+     ],
+     "line": 49
+    },
+    {
+     "rust": "uplink",
+     "rename": null,
+     "aliases": [
+      "uplinkOnly"
+     ],
+     "line": 52
+    },
+    {
+     "rust": "downlink",
+     "rename": null,
+     "aliases": [
+      "downlinkOnly"
+     ],
+     "line": 55
+    },
+    {
+     "rust": "buffer_size",
+     "rename": null,
+     "aliases": [
+      "buffer_size"
+     ],
+     "line": 59
+    },
+    {
+     "rust": "stats_user_uplink",
+     "rename": null,
+     "aliases": [
+      "stats_user_uplink"
+     ],
+     "line": 62
+    },
+    {
+     "rust": "stats_user_downlink",
+     "rename": null,
+     "aliases": [
+      "stats_user_downlink"
+     ],
+     "line": 64
+    },
+    {
+     "rust": "stats_user_online",
+     "rename": null,
+     "aliases": [
+      "stats_user_online"
+     ],
+     "line": 67
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "PolicySystem",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 73,
+   "fields": [
+    {
+     "rust": "stats_inbound_uplink",
+     "rename": null,
+     "aliases": [
+      "stats_inbound_uplink"
+     ],
+     "line": 75
+    },
+    {
+     "rust": "stats_inbound_downlink",
+     "rename": null,
+     "aliases": [
+      "stats_inbound_downlink"
+     ],
+     "line": 77
+    },
+    {
+     "rust": "stats_outbound_uplink",
+     "rename": null,
+     "aliases": [
+      "stats_outbound_uplink"
+     ],
+     "line": 79
+    },
+    {
+     "rust": "stats_outbound_downlink",
+     "rename": null,
+     "aliases": [
+      "stats_outbound_downlink"
+     ],
+     "line": 81
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "PolicyConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 87,
+   "fields": [
+    {
+     "rust": "levels",
+     "rename": null,
+     "aliases": [],
+     "line": 90
+    },
+    {
+     "rust": "system",
+     "rename": null,
+     "aliases": [],
+     "line": 92
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ObservatoryConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 102,
+   "fields": [
+    {
+     "rust": "subject_selector",
+     "rename": null,
+     "aliases": [],
+     "line": 105
+    },
+    {
+     "rust": "subject_outbound",
+     "rename": null,
+     "aliases": [
+      "subject_outbound"
+     ],
+     "line": 109
+    },
+    {
+     "rust": "enable_concurrency",
+     "rename": null,
+     "aliases": [],
+     "line": 112
+    },
+    {
+     "rust": "probe_url",
+     "rename": null,
+     "aliases": [],
+     "line": 120
+    },
+    {
+     "rust": "probe_interval",
+     "rename": null,
+     "aliases": [
+      "probe_interval"
+     ],
+     "line": 123
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BurstObservatoryConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 129,
+   "fields": [
+    {
+     "rust": "subject_selector",
+     "rename": null,
+     "aliases": [],
+     "line": 133
+    },
+    {
+     "rust": "subject_outbound",
+     "rename": null,
+     "aliases": [
+      "subject_outbound"
+     ],
+     "line": 136
+    },
+    {
+     "rust": "ping_config",
+     "rename": null,
+     "aliases": [
+      "ping_config"
+     ],
+     "line": 139
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "MetricsConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 149,
+   "fields": [
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 153
+    },
+    {
+     "rust": "listen",
+     "rename": null,
+     "aliases": [],
+     "line": 156
+    },
+    {
+     "rust": "tags",
+     "rename": null,
+     "aliases": [],
+     "line": 159
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VersionConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 183,
+   "fields": [
+    {
+     "rust": "min",
+     "rename": null,
+     "aliases": [],
+     "line": 186
+    },
+    {
+     "rust": "max",
+     "rename": null,
+     "aliases": [],
+     "line": 189
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "GeodataConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 207,
+   "fields": [
+    {
+     "rust": "cron",
+     "rename": null,
+     "aliases": [],
+     "line": 212
+    },
+    {
+     "rust": "outbound",
+     "rename": null,
+     "aliases": [],
+     "line": 215
+    },
+    {
+     "rust": "assets",
+     "rename": null,
+     "aliases": [],
+     "line": 218
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "GeodataAssetConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 224,
+   "fields": [
+    {
+     "rust": "url",
+     "rename": null,
+     "aliases": [],
+     "line": 227
+    },
+    {
+     "rust": "file",
+     "rename": null,
+     "aliases": [],
+     "line": 230
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ApiConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 236,
+   "fields": [
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 239
+    },
+    {
+     "rust": "listen",
+     "rename": null,
+     "aliases": [],
+     "line": 245
+    },
+    {
+     "rust": "services",
+     "rename": null,
+     "aliases": [],
+     "line": 248
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FakeDnsPoolElement",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 258,
+   "fields": [
+    {
+     "rust": "ip_pool",
+     "rename": null,
+     "aliases": [
+      "ip_pool"
+     ],
+     "line": 261
+    },
+    {
+     "rust": "pool_size",
+     "rename": null,
+     "aliases": [
+      "pool_size"
+     ],
+     "line": 264
+    }
+   ],
+   "rename_all": "camelCase",
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FakeDnsConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\app_config.rs",
+   "line": 270,
+   "fields": [
+    {
+     "rust": "ip_pool",
+     "rename": null,
+     "aliases": [],
+     "line": 272
+    },
+    {
+     "rust": "pool_size",
+     "rename": null,
+     "aliases": [],
+     "line": 274
+    },
+    {
+     "rust": "pools",
+     "rename": null,
+     "aliases": [],
+     "line": 276
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BuiltEntry",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\built.rs",
+   "line": 37,
+   "fields": [
+    {
+     "rust": "kind",
+     "rename": null,
+     "aliases": [],
+     "line": 39
+    },
+    {
+     "rust": "data",
+     "rename": null,
+     "aliases": [],
+     "line": 41
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BuiltInbound",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\built.rs",
+   "line": 46,
+   "fields": [
+    {
+     "rust": "entry",
+     "rename": null,
+     "aliases": [],
+     "line": 48
+    },
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 50
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 52
+    },
+    {
+     "rust": "listen",
+     "rename": null,
+     "aliases": [],
+     "line": 54
+    },
+    {
+     "rust": "stream_settings_json",
+     "rename": null,
+     "aliases": [],
+     "line": 56
+    },
+    {
+     "rust": "sniffing_json",
+     "rename": null,
+     "aliases": [],
+     "line": 58
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BuiltOutbound",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\built.rs",
+   "line": 63,
+   "fields": [
+    {
+     "rust": "entry",
+     "rename": null,
+     "aliases": [],
+     "line": 65
+    },
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 67
+    },
+    {
+     "rust": "send_through",
+     "rename": null,
+     "aliases": [],
+     "line": 69
+    },
+    {
+     "rust": "stream_settings_json",
+     "rename": null,
+     "aliases": [],
+     "line": 71
+    },
+    {
+     "rust": "proxy_settings_json",
+     "rename": null,
+     "aliases": [],
+     "line": 73
+    },
+    {
+     "rust": "mux_json",
+     "rename": null,
+     "aliases": [],
+     "line": 75
+    },
+    {
+     "rust": "target_strategy",
+     "rename": null,
+     "aliases": [],
+     "line": 81
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BuiltConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\built.rs",
+   "line": 86,
+   "fields": [
+    {
+     "rust": "apps",
+     "rename": null,
+     "aliases": [],
+     "line": 88
+    },
+    {
+     "rust": "inbounds",
+     "rename": null,
+     "aliases": [],
+     "line": 90
+    },
+    {
+     "rust": "outbounds",
+     "rename": null,
+     "aliases": [],
+     "line": 92
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "Address",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 20,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "PortRange",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 90,
+   "fields": [
+    {
+     "rust": "start",
+     "rename": null,
+     "aliases": [],
+     "line": 91
+    },
+    {
+     "rust": "end",
+     "rename": null,
+     "aliases": [],
+     "line": 92
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "PortList",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 118,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "User",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 228,
+   "fields": [
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 231
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 234
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "Int32Range",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 255,
+   "fields": [
+    {
+     "rust": "left",
+     "rename": null,
+     "aliases": [],
+     "line": 257
+    },
+    {
+     "rust": "right",
+     "rename": null,
+     "aliases": [],
+     "line": 259
+    },
+    {
+     "rust": "from",
+     "rename": null,
+     "aliases": [],
+     "line": 261
+    },
+    {
+     "rust": "to",
+     "rename": null,
+     "aliases": [],
+     "line": 263
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "StringList",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 364,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "NetworkList",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\common.rs",
+   "line": 442,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "Config",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\config.rs",
+   "line": 25,
+   "fields": [
+    {
+     "rust": "log",
+     "rename": null,
+     "aliases": [],
+     "line": 28
+    },
+    {
+     "rust": "routing",
+     "rename": null,
+     "aliases": [],
+     "line": 32
+    },
+    {
+     "rust": "dns",
+     "rename": null,
+     "aliases": [],
+     "line": 36
+    },
+    {
+     "rust": "policy",
+     "rename": null,
+     "aliases": [],
+     "line": 40
+    },
+    {
+     "rust": "api",
+     "rename": null,
+     "aliases": [],
+     "line": 44
+    },
+    {
+     "rust": "metrics",
+     "rename": null,
+     "aliases": [],
+     "line": 48
+    },
+    {
+     "rust": "stats",
+     "rename": null,
+     "aliases": [],
+     "line": 52
+    },
+    {
+     "rust": "reverse",
+     "rename": null,
+     "aliases": [],
+     "line": 57
+    },
+    {
+     "rust": "fake_dns",
+     "rename": "fakeDns",
+     "aliases": [],
+     "line": 61
+    },
+    {
+     "rust": "observatory",
+     "rename": null,
+     "aliases": [],
+     "line": 65
+    },
+    {
+     "rust": "burst_observatory",
+     "rename": "burstObservatory",
+     "aliases": [],
+     "line": 69
+    },
+    {
+     "rust": "version",
+     "rename": null,
+     "aliases": [],
+     "line": 73
+    },
+    {
+     "rust": "geodata",
+     "rename": null,
+     "aliases": [],
+     "line": 77
+    },
+    {
+     "rust": "transport",
+     "rename": null,
+     "aliases": [],
+     "line": 82
+    },
+    {
+     "rust": "env",
+     "rename": null,
+     "aliases": [],
+     "line": 87
+    },
+    {
+     "rust": "inbound_configs",
+     "rename": "inbounds",
+     "aliases": [],
+     "line": 91
+    },
+    {
+     "rust": "outbound_configs",
+     "rename": "outbounds",
+     "aliases": [],
+     "line": 95
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "InboundDetourConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\config.rs",
+   "line": 137,
+   "fields": [
+    {
+     "rust": "protocol",
+     "rename": null,
+     "aliases": [],
+     "line": 139
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 143
+    },
+    {
+     "rust": "listen",
+     "rename": null,
+     "aliases": [],
+     "line": 147
+    },
+    {
+     "rust": "settings",
+     "rename": null,
+     "aliases": [],
+     "line": 151
+    },
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 154
+    },
+    {
+     "rust": "stream_settings",
+     "rename": "streamSettings",
+     "aliases": [],
+     "line": 158
+    },
+    {
+     "rust": "sniffing",
+     "rename": null,
+     "aliases": [],
+     "line": 162
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "OutboundDetourConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\config.rs",
+   "line": 172,
+   "fields": [
+    {
+     "rust": "protocol",
+     "rename": null,
+     "aliases": [],
+     "line": 174
+    },
+    {
+     "rust": "send_through",
+     "rename": "sendThrough",
+     "aliases": [],
+     "line": 178
+    },
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 181
+    },
+    {
+     "rust": "settings",
+     "rename": null,
+     "aliases": [],
+     "line": 185
+    },
+    {
+     "rust": "stream_settings",
+     "rename": "streamSettings",
+     "aliases": [],
+     "line": 189
+    },
+    {
+     "rust": "proxy_settings",
+     "rename": "proxySettings",
+     "aliases": [],
+     "line": 193
+    },
+    {
+     "rust": "mux",
+     "rename": null,
+     "aliases": [],
+     "line": 197
+    },
+    {
+     "rust": "target_strategy",
+     "rename": "targetStrategy",
+     "aliases": [],
+     "line": 201
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "SniffingConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\config.rs",
+   "line": 211,
+   "fields": [
+    {
+     "rust": "enabled",
+     "rename": null,
+     "aliases": [],
+     "line": 213
+    },
+    {
+     "rust": "dest_override",
+     "rename": "destOverride",
+     "aliases": [],
+     "line": 217
+    },
+    {
+     "rust": "domains_excluded",
+     "rename": "domainsExcluded",
+     "aliases": [],
+     "line": 221
+    },
+    {
+     "rust": "ips_excluded",
+     "rename": "ipsExcluded",
+     "aliases": [],
+     "line": 225
+    },
+    {
+     "rust": "metadata_only",
+     "rename": "metadataOnly",
+     "aliases": [],
+     "line": 229
+    },
+    {
+     "rust": "route_only",
+     "rename": "routeOnly",
+     "aliases": [],
+     "line": 233
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "MuxConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\config.rs",
+   "line": 246,
+   "fields": [
+    {
+     "rust": "enabled",
+     "rename": null,
+     "aliases": [],
+     "line": 248
+    },
+    {
+     "rust": "concurrency",
+     "rename": null,
+     "aliases": [],
+     "line": 251
+    },
+    {
+     "rust": "xudp_concurrency",
+     "rename": "xudpConcurrency",
+     "aliases": [],
+     "line": 255
+    },
+    {
+     "rust": "xudp_proxy_udp_443",
+     "rename": "xudpProxyUDP443",
+     "aliases": [],
+     "line": 260
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FakeDnsStage",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\init.rs",
+   "line": 51,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ValidationStage",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\init.rs",
+   "line": 159,
+   "fields": [],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VLessInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 35,
+   "fields": [
+    {
+     "rust": "clients",
+     "rename": "clients",
+     "aliases": [],
+     "line": 38
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 42
+    },
+    {
+     "rust": "decryption",
+     "rename": null,
+     "aliases": [],
+     "line": 45
+    },
+    {
+     "rust": "fallbacks",
+     "rename": null,
+     "aliases": [],
+     "line": 49
+    },
+    {
+     "rust": "flow",
+     "rename": null,
+     "aliases": [],
+     "line": 53
+    },
+    {
+     "rust": "testseed",
+     "rename": null,
+     "aliases": [],
+     "line": 57
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VLessInboundFallbackConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 63,
+   "fields": [
+    {
+     "rust": "name",
+     "rename": null,
+     "aliases": [],
+     "line": 65
+    },
+    {
+     "rust": "alpn",
+     "rename": null,
+     "aliases": [],
+     "line": 67
+    },
+    {
+     "rust": "path",
+     "rename": null,
+     "aliases": [],
+     "line": 69
+    },
+    {
+     "rust": "type",
+     "rename": null,
+     "aliases": [],
+     "line": 71
+    },
+    {
+     "rust": "dest",
+     "rename": null,
+     "aliases": [],
+     "line": 74
+    },
+    {
+     "rust": "xver",
+     "rename": null,
+     "aliases": [],
+     "line": 76
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VMessInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 82,
+   "fields": [
+    {
+     "rust": "clients",
+     "rename": "clients",
+     "aliases": [],
+     "line": 84
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 86
+    },
+    {
+     "rust": "default",
+     "rename": null,
+     "aliases": [],
+     "line": 88
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VMessDefaultConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 93,
+   "fields": [
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 95
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "TrojanInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 101,
+   "fields": [
+    {
+     "rust": "clients",
+     "rename": null,
+     "aliases": [],
+     "line": 103
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 105
+    },
+    {
+     "rust": "fallbacks",
+     "rename": null,
+     "aliases": [],
+     "line": 107
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "TrojanUserConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 112,
+   "fields": [
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 113
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 115
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 117
+    },
+    {
+     "rust": "flow",
+     "rename": null,
+     "aliases": [],
+     "line": 119
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "TrojanInboundFallbackConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 124,
+   "fields": [
+    {
+     "rust": "name",
+     "rename": null,
+     "aliases": [],
+     "line": 126
+    },
+    {
+     "rust": "alpn",
+     "rename": null,
+     "aliases": [],
+     "line": 128
+    },
+    {
+     "rust": "path",
+     "rename": null,
+     "aliases": [],
+     "line": 130
+    },
+    {
+     "rust": "type",
+     "rename": null,
+     "aliases": [],
+     "line": 132
+    },
+    {
+     "rust": "dest",
+     "rename": null,
+     "aliases": [],
+     "line": 134
+    },
+    {
+     "rust": "xver",
+     "rename": null,
+     "aliases": [],
+     "line": 136
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ShadowsocksInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 144,
+   "fields": [
+    {
+     "rust": "method",
+     "rename": "method",
+     "aliases": [],
+     "line": 146
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 148
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 150
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 152
+    },
+    {
+     "rust": "clients",
+     "rename": null,
+     "aliases": [],
+     "line": 154
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 156
+    },
+    {
+     "rust": "network",
+     "rename": null,
+     "aliases": [],
+     "line": 158
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ShadowsocksUserConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 163,
+   "fields": [
+    {
+     "rust": "method",
+     "rename": "method",
+     "aliases": [],
+     "line": 165
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 167
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 169
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 171
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 173
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 175
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "SocksInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 181,
+   "fields": [
+    {
+     "rust": "auth",
+     "rename": "auth",
+     "aliases": [],
+     "line": 183
+    },
+    {
+     "rust": "accounts",
+     "rename": null,
+     "aliases": [],
+     "line": 185
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 187
+    },
+    {
+     "rust": "udp",
+     "rename": null,
+     "aliases": [],
+     "line": 189
+    },
+    {
+     "rust": "ip",
+     "rename": null,
+     "aliases": [],
+     "line": 191
+    },
+    {
+     "rust": "user_level",
+     "rename": "userLevel",
+     "aliases": [],
+     "line": 193
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "SocksAccountConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 198,
+   "fields": [
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 200
+    },
+    {
+     "rust": "pass",
+     "rename": null,
+     "aliases": [],
+     "line": 202
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 208,
+   "fields": [
+    {
+     "rust": "accounts",
+     "rename": null,
+     "aliases": [],
+     "line": 210
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 212
+    },
+    {
+     "rust": "allow_transparent",
+     "rename": "allowTransparent",
+     "aliases": [],
+     "line": 214
+    },
+    {
+     "rust": "user_level",
+     "rename": "userLevel",
+     "aliases": [],
+     "line": 216
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpAccountConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 221,
+   "fields": [
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 223
+    },
+    {
+     "rust": "pass",
+     "rename": null,
+     "aliases": [],
+     "line": 225
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpServerBuild",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 231,
+   "fields": [
+    {
+     "rust": "accounts",
+     "rename": null,
+     "aliases": [],
+     "line": 233
+    },
+    {
+     "rust": "allow_transparent",
+     "rename": null,
+     "aliases": [],
+     "line": 235
+    },
+    {
+     "rust": "user_level",
+     "rename": null,
+     "aliases": [],
+     "line": 237
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "DokodemoDoorInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 269,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 271
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 273
+    },
+    {
+     "rust": "network",
+     "rename": null,
+     "aliases": [],
+     "line": 275
+    },
+    {
+     "rust": "allowed_network",
+     "rename": null,
+     "aliases": [],
+     "line": 277
+    },
+    {
+     "rust": "rewrite_address",
+     "rename": null,
+     "aliases": [],
+     "line": 279
+    },
+    {
+     "rust": "rewrite_port",
+     "rename": null,
+     "aliases": [],
+     "line": 281
+    },
+    {
+     "rust": "port_map",
+     "rename": "portMap",
+     "aliases": [],
+     "line": 283
+    },
+    {
+     "rust": "follow_redirect",
+     "rename": "followRedirect",
+     "aliases": [],
+     "line": 285
+    },
+    {
+     "rust": "user_level",
+     "rename": "userLevel",
+     "aliases": [],
+     "line": 287
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HysteriaInboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 293,
+   "fields": [
+    {
+     "rust": "version",
+     "rename": null,
+     "aliases": [],
+     "line": 295
+    },
+    {
+     "rust": "clients",
+     "rename": null,
+     "aliases": [],
+     "line": 297
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 299
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HysteriaUserConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 304,
+   "fields": [
+    {
+     "rust": "auth",
+     "rename": null,
+     "aliases": [],
+     "line": 305
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 307
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 309
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VLessOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 339,
+   "fields": [
+    {
+     "rust": "vnext",
+     "rename": null,
+     "aliases": [],
+     "line": 341
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 343
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 345
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 347
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 349
+    },
+    {
+     "rust": "id",
+     "rename": null,
+     "aliases": [],
+     "line": 351
+    },
+    {
+     "rust": "flow",
+     "rename": null,
+     "aliases": [],
+     "line": 353
+    },
+    {
+     "rust": "seed",
+     "rename": null,
+     "aliases": [],
+     "line": 355
+    },
+    {
+     "rust": "encryption",
+     "rename": null,
+     "aliases": [],
+     "line": 357
+    },
+    {
+     "rust": "reverse",
+     "rename": null,
+     "aliases": [],
+     "line": 359
+    },
+    {
+     "rust": "testpre",
+     "rename": null,
+     "aliases": [],
+     "line": 361
+    },
+    {
+     "rust": "testseed",
+     "rename": null,
+     "aliases": [],
+     "line": 363
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VLessOutboundVnext",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 368,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 370
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 371
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 374
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VLessReverseConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 379,
+   "fields": [
+    {
+     "rust": "tag",
+     "rename": null,
+     "aliases": [],
+     "line": 380
+    },
+    {
+     "rust": "sniffing",
+     "rename": null,
+     "aliases": [],
+     "line": 382
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VMessOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 388,
+   "fields": [
+    {
+     "rust": "vnext",
+     "rename": null,
+     "aliases": [],
+     "line": 390
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 392
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 394
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 396
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 398
+    },
+    {
+     "rust": "id",
+     "rename": null,
+     "aliases": [],
+     "line": 400
+    },
+    {
+     "rust": "security",
+     "rename": null,
+     "aliases": [],
+     "line": 402
+    },
+    {
+     "rust": "experiments",
+     "rename": null,
+     "aliases": [],
+     "line": 404
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "VMessOutboundTarget",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 409,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 411
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 412
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 414
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "TrojanOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 420,
+   "fields": [
+    {
+     "rust": "servers",
+     "rename": null,
+     "aliases": [],
+     "line": 422
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 424
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 426
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 428
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 430
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 432
+    },
+    {
+     "rust": "flow",
+     "rename": null,
+     "aliases": [],
+     "line": 434
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "TrojanServerTarget",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 439,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 441
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 442
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 444
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 446
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 447
+    },
+    {
+     "rust": "flow",
+     "rename": null,
+     "aliases": [],
+     "line": 449
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ShadowsocksOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 456,
+   "fields": [
+    {
+     "rust": "servers",
+     "rename": null,
+     "aliases": [],
+     "line": 458
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 460
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 462
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 464
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 466
+    },
+    {
+     "rust": "method",
+     "rename": "method",
+     "aliases": [],
+     "line": 468
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 470
+    },
+    {
+     "rust": "uot",
+     "rename": null,
+     "aliases": [],
+     "line": 473
+    },
+    {
+     "rust": "uot_version",
+     "rename": "uotVersion",
+     "aliases": [],
+     "line": 475
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ShadowsocksServerTarget",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 480,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 482
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 483
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 485
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 487
+    },
+    {
+     "rust": "method",
+     "rename": "method",
+     "aliases": [],
+     "line": 489
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 491
+    },
+    {
+     "rust": "uot",
+     "rename": null,
+     "aliases": [],
+     "line": 493
+    },
+    {
+     "rust": "uot_version",
+     "rename": "uotVersion",
+     "aliases": [],
+     "line": 495
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "Shadowsocks2022User",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 568,
+   "fields": [
+    {
+     "rust": "key",
+     "rename": null,
+     "aliases": [],
+     "line": 570
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 571
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 572
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "Shadowsocks2022RelayDestination",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 578,
+   "fields": [
+    {
+     "rust": "key",
+     "rename": null,
+     "aliases": [],
+     "line": 580
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 581
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 583
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 585
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 586
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "ShadowsocksAeadUser",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 591,
+   "fields": [
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 592
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 593
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 594
+    },
+    {
+     "rust": "cipher",
+     "rename": null,
+     "aliases": [],
+     "line": 595
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "SocksOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 909,
+   "fields": [
+    {
+     "rust": "servers",
+     "rename": null,
+     "aliases": [],
+     "line": 911
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 913
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 915
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 917
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 919
+    },
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 921
+    },
+    {
+     "rust": "pass",
+     "rename": null,
+     "aliases": [],
+     "line": 923
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "SocksRemoteConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 928,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 930
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 931
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 933
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 939,
+   "fields": [
+    {
+     "rust": "servers",
+     "rename": null,
+     "aliases": [],
+     "line": 941
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 943
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 945
+    },
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 947
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 949
+    },
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 951
+    },
+    {
+     "rust": "pass",
+     "rename": null,
+     "aliases": [],
+     "line": 953
+    },
+    {
+     "rust": "headers",
+     "rename": null,
+     "aliases": [],
+     "line": 955
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpRemoteUserConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 964,
+   "fields": [
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 966
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 968
+    },
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 970
+    },
+    {
+     "rust": "pass",
+     "rename": null,
+     "aliases": [],
+     "line": 972
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpRemoteConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 978,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 980
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 981
+    },
+    {
+     "rust": "users",
+     "rename": null,
+     "aliases": [],
+     "line": 983
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpClientUserBuild",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 989,
+   "fields": [
+    {
+     "rust": "level",
+     "rename": null,
+     "aliases": [],
+     "line": 990
+    },
+    {
+     "rust": "email",
+     "rename": null,
+     "aliases": [],
+     "line": 991
+    },
+    {
+     "rust": "username",
+     "rename": null,
+     "aliases": [],
+     "line": 992
+    },
+    {
+     "rust": "password",
+     "rename": null,
+     "aliases": [],
+     "line": 993
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpHeaderBuild",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 999,
+   "fields": [
+    {
+     "rust": "key",
+     "rename": null,
+     "aliases": [],
+     "line": 1000
+    },
+    {
+     "rust": "value",
+     "rename": null,
+     "aliases": [],
+     "line": 1001
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HttpClientBuild",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1007,
+   "fields": [
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 1009
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 1010
+    },
+    {
+     "rust": "user",
+     "rename": null,
+     "aliases": [],
+     "line": 1012
+    },
+    {
+     "rust": "headers",
+     "rename": null,
+     "aliases": [],
+     "line": 1014
+    }
+   ],
+   "rename_all": null,
+   "serde": false,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FreedomOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1099,
+   "fields": [
+    {
+     "rust": "domain_strategy",
+     "rename": "domainStrategy",
+     "aliases": [],
+     "line": 1101
+    },
+    {
+     "rust": "target_strategy",
+     "rename": null,
+     "aliases": [],
+     "line": 1104
+    },
+    {
+     "rust": "redirect",
+     "rename": null,
+     "aliases": [],
+     "line": 1106
+    },
+    {
+     "rust": "user_level",
+     "rename": "userLevel",
+     "aliases": [],
+     "line": 1108
+    },
+    {
+     "rust": "fragment",
+     "rename": null,
+     "aliases": [],
+     "line": 1110
+    },
+    {
+     "rust": "noise",
+     "rename": null,
+     "aliases": [],
+     "line": 1112
+    },
+    {
+     "rust": "noises",
+     "rename": null,
+     "aliases": [],
+     "line": 1114
+    },
+    {
+     "rust": "proxy_protocol",
+     "rename": "proxyProtocol",
+     "aliases": [],
+     "line": 1116
+    },
+    {
+     "rust": "ips_blocked",
+     "rename": "ipsBlocked",
+     "aliases": [],
+     "line": 1119
+    },
+    {
+     "rust": "final_rules",
+     "rename": "finalRules",
+     "aliases": [],
+     "line": 1121
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FragmentConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1126,
+   "fields": [
+    {
+     "rust": "packets",
+     "rename": null,
+     "aliases": [],
+     "line": 1128
+    },
+    {
+     "rust": "length",
+     "rename": null,
+     "aliases": [],
+     "line": 1130
+    },
+    {
+     "rust": "interval",
+     "rename": null,
+     "aliases": [],
+     "line": 1132
+    },
+    {
+     "rust": "max_split",
+     "rename": null,
+     "aliases": [],
+     "line": 1134
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "NoiseConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1139,
+   "fields": [
+    {
+     "rust": "type",
+     "rename": null,
+     "aliases": [],
+     "line": 1141
+    },
+    {
+     "rust": "packet",
+     "rename": null,
+     "aliases": [],
+     "line": 1143
+    },
+    {
+     "rust": "delay",
+     "rename": null,
+     "aliases": [],
+     "line": 1145
+    },
+    {
+     "rust": "apply_to",
+     "rename": null,
+     "aliases": [],
+     "line": 1147
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "FreedomFinalRuleConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1152,
+   "fields": [
+    {
+     "rust": "action",
+     "rename": null,
+     "aliases": [],
+     "line": 1153
+    },
+    {
+     "rust": "network",
+     "rename": null,
+     "aliases": [],
+     "line": 1155
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 1157
+    },
+    {
+     "rust": "ip",
+     "rename": null,
+     "aliases": [],
+     "line": 1159
+    },
+    {
+     "rust": "block_delay",
+     "rename": "blockDelay",
+     "aliases": [],
+     "line": 1161
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BlackholeSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1169,
+   "fields": [
+    {
+     "rust": "response",
+     "rename": null,
+     "aliases": [],
+     "line": 1171
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "BlackholeResponseConfig",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1176,
+   "fields": [
+    {
+     "rust": "type",
+     "rename": "type",
+     "aliases": [],
+     "line": 1178
+    },
+    {
+     "rust": "custom_response_data",
+     "rename": "customResponseData",
+     "aliases": [],
+     "line": 1181
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "LoopbackOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1187,
+   "fields": [
+    {
+     "rust": "inbound_tag",
+     "rename": "inboundTag",
+     "aliases": [],
+     "line": 1189
+    },
+    {
+     "rust": "sniffing",
+     "rename": null,
+     "aliases": [],
+     "line": 1193
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "HysteriaOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1212,
+   "fields": [
+    {
+     "rust": "version",
+     "rename": null,
+     "aliases": [],
+     "line": 1213
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 1215
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 1217
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "DnsOutboundSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1228,
+   "fields": [
+    {
+     "rust": "servers",
+     "rename": null,
+     "aliases": [],
+     "line": 1232
+    },
+    {
+     "rust": "query_strategy",
+     "rename": "queryStrategy",
+     "aliases": [],
+     "line": 1234
+    },
+    {
+     "rust": "disable_cache",
+     "rename": "disableCache",
+     "aliases": [],
+     "line": 1236
+    },
+    {
+     "rust": "disable_fallback",
+     "rename": "disableFallback",
+     "aliases": [],
+     "line": 1238
+    },
+    {
+     "rust": "rewrite_network",
+     "rename": "rewriteNetwork",
+     "aliases": [],
+     "line": 1242
+    },
+    {
+     "rust": "rewrite_address",
+     "rename": "rewriteAddress",
+     "aliases": [],
+     "line": 1245
+    },
+    {
+     "rust": "rewrite_port",
+     "rename": "rewritePort",
+     "aliases": [],
+     "line": 1248
+    },
+    {
+     "rust": "network",
+     "rename": null,
+     "aliases": [],
+     "line": 1251
+    },
+    {
+     "rust": "address",
+     "rename": null,
+     "aliases": [],
+     "line": 1254
+    },
+    {
+     "rust": "port",
+     "rename": null,
+     "aliases": [],
+     "line": 1257
+    },
+    {
+     "rust": "user_level",
+     "rename": "userLevel",
+     "aliases": [],
+     "line": 1260
+    },
+    {
+     "rust": "rules",
+     "rename": null,
+     "aliases": [],
+     "line": 1263
+    },
+    {
+     "rust": "non_ip_query",
+     "rename": "nonIPQuery",
+     "aliases": [],
+     "line": 1267
+    },
+    {
+     "rust": "block_types",
+     "rename": "blockTypes",
+     "aliases": [],
+     "line": 1270
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  },
+  {
+   "struct": "DnsOutboundRuleSettings",
+   "file": "D:\\Project\\Xray-core-rust\\crates\\xray-conf\\src\\protocols.rs",
+   "line": 1279,
+   "fields": [
+    {
+     "rust": "action",
+     "rename": null,
+     "aliases": [],
+     "line": 1282
+    },
+    {
+     "rust": "q_type",
+     "rename": "qType",
+     "aliases": [],
+     "line": 1285
+    },
+    {
+     "rust": "domain",
+     "rename": null,
+     "aliases": [],
+     "line": 1288
+    },
+    {
+     "rust": "r_code",
+     "rename": "rCode",
+     "aliases": [],
+     "line": 1291
+    }
+   ],
+   "rename_all": null,
+   "serde": true,
+   "has_flatten": false,
+   "has_deny_unknown": false
+  }
+ ]
+}

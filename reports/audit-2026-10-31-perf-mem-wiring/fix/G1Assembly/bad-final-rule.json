@@ -1,0 +1,15 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "in", "listen": "127.0.0.1", "port": 28562, "protocol": "socks", "settings": {} }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "finalRules": [{ "action": "block", "ip": ["not-an-ip"] }]
+      }
+    }
+  ]
+}

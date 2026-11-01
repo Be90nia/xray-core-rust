@@ -1,0 +1,54 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 19001,
+      "settings": {
+        "auth": "noauth",
+        "udp": false
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "domain": [
+          "local"
+        ],
+        "outboundTag": "block"
+      }
+    ],
+    "ruleSet": [
+      {
+        "tag": "a",
+        "type": "remote",
+        "url": "http://x",
+        "format": "json"
+      },
+      {
+        "tag": "a",
+        "type": "remote",
+        "url": "http://y",
+        "format": "json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 28080,
+      "protocol": "socks",
+      "settings": {
+        "udp": false
+      }
+    },
+    {
+      "tag": "portal-in",
+      "listen": "127.0.0.1",
+      "port": 28443,
+      "protocol": "vless",
+      "settings": {
+        "decryption": "none",
+        "clients": [
+          {
+            "id": "699b4bd9-cb08-4c73-a2eb-6f08bdb05ac4",
+            "reverse": {
+              "tag": "rvs1"
+            }
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "freedom-out",
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "tag": "rvs-bridge-out",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "127.0.0.1",
+            "port": 28443,
+            "users": [
+              {
+                "id": "699b4bd9-cb08-4c73-a2eb-6f08bdb05ac4",
+                "reverse": {
+                  "tag": "rvs1"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp"
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "domain": [
+          "v1.rvs.cool"
+        ],
+        "outboundTag": "rvs-bridge-out"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "rvs1"
+        ],
+        "outboundTag": "freedom-out"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "socks-in"
+        ],
+        "outboundTag": "rvs1"
+      }
+    ]
+  }
+}

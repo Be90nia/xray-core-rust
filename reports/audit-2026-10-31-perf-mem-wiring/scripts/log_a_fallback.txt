@@ -1,0 +1,6 @@
+2026-10-31T04:23:13.269022Z  INFO version=26.10.11 git_rev=5fe98b907c7b550d4a70202abb475e26ee89013d exe_fingerprint=b35a2b3b121ad6ba1c5664f167fa247c profile=release target_triple=windows-x86_64 xray kernel identity
+2026-10-31T04:23:13.269290Z  INFO system dialer initialized with DNS resolution
+2026-10-31T04:23:13.269386Z  WARN full Router init failed, falling back to PatternRouter error=routing config JSON parse: routing rule network: unknown network token 'bogus'
+2026-10-31T04:23:13.772423Z DEBUG target=localhost:19099 resolving domain via system DNS
+2026-10-31T04:23:13.775874Z DEBUG target=localhost:19099 addrs=[[::1]:19099, 127.0.0.1:19099] domain resolved
+2026-10-31T04:23:13.776576Z DEBUG addr=[::1]:19099 error=由于目标计算机积极拒绝，无法连接。 (os error 10061) dial attempt failed

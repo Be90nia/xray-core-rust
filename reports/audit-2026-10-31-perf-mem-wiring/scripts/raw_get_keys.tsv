@@ -1,0 +1,475 @@
+crate	file	line	kind	key	src
+xray-proxy-anytls	src/plugin.rs	164	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-anytls	src/plugin.rs	165	get	password	match settings.get("password") {
+xray-proxy-blackhole	src/plugin.rs	166	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-blackhole	src/plugin.rs	167	get	response	let response = settings.get("response");
+xray-proxy-blackhole	src/plugin.rs	171	get	type	let ty = resp.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_owned();
+xray-proxy-blackhole	src/plugin.rs	172	get	customResponseData	let data = match resp.get("customResponseData").and_then(|d| d.as_str()) {
+xray-proxy-dns	src/plugin.rs	177	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-dns	src/plugin.rs	202	get	rules	let has_rules = v.get("rules").is_some() || v.get("rule").is_some();
+xray-proxy-dns	src/plugin.rs	202	get	rule	let has_rules = v.get("rules").is_some() || v.get("rule").is_some();
+xray-proxy-dns	src/plugin.rs	203	get	nonIPQuery	let non_ip_query = match v.get("nonIPQuery") {
+xray-proxy-dns	src/plugin.rs	210	get	blockTypes	let block_types = match v.get("blockTypes") {
+xray-proxy-dns	src/plugin.rs	285	get	rewriteServer	if let Some(rw) = v.get("rewriteServer") {
+xray-proxy-dns	src/plugin.rs	287	get	network	if let Some(n) = rw.get("network").and_then(|x| x.as_str()) {
+xray-proxy-dns	src/plugin.rs	290	get	address	if let Some(a) = rw.get("address").and_then(|x| x.as_str()) {
+xray-proxy-dns	src/plugin.rs	293	get	port	if let Some(p) = rw.get("port").and_then(|x| x.as_u64()) {
+xray-proxy-dns	src/plugin.rs	542	get	action	let action = match r.get("action") {
+xray-proxy-dns	src/plugin.rs	555	get	qType	let q_type = match r.get("qType") {
+xray-proxy-dns	src/plugin.rs	559	get	domain	let domain = match r.get("domain") {
+xray-proxy-dns	src/plugin.rs	585	get	rCode	let r_code = match r.get("rCode") {
+xray-proxy-dokodemo	src/plugin.rs	165	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-dokodemo	src/plugin.rs	170	get	rewrite_address	settings.get("rewrite_address").or_else(|| settings.get("address")).and_then(|x| x.as_str())
+xray-proxy-dokodemo	src/plugin.rs	170	get	address	settings.get("rewrite_address").or_else(|| settings.get("address")).and_then(|x| x.as_str())
+xray-proxy-dokodemo	src/plugin.rs	176	get	rewrite_port	if let Some(v) = settings.get("rewrite_port").or_else(|| settings.get("port")) {
+xray-proxy-dokodemo	src/plugin.rs	176	get	port	if let Some(v) = settings.get("rewrite_port").or_else(|| settings.get("port")) {
+xray-proxy-dokodemo	src/plugin.rs	184	get	network	if let Some(v) = settings.get("network").or_else(|| settings.get("allowed_network")) {
+xray-proxy-dokodemo	src/plugin.rs	184	get	allowed_network	if let Some(v) = settings.get("network").or_else(|| settings.get("allowed_network")) {
+xray-proxy-dokodemo	src/plugin.rs	188	get	portMap	if let Some(m) = settings.get("portMap").and_then(|x| x.as_object()) {
+xray-proxy-dokodemo	src/plugin.rs	195	get	followRedirect	cfg.follow_redirect = settings.get("followRedirect").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-proxy-dokodemo	src/plugin.rs	198	get	userLevel	if let Some(v) = settings.get("userLevel") {
+xray-proxy-dokodemo	src/plugin.rs	279	get	5353	assert_eq!(parsed.port_map.get("5353").map(String::as_str), Some("8.8.8.8:53"));
+xray-proxy-dokodemo	src/plugin.rs	307	index	udp	let alias = parse_config_section(&json!({"settings": {"allowed_network": ["udp"]}}))
+xray-proxy-freedom	src/config.rs	219	get	server	let server = v.get("server")?;
+xray-proxy-freedom	src/config.rs	220	get	address	let address = server.get("address").and_then(|a| a.as_str()).map(|s| {
+xray-proxy-freedom	src/config.rs	225	get	port	let port = server.get("port").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+xray-proxy-freedom	src/config.rs	354	get	packets	let (packets_from, packets_to) = packets_range(v.get("packets"))?;
+xray-proxy-freedom	src/config.rs	355	get	length	let Some(length) = v.get("length") else {
+xray-proxy-freedom	src/config.rs	375	get	interval	let interval = v.get("interval").ok_or_else(|| invalid("Interval can't be empty"))?;
+xray-proxy-freedom	src/config.rs	377	get	maxSplit	let (max_split_min, max_split_max) = match v.get("maxSplit") {
+xray-proxy-freedom	src/config.rs	402	get	type	let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+xray-proxy-freedom	src/config.rs	403	get	packet	let packet_raw = v.get("packet").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+xray-proxy-freedom	src/config.rs	435	get	delay	let (delay_min, delay_max) = match v.get("delay") {
+xray-proxy-freedom	src/config.rs	440	get	applyTo	.get("applyTo")
+xray-proxy-freedom	src/config.rs	495	get	action	.get("action")
+xray-proxy-freedom	src/config.rs	509	get	network	let networks = v.get("network").map(json_network_list).unwrap_or_default();
+xray-proxy-freedom	src/config.rs	510	get	port	let port_list = v.get("port").and_then(json_port_list);
+xray-proxy-freedom	src/config.rs	511	get	ip	let ip = v.get("ip").map(json_ip_rules).unwrap_or_default();
+xray-proxy-freedom	src/config.rs	512	get	blockDelay	let block_delay = v.get("blockDelay").and_then(json_int32_range);
+xray-proxy-freedom	src/config.rs	638	get	from	let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
+xray-proxy-freedom	src/config.rs	639	get	to	let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
+xray-proxy-freedom	src/plugin.rs	184	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-freedom	src/plugin.rs	186	get	targetStrategy	.get("targetStrategy")
+xray-proxy-freedom	src/plugin.rs	189	get	domainStrategy	.or_else(|| settings.get("domainStrategy").and_then(|s| s.as_str()));
+xray-proxy-freedom	src/plugin.rs	195	get	destinationOverride	settings.get("destinationOverride").and_then(DestinationOverride::from_json);
+xray-proxy-freedom	src/plugin.rs	196	get	userLevel	let user_level = settings.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-freedom	src/plugin.rs	197	get	proxyProtocol	let proxy_protocol = settings.get("proxyProtocol").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+xray-proxy-freedom	src/plugin.rs	198	get	finalRules	let final_rules = match settings.get("finalRules").and_then(|r| r.as_array()) {
+xray-proxy-freedom	src/plugin.rs	208	get	fragment	let fragment = match settings.get("fragment") {
+xray-proxy-freedom	src/plugin.rs	215	get	noises	.get("noises")
+xray-proxy-http	src/client.rs	83	get	servers	.get("servers")
+xray-proxy-http	src/client.rs	88	get	address	.get("address")
+xray-proxy-http	src/client.rs	92	get	port	.get("port")
+xray-proxy-http	src/client.rs	98	get	users	first.get("users").and_then(|v| v.as_array()).and_then(|arr| arr.first()).and_then(|u| {
+xray-proxy-http	src/client.rs	99	get	user	let user = u.get("user")?.as_str()?.to_string();
+xray-proxy-http	src/client.rs	100	get	pass	let pass = u.get("pass")?.as_str()?.to_string();
+xray-proxy-http	src/client.rs	110	get	headers	if let Some(headers_v) = first.get("headers").and_then(|v| v.as_object()) {
+xray-proxy-http	src/client.rs	118	get	h2	config.h2 = first.get("h2").and_then(|v| v.as_bool()).unwrap_or(false);
+xray-proxy-http	src/plugin.rs	171	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-http	src/plugin.rs	174	get	users	settings.get("users").or_else(|| settings.get("accounts")).and_then(|c| c.as_array())
+xray-proxy-http	src/plugin.rs	174	get	accounts	settings.get("users").or_else(|| settings.get("accounts")).and_then(|c| c.as_array())
+xray-proxy-http	src/plugin.rs	177	get	user	let user = a.get("user").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-http	src/plugin.rs	178	get	pass	let pass = a.get("pass").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-http	src/plugin.rs	185	get	allowTransparent	settings.get("allowTransparent").and_then(|c| c.as_bool()).unwrap_or(false);
+xray-proxy-http	src/plugin.rs	186	get	userLevel	config.user_level = settings.get("userLevel").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+xray-proxy-http	src/server.rs	199	get	connection	if let Some(values) = headers.get("connection") {
+xray-proxy-http	src/server.rs	228	get	transfer-encoding	let chunked = headers.get("transfer-encoding").is_some_and(|values| {
+xray-proxy-http	src/server.rs	526	get	transfer-encoding	.get("transfer-encoding")
+xray-proxy-http	src/server.rs	666	get	content-length	match headers.get("content-length").and_then(|vals| vals.first()) {
+xray-proxy-http	src/server.rs	680	get	proxy-connection	.get("proxy-connection")
+xray-proxy-http	src/server.rs	723	get	host	.get("host")
+xray-proxy-http	src/server.rs	998	get	proxy-authorization	.get("proxy-authorization")
+xray-proxy-http	src/server.rs	1114	get	host	if headers.get("host").is_some_and(|values| values.len() > 1) {
+xray-proxy-http	src/server.rs	1598	get	host	assert_eq!(hs.headers.get("host").unwrap()[0], "example.com");
+xray-proxy-http	src/server.rs	1608	get	x-a	assert_eq!(hs.headers.get("x-a").unwrap()[0], "v more");
+xray-proxy-hysteria	src/plugin.rs	211	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-hysteria	src/plugin.rs	212	get	users	let has_users = settings.get("users").is_some_and(|u| !u.is_null());
+xray-proxy-hysteria	src/plugin.rs	214	get	address	settings.get("address").and_then(|a| a.as_str()).is_some_and(|a| !a.is_empty());
+xray-proxy-hysteria	src/plugin.rs	215	get	servers	let has_servers = settings.get("servers").and_then(serde_json::Value::as_array).is_some();
+xray-proxy-hysteria	src/plugin.rs	238	get	bind	let bind = settings.get("bind").and_then(|b| b.as_str()).filter(|b| !b.is_empty()).ok_or_else(
+xray-proxy-hysteria	src/plugin.rs	248	get	users	for user in settings.get("users").and_then(|u| u.as_array()).into_iter().flatten() {
+xray-proxy-hysteria	src/plugin.rs	249	get	email	let email = user.get("email").and_then(|e| e.as_str()).unwrap_or("");
+xray-proxy-hysteria	src/plugin.rs	250	get	auth	let auth = user.get("auth").and_then(|a| a.as_str()).filter(|a| !a.is_empty()).ok_or_else(
+xray-proxy-hysteria	src/plugin.rs	253	get	level	let level = user.get("level").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+xray-proxy-hysteria	src/plugin.rs	256	get	udpIdleTimeout	if let Some(secs) = settings.get("udpIdleTimeout").and_then(serde_json::Value::as_u64) {
+xray-proxy-hysteria	src/plugin.rs	283	get	udpIdleTimeout	if let Some(secs) = settings.get("udpIdleTimeout").and_then(serde_json::Value::as_u64) {
+xray-proxy-hysteria	src/plugin.rs	300	get	alpn	match settings.get("alpn") {
+xray-proxy-hysteria	src/servers.rs	31	get	version	if let Some(ver) = settings.get("version").and_then(|x| x.as_i64()) {
+xray-proxy-hysteria	src/servers.rs	36	get	servers	let first = match settings.get("servers").and_then(|v| v.as_array()) {
+xray-proxy-hysteria	src/servers.rs	41	get	address	first.get("address").and_then(|v| v.as_str()).ok_or("missing servers[0].address")?;
+xray-proxy-hysteria	src/servers.rs	42	get	port	let port = first.get("port").and_then(|v| v.as_u64()).ok_or("missing servers[0].port")?;
+xray-proxy-hysteria	src/servers.rs	44	get	auth	first.get("auth").or_else(|| first.get("password")).and_then(|v| v.as_str()).unwrap_or("");
+xray-proxy-hysteria	src/servers.rs	44	get	password	first.get("auth").or_else(|| first.get("password")).and_then(|v| v.as_str()).unwrap_or("");
+xray-proxy-hysteria	src/servers.rs	46	get	serverName	.get("serverName")
+xray-proxy-hysteria	src/servers.rs	47	get	server_name	.or_else(|| first.get("server_name"))
+xray-proxy-hysteria	src/servers.rs	48	get	sni	.or_else(|| first.get("sni"))
+xray-proxy-loopback	src/plugin.rs	148	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-loopback	src/plugin.rs	150	get	inboundTag	.get("inboundTag")
+xray-proxy-socks	src/plugin.rs	145	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-socks	src/plugin.rs	147	get	auth	if settings.get("auth").and_then(|x| x.as_str()) == Some("password") {
+xray-proxy-socks	src/plugin.rs	152	get	accounts	settings.get("accounts").or_else(|| settings.get("users")).and_then(|x| x.as_array())
+xray-proxy-socks	src/plugin.rs	152	get	users	settings.get("accounts").or_else(|| settings.get("users")).and_then(|x| x.as_array())
+xray-proxy-socks	src/plugin.rs	155	get	user	let user = u.get("user").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-socks	src/plugin.rs	156	get	pass	let pass = u.get("pass").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-socks	src/plugin.rs	160	get	udp	cfg.udp_enabled = settings.get("udp").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-proxy-socks	src/plugin.rs	161	get	userLevel	cfg.user_level = settings.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-socks	src/plugin.rs	162	get	ip	if let Some(ip) = settings.get("ip").and_then(|x| x.as_str()) {
+xray-proxy-ss	src/dispatcher.rs	367	get	servers	let first: &serde_json::Value = match v.get("servers") {
+xray-proxy-ss	src/dispatcher.rs	371	get	address	None if v.get("address").is_some() => &v,
+xray-proxy-ss	src/dispatcher.rs	375	get	address	.get("address")
+xray-proxy-ss	src/dispatcher.rs	379	get	port	.get("port")
+xray-proxy-ss	src/dispatcher.rs	383	get	method	.get("method")
+xray-proxy-ss	src/dispatcher.rs	387	get	password	.get("password")
+xray-proxy-ss	src/dispatcher.rs	394	get	level	let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+xray-proxy-ss	src/dispatcher.rs	395	get	email	let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/dispatcher.rs	398	get	uot	enabled: first.get("uot").and_then(|v| v.as_bool()).unwrap_or(false),
+xray-proxy-ss	src/dispatcher.rs	399	get	uotVersion	version: first.get("uotVersion").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
+xray-proxy-ss	src/dispatcher.rs	439	get	level	let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+xray-proxy-ss	src/dispatcher.rs	440	get	email	let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/plugin.rs	185	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-ss	src/plugin.rs	187	get	address	settings.get("address").and_then(|a| a.as_str()).is_some_and(|a| !a.is_empty());
+xray-proxy-ss	src/plugin.rs	188	get	servers	if settings.get("servers").is_some() || flat_outbound {
+xray-proxy-ss	src/plugin.rs	204	get	method	let method = settings.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+xray-proxy-ss	src/plugin.rs	210	get	users	settings.get("users").or_else(|| settings.get("clients")).and_then(|c| c.as_array())
+xray-proxy-ss	src/plugin.rs	210	get	clients	settings.get("users").or_else(|| settings.get("clients")).and_then(|c| c.as_array())
+xray-proxy-ss	src/plugin.rs	222	get	password	.get("password")
+xray-proxy-ss	src/plugin.rs	232	get	password	let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-ss	src/plugin.rs	233	get	email	let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/plugin.rs	234	get	method	let method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+xray-proxy-ss	src/plugin.rs	258	get	password	.get("password")
+xray-proxy-ss	src/plugin.rs	263	get	destinations	if let Some(dests) = settings.get("destinations").and_then(|d| d.as_array()) {
+xray-proxy-ss	src/plugin.rs	266	get	email	let email = d.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/plugin.rs	267	get	level	let level = d.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-ss	src/plugin.rs	268	get	server	let addr_str = d.get("server").and_then(|x| x.as_str()).unwrap_or("127.0.0.1");
+xray-proxy-ss	src/plugin.rs	269	get	server_port	let port = d.get("server_port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+xray-proxy-ss	src/plugin.rs	271	get	password	key: parse_psk(d.get("password").and_then(|x| x.as_str()).unwrap_or(""))?,
+xray-proxy-ss	src/plugin.rs	288	get	users	settings.get("users").or_else(|| settings.get("clients")).and_then(|c| c.as_array());
+xray-proxy-ss	src/plugin.rs	288	get	clients	settings.get("users").or_else(|| settings.get("clients")).and_then(|c| c.as_array());
+xray-proxy-ss	src/plugin.rs	293	get	address	if user_list.first().is_some_and(|u| u.get("address").and_then(|x| x.as_str()).is_some()) {
+xray-proxy-ss	src/plugin.rs	296	get	email	let email = u.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/plugin.rs	297	get	level	let level = u.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-ss	src/plugin.rs	299	get	address	.get("address")
+xray-proxy-ss	src/plugin.rs	300	get	server	.or_else(|| u.get("server"))
+xray-proxy-ss	src/plugin.rs	304	get	port	.get("port")
+xray-proxy-ss	src/plugin.rs	305	get	server_port	.or_else(|| u.get("server_port"))
+xray-proxy-ss	src/plugin.rs	309	get	password	key: parse_psk(u.get("password").and_then(|x| x.as_str()).unwrap_or(""))?,
+xray-proxy-ss	src/plugin.rs	327	get	email	let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-ss	src/plugin.rs	328	get	level	let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-ss	src/plugin.rs	332	get	password	psk: parse_psk(c.get("password").and_then(|x| x.as_str()).unwrap_or(""))?,
+xray-proxy-trojan	src/plugin.rs	176	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-trojan	src/plugin.rs	187	get	clients	settings.get("clients").or_else(|| settings.get("users")).and_then(|c| c.as_array());
+xray-proxy-trojan	src/plugin.rs	187	get	users	settings.get("clients").or_else(|| settings.get("users")).and_then(|c| c.as_array());
+xray-proxy-trojan	src/plugin.rs	195	get	password	let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-trojan	src/plugin.rs	196	get	email	let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-trojan	src/plugin.rs	197	get	level	let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-trojan	src/plugin.rs	211	get	flow	user.get("flow").and_then(|f| f.as_str()).is_some_and(|f| !f.is_empty())
+xray-proxy-trojan	src/plugin.rs	219	get	fallbacks	let Some(fbs) = settings.get("fallbacks").and_then(|f| f.as_array()) else {
+xray-proxy-trojan	src/plugin.rs	224	get	name	let name = fb.get("name").and_then(|x| x.as_str()).unwrap_or("").into();
+xray-proxy-trojan	src/plugin.rs	225	get	alpn	let alpn = fb.get("alpn").and_then(|x| x.as_str()).unwrap_or("").into();
+xray-proxy-trojan	src/plugin.rs	226	get	path	let path = fb.get("path").and_then(|x| x.as_str()).unwrap_or("").into();
+xray-proxy-trojan	src/plugin.rs	227	get	xver	let xver = fb.get("xver").and_then(|x| x.as_u64()).unwrap_or(0);
+xray-proxy-trojan	src/plugin.rs	228	get	dest	let mut dest = match fb.get("dest") {
+xray-proxy-trojan	src/plugin.rs	233	get	type	let mut fb_type = fb.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-tuic	src/plugin.rs	161	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-tuic	src/plugin.rs	163	get	uuid	.get("uuid")
+xray-proxy-tuic	src/plugin.rs	169	get	password	.get("password")
+xray-proxy-tuic	src/plugin.rs	172	get	serverName	let server_name = settings.get("serverName").and_then(|x| x.as_str()).unwrap_or("tuic");
+xray-proxy-tuic	src/plugin.rs	175	get	listen	parse_bind_addr(section.get("listen").and_then(|x| x.as_str()).unwrap_or(""), port)?;
+xray-proxy-tuic	src/plugin.rs	177	get	certificate	let cert_der = match settings.get("certificate").and_then(|x| x.as_str()) {
+xray-proxy-tuic	src/plugin.rs	181	get	certificateKey	let key_der = match settings.get("certificateKey").and_then(|x| x.as_str()) {
+xray-proxy-tuic	src/plugin.rs	187	get	congestion_control	settings.get("congestion_control").and_then(|x| x.as_str()).unwrap_or("cubic");
+xray-proxy-tuic	src/plugin.rs	196	get	brutal_up_bps	let brutal_up_bps = settings.get("brutal_up_bps").and_then(|x| x.as_u64()).unwrap_or(0);
+xray-proxy-tuic	src/plugin.rs	204	get	streamSettings	let sockopt = xray_transport::dialer::StreamSettings::from_json(section.get("streamSettings"))
+xray-proxy-tuic	src/plugin.rs	223	get	port	section.get("port").ok_or_else(|| PluginError::Other("tuic: missing port".into()))?;
+xray-proxy-tuic	src/plugin.rs	309	index	listen	sect["listen"] = json!("");
+xray-proxy-tuic	src/plugin.rs	375	index	port	sect["port"] = json!(70_000);
+xray-proxy-tun	src/config.rs	167	get	name	if let Some(s) = v.get("name").and_then(|x| x.as_str()) {
+xray-proxy-tun	src/config.rs	170	get	desc	if let Some(s) = v.get("desc").and_then(|x| x.as_str()) {
+xray-proxy-tun	src/config.rs	173	get	mtu	if let Some(n) = v.get("mtu").and_then(|x| x.as_u64()) {
+xray-proxy-tun	src/config.rs	179	get	gateway	if let Some(arr) = v.get("gateway").and_then(|x| x.as_array()) {
+xray-proxy-tun	src/config.rs	182	get	dns	if let Some(arr) = v.get("dns").and_then(|x| x.as_array()) {
+xray-proxy-tun	src/config.rs	185	get	userLevel	if let Some(n) = v.get("userLevel").and_then(|x| x.as_u64()) {
+xray-proxy-tun	src/config.rs	188	get	autoSystemRoutingTable	if let Some(arr) = v.get("autoSystemRoutingTable").and_then(|x| x.as_array()) {
+xray-proxy-tun	src/config.rs	191	get	autoOutboundsInterface	if let Some(s) = v.get("autoOutboundsInterface").and_then(|x| x.as_str()) {
+xray-proxy-tun	src/config.rs	195	get	autoSystemDnsToGateway	if let Some(b) = v.get("autoSystemDnsToGateway").and_then(|x| x.as_bool()) {
+xray-proxy-tun	src/config.rs	202	get	autoSystemWfpBlockLeak	if let Some(w) = v.get("autoSystemWfpBlockLeak").filter(|x| !x.is_null()) {
+xray-proxy-tun	src/config.rs	243	get	idleTimeout	if let Some(val) = v.get("idleTimeout") {
+xray-proxy-tun	src/config.rs	587	index	bogus	let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["bogus"]}"#)
+xray-proxy-tun	src/config.rs	618	index	misconfigtun	let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["misconfigtun"]}"#)
+xray-proxy-tun	src/config.rs	642	index	dns	let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["dns"]}"#)
+xray-proxy-tun	src/plugin.rs	183	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-tun	src/plugin.rs	273	index	autoSystemWfpBlockLeak	settings["autoSystemWfpBlockLeak"] = json!(["dns"]);
+xray-proxy-tun	src/plugin.rs	273	index	dns	settings["autoSystemWfpBlockLeak"] = json!(["dns"]);
+xray-proxy-vless	src/plugin.rs	238	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-vless	src/plugin.rs	239	get	address	let flat_outbound = settings.get("address").and_then(|a| a.as_str()).is_some();
+xray-proxy-vless	src/plugin.rs	240	get	vnext	if settings.get("vnext").is_some() || flat_outbound {
+xray-proxy-vless	src/plugin.rs	258	get	address	let v = if settings.get("address").and_then(|a| a.as_str()).is_some() {
+xray-proxy-vless	src/plugin.rs	261	get	address	"address": settings.get("address"),
+xray-proxy-vless	src/plugin.rs	262	get	port	"port": settings.get("port"),
+xray-proxy-vless	src/plugin.rs	264	get	id	"id": settings.get("id"),
+xray-proxy-vless	src/plugin.rs	265	get	flow	"flow": settings.get("flow"),
+xray-proxy-vless	src/plugin.rs	266	get	encryption	"encryption": settings.get("encryption"),
+xray-proxy-vless	src/plugin.rs	267	get	level	"level": settings.get("level"),
+xray-proxy-vless	src/plugin.rs	268	get	email	"email": settings.get("email"),
+xray-proxy-vless	src/plugin.rs	269	get	reverse	"reverse": settings.get("reverse"),
+xray-proxy-vless	src/plugin.rs	272	get	testseed	"testseed": settings.get("testseed"),
+xray-proxy-vless	src/plugin.rs	273	get	testpre	"testpre": settings.get("testpre"),
+xray-proxy-vless	src/plugin.rs	279	get	vnext	.get("vnext")
+xray-proxy-vless	src/plugin.rs	291	get	address	.get("address")
+xray-proxy-vless	src/plugin.rs	295	get	port	.get("port")
+xray-proxy-vless	src/plugin.rs	299	get	users	.get("users")
+xray-proxy-vless	src/plugin.rs	310	get	id	.get("id")
+xray-proxy-vless	src/plugin.rs	317	get	flow	let flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string();
+xray-proxy-vless	src/plugin.rs	318	get	encryption	let encryption = user.get("encryption").and_then(|v| v.as_str()).unwrap_or("none").to_string();
+xray-proxy-vless	src/plugin.rs	328	get	level	let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+xray-proxy-vless	src/plugin.rs	329	get	email	let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+xray-proxy-vless	src/plugin.rs	333	get	reverse	.get("reverse")
+xray-proxy-vless	src/plugin.rs	334	get	tag	.and_then(|r| r.get("tag"))
+xray-proxy-vless	src/plugin.rs	340	get	testseed	.get("testseed")
+xray-proxy-vless	src/plugin.rs	341	get	testseed	.or_else(|| v.get("testseed"))
+xray-proxy-vless	src/plugin.rs	346	get	testpre	user.get("testpre").or_else(|| v.get("testpre")).and_then(|x| x.as_u64()).unwrap_or(0)
+xray-proxy-vless	src/plugin.rs	346	get	testpre	user.get("testpre").or_else(|| v.get("testpre")).and_then(|x| x.as_u64()).unwrap_or(0)
+xray-proxy-vless	src/plugin.rs	397	get	flow	let settings_flow = settings.get("flow").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	405	get	testseed	.get("testseed")
+xray-proxy-vless	src/plugin.rs	410	get	testseed	c.get("testseed")
+xray-proxy-vless	src/plugin.rs	416	get	clients	.get("clients")
+xray-proxy-vless	src/plugin.rs	418	get	users	.or_else(|| settings.get("users"))
+xray-proxy-vless	src/plugin.rs	422	get	id	let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	423	get	email	let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-vless	src/plugin.rs	424	get	level	let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-proxy-vless	src/plugin.rs	425	get	flow	let flow = match c.get("flow").and_then(|x| x.as_str()).unwrap_or("") {
+xray-proxy-vless	src/plugin.rs	468	get	decryption	let raw = settings.get("decryption").and_then(|d| d.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	482	get	fallbacks	if settings.get("fallbacks").is_some() {
+xray-proxy-vless	src/plugin.rs	519	get	fallbacks	let Some(fbs) = settings.get("fallbacks").and_then(|f| f.as_array()) else {
+xray-proxy-vless	src/plugin.rs	524	get	name	let name = fb.get("name").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	525	get	alpn	let alpn = fb.get("alpn").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	526	get	path	let path = fb.get("path").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vless	src/plugin.rs	532	get	xver	let xver = match fb.get("xver") {
+xray-proxy-vless	src/plugin.rs	550	get	dest	let mut dest = match fb.get("dest") {
+xray-proxy-vless	src/plugin.rs	570	get	type	let mut fb_type = fb.get("type").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-vmess	src/dispatcher.rs	159	get	address	let v = if v.get("address").and_then(|a| a.as_str()).is_some() {
+xray-proxy-vmess	src/dispatcher.rs	164	get	address	"address": v.get("address"),
+xray-proxy-vmess	src/dispatcher.rs	165	get	port	"port": v.get("port"),
+xray-proxy-vmess	src/dispatcher.rs	167	get	id	"id": v.get("id"),
+xray-proxy-vmess	src/dispatcher.rs	168	get	security	"security": v.get("security"),
+xray-proxy-vmess	src/dispatcher.rs	169	get	level	"level": v.get("level"),
+xray-proxy-vmess	src/dispatcher.rs	170	get	email	"email": v.get("email"),
+xray-proxy-vmess	src/dispatcher.rs	179	get	vnext	.get("vnext")
+xray-proxy-vmess	src/dispatcher.rs	188	get	address	.get("address")
+xray-proxy-vmess	src/dispatcher.rs	192	get	port	.get("port")
+xray-proxy-vmess	src/dispatcher.rs	196	get	users	.get("users")
+xray-proxy-vmess	src/dispatcher.rs	204	get	id	.get("id")
+xray-proxy-vmess	src/dispatcher.rs	208	get	security	let security_str = user.get("security").and_then(|v| v.as_str()).unwrap_or("auto");
+xray-proxy-vmess	src/dispatcher.rs	209	get	level	let level = user.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+xray-proxy-vmess	src/dispatcher.rs	210	get	email	let email = user.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
+xray-proxy-vmess	src/dispatcher.rs	214	get	experiments	.get("experiments")
+xray-proxy-vmess	src/dispatcher.rs	216	get	experiments	.or_else(|| v.get("experiments").and_then(serde_json::Value::as_str))
+xray-proxy-vmess	src/dispatcher.rs	223	get	alterId	.get("alterId")
+xray-proxy-vmess	src/plugin.rs	182	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-vmess	src/plugin.rs	184	get	address	settings.get("address").and_then(|a| a.as_str()).is_some_and(|a| !a.is_empty());
+xray-proxy-vmess	src/plugin.rs	185	get	vnext	if settings.get("vnext").is_some() || flat_outbound {
+xray-proxy-vmess	src/plugin.rs	209	get	default	.get("default")
+xray-proxy-vmess	src/plugin.rs	210	get	level	.and_then(|d| d.get("level"))
+xray-proxy-vmess	src/plugin.rs	214	get	clients	.get("clients")
+xray-proxy-vmess	src/plugin.rs	216	get	users	.or_else(|| settings.get("users"))
+xray-proxy-vmess	src/plugin.rs	220	get	id	let id = c.get("id").and_then(|x| x.as_str()).unwrap_or("");
+xray-proxy-vmess	src/plugin.rs	221	get	email	let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-proxy-vmess	src/plugin.rs	223	get	level	.get("level")
+xray-proxy-vmess	src/plugin.rs	227	get	alterId	.get("alterId")
+xray-proxy-wireguard	src/dispatcher.rs	1156	get	h.test	let hit = cache.get("h.test").expect("must hit within ttl");
+xray-proxy-wireguard	src/dispatcher.rs	1158	get	missing.test	assert!(cache.get("missing.test").is_none());
+xray-proxy-wireguard	src/dispatcher.rs	1161	get	h.test	assert!(cache.get("h.test").is_none(), "过期条目必须被删除");
+xray-proxy-wireguard	src/dispatcher.rs	1174	get	edge.test	assert_eq!(cache.get("edge.test"), Some(a), "59s < 60s 必须命中");
+xray-proxy-wireguard	src/dispatcher.rs	1176	get	edge.test	assert_eq!(cache.get("edge.test"), None, "恰 60s 过期边界必须死");
+xray-proxy-wireguard	src/plugin.rs	175	get	settings	let settings = section.get("settings").unwrap_or(section);
+xray-proxy-wireguard	src/plugin.rs	178	get	port	let port = settings.get("port").and_then(|x| x.as_u64()).unwrap_or(51820);
+xray-proxy-wireguard	src/plugin.rs	194	get	peers	if let Some(arr) = v.get("peers").and_then(|x| x.as_array()) {
+xray-proxy-wireguard	src/plugin.rs	201	get	endpoint	.get("endpoint")
+xray-proxy-wireguard	src/plugin.rs	242	get	address	.get("address")
+xray-proxy-wireguard	src/plugin.rs	248	get	mtu	.get("mtu")
+xray-proxy-wireguard	src/plugin.rs	255	get	reserved	.get("reserved")
+xray-transport-grpc	src/config.rs	106	get	idleTimeout	.get("idleTimeout")
+xray-transport-grpc	src/config.rs	107	get	idle_timeout	.or_else(|| obj.get("idle_timeout"))
+xray-transport-grpc	src/register.rs	333	get	content-type	resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+xray-transport-grpc	src/register.rs	352	get	grpc-status	resp.headers().get("grpc-status").and_then(|v| v.to_str().ok()),
+xray-transport-grpc	src/register.rs	355	get	grpc-status	resp.headers().get("grpc-status")
+xray-transport-grpc	src/register.rs	591	get	serverName	assert_eq!(sj.get("serverName").and_then(|v| v.as_str()), Some("localhost"));
+xray-transport-grpc	src/register.rs	592	get	allowInsecure	assert_eq!(sj.get("allowInsecure").and_then(|v| v.as_bool()), Some(true));
+xray-transport-grpc	src/register.rs	593	get	alpn	assert_eq!(sj.get("alpn").and_then(|v| v.as_array()).map(|a| a.len()), Some(1));
+xray-transport-grpc	src/transport.rs	51	get	serverName	.and_then(|v| v.get("serverName"))
+xray-transport-grpc	src/transport.rs	90	get	serverName	.and_then(|v| v.get("serverName"))
+xray-transport-grpc	src/transport.rs	128	get	fingerprint	.and_then(|m| m.get("fingerprint"))
+xray-transport-grpc	src/transport.rs	413	get	content-type	resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+xray-transport-grpc	src/transport.rs	831	get	content-type	let req_ct = req.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+xray-transport-grpc	src/transport.rs	947	get	X-Forwarded-For	headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty())
+xray-transport-grpc	src/transport.rs	1223	get	user-agent	req.headers().get("user-agent").map(|v| v.to_str().unwrap()),
+xray-transport-grpc	src/transport.rs	1350	get	grpc-status	assert_eq!(resp.headers().get("grpc-status").map(|v| v.to_str().unwrap()), Some("12"));
+xray-transport-httpupgrade	src/hub.rs	85	get	host	let host = headers.get("host").cloned().unwrap_or_default();
+xray-transport-httpupgrade	src/hub.rs	99	get	connection	let connection = headers.get("connection").cloned().unwrap_or_default();
+xray-transport-httpupgrade	src/hub.rs	100	get	upgrade	let upgrade = headers.get("upgrade").cloned().unwrap_or_default();
+xray-transport-httpupgrade	src/hub.rs	107	get	x-forwarded-for	headers.get("x-forwarded-for").map(|v| parse_x_forwarded_for(v)).unwrap_or_default();
+xray-transport-httpupgrade	src/hub.rs	167	get	x-forwarded-for	let value = headers.get("x-forwarded-for").filter(|v| !v.is_empty())?;
+xray-transport-httpupgrade	src/hub.rs	226	get	connection	assert_eq!(req.headers.get("connection").map(String::as_str), Some("Upgrade"));
+xray-transport-httpupgrade	src/hub.rs	359	get	sec-websocket-key	let ws_key = parsed.headers.get("sec-websocket-key").map(String::as_str);
+xray-transport-httpupgrade	src/register.rs	469	get	serverName	.and_then(|v| v.get("serverName"))
+xray-transport-httpupgrade	src/register.rs	586	get	host	let host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-httpupgrade	src/register.rs	587	get	path	let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-httpupgrade	src/register.rs	588	get	ed	let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-transport-httpupgrade	src/register.rs	597	get	acceptProxyProtocol	obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-transport-httpupgrade	src/register.rs	600	get	header	let header = parse_headers(obj.get("header"))
+xray-transport-httpupgrade	src/register.rs	601	get	headers	.or_else(|| parse_headers(obj.get("headers")))
+xray-transport-httpupgrade	src/register.rs	629	get	fingerprint	.and_then(|m| m.get("fingerprint"))
+xray-transport-httpupgrade	src/register.rs	727	get	X-Forwarded-For	assert_eq!(cfg.header.get("X-Forwarded-For").unwrap(), "10.0.0.1");
+xray-transport-httpupgrade	src/register.rs	734	get	X-Custom	assert_eq!(cfg.header.get("X-Custom").unwrap(), "v");
+xray-transport-httpupgrade	src/register.rs	744	get	K	assert_eq!(cfg.header.get("K").unwrap(), "from-proto");
+xray-transport-httpupgrade	src/register.rs	761	get	good	assert_eq!(cfg.header.get("good").unwrap(), "v");
+xray-transport-httpupgrade	src/server.rs	105	get	sec-websocket-key	let ws_key = req.headers.get("sec-websocket-key").map(String::as_str);
+xray-transport-hysteria	src/hub.rs	603	get	X-Custom	assert_eq!(headers.get("X-Custom"), Some(&"value".to_string()));
+xray-transport-hysteria	src/hub.rs	650	get	X-Test	assert_eq!(headers.get("X-Test"), Some(&"yes".to_string()));
+xray-transport-hysteria	src/hub.rs	660	get	Content-Type	assert_eq!(headers.get("Content-Type"), Some(&"text/plain; charset=utf-8".to_string()));
+xray-transport-hysteria	src/hub.rs	740	get	Content-Type	assert_eq!(headers.get("Content-Type").unwrap(), "text/plain; charset=utf-8");
+xray-transport-hysteria	src/hub.rs	741	get	X-Content-Type-Options	assert_eq!(headers.get("X-Content-Type-Options").unwrap(), "nosniff");
+xray-transport-hysteria	src/hub.rs	753	get	Content-Type	assert_eq!(headers.get("Content-Type").unwrap(), "text/html; charset=utf-8");
+xray-transport-hysteria	src/hub.rs	780	get	Content-Type	assert_eq!(headers.get("Content-Type").unwrap(), "text/plain; charset=utf-8");
+xray-transport-hysteria	src/hub.rs	804	get	Allow	assert_eq!(headers.get("Allow").unwrap(), "GET, HEAD");
+xray-transport-hysteria	src/hysteria_transport.rs	279	get	Hysteria-UDP	.get("Hysteria-UDP")
+xray-transport-hysteria	src/hysteria_transport.rs	285	get	Hysteria-CC-RX	.get("Hysteria-CC-RX")
+xray-transport-hysteria	src/proto_config.rs	40	get	rewriteHost	config.masq_url_rewrite_host = m.get("rewriteHost").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-transport-hysteria	src/proto_config.rs	41	get	insecure	config.masq_url_insecure = m.get("insecure").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-transport-hysteria	src/proto_config.rs	45	get	xForwarded	match m.get("xForwarded") {
+xray-transport-hysteria	src/proto_config.rs	56	get	headers	if let Some(h) = m.get("headers") {
+xray-transport-hysteria	src/proto_config.rs	69	get	statusCode	m.get("statusCode").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+xray-transport-hysteria	src/quic_params.rs	30	get	quicParams	let Some(qp) = v.get("quicParams") else { return Ok(None) };
+xray-transport-hysteria	src/quic_params.rs	40	get	bbrProfile	.get("bbrProfile")
+xray-transport-hysteria	src/quic_params.rs	71	get	congestion	.get("congestion")
+xray-transport-hysteria	src/quic_params.rs	88	get	udpHop	if let Some(h) = obj.get("udpHop") {
+xray-transport-hysteria	src/quic_params.rs	92	get	ports	if let Some(ports) = h.get("ports") {
+xray-transport-hysteria	src/quic_params.rs	95	get	interval	if let Some(interval) = h.get("interval") {
+xray-transport-hysteria	src/quic_params.rs	133	get	debug	let _ = obj.get("debug").and_then(serde_json::Value::as_bool);
+xray-transport-hysteria	src/quic_params.rs	141	get	brutalDisableLossCompensation	.get("brutalDisableLossCompensation")
+xray-transport-hysteria	src/quic_params.rs	152	get	disablePathMTUDiscovery	.get("disablePathMTUDiscovery")
+xray-transport-hysteria	src/quinn_adapter.rs	2092	get	X-Masq	resp.headers().get("X-Masq").and_then(|v| v.to_str().ok()).map(str::to_string);
+xray-transport-hysteria	src/quinn_adapter.rs	2222	get	Hysteria-CC-RX	resp.headers().get("Hysteria-CC-RX").unwrap(),
+xray-transport-hysteria	src/register.rs	326	get	auth	let auth = obj.get("auth").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-hysteria	src/register.rs	327	get	masqType	let masq_type = obj.get("masqType").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-hysteria	src/register.rs	328	get	udpIdleTimeout	let udp_idle_timeout = obj.get("udpIdleTimeout").and_then(|x| x.as_i64()).unwrap_or(60);
+xray-transport-hysteria	src/register.rs	329	get	version	let version = obj.get("version").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+xray-transport-hysteria	src/register.rs	332	get	masquerade	if let Some(m) = obj.get("masquerade") {
+xray-transport-hysteria	src/register.rs	450	get	X-A	assert_eq!(cfg.masq_string_headers.get("X-A").unwrap(), "1");
+xray-transport-hysteria	src/register.rs	496	index	h3	Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
+xray-transport-hysteria	src/salamander_socket.rs	289	get	udp	let Some(udp) = v.get("udp").and_then(|u| u.as_array()) else {
+xray-transport-hysteria	src/salamander_socket.rs	294	get	type	let ty = entry.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+xray-transport-hysteria	src/salamander_socket.rs	304	get	settings	let settings = entry.get("settings").cloned().unwrap_or_default();
+xray-transport-hysteria	src/salamander_socket.rs	305	get	password	let password = settings.get("password").and_then(|p| p.as_str()).unwrap_or_default();
+xray-transport-hysteria	src/salamander_socket.rs	313	get	packetSize	let kind = match packet_size_range(settings.get("packetSize"))? {
+xray-transport-kcp	src/register.rs	263	get	mtu	if let Some(v) = obj.get("mtu") {
+xray-transport-kcp	src/register.rs	276	get	tti	if let Some(v) = obj.get("tti") {
+xray-transport-kcp	src/register.rs	311	get	cwndMultiplier	if let Some(v) = obj.get("cwndMultiplier") {
+xray-transport-kcp	src/register.rs	327	get	maxSendingWindow	if let Some(v) = obj.get("maxSendingWindow") {
+xray-transport-naive	src/inbound.rs	64	get	users	v.get("users").and_then(|u| u.as_array()).and_then(|a| a.first()).ok_or_else(|| {
+xray-transport-naive	src/inbound.rs	70	get	name	let username = user.get("name").and_then(|x| x.as_str()).unwrap_or_default();
+xray-transport-naive	src/inbound.rs	71	get	pass	let password = user.get("pass").and_then(|x| x.as_str()).unwrap_or_default();
+xray-transport-naive	src/uri.rs	45	get	server	let server = v.get("server").and_then(Value::as_str).ok_or("missing server")?;
+xray-transport-naive	src/uri.rs	46	get	port	let port = v.get("port").and_then(Value::as_u64).ok_or("missing port")?;
+xray-transport-naive	src/uri.rs	48	get	username	let username = v.get("username").and_then(Value::as_str).ok_or("missing username")?;
+xray-transport-naive	src/uri.rs	49	get	password	let password = v.get("password").and_then(Value::as_str).ok_or("missing password")?;
+xray-transport-naive	src/uri.rs	52	get	sni	if let Some(sni) = v.get("sni").and_then(Value::as_str) {
+xray-transport-naive	src/uri.rs	55	get	fingerprint	if let Some(fp) = v.get("fingerprint").and_then(Value::as_str) {
+xray-transport-naive	src/uri.rs	58	get	pinnedPeerCertSha256	if let Some(pin) = v.get("pinnedPeerCertSha256").and_then(Value::as_str) {
+xray-transport-quic	src/config.rs	86	get	keepAlive	let keep_alive = obj.get("keepAlive").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-transport-quic	src/config.rs	91	get	congestion	obj.get("congestion").and_then(|x| x.as_str()).unwrap_or("").to_ascii_lowercase();
+xray-transport-splithttp	src/client.rs	980	get	user-agent	assert_eq!(req.headers().get("user-agent").unwrap(), "test");
+xray-transport-splithttp	src/client.rs	995	get	cookie	assert_eq!(req.headers().get("cookie").unwrap(), "k1=v1; k2=v2");
+xray-transport-splithttp	src/register.rs	94	get	serverName	.and_then(|v| v.get("serverName"))
+xray-transport-splithttp	src/register.rs	118	get	fingerprint	.and_then(|m| m.get("fingerprint"))
+xray-transport-splithttp	src/register.rs	183	get	quicParams	settings.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
+xray-transport-splithttp	src/register.rs	267	get	serverName	.and_then(|j| j.get("serverName").and_then(|v| v.as_str()))
+xray-transport-splithttp	src/register.rs	337	get	extra	if let Some(extra) = obj.get("extra") {
+xray-transport-splithttp	src/register.rs	381	get	header	let headers = parse_headers(obj.get("header"))
+xray-transport-splithttp	src/register.rs	382	get	headers	.or_else(|| parse_headers(obj.get("headers")))
+xray-transport-splithttp	src/register.rs	390	get	xmux	let xmux = match obj.get("xmux").and_then(|x| x.as_object()) {
+xray-transport-splithttp	src/register.rs	392	get	maxConcurrency	max_concurrency: m.get("maxConcurrency").and_then(parse_range),
+xray-transport-splithttp	src/register.rs	393	get	maxConnections	max_connections: m.get("maxConnections").and_then(parse_range),
+xray-transport-splithttp	src/register.rs	394	get	cMaxReuseTimes	c_max_reuse_times: m.get("cMaxReuseTimes").and_then(parse_range),
+xray-transport-splithttp	src/register.rs	395	get	hMaxRequestTimes	h_max_request_times: m.get("hMaxRequestTimes").and_then(parse_range),
+xray-transport-splithttp	src/register.rs	396	get	hMaxReusableSecs	h_max_reusable_secs: m.get("hMaxReusableSecs").and_then(parse_range),
+xray-transport-splithttp	src/register.rs	397	get	hKeepAlivePeriod	h_keep_alive_period: m.get("hKeepAlivePeriod").and_then(|x| x.as_i64()).unwrap_or(0),
+xray-transport-splithttp	src/register.rs	409	get	downloadSettings	let download_settings = obj.get("downloadSettings").and_then(|ds| {
+xray-transport-splithttp	src/register.rs	410	get	splithttpSettings	ds.get("splithttpSettings").and_then(|v| parse_splithttp_config(Some(v)).ok()).map(Box::new)
+xray-transport-splithttp	src/register.rs	452	get	sessionIDLength	if let Some(len_range) = obj.get("sessionIDLength").and_then(parse_range) {
+xray-transport-splithttp	src/register.rs	484	get	sessionIDLength	session_id_length: match obj.get("sessionIDLength").and_then(parse_range) {
+xray-transport-splithttp	src/register.rs	527	get	from	let from = obj.get("from").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+xray-transport-splithttp	src/register.rs	528	get	to	let to = obj.get("to").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+xray-transport-splithttp	src/register.rs	786	get	X-Forwarded-For	assert_eq!(cfg.headers.get("X-Forwarded-For").unwrap(), "10.0.0.1");
+xray-transport-splithttp	src/transport.rs	4	index	h3	//! - **isH3 判定**（hub.go:469）：`tlsSettings.alpn == ["h3"]` → UDP + QUIC + h3 server
+xray-transport-splithttp	src/transport.rs	612	get	privateKey	.get("privateKey")
+xray-transport-splithttp	src/transport.rs	620	get	serverNames	if let Some(arr) = json.get("serverNames").and_then(|x| x.as_array()) {
+xray-transport-splithttp	src/transport.rs	635	get	shortIds	.get("shortIds")
+xray-transport-splithttp	src/transport.rs	660	get	target	json.get("target").or_else(|| json.get("dest")).cloned().unwrap_or(serde_json::Value::Null);
+xray-transport-splithttp	src/transport.rs	660	get	dest	json.get("target").or_else(|| json.get("dest")).cloned().unwrap_or(serde_json::Value::Null);
+xray-transport-splithttp	src/transport.rs	665	get	xver	let xver = json.get("xver").and_then(|x| x.as_u64()).unwrap_or(0).min(2) as u8;
+xray-transport-splithttp	src/transport.rs	668	get	maxUselessRecords	xray_reality::MaxUselessRecordsSetting::from_json(json.get("maxUselessRecords"))
+xray-transport-splithttp	src/transport.rs	672	get	serverAcceptor	xray_reality::ServerAcceptorSetting::from_json(json.get("serverAcceptor"))
+xray-transport-splithttp	src/transport.rs	676	get	mldsa65Seed	if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
+xray-transport-splithttp	src/transport.rs	686	get	maxTimeDiff	let max_time_diff_ms = json.get("maxTimeDiff").and_then(|x| x.as_u64()).unwrap_or(0);
+xray-transport-splithttp	src/transport.rs	1321	index	h3	settings.security_json = Some(serde_json::json!({ "alpn": ["h3"] }));
+xray-transport-splithttp	src/transport.rs	1335	index	h3	Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
+xray-transport-splithttp	src/transport.rs	1509	index	h3	settings.security_json = Some(serde_json::json!({ "alpn": ["h3"] }));
+xray-transport-splithttp	src/transport.rs	1524	index	h3	Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
+xray-transport-splithttp	src/hub/handler.rs	107	get	host	.or_else(|| req.headers().get("host").and_then(|v| v.to_str().ok()).map(str::to_string))
+xray-transport-splithttp	src/hub/handler.rs	161	get	Referer	req.headers().get("Referer").and_then(|v| v.to_str().ok()).is_some_and(|s| !s.is_empty());
+xray-transport-splithttp	src/hub/handler.rs	192	get	Referer	let referer = req.headers().get("Referer").and_then(|v| v.to_str().ok());
+xray-transport-splithttp	src/hub/handler.rs	906	get	Access-Control-Allow-Origin	assert_eq!(merged.headers().get("Access-Control-Allow-Origin").unwrap(), "*");
+xray-transport-splithttp	src/hub/handler.rs	907	get	Access-Control-Allow-Methods	assert_eq!(merged.headers().get("Access-Control-Allow-Methods").unwrap(), "POST");
+xray-transport-splithttp	src/hub/handler.rs	977	get	host	/// 挂到 URI authority）。旧实现只读 `headers().get("host")` 恒空串 →
+xray-transport-splithttp	src/hub/handler.rs	987	get	host	assert!(req.headers().get("host").is_none(), "h2 request must carry no Host header");
+xray-transport-splithttp	src/hub/handler.rs	1015	get	X-Padding	let pad = resp.headers().get("X-Padding").expect("X-Padding must be present");
+xray-transport-splithttp	src/hub/handler.rs	1079	get	sess-ikzy	assert!(ctx.sessions.get("sess-ikzy").await.is_some(), "GET must register session");
+xray-transport-splithttp	src/hub/handler.rs	1084	get	sess-ikzy	if ctx.sessions.get("sess-ikzy").await.is_none() {
+xray-transport-splithttp	src/hub/handler.rs	1090	get	sess-ikzy	ctx.sessions.get("sess-ikzy").await.is_none(),
+xray-transport-splithttp	src/hub/session.rs	159	get	nope	assert!(map.get("nope").await.is_none());
+xray-transport-splithttp	src/hub/session.rs	166	get	x	assert!(map.get("x").await.is_some());
+xray-transport-splithttp	src/hub/session.rs	174	get	x	assert!(map.get("x").await.is_none());
+xray-transport-splithttp	src/hub/session.rs	184	get	reap-me	assert!(map.get("reap-me").await.is_some());
+xray-transport-splithttp	src/hub/session.rs	187	get	reap-me	assert!(map.get("reap-me").await.is_none());
+xray-transport-tcp	src/register.rs	110	get	fingerprint	.and_then(|m| m.get("fingerprint"))
+xray-transport-tcp	src/register.rs	162	get	serverName	.and_then(|m| m.get("serverName"))
+xray-transport-websocket	src/client.rs	595	get	host	assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
+xray-transport-websocket	src/client.rs	610	get	Sec-WebSocket-Protocol	let v = req.headers().get("Sec-WebSocket-Protocol").expect("header should be set");
+xray-transport-websocket	src/client.rs	621	get	Sec-WebSocket-Protocol	assert!(req.headers().get("Sec-WebSocket-Protocol").is_none());
+xray-transport-websocket	src/client.rs	631	get	x-forwarded-for	assert_eq!(req.headers().get("x-forwarded-for").unwrap(), "10.0.0.1");
+xray-transport-websocket	src/client.rs	632	get	x-custom	assert_eq!(req.headers().get("x-custom").unwrap(), "v");
+xray-transport-websocket	src/client.rs	645	get	host	assert_eq!(req.headers().get("host").unwrap(), "front.example.com");
+xray-transport-websocket	src/client.rs	651	get	host	assert_eq!(req.headers().get("host").unwrap(), "sni.example.com");
+xray-transport-websocket	src/client.rs	655	get	host	assert_eq!(req.headers().get("host").unwrap(), "203.0.113.9");
+xray-transport-websocket	src/client.rs	664	get	user-agent	let ua = req.headers().get("user-agent").expect("UA must be set").to_str().unwrap();
+xray-transport-websocket	src/client.rs	670	get	sec-fetch-mode	assert_eq!(req.headers().get("sec-fetch-mode").unwrap(), "websocket");
+xray-transport-websocket	src/client.rs	671	get	sec-fetch-dest	assert_eq!(req.headers().get("sec-fetch-dest").unwrap(), "empty");
+xray-transport-websocket	src/client.rs	672	get	sec-fetch-site	assert_eq!(req.headers().get("sec-fetch-site").unwrap(), "same-origin");
+xray-transport-websocket	src/client.rs	673	get	cache-control	assert_eq!(req.headers().get("cache-control").unwrap(), "no-cache");
+xray-transport-websocket	src/client.rs	674	get	pragma	assert_eq!(req.headers().get("pragma").unwrap(), "no-cache");
+xray-transport-websocket	src/client.rs	675	get	accept	assert_eq!(req.headers().get("accept").unwrap(), "*/*");
+xray-transport-websocket	src/client.rs	676	get	sec-ch-ua	assert!(req.headers().get("sec-ch-ua").is_some(), "CH-UA GREASE present");
+xray-transport-websocket	src/client.rs	678	get	sec-websocket-key	assert!(req.headers().get("sec-websocket-key").is_some());
+xray-transport-websocket	src/client.rs	679	get	upgrade	assert_eq!(req.headers().get("upgrade").unwrap(), "websocket");
+xray-transport-websocket	src/client.rs	680	get	connection	assert_eq!(req.headers().get("connection").unwrap(), "Upgrade");
+xray-transport-websocket	src/client.rs	690	get	user-agent	assert_eq!(req.headers().get("user-agent").unwrap(), "my-agent/9");
+xray-transport-websocket	src/client.rs	691	get	accept	assert_eq!(req.headers().get("accept").unwrap(), "application/json");
+xray-transport-websocket	src/client.rs	692	get	sec-fetch-mode	assert!(req.headers().get("sec-fetch-mode").is_none(), "custom UA → no masquerade");
+xray-transport-websocket	src/client.rs	787	index	fingerprint	sec["fingerprint"] = serde_json::Value::String(fp.into());
+xray-transport-websocket	src/client.rs	790	index	alpn	sec["alpn"] = serde_json::json!(alpn);
+xray-transport-websocket	src/register.rs	637	get	host	let mut host = obj.get("host").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-websocket	src/register.rs	638	get	path	let mut path = obj.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+xray-transport-websocket	src/register.rs	639	get	ed	let mut ed = obj.get("ed").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+xray-transport-websocket	src/register.rs	642	get	heartbeatPeriod	obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).map(|v| v as u32).unwrap_or(30);
+xray-transport-websocket	src/register.rs	645	get	poolSize	let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(12) as u32;
+xray-transport-websocket	src/register.rs	655	get	header	let mut header = parse_headers(obj.get("header"))
+xray-transport-websocket	src/register.rs	656	get	headers	.or_else(|| parse_headers(obj.get("headers")))
+xray-transport-websocket	src/register.rs	666	get	acceptProxyProtocol	obj.get("acceptProxyProtocol").and_then(|x| x.as_bool()).unwrap_or(false);
+xray-transport-websocket	src/register.rs	757	get	X-Forwarded-For	assert_eq!(cfg.header.get("X-Forwarded-For").unwrap(), "10.0.0.1");
+xray-transport-websocket	src/register.rs	764	get	X-Custom	assert_eq!(cfg.header.get("X-Custom").unwrap(), "v");
+xray-transport-websocket	src/register.rs	774	get	K	assert_eq!(cfg.header.get("K").unwrap(), "from-proto");
+xray-transport-websocket	src/register.rs	791	get	good	assert_eq!(cfg.header.get("good").unwrap(), "v");
+xray-transport-websocket	src/register.rs	823	get	X-Foo	assert_eq!(cfg.header.get("X-Foo").map(String::as_str), Some("1"));
+xray-transport-websocket	src/server.rs	513	get	Sec-WebSocket-Protocol	let raw = headers.get("Sec-WebSocket-Protocol")?.to_str().ok()?;
+xray-transport-websocket	src/server.rs	544	get	X-Forwarded-For	let val = headers.get("X-Forwarded-For")?.to_str().ok()?;

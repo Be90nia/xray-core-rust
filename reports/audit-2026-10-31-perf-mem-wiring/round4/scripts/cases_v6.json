@@ -1,0 +1,17 @@
+[
+  {"name":"v6_xdns_go_shape","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xdns","settings":{"domains":[{"names":["t.example.com"],"types":[16]}],"resolvers":[{"addrs":["1.1.1.1:53"]}],"extraPoll":1}}]}}},
+  {"name":"v6_xdns_rust_shape","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xdns","settings":{"domains":[{"name":"t.example.com","types":[16]}],"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}],"extraPoll":1}}]}}},
+  {"name":"v6_xdns_worker","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xdns","settings":{"resolvers":[{"addrs":["1.1.1.1:53"],"worker":8}]}}]}}},
+  {"name":"v6_xdns_domain_edns0","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xdns","settings":{"domains":[{"names":["t.example.com"],"edns0":123,"lenLimit":100,"labelLimit":10,"types":[16,28]}]}}]}}},
+  {"name":"v6_wireguard_noKernelTun","path":["outbounds",0],"value":{"protocol":"wireguard","tag":"out-1","settings":{"secretKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","address":["10.0.0.2/32"],"peers":[{"publicKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","endpoint":"1.2.3.4:51820"}],"noKernelTun":true}}},
+  {"name":"v6_xdns_extraPoll_only","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xdns","settings":{"extraPoll":2}}]}}},
+  {"name":"v6_xicmp","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"xicmp","settings":{"ips":["10.0.0.1"],"dgram":true}}]}}},
+  {"name":"v6_realm","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"realm","settings":{"url":"stun:stun.l.google.com:19302"}}]}}},
+  {"name":"v6_sudoku","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}},
+  {"name":"v6_mkcp_header","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"tcp":[{"type":"mkcp-legacy","settings":{"header":"dns","value":"x.com"}}]}}},
+  {"name":"v6_udphop","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":{"from":30,"to":30},"ports":[443]}}]}}},
+  {"name":"v6_salamander","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"salamander","settings":{"key":"abc"}}]}}},
+  {"name":"v6_ob_wireguard_domainStrategy","path":["outbounds",0],"value":{"protocol":"wireguard","tag":"out-1","settings":{"secretKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","address":["10.0.0.2/32"],"peers":[{"publicKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","endpoint":"1.2.3.4:51820"}],"domainStrategy":"ForceIPv4"}}},
+  {"name":"v6_ob_wireguard_reserved_bad","path":["outbounds",0],"value":{"protocol":"wireguard","tag":"out-1","settings":{"secretKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","address":["10.0.0.2/32"],"peers":[{"publicKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","endpoint":"1.2.3.4:51820"}],"reserved":[1,2]}}},
+  {"name":"v6_ob_wireguard_mtu","path":["outbounds",0],"value":{"protocol":"wireguard","tag":"out-1","settings":{"secretKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","address":["10.0.0.2/32"],"peers":[{"publicKey":"qLJ4p9lPFhwOjnK5tYFCbLAuFKP+AOLY3tCXh5gS+vo=","endpoint":"1.2.3.4:51820"}],"mtu":1400}}}
+]

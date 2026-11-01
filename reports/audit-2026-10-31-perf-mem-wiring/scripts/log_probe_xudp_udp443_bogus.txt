@@ -1,0 +1,1 @@
+Error: failed to start xray: config build failed: invalid config: rejected by postprocessing stage Validation: outbound 'direct' mux.xudpProxyUDP443='bogus' is invalid (Go MuxConfig.Build rejects; allowed: reject|allow|skip)

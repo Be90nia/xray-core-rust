@@ -1,0 +1,3 @@
+2026-10-31T04:22:56.551439Z  INFO version=26.10.11 git_rev=5fe98b907c7b550d4a70202abb475e26ee89013d exe_fingerprint=b35a2b3b121ad6ba1c5664f167fa247c profile=release target_triple=windows-x86_64 xray kernel identity
+2026-10-31T04:22:56.551780Z  INFO system dialer initialized with DNS resolution
+2026-10-31T04:22:56.551886Z  WARN full Router init failed, falling back to PatternRouter error=routing config JSON parse: routing rule ip: CIDR 前缀过大: 99, 最大: 32

@@ -1,0 +1,18 @@
+[
+  {"name":"v8_xmux_maxConn_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","xmux":{"maxConnections":"2-8"}}}},
+  {"name":"v8_xmux_maxConn_obj","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","xmux":{"maxConnections":{"from":2,"to":8}}}}},
+  {"name":"v8_xPaddingBytes_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","xPaddingBytes":"100-200"}}},
+  {"name":"v8_xPaddingBytes_obj","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","xPaddingBytes":{"from":100,"to":200}}}},
+  {"name":"v8_uplinkChunkSize_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","uplinkChunkSize":"100-200"}}},
+  {"name":"v8_sessionIDLength_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","sessionIDTable":"HEX","sessionIDLength":"8"}}},
+  {"name":"v8_scMaxEachPostBytes_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","scMaxEachPostBytes":"1000000"}}},
+  {"name":"v8_scStreamUpServerSecs_string","path":["inbounds",0,"streamSettings"],"value":{"network":"splithttp","splithttpSettings":{"path":"/s","scStreamUpServerSecs":"30-60"}}},
+  {"name":"v8_udphop_interval_obj_only","path":["inbounds",0,"streamSettings"],"value":{"network":"tcp","finalmask":{"udp":[{"type":"udphop","settings":{"mode":"intervallocal","remoteIPs":["10.0.0.0/24"],"interval":{"from":30,"to":60}}}]}}},
+  {"name":"v8_freedom_fragment_interval_obj","path":["outbounds",0,"settings","fragment"],"value":{"packets":"tlshello","length":"10-20","interval":{"from":30,"to":60}}},
+  {"name":"v8_freedom_finalrule_blockDelay_obj","path":["outbounds",0,"settings","finalRules"],"value":[{"action":"block","blockDelay":{"from":30,"to":90}}]},
+  {"name":"v8_freedom_noise_delay_obj","path":["outbounds",0,"settings","noises"],"value":[{"type":"str","packet":"aGVsbG8=","delay":{"from":10,"to":20},"applyTo":"ip"}]},
+  {"name":"v8_freedom_fragment_length_obj","path":["outbounds",0,"settings","fragment"],"value":{"packets":"tlshello","length":{"from":10,"to":20},"interval":"30-60"}},
+  {"name":"v8_freedom_fragment_maxSplit_obj","path":["outbounds",0,"settings","fragment"],"value":{"packets":"tlshello","length":"10-20","maxSplit":{"from":1,"to":3}}},
+  {"name":"v8_route_port_obj","path":["routing"],"value":{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"out-1","port":{"from":80,"to":90}}]}},
+  {"name":"v8_route_localPort_obj","path":["routing"],"value":{"domainStrategy":"AsIs","rules":[{"type":"field","outboundTag":"out-1","localPort":{"from":8000,"to":9000}}]}}
+]

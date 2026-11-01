@@ -1,0 +1,1 @@
+Error: failed to start xray: config build failed: failed to build outbound.targetStrategy: unsupported target domain strategy: bogusStrategy

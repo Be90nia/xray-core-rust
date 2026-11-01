@@ -1,0 +1,30 @@
+# cargo-deny 0.20.2  `cargo deny check advisories` （exit=0 = advisories ok）
+# 原始输出 37KB：每条 yanked warning 带完整反向依赖树（chacha20 0.10.0 一路到 xray-*），
+# 此处保留结论头 + 定位行；复跑：CARGO_TARGET_DIR=target-G10Plan cargo deny check advisories
+
+warning[yanked]: detected yanked crate (try `cargo update -p chacha20`)
+   ┌─ D:\Project\Xray-core-rust/Cargo.lock:57:1
+   │
+57 │ chacha20 0.10.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ yanked version
+   ...
+warning[yanked]: detected yanked crate (try `cargo update -p spin`)
+    ┌─ D:\Project\Xray-core-rust/Cargo.lock:396:1
+    │
+396 │ spin 0.9.8 registry+https://github.com/rust-lang/crates.io-index
+    │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ yanked version
+   ...
+warning[advisory-not-detected]: advisory was not encountered
+   ┌─ D:\Project\Xray-core-rust\deny.toml:34:6
+   │
+34 │     "RUSTSEC-2026-0381", # webpki-roots 1.0.8 bundled roots allow trust in distrusted emSign intermediates
+   │      ━━━━━━━━━━━━━━━━━ no crate matched advisory criteria
+   ...
+warning[advisory-not-detected]: advisory was not encountered
+   ┌─ D:\Project\Xray-core-rust\deny.toml:33:6
+   │
+33 │     "RUSTSEC-2026-0382", # rustls-webpki 0.103.15 certificate verification may accept distrusted intermediates
+   │      ━━━━━━━━━━━━━━━━━ no crate matched advisory criteria
+   ...
+
+advisories ok

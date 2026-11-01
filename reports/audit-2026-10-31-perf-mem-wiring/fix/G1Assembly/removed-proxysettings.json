@@ -1,0 +1,14 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    { "tag": "in", "listen": "127.0.0.1", "port": 28564, "protocol": "socks", "settings": {} }
+  ],
+  "outbounds": [
+    { "tag": "socks-out", "protocol": "socks", "settings": { "servers": [{ "address": "127.0.0.1", "port": 1081 }] } },
+    {
+      "tag": "chained",
+      "protocol": "freedom",
+      "proxySettings": { "tag": "socks-out" }
+    }
+  ]
+}
