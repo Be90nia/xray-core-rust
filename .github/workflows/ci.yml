@@ -257,8 +257,9 @@ jobs:
       # 只跑这一条：整文件在特权下会连带跑其它契约夹具，超出本票要验证的语义锚
       - name: Run tproxy gate as root (privileged branch)
         run: >
-          sudo --preserve-env=PATH,RUSTUP_HOME,CARGO_HOME,RUST_MIN_STACK
-          cargo test -p xray-proxy-dokodemo --test plugin_contract
+          sudo --preserve-env=RUSTUP_HOME,CARGO_HOME,RUST_MIN_STACK
+          "$(command -v cargo)"
+          test -p xray-proxy-dokodemo --test plugin_contract
           tproxy_gate_is_runtime_semantics_not_compiled_away -- --exact --nocapture
 
   # bd c4ueq：Go/Rust 入站解析器差分对拍门——同一原始字节流打 Go「裁定基准」与

@@ -17,7 +17,7 @@
 //!   `xray-core/src/inbound.rs` 的 ss2022 解析口径）
 //!
 //! 覆盖族（bd k0hdi 补全，原始 settings JSON 面——这些协议没有 conf 层结构体，
-//! 或凭据键藏在 `accounts`/`users`/`servers` 嵌套里，见 [`collect_generic`]）：
+//! 或凭据键藏在 `accounts`/`users`/`servers` 嵌套里，见 `collect_generic`）：
 //! anytls / tuic / naive / wireguard / hysteria / socks(含 mixed) / http。
 
 use serde_json::Value;

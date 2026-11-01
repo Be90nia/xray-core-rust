@@ -1246,6 +1246,36 @@ mod tests {
         assert_eq!(&wire[21..25], b"ping");
     }
 
+    /// link 侧 XUDP 帧（`[meta][2B BE len][payload]`，bd t0ls1）：UDP 会话在
+    /// `VlessUdpFramedConn` 的 AsyncRead/AsyncWrite 面上就是帧，不是裸载荷。
+    fn xudp_frame(dest: &Destination, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        xray_xudp::packet::FrameMetadata::new_udp(dest.address().clone(), dest.port(), [7u8; 8])
+            .write_to(&mut frame)
+            .unwrap();
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// 从 link 读一帧 XUDP：按帧内长度逐段 read_exact（帧不可分，不越读）。
+    /// 返回 (帧状态, 载荷)——状态用于断言 New→Keep 的会话复用。
+    async fn read_xudp_payload(
+        conn: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> (xray_xudp::packet::FrameStatus, Vec<u8>) {
+        let mut meta_len = [0u8; 2];
+        conn.read_exact(&mut meta_len).await.expect("xudp meta len");
+        let mut meta = vec![0u8; u16::from_be_bytes(meta_len) as usize];
+        conn.read_exact(&mut meta).await.expect("xudp meta");
+        let mut data_len = [0u8; 2];
+        conn.read_exact(&mut data_len).await.expect("xudp data len");
+        let mut payload = vec![0u8; u16::from_be_bytes(data_len) as usize];
+        conn.read_exact(&mut payload).await.expect("xudp payload");
+        // meta = [session_id(2B)][status(1B)][opt(1B)]…
+        let status = xray_xudp::packet::FrameStatus::from_byte(meta[2]).expect("xudp frame status");
+        (status, payload)
+    }
+
     /// e2e（bd 1wq8）：vless 出站 UDP（make_dial_fn + UDP dest → VlessCommand::Udp +
     /// 长度前缀分帧）→ serve_vless `handle_udp_relay` → freedom → UDP echo 全链路往返。
     #[tokio::test]
@@ -1310,17 +1340,17 @@ mod tests {
             .expect("dial timeout")
             .expect("udp dial");
 
-        // 4. 往返（两包不同尺寸）
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for payload in [&b"ping"[..], &[9u8; 600][..]] {
-            conn.write_all(payload).await.unwrap();
+        // 4. 往返（两包不同尺寸）：上下行都是 XUDP 帧（上行剥帧、下行裹帧）
+        use xray_xudp::packet::FrameStatus;
+        for (idx, payload) in [&b"ping"[..], &[9u8; 600][..]].into_iter().enumerate() {
+            conn.write_all(&xudp_frame(&dest, payload)).await.unwrap();
             conn.flush().await.unwrap();
-            let mut buf = vec![0u8; payload.len()];
-            timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+            let (status, got) = timeout(Duration::from_secs(10), read_xudp_payload(&mut conn))
                 .await
-                .expect("roundtrip timeout")
-                .expect("read");
-            assert_eq!(&buf, payload);
+                .expect("roundtrip timeout");
+            // 首帧 New / 次帧 Keep：同一 UDP 会话复用，帧序与发送序一致
+            assert_eq!(status, [FrameStatus::New, FrameStatus::Keep][idx], "下行帧状态");
+            assert_eq!(got, payload);
         }
     }
 

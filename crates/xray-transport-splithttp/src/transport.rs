@@ -1325,10 +1325,23 @@ mod tests {
     #[tokio::test]
     async fn h3_server_receives_stream_one() {
         ensure_provider();
+        // 服务端必须配真证书：缺证书 → 每条握手 `no server certificate chain
+        // resolved`（bd mwvwd F2，不再自签）；客户端用
+        // `pinnedPeerCertSha256` 钉住它，不依赖已收紧的 allowInsecure。
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&serde_json::json!({
+            "certificate": cert_pem,
+        }))
+        .unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
         let (handler, count) = greeting_handler();
         let mut settings = plain_settings();
         settings.security = "tls".into();
-        settings.security_json = Some(serde_json::json!({ "alpn": ["h3"] }));
+        settings.security_json = Some(serde_json::json!({
+            "alpn": ["h3"],
+            "certificates": [{ "certificate": cert_pem, "key": key_pem }],
+        }));
         let listener = listen_splithttp(
             "127.0.0.1:0".parse().unwrap(),
             &settings,
@@ -1339,11 +1352,14 @@ mod tests {
         .expect("listen h3");
         let addr = listener.local_addr().unwrap();
 
-        // quinn + h3 客户端（自签证书 → allowInsecure）
+        // quinn + h3 客户端（钉扎证书；SNI/主机名取证书 SAN "localhost"）
         let client_tls = xray_tls::client_config::build_client_config(
             "tls",
-            Some(&serde_json::json!({"allowInsecure": true, "alpn": ["h3"]})),
-            "127.0.0.1",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": pin,
+                "alpn": ["h3"],
+            })),
+            "localhost",
         )
         .unwrap()
         .expect("client tls config");
@@ -1352,7 +1368,7 @@ mod tests {
         ));
         let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(quic_cfg);
-        let conn = endpoint.connect(addr, "127.0.0.1").unwrap().await.expect("quic connect");
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.expect("quic connect");
         let (mut driver, mut send_req) =
             h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
         tokio::spawn(async move {

@@ -1051,6 +1051,47 @@ mod tests {
             other => panic!("expected EOF or connection reset, got {other:?}"),
         }
     }
+    /// link 侧 XUDP 帧（手拼线格式——vmess crate 不依赖 xray-xudp，与
+    /// `dispatcher::tests::xudp_frame` 同格式）：`[2B meta_len][2B session]
+    /// [1B status][1B opt][1B net][2B port][atyp][addr][?8B gid][2B len][payload]`。
+    /// 帧内目标只是格式占位：vmess 服务端转发目标取自请求头（bd uhg2）。
+    fn xudp_frame(payload: &[u8], first: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u16.to_be_bytes()); // session id
+        body.push(if first { 1 } else { 2 }); // status: New / Keep
+        body.push(1); // opt = Data
+        body.push(2); // network = UDP
+        body.extend_from_slice(&53u16.to_be_bytes()); // port（PortThenAddress）
+        body.push(1); // atyp = IPv4
+        body.extend_from_slice(&[127, 0, 0, 1]);
+        if first {
+            body.extend_from_slice(&[3u8; 8]); // GlobalID（仅 New）
+        }
+        let mut f = Vec::new();
+        f.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        f.extend_from_slice(&body);
+        f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// 从 link 读一帧 XUDP：按帧内长度逐段 read_exact（帧不可分，不越读）。
+    /// 返回 (帧状态, 载荷)——1=New / 2=Keep，用于断言会话复用。
+    async fn read_xudp_payload(conn: &mut (impl tokio::io::AsyncRead + Unpin)) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+
+        let mut meta_len = [0u8; 2];
+        conn.read_exact(&mut meta_len).await.expect("xudp meta len");
+        let mut meta = vec![0u8; u16::from_be_bytes(meta_len) as usize];
+        conn.read_exact(&mut meta).await.expect("xudp meta");
+        let mut data_len = [0u8; 2];
+        conn.read_exact(&mut data_len).await.expect("xudp data len");
+        let mut payload = vec![0u8; u16::from_be_bytes(data_len) as usize];
+        conn.read_exact(&mut payload).await.expect("xudp payload");
+        // meta = [session_id(2B)][status(1B)][opt(1B)]…
+        (meta[2], payload)
+    }
+
     /// e2e（bd uhg2）：vmess 出站 UDP（make_vmess_dial_fn + UDP dest，chunk 即 packet）
     /// → serve_vmess `pump_udp_session` → freedom → UDP echo 全链路往返。
     #[tokio::test]
@@ -1111,17 +1152,17 @@ mod tests {
             .expect("dial timeout")
             .expect("udp dial");
 
-        // 4. 往返（两包不同尺寸）
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for payload in [&b"ping"[..], &[9u8; 600][..]] {
-            conn.write_all(payload).await.unwrap();
+        // 4. 往返（两包不同尺寸）：上下行都是 XUDP 帧（上行剥帧、下行裹帧）
+        use tokio::io::AsyncWriteExt;
+        for (idx, payload) in [&b"ping"[..], &[9u8; 600][..]].into_iter().enumerate() {
+            conn.write_all(&xudp_frame(payload, idx == 0)).await.unwrap();
             conn.flush().await.unwrap();
-            let mut buf = vec![0u8; payload.len()];
-            timeout(Duration::from_secs(10), conn.read_exact(&mut buf))
+            let (status, got) = timeout(Duration::from_secs(10), read_xudp_payload(&mut conn))
                 .await
-                .expect("roundtrip timeout")
-                .expect("read");
-            assert_eq!(&buf, payload);
+                .expect("roundtrip timeout");
+            // 首帧 New / 次帧 Keep：同一 UDP 会话复用，帧序与发送序一致
+            assert_eq!(status, [1u8, 2u8][idx], "下行帧状态（New→Keep）");
+            assert_eq!(got, payload);
         }
     }
 
