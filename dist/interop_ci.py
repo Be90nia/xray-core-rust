@@ -355,7 +355,15 @@ def kill_bins(*paths):
                 subprocess.run(['cmd', '/c', 'taskkill /F /IM ' + os.path.basename(path)],
                                capture_output=True, timeout=5)
             else:
-                subprocess.run(['pkill', '-f', re.escape(path)], capture_output=True, timeout=5)
+                # 行首锚定（`^`）不可省：被测二进制的绝对路径会出现在**本脚本自身**
+                # 的命令行里（`--go /abs/path/xray` / `--rust /abs/path/xray`），
+                # 无锚定的 `pkill -f <path>` 会把父进程 python 一起打死 → 步骤 SIGTERM
+                # （CI 实证：ubuntu 在 #12 Rust/Rust 之后切 Go 方向时 exit 143
+                # "Terminated"，macOS 的 BSD pkill 行为不同故未暴露）。
+                # xray 进程的 cmdline 以二进制路径开头，python 的以 `python3` 开头，
+                # 故 `^` 精确区分二者。
+                subprocess.run(['pkill', '-f', '^' + re.escape(path)],
+                               capture_output=True, timeout=5)
         except Exception:
             pass
 
