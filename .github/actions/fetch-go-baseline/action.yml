@@ -1,0 +1,53 @@
+name: 'Fetch Go baseline (pinned commit build)'
+description: >-
+  取得「裁定基准」Go Xray 二进制（bd t3wtj：基准版本收敛到本文件一处）。
+  基准 = v26.10.17（commit 92ccc939aaf4f8965f369cf0b142e005aeaa11d5）。
+  **为什么不是下载 release asset**：上游从未为 26.10.17 发布二进制（releases 列表与
+  tags 双双查无此项——存在的只有 26.9.9 / 26.9.30 / 26.10.21 / 26.10.31）。而 26.9.9
+  已按 CLAUDE.md §0 降级为「仅解释上游改了什么、不得用于裁定」，26.10.21 会把上游新增项
+  误判成本仓缺口。→ 唯一能拿到 26.10.17 二进制的途径 = 按 commit 取源码构建。
+  完整性锚点因此从「release asset 的 sha256」换成「commit sha（不可变）+ go.sum 模块校验和」，
+  并在构建后断言 `xray version` 输出确为基准版本号（错版本立即红）。
+  升级基准 = 改本文件 env 两行（VERSION + COMMIT）+ 跑一次 CI。
+
+inputs:
+  out:
+    description: '输出二进制路径（相对仓库根；Windows 消费方请自带 .exe 后缀）'
+    required: false
+    default: tools/xray-go/xray
+
+runs:
+  using: composite
+  steps:
+    # 26.10.17 的 go.mod 声明 `go 1.27`：低版本 go 会尝试 GOTOOLCHAIN 自动下载
+    # （CI 允许，但多一次网络依赖与失败面），故显式装同代工具链。
+    - name: Install Go toolchain
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.27.x'
+        cache: false
+
+    - name: Build Go baseline from pinned commit
+      shell: bash
+      env:
+        BASELINE_VERSION: '26.10.17'
+        BASELINE_COMMIT: '92ccc939aaf4f8965f369cf0b142e005aeaa11d5'
+        OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        src="${RUNNER_TEMP}/xray-go-src"
+        rm -rf "$src" && mkdir -p "$src"
+        # codeload tar = 该 commit 的源码快照（无 .git 历史，比 clone 全仓省时省盘）
+        curl -fsSL "https://codeload.github.com/XTLS/Xray-core/tar.gz/${BASELINE_COMMIT}" \
+          | tar xz -C "$src" --strip-components=1
+        mkdir -p "$(dirname "$GITHUB_WORKSPACE/${OUT}")"
+        ( cd "$src" && go build -trimpath -o "$GITHUB_WORKSPACE/${OUT}" ./main )
+        ver="$("$GITHUB_WORKSPACE/${OUT}" version | head -1)"
+        echo "Go 基准二进制: $GITHUB_WORKSPACE/${OUT}"
+        echo "版本行: ${ver}"
+        if ! printf '%s' "$ver" | grep -q "Xray ${BASELINE_VERSION} "; then
+          echo "::error::Go 基准版本不符：期望 ${BASELINE_VERSION}（commit ${BASELINE_COMMIT}），实得: ${ver}"
+          exit 1
+        fi
+        # 消费方统一用 $GO_BASELINE_BIN，不必知道路径细节
+        echo "GO_BASELINE_BIN=$GITHUB_WORKSPACE/${OUT}" >> "$GITHUB_ENV"

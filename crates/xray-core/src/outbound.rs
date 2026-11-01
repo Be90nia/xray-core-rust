@@ -379,7 +379,10 @@ pub(crate) fn wrap_dial_with_send_through(
 /// `target_strategy` 有效（非 AsIs）时先经 [`wrap_dial_with_target_strategy`]
 /// 包装 dial_fn（bd bqm）。
 #[allow(clippy::type_complexity)] // 返回类型即三组件装配形态
-#[allow(clippy::too_many_arguments, reason = "装配期一次性参数搬运：tag/dial/proxy_chain/target_strategy/dns/send_through/level/policy 各自来自不同配置面，聚成 struct 只是把参数搬到字段，不减少耦合")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "装配期一次性参数搬运：tag/dial/proxy_chain/target_strategy/dns/send_through/level/policy 各自来自不同配置面，聚成 struct 只是把参数搬到字段，不减少耦合"
+)]
 pub(crate) fn wrap_bridge(
     tag: String,
     dial_fn: xray_app_dispatcher::default::DialFn,

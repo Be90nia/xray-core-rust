@@ -268,14 +268,16 @@ async fn dial_splithttp(
                     .unwrap_or("")
                     .to_string(),
             };
-            // bd rjzw2：握手前 RTT 探针（一次性 TCP connect 计时，DNS 在计时外；
-            // 失败 → None → 阶梯回落静态保底，永不劣于现状）。独立于数据连接。
-            // bench/诊断可用 XRAY_H2_RTT_HINT_MS 强制（此时跳过探针）。
+            // bd rjzw2：握手前 RTT 探针（一次性 TCP connect 计时，DNS 在计时外）。
+            // ⚠️ 阶梯已撤（flow_window 模块头）：探针结果**只进定窗日志**，不再影响
+            // 任何窗值——窗组恒为静态保底。bench/诊断可用 XRAY_H2_RTT_HINT_MS 强制
+            // （此时跳过探针）。
             //
             // ⚠️ bd vkirx①：这条探针就是抓包看到的「stream-one 每会话多 1 条零字节
             // TCP」（Rust 2 条 vs Go 1 条）的唯一来源——Go 用握手指令内 RTT，Rust 另
-            // 拨一条 SYN 再丢弃。互认不受影响，但多一个可指纹化的 SYN；要清零就得
-            // 用带内 RTT 测量替代（跟踪票口径，不在本轮）。
+            // 拨一条 SYN 再丢弃。互认不受影响，但多一个可指纹化的 SYN 且现在零收益
+            // （只喂日志）；清掉它要动本处调用 + `resolve_rtt`/`probe_rtt`
+            // （跟踪票口径，不在本轮）。
             let rtt_hint =
                 crate::flow_window::resolve_rtt(&dial_target.host, dial_target.port).await;
             let client = Arc::new(DefaultDialerClient::new(

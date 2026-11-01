@@ -420,7 +420,7 @@ async fn handle_accepted_stream<S>(
     } else if let Some(tc) = tls {
         // Go hub.go:553-556 `gotls.NewListener`
         // bd rjzw2：TLS accept 耗时 ≈ 1 RTT（ServerHello→Finished）+ 毫秒级 CPU
-        // —— 服务端 RTT 探针，喂 h2 阶梯定窗（明文分支无信号，回落静态保底）。
+        // —— 服务端 RTT 探针。阶梯已撤：该值**只进定窗日志**（flow_window 模块头）。
         let started = xray_frame::compat::clock().now_instant();
         if let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tc).accept(stream).await {
             let rtt_hint = started.elapsed();
@@ -518,7 +518,7 @@ async fn drive_serve_guarded(
 /// （`protocols.SetHTTP1(true)` + `SetUnencryptedHTTP2(true)` 的 http.Server）。
 ///
 /// `rtt_hint`：bd rjzw2 服务端 RTT 探针结果（TLS/REALITY accept 耗时；明文
-/// 分支 None）——h2 SETTINGS 初窗按 RTT 阶梯自适应，保底 = 原静态值。
+/// 分支 None）——**只进定窗日志**，h2 窗组恒为静态保底（阶梯已撤）。
 async fn serve_http_conn<S>(
     stream: S,
     peer: SocketAddr,
@@ -546,8 +546,7 @@ async fn serve_http_conn<S>(
     // builder 由 async move 块持有：serve_connection 借用 &self，装箱 future
     // 生命周期超出本函数栈帧。
     let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-        // bd rjzw2：h2 三参数改由 RTT 阶梯驱动（低 RTT 缩 send_buf 削缓冲占用；
-        // 保底 = 下方原静态值，探针失败/高 RTT 档行为与现状完全一致）。
+        // bd rjzw2：三参数 = 静态保底（阶梯已撤；rtt_hint 只进定窗日志）。
         let win = crate::flow_window::server_windows_from_rtt(rtt_hint);
         let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
         builder
@@ -574,7 +573,7 @@ async fn serve_http_conn<S>(
             // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
             // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
             // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
-            // bd rjzw2：值改由 RTT 阶梯驱动，保底 = 16MB/32MB。
+            // bd rjzw2：值 = 静态保底 16MB/32MB（RTT 阶梯已撤）。
             .initial_stream_window_size(win.stream_window)
             .initial_connection_window_size(win.connection_window)
             // 票 2xgln：对端并发流上限（Go net/http h2 缺省 250）。h2 侧据此
@@ -755,7 +754,7 @@ async fn serve_reality_conn<S>(
     use xray_reality::server::{RealityServerOutcome, server_tls};
 
     // bd rjzw2：REALITY 握手同为 TLS 1.3 往返（≈1 RTT + 认证/HMAC 毫秒级）
-    // —— 服务端 RTT 探针，喂 h2 阶梯定窗。
+    // —— 服务端 RTT 探针。阶梯已撤：该值只进定窗日志。
     let started = xray_frame::compat::clock().now_instant();
     // bd tce2：serverAcceptor="btls" 走 BoringSSL 握手（含 26zn 后握手记录
     // 模仿消费）；默认 rustls 路径行为不变。

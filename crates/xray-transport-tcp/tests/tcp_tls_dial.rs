@@ -136,3 +136,43 @@ async fn tcp_plus_tls_with_fingerprint_uses_btls() {
     let n = conn.read(&mut got).await.expect("btls echo read 应成功");
     assert_eq!(&got[..n], b"hello-over-btls");
 }
+
+/// 未配 fingerprint 时也必须发 Chrome uTLS hello（bd qscjv）。
+///
+/// Go `GetFingerprint("")` = `HelloChrome_Auto`：缺省配置的 ClientHello 带 GREASE +
+/// X25519MLKEM768 等扩展，约 1.5-1.8 KB。改动前 Rust 缺省走 rustls 原生 hello（252 B、
+/// 无 GREASE），长度即暴露实现——本测试只抓首 record 长度，长度塌回三位数即回归。
+#[tokio::test]
+async fn tcp_tls_without_fingerprint_sends_chrome_hello() {
+    ensure_crypto_provider();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：抓 ClientHello 的裸 TCP 监听端")]
+    let capture = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut head = [0u8; 5];
+        sock.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], 0x16, "首 record 应是 handshake，实际 {}", head[0]);
+        let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+        let mut body = vec![0u8; len];
+        sock.read_exact(&mut body).await.unwrap();
+        len
+    });
+
+    let _ = xray_transport_tcp::register::register_dialer();
+    // 无 fingerprint 字段（= Go 缺省 GetFingerprint("") 场景）
+    let mut settings = StreamSettings::tcp();
+    settings.security = "tls".to_string();
+    settings.security_json =
+        Some(serde_json::json!({"allowInsecure": true, "serverName": "localhost"}));
+    let dest = Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(addr.port()));
+    // 对端不回应 ServerHello → 握手必失败，这里只关心客户端发出的字节。
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        dial_with_settings("tcp", &dest, &SocketOptions::default(), &settings),
+    )
+    .await;
+
+    let len = capture.await.expect("ClientHello 抓取任务不应 panic");
+    assert!(len > 1000, "未配 fingerprint 的 ClientHello 应 > 1000B（Chrome 模板），实际 {len}B");
+}

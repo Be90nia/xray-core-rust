@@ -211,14 +211,66 @@ jobs:
           & "$env:RUNNER_TEMP\protoc\bin\protoc.exe" --version
       - run: cargo test -p xray-proxy-tun --all-targets
 
-  # bd c4ueq：Go/Rust 入站解析器差分对拍门——同一原始字节流打 Go v26.9.9（官方
-  # release 二进制，tag + sha256 双钉死）与本仓 Rust 的 mixed 入站，比接受/拒绝、
-  # 响应字节（HTTP 侧剥 Date）与连接关闭方式三维判据；allowlist 外任何差异即红
-  # （已知残留差异逐条带理由显式放行，不静默绿）。协议语义漂移自动发现。
+  # bd 1gkcf：DKD-TPROXY 语义锚要真跑「特权分支」。
+  # crates/xray-proxy-dokodemo/tests/plugin_contract.rs 的
+  # tproxy_gate_is_runtime_semantics_not_compiled_away 在 Linux 有两种合法态：
+  #   非特权 → fake_udp 返回 PermissionDenied（setsockopt IP_TRANSPARENT 被拒）
+  #   特权（root + CAP_NET_ADMIN）→ fake_udp 成功，且必须在**当前 tokio reactor** 内可收发
+  # 现役 Test job 是非特权的（永远走 EPERM 那一支）——特权支路一旦回归（波4 G9 前的
+  # 裸 #[test] 越界到 from_std → "no reactor running" panic）CI 依然是绿的（假绿）。
+  # 本 job 用 sudo 跑同一条测试：hosted runner 是整机 VM，root 保有 CAP_NET_ADMIN，
+  # 因此不需要 docker——容器默认丢 CAP_NET_ADMIN，那才必须 `--privileged -v /dev/net/tun`。
+  # 该测试打的是 IP_TRANSPARENT **UDP** socket，不打开 /dev/net/tun，故不挂 tun 设备。
+  # 前置探针显式断言能力在场：能力缺失时 job 红，而不是静默退化成非特权假绿。
+  test-linux-privileged-tproxy:
+    name: Test (linux, privileged tproxy gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@stable
+      # 独立 prefix-key：不与其他 job 缓存互串
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: test-linux-priv-tproxy-v1
+          key: ${{ env.UDF_HEAD }}
+      # 依赖闭包含 xray-proto(prost-build)，构建需要 protoc
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z），与 test/clippy 同源配方；
+      # 顺序须在 rust-cache 之后（action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
+      # 能力探针：IP_TRANSPARENT(19) 的 setsockopt 需要 CAP_NET_ADMIN，缺则 job 红
+      - name: Preflight — CAP_NET_ADMIN (IP_TRANSPARENT)
+        run: |
+          sudo python3 - <<'PY'
+          import socket, sys
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          try:
+              s.setsockopt(socket.IPPROTO_IP, 19, 1)  # IP_TRANSPARENT
+          except OSError as e:
+              sys.exit("::error::root 缺 CAP_NET_ADMIN（IP_TRANSPARENT: %s）——特权 job 会退化成非特权假绿" % e)
+          print("CAP_NET_ADMIN 可用：IP_TRANSPARENT setsockopt 成功")
+          PY
+      # 只跑这一条：整文件在特权下会连带跑其它契约夹具，超出本票要验证的语义锚
+      - name: Run tproxy gate as root (privileged branch)
+        run: >
+          sudo --preserve-env=PATH,RUSTUP_HOME,CARGO_HOME,RUST_MIN_STACK
+          cargo test -p xray-proxy-dokodemo --test plugin_contract
+          tproxy_gate_is_runtime_semantics_not_compiled_away -- --exact --nocapture
+
+  # bd c4ueq：Go/Rust 入站解析器差分对拍门——同一原始字节流打 Go「裁定基准」与
+  # 本仓 Rust 的 mixed 入站，比接受/拒绝、响应字节（HTTP 侧剥 Date）与连接关闭方式
+  # 三维判据；allowlist 外任何差异即红（已知残留差异逐条带理由显式放行，不静默绿）。
+  # 协议语义漂移自动发现。
+  # 基准版本不再写在本 job：统一由 ./.github/actions/fetch-go-baseline 提供
+  # （bd t3wtj：基准 = v26.10.17 的 commit，上游无该版本 release asset，故按 commit 构建）。
   # harness：dist/parser_parity/parity.py（母本 reports/audit-2026-10-29/tmp/），
   # 确定性 = 127.0.0.1 固定高位端口 + 源站为本地 python（origin.py）+ 零外网依赖。
   parser-parity:
-    name: Parser Parity (Go v26.9.9 vs Rust)
+    name: Parser Parity (Go ruling baseline vs Rust)
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -239,25 +291,15 @@ jobs:
       - uses: ./.github/actions/setup-boringssl
       - name: Build Rust xray (debug)
         run: cargo build -p xray-cli --bin xray
-      # Go 参照：官方 release（interop.yml 同配方）；对拍门参照须逐字节确定，
-      # 故在 tag 之上再加官方 API digest 校验。21MB 下载秒级，不做缓存。
-      - name: Download Go reference (Xray-core v26.9.9, sha256-pinned)
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/xray-go.zip \
-            https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip
-          echo "1eb9175d0f0a8f8149c9230a7fc5ae66ce332ed20a53155ce61fe62e3f58b7df  /tmp/xray-go.zip" | sha256sum -c -
-          mkdir -p /tmp/xray-go
-          unzip -o /tmp/xray-go.zip -d /tmp/xray-go xray
-          chmod +x /tmp/xray-go/xray
-          /tmp/xray-go/xray version
+      # Go 参照 = 裁定基准（版本/commit 只在本 action 里出现一次，bd t3wtj）
+      - uses: ./.github/actions/fetch-go-baseline
       - name: Parser parity matrix (HTTP 38 + SOCKS5 19)
         env:
           # debug Rust 服务端任务同样吃线程栈（bd k2hf7 同族），env 会继承进 xray 进程
           RUST_MIN_STACK: 16777216
         run: >-
           python3 dist/parser_parity/parity.py
-          --go-bin /tmp/xray-go/xray
+          --go-bin "$GO_BASELINE_BIN"
           --rust-bin target/debug/xray
       - name: Upload parity evidence on failure
         if: failure()

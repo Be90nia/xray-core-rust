@@ -227,7 +227,7 @@ impl HubListener {
                 // bd wz2b S2：与 transport.rs serve_http_conn 同款 h2 显式流控——
                 // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
                 // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
-                // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取服务端阶梯保底
+                // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取静态保底
                 // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
                 // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES` / `XRAY_H2_RTT_HINT_MS`）
                 // 与 serve_http_conn 同源生效。不探针。
@@ -246,7 +246,7 @@ impl HubListener {
 
 #[cfg(test)]
 mod tests {
-    /// bd xzg3x：明文/unix `serve` 取窗 = 服务端阶梯保底（无握手 → 无 RTT 信号，
+    /// bd xzg3x：明文/unix `serve` 取窗 = 服务端静态保底（无握手 → 无 RTT 信号，
     /// 不探针）；未设 bench env 时逐值等于修前硬编码。削弱任一值必红。
     #[test]
     fn plaintext_serve_windows_equal_pre_fix_static() {

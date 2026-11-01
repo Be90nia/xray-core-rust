@@ -5,8 +5,14 @@ name: Interop
 
 on:
   workflow_dispatch:
+  # bd 0m0f6：真二进制互通门必须进 PR 路径（此前只有 push 分支）
+  pull_request:
+    branches: [main, master]
   push:
     branches: [master, main, dev, 'feature/**']
+  schedule:
+    # nightly 03:17 UTC（避开整点排队高峰）：32/32 真机矩阵只在定时跑，见 full32 job
+    - cron: '17 3 * * *'
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,27 +85,27 @@ jobs:
       - name: Build release binary
         run: cargo build --release --bin xray
 
-      # Go 基线 = 官方 release 二进制 (禁 git clone 全仓构建)
-      - name: Download Go baseline (xray-core v26.9.9)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$RUNNER_OS:$(uname -m)" in
-            macOS:arm64)   asset=Xray-macos-arm64-v8a.zip ;;
-            macOS:x86_64)  asset=Xray-macos-64.zip ;;
-            Linux:x86_64)  asset=Xray-linux-64.zip ;;
-            Linux:aarch64) asset=Xray-linux-arm64-v8a.zip ;;
-            *) echo "unsupported platform: $RUNNER_OS $(uname -m)"; exit 1 ;;
-          esac
-          curl -fsSL -o /tmp/xray-go.zip \
-            "https://github.com/XTLS/Xray-core/releases/download/v26.9.9/$asset"
-          mkdir -p tools/xray-go
-          unzip -o /tmp/xray-go.zip -d tools/xray-go xray
-          chmod +x tools/xray-go/xray
-          tools/xray-go/xray version
+      # Go 基线 = 裁定基准（版本/commit 只在 ./.github/actions/fetch-go-baseline 出现一次，
+      # bd t3wtj）。历史上这里逐 OS 拼 release asset 名——基准版本 26.10.17 上游没有发布
+      # 二进制，改用「按 commit 取源码构建」后各平台配方天然统一，asset 映射表整段删除。
+      - uses: ./.github/actions/fetch-go-baseline
 
       - name: Interop tests (Rust<->Rust 12 + Go->Rust 12 + Rust->Go 12 + extra 18 = 54, Go 不支持的方向 runtime 探测自动跳过)
-        run: python3 dist/interop_ci.py --rust target/release/xray --go tools/xray-go/xray
+        run: python3 dist/interop_ci.py --rust target/release/xray --go "$GO_BASELINE_BIN"
+
+      # bd 0m0f6：UDP 隧道字节级验收（bd t0ls1 正式验收门）——全环回无外网，PR 可跑。
+      # 端口段 29051-29056 与上面 18100+ 不冲突。只在 Linux 腿跑一次（跨平台冗余，省 macOS 时长）。
+      # PR 门取「快速 + 避开已知红面」子集：dest=443 的 cone=on 组合在本仓与 go↔go 对照组
+      # 同时失败（harness/Go 口径面，非本仓缺陷），故 --dest-ports 只留 53/29090；
+      # 四方向全量在 nightly（full32 job）跑，PR 面只要 Rust→Go 的字节级证明。
+      - name: UDP tunnel interop (vless/vmess/trojan rust→go，逐字节；PR 子集)
+        if: runner.os == 'Linux'
+        run: >-
+          python3 dist/interop_udp_tunnel.py
+          --rust target/release/xray
+          --go "$GO_BASELINE_BIN"
+          --quick
+          --dest-ports 53,29090
 
       - name: Upload logs on failure
         if: failure()
@@ -107,4 +113,100 @@ jobs:
         with:
           name: interop-logs-${{ matrix.os }}
           path: target/interop_ci/
+          if-no-files-found: ignore
+
+  # bd 0m0f6：32/32 真机矩阵（dist/run_full32.py）**不进 PR/push 路径**——它连真实节点、
+  # 需要节点表（红线：节点表不入仓），作为合入门会天天误红。这里改为 nightly 定时 +
+  # 手动触发；节点表由 secret FULL32_URI_FILE 提供，secret 缺失时各步条件退出 →
+  # job 仍是 success（干净 skip，不是失败），无 secret 的 fork 也不会红。
+  full32:
+    name: Full 32-node matrix (nightly / manual)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需要）
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.UDF_HEAD }}
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - uses: ./.github/actions/setup-boringssl
+      - name: Raise rmem_max for SO_RCVBUF defaults
+        run: sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+
+      - name: Materialize node list from secret
+        id: nodes
+        env:
+          URI_FILE: ${{ secrets.FULL32_URI_FILE }}
+        run: |
+          if [ -z "${URI_FILE}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::secret FULL32_URI_FILE 未配置 → 跳过 32/32 真机矩阵（干净 skip，非失败）"
+            exit 0
+          fi
+          printf '%s\n' "${URI_FILE}" > "$RUNNER_TEMP/nodes.txt"
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          echo "节点表非空行: $(grep -c . "$RUNNER_TEMP/nodes.txt" || true)"
+
+      - name: Build release binary
+        run: cargo build --release -p xray-cli --bin xray
+
+      # Go 基准（同 t3wtj 单点常量）；UDP 隧道四方向矩阵要靠它跑 Go 腿
+      - uses: ./.github/actions/fetch-go-baseline
+
+      # 四方向全量 UDP 隧道矩阵（PR 面只跑 rust→go 快速子集）：dest=443 的 cone=on 组合
+      # 是已知红面（go↔go 对照同样失败 → harness/Go 口径），故 --dest-ports 排除它。
+      - name: UDP tunnel interop matrix (4 directions, byte-level)
+        run: >-
+          python3 dist/interop_udp_tunnel.py
+          --rust target/release/xray
+          --go "$GO_BASELINE_BIN"
+          --dest-ports 53,29090
+          --out "$RUNNER_TEMP/udp_tunnel.json"
+
+      - name: Upload UDP matrix evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp-tunnel-json
+          path: ${{ runner.temp }}/udp_tunnel.json
+          if-no-files-found: ignore
+
+      # 节点表来自 secret，落盘只在 runner 临时目录；--work 也放 RUNNER_TEMP，避免污染工作树。
+      # run_full32.py 自身恒 exit 0（它只打印/落盘），判据必须由门从它的汇总行取：
+      # 任一 FAIL/PARSE 或 PASS 数不足 = 红，否则 nightly 会「永远绿」（静默失败）。
+      - name: Full 32-node matrix
+        if: steps.nodes.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          python3 dist/run_full32.py \
+            --bin target/release/xray \
+            --uri-file "$RUNNER_TEMP/nodes.txt" \
+            --work "$RUNNER_TEMP/full32" | tee "$RUNNER_TEMP/full32.log"
+          python3 - "$RUNNER_TEMP/full32.log" <<'PY'
+          import re, sys
+          txt = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+          m = re.search(r"=== (\d+)/(\d+) PASS\s+(\d+) FAIL\s+(\d+) PARSE ===", txt)
+          if not m:
+              sys.exit("::error::32/32 汇总行缺失——脚本未正常跑完")
+          ok, total, fail, parse = map(int, m.groups())
+          print("32 节点矩阵: %d/%d PASS, %d FAIL, %d PARSE" % (ok, total, fail, parse))
+          if fail or parse or ok != total:
+              sys.exit("::error::32/32 真机矩阵存在失败用例（明细见 full32-log 工件）")
+          PY
+
+      - name: Upload matrix log on failure
+        if: failure() && steps.nodes.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: full32-log
+          path: ${{ runner.temp }}/full32/f_results.txt
           if-no-files-found: ignore

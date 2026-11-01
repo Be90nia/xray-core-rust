@@ -75,6 +75,21 @@ jobs:
       - name: Prepare ASM boringssl (Windows)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         uses: ./.github/actions/setup-boringssl-asm
+      # bd jyipl + qscjv：**所有发布产物必须带汇编 BoringSSL，这不是优化项**。
+      # qscjv 后缺省 TLS（用户不配 fingerprint）也走 btls（Chrome uTLS hello，
+      # xray-transport-tcp/register.rs 缺省对齐 Go）——产物若 NO_ASM，**全体缺省
+      # TLS 用户从 ~241 MB/s 掉到 ~31.6 MB/s（7.6×，bd jyipl 实测）= 发版级事故**。
+      # 三层防线：
+      #   Windows（btls-sys 的 build.rs 在 windows host 无条件 OPENSSL_NO_ASM=YES，
+      #   上游 build/main.rs:315-318 原注释 "not set up for cross-compiling using
+      #   Visual Studio"）→ 唯一正解 = 上面的 setup-boringssl-asm 预构建带汇编库
+      #   （NASM 缺失/编不出都 hard-fail，产不出不发版）；
+      #   Linux/macOS/musl（非 windows host，btls-sys 不设 NO_ASM）→ cmake 默认带
+      #   汇编（走 perl→GAS/.S，NASM 并非其消费者，装它只为对齐配方与兜后手）；
+      #   构建后「Verify assembly BoringSSL」门逐靶断言（见 Build release 之后）。
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - name: Install protoc
         shell: pwsh
         run: |
@@ -118,6 +133,76 @@ jobs:
       - name: Build release
         if: matrix.target != 'x86_64-unknown-linux-musl'
         run: cargo build --release -p xray-cli --target ${{ matrix.target }}
+
+      # ── 产物汇编门（逐靶，红即不发版）────────────────────────────────────
+      # Windows：btls-sys 走预构建路线（跳过 cmake），本仓没有可查的 CMakeCache →
+      #   断言 BORING_BSSL_PATH 已导出、预构建库齐全，并复跑 tools/
+      #   build_boringssl_asm.py --check（其判据 = 自产 CMakeCache 无
+      #   OPENSSL_NO_ASM + CMAKE_ASM_NASM_COMPILER_WORKS=1 + crypto.lib 体量）。
+      # 非 Windows：btls-sys 走 cmake，判据直接取它的 build/out/build/CMakeCache.txt
+      #   ——里面**不得出现 OPENSSL_NO_ASM**（本机 NO_ASM 时代的 11 个 btls-sys-* 残留
+      #   目录实证：NO_ASM 时 cache 恒有 `OPENSSL_NO_ASM:INTERNAL=YES`；asm 开时该键
+      #   根本不进 cache）。setup-boringssl 每次清残留目录 → 命中的是本次构建。
+      #   取 mtime 最新一份（ls -t），防旧缓存串扰。
+      # musl(zig) / 交叉 apple 靶同门：工具链若哪天编不出汇编，这里红——宁红不发慢库。
+      - name: Verify assembly BoringSSL (artifact gate)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            [ -n "${BORING_BSSL_PATH:-}" ] || { echo "::error::BORING_BSSL_PATH 未导出——btls-sys 将退回 cmake→OPENSSL_NO_ASM=YES 慢库（31.6 vs 241.2 MB/s，bd jyipl）"; exit 1; }
+            for f in crypto.lib ssl.lib include/openssl/ssl.h; do
+              [ -e "$BORING_BSSL_PATH/$f" ] || { echo "::error::汇编预构建库缺 $f"; exit 1; }
+            done
+            python3 tools/build_boringssl_asm.py --check --src "$BORING_BSSL_SOURCE_PATH" --dest "$BORING_BSSL_PATH"
+          else
+            cache="$(ls -t "target/${{ matrix.target }}"/release/build/btls-sys-*/out/build/CMakeCache.txt 2>/dev/null | sed -n 1p || true)"
+            if [ -z "$cache" ]; then
+              echo "::error::未找到 btls-sys 的 CMakeCache——cmake 路线没跑，无法证明汇编在"
+              exit 1
+            fi
+            echo "体检对象: $cache"
+            if grep -q 'OPENSSL_NO_ASM' "$cache"; then
+              echo "::error::CMakeCache 含 OPENSSL_NO_ASM → 汇编被关（NO_ASM 慢库，见 bd jyipl）"
+              exit 1
+            fi
+            echo "[ok] CMakeCache 无 OPENSSL_NO_ASM（汇编开）"
+          fi
+
+      # bd 3t30l：发布产物此前「只构建、零测试」——发出去的二进制从未在任何门里跑过。
+      # 这里用 hermetic（全环回 + 脚本内 local upstream，无外网、无 Go 基线、无真实节点）
+      # 的 rust-only 互通套件当场验证**刚构建出的产物**：12 例 Rust<->Rust（同配双轮，
+      # 覆盖 vmess / vless-vision-tls / trojan / ws / ss / ss2022 主协议）。Linux 与
+      # Windows 产物跑同一套 → 两侧对等性有实测证据，而非「同一次构建」的推断。
+      # 32/32 真机矩阵属 nightly（interop.yml 的 full32 job），release 门不重复。
+      # 跳过 x86_64-apple-darwin：它是 macOS arm64 runner 交叉编出的 x86_64 产物，能否
+      # 执行取决于 runner 上的 Rosetta——不把基础设施运气当发布门。
+      - name: Ensure openssl on PATH (Windows smoke)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          if (Get-Command openssl -ErrorAction SilentlyContinue) { openssl version; exit 0 }
+          $gitOpenssl = "$env:ProgramFiles\Git\usr\bin"
+          if (-not (Test-Path "$gitOpenssl\openssl.exe")) {
+            throw "openssl 不可用：release 互通冒烟需要它生成 TLS 证书"
+          }
+          echo "$gitOpenssl" | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$gitOpenssl\openssl.exe" version
+      - name: Hermetic interop smoke (built artifact, rust-only, local upstream)
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          # 预热：刚编出的 50MB 产物首次执行会吃满磁盘/杀软首扫（本机实测冷启 >15s，
+          # harness 的 client 就绪窗正好 15s → 第 1 例假红）。预热后连跑 12/12 全绿；
+          # 顺带把版本行打进日志（产物可执行 = 第一个证据）。
+          "$bin" version
+          python3 dist/interop_ci.py \
+            --rust "$bin" \
+            --suites rust \
+            --upstream local \
+            --work "$RUNNER_TEMP/interop_release"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -137,7 +222,7 @@ jobs:
         with:
           path: artifacts
       # 四平台二进制同叫 xray/xray.exe，artifacts/** 直接上传会同名互相覆盖
-      # （v26.9.9 首发实锤只剩 2 个文件）——先拍平重命名为 artifact 名。
+      # （首发实锤只剩 2 个文件）——先拍平重命名为 artifact 名。
       # 必须先清空 dist/：仓库里 dist/ 还入库了 interop 脚本（interop_*.py /
       # run_all.py / uriclient.py，interop.yml 在用），package_release.py 会给
       # dist/ 里每个文件都打 zip+dgst，`files: dist/**` 再全量上传 —— v26.10.11-rust.1

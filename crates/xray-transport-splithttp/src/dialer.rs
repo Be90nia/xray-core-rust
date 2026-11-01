@@ -624,8 +624,8 @@ pub async fn dial_h3(
 /// - `base_uri`: 完整 URL
 /// - `session_id`: uuid 字符串（stream-one 时为空）
 /// - `config`: splithttp 配置（构造 RequestMeta）
-/// - `rtt_hint`: bd rjzw2 RTT 探针结果（调用方计时真实 `dial_system` connect）， 喂 h2
-///   阶梯定窗；`None` 回落静态保底（见 `flow_window` 模块）
+/// - `rtt_hint`: bd rjzw2 RTT 探针结果（调用方计时真实 `dial_system` connect），**只进
+///   定窗日志**：h2 窗组恒为静态保底（阶梯已撤，见 `flow_window` 模块头）
 ///
 /// # Errors
 ///
@@ -655,7 +655,7 @@ where
     // 上行 1MB→16MB 与服务端对称（bd wz2b：服务端收窗放大后 send buf 成次级钉，
     // 4MB/RTT@169ms≈23.7MB/s < 25 判据）。
     let mut builder = http2::Builder::new(TokioExecutor::new());
-    // bd rjzw2：三参数改由 RTT 阶梯驱动（保底 = 下方原静态值）。
+    // bd rjzw2：三参数 = 静态保底（RTT 阶梯已撤，见 flow_window 模块头）。
     let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
     builder
         .timer(hyper_util::rt::TokioTimer::new())

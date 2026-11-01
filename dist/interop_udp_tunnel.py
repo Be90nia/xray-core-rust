@@ -18,6 +18,7 @@
   python dist/interop_udp_tunnel.py                        # 全矩阵
   python dist/interop_udp_tunnel.py --quick                # 每协议一条（烟测）
   python dist/interop_udp_tunnel.py --only trojan
+  python dist/interop_udp_tunnel.py --dest-ports 53,29090   # 规避已知红的 cone=on/dest=443
   python dist/interop_udp_tunnel.py --rust <path> --go <path>
 """
 from __future__ import annotations
@@ -473,6 +474,9 @@ def main() -> int:
     ap.add_argument("--go", default=GO_DEFAULT)
     ap.add_argument("--only", default=None, help="vless|vmess|trojan|dokodemo|dns")
     ap.add_argument("--quick", action="store_true", help="每协议只跑 Rust→Go 一条")
+    ap.add_argument("--dest-ports", default="53,443,%d" % PORT_UP_OTHER,
+                    help="目标端口列表（逗号分隔）。dest=443 的 cone=on 组合是已知红面"
+                         "（go↔go 对照同样失败 → harness/Go 口径，非本仓缺陷），CI 用 53,29090")
     ap.add_argument("--out", default=os.path.join(TMP, "interop_udp_tunnel.json"))
     args = ap.parse_args()
 
@@ -489,7 +493,10 @@ def main() -> int:
     protos = ["vless", "vmess", "trojan"]
     if args.only and args.only in protos:
         protos = [args.only]
-    dest_ports = [53, 443, PORT_UP_OTHER]
+    dest_ports = [int(p) for p in args.dest_ports.split(",") if p.strip()]
+    if not dest_ports:
+        print("FATAL: --dest-ports 为空", file=sys.stderr)
+        return 2
 
     for proto in protos:
         for c, s in pairs:

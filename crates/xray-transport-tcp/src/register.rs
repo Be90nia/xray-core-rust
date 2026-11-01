@@ -95,7 +95,9 @@ async fn wrap_security(
     if settings.security == "reality" {
         return xray_reality::register::handshake_over(conn, settings).await;
     }
-    // security=tls：有 fingerprint 或 ECH 用 u_client（btls 真实指纹），否则标准 rustls。
+    // security=tls：恒走 `u_client`（btls 真实指纹）。Go `GetFingerprint("")` =
+    // `HelloChrome_Auto`——未配 fingerprint 也发 Chrome uTLS hello；此前 Rust 缺省落
+    // rustls 原生 hello（252B、无 GREASE），DPI 可一眼判定（bd qscjv）。
     let default_sni = dest.address().to_string();
     let sni = resolve_sni(settings, &default_sni);
     let config =
@@ -114,40 +116,23 @@ async fn wrap_security(
             let json = settings.security_json.clone().unwrap_or(serde_json::Value::Null);
             let ech_list = xray_tls::ech::parse_ech_config_list(&json);
             let ech = (!ech_list.is_empty()).then_some(ech_list.as_str());
-            if !fp_name.is_empty() {
-                let fp = xray_tls::fingerprint::get_fingerprint(fp_name)
-                    .map_err(|e| io::Error::other(format!("invalid fingerprint: {e}")))?;
-                let tls_conn = xray_tls::utls::u_client(
-                    conn,
-                    &sni,
-                    cfg,
-                    fp,
-                    ech,
-                    settings.security_json.as_ref(),
-                )
-                .await?;
-                Ok(Box::new(tls_conn))
-            } else if ech.is_some() {
-                // Go 端 ECH 不依赖 fingerprint（stdlib 原生）；Rust 端 ECH 仅 btls 可用，
-                // 未指定 fingerprint 时用默认 Chrome 指纹走 btls，保 ECH 生效。
-                tracing::warn!(
-                    target: "xray_transport_tcp",
-                    "ECH enabled without fingerprint; using default Chrome fingerprint via btls"
-                );
-                let tls_conn = xray_tls::utls::u_client(
-                    conn,
-                    &sni,
-                    cfg,
-                    xray_tls::fingerprint::Fingerprint::Chrome,
-                    ech,
-                    settings.security_json.as_ref(),
-                )
-                .await?;
-                Ok(Box::new(tls_conn))
-            } else {
-                let tls_conn = xray_tls::utls::client(conn, &sni, cfg).await?;
-                Ok(Box::new(tls_conn))
-            }
+            // 空串 → `Fingerprint::Chrome`（Go `GetFingerprint("")`）；清单外硬错。
+            let fp = xray_tls::fingerprint::get_fingerprint(fp_name)
+                .map_err(|e| io::Error::other(format!("invalid fingerprint: {e}")))?;
+            // ALPN 显式按配置重写（Go 也按 `tlsSettings.alpn` 发；缺省 ["h2","http/1.1"]），
+            // 否则 btls 会用模板 ALPN 忽略用户配置。
+            let alpn = cfg.alpn_protocols.clone();
+            let tls_conn = xray_tls::utls::u_client_with_alpn(
+                conn,
+                &sni,
+                cfg,
+                fp,
+                ech,
+                settings.security_json.as_ref(),
+                Some(&alpn),
+            )
+            .await?;
+            Ok(Box::new(tls_conn))
         },
         None => Ok(conn),
     }

@@ -395,10 +395,10 @@ impl DefaultDialerClient {
     /// `[h2, http/1.1]`（builder.rs:346）；用户 alpn 已在 register.rs
     /// decide_http_version 消费（本调用之前）。btls 分支不读
     /// config.alpn_protocols（指纹 ALPN 走模板/显式覆盖），不受影响。
-    /// `rtt_hint`：bd rjzw2 RTT 探针结果（TCP connect 计时，见
-    /// `flow_window` 模块）——h2 握手 SETTINGS 初窗按 RTT 阶梯自适应
-    /// （低 RTT 档缩窗削缓冲占用，高 RTT 档/探针失败回落静态保底，永不劣于
-    /// 现状）。h2 接收窗运行时不可调（无翻倍 API），只能握手前定。
+    /// `rtt_hint`：bd rjzw2 RTT 探针结果（TCP connect 计时，见 `flow_window` 模块）
+    /// ——**只进定窗日志**，不参与定窗：h2 窗组恒为静态保底（RTT 阶梯已撤，理由见
+    /// `flow_window` 模块头：探测 RTT ≠ 端到端 RTT，CDN 场景下缩 send_buf 即钉吞吐）。
+    /// h2 接收窗运行时不可调（无翻倍 API），只能握手前定。
     #[must_use]
     pub fn new(
         config: Arc<Config>,
@@ -447,7 +447,8 @@ impl DefaultDialerClient {
         // 1MB）——packet-up/stream-down 路径下载钉 2MB/RTT（169ms≈11.8MB/s）、上行钉
         // 1MB/RTT。32/32MB 流窗/连窗 + 16MiB send 与 stream-one dialer.rs 同批同值
         // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
-        // bd rjzw2：三参数改由 RTT 阶梯驱动（低 RTT 缩 send_buf 削缓冲，保底=原静态值）。
+        // bd rjzw2：三参数 = 静态保底（RTT 阶梯已撤，rtt_hint 只进日志；理由见
+        // flow_window 模块头）。
         let win = crate::flow_window::client_windows_from_rtt(rtt_hint);
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
@@ -891,8 +892,8 @@ mod tests {
     /// 链可调用；不 build 不拨号）：h2 初始流窗/连窗 32MB + 每流 send buf
     /// 16MiB（bd wz2b C2 上行钉 / bd c9oc F-A 在途平台钉，argo xhttp 增益）。
     /// 削弱常量 = 本测试红；builder 回退内联字面量 = 常量失引用，clippy dead_code 红。
-    /// bd rjzw2：常量语义变为「RTT 不可知时静态保底」——阶梯断言见
-    /// `h2_adaptive_windows_tier_by_rtt`。
+    /// bd rjzw2：这些常量现在恒为定窗结果（RTT 阶梯已撤）——不随 RTT 变见
+    /// `h2_windows_do_not_follow_rtt`。
     #[test]
     fn h2_window_pins_match_wz2b_c9oc() {
         assert_eq!(
@@ -916,26 +917,21 @@ mod tests {
             .http2_max_send_buf_size(crate::transport::H2_MAX_SEND_BUF_SIZE);
     }
 
-    /// bd rjzw2 防回档：RTT 阶梯定窗各档输出（含保底）——阶梯函数被旁路
-    /// （builder 回退常量直连）时低 RTT 档不再缩 send_buf = 缓冲占用验收失守，
-    /// 本测试红。流窗全档不缩（rjzw2 bench 实测：缩流窗钉吞吐）。
+    /// 撤阶梯防回档：任何 RTT 下 send_buf 都等于静态保底 16MiB、流窗保持 32MB。
+    /// 33bacd22 的 RTT 阶梯曾把 CDN 边缘 RTT（~30ms）当端到端 RTT 用，8MB send_buf
+    /// / 0.2s ≈ 40MB/s 直接成为吞吐上限（实测 35MB/s）；把阶梯复原 = 本测试红。
     #[test]
-    fn h2_adaptive_windows_tier_by_rtt() {
+    fn h2_windows_do_not_follow_rtt() {
         use std::time::Duration;
         let w = |rtt| crate::flow_window::client_windows_from_rtt(rtt);
         // None → 静态保底（永不劣于现状）。
         assert_eq!(w(None), crate::flow_window::CLIENT_FALLBACK);
-        // <40ms → send_buf 8MB，流窗 32MB 不动。
-        assert_eq!(
-            w(Some(Duration::from_millis(20))).max_send_buf,
-            8 * 1024 * 1024,
-            "低 RTT 档必须缩 send_buf（缓冲占用降验收），流窗不得缩（吞吐验收）"
-        );
-        assert_eq!(w(Some(Duration::from_millis(20))).stream_window, 32 * 1024 * 1024);
-        // 40-100ms → send_buf 12MB。
-        assert_eq!(w(Some(Duration::from_millis(80))).max_send_buf, 12 * 1024 * 1024);
-        // ≥100ms → 保底。
-        assert_eq!(w(Some(Duration::from_millis(120))), crate::flow_window::CLIENT_FALLBACK);
+        for ms in [1u64, 20, 39, 40, 80, 99, 100, 200] {
+            let win = w(Some(Duration::from_millis(ms)));
+            assert_eq!(win.max_send_buf, 16 * 1024 * 1024, "rtt={ms}ms 缩了 send_buf");
+            assert_eq!(win.stream_window, 32 * 1024 * 1024, "rtt={ms}ms 缩了流窗");
+            assert_eq!(win, crate::flow_window::CLIENT_FALLBACK, "rtt={ms}ms 窗组偏离保底");
+        }
     }
 
     /// 1f43481b 防回档：完整 TCP connector（[`DestTcpConnector`] =

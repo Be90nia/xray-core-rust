@@ -1,43 +1,39 @@
-//! bd rjzw2：h2 流控 RTT 自适应定窗（xhttp 客户端 + 服务端共用）。
+//! xhttp h2 窗组（客户端 + 服务端共用）：静态保底值 + 诊断 env 覆盖。
 //!
-//! 物理约束：单流吞吐 ≤ min(对端收窗, 本端 send_buf)/RTT；但 in-flight 不必静态
-//! 拉满——低 RTT 档大窗只堆 bufferbloat 不涨吞吐。h2 的接收窗仅在握手 SETTINGS 定
-//! 初值、运行时 auto-refill 不超初窗（hyper/h2 无运行时调接收窗 API，quic-go 式
-//! 「每 RTT 翻倍」不可复刻——已知局限），故落点 = 每连接握手前 RTT 探测定初窗。
+//! 物理约束：单流吞吐 ≤ min(对端收窗, 本端 send_buf)/RTT，其中 RTT 是**数据路径
+//! 的端到端 RTT**。h2 的接收窗只在握手 SETTINGS 定初值、运行时 auto-refill 不超初窗
+//! （hyper/h2 无运行时调接收窗 API——已知局限），故任何自适应都只能落在握手前的初值上。
 //!
-//! 探针（各自贴合所在层，不侵入协议逻辑）：
-//! - 客户端 rustls/btls 主路径：独立探测连接 TCP connect 计时 （SYN→SYN-ACK ≈ 1 RTT，先
-//!   `lookup_host` 再计时——DNS 不进 RTT）。
-//! - 客户端 REALITY 路径：直接计时真实 `dial_system` connect（零额外握手）。
-//! - 服务端 TLS/REALITY：accept 耗时 ≈ 1 RTT（ServerHello→Finished）+ 毫秒级 CPU，40ms
-//!   断点下偏差可容忍；明文/unix 分支无信号 → 保底。
+//! ## 为什么**不再**按 RTT 缩 send_buf（撤掉 bd rjzw2 的阶梯）
 //!
-//! 探针失败/RTT 不可知 → 回落静态保底（**逐值等于修前原静态值**，永不劣于现状）。
+//! 33bacd22 曾按探测 RTT 缩 send_buf：<40ms→8MB、40-99ms→12MB、≥100ms→16MB。
+//! 该优化的隐含前提是「探测 RTT = 端到端 RTT」，**在代理场景结构性不成立**：
 //!
-//! 自适应对象 = **send_buf**（per-stream 发送缓冲，hyper 实分配、bufferbloat 源头）；
-//! **流窗/连窗保持各端原静态值不动**——rjzw2 bench 实测（delay-proxy RTT20，override
-//! 扫描 8/12/16/24/26/28/30/32MB）：缩流窗 ≤26MB 吞吐掉 14-31%、28MB 起满速
-//! （211-216MB/s = 静态持平）——SETTINGS 窗是零预分配计数器、非真缓冲。
+//! - 客户端探针只测到「本机 → host」这一段（`probe_rtt` 建一条一次性 TCP 连接计时）。
+//! - host 是 CDN 域名时（生产 xhttp 入站走 CDN，mode=packet-up），这一段 ≈ **CDN 边缘 RTT**（实测
+//!   ~30ms），真实数据路径（客户端→CDN→源站）端到端 RTT ≈ 200ms。
+//! - 于是 send_buf 落 8MB 档，而吞吐上限 = send_buf / 端到端 RTT = 8MB / 0.2s ≈ 40MB/s ——实测被钉在
+//!   35MB/s（历史 50-60MB/s）。**这是把 probe 的 RTT 当成了 BDP 的 RTT**。
+//! - 探针无法区分「直连」与「CDN/中转/隧道」：同一个低 RTT 观测既可能是低延迟直连，
+//!   也可能是高延迟链路的薄边缘。= 该优化没有可判定的适用范围，故整体删除（Go 侧 本无此机制：Go
+//!   xray 的 h2 发送缓冲恒为静态值，本轮对齐 Go）。
 //!
-//! 阶梯断点数据来源：delay-proxy 实测（reports/audit-2026-10-29/rjzw2-h2-adaptive.md）：
-//! 20ms 档 in-flight ~3.2MB 即打满；80ms 档需 ~9.8MB、120ms 档需 ~11.1MB in-flight
-//! → send_buf 取「够喂饱该档 BDP」的最小档：8MB(<40ms) / 12MB(40-100ms) /
-//! 16MB(≥100ms 与探针失败 = 各端原静态 send_buf）。
+//! 现状：`max_send_buf` 恒等于各端静态保底（16MiB）；流窗/连窗亦保持各端原静态值
+//! （32/32MB 客户端、16/32MB 服务端）——rjzw2 bench 实测缩流窗 ≤26MB 吞吐掉 14-31%
+//! （SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
+//!
+//! ## RTT 探针为何保留
+//!
+//! 探针结果**只进定窗日志**（`h2_adaptive_window rtt_ms=`），不再参与定窗——排查「走上行
+//! 时探针看到的 RTT 与端到端差多少」仍靠它。诊断 env：`XRAY_H2_RTT_HINT_MS`（hint 优先
+//! 于探针，仅影响日志标签）、`XRAY_H2_FLOW_WINDOW_OVERRIDE_BYTES` /
+//! `XRAY_H2_SEND_BUF_OVERRIDE_BYTES`（强制流窗/send_buf，bench 扫曲线用）。三者未设置时
+//! 零影响。
 
 use std::time::Duration;
 
-/// RTT 阶梯下档断点：低于此 = 低延迟档，send_buf 缩到 8MB。
-const RTT_TIER_FAST_MS: u128 = 40;
-/// RTT 阶梯中档断点：低于此 = 中延迟档，send_buf 12MB；≥此值保持各端静态值。
-const RTT_TIER_MID_MS: u128 = 100;
-
-/// 低 RTT 档（rtt < 40ms）send_buf 8MB（BDP≈4.2MB×2 取整）。
-const TIER_FAST_SEND_BUF: usize = 8 * 1024 * 1024;
-/// 中 RTT 档（40ms ≤ rtt < 100ms）send_buf 12MB。
-const TIER_MID_SEND_BUF: usize = 12 * 1024 * 1024;
-
 /// 客户端静态保底 = bd wz2b C2 + c9oc F-A 修前原静态值（32MB 流窗 / 32MB 连窗 /
-/// 16MiB send buf），探针失败或 RTT ≥ 100ms 档逐值回此。
+/// 16MiB send buf）——现在**恒为**客户端定窗结果，不再随 RTT 变。
 pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
     stream_window: crate::transport::H2_INITIAL_STREAM_WINDOW,
     connection_window: crate::transport::H2_INITIAL_CONNECTION_WINDOW,
@@ -46,7 +42,7 @@ pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
 
 /// 服务端静态保底 = 修前 `serve_http_conn` 原静态值（16MB 流窗 / 32MB 连窗 /
 /// 16MiB send buf）——**不得用客户端常量**：客户端流窗 32MB 会把服务端原静态 16MB
-/// 抬到 32MB（保底被偷改 → 「现状静态 vs 自适应」对比基线失效）。
+/// 抬到 32MB（保底被偷改 → 「静态 vs 自适应」对比基线失效）。
 pub(crate) const SERVER_FALLBACK: H2Windows = H2Windows {
     stream_window: crate::transport::H2_SERVER_INITIAL_STREAM_WINDOW,
     connection_window: crate::transport::H2_SERVER_INITIAL_CONNECTION_WINDOW,
@@ -54,7 +50,7 @@ pub(crate) const SERVER_FALLBACK: H2Windows = H2Windows {
 };
 
 /// bench/诊断专用：强制流窗字节数（conn=2×、send=同值），进程级显式值驱动，
-/// 未设置零影响。bench 用它扫「窗-吞吐」曲线定阶梯断点。
+/// 未设置零影响。bench 用它扫「窗-吞吐」曲线。
 const ENV_OVERRIDE: &str = "XRAY_H2_FLOW_WINDOW_OVERRIDE_BYTES";
 
 /// bench/诊断专用：仅覆盖 send_buf（流窗保持），与 [`ENV_OVERRIDE`] 组合可
@@ -63,9 +59,8 @@ const ENV_SEND_OVERRIDE: &str = "XRAY_H2_SEND_BUF_OVERRIDE_BYTES";
 
 /// bench/诊断专用：强制 RTT hint（毫秒），**仅 bench/诊断用，生产默认不设**。
 ///
-/// 存在理由：connect() 探针在生产是对的（无中间盒时 ≈1 RTT），但 delay-proxy 挡在
-/// 探针之前时探针**结构上测不到注入 RTT**（SYN/ACK 走 loopback）→ 不注入则阶梯在
-/// bench 里无法验证。设了就绕过探针值直接喂阶梯；未设置 = 零影响（走真探针路径）。
+/// 撤阶梯后它只改定窗日志的 `rtt_ms` 标签（不再影响任何窗值）；保留是为不打断既有
+/// 诊断/bench 流程（设了即绕过探针，省一次 TCP 握手的探测开销）。
 const ENV_RTT_HINT_MS: &str = "XRAY_H2_RTT_HINT_MS";
 
 /// 一组 h2 握手期定死的流控参数（SETTINGS 初窗 + 每流发送缓冲）。
@@ -76,21 +71,24 @@ pub(crate) struct H2Windows {
     pub max_send_buf: usize,
 }
 
-/// 客户端 h2 窗组（阶梯驱动；保底 = [`CLIENT_FALLBACK`] = 修前原静态值）。
+/// 客户端 h2 窗组（恒 = [`CLIENT_FALLBACK`]；`rtt` 只进日志，不参与定窗）。
 pub(crate) fn client_windows_from_rtt(rtt: Option<Duration>) -> H2Windows {
     windows_for("client", CLIENT_FALLBACK, rtt)
 }
 
-/// 服务端 h2 窗组（阶梯驱动；保底 = [`SERVER_FALLBACK`] = 修前原静态值）。
+/// 服务端 h2 窗组（恒 = [`SERVER_FALLBACK`]；`rtt` 只进日志，不参与定窗）。
 pub(crate) fn server_windows_from_rtt(rtt: Option<Duration>) -> H2Windows {
     windows_for("server", SERVER_FALLBACK, rtt)
 }
 
-/// 阶梯定窗 + 定窗日志（唯一实现点；客户端/服务端共用，仅保底基不同）。
+/// 定窗 + 定窗日志（唯一实现点；客户端/服务端共用，仅保底基不同）。
+///
+/// 窗值 = 各端静态保底，**唯二**能改动它们的是诊断 env 覆盖
+/// （[`apply_env_overrides`]）。`rtt` 仅作日志标签——按 RTT 缩 send_buf 的错误见
+/// 模块头（CDN 边缘 RTT ≠ 端到端 RTT）。
 fn windows_for(role: &str, fallback: H2Windows, rtt: Option<Duration>) -> H2Windows {
     let effective = pick_rtt(rtt_hint_env(), rtt);
     let mut w = fallback;
-    w.max_send_buf = tier_send_buf(effective).unwrap_or(fallback.max_send_buf);
     apply_env_overrides(&mut w);
     crate::hot_log!(
         DEBUG,
@@ -109,18 +107,8 @@ pub(crate) fn rtt_hint_env() -> Option<Duration> {
     parse_rtt_hint(std::env::var(ENV_RTT_HINT_MS).ok().as_deref())
 }
 
-/// 纯阶梯：RTT → send_buf 档位（**不读全局 env**，单测逐值锁定）。
-///
-/// `None` = 「本档不缩」→ 保持各端静态 send_buf（探针失败 / RTT ≥ 100ms 档）。
-fn tier_send_buf(rtt: Option<Duration>) -> Option<usize> {
-    match rtt.map(|d| d.as_millis()) {
-        Some(ms) if ms < RTT_TIER_FAST_MS => Some(TIER_FAST_SEND_BUF),
-        Some(ms) if ms < RTT_TIER_MID_MS => Some(TIER_MID_SEND_BUF),
-        _ => None,
-    }
-}
-
 /// 有效 RTT = bench/诊断 hint 优先，否则用探针实测值（纯函数，单测锁优先级）。
+/// **只喂定窗日志**，不参与任何窗值计算。
 fn pick_rtt(hint: Option<Duration>, probed: Option<Duration>) -> Option<Duration> {
     hint.or(probed)
 }
@@ -211,22 +199,44 @@ mod tests {
     }
 
     #[test]
-    fn ladder_locks_send_buf_per_rtt() {
-        // 阶梯逐值锁定（bench 只是驱动手段，不是唯一证据）。
-        assert_eq!(tier_send_buf(None), None);
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(1))), Some(8 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(20))), Some(8 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(39))), Some(8 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(40))), Some(12 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(80))), Some(12 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(99))), Some(12 * 1024 * 1024));
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(100))), None);
-        assert_eq!(tier_send_buf(Some(Duration::from_millis(240))), None);
+    fn send_buf_is_rtt_independent() {
+        // 撤阶梯的钉子（33bacd22 曾按探测 RTT 缩 send_buf）：任何 RTT 下客户端/服务端
+        // send_buf 都必须等于静态保底 16MiB。理由见模块头——探针测的是「本机→host」
+        // 一段，CDN 场景下该值是边缘 RTT（~30ms），拿它裁端到端 BDP 会把吞吐钉在
+        // send_buf/端到端 RTT（8MB/0.2s ≈ 40MB/s）。改回阶梯 = 本测试红。
+        let rtts = [
+            None,
+            Some(Duration::from_millis(1)),
+            Some(Duration::from_millis(20)),
+            Some(Duration::from_millis(39)),
+            Some(Duration::from_millis(40)),
+            Some(Duration::from_millis(80)),
+            Some(Duration::from_millis(99)),
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(240)),
+            Some(Duration::from_secs(5)),
+        ];
+        for rtt in rtts {
+            let c = client_windows_from_rtt(rtt);
+            assert_eq!(
+                c.max_send_buf,
+                16 * 1024 * 1024,
+                "客户端 send_buf 随 RTT 变（rtt={rtt:?}）"
+            );
+            assert_eq!(c, CLIENT_FALLBACK, "客户端窗组随 RTT 变（rtt={rtt:?}）");
+            let s = server_windows_from_rtt(rtt);
+            assert_eq!(
+                s.max_send_buf,
+                16 * 1024 * 1024,
+                "服务端 send_buf 随 RTT 变（rtt={rtt:?}）"
+            );
+            assert_eq!(s, SERVER_FALLBACK, "服务端窗组随 RTT 变（rtt={rtt:?}）");
+        }
     }
 
     #[test]
-    fn tiers_keep_flow_windows_at_role_static() {
-        // 流窗/连窗各端原静态值不动（缩窗钉吞吐：rjzw2 bench 实测）。
+    fn flow_windows_do_not_follow_rtt() {
+        // 流窗/连窗各端原静态值不动（缩窗钉吞吐：rjzw2 bench 实测，与本票无关的红线）。
         for rtt in [None, Some(Duration::from_millis(20)), Some(Duration::from_millis(80))] {
             let c = client_windows_from_rtt(rtt);
             assert_eq!(c.stream_window, 32 * 1024 * 1024);
@@ -238,26 +248,8 @@ mod tests {
     }
 
     #[test]
-    fn low_rtt_tier_shrinks_only_send_buf() {
-        let c = client_windows_from_rtt(Some(Duration::from_millis(20)));
-        assert_eq!(c.max_send_buf, 8 * 1024 * 1024);
-        let s = server_windows_from_rtt(Some(Duration::from_millis(20)));
-        assert_eq!(s.max_send_buf, 8 * 1024 * 1024);
-        // 中档 12MB。
-        assert_eq!(
-            client_windows_from_rtt(Some(Duration::from_millis(80))).max_send_buf,
-            12 * 1024 * 1024
-        );
-        // ≥100ms 档 = 各端原静态 send_buf。
-        assert_eq!(
-            client_windows_from_rtt(Some(Duration::from_millis(120))).max_send_buf,
-            16 * 1024 * 1024
-        );
-    }
-
-    #[test]
     fn rtt_hint_parse_bounds() {
-        // 纯解析单测（不碰进程 env——libtest 并行下全局 env 改动会污染阶梯断言测试）。
+        // 纯解析单测（不碰进程 env——libtest 并行下全局 env 改动会污染窗组断言测试）。
         assert_eq!(parse_rtt_hint(Some("20")), Some(Duration::from_millis(20)));
         assert_eq!(parse_rtt_hint(Some(" 80 ")), Some(Duration::from_millis(80)));
         assert_eq!(parse_rtt_hint(Some("0")), None, "0ms 视为未设置");
@@ -310,7 +302,7 @@ mod tests {
 
     #[test]
     fn env_override_parse_bounds() {
-        // 纯解析单测（不碰进程 env——libtest 并行下全局 env 改动会污染阶梯断言测试）。
+        // 纯解析单测（不碰进程 env——libtest 并行下全局 env 改动会污染窗组断言测试）。
         assert_eq!(parse_override(Some("4194304")), Some(4 * 1024 * 1024));
         assert_eq!(parse_override(Some("1024")), Some(1024));
         assert_eq!(parse_override(Some("1023")), None, "低于 1KiB 视为未设置");
