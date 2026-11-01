@@ -95,9 +95,10 @@ jobs:
 
       # bd 0m0f6：UDP 隧道字节级验收（bd t0ls1 正式验收门）——全环回无外网，PR 可跑。
       # 端口段 29051-29056 与上面 18100+ 不冲突。只在 Linux 腿跑一次（跨平台冗余，省 macOS 时长）。
-      # PR 门取「快速 + 避开已知红面」子集：dest=443 的 cone=on 组合在本仓与 go↔go 对照组
-      # 同时失败（harness/Go 口径面，非本仓缺陷），故 --dest-ports 只留 53/29090；
-      # 四方向全量在 nightly（full32 job）跑，PR 面只要 Rust→Go 的字节级证明。
+      # PR 门取「快速 + 避开已知红面」子集：
+      #   · dest=443 的 cone=on 组合在本仓与 go↔go 对照组同时失败（harness/Go 口径面），排除；
+      #   · dest=53 需要 bind 1024 以下端口 → hosted runner 非 root 会 PermissionError(13)，
+      #     故 PR 面只跑 29090（高位端口）；DNS-53 形态在 nightly 用 sudo 跑。
       - name: UDP tunnel interop (vless/vmess/trojan rust→go，逐字节；PR 子集)
         if: runner.os == 'Linux'
         run: >-
@@ -105,7 +106,7 @@ jobs:
           --rust target/release/xray
           --go "$GO_BASELINE_BIN"
           --quick
-          --dest-ports 53,29090
+          --dest-ports 29090
 
       - name: Upload logs on failure
         if: failure()
@@ -162,11 +163,14 @@ jobs:
       # Go 基准（同 t3wtj 单点常量）；UDP 隧道四方向矩阵要靠它跑 Go 腿
       - uses: ./.github/actions/fetch-go-baseline
 
-      # 四方向全量 UDP 隧道矩阵（PR 面只跑 rust→go 快速子集）：dest=443 的 cone=on 组合
-      # 是已知红面（go↔go 对照同样失败 → harness/Go 口径），故 --dest-ports 排除它。
+      # 四方向全量 UDP 隧道矩阵（PR 面只跑 rust→go 快速子集）：
+      #   · dest=443 的 cone=on 组合是已知红面（go↔go 对照同样失败 → harness/Go 口径），排除；
+      #   · dest=53 要 bind 1024 以下端口，非 root 会 PermissionError(13) → 本步用 sudo 跑，
+      #     这也是唯一保留 DNS-53 形态的地方（PR 面非特权，只跑 29090）。
       - name: UDP tunnel interop matrix (4 directions, byte-level)
         run: >-
-          python3 dist/interop_udp_tunnel.py
+          sudo --preserve-env=HOME,PATH,RUNNER_TEMP
+          "$(command -v python3)" dist/interop_udp_tunnel.py
           --rust target/release/xray
           --go "$GO_BASELINE_BIN"
           --dest-ports 53,29090
