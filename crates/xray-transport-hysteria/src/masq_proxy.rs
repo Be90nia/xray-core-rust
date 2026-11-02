@@ -4,12 +4,12 @@
 //!
 //! | Go 行为 | 本实现 |
 //! |---|---|
-//! | `r.SetURL(u)`：出站 scheme/host 取 `MasqUrl`；path = `joinURLPath(MasqUrl.path, 入站 path)`；query = `MasqUrl.query` + "&" + 入站 query；`r.Out.Host = ""` | [`MasqTarget`] 解析 + [`join_url_path`] / [`join_query`] |
+//! | `r.SetURL(u)`：出站 scheme/host 取 `MasqUrl`；path = `joinURLPath(MasqUrl.path, 入站 path)`；query = `MasqUrl.query` + "&" + 入站 query；`r.Out.Host = ""` | [`MasqTarget`] 解析 + `join_url_path` / `join_query` |
 //! | `if !MasqUrlRewriteHost { r.Out.Host = r.In.Host }` | `rewrite_host=false`（**Go 默认**）→ Host 头保留**客户端原始 Host**；`true` → Host 头 = 上游 authority |
-//! | `MasqUrlInsecure`（仅 http/https）→ 上游 TLS `InsecureSkipVerify` | [`tls_connector`] 的 `insecure` 分支（跳过证书校验） |
-//! | Rewrite 前剥除客户端自带 `X-Forwarded-*` | [`strip_forwarded_headers`] |
-//! | hop-by-hop 头不转发（Go `ReverseProxy`） | [`HOP_BY_HOP`] |
-//! | `ErrorHandler` → `502 Bad Gateway` | [`proxy_bad_gateway`] |
+//! | `MasqUrlInsecure`（仅 http/https）→ 上游 TLS `InsecureSkipVerify` | `tls_connector` 的 `insecure` 分支（跳过证书校验） |
+//! | Rewrite 前剥除客户端自带 `X-Forwarded-*` | `strip_forwarded_headers` |
+//! | hop-by-hop 头不转发（Go `ReverseProxy`） | `HOP_BY_HOP` |
+//! | `ErrorHandler` → `502 Bad Gateway` | `proxy_bad_gateway` |
 //! | scheme `""`/`unix` → unix socket 上游 | 未实现：构造期报错（Rust 侧无 unix socket 上游面） |
 //!
 //! 未对齐（已知偏差，报告登记）：Go 的 `MasqUrlXForwarded`（本仓配置面无该字段）、

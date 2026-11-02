@@ -903,7 +903,7 @@ impl DispatchHandler for MuxBridge {
     /// （`access.from`）计算 XUDP GlobalID 随 New 帧下发，服务端按 GlobalID
     /// 复用 cone 会话。TCP/无源/非白名单入站走普通 dispatch。
     /// 入站白名单逐字对齐 Go（`xudp.go:69-70`，见
-    /// [`GO_CONE_INBOUND_WHITELIST`]；bd kol4a 起 relay 面接线 `from` +
+    /// `GO_CONE_INBOUND_WHITELIST`；bd kol4a 起 relay 面接线 `from` +
     /// `inbound_name`，白名单由本方法显式判定而非「from 非空」近似）。
     fn dispatch_with_access(
         &self,

@@ -165,7 +165,7 @@ impl XmuxConfig {
 /// - 传输层段 → 下载侧 StreamConfig 的原始 JSON（network/security/tlsSettings/
 ///   realitySettings/sockopt/finalmask），拨号时经
 ///   [`xray_transport::dialer::StreamSettings::from_json`] 转成既有承载类型
-/// - 拨号目标 → [`Destination`]（下载侧 address/port）
+/// - 拨号目标 → `Destination`（下载侧 address/port）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadSettings {
     /// 下载侧 splithttp 协议段（下载侧自己的 host/path/query/session id 表）。

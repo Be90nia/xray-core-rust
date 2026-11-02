@@ -208,7 +208,7 @@ impl OutboundRegistrar for RecordingOutboundRegistrar {
 /// 生产实现：dispatcher `SimpleOhm` 后端（对应 Go `ohm.RemoveHandler` +
 /// `ohm.AddHandler`，metrics.go:82-94）。
 ///
-/// `add` 把 [`Outbound`] 包成 [`MetricsDispatchHandler`] 注册进出站表——路由规则
+/// `add` 把 [`Outbound`] 包成 [`crate::outbound::MetricsDispatchHandler`] 注册进出站表——路由规则
 /// `outboundTag` 命中该 tag 的连接即被灌进 metrics HTTP server（Go
 /// outbound.go:66-84 Dispatch 语义）。`remove` 按 tag 注销（不存在 = no-op，
 /// 对齐 Go `RemoveHandler` 的容忍语义）。

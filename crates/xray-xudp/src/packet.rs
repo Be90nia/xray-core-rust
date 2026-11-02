@@ -183,7 +183,7 @@ impl FrameMetadata {
     /// 逐包调用时这两次都省不掉）。线格式与 [`Self::to_bytes`] 完全一致。
     ///
     /// 要求 `out` 剩余容量 ≥ 帧头全长（不足时 `write_from` 静默截断 → 畸形帧），
-    /// 调用方按 [`MAX_FRAME_OVERHEAD`](self::MAX_FRAME_OVERHEAD) 取池。
+    /// 调用方按 [`MAX_FRAME_OVERHEAD`] 取池。
     pub fn write_into_buffer(&self, out: &mut Buffer) {
         out.clear();
         // 占位 length(2B) + session_id(2B=0)
@@ -316,7 +316,7 @@ pub const MAX_FRAME_OVERHEAD: usize = 4 + 1 + 1 + 1 + 2 + 1 + 256 + 8;
 /// [`FrameMetadata::write_into_buffer`] 直写、载荷随后直写——配合调用方
 /// `Buffer::new_pooled` 借还，稳态每数据报 0 次堆分配。New/Keep 状态由调用方
 /// 跨包持有（`new_sent`：首次写发 New+GlobalID，其后 Keep），跳过语义同
-/// [`PacketWriter::write_packet`]（空载荷 / 超 [`MAX_DATA_LEN`] 静默返回）。
+/// [`PacketWriter::write_packet`]（空载荷 / 超 `MAX_DATA_LEN` 静默返回）。
 ///
 /// # Errors
 /// `frame` 剩余容量不足容纳整帧（调用方按 `MAX_FRAME_OVERHEAD + 2 + 载荷长`
