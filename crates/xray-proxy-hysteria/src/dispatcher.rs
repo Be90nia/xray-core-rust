@@ -30,7 +30,7 @@ use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
 
 use crate::{
     config::HysteriaConfig,
-    protocol::{Defragger, UdpMessage},
+    protocol::{Defragger, UdpMessage, parse_body},
 };
 
 /// 出站泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具链上
@@ -162,8 +162,7 @@ async fn pump_hysteria_udp(
         let mut df = Defragger::new();
         let global_id: [u8; GLOBAL_ID_LEN] = rand::random();
         let mut buf = vec![0u8; RECV_BUF_SIZE];
-        // 收发缓冲随 pump 持久化（clear + 复用容量），消每包 full/frame 两次分配
-        let mut full = Vec::with_capacity(4 + RECV_BUF_SIZE);
+        // 帧缓冲随 pump 持久化（clear + 复用容量），消每包一次堆分配
         let mut frame = Vec::with_capacity(RECV_BUF_SIZE + 64);
         loop {
             let n = match conn.read(&mut buf).await {
@@ -177,13 +176,40 @@ async fn pump_hysteria_udp(
                 break;
             }
             // UdpSessionManager 投递时已剥除 4B session id 信封（Go 由
-            // ParseUDPMessage 读出、本桥不消费）→ 前补哑元对齐 8B 头布局
-            full.clear();
-            full.extend_from_slice(&[0u8; 4]);
-            full.extend_from_slice(&buf[..n]);
+            // ParseUDPMessage 读出、本桥不消费）→ 直接就地解析消息体，
+            // 不再经「补 4B 哑元 + 拥有化 UdpMessage」中转（每包省 2 遍 memcpy）。
             // Go UDPReader.ReadFrom：解析/重组失败 continue 跳过
-            let Ok(msg) = UdpMessage::parse(&full) else {
+            let Ok(body) = parse_body(&buf[..n]) else {
                 continue;
+            };
+            if body.frag_count <= 1 {
+                // 非分片快路：载荷借用 buf，直接写回 XUDP 帧
+                // （Defragger::feed 对 frag_count<=1 是原样返回、不动状态 →
+                //  与走 feed 等价；分片路才需拥有化持有分片）。
+                let Some(source) = parse_udp_source(body.addr) else {
+                    continue;
+                };
+                // 回包帧来源 = UdpMessage.addr（与 freedom pump_response 同款 per-packet 帧）
+                frame.clear();
+                {
+                    let mut pw = PacketWriter::new(&mut frame, source, global_id);
+                    if pw.write_packet(body.data).is_err() {
+                        break;
+                    }
+                }
+                if wr.write_all(&frame).await.is_err() {
+                    break; // client 侧已关闭
+                }
+                continue;
+            }
+            // 分片路：重组需跨包持有分片 → 拥有化后进 Defragger
+            let msg = UdpMessage {
+                session_id: 0,
+                packet_id: body.packet_id,
+                frag_id: body.frag_id,
+                frag_count: body.frag_count,
+                addr: body.addr.to_string(),
+                data: body.data.to_vec(),
             };
             let Some(msg) = df.feed(msg) else {
                 continue;
@@ -191,7 +217,6 @@ async fn pump_hysteria_udp(
             let Some(source) = parse_udp_source(&msg.addr) else {
                 continue;
             };
-            // 回包帧来源 = UdpMessage.addr（与 freedom pump_response 同款 per-packet 帧）
             frame.clear();
             {
                 let mut pw = PacketWriter::new(&mut frame, source, global_id);
@@ -624,6 +649,101 @@ mod tests {
         assert_eq!(seen[1].1.addr, "alt.example.com:5353");
         assert_eq!(seen[1].1.data, b"query-2".as_slice());
     }
+
+    /// 从 UDP 桥接连接读出一个 XUDP 帧（回包方向）。
+    async fn read_one_xudp_frame<R: tokio::io::AsyncRead + Unpin>(
+        conn: &mut R,
+    ) -> xray_xudp::packet::PacketData {
+        let mut acc = Vec::new();
+        let mut buf = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let n = conn.read(&mut buf).await.expect("read from bridge");
+                assert!(n > 0, "unexpected EOF before echo frame");
+                acc.extend_from_slice(&buf[..n]);
+                let mut pr = PacketReader::new(std::io::Cursor::new(&acc));
+                if let Ok(Some(p)) = pr.read_packet() {
+                    break p;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for echo frame")
+    }
+
+    /// 多会话并发：两次 UDP dial 得到两条独立 session，回包不串台。
+    #[tokio::test]
+    async fn udp_two_concurrent_sessions_relay_independently() {
+        let (mock_conn, seen) = MockEchoConn::new();
+        let transport = MockTransport { conn: mock_conn };
+        let dial = make_hysteria_dial_fn(
+            HysteriaConfig::new("127.0.0.1:443", "secret"),
+            Arc::new(transport),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("hysteria")),
+        );
+        let a = Destination::new(Address::new_domain("a.example.com"), Port::new(53), Network::UDP);
+        let b = Destination::new(Address::new_domain("b.example.com"), Port::new(53), Network::UDP);
+        let mut conn_a = dial(&a).await.expect("udp dial a");
+        let mut conn_b = dial(&b).await.expect("udp dial b");
+
+        for (conn, dest, gid, payload) in [
+            (&mut conn_a, &a, [1u8; 8], b"aaa".as_slice()),
+            (&mut conn_b, &b, [2u8; 8], b"bbb".as_slice()),
+        ] {
+            let mut frames = Vec::new();
+            {
+                let mut pw = PacketWriter::new(&mut frames, dest.clone(), gid);
+                pw.write_packet(payload).unwrap();
+            }
+            conn.write_all(&frames).await.unwrap();
+        }
+
+        let fa = read_one_xudp_frame(&mut conn_a).await;
+        assert_eq!(fa.data(), b"aaa".as_slice(), "session A 只收回自己的帧");
+        assert_eq!(fa.udp_target(), Some(&a));
+        let fb = read_one_xudp_frame(&mut conn_b).await;
+        assert_eq!(fb.data(), b"bbb".as_slice(), "session B 只收回自己的帧");
+        assert_eq!(fb.udp_target(), Some(&b));
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "两条 session 各投递一个 datagram");
+        assert_eq!(seen[0].0, 1);
+        assert_eq!(seen[1].0, 2, "第二次 udp() 分配新 session id");
+    }
+
+    /// 空闲回收：会话超时 → InterConn 关闭 → 桥接 pump 收到 EOF/错误 → 调用方读端 EOF。
+    ///
+    /// 空闲清理 tick 1s，Go 允许的最小超时 2s → 最多 ~3s 回收。
+    #[tokio::test]
+    async fn udp_idle_timeout_reclaims_session_and_ends_bridge() {
+        let (mock_conn, _seen) = MockEchoConn::new();
+        let transport = MockTransport { conn: mock_conn };
+        let dial = make_hysteria_dial_fn(
+            HysteriaConfig::new("127.0.0.1:443", "secret").with_udp_idle_timeout(2),
+            Arc::new(transport),
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("hysteria")),
+        );
+        let target =
+            Destination::new(Address::new_domain("dns.example.com"), Port::new(53), Network::UDP);
+        let mut conn = dial(&target).await.expect("udp dial");
+
+        let mut frames = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frames, target.clone(), [7u8; 8]);
+            pw.write_packet(b"ping").unwrap();
+        }
+        conn.write_all(&frames).await.unwrap();
+        assert_eq!(read_one_xudp_frame(&mut conn).await.data(), b"ping".as_slice());
+
+        // 空闲 → 会话被回收 → 桥接结束 → 读端 EOF（Ok(0)，不是挂死）
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(15), conn.read(&mut buf))
+            .await
+            .expect("idle reclaim must surface within 15s")
+            .expect("bridge should end with EOF, not error");
+        assert_eq!(n, 0, "回收后调用方必须读到 EOF");
+    }
+
     /// 捕获 dial_and_authenticate 收到的 DialDestination（域名解析断言用）。
     struct CaptureTransport {
         conn: Arc<MockEchoConn>,

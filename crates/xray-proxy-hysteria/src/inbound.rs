@@ -497,8 +497,7 @@ async fn handle_udp_session(
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut df = Defragger::new();
     let mut buf = vec![0u8; 65535];
-    // 缓冲随会话持久化（clear + 复用容量）：full 挪哑元前缀、wire 序列化出站帧
-    let mut full = Vec::with_capacity(4 + buf.len());
+    // 缓冲随会话持久化（clear + 复用容量）：wire 序列化出站帧
     let mut wire: Vec<u8> = Vec::new();
     loop {
         tokio::select! {
@@ -508,13 +507,30 @@ async fn handle_udp_session(
                 if n == 0 {
                     break;
                 }
-                // feed 剥了 4B 信封 → 前补哑元对齐 UdpMessage 的 8B 头布局
-                full.clear();
-                full.extend_from_slice(&[0u8; 4]);
-                full.extend_from_slice(&buf[..n]);
+                // feed 剥了 4B 信封 → 直接就地解析消息体（不再经「补 4B 哑元 +
+                // 拥有化 UdpMessage」中转：每包省 2 遍 memcpy）。
                 // Go UDPReader.ReadFrom：解析/重组/地址解析失败 continue 跳过
-                let Ok(msg) = UdpMessage::parse(&full) else {
+                let Ok(body) = crate::protocol::parse_body(&buf[..n]) else {
                     continue;
+                };
+                if body.frag_count <= 1 {
+                    // 非分片快路：载荷借用 buf 直送 dispatch
+                    // （Defragger::feed 对 frag_count<=1 是原样返回、不动状态 →
+                    //  与走 feed 等价；分片路才需拥有化持有分片）。
+                    let Some(dest) = crate::dispatcher::parse_udp_source(body.addr) else {
+                        continue;
+                    };
+                    session.send_packet(&dest, body.data).await?;
+                    continue;
+                }
+                // 分片路：重组需跨包持有分片 → 拥有化后进 Defragger
+                let msg = UdpMessage {
+                    session_id: 0,
+                    packet_id: body.packet_id,
+                    frag_id: body.frag_id,
+                    frag_count: body.frag_count,
+                    addr: body.addr.to_string(),
+                    data: body.data.to_vec(),
                 };
                 let Some(msg) = df.feed(msg) else {
                     continue;

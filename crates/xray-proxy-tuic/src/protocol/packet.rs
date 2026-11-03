@@ -72,15 +72,41 @@ impl Packet {
     /// - [`TuicError::PacketTooLarge`]：`data.len()` 超过 u16 可编码上限（65535）， SIZE
     ///   字段无法如实表达 → 拒绝写出（历史饱和截断会静默丢尾）。
     pub fn write_payload<B: BufMut>(&self, buf: &mut B) -> Result<()> {
-        let size = u16::try_from(self.data.len())
-            .map_err(|_| TuicError::PacketTooLarge(self.data.len()))?;
+        self.write_payload_with(buf, &self.data)
+    }
+
+    /// 同 [`Packet::write_payload`]，但载荷由调用方**借用**给出（`self.data` 忽略）。
+    ///
+    /// 线格式单一来源：两者写出的字节完全一致（SIZE 字段取 `data.len()`）。
+    /// 用途：调用方手上已是 `&[u8]`（如 UDP 收包缓冲）时，省掉
+    /// 「先拥有化成 `Bytes` 再拷进帧缓冲」的中转拷贝。
+    ///
+    /// # Errors
+    ///
+    /// - [`TuicError::PacketTooLarge`]：`data.len()` 超过 u16 可编码上限（65535）。
+    pub fn write_payload_with<B: BufMut>(&self, buf: &mut B, data: &[u8]) -> Result<()> {
+        self.write_header(buf, data.len())?;
+        buf.put_slice(data);
+        Ok(())
+    }
+
+    /// 只写帧头（`ASSOC_ID + PKT_ID + FRAG_TOTAL + FRAG_ID + SIZE + ADDR`），
+    /// `data_len` 为载荷长度（写进 SIZE 字段）。
+    ///
+    /// 与 [`Packet::write_payload`] / [`Packet::write_payload_with`] 同源——
+    /// 三者写出的头部字节完全一致（wire 格式单一来源）。
+    ///
+    /// # Errors
+    ///
+    /// - [`TuicError::PacketTooLarge`]：`data_len` 超过 u16 可编码上限（65535）。
+    pub fn write_header<B: BufMut>(&self, buf: &mut B, data_len: usize) -> Result<()> {
+        let size = u16::try_from(data_len).map_err(|_| TuicError::PacketTooLarge(data_len))?;
         buf.put_u16(self.assoc_id);
         buf.put_u16(self.pkt_id);
         buf.put_u8(self.frag_total);
         buf.put_u8(self.frag_id);
         buf.put_u16(size);
         self.addr.write_to(buf);
-        buf.put_slice(&self.data);
         Ok(())
     }
 

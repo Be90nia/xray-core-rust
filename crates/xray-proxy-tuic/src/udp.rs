@@ -141,6 +141,7 @@ impl UniRespRouter {
         &self,
         conn: &quinn::Connection,
         pkt: &Packet,
+        payload: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -148,7 +149,15 @@ impl UniRespRouter {
         self.waiters.lock().entry(pkt.assoc_id).or_default().push_back(Arc::clone(&slot));
         let recv = async {
             let mut uni = conn.open_uni().await?;
-            uni.write_all(Self::encode_frame(pkt)?.as_ref()).await?;
+            // 帧 = VER+TYPE + 头 + 载荷，分两段写：uni stream 是字节流，
+            // wire 字节序列与「整帧一次写」完全一致，但省掉
+            // 「载荷先拥有化成 Bytes、再拷进整帧缓冲」两遍 memcpy。
+            let mut hdr = BytesMut::with_capacity(2 + 2 + 2 + 1 + 1 + 2 + pkt.addr.encoded_len());
+            hdr.put_u8(VERSION);
+            hdr.put_u8(type_code::PACKET);
+            pkt.write_header(&mut hdr, payload.len())?;
+            uni.write_all(&hdr).await?;
+            uni.write_all(payload).await?;
             let _ = uni.finish();
             rx.await.map_err(|_| TuicError::UnexpectedEof("udp resp router dropped"))
         };
@@ -163,14 +172,6 @@ impl UniRespRouter {
             },
         }
     }
-
-    /// 将 Packet 帧序列化为 wire 格式（VER + TYPE + payload）。
-    ///
-    /// # Errors
-    /// 透传 [`Packet::write_payload`]（`data.len()` 超 u16 上限 → `PacketTooLarge`）。
-    fn encode_frame(pkt: &Packet) -> Result<BytesMut> {
-        encode_packet_frame(pkt)
-    }
 }
 
 /// 将 Packet 帧序列化为 wire 格式（VER + TYPE + payload）——client/server 共用
@@ -184,6 +185,52 @@ pub(crate) fn encode_packet_frame(pkt: &Packet) -> Result<BytesMut> {
     buf.put_u8(type_code::PACKET);
     pkt.write_payload(&mut buf)?;
     Ok(buf)
+}
+
+/// native datagram 的分片数（本轮分片规则单一来源）。
+///
+/// 每片长度由调用方按 `frag_payload` 连续切分（末片可能不足）；单片返回 1。
+/// 总负载上界 = [`MAX_UDP_PAYLOAD`]。
+fn native_frag_total(data_len: usize, frag_payload: usize) -> Result<u8> {
+    if data_len <= frag_payload {
+        return Ok(1);
+    }
+    if data_len > crate::protocol::packet::MAX_UDP_PAYLOAD {
+        return Err(TuicError::PacketTooLarge(data_len));
+    }
+    u8::try_from(data_len.div_ceil(frag_payload)).map_err(|_| TuicError::PacketTooLarge(data_len))
+}
+
+/// native datagram 帧编码（载荷借用 → 不经拥有化中转）。
+///
+/// 与 `build_native_fragments` + [`encode_packet_frame`] 的组合产出的字节
+/// 逐字节一致（同一分片规则 + 同一头布局）；差别仅在载荷不拥有化
+/// （省每包 1 遍 `copy_from_slice`）。
+pub(crate) fn encode_native_frames(
+    assoc_id: u16,
+    pkt_id: u16,
+    target: &Address,
+    data: &[u8],
+    frag_payload: usize,
+) -> Result<Vec<BytesMut>> {
+    let frag_total = native_frag_total(data.len(), frag_payload)?;
+    let mut out = Vec::with_capacity(frag_total as usize);
+    let mut off = 0usize;
+    for i in 0..frag_total {
+        // 空载荷也需产出一帧（SIZE=0），故按剩余长度切而不走 chunks
+        let len = (data.len() - off).min(frag_payload);
+        let chunk = &data[off..off + len];
+        off += len;
+        // spec：仅首片携带目标 Address（后续片 addr=None → 0xff）
+        let addr = if i == 0 { target.clone() } else { Address::None };
+        let mut buf = BytesMut::with_capacity(2 + 2 + 2 + 1 + 1 + 2 + addr.encoded_len() + len);
+        buf.put_u8(VERSION);
+        buf.put_u8(type_code::PACKET);
+        let meta = Packet { assoc_id, pkt_id, frag_total, frag_id: i, addr, data: Bytes::new() };
+        meta.write_payload_with(&mut buf, chunk)?;
+        out.push(buf);
+    }
+    Ok(out)
 }
 
 impl TuicUdpAssoc {
@@ -225,9 +272,10 @@ impl TuicUdpAssoc {
         timeout: Option<Duration>,
     ) -> Result<Vec<u8>> {
         let pkt_id = self.pkt_id.fetch_add(1, Ordering::Relaxed);
-        let pkt = Packet::new(self.assoc_id, pkt_id, target, Bytes::copy_from_slice(data));
+        // 载荷不进 Packet（保持借用）：Packet 只承载帧头，SIZE 由 payload.len() 给出
+        let pkt = Packet::new(self.assoc_id, pkt_id, target, Bytes::new());
         let to = timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
-        self.router.send_and_wait(&self.conn, &pkt, to).await
+        self.router.send_and_wait(&self.conn, &pkt, data, to).await
     }
 
     /// 计算单 datagram 可容纳的 UDP 负载大小（帧头开销之外）。
@@ -241,12 +289,10 @@ impl TuicUdpAssoc {
         let Some(frag_payload) = self.native_frag_payload(target) else {
             return Err(TuicError::ProtocolParse("native datagram mode not negotiated".into()));
         };
-        // 一次 owned 化，分片走 Bytes::slice 零拷贝（原每片 chunk.to_vec 各拷一次）
-        let data = Bytes::copy_from_slice(data);
-        for pkt in build_native_fragments(self.assoc_id, pkt_id, target, data, frag_payload)? {
-            self.conn
-                .send_datagram(UniRespRouter::encode_frame(&pkt)?.freeze())
-                .map_err(TuicError::QuinnSendDatagram)?;
+        // 载荷全程借用（不拥有化）：分片布局与 owned 路径同一函数产出，
+        // wire 字节逐字节一致（见 encode_native_frames 文档）。
+        for frame in encode_native_frames(self.assoc_id, pkt_id, target, data, frag_payload)? {
+            self.conn.send_datagram(frame.freeze()).map_err(TuicError::QuinnSendDatagram)?;
         }
         Ok(())
     }
@@ -321,16 +367,10 @@ pub(crate) fn build_native_fragments(
     data: Bytes,
     frag_payload: usize,
 ) -> Result<Vec<Packet>> {
-    if data.len() <= frag_payload {
+    let frag_total = native_frag_total(data.len(), frag_payload)?;
+    if frag_total == 1 {
         return Ok(vec![Packet::new(assoc_id, pkt_id, target.clone(), data)]);
     }
-    if data.len() > crate::protocol::packet::MAX_UDP_PAYLOAD {
-        return Err(TuicError::PacketTooLarge(data.len()));
-    }
-    let frag_total = data.len().div_ceil(frag_payload);
-    let Ok(frag_total) = u8::try_from(frag_total) else {
-        return Err(TuicError::PacketTooLarge(data.len()));
-    };
     let mut frags = Vec::with_capacity(frag_total as usize);
     for (i, chunk) in data.chunks(frag_payload).enumerate() {
         frags.push(Packet {
@@ -515,5 +555,30 @@ mod tests {
         assert_eq!(done.data.len(), cap + 1);
         assert!(done.data.iter().all(|b| *b == 3));
         assert_eq!(done.addr, target);
+    }
+
+    /// 借用载荷路径（`encode_native_frames`）与拥有化路径
+    /// （`build_native_fragments` + `encode_packet_frame`）产出的 wire 字节逐字节一致
+    /// —— 含空载荷（SIZE=0）与分片阈值 ±1 边界。
+    #[test]
+    fn encode_native_frames_matches_owned_path_bytes() {
+        let target = Address::Ipv4(Ipv4Addr::new(203, 0, 113, 7), 5353);
+        let cap = 64usize;
+        for len in [0usize, 1, cap - 1, cap, cap + 1, 200] {
+            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let borrowed =
+                encode_native_frames(9, 11, &target, &payload, cap).expect("borrowed encode");
+            let owned: Vec<BytesMut> =
+                build_native_fragments(9, 11, &target, Bytes::from(payload.clone()), cap)
+                    .expect("fragments")
+                    .iter()
+                    .map(|f| encode_packet_frame(f).expect("owned encode"))
+                    .collect();
+            assert_eq!(borrowed.len(), owned.len(), "len={len} 帧数一致");
+            for (i, (b, o)) in borrowed.iter().zip(owned.iter()).enumerate() {
+                assert_eq!(b.as_ref(), o.as_ref(), "len={len} frag={i} 字节一致");
+            }
+            assert!(!borrowed.is_empty(), "len={len} 至少产出一帧");
+        }
     }
 }

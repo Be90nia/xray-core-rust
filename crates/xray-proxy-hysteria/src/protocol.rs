@@ -268,28 +268,63 @@ impl UdpMessage {
             return Err(HysteriaProxyError::ProtocolParse("udp message too short".into()));
         }
         let session_id = u32::from_be_bytes([msg[0], msg[1], msg[2], msg[3]]);
-        let packet_id = u16::from_be_bytes([msg[4], msg[5]]);
-        let frag_id = msg[6];
-        let frag_count = msg[7];
-        // 从偏移 8 开始读 varint addr_len
-        let mut cursor = io::Cursor::new(&msg[8..]);
-        let addr_len = read_varint(&mut cursor)
-            .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr len: {e}")))?;
-        if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH {
-            return Err(HysteriaProxyError::ProtocolParse("invalid address length".into()));
-        }
-        let consumed = cursor.position() as usize;
-        let rest_start = 8 + consumed;
-        let rest = &msg[rest_start..];
-        if rest.len() <= addr_len as usize {
-            // 需要 addr + 至少 1 字节 data
-            return Err(HysteriaProxyError::ProtocolParse("invalid message length".into()));
-        }
-        let addr = String::from_utf8(rest[..addr_len as usize].to_vec())
-            .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr utf8: {e}")))?;
-        let data = rest[addr_len as usize..].to_vec();
-        Ok(Self { session_id, packet_id, frag_id, frag_count, addr, data })
+        let body = parse_body(&msg[4..])?;
+        Ok(Self {
+            session_id,
+            packet_id: body.packet_id,
+            frag_id: body.frag_id,
+            frag_count: body.frag_count,
+            addr: body.addr.to_string(),
+            data: body.data.to_vec(),
+        })
     }
+}
+
+/// 借用式 UDP 消息体（session id 已剥离的 4 字节头布局）——零拷贝解析。
+///
+/// 布局 = `packet_id(2) + frag_id(1) + frag_count(1) + varint(addr_len) + addr + data`，
+/// 与 [`UdpMessage::serialize`] 去掉前 4 字节 session id 占位后的字节一一对应
+/// （[`UdpMessage::parse`] 的入参则是补回 4 字节哑元后的整帧）。
+pub(crate) struct UdpMessageBody<'a> {
+    /// 包 ID（分片重组用）。
+    pub packet_id: u16,
+    /// 分片 ID。
+    pub frag_id: u8,
+    /// 分片总数。
+    pub frag_count: u8,
+    /// 目标地址（借用）。
+    pub addr: &'a str,
+    /// 数据负载（借用）。
+    pub data: &'a [u8],
+}
+
+/// 解析 session id 已剥离的 UDP 消息体（零拷贝：addr/data 均借用入参）。
+///
+/// 判定与 [`UdpMessage::parse`] 对同一字节序列逐条一致（长度 / 地址长度 / utf8），
+/// 仅省掉拥有型拷贝。
+pub(crate) fn parse_body(body: &[u8]) -> Result<UdpMessageBody<'_>, HysteriaProxyError> {
+    if body.len() < 4 {
+        return Err(HysteriaProxyError::ProtocolParse("udp message too short".into()));
+    }
+    let packet_id = u16::from_be_bytes([body[0], body[1]]);
+    let frag_id = body[2];
+    let frag_count = body[3];
+    // 从偏移 4 开始读 varint addr_len
+    let mut cursor = io::Cursor::new(&body[4..]);
+    let addr_len = read_varint(&mut cursor)
+        .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr len: {e}")))?;
+    if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH {
+        return Err(HysteriaProxyError::ProtocolParse("invalid address length".into()));
+    }
+    let consumed = cursor.position() as usize;
+    let rest = &body[4 + consumed..];
+    if rest.len() <= addr_len as usize {
+        // 需要 addr + 至少 1 字节 data
+        return Err(HysteriaProxyError::ProtocolParse("invalid message length".into()));
+    }
+    let addr = std::str::from_utf8(&rest[..addr_len as usize])
+        .map_err(|e| HysteriaProxyError::ProtocolParse(format!("udp msg addr utf8: {e}")))?;
+    Ok(UdpMessageBody { packet_id, frag_id, frag_count, addr, data: &rest[addr_len as usize..] })
 }
 
 /// 分片 UDP 消息（对应 Go `FragUDPMessage`）。
