@@ -51,17 +51,13 @@ async fn read_exact_into(
 ) -> Result<(), MuxError> {
     let mut remaining = n;
     while remaining > 0 {
-        let read_n = {
-            let spare = dst.writable_bytes();
-            if remaining > spare.len() {
-                return Err(MuxError::Io(format!("read {} exceeds buffer capacity", n)));
-            }
-            reader.read(&mut spare[..remaining]).await
-        };
+        if remaining > dst.free() {
+            return Err(MuxError::Io(format!("read {} exceeds buffer capacity", n)));
+        }
+        let read_n = reader.read_into(dst, remaining).await;
         if read_n == 0 {
             return Err(MuxError::Io("unexpected EOF".to_string()));
         }
-        dst.advance_write(read_n);
         remaining -= read_n;
     }
     Ok(())

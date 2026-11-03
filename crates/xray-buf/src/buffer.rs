@@ -5,6 +5,8 @@
 //! [`Buffer::from_bytes_frozen`] 补回 Go ownership enum 的只读形态
 //! （oracle v1 §2.2-3）：外部 `Bytes` 零拷贝进入 relay，Drop 不回池。
 
+use std::{mem::MaybeUninit, pin::Pin, task::Poll};
+
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::alloc;
@@ -44,7 +46,10 @@ pub struct SealWindow<'a> {
     /// 数据区 `[start, end)`：当前为明文，调用方覆写为密文（长度不变）。
     pub payload: &'a mut [u8],
     /// 紧随数据区的 tag 区 `[end, end + tag_len)`：调用方写入 AEAD tag。
-    pub tag: &'a mut [u8],
+    ///
+    /// 该区间可能越过底层已初始化 `len`，故形态是未初始化视图：
+    /// 消费方**只写不读**，写完经 [`Buffer::advance_write`] 提交。
+    pub tag: &'a mut [MaybeUninit<u8>],
 }
 
 impl Buffer {
@@ -270,10 +275,13 @@ impl Buffer {
         let base = m.as_mut_ptr();
         // SAFETY: ①start <= end <= cap 且 end + tag_len <= cap（rear_headroom 已确认）
         // ⇒ 两段都在同一分配容量内、互不重叠且相邻（payload 尾地址 == tag 首地址）
-        // ②u8 无无效位模式；tag 落在尾部可写区（可能跨 `len` 的未初始化 spare），
-        // 调用方负责写满后经 advance_write 提交，写入前不得读该切片
+        // ②payload 区 `[start, end)` 恒在已初始化区内（未读数据）；
+        //   tag 区落在尾部可写区、可能跨 `len`（[end, len) 是已初始化死字节，
+        //   [len, cap) 是 spare），故 tag 用 MaybeUninit 视图——消费方只写不读。
         let payload = unsafe { std::slice::from_raw_parts_mut(base.add(start), end - start) };
-        let tag = unsafe { std::slice::from_raw_parts_mut(base.add(end), tag_len) };
+        let tag = unsafe {
+            std::slice::from_raw_parts_mut(base.add(end).cast::<MaybeUninit<u8>>(), tag_len)
+        };
         Some(SealWindow { payload, tag })
     }
 
@@ -281,18 +289,24 @@ impl Buffer {
     ///
     /// 用于直接写入操作（如系统调用 read）。**不谎报底层 `BytesMut` 的 `len`**（历史
     /// `set_len(capacity)` 会把已初始化字节数谎报成容量，令 `into_bytes` 等按 len 取数的
-    /// 路径把死字节当数据外发）；越过 `len` 的部分是未初始化 spare 区。调用方写完**必须**
-    /// [`advance_write`](Self::advance_write) 提交，写入前不得读该切片。
-    pub fn writable_bytes(&mut self) -> &mut [u8] {
+    /// 路径把死字节当数据外发）；越过 `len` 的部分是未初始化 spare 区，故视图形态是
+    /// `&mut [MaybeUninit<u8>]`（构造 `&mut [u8]` 会越过 `len`，属形式 UB）。调用方写完
+    /// **必须** [`advance_write`](Self::advance_write) 提交，写入前不得读该切片。
+    ///
+    /// # Panics
+    /// 写游标越过容量时 panic（内部不变式被破坏）。
+    pub fn writable_bytes(&mut self) -> &mut [MaybeUninit<u8>] {
         let end = self.end;
         let m = self.pooled_mut();
         let cap = m.capacity();
         assert!(end <= cap, "writable_bytes 前写游标越界: end={end}, cap={cap}");
         let base = m.as_mut_ptr();
-        // SAFETY: end <= cap ⇒ 切片在同一分配内；u8 无无效位模式。
-        // [end, cap) 可能跨 `len`（[end, len) 是已初始化的死字节，[len, cap) 是 spare），
+        // SAFETY: end <= cap ⇒ 切片在同一分配内；`MaybeUninit<u8>` 接受未初始化字节，
+        // 故 [end, cap) 整体（含跨 `len` 的 spare）都是合法引用目标。
         // 视图只用于写入，写入后经 advance_write 提交。
-        unsafe { std::slice::from_raw_parts_mut(base.add(end), cap - end) }
+        unsafe {
+            std::slice::from_raw_parts_mut(base.add(end).cast::<MaybeUninit<u8>>(), cap - end)
+        }
     }
 
     /// 将写游标前进 n 字节（确认写入了 n 字节）。
@@ -364,6 +378,57 @@ impl Buffer {
         }
         self.end = new_end;
         true
+    }
+
+    /// 从 `r` 读最多 `limit` 字节（按 [`free`](Self::free) 截断）**直落**可写区，
+    /// 成功后提交写游标；返回实读字节数（`0` = 对端 EOF）。
+    ///
+    /// 这是「系统调用读进未初始化尾部」的唯一入口：内核写满的字节由 `ReadBuf`
+    /// 记账初始化，`advance_write` 之前不会有 `&mut [u8]` 越过底层 `len`。
+    pub async fn read_from<R>(&mut self, r: &mut R, limit: usize) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncRead + Unpin + ?Sized,
+    {
+        let limit = limit.min(self.free());
+        let n = {
+            let spare = self.writable_bytes();
+            let mut rb = tokio::io::ReadBuf::uninit(&mut spare[..limit]);
+            std::future::poll_fn(|cx| Pin::new(&mut *r).poll_read(cx, &mut rb)).await?;
+            rb.filled().len()
+        };
+        self.advance_write(n);
+        Ok(n)
+    }
+
+    /// 从 `r` 读满 `limit` 字节直落可写区，成功后提交写游标（`read_exact` 语义）；
+    /// 中途 EOF / 出错时写游标**不推进**，已读字节按死字节留在尾部。
+    ///
+    /// # Panics
+    /// `limit` 超过 [`free`](Self::free)（容量不足是调用方的界失效，非对端行为）。
+    pub async fn read_exact_from<R>(&mut self, r: &mut R, limit: usize) -> std::io::Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin + ?Sized,
+    {
+        assert!(limit <= self.free(), "read_exact_from {limit} 超过可写空间 {}", self.free());
+        {
+            let spare = self.writable_bytes();
+            let mut rb = tokio::io::ReadBuf::uninit(&mut spare[..limit]);
+            std::future::poll_fn(|cx| {
+                while rb.filled().len() < limit {
+                    let before = rb.filled().len();
+                    std::task::ready!(Pin::new(&mut *r).poll_read(cx, &mut rb))?;
+                    if rb.filled().len() == before {
+                        return Poll::Ready(Err(std::io::Error::from(
+                            std::io::ErrorKind::UnexpectedEof,
+                        )));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            })
+            .await?;
+        }
+        self.advance_write(limit);
+        Ok(())
     }
 
     /// 将 `Bytes` 数据写入缓冲区末尾。
@@ -780,12 +845,43 @@ mod tests {
         let writable = buf.writable_bytes();
         assert!(writable.len() >= alloc::DEFAULT_SIZE);
 
-        // 模拟直接写入
+        // 模拟直接写入（未初始化视图：逐字节 write，不读）
         let data = b"direct";
-        buf.writable_bytes()[..data.len()].copy_from_slice(data);
+        for (dst, src) in buf.writable_bytes().iter_mut().zip(data) {
+            dst.write(*src);
+        }
         buf.advance_write(data.len());
         assert_eq!(buf.len(), 6);
         assert_eq!(buf.bytes(), b"direct");
+    }
+
+    /// 零成本证据（票 gimpm）：可写视图 → 提交 → 原地 seal 循环不触发重分配。
+    ///
+    /// 分配地址/容量恒定即证明改造没有引入新的分配或扩容（重分配必然漂移起点）。
+    #[test]
+    fn writable_view_cycle_does_not_realloc() {
+        init();
+        let mut buf = Buffer::new_pooled(alloc::DEFAULT_SIZE);
+        let addr = buf.writable_bytes().as_ptr() as usize;
+        let cap = buf.capacity();
+        for _ in 0..64 {
+            buf.clear();
+            for (dst, src) in buf.writable_bytes().iter_mut().take(1000).zip([0xABu8; 1000]) {
+                dst.write(src);
+            }
+            buf.advance_write(1000);
+            {
+                let win = buf.seal_window(16).expect("尾部足够");
+                for b in win.tag.iter_mut() {
+                    b.write(0xCD);
+                }
+            }
+            buf.advance_write(16);
+            assert_eq!(buf.len(), 1016);
+        }
+        buf.clear();
+        assert_eq!(buf.writable_bytes().as_ptr() as usize, addr, "可写视图起点漂移 = 发生重分配");
+        assert_eq!(buf.capacity(), cap, "容量变化 = 发生重分配");
     }
 
     #[test]

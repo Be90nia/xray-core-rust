@@ -495,30 +495,37 @@ impl ChunkFrame {
         self.payload.clear();
     }
 
-    /// 明文读入区：长度 = 块剩余空间 − tag 区（tag 与载荷同块相邻，必须留位）。
+    /// 明文读入区长度上限 = 块剩余空间 − tag 区（tag 与载荷同块相邻，必须留位）。
+    pub(crate) fn plaintext_max(&self, tag_len: usize) -> usize {
+        self.payload.free().saturating_sub(tag_len)
+    }
+
+    /// 读最多 [`Self::plaintext_max`] 字节**直落**明文区（提交写游标），返回实读字节数。
     ///
-    /// 数据面泵直接 `read` 进本切片 ⇒ 明文零拷贝落在将上线的那块内存里。
-    pub(crate) fn plaintext_read_buf(&mut self, tag_len: usize) -> &mut [u8] {
-        let max = self.payload.free().saturating_sub(tag_len);
-        &mut self.payload.writable_bytes()[..max]
+    /// 数据面泵直接读进将上线的那块内存 ⇒ 明文零拷贝。
+    pub(crate) async fn read_plaintext<R>(
+        &mut self,
+        r: &mut R,
+        tag_len: usize,
+    ) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncRead + Unpin + ?Sized,
+    {
+        let max = self.plaintext_max(tag_len);
+        self.payload.read_from(r, max).await
     }
 
-    /// 提交从 [`Self::plaintext_read_buf`] 读入的 `n` 字节。
-    pub(crate) fn commit_plaintext(&mut self, n: usize) {
-        self.payload.advance_write(n);
-    }
-
-    /// 把 `data` 拷进明文区（测试用；数据面泵直接读进 [`Self::plaintext_read_buf`]）。
-    #[cfg(test)]
-    pub(crate) fn write_plaintext(&mut self, data: &[u8]) {
-        self.payload.write_from(data);
+    /// 把 `data` 拷进明文区（写侧泵；提交写游标）。返回实拷字节数。
+    pub(crate) fn write_plaintext(&mut self, data: &[u8]) -> usize {
+        self.payload.write_from(data)
     }
 }
 
 /// 把一帧 `[size_field][ciphertext‖tag][padding]` 以 2~3 段向量写发出（用户态零拷贝）。
 ///
 /// 前置：`plaintext_len` 字节明文已落在 `frame` 的读入区并经
-/// [`ChunkFrame::commit_plaintext`] 提交。`plaintext_len == 0` 即终止 chunk
+/// [`ChunkFrame::write_plaintext`] / [`ChunkFrame::read_plaintext`] 提交。
+/// `plaintext_len == 0` 即终止 chunk
 /// （Go `seal([])` 语义）：wire 上只余 size + tag。
 ///
 /// 段数 ≤ 3（< `MAX_SEGMENTS_PER_WRITE`）⇒ 一次 `poll_write_vectored`；底层不支持

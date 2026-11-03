@@ -19,7 +19,9 @@ fn writable_bytes_does_not_inflate_len() {
     buf.advance_write(0);
 
     let data = b"0123456789";
-    buf.writable_bytes()[..data.len()].copy_from_slice(data);
+    for (dst, src) in buf.writable_bytes().iter_mut().zip(data) {
+        dst.write(*src);
+    }
     buf.advance_write(data.len());
     assert_eq!(buf.len(), data.len());
     assert_eq!(buf.free(), cap - data.len());
@@ -103,8 +105,7 @@ fn no_cross_connection_residue_visible_to_next_holder() {
     assert!(c.bytes().is_empty(), "bytes() 不得暴露 A 的残留明文");
 
     // 连接 B 自己写多少就交出多少
-    c.writable_bytes()[..own.len()].copy_from_slice(own);
-    c.advance_write(own.len());
+    c.write_from(own);
     let got = c.into_bytes();
     assert_eq!(&got[..], &own[..], "B 的载荷必须逐字节等于自己写的内容");
     assert_eq!(got.len(), own.len(), "不得携带 A 的任何字节（长度即证）");
@@ -131,7 +132,9 @@ fn advance_write_len_free_resize_semantics() {
     let free = buf.free();
     let spare = buf.writable_bytes();
     assert_eq!(spare.len(), free, "可写视图长度恒等于 free()");
-    spare[..2].copy_from_slice(b"XY");
+    for (dst, src) in spare.iter_mut().zip(b"XY") {
+        dst.write(*src);
+    }
     buf.advance_write(2);
     assert_eq!(buf.bytes(), &b"abXY"[..], "写入必须落在 [end, cap) 且按序提交");
 }
@@ -145,7 +148,9 @@ fn seal_window_then_into_bytes_logical() {
     {
         let win = buf.seal_window(16).expect("尾部足够");
         win.payload.copy_from_slice(b"CIPHERTXT");
-        win.tag.fill(0xEE);
+        for b in win.tag.iter_mut() {
+            b.write(0xEE);
+        }
     }
     buf.advance_write(16);
 

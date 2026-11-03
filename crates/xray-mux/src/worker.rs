@@ -692,15 +692,10 @@ impl ServerWorker {
     ) -> Result<(), ServerError> {
         let mut remaining = n;
         while remaining > 0 {
-            let r = {
-                let spare = dst.writable_bytes();
-                if remaining > spare.len() {
-                    return Err(ServerError::InvalidFrame(
-                        "read exceeds buffer capacity".to_string(),
-                    ));
-                }
-                reader.read(&mut spare[..remaining]).await
-            };
+            if remaining > dst.free() {
+                return Err(ServerError::InvalidFrame("read exceeds buffer capacity".to_string()));
+            }
+            let r = reader.read_into(dst, remaining).await;
             if r == 0 {
                 return Err(ServerError::InvalidFrame(format!(
                     "EOF reading {} bytes at offset {}",
@@ -708,7 +703,6 @@ impl ServerWorker {
                     n - remaining
                 )));
             }
-            dst.advance_write(r);
             remaining -= r;
         }
         Ok(())

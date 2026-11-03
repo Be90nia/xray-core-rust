@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// 单 chunk 明文上限：8 KiB 池块容量 − AEAD tag（tag 必须与载荷同块相邻，
-/// `seal_window` 才成立）。与旧泵的 `plaintext_read_buf` 同一上界。
+/// `seal_window` 才成立）。与旧泵的明文读入区同一上界。
 const PAYLOAD_MAX: usize = 8 * 1024 - 16;
 
 /// 读半：wire 上的 chunk 帧 → 明文 MultiBuffer。
@@ -87,13 +87,9 @@ impl<R: AsyncRead + Unpin + Send> Reader for ChunkReader<R> {
             let ct_len = total.saturating_sub(padding);
             // 2. 密文（含 tag）直落池化块 → 原地解密 → 明文即该块数据区（0 遍 memcpy）
             let mut buf = Buffer::new_pooled(ct_len.max(1));
-            {
-                let dst = buf.writable_bytes();
-                if dst.len() < ct_len || self.stream.read_exact(&mut dst[..ct_len]).await.is_err() {
-                    return Ok(MultiBuffer::new());
-                }
+            if buf.free() < ct_len || buf.read_exact_from(&mut self.stream, ct_len).await.is_err() {
+                return Ok(MultiBuffer::new());
             }
-            buf.advance_write(ct_len);
             let nonce = self.nonce_gen.next_ref();
             let plaintext_len =
                 match self.cipher.open_in_place(nonce, &[], &mut buf.as_mut()[..ct_len]) {
@@ -163,17 +159,15 @@ impl<W: AsyncWrite + Unpin + Send> Writer for ChunkWriter<W> {
             let tag_len = self.cipher.tag_size();
             let mut mb = mb;
             while !mb.is_empty() {
-                let cap = self.frame.plaintext_read_buf(tag_len).len().min(PAYLOAD_MAX);
+                let cap = self.frame.plaintext_max(tag_len).min(PAYLOAD_MAX);
                 let piece = mb.split_bytes(cap);
                 let n = piece.len();
                 if n == 0 {
                     break;
                 }
-                {
-                    let dst = self.frame.plaintext_read_buf(tag_len);
-                    piece.copy_to_slice(0, &mut dst[..n]);
+                for buf in piece.iter() {
+                    self.frame.write_plaintext(buf.bytes());
                 }
-                self.frame.commit_plaintext(n);
                 let nonce = self.nonce_gen.next_ref();
                 write_chunk_frame(
                     &mut self.stream,

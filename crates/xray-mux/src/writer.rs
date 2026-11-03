@@ -135,13 +135,9 @@ impl MuxWriter {
         // 直序进池化 Buffer（同 write_meta_with_frame 形态）：免 from_vec
         // 二次拷贝，scratch 容量留在 self 跨帧复用。
         let mut frame = Buffer::new();
-        {
-            let spare = frame.writable_bytes();
-            let n = self.meta_scratch.len();
-            assert!(n <= spare.len(), "mux meta exceeds buffer writable capacity");
-            spare[..n].copy_from_slice(&self.meta_scratch);
-            frame.advance_write(n);
-        }
+        let n = self.meta_scratch.len();
+        assert!(n <= frame.free(), "mux meta exceeds buffer writable capacity");
+        frame.write_from(&self.meta_scratch);
         let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
@@ -190,13 +186,9 @@ impl MuxWriter {
         meta.write_bytes_into(&mut self.meta_scratch)
             .map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
         let mut frame = Buffer::new();
-        {
-            let spare = frame.writable_bytes();
-            let n = self.meta_scratch.len();
-            assert!(n <= spare.len(), "mux meta exceeds buffer writable capacity");
-            spare[..n].copy_from_slice(&self.meta_scratch);
-            frame.advance_write(n);
-        }
+        let n = self.meta_scratch.len();
+        assert!(n <= frame.free(), "mux meta exceeds buffer writable capacity");
+        frame.write_from(&self.meta_scratch);
         let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
@@ -246,15 +238,11 @@ async fn write_meta_with_frame(
     scratch.clear();
     meta.write_bytes_into(scratch).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
     let mut frame = Buffer::new();
-    {
-        let spare = frame.writable_bytes();
-        let meta_len = scratch.len();
-        let n = meta_len + 2;
-        assert!(n <= spare.len(), "mux meta + length exceeds buffer writable capacity");
-        spare[..meta_len].copy_from_slice(scratch);
-        spare[meta_len..n].copy_from_slice(&data_len.to_be_bytes());
-        frame.advance_write(n);
-    }
+    let meta_len = scratch.len();
+    let n = meta_len + 2;
+    assert!(n <= frame.free(), "mux meta + length exceeds buffer writable capacity");
+    frame.write_from(scratch);
+    frame.write_from(&data_len.to_be_bytes());
     let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
     mb.push(frame);
     for buf in data.into_buffers() {

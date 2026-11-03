@@ -818,17 +818,13 @@ async fn read_exact_buffer(
 ) -> Result<(), String> {
     let mut off = 0;
     while off < n {
-        let got = {
-            let spare = dst.writable_bytes();
-            if n - off > spare.len() {
-                return Err(format!("read {n} exceeds buffer capacity at offset {off}"));
-            }
-            reader.read(&mut spare[..n - off]).await
-        };
+        if n - off > dst.free() {
+            return Err(format!("read {n} exceeds buffer capacity at offset {off}"));
+        }
+        let got = reader.read_into(dst, n - off).await;
         if got == 0 {
             return Err(if off == 0 { String::new() } else { format!("EOF at offset {off}/{n}") });
         }
-        dst.advance_write(got);
         off += got;
     }
     Ok(())

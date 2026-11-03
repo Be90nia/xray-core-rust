@@ -6,11 +6,18 @@ use xray_buf::{alloc, buffer::Buffer};
 
 const TAG_LEN: usize = 16;
 
+/// 把未初始化 tag 区写满 `v`（未初始化视图：只写不读）。
+fn fill_tag(tag: &mut [std::mem::MaybeUninit<u8>], v: u8) {
+    for b in tag.iter_mut() {
+        b.write(v);
+    }
+}
+
 /// 不变量 A：payload 尾地址 == tag 首地址（同一分配内相邻）。
 fn assert_adjacent(win: &xray_buf::buffer::SealWindow<'_>) {
     assert_eq!(
         win.payload.as_ptr().wrapping_add(win.payload.len()),
-        win.tag.as_ptr(),
+        win.tag.as_ptr().cast::<u8>(),
         "payload 尾必须紧贴 tag 头（wire 上 [ciphertext][tag] 连续）"
     );
 }
@@ -32,7 +39,7 @@ fn seal_window_adjacent_vec_backed() {
         assert_eq!(win.tag.len(), TAG_LEN);
         assert_adjacent(&win);
         win.payload.copy_from_slice(&cipher);
-        win.tag.fill(0xAA);
+        fill_tag(win.tag, 0xAA);
     }
     buf.advance_write(TAG_LEN);
 

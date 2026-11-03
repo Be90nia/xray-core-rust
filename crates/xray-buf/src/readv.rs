@@ -14,14 +14,16 @@
 use std::{
     future::Future,
     io::{ErrorKind, IoSliceMut},
+    mem::MaybeUninit,
     pin::Pin,
     sync::{
         LazyLock,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
 };
 
-use tokio::net::tcp::OwnedReadHalf;
+use tokio::{io::ReadBuf, net::tcp::OwnedReadHalf};
 
 use crate::{
     alloc,
@@ -146,10 +148,28 @@ impl<'a> IovecBatch<'a> {
             let Some(buf) = slot.as_mut() else { continue };
             let w = buf.writable_bytes();
             lens[i] = w.len();
-            slices[i] = IoSliceMut::new(w);
+            // SAFETY: 见 `write_only_view`——切片只交给 `try_read_vectored`（写方向 syscall），
+            // 写入量以返回值为界，之后才经 `distribute_slots` 的 `advance_write` 提交。
+            slices[i] = IoSliceMut::new(unsafe { write_only_view(w) });
         }
         Self { slices, lens, n: n_bufs }
     }
+}
+
+/// `&mut [MaybeUninit<u8>]` → 只写 `&mut [u8]` 视图（scatter-read 专用）。
+///
+/// # Safety
+/// 返回切片**只能**作为写方向 syscall（`readv` / `WSARecv`）的目标，调用方在读入
+/// 提交（`advance_write`）前不得读其中任何字节。
+///
+/// # 为什么本 crate 只留这一处
+/// std/tokio 的 vectored 读 API 只有 `IoSliceMut`，它要求 `&mut [u8]`，**没有**未初始化
+/// 形态（单缓冲有 `ReadBuf::uninit`，vectored 没有）；tokio 自己在
+/// `TcpStream::try_read_buf` 内部做的正是同一件事（`UninitSlice` → `&mut [u8]` 交 syscall）。
+/// 迁 `MaybeUninit` 后其余读路径全部走 `ReadBuf`，此处是类型系统无法表达的最后一格。
+unsafe fn write_only_view(w: &mut [MaybeUninit<u8>]) -> &mut [u8] {
+    // SAFETY: 调用契约见函数文档；`MaybeUninit<u8>` 与 `u8` 同布局、同对齐。
+    unsafe { &mut *(w as *mut [MaybeUninit<u8>] as *mut [u8]) }
 }
 
 /// 数组版分发：n 字节按 iovec 容量切进各槽（原 Vec 版 distribute 的零分配
@@ -261,11 +281,20 @@ impl ReadVSource {
             Self::Half(s) => s.try_read_vectored(slices),
         }
     }
+}
 
-    fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Self::Whole(s) => s.try_read(buf),
-            Self::Half(s) => s.try_read(buf),
+/// 单缓冲读走 tokio 标准读路径（`ReadBuf` 记录已初始化区间，见
+/// [`Buffer::read_from`](crate::buffer::Buffer::read_from)）；scatter 读另走
+/// [`ReadVSource::try_read_vectored`]（vectored API 无未初始化形态）。
+impl tokio::io::AsyncRead for ReadVSource {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Whole(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Half(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -384,9 +413,8 @@ impl ReadVReader {
     /// 下次起用 readv 多缓冲。
     async fn read_multi_single(&mut self) -> Result<MultiBuffer> {
         let mut buf = Buffer::new_pooled(self.block_size);
-        let cap = buf.writable_bytes().len();
-        let read = self.read_ready_single(buf.writable_bytes()).await;
-        let n = match read {
+        let cap = buf.free();
+        let n = match buf.read_from(&mut self.src, cap).await {
             Ok(n) => n,
             Err(e) => {
                 buf.release();
@@ -398,7 +426,6 @@ impl ReadVReader {
             buf.release();
             return Ok(MultiBuffer::new());
         }
-        buf.advance_write(n);
         if n >= cap {
             self.alloc.adjust(1);
         }
@@ -408,18 +435,6 @@ impl ReadVReader {
         let mut mb = MultiBuffer::with_capacity(1);
         mb.push(buf);
         Ok(mb)
-    }
-
-    /// 就绪等待 + 非阻塞单缓冲读循环（`try_read`，非 readv）。
-    async fn read_ready_single(&self, w: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            self.src.readable().await?;
-            match self.src.try_read(w) {
-                Ok(n) => return Ok(n),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                Err(e) => return Err(e),
-            }
-        }
     }
 }
 

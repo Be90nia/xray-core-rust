@@ -28,6 +28,8 @@
 //! - XChaCha20-Poly1305 nonces must be 24 bytes
 //! - All public APIs return `Result` instead of panicking
 
+use std::mem::MaybeUninit;
+
 use aes::{
     Aes128, Aes256,
     cipher::{KeyIvInit, StreamCipher},
@@ -146,14 +148,14 @@ pub trait AeadCipher {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [MaybeUninit<u8>],
     ) -> Result<(), CryptoError> {
         check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
         // seal 会复核 nonce 长度；此处已校验，错误面只剩加密失败。
         let sealed = self.seal(nonce, aad, payload)?;
         let (ct, t) = sealed.split_at(payload.len());
         payload.copy_from_slice(ct);
-        tag.copy_from_slice(t);
+        write_tag(tag, t);
         Ok(())
     }
 
@@ -202,7 +204,7 @@ fn check_seal_in_place(
     nonce_size: usize,
     tag_size: usize,
     nonce: &[u8],
-    tag: &[u8],
+    tag: &[MaybeUninit<u8>],
 ) -> Result<(), CryptoError> {
     if nonce.len() != nonce_size {
         return Err(CryptoError::InvalidNonceLength { expected: nonce_size, actual: nonce.len() });
@@ -211,6 +213,28 @@ fn check_seal_in_place(
         return Err(CryptoError::InvalidNonceLength { expected: tag_size, actual: tag.len() });
     }
     Ok(())
+}
+
+/// 已初始化 `&mut [u8]` → 未初始化视图（恒安全，无需前置条件）。
+///
+/// `MaybeUninit<u8>` 接受任意位模式（含已初始化值），布局与对齐同 `u8`，故该转换
+/// 不需要 `unsafe` 契约——供「tag 区本来就是已初始化内存」（栈数组 / `Vec`）的
+/// 调用方对齐 [`seal_in_place_with_tag`](AeadCipher::seal_in_place_with_tag) 的入参形态。
+#[inline]
+pub fn uninit_mut(buf: &mut [u8]) -> &mut [std::mem::MaybeUninit<u8>] {
+    // SAFETY: 见上——同布局同对齐，目标类型无无效位模式约束。
+    unsafe { &mut *(buf as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) }
+}
+
+/// 把 AEAD tag 写进**未初始化** tag 区（`Buffer::seal_window` 的尾部 headroom）。
+///
+/// 只写不读：逐字节 `MaybeUninit::write`，与 `copy_from_slice` 同样的 store 数，
+/// 零额外分配/拷贝。tag 区越过底层 `len` 时构造 `&mut [u8]` 会违约，故入口形态是
+/// 未初始化视图。
+fn write_tag(tag: &mut [MaybeUninit<u8>], src: &[u8]) {
+    for (dst, byte) in tag.iter_mut().zip(src) {
+        dst.write(*byte);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +325,7 @@ impl AeadCipher for Aes128Gcm {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [MaybeUninit<u8>],
     ) -> Result<(), CryptoError> {
         check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
         let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
@@ -310,7 +334,7 @@ impl AeadCipher for Aes128Gcm {
             .key
             .seal_in_place_separate_tag(ring_nonce, Aad::from(aad), payload)
             .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
-        tag.copy_from_slice(t.as_ref());
+        write_tag(tag, t.as_ref());
         Ok(())
     }
 
@@ -461,7 +485,7 @@ impl AeadCipher for Aes256Gcm {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [MaybeUninit<u8>],
     ) -> Result<(), CryptoError> {
         check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
         let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
@@ -470,7 +494,7 @@ impl AeadCipher for Aes256Gcm {
             .key
             .seal_in_place_separate_tag(ring_nonce, Aad::from(aad), payload)
             .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
-        tag.copy_from_slice(t.as_ref());
+        write_tag(tag, t.as_ref());
         Ok(())
     }
 
@@ -960,7 +984,7 @@ impl AeadCipher for ChaCha20Poly1305Aead {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [MaybeUninit<u8>],
     ) -> Result<(), CryptoError> {
         check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
         let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
@@ -970,7 +994,7 @@ impl AeadCipher for ChaCha20Poly1305Aead {
             .inner
             .encrypt_inout_detached(&nonce_arr, aad, payload.into())
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-        tag.copy_from_slice(t.as_ref());
+        write_tag(tag, t.as_ref());
         Ok(())
     }
 
@@ -1129,7 +1153,7 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [MaybeUninit<u8>],
     ) -> Result<(), CryptoError> {
         check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
         let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
@@ -1139,7 +1163,7 @@ impl AeadCipher for XChaCha20Poly1305Aead {
             .inner
             .encrypt_inout_detached(&nonce_arr, aad, payload.into())
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
-        tag.copy_from_slice(t.as_ref());
+        write_tag(tag, t.as_ref());
         Ok(())
     }
 
@@ -1353,7 +1377,9 @@ mod tests {
 
             let mut payload = plaintext.clone();
             let mut tag = vec![0xEEu8; cipher.tag_size()];
-            cipher.seal_in_place_with_tag(&nonce, aad, &mut payload, &mut tag).expect(name);
+            cipher
+                .seal_in_place_with_tag(&nonce, aad, &mut payload, uninit_mut(&mut tag))
+                .expect(name);
 
             assert_eq!(payload, expected[..plaintext.len()], "{name}: 载荷原地成密文");
             assert_eq!(tag, expected[plaintext.len()..], "{name}: tag 落独立 tag 区");
@@ -1386,14 +1412,18 @@ mod tests {
             let mut tag = vec![0xAAu8; cipher.tag_size()];
 
             assert!(
-                cipher.seal_in_place_with_tag(&nonce[..1], b"", &mut payload, &mut tag).is_err()
+                cipher
+                    .seal_in_place_with_tag(&nonce[..1], b"", &mut payload, uninit_mut(&mut tag))
+                    .is_err()
             );
             assert_eq!(payload, before, "错 nonce 长度后载荷必须逐字节不变");
             assert_eq!(tag, vec![0xAAu8; cipher.tag_size()], "错 nonce 长度后 tag 区不得被写");
 
             let mut short_tag = vec![0xAAu8; cipher.tag_size() - 1];
             assert!(
-                cipher.seal_in_place_with_tag(&nonce, b"", &mut payload, &mut short_tag).is_err()
+                cipher
+                    .seal_in_place_with_tag(&nonce, b"", &mut payload, uninit_mut(&mut short_tag))
+                    .is_err()
             );
             assert_eq!(payload, before, "错 tag 区长度后载荷必须逐字节不变");
             assert_eq!(short_tag, vec![0xAAu8; cipher.tag_size() - 1], "短 tag 区保持原样");

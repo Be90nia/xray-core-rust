@@ -125,7 +125,7 @@ impl AeadCipher for BodyCipher {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [std::mem::MaybeUninit<u8>],
     ) -> Result<(), xray_crypto::aead::CryptoError> {
         match self {
             BodyCipher::Aes(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),

@@ -135,8 +135,7 @@ impl SsStreamConn {
                 let rest = self.stage.bytes().to_vec();
                 self.stage.clear();
                 if !rest.is_empty() {
-                    self.stage.writable_bytes()[..rest.len()].copy_from_slice(&rest);
-                    self.stage.advance_write(rest.len());
+                    self.stage.write_from(&rest);
                 }
             }
             self.out = Out::Header { done: 0 };
@@ -373,9 +372,7 @@ impl AsyncWrite for SsStreamConn {
         let room = me.up_cap() - me.staged;
         let n = buf.len().min(room);
         if n > 0 {
-            let dst = me.stage.writable_bytes();
-            dst[..n].copy_from_slice(&buf[..n]);
-            me.stage.advance_write(n);
+            me.stage.write_from(&buf[..n]);
             me.staged += n;
         }
         // ③ 满块 → 原地 seal（落线由后续 poll 推进）。

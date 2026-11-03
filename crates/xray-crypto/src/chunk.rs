@@ -200,6 +200,9 @@ impl<'a> ChunkStreamReader<'a> {
     }
 }
 
+/// chunk size 字段上限：Plain = 2B；AEAD = 2B + 16B tag。
+const MAX_SIZE_FIELD: usize = 18;
+
 // ========== ChunkStreamWriter ==========
 
 pub struct ChunkStreamWriter<'a> {
@@ -222,9 +225,11 @@ impl<'a> ChunkStreamWriter<'a> {
             let slice = remaining.split_size(SLICE_SIZE);
             let mut size_buf = Buffer::new();
             let sb = self.size_encoder.size_bytes() as usize;
-            let writable = size_buf.writable_bytes();
-            self.size_encoder.encode(slice.len() as u16, &mut writable[..sb]);
-            size_buf.advance_write(sb);
+            // size 字段先编码进栈上数组再整段落盘：≤ 18B（2B size + 16B AEAD tag），
+            // 免去为未初始化尾部造 `&mut [u8]`（可写区视图已是 `MaybeUninit` 形态）。
+            let mut head = [0u8; MAX_SIZE_FIELD];
+            self.size_encoder.encode(slice.len() as u16, &mut head[..sb]);
+            size_buf.write_from(&head[..sb]);
             mb2_write.push(size_buf);
             for buf in slice.into_buffers() {
                 mb2_write.push(buf);

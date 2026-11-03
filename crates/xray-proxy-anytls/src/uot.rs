@@ -113,14 +113,10 @@ impl Reader for LengthFramedReader {
             let len = usize::from(u16::from_be_bytes(len_buf));
             let mut payload = Buffer::with_capacity(len.max(1));
             if len > 0 {
-                {
-                    let spare = payload.writable_bytes();
-                    self.inner
-                        .read_exact(&mut spare[..len])
-                        .await
-                        .map_err(|e| BufError::ReadError(format!("uot frame body: {e}")))?;
-                }
-                payload.advance_write(len);
+                payload
+                    .read_exact_from(&mut *self.inner, len)
+                    .await
+                    .map_err(|e| BufError::ReadError(format!("uot frame body: {e}")))?;
             }
             Ok(MultiBuffer::from_buffer(payload))
         })
@@ -161,12 +157,7 @@ impl Writer for LengthFramedWriter {
                 )));
             }
             let mut header = Buffer::new();
-            {
-                let spare = header.writable_bytes();
-                let len = (mb.len() as u16).to_be_bytes();
-                spare[..2].copy_from_slice(&len);
-                header.advance_write(2);
-            }
+            header.write_from(&(mb.len() as u16).to_be_bytes());
             let mut out = MultiBuffer::with_capacity(mb.buffer_count() + 1);
             out.push(header);
             for buf in mb.into_buffers() {

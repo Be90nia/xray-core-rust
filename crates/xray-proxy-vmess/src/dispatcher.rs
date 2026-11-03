@@ -948,7 +948,7 @@ impl AeadCipher for BodyCipher {
         nonce: &[u8],
         aad: &[u8],
         payload: &mut [u8],
-        tag: &mut [u8],
+        tag: &mut [std::mem::MaybeUninit<u8>],
     ) -> Result<(), xray_crypto::aead::CryptoError> {
         match self {
             BodyCipher::Aes(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),
@@ -999,7 +999,7 @@ async fn pump_up<C, R, W>(
     let tag_len = cipher.tag_size();
     loop {
         frame.clear();
-        let n = match server_r.read(frame.plaintext_read_buf(tag_len)).await {
+        let n = match frame.read_plaintext(&mut server_r, tag_len).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -1007,7 +1007,6 @@ async fn pump_up<C, R, W>(
                 break;
             },
         };
-        frame.commit_plaintext(n);
         let nonce = nonce_gen.next_ref();
         if write_chunk_frame(
             &mut stream_w,
@@ -1646,7 +1645,7 @@ mod tests {
         let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
         let mut sp = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
         let mut frame = ChunkFrame::new();
-        let cap = frame.plaintext_read_buf(cipher.tag_size()).len();
+        let cap = frame.plaintext_max(cipher.tag_size());
         let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
         let pt = b"payload bytes for one chunk";
         for _ in 0..2 {
@@ -1667,7 +1666,7 @@ mod tests {
         assert_eq!(w.writes, 2, "each chunk must be one vectored write (3 segments)");
         frame.clear(); // 与泵一致：每帧先 clear 再取读区
         assert_eq!(
-            frame.plaintext_read_buf(cipher.tag_size()).len(),
+            frame.plaintext_max(cipher.tag_size()),
             cap,
             "frame block must be reused without growth"
         );

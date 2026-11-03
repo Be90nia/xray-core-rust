@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
 use crate::{
     alloc,
@@ -55,14 +55,12 @@ impl Reader for SingleReader {
     ) -> Pin<Box<dyn Future<Output = Result<MultiBuffer>> + Send + '_>> {
         Box::pin(async move {
             let mut buf = Buffer::new_pooled(self.capacity);
-            let writable = buf.writable_bytes();
-            match self.inner.read(writable).await {
+            match buf.read_from(&mut *self.inner, buf.free()).await {
                 Ok(0) => {
                     buf.release();
                     Ok(MultiBuffer::new())
                 },
                 Ok(n) => {
-                    buf.advance_write(n);
                     tracing::trace!(bytes = n, "SingleReader 读取");
                     Ok(MultiBuffer::from_buffer(buf))
                 },
@@ -101,8 +99,7 @@ impl Reader for PacketReader {
 
             for _ in 0..MAX_RETRIES {
                 let mut buf = Buffer::new();
-                let writable = buf.writable_bytes();
-                match self.inner.read(writable).await {
+                match buf.read_from(&mut *self.inner, buf.free()).await {
                     Ok(0) => {
                         buf.release();
                         return Ok(MultiBuffer::new());
@@ -112,7 +109,6 @@ impl Reader for PacketReader {
                             buf.release();
                             continue;
                         }
-                        buf.advance_write(n);
                         tracing::trace!(bytes = n, "PacketReader 读取");
                         return Ok(MultiBuffer::from_buffer(buf));
                     },
@@ -168,6 +164,35 @@ impl BufferedReader {
             },
             Err(_) => 0,
         }
+    }
+
+    /// 从内部缓存读最多 `limit` 字节**直落** `dst` 可写区（提交写游标），返回实读字节数。
+    ///
+    /// 与 [`Self::read`] 同语义，差别只在目标形态：`dst` 的可写区是未初始化视图，
+    /// 这里按 `Buffer::write_from` 逐块落盘，绕开「先借 `&mut [u8]` 再回拷」的第二遍搬运。
+    pub async fn read_into(&mut self, dst: &mut Buffer, limit: usize) -> usize {
+        // 返回值的语义是「实际写进 dst 的字节数」⇒ 请求量必须按剩余空间截断
+        let limit = limit.min(dst.free());
+        if limit == 0 {
+            return 0;
+        }
+        if self.buffer.is_empty() {
+            match self.reader.read_multi_buffer().await {
+                Ok(mb) => {
+                    if mb.is_empty() {
+                        return 0;
+                    }
+                    self.buffer.merge(mb);
+                },
+                Err(_) => return 0,
+            }
+        }
+        let piece = self.buffer.split_bytes(limit);
+        let n = piece.len();
+        for buf in piece.iter() {
+            dst.write_from(buf.bytes());
+        }
+        n
     }
 
     /// 读取 MultiBuffer（内部实现）

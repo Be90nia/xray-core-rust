@@ -564,13 +564,9 @@ impl Writer for XudpFramingWriter {
                 .write_header(mb.len(), None, &mut self.scratch)
                 .map_err(|e| xray_buf::io::Error::WriteError(format!("xudp frame header: {e}")))?;
             let mut frame = Buffer::new();
-            {
-                let spare = frame.writable_bytes();
-                let n = self.scratch.len();
-                assert!(n <= spare.len(), "xudp frame header exceeds buffer capacity");
-                spare[..n].copy_from_slice(&self.scratch);
-                frame.advance_write(n);
-            }
+            let n = self.scratch.len();
+            assert!(n <= frame.free(), "xudp frame header exceeds buffer capacity");
+            frame.write_from(&self.scratch);
             let mut out = MultiBuffer::with_capacity(mb.buffer_count() + 1);
             out.push(frame);
             for buf in mb.into_buffers() {

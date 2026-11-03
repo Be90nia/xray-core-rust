@@ -387,7 +387,12 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.write_buf[..2].copy_from_slice(&plain_size.to_be_bytes());
         let (size_plain, size_tag) = self.write_buf.split_at_mut(2);
         self.write_aead
-            .seal_in_place_with_tag(&self.write_nonce, &[], size_plain, size_tag)
+            .seal_in_place_with_tag(
+                &self.write_nonce,
+                &[],
+                size_plain,
+                xray_crypto::aead::uninit_mut(size_tag),
+            )
             .map_err(|e| SsError::AeadSeal(e.to_string()))?;
 
         // ② payload 段：调用方缓冲原地 seal（密文覆写明文，tag 落尾部 headroom）。
