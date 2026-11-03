@@ -29,7 +29,7 @@
 
 use std::{
     future::Future,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -56,13 +56,16 @@ pub struct ArmScope {
     /// 关闭广播（true = 已关）。`send_replace` 对零订阅者无害；每接收端独立
     /// 版本账 → 关闭前后订阅都读得到终值（无丢失唤醒）。
     closed: watch::Sender<bool>,
+    /// 收割节流计数（O29）：arm scope 每连接 spawn 一次，逐次收割 = 每次 spawn
+    /// 两次同一把 scope 锁；每 [`crate::compat::REAP_EVERY`] 次摊一次。
+    tick: AtomicUsize,
 }
 
 impl ArmScope {
     /// 新建 arm scope（内部自建 udf `FxScope`；返回 `Arc` 便于跨任务共享）。
     pub fn new() -> Arc<Self> {
         let (closed, _) = watch::channel(false);
-        Arc::new(Self { fx: Arc::new(FxScope::new()), closed })
+        Arc::new(Self { fx: Arc::new(FxScope::new()), closed, tick: AtomicUsize::new(0) })
     }
 
     /// 内嵌托管 scope（token / in_flight / `expect_idle` 等观察与 builder 面）。
@@ -71,7 +74,8 @@ impl ArmScope {
     }
 
     /// 托管任务（udf `FxScope::spawn_tracked` + 收割：先清已完成条目再入集，
-    /// bd 86i4h 阶段1——条目数跟随在途数而非累计 spawn 数）。
+    /// bd 86i4h 阶段1——条目数跟随在途数而非累计 spawn 数；收割按
+    /// [`crate::compat::REAP_EVERY`] 摊薄，O29）。
     ///
     /// `#[inline(always)]`：薄透传不落真实栈帧——debug 构建不内联，本仓 xray-core
     /// inbound 深轮询链的测试线程栈余量已薄（mzput 实证：一层透传帧即可击穿
@@ -84,7 +88,13 @@ impl ArmScope {
     where
         T: Send + 'static,
     {
-        crate::compat::spawn_reaping(&self.fx, &scope_log(), "arm scope", fut)
+        crate::compat::spawn_reaping_ticked(
+            &self.fx,
+            &scope_log(),
+            "arm scope",
+            Some(&self.tick),
+            fut,
+        )
     }
 
     /// accepting 闸读侧（true = 已关）。

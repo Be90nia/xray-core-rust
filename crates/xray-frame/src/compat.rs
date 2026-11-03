@@ -22,7 +22,10 @@
 use std::{
     fmt,
     future::Future,
-    sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock},
+    sync::{
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -203,11 +206,21 @@ pub fn reap_into(scope: &FxScope, log: &LogFacade, label: &str) -> usize {
     count
 }
 
+/// 收割节流间隔（O29）：长生命周期 scope 每 N 次 spawn 摊一次 `try_reap`。
+///
+/// `try_reap` 与 `spawn_tracked` 取的是**同一把** scope 锁 → 逐次收割 = 每 spawn
+/// 两次加锁（每连接 2 次 spawn ⇒ 4 次全局锁）。摊薄后每连接 2 次，代价有界：
+/// 已完成条目在每个 scope 内最多滞留 `REAP_EVERY - 1` 条（与 spawn 总次数无关）。
+/// **停机排空不受影响**：`shutdown_timeout` 自走 join 循环收 JoinSet，panic 清单
+/// 进 `ShutdownReport`（不经本路径，不丢）。
+pub const REAP_EVERY: usize = 32;
+
 /// 托管 spawn 的收割版（bd 86i4h 阶段1）：**先收割已完成条目、再入集新任务**
 /// ——条目数跟随在途任务数而非累计任务数（长跑服务端「每连接一个任务」形态的
 /// 内存只涨不降即由此消失）。拒发（`ScopeClosed`）与 panic 上报口径同
 /// [`ManagedScope::spawn`]，调用方无需各自处理。
 ///
+/// 逐次收割（无节流）；长生命周期 scope 用 [`spawn_reaping_ticked`] 摊薄。
 /// spawn 速率 ≥ panic 速率时滞留窗口恒有界；空闲期 panic 由停机排空兜底上报
 /// （udf `ShutdownReport::panicked`，不丢）。
 ///
@@ -223,7 +236,26 @@ pub fn spawn_reaping<T>(
 where
     T: Send + 'static,
 {
-    reap_into(scope, log, label);
+    spawn_reaping_ticked(scope, log, label, None, fut)
+}
+
+/// 同 [`spawn_reaping`]，`tick` 由**该 scope 自持**（每 scope 一个计数）：`None`
+/// = 逐次收割，`Some` = 每 [`REAP_EVERY`] 次收割一次。节流只改「何时收割」，不改
+/// 收割语义与 JoinSet 归属（条目有界，panic 上报延迟 ≤ `REAP_EVERY` 次 spawn）。
+#[inline(always)]
+pub fn spawn_reaping_ticked<T>(
+    scope: &FxScope,
+    log: &LogFacade,
+    label: &str,
+    tick: Option<&AtomicUsize>,
+    fut: impl Future<Output = T> + Send + 'static,
+) -> Result<Spawned<T>, ScopeClosed>
+where
+    T: Send + 'static,
+{
+    if tick.is_none_or(|t| t.fetch_add(1, Ordering::Relaxed) % REAP_EVERY == 0) {
+        reap_into(scope, log, label);
+    }
     let spawned = scope.spawn_tracked(fut);
     if spawned.is_err() {
         log.warn(format!("{label}: spawn rejected (scope closed)"));
@@ -245,9 +277,10 @@ where
 /// **不是**等任务自然跑完（口径同迁移前自持 `JoinSet` 的 drop=abort）。
 ///
 /// 已知上界（迁移前自持账本的差异，已由上游补齐）：`FxScope` 在 udf `51c2428b`
-/// （issue#13）后提供增量收割口 `try_reap`，本件**每次 spawn 前先收割**——已完成
-/// 条目即时出集（长跑进程不再按 spawn 总数累积），其中的 panic 载荷随之经本件落
-/// 日志；停机排空（`shutdown_timeout`）返回 udf [`ShutdownReport`]，panic 清单与
+/// （issue#13）后提供增量收割口 `try_reap`，本件每次 spawn 先收割（每
+/// [`REAP_EVERY`] 次摊一次，O29）——已完成条目出集不再随 spawn 总数累积（滞留
+/// 上限 `REAP_EVERY - 1` 条），其中的 panic 载荷随之经本件落日志；停机排空
+/// （`shutdown_timeout`）返回 udf [`ShutdownReport`]，panic 清单与
 /// 未完成数一并在本件上报（udf 侧此前丢弃 join 结果、静默丢条目的缺口已修）。
 #[derive(Clone)]
 pub struct ManagedScope {
@@ -255,6 +288,9 @@ pub struct ManagedScope {
     label: Arc<str>,
     scope: Arc<FxScope>,
     log: LogFacade,
+    /// 收割节流计数（O29）：随 scope 共享（clone 同一份），每 [`REAP_EVERY`] 次
+    /// spawn 摊一次 `try_reap`。
+    tick: Arc<AtomicUsize>,
 }
 
 impl ManagedScope {
@@ -264,20 +300,22 @@ impl ManagedScope {
             label: label.into(),
             scope: Arc::new(FxScope::new()),
             log: LogFacade::new("compat", Vec::new()),
+            tick: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// 托管 spawn：scope 已关（拒发）时记 warn 并回 `Err`。
     ///
-    /// 走 [`spawn_reaping`]（udf `try_reap` + 入集）：已完成条目即时出集，其中
-    /// 的 panic 载荷当场落日志。udf `task_body` 自带 `catch_unwind`（panic 归一成
-    /// `TaskError::Panicked` 双投 oneshot + 集合条目），故本件**不再包任务体**：
-    /// 上报口径 = `background task panicked: {payload}`（同迁移前 `harvest`）。
+    /// 走 [`spawn_reaping_ticked`]（udf `try_reap` + 入集，收割按本 scope 的 `tick`
+    /// 摊薄）：已完成条目出集，其中的 panic 载荷落日志。udf `task_body` 自带
+    /// `catch_unwind`（panic 归一成 `TaskError::Panicked` 双投 oneshot + 集合条目），
+    /// 故本件**不再包任务体**：上报口径 = `background task panicked: {payload}`
+    /// （同迁移前 `harvest`）。
     pub fn spawn<F>(&self, fut: F) -> Result<Spawned<()>, ScopeClosed>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        spawn_reaping(&self.scope, &self.log, &self.label, fut)
+        spawn_reaping_ticked(&self.scope, &self.log, &self.label, Some(&self.tick), fut)
     }
 
     /// 增量收割已完成条目（udf `try_reap`）并上报 panic；返回收割条数。
@@ -475,7 +513,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 assert!(panicked.is_finished(), "panic 任务必须终局（udf task_body 归一）");
-                scope.spawn(async {}).expect("spawn 照常受理（panic 不传染 scope）");
+                // 收割按 REAP_EVERY 摊薄（O29）→ 触发面要够一整轮才轮到收割。
+                for _ in 0..REAP_EVERY {
+                    scope.spawn(async {}).expect("spawn 照常受理（panic 不传染 scope）");
+                }
                 for _ in 0..200 {
                     if scope.in_flight() == 0 {
                         break;
@@ -609,7 +650,10 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 drop(doomed); // 句柄丢弃：载荷只在集合面
-                let _ = arm.spawn(async {}).expect("spawn accepted");
+                // 收割按 REAP_EVERY 摊薄（O29）→ 触发面要够一整轮才轮到收割。
+                for _ in 0..REAP_EVERY {
+                    let _ = arm.spawn(async {}).expect("spawn accepted");
+                }
                 assert_eq!(
                     arm.fx().try_reap().len(),
                     0,
