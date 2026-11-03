@@ -1,11 +1,15 @@
 //! bd s8eio 证据锚：**服务端 accept 计数**（不是客户端日志）。
 //!
-//! 断言两件事：
-//! 1. 默认配置（无 `poolSize`）⇒ 一条代理链路 = **1 条**服务端连接 （Go 26.10.17 ws dialer
-//!    无池：`websocket/dialer.go` 每次 Dial 现拨）。
-//! 2. 显式 `poolSize>0` ⇒ 预连接池仍可用（后台补拨 → 服务端 accept 数 > 1）。
+//! 断言三件事：
+//! 1. 默认配置（无 `poolSize`）⇒ 缺省 12 = 开池 ⇒ 后台补拨让服务端 accept 数 **> 1** （省后续会话 1
+//!    个握手 RTT）。
+//! 2. 显式 `poolSize: 0` ⇒ 关池 ⇒ 一条代理链路 = **1 条**服务端连接（每次 Dial 现拨， 严格对齐 Go
+//!    26.10.17 `websocket/dialer.go` 无池）。
+//! 3. 显式 `poolSize: 12` ⇒ 池可用（与缺省同效，此条测的是显式配置路径）。
 //!
-//! 把默认值改回 12，测试 1 立即红（burst 补拨会在此窗口内多 accept）——即反证。
+//! 历史：s8eio 曾把缺省改成 0（理由「Go 无池」），本文件当时以「默认配置 ⇒ 1 条」作反证锚；
+//! 2026-11-02 复议把缺省恢复 12（缺省 0 关池实测 TTFB 慢 33%），该断言随之改为测
+//! 显式 `poolSize: 0`，新的「默认 ⇒ 开池」断言见测试 1。
 
 use std::{
     net::Ipv4Addr,
@@ -84,19 +88,39 @@ async fn run_one_session(port: u16, settings: &StreamSettings) {
     tokio::time::sleep(Duration::from_millis(700)).await;
 }
 
-/// 默认配置（无 `poolSize`）= 与 Go 对齐不预连接 ⇒ 服务端只见 1 条连接。
+/// 默认配置（无 `poolSize`）⇒ 缺省 12 = 开池 ⇒ 后台补拨让服务端 accept 数 > 1。
 #[tokio::test]
-async fn default_config_opens_exactly_one_server_connection() {
+async fn default_config_preconnects() {
     register_dialer().unwrap();
     let (port, accepts) = spawn_counting_ws_echo().await;
     let settings = StreamSettings { protocol: "ws".into(), ..StreamSettings::tcp() };
 
     run_one_session(port, &settings).await;
 
+    let seen = accepts.load(Ordering::SeqCst);
+    assert!(
+        seen > 1,
+        "默认配置（缺省 poolSize=12）必须开池：后台补拨让服务端 accept > 1，实际 {seen}"
+    );
+}
+
+/// 显式 `poolSize: 0` ⇒ 关池 ⇒ 服务端只见 1 条连接（对齐 Go 26.10.17 ws 无池）。
+#[tokio::test]
+async fn explicit_pool_size_zero_opens_exactly_one_server_connection() {
+    register_dialer().unwrap();
+    let (port, accepts) = spawn_counting_ws_echo().await;
+    let settings = StreamSettings {
+        protocol: "ws".into(),
+        transport_json: Some(serde_json::json!({"path": "/ws", "poolSize": 0})),
+        ..StreamSettings::tcp()
+    };
+
+    run_one_session(port, &settings).await;
+
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         1,
-        "默认配置必须只开 1 条服务端连接（Go 26.10.17 ws 无池）；多出即池默认被打开"
+        "显式 poolSize=0 必须关池：只开 1 条服务端连接；多出即池未被关"
     );
 }
 

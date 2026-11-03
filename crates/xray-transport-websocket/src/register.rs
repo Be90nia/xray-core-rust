@@ -334,11 +334,11 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
     }
 
     // ===== 预连接池（virgin-connection pool，bd k9qg → ss-ws 池票修订）=====
-    // 池启用条件：`Config::pool_size > 0`（**默认 0 = 关池，与 Go 26.10.17 对齐**
-    // ——Go ws dialer 无任何预热/复用；bd s8eio）。显式 `wsSettings.poolSize`
-    // 才启用。key 必须包含能区分握手细节的字段（host/port/path/sni/
-    // fingerprint）——任意字段不同 = 不能复用（TLS 握手 / WS 升级 / SNI 校验
-    // 阶段已不同）。
+    // 池启用条件：`Config::pool_size > 0`（**缺省 12 = 开池**；bd s8eio 复议：
+    // 缺省 0 关池实测经 CF 的 ws 节点 TTFB 慢 33%，判为真倒退）。显式
+    // `wsSettings.poolSize: 0` 关池（需严格对齐 Go 无池时用）。key
+    // 必须包含能区分握手细节的字段（host/port/path/sni/ fingerprint）——任意字段不同 =
+    // 不能复用（TLS 握手 / WS 升级 / SNI 校验 阶段已不同）。
     let pool_key = PoolKey {
         host: dest.address().to_string(),
         port: dest.port().value(),
@@ -624,7 +624,7 @@ fn hex_val(c: u8) -> Option<u8> {
 /// - `header` 或 `headers`：`map<string,string>`（同时支持两种 key 兼容客户端配置）
 /// - `ed`：u32（Early Data 长度）
 /// - `heartbeatPeriod`：u32（秒，camelCase 对齐 proto JSON）
-/// - `poolSize`：u32（预连接池空闲上限，**缺省 0 = 关池，与 Go 无池对齐**；显式非 0 才启用）
+/// - `poolSize`：u32（预连接池空闲上限，**缺省 12 = 开池**；显式 `0` 关池以严格对齐 Go 无池）
 ///
 /// `None` 或非 object 返回 [`Config::default`]。
 fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
@@ -641,9 +641,14 @@ fn parse_ws_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     // Bug-B（bd cqyj）：缺省 30s 心跳；显式 0 = 关闭。
     let heartbeat_period =
         obj.get("heartbeatPeriod").and_then(|x| x.as_u64()).map(|v| v as u32).unwrap_or(30);
-    // bd s8eio：poolSize 缺省 → 0（关池，与 `Config::default()` 一致）。Go 无池
-    // 机制，预连接是服务端可见的额外握手连接（不传数据），故须显式 opt-in。
-    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // bd s8eio 复议（2026-11-02）：poolSize 缺省 → 12（开池）。
+    // s8eio 曾把缺省改成 0（理由「Go 无池」），但那是**服务端连接数**维度，
+    // 不是 wire 语义维度——预连接池不改数据面 wire，只让客户端少付一个握手
+    // RTT。实测（v2rayN → Cloudflare Argo → 176，shadowsocks+ws+tls）：
+    // 缺省 0 关池 TTFB median 4489ms vs 显式 poolSize=12 的 3001ms（慢 33%），
+    // 且开池后与旧内核（默认 12）持平（3001 vs 2938，噪声内）→ 判定为真倒退，
+    // 恢复缺省 12。显式 `poolSize: 0` 仍可关池（服务端敏感/严格对齐 Go 时）。
+    let pool_size = obj.get("poolSize").and_then(|x| x.as_u64()).unwrap_or(12) as u32;
 
     // Go `infra/conf/transport_internet.go::WebSocketConfig.Build`：
     // path 中 `?ed=N` 提取为 Ed 字段并从 path 删除（其余 query 参数保留）。
@@ -744,12 +749,12 @@ mod tests {
         assert_eq!(cfg.heartbeat_period, 30);
     }
 
-    /// bd s8eio：poolSize 缺省 = 0（关池，与 Go 26.10.17 无池对齐）。
+    /// poolSize 缺省 = 12（开池；bd s8eio 复议——缺省 0 关池实测慢 33%）。
     #[test]
-    fn parse_ws_config_pool_size_default_off() {
+    fn parse_ws_config_pool_size_default_on() {
         let v: serde_json::Value = serde_json::from_str(r#"{"path":"/ws"}"#).unwrap();
         let cfg = parse_ws_config(Some(&v)).unwrap();
-        assert_eq!(cfg.pool_size, 0);
+        assert_eq!(cfg.pool_size, 12);
     }
 
     /// poolSize=0 显式关池。

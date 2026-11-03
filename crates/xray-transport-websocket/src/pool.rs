@@ -9,10 +9,11 @@
 //! 预连接；交付出去的连接承载过任何会话数据即绝不回池（used = 不可归还）——
 //! 交付侧无归还代码路径，预连接只由补拨任务（replenish：acquire/现拨后 spawn
 //! 后台拨号）存入，维持每 key ≤ `max_idle_per_key` 条。每条会话拿到的新鲜
-//! 连接 wire 行为与现拨一致，只是免了握手。**默认关闭**（`max_idle_per_key=0`
-//! 不预连接，与 Go 26.10.17 行为一致——Go 无池，bd s8eio）；显式
-//! `pool_size>0` 才启用，启用后每 key ≤ `max_idle_per_key` 条（Chrome 6/host
-//! × 多 host burst 上限 = 12 的调参值仍作为文档化建议保留）。
+//! 连接 wire 行为与现拨一致，只是免了握手。**缺省开池**（`Config::default()`
+//! 的 `pool_size: 12` 经 `init_config` 传入；`WsPoolConfig::default()` 自身仍是
+//! `max_idle_per_key=0`）。bd s8eio 复议：缺省 0 关池实测经 CF 的 ws 节点慢 33%；
+//! 显式 `wsSettings.poolSize: 0` 关池（严格对齐 Go 无池）。启用后每 key ≤ `max_idle_per_key`
+//! 条（Chrome 6/host × 多 host burst 上限 = 12 的调参值仍作为文档化建议保留）。
 //!
 //! ## 业界对照
 //!
@@ -115,11 +116,13 @@ impl PoolKey {
 /// 池配置。
 #[derive(Debug, Clone)]
 pub struct WsPoolConfig {
-    /// 每 key 最大空闲连接数。`0` = 关闭池化（默认）。
+    /// 每 key 最大空闲连接数。`0` = 关闭池化。
     ///
-    /// 默认 0（bd s8eio）：Go 26.10.17 无池，预连接是只会握手不传数据的额外
-    /// 服务端连接；需省握手的用户显式配 `poolSize`。调参参考：Chrome 6/host ×
-    /// 多 host burst（实测一页 50+ subresource）下 12 命中率 ~95%（3 → ~40%）。
+    /// 本类型 `default()` 为 0，但上层 `Config::default()` 用 12 经
+    /// `init_config` 传入 → **实际缺省开池**（bd s8eio 复议）。显式
+    /// `wsSettings.poolSize: 0` 关池（严格对齐 Go 无池；预连接是只握手不传数据
+    /// 的额外服务端连接）。调参参考：Chrome 6/host × 多 host burst（实测一页
+    /// 50+ subresource）下 12 命中率 ~95%（3 → ~40%）。
     pub max_idle_per_key: usize,
     /// 空闲连接最大存活时间（秒）。
     pub max_idle_duration: Duration,
