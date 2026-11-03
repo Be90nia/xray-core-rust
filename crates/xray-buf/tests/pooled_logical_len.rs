@@ -51,14 +51,27 @@ fn into_bytes_uses_logical_cursors() {
 }
 
 /// A0/A7 合体：跨连接残留对下一持有者零可见。
+///
+/// **地址断言只锚在池确实保证的转换上**：`drop`/`release` → 同线程 `alloc`
+/// ⇒ TLS 层缓存 LIFO ⇒ 必得同一块（与 `src/alloc.rs` 单测
+/// `alloc_64k_request_lands_exact_tier`、`src/buffer.rs` 单测
+/// `test_pooled_buffer_is_reused_after_drop` 同一 house pattern）。
+///
+/// 反之，`into_bytes()` 会把块**移出池**（分配随 `Bytes` 离开，见 `buffer.rs`
+/// 「尾部余块随 Bytes 离开池」注释），此后 `new_pooled` 是**新鲜分配**——地址
+/// 相同纯属系统分配器 free-list 巧合，并行负载下必漂（2026-11-03 实测 2/300
+/// 红于「同层块继续复用」断言）。故两个周期各自独立取块，残留断言始终作用在
+/// **真正被弄脏的那块**上（不弱化为恒真）。
 #[test]
 fn no_cross_connection_residue_visible_to_next_holder() {
     alloc::clear();
     // 独立分层（32K）避免与同二进制其它测试争用同层块，保证「同块复用」可断言
     const TIER: usize = 32 * 1024;
     let marker = [0xA7u8; 64];
+    let own = b"OKSYNC";
 
-    let addr = {
+    // ── 周期①：连接 A 弄脏一块 → 归还 → 连接 B 拿到**同一块**且零可见残留 ──
+    let addr_a = {
         let mut a = Buffer::new_pooled(TIER);
         // 取分配起点（end=0 时的可写视图起点）
         let addr = a.writable_bytes().as_ptr() as usize;
@@ -69,15 +82,27 @@ fn no_cross_connection_residue_visible_to_next_holder() {
     };
 
     let mut b = Buffer::new_pooled(TIER);
-    assert_eq!(b.writable_bytes().as_ptr() as usize, addr, "连接 B 必须拿到 A 归还的同一块");
+    assert_eq!(b.writable_bytes().as_ptr() as usize, addr_a, "连接 B 必须拿到 A 归还的同一块");
     assert_eq!(b.len(), 0, "归还块对下一持有者逻辑长度为 0");
     assert!(b.bytes().is_empty(), "bytes() 不得暴露 A 的残留明文");
     assert!(b.into_bytes().is_empty(), "into_bytes() 不得把 A 的残留字节当数据交出");
+    // ↑ into_bytes 消费 b：块随 Bytes 离开池（设计语义），故周期②另起一块
+
+    // ── 周期②：另一块被弄脏 → 下一持有者复用**同一块**，只交出自己写的字节 ──
+    let addr_c = {
+        let mut a2 = Buffer::new_pooled(TIER);
+        let addr = a2.writable_bytes().as_ptr() as usize;
+        a2.write_from(&marker);
+        drop(a2);
+        addr
+    };
+
+    let mut c = Buffer::new_pooled(TIER);
+    assert_eq!(c.writable_bytes().as_ptr() as usize, addr_c, "同层块继续复用");
+    assert_eq!(c.len(), 0, "归还块对下一持有者逻辑长度为 0");
+    assert!(c.bytes().is_empty(), "bytes() 不得暴露 A 的残留明文");
 
     // 连接 B 自己写多少就交出多少
-    let mut c = Buffer::new_pooled(TIER);
-    assert_eq!(c.writable_bytes().as_ptr() as usize, addr, "同层块继续复用");
-    let own = b"OKSYNC";
     c.writable_bytes()[..own.len()].copy_from_slice(own);
     c.advance_write(own.len());
     let got = c.into_bytes();
