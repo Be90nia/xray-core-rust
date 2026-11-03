@@ -15,7 +15,9 @@
 //!   全链路
 //! - [`CachedReader`] — 依赖 `pipe.Reader`，主体留 TODO
 
-use std::{collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc};
+use std::{
+    borrow::Cow, collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc,
+};
 
 use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use xray_buf::multi::MultiBuffer;
@@ -1234,7 +1236,9 @@ impl DefaultDispatcher {
 
         // 克隆必要数据进入 spawn
         let dest = destination.clone();
-        let sniff_req = sniffing_request.clone();
+        // O2：嗅探关闭时（默认配置）不深拷 —— 其余字段只在 enabled 分支读，
+        // 此前无条件 clone 一份 `Vec<String>`。
+        let sniff_req = sniffing_request.enabled.then(|| sniffing_request.clone());
         let router = self.router.clone();
         let fdns = self.fdns.clone();
         let stats = self.stats.clone();
@@ -1276,8 +1280,8 @@ impl DefaultDispatcher {
         let fut = CONN_POLICY.scope(conn_policy, async move {
             // ---- Phase 1: Sniffing ----
             let mut cr = CachedReader::with_inner(outbound_reader);
-            let (final_dest, sniffed_protocol, route_target) = if sniff_req.enabled {
-                match sniff_connection(&mut cr, &dest, &sniff_req, fdns.as_deref()).await {
+            let (final_dest, sniffed_protocol, route_target) = if let Some(sniff_req) = &sniff_req {
+                match sniff_connection(&mut cr, &dest, sniff_req, fdns.as_deref()).await {
                     Ok((d, proto, rt)) => (d, proto, rt),
                     Err(e) => {
                         tracing::debug!(dest = %dest, error = %e, "sniffing failed, using original dest");
@@ -1665,14 +1669,21 @@ impl CachedReader {
         Ok(true)
     }
 
-    /// 取缓存的首包字节切片（用于 sniffing）。
-    /// 诊断/嗅探快照访问器，非 relay 数据热路径（每连接一次）。
+    /// 取缓存的首包字节（用于 sniffing）。
+    ///
+    /// 单缓冲（读路径的常见形态）直接借用池化 Buffer，零拷贝；只有多缓冲才扁平化。
+    /// O3：此前每次嗅探尝试都整块拷成新 `Vec`（NoClue 重试最多 3 次/连接）。
+    /// 诊断/嗅探快照访问器，非 relay 数据热路径。
     #[allow(
         clippy::disallowed_methods,
-        reason = "嗅探快照访问器（每连接一次，非 relay 热路径）：整链扁平化是诊断接口语义，数据面传递仍走池化 MultiBuffer"
+        reason = "嗅探快照访问器（非 relay 热路径）：多缓冲才整链扁平化，单缓冲借用；数据面传递仍走池化 MultiBuffer"
     )]
-    pub fn cached_bytes(&self) -> Vec<u8> {
-        self.cache.as_ref().map_or(Vec::new(), |mb| mb.to_vec())
+    pub fn cached_bytes(&self) -> Cow<'_, [u8]> {
+        match self.cache.as_ref() {
+            Some(mb) if mb.buffer_count() > 1 => Cow::Owned(mb.to_vec()),
+            Some(mb) => Cow::Borrowed(mb.iter().next().map_or(&[][..], |b| b.as_ref())),
+            None => Cow::Borrowed(&[]),
+        }
     }
 }
 
