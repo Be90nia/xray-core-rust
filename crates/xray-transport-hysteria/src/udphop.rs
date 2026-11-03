@@ -6,17 +6,10 @@
 //! ponytail: Go 用 `net.PacketConn`，Rust 端用 [`PacketConn`] trait 抽象，
 //! 上层（quinn adapter）注入 `tokio::net::UdpSocket` 或 `std::net::UdpSocket` 适配。
 
-use std::{
-    collections::VecDeque,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
+use skeleton_infra::{ObjectPool, Owned, ResetPhase};
 use tokio::sync::mpsc;
 
 use crate::error::{HysteriaError, Result};
@@ -51,35 +44,53 @@ struct UdpPacket {
 /// recv_loop 与 read_from 消费端共享：buf 随 [`UdpPacket`] 零拷贝流转，
 /// 消费端拷出数据后归还（对齐 Go `ReadFrom` 的 `pool.Put`）。
 ///
-/// **为何不用 udf `ObjectPool`**（2026-11-02 判定，依据 + 实测见
-/// `reports/audit-2026-11-02/udf-pool-migration.md`）：buf 按值随 [`UdpPacket`]
-/// 过 mpsc 到另一任务、稍后归还，而 `Pooled<'p, T>` 借用池、非 `'static`；池只有
-/// 「工厂出对象 → Drop 归还」一个句式，**无按值插入入口**（`release` 私有）。
-/// 「借一槽把块换进去」的组合实测让每次归还白构一块（`constructed` 每轮 +N、
-/// idle 恒 1 ⇒ 池退化成恒分配）。解锁前提 = udf 补 `insert` / `acquire_owned`。
-#[derive(Default)]
+/// 槽位存储 / 借还记账 / 有界降级 / 分片全部由 udf [`ObjectPool`] 承担（2026-11-03
+/// 迁移，依据见 `reports/audit-2026-11-03/bufpool-migration.md`）：
+/// - 取出走 `acquire_owned`：`'static` 句柄，跨 `recv_from` 的 await 持有成立， 任务被取消时 Drop
+///   即归还（不遗留脱离池的野块）；
+/// - 归还走 `insert`（按值入池）：`Some(buf)` = 池已满，裸块就地释放； `dropped_overflow` +
+///   审计事件由池留痕（原实现的静默丢弃变成可观测）；
+/// - reset 钩子做容量归一（红线：池化对象等重，防池毒化）。
 struct BufPool {
-    bufs: Mutex<VecDeque<Vec<u8>>>,
-    /// 池空时的新分配次数（供测试断言复用）。
-    allocs: AtomicUsize,
+    inner: Arc<ObjectPool<Vec<u8>>>,
 }
 
 impl BufPool {
-    /// 取 buf（Go `pool.Get`）：优先复用，池空才分配。
-    fn get(&self) -> Vec<u8> {
-        if let Some(buf) = self.bufs.lock().pop_front() {
-            return buf;
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(ObjectPool::with_reset(
+                // max = idle 额度 + 在途额度：插入件按值认领宇宙配额，留一倍余量，
+                // 使「容量因拒收」只发生在 idle 面（= 原 `put` 的 `PACKET_QUEUE_SIZE` 门）。
+                PACKET_QUEUE_SIZE * 2,
+                PACKET_QUEUE_SIZE,
+                // 工厂 = 原 `get` 的 miss 分支（池空才分配）。
+                || vec![0u8; UDP_BUFFER_SIZE],
+                |buf: &mut Vec<u8>| {
+                    // 容量归一：合规块只付一次 len 比较；异形块（超长/短块）就地归一到
+                    // 定长，免得把脏块投给下一个借出方。
+                    if buf.len() != UDP_BUFFER_SIZE {
+                        buf.clear();
+                        buf.resize(UDP_BUFFER_SIZE, 0);
+                    }
+                },
+                ResetPhase::OnReturn,
+            )),
         }
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        vec![0u8; UDP_BUFFER_SIZE]
     }
 
-    /// 归还 buf（Go `pool.Put`），超量直接丢弃防无界滞留。
+    /// 取 buf（Go `pool.Get`）：优先复用，池空才按工厂分配。
+    ///
+    /// 返回 `'static` 句柄而非裸块：recv 循环跨 `recv_from` 的 await 持有它；进
+    /// [`UdpPacket`] 前才 `detach()` 交出裸块——包在 mpsc 上跨任务，消费端不需要
+    /// 知道池的存在。
+    fn get(&self) -> Owned<Vec<u8>> {
+        self.inner.acquire_owned()
+    }
+
+    /// 归还 buf（Go `pool.Put`）：容量裁决/计数/审计全由 `insert` 完成。
     fn put(&self, buf: Vec<u8>) {
-        let mut bufs = self.bufs.lock();
-        if bufs.len() < PACKET_QUEUE_SIZE {
-            bufs.push_back(buf);
-        }
+        // `Some` = 池已满（`insert` 已记 dropped_overflow + 发审计事件）⇒ 就地释放。
+        drop(self.inner.insert(buf));
     }
 }
 
@@ -215,7 +226,7 @@ impl UdpHopPacketConn {
         }
 
         let (recv_tx, recv_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
-        let pool = Arc::new(BufPool::default());
+        let pool = Arc::new(BufPool::new());
 
         let inner = Arc::new(Mutex::new(UdpHopInner {
             addrs,
@@ -361,8 +372,9 @@ impl UdpHopPacketConn {
 
 /// recv 循环（对应 Go `recvLoop`）。
 ///
-/// buf 从池 Get，直接 recv 进池 buf（无草稿拷贝），成功后随包 move 出去，
-/// 由消费端 read_from 归还池（对齐 Go `pool.Get`/`pool.Put`）。
+/// buf 从池借出（`'static` 句柄），直接 recv 进池 buf（无草稿拷贝），成功后
+/// `detach` 出裸块随包 move 出去，由消费端 read_from 用 `insert` 归还池
+/// （对齐 Go `pool.Get`/`pool.Put`）。
 async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>, pool: Arc<BufPool>) {
     loop {
         let mut buf = pool.get();
@@ -371,7 +383,7 @@ async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>, pool:
         match res {
             Ok((n, addr)) => {
                 // buf 所有权零拷贝移入 packet（Go: readCh <- packet{p: p[:n]}）。
-                let pkt = UdpPacket { buf, n, addr: Some(addr), err: None };
+                let pkt = UdpPacket { buf: buf.detach(), n, addr: Some(addr), err: None };
                 match tx.try_send(pkt) {
                     Ok(()) => {},
                     // 队列满：丢弃包，buf 归还池（Go 侧 channel 阻塞背压，此处丢弃防堆积）。
@@ -384,7 +396,8 @@ async fn recv_loop(conn: Arc<dyn PacketConn>, tx: mpsc::Sender<UdpPacket>, pool:
                 let kind = e.kind();
                 if matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) {
                     // buf 未消费，归还池（Go: pool.Put(p[:cap(p))] 后 continue）。
-                    pool.put(buf);
+                    // 句柄未 detach ⇒ drop 即归还（不必绕 insert 一趟）。
+                    drop(buf);
                     let _ =
                         tx.try_send(UdpPacket { buf: Vec::new(), n: 0, addr: None, err: Some(e) });
                     continue;
@@ -612,25 +625,66 @@ mod tests {
         }
 
         // 回池断言：消费端归还后池非空。
-        let pooled = conn.pool.bufs.lock().len();
-        assert!(pooled >= 1, "pool should hold recycled bufs, got {pooled}");
+        let m = conn.pool.inner.metrics();
+        assert!(m.core.idle >= 1, "pool should hold recycled bufs, idle={}", m.core.idle);
         // 复用断言：8 包只允许 ≤2 次池外新分配（首包 + 至多一个在途 buf）。
-        let allocs = conn.pool.allocs.load(Ordering::Relaxed);
-        assert!(allocs <= 2, "8 packets should reuse pooled bufs, allocs={allocs}");
+        assert!(
+            m.constructed <= 2,
+            "8 packets should reuse pooled bufs, constructed={}",
+            m.constructed
+        );
+        // 同口径正面读数：至少 6 次命中 idle 槽（改前只断言分配数上限）。
+        assert!(m.reused >= 6, "8 packets should reuse pooled bufs, reused={}", m.reused);
+        assert_eq!(m.reset_panicked, 0, "归一路径只有赋值，不得 panic");
 
         conn.close().await.ok();
     }
 
     #[test]
     fn buf_pool_get_put_reuses() {
-        let pool = BufPool::default();
-        let b = pool.get();
+        let pool = BufPool::new();
+        let b = pool.get().detach();
         assert_eq!(b.len(), UDP_BUFFER_SIZE);
-        assert_eq!(pool.allocs.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.inner.metrics().constructed, 1, "池空 ⇒ 工厂造一块");
         pool.put(b);
-        let b2 = pool.get();
-        assert_eq!(pool.allocs.load(Ordering::Relaxed), 1, "must reuse instead of realloc");
+        assert_eq!(pool.inner.metrics().core.idle, 1, "归还即入 idle");
+        let b2 = pool.get().detach();
+        assert_eq!(pool.inner.metrics().constructed, 1, "must reuse instead of realloc");
+        assert_eq!(pool.inner.metrics().reused, 1, "命中 idle 槽一次");
         pool.put(b2);
-        assert_eq!(pool.bufs.lock().len(), 1);
+        assert_eq!(pool.inner.metrics().core.idle, 1);
+    }
+
+    /// 红线：reset 钩子负责容量归一——异形块插入后必须归一到定长才可能被借出。
+    /// **反向自检锚点**：把钩子改成 no-op，本断言必红（迁移报告有实测记录）。
+    #[test]
+    fn buf_pool_reset_normalizes_poisoned_block() {
+        let pool = BufPool::new();
+        pool.put(vec![0xCD; UDP_BUFFER_SIZE * 3]);
+        assert_eq!(pool.inner.metrics().core.idle, 1, "归一到定长的块才入池");
+        let reused = pool.get();
+        assert_eq!(reused.len(), UDP_BUFFER_SIZE, "reset 必须把块归一到定长");
+        assert!(
+            reused.iter().all(|&b| b == 0),
+            "归一后必须清零：禁把上一轮的脏数据发给下一个借出方"
+        );
+    }
+
+    /// udf 独有语义：`insert` 收不下时**按值交回**（`Some`）+ `dropped_overflow`
+    /// 留痕，池不静默吞块（改前的静默丢弃在这里变成可观测）。
+    #[test]
+    fn buf_pool_insert_overflow_returns_object_and_counts() {
+        let pool = BufPool::new();
+        for _ in 0..PACKET_QUEUE_SIZE {
+            pool.put(vec![0u8; UDP_BUFFER_SIZE]);
+        }
+        assert_eq!(pool.inner.metrics().core.idle, PACKET_QUEUE_SIZE, "idle 额度内全收");
+        assert_eq!(pool.inner.metrics().core.dropped_overflow, 0);
+
+        // 第 N+1 块：idle 额度已满 ⇒ 交回，本模块就地释放并计数。
+        pool.put(vec![0u8; UDP_BUFFER_SIZE]);
+        let m = pool.inner.metrics();
+        assert_eq!(m.core.dropped_overflow, 1, "超量归还必须计数，不得静默");
+        assert_eq!(m.core.idle, PACKET_QUEUE_SIZE, "idle 不得越过额度");
     }
 }

@@ -17,9 +17,10 @@ xray-transport-quic = { path = "../xray-transport-quic" }
 # T3.2a 日志收敛：LogFacade（target = xray_frame::transport::splithttp）统一入口
 xray-frame = { path = "../xray-frame" }
 # xmux ManagerPool 注册表层：udf memgov::BoundedRegistry（keyed 有界注册表，
-# fail-closed；bd 复核 2026-11-02 交付⑦）。path 形态同各 app crate（udf-frame
-# 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
-udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov"] }
+# fail-closed；bd 复核 2026-11-02 交付⑦）；pool = 池化读流的块池（udf ObjectPool，
+# bd gz1ym 迁移）。path 形态同各 app crate（udf-frame 仓内工作副本即改即用；CI 由
+# fetch-udf 拉料，不锁 rev）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov", "pool"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
