@@ -2,13 +2,12 @@
 //!
 //! 协议要求：服务端接到新 session 后，从 session 首帧读 SOCKS5 目标地址：
 //! - `dispatch = Some(h)`：构造 Destination + Link → `h.dispatch(&dest, link)`
-//!   （reader=InitialedReader{consumed}, writer=SessionBridge{duplex}）。
+//!   （reader=InitialedReader{consumed}+SessionReader, writer=SessionWriter）。
 //! - `dispatch = None`：直连 TCP（仅 loopback 测试）。
 //!
 //! 桥接策略：Session 仅暴露 `async fn read/write(&self, ...)`，非 `AsyncRead`
-//! trait。在 `poll_read/poll_write` 里直接 poll future 会遇到 buf 生命周期问题。
-//! 复用 client.rs 的 `duplex + pump` 模式：构造 `tokio::io::duplex(64KiB)`，
-//! server_io 端交给 Session pump，client_io 端供 InitialedReader/Link 用。
+//! trait；Link 直挂 [`crate::session_io`] 的在途-future 适配器（无中转任务、
+//! 无 duplex 环，每方向 1 次 scratch 拷贝）。
 //!
 //! 见 bd Xray-core-rust-dax。
 
@@ -26,7 +25,7 @@ use anytls::{
 use sha2::{Digest, Sha256};
 use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
@@ -42,7 +41,11 @@ use xray_common::{
 use xray_frame::LogFacade;
 use xray_transport::link::Link;
 
-use crate::{error::Result, socks::SocksAddr};
+use crate::{
+    error::Result,
+    session_io::{SessionReader, SessionWriter},
+    socks::SocksAddr,
+};
 
 /// mock server 诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目
 /// 工具链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶
@@ -50,9 +53,6 @@ use crate::{error::Result, socks::SocksAddr};
 /// `xray_frame::anytls` + mask_secrets。只在握手/认证/桥接错误与超时分支发射
 /// （mock 面，非逐包稳态；pump 循环外取一次引用，坑约束⑫）。
 static SERVER_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytls", vec![]));
-
-/// anytls duplex 缓冲（64 KiB，与 client.rs 一致）。
-const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 
 /// 服务端握手/首包限时（绝对 deadline，从 accept 起算，覆盖 TLS 握手、认证帧
 /// 读取、session 启动与 SOCKS5 target 首包）。产品缺省对齐 policy
@@ -297,20 +297,12 @@ async fn handle_conn(
         let dispatch = dispatch.clone();
         let kill_tx = kill_tx_cell.lock().take();
         let fx = Arc::clone(&fx_session);
-        // fx 按 Arc 值移交（'static future；内部再借引用会随闭包局部悬垂）
-        let fx_task = Arc::clone(&fx);
         // 每 session spawn 前先收割（bd 86i4h 阶段2）。
         xray_frame::compat::spawn_reaping(
             &fx,
             &SERVER_LOG,
             "anytls session",
-            handle_session(
-                fx_task,
-                session,
-                dispatch,
-                kill_tx,
-                handshake_deadline_for_session.clone(),
-            ),
+            handle_session(session, dispatch, kill_tx, handshake_deadline_for_session.clone()),
         )
         .expect("internal FxScope is never closed");
     });
@@ -356,7 +348,6 @@ async fn handle_conn(
 /// SOCKS5 target 首包受 `first_packet_deadline` 限时（与握手段共用的绝对
 /// deadline）：对端认证通过后不发首包，到期发 FIN + shutdown 关闭连接（bd v57c）。
 async fn handle_session(
-    fx: Arc<FxScope>,
     session: Arc<Session>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
@@ -399,34 +390,24 @@ async fn handle_session(
                 finish_session(&session, kill_tx).await;
                 return;
             };
-            serve_uot_session(session, handler, kill_tx, fx, buf[consumed..n].to_vec()).await;
+            serve_uot_session(session, handler, kill_tx, buf[consumed..n].to_vec()).await;
             return;
         }
     }
 
     if let Some(handler) = dispatch {
         // 生产路径：dispatcher/router 分发。
-        // Link 的 reader 用 InitialedReader{consumed 前缀 + duplex read_half}
-        // ——reader 先吐出多读的 payload，再透传 session 后续 application data。
-        // writer 用 duplex write_half，dispatcher 关闭 writer 时 pump 收到 EOF。
+        // Link 直挂 session 适配器（ADR P-6）：reader 用 InitialedReader 先吐
+        // 多读的 payload 再透传后续 application data；writer 直接落 session 帧。
+        // 无中转任务/无 duplex 环——dispatch 返回后写入已全部入队，再统一收尾。
         let dest = socks_to_destination(&target);
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        let (rd_half, wr_half) = tokio::io::split(client_io);
-        // 组件自持 FxScope 记账（B6，app 家族同款）：session pump 随 handler
-        // drop 兜底 abort；dispatch 关闭 writer 时 pump 亦随 duplex EOF 退出。
-        // 每 session spawn 前先收割（bd 86i4h 阶段2）：条目不随累计会话数增长。
-        xray_frame::compat::spawn_reaping(
-            &fx,
-            &SERVER_LOG,
-            "anytls session pump",
-            pump_session_to_duplex(session.clone(), server_io),
-        )
-        .expect("internal FxScope is never closed");
-        let reader = new_reader(InitialedReader::new(buf[consumed..n].to_vec(), rd_half));
-        let writer = new_writer(wr_half);
+        let reader = new_reader(InitialedReader::new(
+            buf[consumed..n].to_vec(),
+            SessionReader::new(session.clone()),
+        ));
+        let writer = new_writer(SessionWriter::new(session.clone()));
         let link = Link::new(reader, writer);
         handler.dispatch(&dest, link).await;
-        // dispatch 返回后 dispatch handle 已 drop，pump 随 duplex EOF 退出；
         // 按 FIN + shutdown 收尾释放会话（同 mock 直连分支）。
         finish_session(&session, kill_tx).await;
     } else {
@@ -468,7 +449,6 @@ async fn serve_uot_session(
     session: Arc<Session>,
     handler: Arc<dyn DispatchHandler>,
     kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    fx: Arc<FxScope>,
     mut pre: Vec<u8>,
 ) {
     let (is_connect, uot_dest, used) = loop {
@@ -508,22 +488,12 @@ async fn serve_uot_session(
     };
     let dest = Destination::new(xaddr, Port::new(port), Network::UDP);
 
-    let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-    let (rd_half, wr_half) = tokio::io::split(client_io);
-    // 每 session spawn 前先收割（bd 86i4h 阶段2）：条目不随累计会话数增长。
-    xray_frame::compat::spawn_reaping(
-        &fx,
-        &SERVER_LOG,
-        "anytls uot pump",
-        pump_session_to_duplex(session.clone(), server_io),
-    )
-    .expect("internal FxScope is never closed");
     let link = Link::new(
         Box::new(XudpUnframingReader::new(Box::new(crate::uot::LengthFramedReader::new(
-            InitialedReader::new(pre, rd_half),
+            InitialedReader::new(pre, SessionReader::new(session.clone())),
         )))),
         Box::new(XudpFramingWriter::new(
-            Box::new(crate::uot::LengthFramedWriter::new(wr_half)),
+            Box::new(crate::uot::LengthFramedWriter::new(SessionWriter::new(session.clone()))),
             dest.clone(),
         )),
     );
@@ -553,52 +523,6 @@ fn socks_to_destination(addr: &SocksAddr) -> Destination {
         SocksAddr::Ipv6(a) => (XAddress::IPv6(*a.ip()), a.port()),
     };
     Destination::new(xaddr, Port::new(p), Network::TCP)
-}
-
-/// 双向桥接 anytls Session 与 `tokio::io::duplex` 的 server 端。
-///
-/// 与 client.rs::pump_stream 同一模式：任何一端 EOF/出错都终止。
-async fn pump_session_to_duplex(session: Arc<Session>, server_io: DuplexStream) {
-    let log = &*SERVER_LOG;
-    let (mut rd, mut wr) = tokio::io::split(server_io);
-    let session_down = session.clone();
-    let down = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match session_down.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if wr.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                },
-                Err(e) => {
-                    log.debug(format!("pump session→duplex read: {e}"));
-                    break;
-                },
-            }
-        }
-        let _ = wr.shutdown().await;
-    };
-    let up = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if session.write(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                },
-                Err(e) => {
-                    log.debug(format!("pump duplex→session read: {e}"));
-                    break;
-                },
-            }
-        }
-        // 会话收尾（FIN + shutdown）由 handle_session::finish_session 统一执行。
-    };
-    tokio::join!(down, up);
 }
 
 /// 前缀已读字节的 reader：先吐 `initial`，再透传内层流（dispatch Link 场景）。

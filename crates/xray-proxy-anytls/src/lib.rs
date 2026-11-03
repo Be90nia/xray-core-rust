@@ -36,6 +36,8 @@ pub mod outbound;
 // P2 批次 D 插件化：AnytlsPlugin + AnytlsLifecycle。
 pub mod plugin;
 pub mod server;
+/// `Session` → AsyncRead/AsyncWrite 适配（服务端 Link 直连用，不对外）。
+mod session_io;
 pub mod socks;
 pub mod uot;
 
