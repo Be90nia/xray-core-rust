@@ -20,6 +20,7 @@
 
 pub mod client;
 pub mod config;
+pub mod conn;
 pub mod dispatcher;
 pub mod error;
 pub mod inbound;
@@ -32,6 +33,7 @@ pub mod stream;
 pub mod validator;
 
 pub use config::{AeadCipher, Cipher, CipherType, InnerAead, MemoryAccount};
+pub use conn::SsStreamConn;
 pub use dispatcher::{
     Ss2022DialParams, SsConnection, SsOutboundConfig, make_ss_dial_fn, make_ss_dial_fn_with_ctx,
     parse_ss_config,

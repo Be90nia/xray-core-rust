@@ -352,6 +352,30 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         if !fits || self.pending_client_2022.is_some() || self.pending_server_2022.is_some() {
             return self.write_chunk(buf.bytes()).await;
         }
+
+        // ①② seal（与直挂连接的同步 seal 路径同源同一份代码 ⇒ wire 字节不可能漂移）。
+        self.seal_chunk_in_place(buf)?;
+
+        // ③ 两段向量写：[sealed_size][ciphertext+tag]（同一分配内连续，无拼装）。
+        xray_buf::writer::write_two_segments(&mut self.inner, &self.write_buf, buf.bytes())
+            .await
+            .map_err(|e| SsError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// **同步**原地 seal 一个 chunk（**不落线**）：size 段进 `write_buf`，
+    /// 载荷密文+tag 覆写进 `buf`（尾部 tag 区）。
+    ///
+    /// 与 [`Self::write_chunk_in_place`] 的 ①② 步同源同一份代码——直挂连接
+    /// （[`crate::conn::SsStreamConn`]）在 poll 侧调用它落线，wire 字节与旧泵逐字节一致。
+    ///
+    /// 调用前置条件（与 `write_chunk_in_place` 的 `fits` 同）：`buf` 尾部 headroom
+    /// ≥ tag_size 且 `buf.len() ≤ u16::MAX`。
+    ///
+    /// # Errors
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    /// - [`SsError::InsufficientData`]：载荷超出 u16 长度域或尾部 headroom 不足。
+    pub(crate) fn seal_chunk_in_place(&mut self, buf: &mut xray_buf::buffer::Buffer) -> Result<()> {
         let tag_size = self.tag_size;
 
         // ① size 段：2B 明文原地 seal 进复用缓冲（tag 紧随其后），nonce 先推进。
@@ -370,7 +394,6 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         increment_nonce_bytes(&mut self.write_nonce);
         let payload_len = buf.len();
         {
-            // `fits` 已保证尾部 headroom ≥ tag_size ⇒ 不会 None；分支仍保持 fail-visible。
             let window = buf.seal_window(tag_size).ok_or(SsError::InsufficientData(payload_len))?;
             self.write_aead
                 .seal_in_place_with_tag(&self.write_nonce, &[], window.payload, window.tag)
@@ -378,12 +401,14 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         }
         // seal_window 只借出视图、不推进 end：tag 写完必须显式提交。
         buf.advance_write(tag_size);
-
-        // ③ 两段向量写：[sealed_size][ciphertext+tag]（同一分配内连续，无拼装）。
-        xray_buf::writer::write_two_segments(&mut self.inner, &self.write_buf, buf.bytes())
-            .await
-            .map_err(|e| SsError::Io(e.to_string()))?;
         Ok(())
+    }
+
+    /// 最近一次 [`Self::seal_chunk_in_place`] 产出的 **size 段**（密文 2B + tag）。
+    ///
+    /// 直挂连接用它作两段写的第一段（与旧泵 `write_two_segments(&write_buf, body)` 同序）。
+    pub(crate) fn sealed_size_chunk(&self) -> &[u8] {
+        &self.write_buf
     }
 
     /// 单块 wire 开销：size/payload 两段的 AEAD tag 字节数。
@@ -454,7 +479,26 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     ///
     /// padding 策略对齐 Go：payload < 900 → 随机 1..=900；否则 0。
     async fn emit_pending_client_2022(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        let Some(p) = self.pending_client_2022.take() else { return Ok(payload.to_vec()) };
+        if self.pending_client_2022.is_none() {
+            return Ok(payload.to_vec());
+        }
+        let (wire, used) = self.build_client_2022_header(payload)?;
+        self.inner.write_all(&wire).await?;
+        Ok(payload[used..].to_vec())
+    }
+
+    /// **同步**构造 SS-2022 请求首写字节（**不落线**）：`[prefix][sealed fixed][sealed
+    /// var(addr_port + padLen + padding + 首段 payload)]`，返回 (wire 字节, 并入 var
+    /// chunk 的 payload 字节数)。无待发状态返回 `(空, 0)`。
+    ///
+    /// 与 [`Self::emit_pending_client_2022`] 同源同一份封装——直挂连接
+    /// （[`crate::conn::SsStreamConn`]）在 poll 侧调用它落线，请求头字节与旧泵逐字节一致。
+    ///
+    /// # Errors
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    /// - [`SsError::InsufficientData`]：var chunk 超出 u16 长度域。
+    pub(crate) fn build_client_2022_header(&mut self, payload: &[u8]) -> Result<(Vec<u8>, usize)> {
+        let Some(p) = self.pending_client_2022.take() else { return Ok((Vec::new(), 0)) };
         let padding_len: usize = if payload.len() < crate::ss2022::packet::MAX_PADDING_LENGTH {
             rand::random::<u16>() as usize % crate::ss2022::packet::MAX_PADDING_LENGTH + 1
         } else {
@@ -494,8 +538,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.write_buf.extend_from_slice(&p.prefix);
         self.write_buf.extend_from_slice(&sealed_fixed);
         self.write_buf.extend_from_slice(&sealed_var);
-        self.inner.write_all(&self.write_buf).await?;
-        Ok(payload[first..].to_vec())
+        Ok((self.write_buf.clone(), first))
     }
 
     /// flush 底层连接。

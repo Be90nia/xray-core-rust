@@ -6,9 +6,11 @@
 //!
 //! ## Connection wrapper
 //!
-//! [`SSStream`] 不直接实现 `AsyncRead`/`AsyncWrite`（SS chunk 天然分帧），
-//! 因此 [`SsConnection`] 包装 `SSStream<TcpStream>`，用
-//! `write_chunk`/`read_chunk` 循环桥接到 `AsyncRead`/`AsyncWrite` trait。
+//! **TCP**：出站连接 = [`crate::conn::SsStreamConn`]——`AsyncRead`/`AsyncWrite` 两半各自
+//! 直挂 SS chunk 流（无 `tokio::io::duplex` 环、无泵任务、无双向 `select!` 串行推进）。
+//!
+//! **UDP**：[`SsConnection`] 包装 `tokio::io::duplex` + XUDP↔数据报泵（UDP 无按字节
+//! `AsyncRead`/`AsyncWrite` 语义可直挂）。
 //!
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
@@ -37,7 +39,6 @@ use crate::{
     config::MemoryAccount,
     protocol::{decode_udp_packet_into, encode_udp_packet_into},
     ss2022::UdpOverTcpConfig,
-    stream::SSStream,
     validator::{MemoryUser, Validator},
 };
 
@@ -54,12 +55,13 @@ const DUPLEX_BUF_SIZE: usize = 64 * 1024;
 /// XUDP GlobalID 长度（与 Go `xudp` / hysteria dispatcher 一致）。
 const GLOBAL_ID_LEN: usize = 8;
 
-/// SS 加密流 → Connection trait 实现。
+/// SS **UDP** 出站连接：duplex + pump → Connection trait。
 ///
-/// 桥接 `SSStream<Box<dyn Connection>>` 的 `write_chunk`/`read_chunk` 到
-/// ``AsyncRead`/`AsyncWrite`：spawn 一个 `pump_ss_stream` task，在 SS 加密`
-/// chunk 流与 `tokio::io::duplex` 明文 IO 之间双向搬运。`SsConnection` 自身只
-/// 持有 duplex 客户端半 + pump task 句柄，trait 方法全部委托给 duplex。
+/// TCP 面不再有中转层——出站 TCP 直接返回 [`crate::conn::SsStreamConn`]
+/// （读写两半直挂 SS wire，无 duplex 环、无泵任务）。
+///
+/// UDP 面仍是 `[XUDP 帧流] ↔ duplex ↔ [SS 数据报泵]`：UDP 无按字节的
+/// `AsyncRead/AsyncWrite` 语义可直挂，泵保留。
 ///
 /// `_ctx` 字段让连接自持 `Arc<PluginContext>`：泵记在 ctx 的 FxScope 账上，
 /// scope drop（JoinSet drop → abort_all）会杀泵——若连接不持引用，直接构造
@@ -70,20 +72,6 @@ pub struct SsConnection {
     inner: DuplexStream,
     _pump: Spawned<()>,
     _ctx: Arc<PluginContext>,
-}
-
-impl SsConnection {
-    /// 从已写完首帧（addr+port）的 `SSStream` 构造。
-    /// 首帧由 `Client::dial_target` 写入，本包装只负责 body 加密透传。
-    #[must_use]
-    pub fn new(ctx: &Arc<PluginContext>, stream: SSStream<Box<dyn Connection>>) -> Self {
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        let pump = ctx
-            .spawn(pump_ss_stream(stream, server_io))
-            .expect("plugin ctx FxScope is never closed (assembly-owned)");
-        Self { inner: client_io, _pump: pump, _ctx: Arc::clone(ctx) }
-    }
 }
 
 impl SsConnection {
@@ -157,140 +145,6 @@ impl Connection for SsConnection {
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
-    }
-}
-
-/// 双向 pump：在 `SSStream`（加密 chunk 流）与 `DuplexStream`（明文 IO）之间桥接。
-///
-/// - up：read duplex（≤64KB/轮）→ `write_chunk_in_place` → flush（明文 → 密文 chunk）
-/// - down：底层单次 read（cancel-safe）→ `pending` 缓冲 → `try_open_chunk` 完整解帧（nonce
-///   只在整帧解出时推进，select! 取消不损流状态）
-///
-/// `SSStream` 的 `write_chunk`/`read_chunk` 共享单一 nonce 计数器且均需 `&mut self`，
-/// 不可并发持有（也无法像 hysteria 那样 `split` 成独立读写半）。故采用 `select!` 串行
-/// 推进：down 方向不直接调 async `read_chunk`（其内部 read_exact 半途被取消会丢字节），
-/// 而是用 cancel-safe 的单次底层 `read` 喂 `pending`，再同步解帧；up 方向用
-/// cancel-safe 的 `AsyncReadExt::read`。连接为 transport 层产物
-/// `Box<dyn Connection>`（ws+tls 包装或裸 TCP），无 TcpStream::readable 可用。
-async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: DuplexStream) {
-    let log = &*SS_LOG;
-    let (mut rd, mut wr) = tokio::io::split(server_io);
-    // 上行明文直接读进池化 Buffer 的尾部可写区：`write_chunk_in_place` 把明文**原地**
-    // 覆写为密文、tag 写进尾部 headroom，再按 [sealed_size][ciphertext+tag] 两段向量写
-    // 落线 ⇒ 稳态用户态 0 拷贝（无「明文另拷一块再加密」）。
-    // 64KB 块（k16um C3）：一读一帧（65520 payload），写帧数/系统调用 8× 降
-    // （mdurk strace：本仓 write 8191.6B/次 vs sing-box 65331.8B/次）；64KB 请求
-    // 落精确 64KB 池层（k16um A4），稳态零新鲜分配。
-    let mut up_buf = xray_buf::buffer::Buffer::new_pooled(64 * 1024);
-    // 每轮读入上限：既要留 tag headroom，也要守住单 chunk 载荷上限（帧边界=wire 契约）。
-    let up_cap =
-        up_buf.capacity().saturating_sub(stream.tag_size()).min(stream.max_chunk_payload());
-    // 解帧缓冲用 BytesMut：`try_open_chunk` 从头部 `split_to` 切密文段是 O(1)
-    // （无 drain 搬移、无逐帧分配），原地解密后直接交付；下行单次读用 `read_buf`
-    // 直读进它的 spare 区（不再经中转缓冲搬一遍）。
-    let mut pending = bytes::BytesMut::new();
-    // SS-2022 客户端请求头首写待发兜底（Go 在 Process 里立即写请求头，Rust 首写
-    // 在 pump 侧才出现）：上游 200ms 内无数据也必须发出（padding-only 请求），
-    // 否则 server-speaks-first 目标（FTP/SMTP banner）会双向等死锁。
-    let mut hdr_timer = stream
-        .has_pending_client_2022()
-        .then(|| Box::pin(tokio::time::sleep(std::time::Duration::from_millis(200))));
-    loop {
-        // 先把 pending 中完整帧全部解出（NeedMore 才进 select 等新数据）
-        loop {
-            match stream.try_open_chunk(&mut pending) {
-                Ok(crate::stream::ChunkOut::Message(plaintext)) => {
-                    if wr.write_all(&plaintext).await.is_err() {
-                        return;
-                    }
-                    let _ = wr.flush().await;
-                },
-                Ok(crate::stream::ChunkOut::NeedMore) => break,
-                Ok(crate::stream::ChunkOut::End) => {
-                    // 0 长度 chunk = 流结束标记
-                    let _ = wr.shutdown().await;
-                    return;
-                },
-                Err(e) => {
-                    log.debug(format!("ss pump down decode error: {e}"));
-                    return;
-                },
-            }
-        }
-        tokio::select! {
-            // up: 明文 duplex 读 → 原地 seal 的加密 chunk 写到 SS wire
-            n = async {
-                let spare = up_buf.writable_bytes();
-                let cap = spare.len().min(up_cap);
-                rd.read(&mut spare[..cap]).await
-            } => {
-                match n {
-                    Ok(0) => {
-                        // 半关闭：请求头尚未落线（无任何首写）时兜底发出
-                        // （Go requestDone 恒写请求头，payload 可为空）
-                        let _ = stream.flush_pending_client_2022().await;
-                        let _ = stream.shutdown().await;
-                        break;
-                    }
-                    Ok(n) => {
-                        up_buf.advance_write(n);
-                        if stream.write_chunk_in_place(&mut up_buf).await.is_err() {
-                            break;
-                        }
-                        // 池化块留在本连接复用：只重置读写游标（密文已被写出）。
-                        up_buf.clear();
-                        if stream.flush().await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        log.debug(format!("ss pump up read error: {e}"));
-                        break;
-                    }
-                }
-            }
-            // SS-2022 请求头空闲兜底：上游迟迟无首写也要发 padding-only 请求头
-            _ = async {
-                if let Some(t) = hdr_timer.as_mut() {
-                    t.as_mut().await;
-                }
-            }, if hdr_timer.is_some() => {
-                if stream.flush_pending_client_2022().await.is_err() {
-                    break;
-                }
-                // 兜底只发一次：推远避免反复唤醒（pending 已清，语义等价停表）
-                // 713x6 台账：tokio 虚拟钟预算面——`Sleep::reset` 仅收 tokio Instant，
-                // 与 std Clock 面禁混换（713x6 判定：tokio 一律不迁）。
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "tokio 虚拟钟预算面：Sleep::reset 仅收 tokio::time::Instant，与 std/Clock 面禁混换（713x6：tokio 一律不迁）"
-                )]
-                if let Some(t) = hdr_timer.as_mut() {
-                    t.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
-                }
-            }
-            // down: cancel-safe 单次底层读，直读进 `pending` 的 spare 区
-            // （解帧在循环顶部同步完成；无中转缓冲 = 无「读完再 extend 一遍」）
-            n = async {
-                // 先保 16 KiB spare：BytesMut 的 chunk_mut 只在容量用尽时补 64B，
-                // 不预留会退化成逐 64B 读。
-                pending.reserve(16 * 1024);
-                stream.get_mut().read_buf(&mut pending).await
-            } => {
-                match n {
-                    Ok(0) => {
-                        let _ = wr.shutdown().await;
-                        break;
-                    }
-                    // 新字节已直接落在 pending 尾部，无需搬移
-                    Ok(_) => {}
-                    Err(e) => {
-                        log.debug(format!("ss pump down read error: {e}"));
-                        break;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -558,10 +412,10 @@ pub fn make_ss_dial_fn_with_ctx(config: Arc<SsOutboundConfig>, ctx: Arc<PluginCo
                         )
                         .map_err(|e| format!("ss2022 client: {e}"))?;
                         // dial_target_on 已 mark_response_rekey_2022 设响应 rekey 状态机；
-                        // 请求头登记为首写待发状态，pump_ss_stream 首写时与首段
-                        // body 合并落线（Go WriteTCPRequest(payload)）。响应读侧在
-                        // pump 首次 try_open_chunk 时经 drive_2022_rekey 解
-                        // salt+fixed+var（payload=0 时只读 salt+fixed）。
+                        // 请求头登记为首写待发状态，直挂连接首写时与首段 body 合并落线
+                        // （Go WriteTCPRequest(payload)）。响应读侧在首个
+                        // try_open_chunk 时经 drive_2022_rekey 解 salt+fixed+var
+                        // （payload=0 时只读 salt+fixed）。
 
                         client
                             .dial_target_on(conn, &target_str, target_port)
@@ -574,7 +428,11 @@ pub fn make_ss_dial_fn_with_ctx(config: Arc<SsOutboundConfig>, ctx: Arc<PluginCo
                             .await
                             .map_err(|e| format!("ss dial: {e}"))?
                     };
-                    Ok(Box::new(SsConnection::new(&ctx, stream)) as Box<dyn Connection>)
+                    // 3. 直挂 wire：TCP 出站不再经 duplex + 单任务泵中转
+                    //    （[`crate::conn::SsStreamConn`] 读写两半各自直挂 SS chunk 流）。
+                    // SS-2022 请求头登记为首写待发，直挂连接在首写时与首段 body
+                    // 合并落线（Go WriteTCPRequest(payload)）。
+                    Ok(Box::new(crate::conn::SsStreamConn::new(stream)) as Box<dyn Connection>)
                 },
                 // UDP：dial SS 服务器的 UDP 端口（Go internet dialer 的 network
                 // 跟随 dest）。legacy：每数据报独立 [salt][AEAD(addr+port+payload)]；
@@ -1243,13 +1101,13 @@ mod tests {
         assert_eq!(cfg.udp_over_tcp.version, 0);
     }
 
-    /// `SsConnection`（duplex pump）端到端：客户端 AsyncRead/AsyncWrite → 加密 chunk →
+    /// `SsStreamConn`（直挂 wire）端到端：客户端 AsyncRead/AsyncWrite → 加密 chunk →
     /// SS inbound 解密 → echo → 加密回响 → 客户端读回。
     ///
-    /// 直接证明 SsConnection 的 pump 走 SS 加密层：若退化为明文透传（旧行为），
-    /// inbound 的 `read_chunk` 会 AEAD open 失败而 panic。
+    /// 直接证明直挂连接走 SS 加密层：若退化为明文透传，inbound 的 `read_chunk`
+    /// 会 AEAD open 失败而 panic。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ss_connection_pump_roundtrips_through_inbound_echo() {
+    async fn ss_stream_conn_roundtrips_through_inbound_echo() {
         use std::net::{IpAddr, SocketAddr};
 
         use tokio::{
@@ -1264,7 +1122,7 @@ mod tests {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
         let echo_addr = echo_listener.local_addr().unwrap();
         xray_common::testing::spawn(
-            "ss-connection-pump-roundtrips-through-inbound-echo-accept",
+            "ss-stream-conn-roundtrips-through-inbound-echo-accept",
             async move {
                 let (sock, _) = echo_listener.accept().await.expect("echo accept");
                 let (mut rd, mut wr) = tokio::io::split(sock);
@@ -1283,9 +1141,8 @@ mod tests {
         };
         let echo_socket = SocketAddr::new(IpAddr::V4(echo_v4), echo_addr.port());
 
-        let server_handle = xray_common::testing::spawn(
-            "ss-connection-pump-roundtrips-through-inbound-echo-accept",
-            {
+        let server_handle =
+            xray_common::testing::spawn("ss-stream-conn-roundtrips-through-inbound-echo-accept", {
                 let ib = std::sync::Arc::clone(&ib);
                 async move {
                     let (conn, _) = inbound_listener.accept().await.expect("inbound accept");
@@ -1299,10 +1156,9 @@ mod tests {
                     ss_stream.write_chunk(&echoed).await.expect("write resp chunk");
                     ss_stream.flush().await.expect("flush resp");
                 }
-            },
-        );
+            });
 
-        // 3. client：dial_target（写 IV + 首帧）→ SsConnection::new → AsyncRead/Write
+        // 3. client：dial_target（写 IV + 首帧）→ SsStreamConn 直挂 → AsyncRead/Write
         let client = Client::new(account, inbound_addr.ip().to_string(), inbound_addr.port());
         let tcp = TcpStream::connect((inbound_addr.ip(), inbound_addr.port()))
             .await
@@ -1316,23 +1172,82 @@ mod tests {
             )
             .await
             .expect("dial_target_for_proxy_on");
-        // 回归钉（f17zu 后波）：构造后立即丢弃调用方侧 Arc——连接必须自持
-        // scope（_ctx 字段）。此前传临时 ctx（`&PluginContext::for_plugin(..)`
-        // 未绑定），语句结束即断 scope，泵刚 spawn 就被 JoinSet abort 收掉，
-        // read_exact 撞 UnexpectedEof。
-        let ctx = std::sync::Arc::new(xray_frame::PluginContext::for_plugin("shadowsocks"));
-        let mut conn = SsConnection::new(&ctx, stream);
-        drop(ctx);
+        let mut conn = crate::conn::SsStreamConn::new(stream);
 
-        let payload = b"hello ss duplex pump!";
+        let payload = b"hello ss direct wire!";
         conn.write_all(payload).await.expect("ss write");
         conn.flush().await.expect("ss flush");
 
         let mut got = vec![0u8; payload.len()];
         conn.read_exact(&mut got).await.expect("ss read");
 
-        assert_eq!(&got[..], payload, "echo through SsConnection pump");
+        assert_eq!(&got[..], payload, "echo through SsStreamConn");
         server_handle.await.expect("server task join");
+    }
+
+    /// SS-2022 走直挂连接：首写合并（salt+EIH+fixed+var 单块）+ 暂存余量续封
+    /// 两条路径同测——70 KB 单次写先撞 65520 满块（首写并 header），余量再封第二块。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ss_stream_conn_ss2022_first_write_and_leftover() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+        };
+
+        use crate::ss2022::{Ss2022Inbound, client::Client2022};
+
+        const METHOD: &str = "2022-blake3-aes-128-gcm";
+        let psk_b64 = {
+            use base64::Engine as _;
+            let psk: Vec<u8> = (0..16).map(|_| rand::random::<u8>()).collect();
+            base64::engine::general_purpose::STANDARD.encode(psk)
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind inbound");
+        let inbound_addr = listener.local_addr().unwrap();
+        let ib = Ss2022Inbound::new(METHOD, &psk_b64, "u@ss2022.local").expect("inbound");
+
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+        let server = xray_common::testing::spawn("ss2022-direct-conn-echo", async move {
+            let (conn, _) = listener.accept().await.expect("inbound accept");
+            let result = ib.handle_conn(conn).await.expect("handshake");
+            let mut s = result.stream;
+            let mut body = Vec::new();
+            while body.len() < expect.len() {
+                let part = s.read_chunk().await.expect("read chunk").expect("non-empty");
+                body.extend_from_slice(&part);
+            }
+            assert_eq!(body, expect, "服务端解出的 2022 请求体逐字节一致");
+            s.write_chunk(&body).await.expect("write resp");
+            s.flush().await.expect("flush resp");
+        });
+
+        let client = Client2022::new(
+            METHOD,
+            &[psk_b64],
+            &inbound_addr.ip().to_string(),
+            inbound_addr.port(),
+        )
+        .expect("client2022");
+        let tcp = TcpStream::connect(inbound_addr).await.expect("connect inbound");
+        let stream = client
+            .dial_target_on(
+                Box::new(xray_transport::connection::TcpConnection::new(tcp))
+                    as Box<dyn Connection>,
+                "1.2.3.4",
+                80,
+            )
+            .await
+            .expect("dial_target_on");
+        let mut conn = crate::conn::SsStreamConn::new(stream);
+
+        conn.write_all(&payload).await.expect("write 70KB");
+        conn.flush().await.expect("flush");
+        let mut got = vec![0u8; payload.len()];
+        conn.read_exact(&mut got).await.expect("read echo");
+        assert_eq!(got, payload, "SS-2022 直挂连接回环逐字节一致");
+        server.await.expect("server task join");
     }
 
     /// UDP 分支 e2e：`make_ss_dial_fn`(UDP dest) → dial SS 服务器 UDP 端口 →
