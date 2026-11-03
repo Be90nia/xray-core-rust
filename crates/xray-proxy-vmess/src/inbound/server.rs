@@ -10,13 +10,11 @@
 
 use std::sync::Arc;
 
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
-};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,
 };
-use xray_buf::io::{new_reader, new_writer};
+use xray_buf::io::{Reader, Writer};
 use xray_common::{
     net::destination::Destination,
     protocol::{Command, ResponseCommand, ResponseHeader, SecurityType},
@@ -29,23 +27,22 @@ use crate::{
     encoding::{
         ChunkNonceGenerator,
         body_chunk::{
-            ChunkFrame, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
-            make_authenticated_length_size_parser, write_chunk_frame,
+            PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+            make_authenticated_length_size_parser,
         },
         generate_chacha20poly1305_key,
         server::{ServerSession, SessionHistory},
     },
     error::VmessError,
+    inbound::chunk_stream::{ChunkReader, ChunkWriter, ClosingPipeWriter},
     request_option,
     validator::TimedUserValidator,
 };
-/// Duplex 缓冲大小（与 chunk payload 上限 8 KiB 对齐，留足一个 chunk 余量）。
-const DUPLEX_BUF: usize = 16_384;
 
 /// VMess body 加密枚举：统一 Aes128Gcm / ChaCha20Poly1305 两种安全类型为同一类型，
 /// 供 pump 函数泛型使用（避免 `Box<dyn AeadCipher>` 跨 await 的 Send 问题）。
 #[allow(clippy::large_enum_variant)] // 双算法 variant 尺寸差是协议事实，Box 化徒增间接
-enum BodyCipher {
+pub(crate) enum BodyCipher {
     Aes(Aes128Gcm),
     Chacha(ChaCha20Poly1305Aead),
 }
@@ -416,157 +413,76 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         .await;
     }
 
-    let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
-    let (server_r, server_w) = tokio::io::split(server_io);
-    let (client_r, client_w) = tokio::io::split(client_io);
-    let link = Link::new(new_reader(client_r), new_writer(client_w));
-
-    let pump_a =
-        pump_request_body(stream_r, server_w, req_cipher, req_iv, req_size_parser, global_padding);
-    let pump_b = pump_response_body(
-        server_r,
-        stream_w,
-        resp_cipher,
-        resp_iv,
-        resp_size_parser,
-        global_padding,
-        no_termination,
+    // 7. TCP：chunk 编解码 + **MultiBuffer 中转**（Go `proxy/vmess/inbound` 同构）。 旧实现是「wire
+    //    ↔ chunk 泵 ↔ `tokio::io::duplex`（**字节**环）↔ dispatch」—— 字节环每方向固定多 2 遍用户态
+    //    memcpy；改为 MultiBuffer pipe 后载荷**零搬运** （Buffer 所有权在 pipe 里转移）。chunk
+    //    帧仍由同一份 `write_chunk_frame` 产出 ⇒ wire 逐字节不变。
+    let pipe_opt = xray_buf::pipe::PipeOption {
+        // 上限同旧 duplex 环（16 KiB）：满时阻塞 ⇒ 背压语义不变
+        limit: 16 * 1024,
+        ..Default::default()
+    };
+    // 请求方向：wire chunk → 明文 MultiBuffer → dispatch
+    let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+    // 响应方向：dispatch → 明文 MultiBuffer → wire chunk
+    let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+    let link = Link::new(
+        Box::new(up_r) as Box<dyn Reader>,
+        Box::new(ClosingPipeWriter::new(dn_w)) as Box<dyn Writer>,
     );
-    let dispatch_fut = handler.dispatch(&dest, link);
 
-    // 三路并发：pump_a / pump_b / dispatch，全部完成后返回
-    let _ = tokio::join!(pump_a, pump_b, dispatch_fut);
+    // 上行腿：解密 chunk → pipe → dispatch（读到终止 chunk/EOF 即止；dispatch 不再
+    // 消费时继续排空 wire——残留未读字节会让对端收到 RST）。
+    let req_task = async move {
+        let mut r = ChunkReader::new(stream_r, req_cipher, req_iv, req_size_parser, global_padding);
+        let mut w = up_w;
+        loop {
+            match r.read_multi_buffer().await {
+                Ok(mb) if !mb.is_empty() => {
+                    if w.write_multi_buffer(mb).await.is_err() {
+                        while r.read_multi_buffer().await.map(|m| !m.is_empty()).unwrap_or(false) {}
+                        break;
+                    }
+                },
+                Ok(_) => break,
+                Err(_) => break,
+            }
+        }
+        w.shutdown(); // dispatch reader EOF
+    };
+
+    // 下行腿：pipe → 装帧 → wire；pipe EOF（dispatch 结束）后写终止 chunk + flush + FIN。
+    let resp_task = async move {
+        let mut r = dn_r;
+        let mut w = ChunkWriter::new(
+            stream_w,
+            resp_cipher,
+            resp_iv,
+            resp_size_parser,
+            global_padding,
+            no_termination,
+        );
+        loop {
+            match r.read_multi_buffer().await {
+                Ok(mb) if !mb.is_empty() => {
+                    if w.write_multi_buffer(mb).await.is_err() {
+                        break;
+                    }
+                },
+                Ok(_) => {},
+                Err(_) => break,
+            }
+        }
+        let _ = w.shutdown_flush().await;
+    };
+
+    let dispatch_fut = handler.dispatch(&dest, link);
+    let _ = tokio::join!(req_task, resp_task, dispatch_fut);
     Ok(())
 }
-/// chunk 格式：`[size_field][AEAD ciphertext][padding]`。
-/// size_field 长度由 `size_parser.size_bytes()` 决定（Plain/Shake=2, AEAD=18）。
-/// 终止 chunk = `seal([])` → 解密后 plaintext 为空即终止信号。
-/// EOF 或解密失败时 break 并 shutdown sink。
-async fn pump_request_body<C, R>(
-    mut stream_r: R,
-    mut server_w: WriteHalf<DuplexStream>,
-    cipher: C,
-    iv: [u8; 16],
-    mut size_parser: Box<dyn SizeParser + Send>,
-    global_padding: bool,
-) where
-    C: AeadCipher + Send,
-    R: AsyncRead + Unpin,
-{
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    let mut size_field = Vec::with_capacity(18);
-    let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
-    loop {
-        // SHAKE128 流同步：先 next_padding_len 再 decode（与 body_chunk decode 一致）。
-        let padding_size =
-            if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-        let sb = size_parser.size_bytes();
-        size_field.resize(sb, 0);
-        if stream_r.read_exact(&mut size_field).await.is_err() {
-            break;
-        }
-        let total_size = usize::from(size_parser.decode(&size_field));
-        if total_size == 0 {
-            break;
-        }
-        let ciphertext_size = total_size.saturating_sub(padding_size);
-        ciphertext.resize(total_size, 0);
-        if stream_r.read_exact(&mut ciphertext).await.is_err() {
-            break;
-        }
-        let nonce = nonce_gen.next_ref();
-        #[allow(clippy::redundant_guards)] // is_empty 守卫表达终止 chunk 语义
-        match cipher.open_in_place(nonce, &[], &mut ciphertext[..ciphertext_size]) {
-            Ok(pt) if pt.is_empty() => break, // 终止 chunk：seal([]) → 解密为空
-            Ok(pt) => {
-                if server_w.write_all(pt).await.is_err() {
-                    break;
-                }
-            },
-            Err(e) => {
-                crate::VMESS_LOG.debug(format!("vmess request body chunk open failed error={e}"));
-                break;
-            },
-        }
-    }
-    // shutdown 写半边，让 dispatch reader 看到 EOF（标记请求 body 结束）
-    let _ = server_w.shutdown().await;
-}
-
-/// 读取明文 sink 字节，按 VMess response body chunk 格式加密写入 stream。
-///
-/// chunk 格式：`[size_field][encrypted][padding]`，size_field 由 SizeParser 编码。
-/// 流结束（EOF 或错误）时写终止 chunk：`seal([])`（no_termination=true 时跳过）。
-async fn pump_response_body<C, W>(
-    mut server_r: ReadHalf<DuplexStream>,
-    mut stream_w: W,
-    cipher: C,
-    iv: [u8; 16],
-    mut size_parser: Box<dyn SizeParser + Send>,
-    global_padding: bool,
-    no_termination: bool,
-) where
-    C: AeadCipher + Send,
-    W: AsyncWrite + Unpin,
-{
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    // 明文直接读进装帧块（原地覆写为密文）⇒ 用户载荷零拷贝
-    let mut frame = ChunkFrame::new();
-    let tag_len = cipher.tag_size();
-    loop {
-        frame.clear();
-        let n = match server_r.read(frame.plaintext_read_buf(tag_len)).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                crate::VMESS_LOG
-                    .debug(format!("vmess response body plaintext read failed error={e}"));
-                break;
-            },
-        };
-        frame.commit_plaintext(n);
-        let nonce = nonce_gen.next_ref();
-        if let Err(e) = write_chunk_frame(
-            &mut stream_w,
-            &mut frame,
-            n,
-            &cipher,
-            nonce,
-            size_parser.as_mut(),
-            global_padding,
-        )
-        .await
-        {
-            // 对端关闭 / 加密失败都在这里收口（旧实现写失败静默、seal 失败 debug）
-            crate::VMESS_LOG.debug(format!("vmess response body chunk write failed error={e}"));
-            break;
-        }
-    }
-    // 写终止 chunk：seal([]) → 仅 tag 字节，客户端 decode 看到 plaintext 为空即返回
-    if !no_termination {
-        frame.clear();
-        let nonce = nonce_gen.next_ref();
-        if let Err(e) = write_chunk_frame(
-            &mut stream_w,
-            &mut frame,
-            0,
-            &cipher,
-            nonce,
-            size_parser.as_mut(),
-            global_padding,
-        )
-        .await
-        {
-            crate::VMESS_LOG.debug(format!("vmess termination chunk write failed error={e}"));
-        }
-    }
-    let _ = stream_w.flush().await;
-    let _ = stream_w.shutdown().await;
-}
-
 /// 将 payload 加密为单个 response chunk 写入 stream（VMess UDP 会话专用）。
 ///
-/// 与 [`pump_response_body`] 的 chunk 写法一致；`payload` 为空时即终止 chunk
+/// 与 [`ChunkWriter`] 的 chunk 写法一致；`payload` 为空时即终止 chunk
 /// （`seal([])`，客户端 chunk reader 以空明文为流结束信号）。
 async fn write_udp_chunk<W: AsyncWrite + Unpin>(
     stream_w: &mut W,

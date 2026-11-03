@@ -8,5 +8,7 @@
 pub mod handler;
 pub mod server;
 
+pub(crate) mod chunk_stream;
+
 pub use handler::{InboundHandler, InboundProcessor, NoopInboundProcessor};
 pub use server::serve_vmess;
