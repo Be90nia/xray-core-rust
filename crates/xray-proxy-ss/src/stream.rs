@@ -33,6 +33,10 @@ use crate::{
 /// size 段 AEAD 与写系统调用同步降一个量级（mdurk strace：本仓 write 帧
 /// 8191.6B/次 vs sing-box 65331.8B/次）。读侧不设上限（`try_open_chunk_body`
 /// 按 u16 长度域收帧），Go 8KB 帧与本仓 64KB 帧双向互认。
+///
+/// ⚠️ 直挂连接的写侧实发上限是 [`SSStream::wire_chunk_payload_cap`]（= 本值 − tag）：
+/// Go legacy 读侧在 `uint16` 里做 `明文长度 + Overhead`，`≥ 65536` 回绕成 0 →
+/// 整条流报认证失败。本值只是长度域字段语义上限，不是互通上限。
 const MAX_CHUNK_PAYLOAD: usize = 65535;
 
 /// SS 流式 AEAD 读写器（**读/写双方向独立 AEAD+nonce**）。
@@ -245,52 +249,13 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             }
             return Ok(());
         }
-        // SS-2022 服务端响应懒写头（sing `serverConn.writeResponse`，service.go:261）：
-        // [resp_salt][AEAD(fixed: type=1|epoch|echo_salt|payload_len)][AEAD(首段数据)]。
-        // 响应握手 chunk **无 2B size 前缀**（sing Writer.WriteChunk 直 seal，客户端
-        // Reader.ReadWithLength 定长读），fixed 用 nonce [0]、首段数据 [1]；之后
-        // body 才走 [2B size+tag][payload+tag] 常规 chunk（nonce [2] 起）。
+        // SS-2022 服务端响应懒写头（sing `serverConn.writeResponse`，service.go:261）。
+        // 封装原语见 [`Self::build_server_2022_header`]（直挂连接共用同一份）。
         let mut rest = plaintext;
-        if let Some(p) = self.pending_server_2022.take() {
-            let salt: Vec<u8> = (0..p.kind.salt_size()).map(|_| rand::random::<u8>()).collect();
-            let subkey = crate::ss2022::derive_session_subkey(&p.psk, &salt, p.kind);
-            let aead = crate::ss2022::key::build_aead(p.kind, &subkey)
-                .map_err(|e| SsError::InitDecode(e.to_string()))?;
-            self.tag_size = aead.tag_size();
-            self.write_nonce = vec![0xFFu8; aead.nonce_size()];
-            self.write_aead = std::sync::Arc::from(aead);
-            let first_len = plaintext.len().min(self.max_chunk_payload());
-            // SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing writeResponse 对齐）。
-            let epoch = xray_frame::compat::clock()
-                .now_system()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| SsError::GetCipher(e.to_string()))?
-                .as_secs();
-            let mut fixed = Vec::with_capacity(11 + p.request_salt.len());
-            fixed.push(1u8); // HeaderTypeServer
-            fixed.extend_from_slice(&epoch.to_be_bytes());
-            fixed.extend_from_slice(&p.request_salt);
-            fixed.extend_from_slice(
-                &u16::try_from(first_len)
-                    .map_err(|_| SsError::InsufficientData(first_len))?
-                    .to_be_bytes(),
-            );
+        if self.pending_server_2022.is_some() {
+            let (head, first_len) = self.build_server_2022_header(plaintext)?;
             // 新版 Go 客户端(v26.9.30 ReadTCPResponse)单次 Read 要求
             // salt+加密头(+首段) ≥91B 原子到达——必须单次 write_all 单帧写出。
-            increment_nonce_bytes(&mut self.write_nonce);
-            let sealed_fixed = self
-                .write_aead
-                .seal(&self.write_nonce, &[], &fixed)
-                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            increment_nonce_bytes(&mut self.write_nonce);
-            let sealed_first = self
-                .write_aead
-                .seal(&self.write_nonce, &[], &plaintext[..first_len])
-                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
-            let mut head = Vec::with_capacity(salt.len() + 64 + sealed_first.len());
-            head.extend_from_slice(&salt);
-            head.extend_from_slice(&sealed_fixed);
-            head.extend_from_slice(&sealed_first);
             self.inner.write_all(&head).await?;
             rest = &plaintext[first_len..];
         }
@@ -321,6 +286,69 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
         self.inner.write_all(&self.write_buf).await?;
         Ok(())
+    }
+
+    /// **同步**构造 SS-2022 响应首写字节（**不落线**），返回 (wire 字节, 并入首段
+    /// chunk 的 payload 字节数)；无待发状态返回 `(空, 0)`。
+    ///
+    /// wire（sing `serverConn.writeResponse`，service.go:261）：
+    /// `[resp_salt][AEAD(fixed: type=1|epoch|echo_salt|payload_len)][AEAD(首段数据)]`。
+    /// 响应握手 chunk **无 2B size 前缀**（sing Writer.WriteChunk 直 seal，客户端
+    /// Reader.ReadWithLength 定长读），fixed 用 nonce [0]、首段数据 [1]；之后
+    /// body 才走 [2B size+tag][payload+tag] 常规 chunk（nonce [2] 起）。
+    ///
+    /// 与 [`Self::write_chunk`] 的服务端分支同源同一份封装——直挂连接
+    /// （[`crate::conn::SsStreamConn`]）在 poll 侧调用它落线，响应头字节与旧泵逐字节一致。
+    /// 响应头**必须在首写时发出**：客户端 `drive_2022_rekey` 先读 salt、再按 fixed
+    /// header 的 payloadLen 定位首段数据，漏发即整条响应流解不出。
+    ///
+    /// # Errors
+    /// - [`SsError::InitDecode`]：响应 subkey 派生失败。
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    /// - [`SsError::InsufficientData`]：首段超出 u16 长度域。
+    pub(crate) fn build_server_2022_header(
+        &mut self,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, usize)> {
+        let Some(p) = self.pending_server_2022.take() else { return Ok((Vec::new(), 0)) };
+        let salt: Vec<u8> = (0..p.kind.salt_size()).map(|_| rand::random::<u8>()).collect();
+        let subkey = crate::ss2022::derive_session_subkey(&p.psk, &salt, p.kind);
+        let aead = crate::ss2022::key::build_aead(p.kind, &subkey)
+            .map_err(|e| SsError::InitDecode(e.to_string()))?;
+        self.tag_size = aead.tag_size();
+        self.write_nonce = vec![0xFFu8; aead.nonce_size()];
+        self.write_aead = std::sync::Arc::from(aead);
+        let first_len = plaintext.len().min(self.max_chunk_payload());
+        // SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing writeResponse 对齐）。
+        let epoch = xray_frame::compat::clock()
+            .now_system()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| SsError::GetCipher(e.to_string()))?
+            .as_secs();
+        let mut fixed = Vec::with_capacity(11 + p.request_salt.len());
+        fixed.push(1u8); // HeaderTypeServer
+        fixed.extend_from_slice(&epoch.to_be_bytes());
+        fixed.extend_from_slice(&p.request_salt);
+        fixed.extend_from_slice(
+            &u16::try_from(first_len)
+                .map_err(|_| SsError::InsufficientData(first_len))?
+                .to_be_bytes(),
+        );
+        increment_nonce_bytes(&mut self.write_nonce);
+        let sealed_fixed = self
+            .write_aead
+            .seal(&self.write_nonce, &[], &fixed)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        increment_nonce_bytes(&mut self.write_nonce);
+        let sealed_first = self
+            .write_aead
+            .seal(&self.write_nonce, &[], &plaintext[..first_len])
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        let mut head = Vec::with_capacity(salt.len() + 64 + sealed_first.len());
+        head.extend_from_slice(&salt);
+        head.extend_from_slice(&sealed_fixed);
+        head.extend_from_slice(&sealed_first);
+        Ok((head, first_len))
     }
 
     /// 原地 seal 写一个 chunk：载荷**零拷贝**（明文被就地覆写为密文）。
@@ -427,9 +455,25 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
     /// 单 chunk 载荷上限：`MAX_CHUNK_PAYLOAD`（Go `MaxPacketSize`，SIP022 u16
     /// 长度域上限）。读侧（本仓与 Go）按长度域收任意 1..=65535 帧，改此值不破互通。
+    ///
+    /// ⚠️ 这只**长度域字段语义上限**，不是互通上限：Go legacy 读侧
+    /// `crypto.AEADChunkSizeParser.Decode` 把明文长度加 `Overhead()` 后仍放在
+    /// `uint16` 里，`载荷 + tag ≥ 65536` 时**回绕成 0** → 对端整条流报
+    /// `cipher: message authentication failed`（实测：65520 载荷帧必红，65519 正常）。
+    /// 真实落线路径取 [`Self::wire_chunk_payload_cap`]。
     #[must_use]
     pub fn max_chunk_payload(&self) -> usize {
         MAX_CHUNK_PAYLOAD
+    }
+
+    /// 互通安全的单帧载荷上限 = `max_chunk_payload() − tag_size`（tag=16 ⇒ 65519）。
+    ///
+    /// Go legacy 读侧的 `uint16` 回绕（见 [`Self::max_chunk_payload`]）决定了
+    /// `载荷 + tag` 不得超过 `u16::MAX`；SS-2022 读侧用 `int` 相加不受限，统一取
+    /// 小值不损失互通性。
+    #[must_use]
+    pub fn wire_chunk_payload_cap(&self) -> usize {
+        self.max_chunk_payload().saturating_sub(self.tag_size)
     }
 
     /// 写一个 raw chunk（直接 seal，无 size prefix）。
@@ -462,6 +506,12 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     #[must_use]
     pub fn has_pending_client_2022(&self) -> bool {
         self.pending_client_2022.is_some()
+    }
+
+    /// 是否存在未发服务端响应头（直挂连接据此在**首写**时先发响应头）。
+    #[must_use]
+    pub(crate) fn has_pending_server_2022(&self) -> bool {
+        self.pending_server_2022.is_some()
     }
 
     /// 无首段数据时兜底发出请求头（padding 1..900 满足 SIP022 §3.1.4

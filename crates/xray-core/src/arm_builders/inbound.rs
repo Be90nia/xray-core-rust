@@ -6,7 +6,12 @@
 //! `uds_stream`/`uds_transport` 槽登记——「协议 → 可构造监听形态」单源，入口不再
 //! 有内联 match 或手写白名单。
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use skeleton_infra::fx::FxScope;
 use tokio::{net::UdpSocket, task::JoinHandle};
@@ -665,9 +670,112 @@ pub(crate) async fn build_hysteria_inbound(
     })))
 }
 
+/// `DispatchHandler` → Go 阻塞语义适配（`Handler.Dispatch(ctx, link)` 契约）。
+///
+/// 生产 default handler 是 **fire-and-forget**：`InboundDispatchHandler::dispatch`
+/// 调 [`xray_app_dispatcher::default::DefaultDispatcher::dispatch_link`]（内部
+/// spawn 后立即返回，见 `crate::wiring`），future 立刻 resolve。而 anytls 服务端
+/// 把 `dispatch(..).await` 的返回当「连接已结束」——随后 `finish_session` 发 FIN
+/// 并关 socket（`xray-proxy-anytls/src/server.rs` 的 `handle_session` /
+/// `serve_uot_session`）。两者直接相接 = 出站桥接还没开始会话就被关掉
+/// （bd b5e77 e2e 实证：TCP / UoT 均立刻 `early eof`）。
+///
+/// 本适配器把「link 生命周期结束」翻译成 future 完成：处置任务 drop writer 或
+/// 调 `shutdown()`（bridge 收尾的既有动作）时才 resolve，恢复 Go 的阻塞语义。
+///
+/// shortcut: 信号只挂 writer（bridge 正常收尾必 `shutdown`，异常路径必 drop）；
+/// 若将来出现只 drop reader、长期持有 writer 的 handler，需补 reader 侧信号。
+/// 通用件——other 协议若同样「dispatch 返回即拆传输」可复用；提炼候选
+/// `xray-app-dispatcher`（同族先例：hysteria 的 [`HysteriaTcpDispatch`] 也住在
+/// 本 crate 做协议→dispatcher 适配）。
+struct DispatchUntilLinkClosed(Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+impl std::fmt::Debug for DispatchUntilLinkClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchUntilLinkClosed").field("tag", &self.0.tag()).finish()
+    }
+}
+
+impl xray_app_dispatcher::DispatchHandler for DispatchUntilLinkClosed {
+    fn tag(&self) -> &str {
+        self.0.tag()
+    }
+
+    fn dispatch(
+        &self,
+        dest: &xray_common::net::destination::Destination,
+        link: xray_transport::link::Link,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
+        let inner = Arc::clone(&self.0);
+        let dest = dest.clone();
+        Box::pin(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let signal = Arc::new(LinkCloseSignal(parking_lot::Mutex::new(Some(tx))));
+            let link = xray_transport::link::Link::new(
+                link.reader,
+                Box::new(SignalWriter { inner: link.writer, signal }),
+            );
+            inner.dispatch(&dest, link).await;
+            // inner 是 fire-and-forget（已 spawn）；等 link 真正结束再返回。
+            let _ = rx.await;
+        })
+    }
+}
+
+/// link 关闭信号闸：一次触发（`shutdown` / `shutdown_flush` / drop 任一先到）。
+struct LinkCloseSignal(parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+
+impl LinkCloseSignal {
+    fn fire(&self) {
+        if let Some(tx) = self.0.lock().take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// writer 包装：转发全部写语义，在关闭/丢弃时触发信号。
+struct SignalWriter {
+    inner: Box<dyn xray_buf::io::Writer>,
+    signal: Arc<LinkCloseSignal>,
+}
+
+impl xray_buf::io::Writer for SignalWriter {
+    fn write_multi_buffer(
+        &mut self,
+        mb: xray_buf::multi::MultiBuffer,
+    ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+        self.inner.write_multi_buffer(mb)
+    }
+
+    fn poll_write_multi_buffer(
+        &mut self,
+        cx: &mut Context<'_>,
+        mb: &mut xray_buf::multi::MultiBuffer,
+    ) -> Poll<xray_buf::io::Result<()>> {
+        self.inner.poll_write_multi_buffer(cx, mb)
+    }
+
+    fn shutdown(&self) {
+        self.signal.fire();
+        self.inner.shutdown();
+    }
+
+    fn shutdown_flush(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + '_>> {
+        self.signal.fire();
+        self.inner.shutdown_flush()
+    }
+}
+
+impl Drop for SignalWriter {
+    fn drop(&mut self) {
+        self.signal.fire();
+    }
+}
+
 // anytls inbound：AnytlsInboundHandler impl InboundHandler
 pub(crate) async fn build_anytls_inbound(
     ib: &BuiltInbound,
+    ohm: Arc<SimpleOhm>,
     shutdown_token: CancellationToken,
     addr: &str,
     plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
@@ -676,8 +784,15 @@ pub(crate) async fn build_anytls_inbound(
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
     })?;
     let (tls_acceptor, password) = parse_anytls_tls_acceptor(&ib.entry.data)?;
+    // bd b5e77：缺 dispatcher 时 anytls 服务端退回 mock 直连分支——TCP 绕过
+    // router（不烘焙 DNS/fake-IP/路由规则），UoT 直接拒会话。故与 hysteria/tuic
+    // 同款 fail-visible：无默认出站 = 启动期硬错，禁静默退回直连。
+    let dispatch = ohm.get_default_handler().ok_or_else(|| {
+        std::io::Error::other("anytls inbound requires a default outbound handler")
+    })?;
     let handler = xray_proxy_anytls::AnytlsInboundHandler::new(&ib.tag, bind_addr, tls_acceptor)
-        .with_password(password);
+        .with_password(password)
+        .with_dispatch(Arc::new(DispatchUntilLinkClosed(dispatch)));
     handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
     // start() 是 spawn-后-返回的短方法：slot.server 持 MockServer stop_tx，
     // handler drop → serve_loop 的 sender-dropped 分支退出 → listener 关闭。
@@ -1012,25 +1127,15 @@ pub(crate) fn ss_transport_on_conn(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
-    // W4 面 6：SS 泵归每连接 scope——per-conn pipeline 需 arm ctx（就地构造，
-    // 与 transport listener inbound 的派发点构造同源）。
-    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）——停机级联取消
-    // ConnScope 泵。
-    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
-    if let Some(api) = api {
-        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
-    }
-    let plugin_ctx = std::sync::Arc::new(ctx_builder);
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
-        let pipeline_ctx = Arc::clone(&plugin_ctx);
         #[allow(
             clippy::disallowed_methods,
             reason = "inbound 连接处理任务（ss/ss2022，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
         )]
         tokio::spawn(async move {
-            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout, pipeline_ctx).await;
+            ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
         });
     }))
 }
@@ -1256,8 +1361,7 @@ pub(crate) fn unix_shadowsocks_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result
             plugin_ctx
                 .spawn(async move {
                     let _ctx = Arc::clone(&task_ctx);
-                    ss_legacy_pipeline(inbound, handler, conn, hs_timeout, Arc::clone(&task_ctx))
-                        .await;
+                    ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
                 })
                 .expect("arm FxScope is never closed");
         })
@@ -1506,7 +1610,13 @@ pub(crate) fn hysteria_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 }
 
 pub(crate) fn anytls_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
-    Box::pin(build_anytls_inbound(ctx.ib, ctx.shutdown_token, ctx.addr, Arc::new(ctx.plugin_ctx)))
+    Box::pin(build_anytls_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
 }
 
 pub(crate) fn tuic_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {

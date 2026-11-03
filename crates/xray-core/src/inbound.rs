@@ -2029,63 +2029,21 @@ pub enum SsInboundMode {
     Ss2022Relay(Arc<xray_proxy_ss::ss2022::RelayInbound>),
 }
 
-/// SS inbound 双向 pump + dispatch（Legacy 握手后共用，泛型以支持 transport 流）。
+/// SS 连接：握手后的 `SSStream` 直接包成 [`xray_proxy_ss::SsStreamConn`]，读写两半
+/// 直挂 SS wire 交给 dispatcher（**无 duplex 中转层、无泵任务**）。
 ///
-/// up: ss_stream.read_chunk → server_io（密文→明文，供 dispatch reader）；
-/// down: server_io 读 → ss_stream.write_chunk（明文→密文，回包给客户端）。
-async fn spawn_ss_pump<C>(
-    mut ss_stream: xray_proxy_ss::stream::SSStream<C>,
+/// 帧/seal 逻辑全在 `xray_proxy_ss::conn`（与出站同一份）；连接生命周期 = `dispatch`
+/// 的 await（不再需要连接级 scope 托管泵任务）。
+async fn ss_dispatch<C>(
+    ss_stream: xray_proxy_ss::stream::SSStream<C>,
     dest: Destination,
     handler: std::sync::Arc<dyn DispatchHandler>,
-    // W4 面 6：泵任务归每连接 scope（两级 scope 模型，方案 §2 面 6 步 2）。
-    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    // connection scope：scope 的 Arc 由泵任务持有（任务内持 Arc 锚，既有先例
-    // `let _ctx = Arc::clone(&plugin_ctx)` 同款）——本函数返回（dispatch 结束）
-    // 后 scope 不被提前 close，泵自然死亡（对端关/断流 break）后计数归零，
-    // Drop → close（cancel 对已终局任务无害）；arm scope close（停机）经父闸
-    // 级联取消泵任务。语义 = 原裸 spawn detach + 停机级联（面 6 收益）。
-    let conn_scope = Arc::new(plugin_ctx.conn_scope());
-    let pump_scope = Arc::clone(&conn_scope);
-    // 单 task select! 串行推进：SSStream 共享 nonce 计数器不可并发持有 read/write &mut。
-    conn_scope
-        .spawn(async move {
-            let _scope = pump_scope;
-            let (mut srv_rd, mut srv_wr) = tokio::io::split(server_io);
-            let mut down_buf = vec![0u8; 8 * 1024];
-            loop {
-                tokio::select! {
-                    chunk = ss_stream.read_chunk() => {
-                        match chunk {
-                            Ok(Some(plaintext)) => {
-                                if tokio::io::AsyncWriteExt::write_all(&mut srv_wr, &plaintext).await.is_err() { break; }
-                                if tokio::io::AsyncWriteExt::flush(&mut srv_wr).await.is_err() { break; }
-                            }
-                            Ok(None) => { let _ = tokio::io::AsyncWriteExt::shutdown(&mut srv_wr).await; break; }
-                            Err(e) => { tracing::debug!("ss pump up read: {e}"); break; }
-                        }
-                    }
-                    n = tokio::io::AsyncReadExt::read(&mut srv_rd, &mut down_buf) => {
-                        match n {
-                            Ok(0) => { let _ = ss_stream.shutdown().await; break; }
-                            Ok(n) => {
-                                if ss_stream.write_chunk(&down_buf[..n]).await.is_err() { break; }
-                                if ss_stream.flush().await.is_err() { break; }
-                            }
-                            Err(e) => { tracing::debug!("ss pump down read: {e}"); break; }
-                        }
-                    }
-                }
-            }
-        })
-        .expect("fresh connection scope gate is never closed");
-    let (client_rd, client_wr) = tokio::io::split(client_io);
-    let link = Link::new(new_reader(client_rd), new_writer(client_wr));
+    let (r, w) = tokio::io::split(xray_proxy_ss::SsStreamConn::new(ss_stream));
+    let link = Link::new(new_reader(r), xray_proxy_ss::conn::new_link_writer(w));
     let _ = handler.dispatch(&dest, link).await;
-    // 本函数返回后 scope 由泵任务的 Arc 锚维活（见上），泵退出即收账。
 }
 
 /// Legacy SS 单条 TCP 连接完整 pipeline：握手 → pump → dispatch。
@@ -2098,8 +2056,6 @@ pub(crate) async fn ss_legacy_pipeline<C>(
     stream: C,
     // sm80④：policy Timeouts.Handshake（Go SessionDefault 60s 同源；装配层注入）
     handshake_timeout: std::time::Duration,
-    // W4 面 6：泵任务归每连接 scope（构造宿 = 本 pipeline 的调用方 arm ctx）。
-    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -2114,7 +2070,7 @@ pub(crate) async fn ss_legacy_pipeline<C>(
     match handshake {
         Ok((address, port, ss_stream)) => {
             let dest = Destination::new(address, Port::new(port), Network::TCP);
-            spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
+            ss_dispatch(ss_stream, dest, handler).await;
         },
         Err(e) => {
             tracing::debug!(error = %e, "ss inbound handshake failed");
@@ -2236,7 +2192,7 @@ pub async fn serve_ss(
         plugin_ctx
             .spawn(async move {
                 let _ctx = Arc::clone(&task_ctx);
-                ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout, task_ctx).await;
+                ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout).await;
             })
             .expect("arm FxScope is never closed");
     }
@@ -2245,21 +2201,19 @@ pub async fn serve_ss(
 /// SS inbound 单条连接 pipeline（按 [`SsInboundMode`] 分派）。
 ///
 /// raw TCP accept loop（[`serve_ss`]）与 transport inbound（ws/grpc/kcp 等 hub
-/// 解包后的明文流）共用：握手限时 → handle_conn → spawn_ss_pump → dispatch。
+/// 解包后的明文流）共用：握手限时 → handle_conn → [`ss_dispatch`]（读写两半直挂）。
 pub(crate) async fn ss_mode_conn_pipeline<C>(
     mode: SsInboundMode,
     handler: std::sync::Arc<dyn DispatchHandler>,
     stream: C,
     // Legacy / Ss2022 单用户的握手限时；Multi / Relay 保持既有 DEFAULT_HANDSHAKE_TIMEOUT
     handshake_timeout: std::time::Duration,
-    // W4 面 6：泵任务归每连接 scope（构造宿 = 本 pipeline 的调用方 arm ctx）。
-    plugin_ctx: Arc<PluginContext>,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     match mode {
         SsInboundMode::Legacy(ib) => {
-            ss_legacy_pipeline(ib, handler, stream, handshake_timeout, plugin_ctx).await;
+            ss_legacy_pipeline(ib, handler, stream, handshake_timeout).await;
         },
         SsInboundMode::Ss2022(ib) => {
             let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
@@ -2274,7 +2228,7 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
             };
             if let Ok((address, port, ss_stream)) = handshake {
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
+                ss_dispatch(ss_stream, dest, handler).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
@@ -2293,7 +2247,7 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
             };
             if let Ok((address, port, ss_stream)) = handshake {
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                spawn_ss_pump(ss_stream, dest, handler, plugin_ctx).await;
+                ss_dispatch(ss_stream, dest, handler).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
