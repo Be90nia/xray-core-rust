@@ -19,13 +19,13 @@
 //!   `XRAY_TUN_FD`）。核心与宿主同进程，fd 可用。
 //! - 核心**接管 fd 副本**（`F_DUPFD_CLOEXEC`）：核心只关自己的副本，宿主原 fd 不受影响（Go：`the
 //!   descriptor stays with the application`）。
-//! - 设备名**不**与配置 `name` 比对（宿主自定接口名，如 `tun0`；Go 同）——策略 [`ANDROID_POLICY`] 的
+//! - 设备名**不**与配置 `name` 比对（宿主自定接口名，如 `tun0`；Go 同）——策略 `ANDROID_POLICY` 的
 //!   `compare_device_name = false` 表达。
-//! - **拒绝 `IFF_VNET_HDR`**（[`ANDROID_POLICY`] 的 `allow_vnet_hdr = false`）：Go Android 走
+//! - **拒绝 `IFF_VNET_HDR`**（`ANDROID_POLICY` 的 `allow_vnet_hdr = false`）：Go Android 走
 //!   `newFdTun(fd, 0)`（无 virtio 头路径），Rust 侧照收会**静默错帧** ⇒
 //!   显式报错，不静默按裸包解析。
 //!
-//! 三个平台差异点集中在 [`InheritPolicy`]（Linux / Android 各一份常量），
+//! 三个平台差异点集中在 `InheritPolicy`（Linux / Android 各一份常量），
 //! Linux 策略 = 现网行为逐字不变。
 //!
 //! vnet_hdr 面（bd y93up，对齐 Go）：带 `IFF_VNET_HDR` 的继承 fd 照常接管。

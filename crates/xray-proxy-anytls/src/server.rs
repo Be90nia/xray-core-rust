@@ -6,7 +6,7 @@
 //! - `dispatch = None`：直连 TCP（仅 loopback 测试）。
 //!
 //! 桥接策略：Session 仅暴露 `async fn read/write(&self, ...)`，非 `AsyncRead`
-//! trait；Link 直挂 [`crate::session_io`] 的在途-future 适配器（无中转任务、
+//! trait；Link 直挂 `crate::session_io` 的在途-future 适配器（无中转任务、
 //! 无 duplex 环，每方向 1 次 scratch 拷贝）。
 //!
 //! 见 bd Xray-core-rust-dax。
