@@ -62,6 +62,14 @@ jobs:
         run: |
           echo "覆盖范围：workspace 全量 --bin xray（含 btls-sys cmake 交叉编译——boringssl 官方支持 android，btls-sys build/main.rs android 分支消费 ANDROID_NDK_HOME）。xray-proxy-tun 已源码级门控：android 上 tun_rs 依赖不编译、走 device_stub（VpnService 宿主注入）"
           cargo build --workspace --bin xray --target aarch64-linux-android
+      # 产物留档（bd 2ub2n 缺口二）：此前 Android job 编完即丢，产物既无法取用
+      # 也无法与本机/真机做字节级比对；if-no-files-found: error 防「空产物静默通过」。
+      - name: Upload android binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-aarch64-linux-android
+          path: target/aarch64-linux-android/debug/xray
+          if-no-files-found: error
 
   ios:
     name: iOS aarch64 check gate
