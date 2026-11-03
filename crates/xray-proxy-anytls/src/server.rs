@@ -29,10 +29,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
-use xray_app_dispatcher::{
-    DispatchHandler,
-    udp_session::{XudpFramingWriter, XudpUnframingReader},
-};
+use xray_app_dispatcher::{DispatchHandler, udp_session::XudpWireConn};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::{
     net::{address::Address as XAddress, destination::Destination, network::Network, port::Port},
@@ -384,6 +381,13 @@ async fn handle_session(
     // UoT v2（bd yfcnr）：magic 目标 = UDP-over-TCP 会话，不是可解析的域名。
     // 旧实现把它当域名交给 dispatcher 解析 → 必失败（UDP 面全废）。
     if let SocksAddr::Domain(host, _) = &target {
+        if host == crate::uot::LEGACY_MAGIC_ADDRESS {
+            // v1 wire **没有** Request 头（sing `uot/server.go` 只在 version==2
+            // 读 Request），按 v2 解析会把首帧长度前缀当 isConnect+atyp 读成垃圾。
+            SERVER_LOG.warn("anytls uot: v1 (legacy) magic unsupported, closing session");
+            finish_session(&session, kill_tx).await;
+            return;
+        }
         if crate::uot::is_magic(host) {
             let Some(handler) = dispatch else {
                 SERVER_LOG.warn("anytls uot: inbound without dispatcher cannot serve UDP");
@@ -442,9 +446,10 @@ async fn handle_session(
 
 /// UoT v2 服务端会话：读 `Request` → 单目标 UDP dispatch。
 ///
-/// wire：`[2B BE len][payload]`（isConnect=true 单目标形态，见 [`crate::uot`]）。
-/// 内部 link 仍是 XUDP 帧（freedom 等消费者按帧解析），故两侧各套一层表示
-/// 转换（bd t0ls1 同一组契约）。
+/// wire（spec: sing `common/uot/conn.go`）：`[2B BE len][payload]`，isConnect=true
+/// 单目标形态。内部 link 是 XUDP 帧（freedom 等消费者按帧解析），转换统一走
+/// `XudpWireConn`——与客户端 [`crate::dispatcher::make_dial_fn`] 用同一个件，
+/// 两侧线格式因此不会漂移。
 async fn serve_uot_session(
     session: Arc<Session>,
     handler: Arc<dyn DispatchHandler>,
@@ -488,15 +493,17 @@ async fn serve_uot_session(
     };
     let dest = Destination::new(xaddr, Port::new(port), Network::UDP);
 
-    let link = Link::new(
-        Box::new(XudpUnframingReader::new(Box::new(crate::uot::LengthFramedReader::new(
-            InitialedReader::new(pre, SessionReader::new(session.clone())),
-        )))),
-        Box::new(XudpFramingWriter::new(
-            Box::new(crate::uot::LengthFramedWriter::new(SessionWriter::new(session.clone()))),
-            dest.clone(),
-        )),
+    // 两侧用**同一个**转换器（客户端 `dispatcher.rs` 也是 `XudpWireConn`）：
+    // wire `[2B len][payload]` ↔ link 的 XUDP 帧。此前服务端另套
+    // `XudpUnframingReader(LengthFramedReader)` / `XudpFramingWriter(LengthFramedWriter)`
+    // ——读侧把裸载荷当 XUDP 帧解析、写侧产出 `[2B len][XUDP 帧]` 双层帧，
+    // 与客户端单层帧对不上（bd b5e77；spec = sing `common/uot/conn.go`）。
+    let stream = tokio::io::join(
+        InitialedReader::new(pre, SessionReader::new(session.clone())),
+        SessionWriter::new(session.clone()),
     );
+    let (rh, wh) = tokio::io::split(XudpWireConn::new(stream, dest.clone()));
+    let link = Link::new(new_reader(rh), new_writer(wh));
     handler.dispatch(&dest, link).await;
     finish_session(&session, kill_tx).await;
 }
