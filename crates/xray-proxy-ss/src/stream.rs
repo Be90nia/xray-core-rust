@@ -420,7 +420,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.tag_size
     }
 
-    /// 单 chunk 载荷上限：[`MAX_CHUNK_PAYLOAD`]（Go `MaxPacketSize`，SIP022 u16
+    /// 单 chunk 载荷上限：`MAX_CHUNK_PAYLOAD`（Go `MaxPacketSize`，SIP022 u16
     /// 长度域上限）。读侧（本仓与 Go）按长度域收任意 1..=65535 帧，改此值不破互通。
     #[must_use]
     pub fn max_chunk_payload(&self) -> usize {
@@ -1227,7 +1227,7 @@ mod tests {
         assert!(pending.is_empty(), "wire 字节必须全部消费");
     }
 
-    /// 单块上限 = [`MAX_CHUNK_PAYLOAD`]（65535，Go `MaxPacketSize`）。跨块 payload
+    /// 单块上限 = `MAX_CHUNK_PAYLOAD`（65535，Go `MaxPacketSize`）。跨块 payload
     /// 自动分块，读侧多 chunk 重组。150000 = 3 块（65535 + 65535 + 18930）。
     /// 注意：duplex 缓冲仅 8KB，写端大 payload 会阻塞，读端必须 spawn 并发收。
     #[tokio::test]

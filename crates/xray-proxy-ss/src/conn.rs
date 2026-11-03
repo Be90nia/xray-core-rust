@@ -6,17 +6,17 @@
 //! （`slow-root-cause.md` §R3：本仓 `nanosleep` 3814 次 / 27x futex 的结构指纹）。
 //!
 //! 新实现（本文件）：直接实现 `AsyncRead`/`AsyncWrite`：
-//! - **读半**：wire 字节直落 `BytesMut` spare 区 → [`SSStream::try_open_chunk`] 原地解密 →
+//! - **读半**：wire 字节直落 `BytesMut` spare 区 → `SSStream::try_open_chunk` 原地解密 →
 //!   交付调用方（**零中转拷贝**）；
-//! - **写半**：明文进 64KiB 暂存 → [`SSStream::seal_chunk_in_place`] **原地 seal** →
+//! - **写半**：明文进 64KiB 暂存 → `SSStream::seal_chunk_in_place` **原地 seal** →
 //!   `[sealed_size][ciphertext+tag]` 两段向量写直落 wire。
 //!
 //! 两个方向由 bridge 的上行/下行两个任务**各自独立**驱动（不再有单任务 `select!`
 //! 串行推进），读写的 `&mut` 互斥由 `tokio::io::split` 的轮询级锁保证。
 //!
 //! **wire 不变量**：帧格式 / 序号 / 加密顺序与旧泵**逐字节一致**——seal 逻辑复用
-//! [`SSStream::seal_chunk_in_place`]（与旧 `write_chunk_in_place` 同源同一份代码），
-//! SS-2022 请求头复用 [`SSStream::build_client_2022_header`]（与旧
+//! `SSStream::seal_chunk_in_place`（与旧 `write_chunk_in_place` 同源同一份代码），
+//! SS-2022 请求头复用 `SSStream::build_client_2022_header`（与旧
 //! `emit_pending_client_2022` 同源）。
 
 use std::{
