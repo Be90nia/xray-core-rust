@@ -643,7 +643,7 @@ pub fn reload_listener_count() -> usize {
 ///
 /// 对应 Go `app/geodata/geodata.go:88-90 reload() = IPReg.Reload() + DomainReg.Reload()`。
 /// `IP_REG`/`DOMAIN_REG` 只有注册进去的 matcher 才会被重建（本仓路由 matcher 是
-/// 本地的，故这两步对路由恒为空操作——真正的路由刷新走 [`RELOAD_LISTENERS`]）。
+/// 本地的，故这两步对路由恒为空操作——真正的路由刷新走 `RELOAD_LISTENERS`）。
 pub struct ReloadBothRegistries;
 
 impl GeodataReloader for ReloadBothRegistries {
