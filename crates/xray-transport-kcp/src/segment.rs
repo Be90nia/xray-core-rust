@@ -213,8 +213,17 @@ impl Segment for DataSegment {
             return (false, 0);
         }
         let payload = self.data();
-        payload.clear();
-        payload.write_from(&body[14..14 + data_len]);
+        // `data_len` 来自 wire（u16 上限 65535），而 `data()` 懒分配的是默认 8KB 块：
+        // 装不下时 `write_from` 静默少写，本函数却仍报 consumed = 14 + data_len
+        // ⇒ 上层把短载荷当整段收下（帧体错位、静默脏数据）。按需换块，绝不静默截断。
+        if payload.free() < data_len {
+            let mut old = std::mem::replace(payload, Buffer::new_pooled(data_len));
+            old.release();
+        } else {
+            payload.clear();
+        }
+        let written = payload.write_from(&body[14..14 + data_len]);
+        assert_eq!(written, data_len, "载荷块已按 data_len 取块");
         (true, 14 + data_len)
     }
 }
@@ -532,6 +541,28 @@ mod tests {
             },
             other => panic!("expected Data, got {other:?}"),
         }
+    }
+
+    /// 载荷长度超过默认 8KB 块时按需换块，**绝不静默少写**（qgdgh）：旧实现
+    /// `write_from` 少写但仍报 `consumed = 14 + data_len` ⇒ 上层把短载荷当整段
+    /// 收下（帧体错位）。wire 的 data_len 是 u16，对端可发 65535。
+    #[test]
+    fn data_segment_parse_keeps_payload_larger_than_default_block() {
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut body = Vec::with_capacity(14 + payload.len());
+        body.extend_from_slice(&3u32.to_be_bytes()); // timestamp
+        body.extend_from_slice(&4u32.to_be_bytes()); // number
+        body.extend_from_slice(&5u32.to_be_bytes()); // sending_next
+        body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        body.extend_from_slice(&payload);
+
+        let mut seg = DataSegment::new();
+        let (valid, consumed) = seg.parse(1, Command::Data, 0, &body);
+        assert!(valid, "载荷超默认块也必须判有效（不得因容量不足丢段）");
+        assert_eq!(consumed, 14 + payload.len(), "消耗量必须覆盖整段载荷");
+        let kept = seg.payload.as_ref().expect("payload");
+        assert_eq!(kept.len(), payload.len(), "载荷不得被截断");
+        assert_eq!(kept.bytes(), &payload[..], "载荷必须逐字节一致");
     }
 
     #[test]

@@ -500,31 +500,23 @@ impl ChunkFrame {
         self.payload.free().saturating_sub(tag_len)
     }
 
-    /// 读最多 [`Self::plaintext_max`] 字节**直落**明文区（提交写游标），返回实读字节数。
+    /// 把 `data` 拷进明文区（写侧；提交写游标）。返回实拷字节数。
     ///
-    /// 数据面泵直接读进将上线的那块内存 ⇒ 明文零拷贝。
-    pub(crate) async fn read_plaintext<R>(
-        &mut self,
-        r: &mut R,
-        tag_len: usize,
-    ) -> std::io::Result<usize>
-    where
-        R: tokio::io::AsyncRead + Unpin + ?Sized,
-    {
-        let max = self.plaintext_max(tag_len);
-        self.payload.read_from(r, max).await
-    }
-
-    /// 把 `data` 拷进明文区（写侧泵；提交写游标）。返回实拷字节数。
+    /// 容量不足即 `write_from` 静默少写：调用方按 `piece.len()` 传
+    /// [`write_chunk_frame`] 装帧时，未写入的尾部字节会被当明文加密上线
+    /// （脏数据外发）。容量由调用方 [`Self::plaintext_max`] 给出 ⇒ 写不满
+    /// 就是调用方算错，故此处 release 也断言写满。
     pub(crate) fn write_plaintext(&mut self, data: &[u8]) -> usize {
-        self.payload.write_from(data)
+        let written = self.payload.write_from(data);
+        assert_eq!(written, data.len(), "明文区剩余空间装不下 {} 字节", data.len());
+        written
     }
 }
 
 /// 把一帧 `[size_field][ciphertext‖tag][padding]` 以 2~3 段向量写发出（用户态零拷贝）。
 ///
 /// 前置：`plaintext_len` 字节明文已落在 `frame` 的读入区并经
-/// [`ChunkFrame::write_plaintext`] / [`ChunkFrame::read_plaintext`] 提交。
+/// [`ChunkFrame::write_plaintext`] 提交。
 /// `plaintext_len == 0` 即终止 chunk
 /// （Go `seal([])` 语义）：wire 上只余 size + tag。
 ///
@@ -845,6 +837,19 @@ mod tests {
 
     fn make_nonce_gen() -> ChunkNonceAdapter {
         ChunkNonceAdapter::new(&[0xAAu8; 16], 12)
+    }
+
+    /// 写不满必须显式失败，不得静默少写（qgdgh）：明文区容量由调用方按
+    /// `plaintext_max` 给出，超量写入 = 调用方算错 ⇒ release 下同样 panic
+    /// （`--release` 跑此用例即证明「写不满」不再是静默失败面）。
+    #[test]
+    #[should_panic(expected = "明文区剩余空间装不下")]
+    fn write_plaintext_panics_instead_of_silent_short_write() {
+        let mut frame = ChunkFrame::new();
+        let cap = frame.payload.free();
+        assert_eq!(frame.write_plaintext(&vec![0u8; cap]), cap, "写满容量内应成功");
+        assert_eq!(frame.payload.free(), 0, "前置：明文区已无剩余空间");
+        frame.write_plaintext(&[0u8; 1]);
     }
 
     #[test]

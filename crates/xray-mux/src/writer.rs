@@ -135,9 +135,8 @@ impl MuxWriter {
         // 直序进池化 Buffer（同 write_meta_with_frame 形态）：免 from_vec
         // 二次拷贝，scratch 容量留在 self 跨帧复用。
         let mut frame = Buffer::new();
-        let n = self.meta_scratch.len();
-        assert!(n <= frame.free(), "mux meta exceeds buffer writable capacity");
-        frame.write_from(&self.meta_scratch);
+        let written = frame.write_from(&self.meta_scratch);
+        assert_eq!(written, self.meta_scratch.len(), "mux meta exceeds buffer writable capacity");
         let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
@@ -186,9 +185,8 @@ impl MuxWriter {
         meta.write_bytes_into(&mut self.meta_scratch)
             .map_err(|e| MuxError::Io(format!("close meta: {:?}", e)))?;
         let mut frame = Buffer::new();
-        let n = self.meta_scratch.len();
-        assert!(n <= frame.free(), "mux meta exceeds buffer writable capacity");
-        frame.write_from(&self.meta_scratch);
+        let written = frame.write_from(&self.meta_scratch);
+        assert_eq!(written, self.meta_scratch.len(), "mux meta exceeds buffer writable capacity");
         let mb = MultiBuffer::from_buffer(frame);
         self.writer
             .write_multi_buffer_direct(mb)
@@ -239,10 +237,14 @@ async fn write_meta_with_frame(
     meta.write_bytes_into(scratch).map_err(|e| MuxError::Io(format!("meta: {:?}", e)))?;
     let mut frame = Buffer::new();
     let meta_len = scratch.len();
-    let n = meta_len + 2;
-    assert!(n <= frame.free(), "mux meta + length exceeds buffer writable capacity");
-    frame.write_from(scratch);
-    frame.write_from(&data_len.to_be_bytes());
+    let len_field = data_len.to_be_bytes();
+    let written = frame.write_from(scratch);
+    let len_written = frame.write_from(&len_field);
+    assert_eq!(
+        written + len_written,
+        meta_len + len_field.len(),
+        "mux meta + length exceeds buffer writable capacity"
+    );
     let mut mb = MultiBuffer::with_capacity(data.buffer_count() + 1);
     mb.push(frame);
     for buf in data.into_buffers() {

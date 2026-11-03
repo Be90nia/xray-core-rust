@@ -71,8 +71,11 @@ impl ResponseConfig {
                 ))
             })?;
             // 通过单一 Buffer 写入；MultiBuffer 仅承载一个 Buffer 即可表达 "one shot write"。
-            let mut buf = xray_buf::buffer::Buffer::new();
-            buf.write_from(&payload);
+            // 容量按 payload 取块：custom_response_data 无长度上限，默认 8KB 块会静默
+            // 少写而本函数仍按 payload.len() 回报写入量 ⇒ 线上短报文 + 计数说谎。
+            let mut buf = xray_buf::buffer::Buffer::new_pooled(payload.len());
+            let written = buf.write_from(&payload);
+            assert_eq!(written, payload.len(), "blackhole 响应块按 payload 长度取块");
             let mb = xray_buf::multi::MultiBuffer::from_buffer(buf);
             writer.write_multi_buffer(mb).await?;
             Ok(n)
@@ -157,6 +160,17 @@ mod tests {
         let n = ResponseConfig::None.write_to(&mut w).await.unwrap();
         assert_eq!(n, 0);
         assert!(w.chunks.is_empty());
+    }
+
+    /// `custom_response_data` 无长度上限：超过默认 8KB 块时按需取块，
+    /// **不得静默少写**（qgdgh）——旧实现只发出前 8KB 却回报 payload 全长。
+    #[tokio::test]
+    async fn custom_response_larger_than_default_block_is_written_whole() {
+        let payload: Vec<u8> = (0..9000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut w = CollectWriter::new();
+        let n = ResponseConfig::Custom(payload.clone()).write_to(&mut w).await.unwrap();
+        assert_eq!(n as usize, payload.len(), "回报的写入量 = payload 全长");
+        assert_eq!(w.collected_bytes(), payload, "线上字节必须逐字节等于 payload");
     }
 
     #[tokio::test]

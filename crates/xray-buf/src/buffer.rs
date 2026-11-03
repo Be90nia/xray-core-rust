@@ -336,6 +336,19 @@ impl Buffer {
     /// 从 `src` 写入数据到缓冲区，返回实际写入的字节数。
     ///
     /// 对应 Go 的 `Buffer.Write()`。只写入可用空间允许的量。
+    ///
+    /// # 写不满（`返回值 < src.len()`）时的契约
+    ///
+    /// 实际写入量恒为 `min(src.len(), free())`：容量不足时**静默少写**尾部，
+    /// 缓冲区里留下的是前缀 `src[..返回值]`。Go 在同处返回 `ErrBufferFull`，
+    /// Rust 侧只回返回值——**没有错误信道**，写不满即调用方的容量判断错了。
+    /// 因此每个调用点必须自证容量，二选一：
+    /// - 容量可静态/构造期确定 → 断言写满（`assert_eq!`，release 也生效）；
+    /// - 容量取决于运行时数据 → 先按需取块（[`Buffer::new_pooled`] 按请求量分层，
+    ///   取到的块必定装得下）或返回显式错误。
+    ///
+    /// 注意 `Frozen` 变体（[`Buffer::from_vec`] / [`Buffer::from_bytes_frozen`]）
+    /// `free()` 恒为 0 ⇒ 恒返回 0，写前须经可变访问转正（见 `pooled_mut`）。
     pub fn write_from(&mut self, src: &[u8]) -> usize {
         let available = self.free();
         let n = src.len().min(available);

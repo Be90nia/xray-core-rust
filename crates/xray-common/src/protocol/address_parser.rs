@@ -20,42 +20,61 @@ const ADDR_TYPE_IPV6: u8 = 3;
 /// 地址序列化器：将地址和端口写入缓冲区。
 pub struct AddressSerializer;
 
+/// 写满 `data`：容量不足时 `write_from` 静默少写 ⇒ wire 地址被截断，而调用方
+/// 仍按完整地址的长度切分/前移游标（后续帧体整体错位）。地址串写不满只可能是
+/// 调用方容量算错（不可由对端触发），故用 release 也生效的断言而非返回错误。
+fn write_all(buf: &mut Buffer, data: &[u8]) {
+    let written = buf.write_from(data);
+    assert_eq!(written, data.len(), "地址序列化空间不足：需 {} 字节", data.len());
+}
+
+/// 同 [`write_all`] 的单字节形态——`write_byte` 满时只回 `false`，不报错。
+fn push_byte(buf: &mut Buffer, b: u8) {
+    assert!(buf.write_byte(b), "地址序列化空间不足：需 1 字节");
+}
+
 impl AddressSerializer {
     /// 将端口和地址写入缓冲区（先端口后地址）。
     ///
     /// 格式：port(2 bytes BE) + address(variable)
+    ///
+    /// # Panics
+    /// 缓冲区剩余空间装不下端口 + 地址（调用方容量算错）时 panic。
     pub fn write_port_address(buf: &mut Buffer, port: Port, addr: &Address) {
         let port_bytes = port.value().to_be_bytes();
-        buf.write_from(&port_bytes);
+        write_all(buf, &port_bytes);
         Self::write_address(buf, addr);
     }
 
     /// 将地址和端口写入缓冲区（先地址后端口）。
     ///
     /// 格式：address(variable) + port(2 bytes BE)
+    ///
+    /// # Panics
+    /// 缓冲区剩余空间装不下地址 + 端口（调用方容量算错）时 panic。
     pub fn write_address_port(buf: &mut Buffer, addr: &Address, port: Port) {
         Self::write_address(buf, addr);
         let port_bytes = port.value().to_be_bytes();
-        buf.write_from(&port_bytes);
+        write_all(buf, &port_bytes);
     }
 
     /// 将地址写入缓冲区（不含端口）。
     fn write_address(buf: &mut Buffer, addr: &Address) {
         match addr {
             Address::IPv4(v4) => {
-                buf.write_byte(ADDR_TYPE_IPV4);
-                buf.write_from(&v4.octets());
+                push_byte(buf, ADDR_TYPE_IPV4);
+                write_all(buf, &v4.octets());
             },
             Address::Domain(domain) => {
-                buf.write_byte(ADDR_TYPE_DOMAIN);
+                push_byte(buf, ADDR_TYPE_DOMAIN);
                 let domain_bytes = domain.as_bytes();
                 let len = domain_bytes.len() as u8;
-                buf.write_byte(len);
-                buf.write_from(domain_bytes);
+                push_byte(buf, len);
+                write_all(buf, domain_bytes);
             },
             Address::IPv6(v6) => {
-                buf.write_byte(ADDR_TYPE_IPV6);
-                buf.write_from(&v6.octets());
+                push_byte(buf, ADDR_TYPE_IPV6);
+                write_all(buf, &v6.octets());
             },
         }
     }
@@ -140,6 +159,16 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    /// 写不满必须显式失败（qgdgh）：容量算错的调用方在 release 下同样 panic，
+    /// 而不是把截断的地址当完整地址上线（后续帧体整体错位）。
+    #[test]
+    #[should_panic(expected = "地址序列化空间不足")]
+    fn test_write_address_panics_when_buffer_too_small() {
+        let mut buf = Buffer::with_capacity(4);
+        let addr = Address::ipv6(Ipv6Addr::LOCALHOST);
+        AddressSerializer::write_address_port(&mut buf, &addr, Port::new(443));
+    }
 
     #[test]
     fn test_write_read_ipv4() {

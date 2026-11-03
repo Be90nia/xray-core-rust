@@ -558,12 +558,17 @@ impl Connection {
         while written < b.len() {
             let end = (written + mss).min(b.len());
             let chunk = &b[written..end];
-            let mut buf = xray_buf::buffer::Buffer::new();
-            buf.write_from(chunk);
+            // 按本段长度取块：`mtu` 无上界（Go 侧也只校验下界 21），默认 8KB 块装不下
+            // 时 `write_from` 静默少写，而下面按 `end` 记账 ⇒ 谎报写入量 + 线上截断段。
+            // `new_pooled` 对任意尺寸都保证 `free() >= 请求量`（超最大层走裸分配）。
+            let mut buf = xray_buf::buffer::Buffer::new_pooled(chunk.len());
+            let staged = buf.write_from(chunk);
+            assert_eq!(staged, chunk.len(), "kcp 写块按本段长度取块");
             let state = self.state();
             if !self.inner.sending_worker.push(buf, state) {
                 break;
             }
+            // 前提：上面的断言保证整段已入 buf ⇒ 记账值 == 实际入段字节数。
             written = end;
         }
         if written > 0 {
@@ -1092,6 +1097,38 @@ mod tests {
         let (conn, writer) = make_connection(1);
         conn.flush();
         assert_eq!(writer.count(), 0);
+    }
+
+    /// 大 mtu（> 默认 8KB 块）+ 跨段载荷：写入必须完整入段，不得静默少写（qgdgh）。
+    /// `mtu` 无上界（Go 也只校验下界 21），旧实现用 8KB 默认块 + 丢弃 `write_from`
+    /// 返回值却按 `end` 记账 ⇒ 段载荷被截断、回报值却仍是全长。
+    #[test]
+    fn write_large_mtu_keeps_every_segment_payload_whole() {
+        let writer = CollectWriter::new();
+        let mut config = default_config();
+        config.mtu = 9000;
+        let conn = Connection::new_without_updater(
+            ConnMetadata::new(9),
+            writer.clone(),
+            Arc::new(NoopCloser),
+            Arc::new(config),
+        );
+        let mss = 9000 - DATA_SEGMENT_OVERHEAD;
+        let payload: Vec<u8> = (0..mss * 2 + 100).map(|i| (i % 251) as u8).collect();
+
+        assert_eq!(conn.write(&payload).unwrap(), payload.len(), "回报写入量 = 全长");
+        writer.take();
+        conn.flush();
+
+        let mut got = Vec::new();
+        for seg in writer.take() {
+            if let SegmentKind::Data(d) = seg {
+                let b = d.payload.as_ref().expect("data segment carries payload");
+                assert!(b.len() <= mss, "段载荷 {} 超过 mss {mss}", b.len());
+                got.extend_from_slice(b.bytes());
+            }
+        }
+        assert_eq!(got, payload, "跨段载荷必须逐字节完整入段");
     }
 
     #[test]

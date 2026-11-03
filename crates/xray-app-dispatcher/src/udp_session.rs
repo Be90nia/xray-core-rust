@@ -337,8 +337,10 @@ const MIN_META_LEN: usize = 4;
 /// 池化 Buffer 装一段拷贝（免 `to_vec` 扁平化禁忌；容量按需，超池档走裸分配）。
 fn buffer_from_slice(src: &[u8]) -> Buffer {
     let mut b = Buffer::with_capacity(src.len().max(1));
-    let n = b.write_from(src);
-    debug_assert_eq!(n, src.len(), "Buffer 容量足够装下整段载荷");
+    // with_capacity 保证 capacity >= 请求量 ⇒ 恒写满；写不满即本函数的构造不变式被破坏，
+    // 而载荷截断不报错（debug_assert 在 release 下消失）→ 用 release 也生效的断言。
+    let written = b.write_from(src);
+    assert_eq!(written, src.len(), "Buffer::with_capacity 已按载荷取块");
     b
 }
 
@@ -564,9 +566,8 @@ impl Writer for XudpFramingWriter {
                 .write_header(mb.len(), None, &mut self.scratch)
                 .map_err(|e| xray_buf::io::Error::WriteError(format!("xudp frame header: {e}")))?;
             let mut frame = Buffer::new();
-            let n = self.scratch.len();
-            assert!(n <= frame.free(), "xudp frame header exceeds buffer capacity");
-            frame.write_from(&self.scratch);
+            let written = frame.write_from(&self.scratch);
+            assert_eq!(written, self.scratch.len(), "xudp frame header exceeds buffer capacity");
             let mut out = MultiBuffer::with_capacity(mb.buffer_count() + 1);
             out.push(frame);
             for buf in mb.into_buffers() {

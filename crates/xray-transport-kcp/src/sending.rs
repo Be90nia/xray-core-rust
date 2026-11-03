@@ -367,8 +367,11 @@ fn clone_for_send(seg: &DataSegment) -> DataSegment {
         number: seg.number,
         sending_next: seg.sending_next,
         payload: seg.payload.as_ref().map(|b| {
-            let mut new_b = Buffer::new();
-            new_b.write_from(b.bytes());
+            // 按源段长度取块：mtu 可配到 > 8KB，沿用默认 8KB 块会静默少写
+            // ⇒ 重传段载荷被截断（线上畸形帧）。new_pooled 保证 free() >= 请求量。
+            let mut new_b = Buffer::new_pooled(b.len());
+            let written = new_b.write_from(b.bytes());
+            assert_eq!(written, b.len(), "重传段载荷块按源长度取块");
             new_b
         }),
         timeout: seg.timeout,
