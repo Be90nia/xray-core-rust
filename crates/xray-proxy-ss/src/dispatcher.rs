@@ -162,7 +162,7 @@ impl Connection for SsConnection {
 
 /// 双向 pump：在 `SSStream`（加密 chunk 流）与 `DuplexStream`（明文 IO）之间桥接。
 ///
-/// - up：read duplex（8KB）→ `write_chunk` → flush（明文 → 密文 chunk）
+/// - up：read duplex（≤64KB/轮）→ `write_chunk_in_place` → flush（明文 → 密文 chunk）
 /// - down：底层单次 read（cancel-safe）→ `pending` 缓冲 → `try_open_chunk` 完整解帧（nonce
 ///   只在整帧解出时推进，select! 取消不损流状态）
 ///
@@ -178,7 +178,10 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
     // 上行明文直接读进池化 Buffer 的尾部可写区：`write_chunk_in_place` 把明文**原地**
     // 覆写为密文、tag 写进尾部 headroom，再按 [sealed_size][ciphertext+tag] 两段向量写
     // 落线 ⇒ 稳态用户态 0 拷贝（无「明文另拷一块再加密」）。
-    let mut up_buf = xray_buf::buffer::Buffer::new_pooled(8 * 1024);
+    // 64KB 块（k16um C3）：一读一帧（65520 payload），写帧数/系统调用 8× 降
+    // （mdurk strace：本仓 write 8191.6B/次 vs sing-box 65331.8B/次）；64KB 请求
+    // 落精确 64KB 池层（k16um A4），稳态零新鲜分配。
+    let mut up_buf = xray_buf::buffer::Buffer::new_pooled(64 * 1024);
     // 每轮读入上限：既要留 tag headroom，也要守住单 chunk 载荷上限（帧边界=wire 契约）。
     let up_cap =
         up_buf.capacity().saturating_sub(stream.tag_size()).min(stream.max_chunk_payload());

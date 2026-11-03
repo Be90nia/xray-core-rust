@@ -20,10 +20,20 @@ use crate::{
     error::{Result, SsError},
 };
 
-/// 单 chunk 的 Go 缓冲大小（`buf.Size`）：载荷上限 = 该值 − 2B size 段 − tag。
+/// 单 chunk 载荷上限（Go `MaxPacketSize` = 65535，SIP022 §3.2：2B BE u16 长度域）。
 ///
-/// 分块粒度属 wire 契约（帧边界不变），写侧/读侧/pump 读入量都以此为上限。
-const GO_BUF_SIZE: usize = 8192;
+/// 这是**发送方自选、接收方按长度域收**的 wire 参数，非「与 Go 实发逐字节一致」：
+/// - Go **读侧**接受 payload `1..=65535`（ss2022 `StreamReader`：`payloadLen == 0 ||
+///   > MaxPacketSize` 才拒，缓冲按 `MaxPacketSize+tag` 预置；legacy
+///   `AuthenticationReader` 对 `> buf.Size` 走堆分配路径，同样收到 65535）；
+/// - Go **写侧**生产实发 ≤8192（`buf.Copy` 源缓冲 = `buf.Size`=8192，legacy 写侧 `totalSize >
+///   buf.Size` 直接报错）。
+///
+/// 因此本仓写侧按协议上限分块（k16um C1）：每 64KB 载荷从 ~16 帧降到 ~1 帧，
+/// size 段 AEAD 与写系统调用同步降一个量级（mdurk strace：本仓 write 帧
+/// 8191.6B/次 vs sing-box 65331.8B/次）。读侧不设上限（`try_open_chunk_body`
+/// 按 u16 长度域收帧），Go 8KB 帧与本仓 64KB 帧双向互认。
+const MAX_CHUNK_PAYLOAD: usize = 65535;
 
 /// SS 流式 AEAD 读写器（**读/写双方向独立 AEAD+nonce**）。
 ///
@@ -213,8 +223,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// plaintext 通常是一段应用层数据（HTTP 请求、TLS record 等）。
     /// 客户端的**第一个** `write_chunk` 应传 addr+port（SS 地址格式），作为首帧。
     ///
-    /// 超过单块上限时自动分块（对应 Go `AuthenticationWriter.writeStream` 按
-    /// `GO_BUF_SIZE - tag - 2` 分块，见 [`Self::max_chunk_payload`]），调用方无需关心大小。
+    /// 超过单块上限时自动分块（按 [`Self::max_chunk_payload`] = Go `MaxPacketSize`
+    /// 65535 分块，k16um C1），调用方无需关心大小。
     /// 空输入不产生任何 chunk（size=0 是流结束标记，不能由本方法发出）。
     ///
     /// # Errors
@@ -385,12 +395,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.tag_size
     }
 
-    /// 单 chunk 载荷上限：`GO_BUF_SIZE - tag_size - 2`（2B = size 段明文长度）。
-    ///
-    /// 与 Go `AuthenticationWriter.writeStream` 的分块粒度一致（帧边界属 wire 契约）。
+    /// 单 chunk 载荷上限：[`MAX_CHUNK_PAYLOAD`]（Go `MaxPacketSize`，SIP022 u16
+    /// 长度域上限）。读侧（本仓与 Go）按长度域收任意 1..=65535 帧，改此值不破互通。
     #[must_use]
     pub fn max_chunk_payload(&self) -> usize {
-        GO_BUF_SIZE.saturating_sub(self.tag_size + 2)
+        MAX_CHUNK_PAYLOAD
     }
 
     /// 写一个 raw chunk（直接 seal，无 size prefix）。
@@ -1175,8 +1184,9 @@ mod tests {
         assert!(pending.is_empty(), "wire 字节必须全部消费");
     }
 
-    /// 单块上限 = 8192 - tag(16) - 2 = 8174。跨块 payload 自动分块，读侧多 chunk 重组。
-    /// 注意：duplex 缓冲仅 8KB，写端 20KB 会阻塞，读端必须 spawn 并发收。
+    /// 单块上限 = [`MAX_CHUNK_PAYLOAD`]（65535，Go `MaxPacketSize`）。跨块 payload
+    /// 自动分块，读侧多 chunk 重组。150000 = 3 块（65535 + 65535 + 18930）。
+    /// 注意：duplex 缓冲仅 8KB，写端大 payload 会阻塞，读端必须 spawn 并发收。
     #[tokio::test]
     async fn multi_chunk_split_roundtrip() {
         let (mut client, mut server) = roundtrip_pair(CipherType::Aes128Gcm).await;
@@ -1190,12 +1200,29 @@ mod tests {
             received
         });
 
-        // 20000 = 3 块（8174 + 8174 + 3652）
-        let payload = vec![0xCDu8; 20_000];
+        // 150000 = 3 块（65535 + 65535 + 18930），验证跨块重组与尾块边界
+        let payload = vec![0xCDu8; 150_000];
         client.write_chunk(&payload).await.expect("write");
         client.flush().await.expect("flush");
 
         assert_eq!(reader.await.expect("reader task"), payload);
+    }
+
+    /// 单帧恰为上限（65535 payload）：u16 长度域满值边界。写侧不得拒绝 65535，
+    /// 读侧必须整帧重组（Go `StreamWriter.WriteChunk` 同值合法，`MaxPacketSize`）。
+    #[tokio::test]
+    async fn max_payload_single_chunk_roundtrip() {
+        let (mut client, mut server) = roundtrip_pair(CipherType::Aes128Gcm).await;
+
+        let payload = vec![0x5Au8; MAX_CHUNK_PAYLOAD];
+        let writer = xray_common::testing::spawn("max-payload-write", async move {
+            client.write_chunk(&payload).await.expect("write");
+            client.flush().await.expect("flush");
+        });
+        let got = server.read_chunk().await.expect("read").expect("chunk");
+        writer.await.expect("writer task");
+        assert_eq!(got.len(), MAX_CHUNK_PAYLOAD, "65535 payload 必须整帧交付");
+        assert!(got.iter().all(|&b| b == 0x5A), "载荷内容逐字节一致");
     }
 
     #[tokio::test]
@@ -1437,7 +1464,7 @@ mod tests {
         let (client_half, mut peer) = tokio::io::duplex(128 * 1024);
         let mut stream = SSStream::new_client(client_half, &account, &iv).expect("client");
 
-        // 小 chunk（1 块）+ 大 payload（8174+8174+3652 = 3 块），共 4 chunk。
+        // 小 chunk（1 块）+ 大 payload（≤65535 = 1 块，不再按 8KB 劈），共 2 chunk。
         let small = b"exact wire bytes check payload";
         let big = vec![0xEEu8; 20_000];
         stream.write_chunk(small).await.expect("write small");
@@ -1450,8 +1477,7 @@ mod tests {
 
         // 独立推导 expected：aead 独立实例，nonce 手动推进。
         let aead = account.cipher.create_aead(&account.key, &iv).expect("aead").expect("aead");
-        let tag_size = aead.tag_size();
-        let max_payload = 8192 - tag_size - 2;
+        let max_payload = MAX_CHUNK_PAYLOAD;
         let mut nonce = vec![0xFFu8; 12];
         let mut expected = Vec::new();
         for part in [small.as_slice(), big.as_slice()] {
