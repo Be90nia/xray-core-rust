@@ -223,8 +223,8 @@ fn next_read_block(
 /// `current >= 2` 时一次 `readv` 填多缓冲，按实填数调整策略。
 ///
 /// 块尺寸升窗（k16um A3，Go 无此机制）：readv **顶格满载**（`count == 8` 且
-/// 全部缓冲填满）连续 [`FULL_STREAK_TO_UPGRADE`] 轮后，读块从 8KB 升到
-/// [`READ_BLOCK_MAX`]（64KB 池层），单轮读入 64KB → 512KB；显著欠载（单轮
+/// 全部缓冲填满）连续 `FULL_STREAK_TO_UPGRADE` 轮后，读块从 8KB 升到
+/// `READ_BLOCK_MAX`（64KB 池层），单轮读入 64KB → 512KB；显著欠载（单轮
 /// 填充 < 半载）回落 8KB。小流/慢流到不了顶格 ⇒ 批边界与升窗前逐字节一致。
 pub struct ReadVReader {
     src: ReadVSource,
