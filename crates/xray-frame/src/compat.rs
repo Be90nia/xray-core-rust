@@ -133,6 +133,11 @@ impl Drop for CompatGuard {
 /// 作用域安装（测试隔离用）：装入临时槽，守卫 drop 即还原。
 ///
 /// 临时槽优先于永久槽 → 作用域安装期间 [`caps`] 读到临时那份。
+///
+/// **守卫窗口内 spawn 的归宿**：期间经 [`spawn`] 起的任务落在**临时** caps 的
+/// scope 上——守卫 drop 后该 scope 若已无他引，`JoinSet` drop = abort 在途任务
+/// （[`Spawned::join`] 回 `Cancelled`）。故并发用例经进程级访问器 spawn 时，须
+/// 自持守卫到 join 完成（见 `tests/compat_caps.rs::process_scope_spawn_is_managed`）。
 pub fn install_scoped(caps: CompatCaps) -> CompatGuard {
     let lock = SCOPED_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let prev = {

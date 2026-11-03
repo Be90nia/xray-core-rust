@@ -90,6 +90,22 @@ fn scoped_install_shadows_and_is_dropped() {
 
 #[tokio::test]
 async fn process_scope_spawn_is_managed() {
+    // 本用例读的是**进程级槽**，而并行用例的作用域安装会把它临时换成本地 scope
+    // （`install_scoped` 影子优先）——那份 scope 随守卫 drop 回收，JoinSet drop
+    // = abort 在途任务 → `Spawned::join` 回 `Cancelled`。故持守卫独占进程级槽
+    // 直到 join 完成：既保 join 期间 scope 存活，也与并发作用域安装串行化。
+    let clock: Arc<dyn Clock> = Arc::new(FixedClock);
+    let scope = Arc::new(FxScope::new());
+    let _guard = install_scoped(CompatCaps::new(
+        clock,
+        Arc::clone(&scope),
+        LogFacade::new("compat_test", Vec::new()),
+    ));
+    assert!(
+        Arc::ptr_eq(&xray_frame::compat::spawn_scope(), &scope),
+        "守卫期间进程级 scope = 本用例装的那份"
+    );
+
     let handle = xray_frame::compat::spawn(async { 7u32 }).expect("进程级 scope 可 spawn");
     let joined = handle.join().await.expect("join");
     assert_eq!(joined, 7, "进程级 scope 托管的任务正常返回");
