@@ -1002,7 +1002,16 @@ mod udp_assoc_tests {
 
         let assoc = client.dial_udp(0x0D22);
         let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
-        for size in [1200usize, 1500, 4000, 20_000] {
+        // ⚠️ 平台上限：macOS 的 `net.inet.udp.maxdgram` 默认 **9216** ⇒ 单 UDP datagram
+        // 超过它会被内核 `EMSGSIZE` 拒（该上限是内核策略，调 SO_SNDBUF/SO_RCVBUF 无效）。
+        // 本测试的 echo 层收发的是**单条** datagram，故 macOS 用 9000 覆盖「大报分片」路径，
+        // 其余平台保留 20000 覆盖更极端的分片数（Linux/Windows 单 datagram 上限 65507）。
+        let sizes: &[usize] = if cfg!(target_os = "macos") {
+            &[1200, 1500, 4000, 9_000]
+        } else {
+            &[1200, 1500, 4000, 20_000]
+        };
+        for &size in sizes {
             let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let resp = tokio::time::timeout(
                 Duration::from_secs(10),
