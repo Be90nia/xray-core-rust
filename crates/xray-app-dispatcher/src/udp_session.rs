@@ -336,11 +336,15 @@ const MIN_META_LEN: usize = 4;
 
 /// 池化 Buffer 装一段拷贝（免 `to_vec` 扁平化禁忌；容量按需，超池档走裸分配）。
 fn buffer_from_slice(src: &[u8]) -> Buffer {
-    let mut b = Buffer::with_capacity(src.len().max(1));
-    // with_capacity 保证 capacity >= 请求量 ⇒ 恒写满；写不满即本函数的构造不变式被破坏，
+    // 走分层池取块（`new_pooled` → `alloc(size)` 向上取整到 tier 档）：
+    // `with_capacity` 的精确容量（如 100B）在 release 时因 `capacity != TIER_SIZES[tier]`
+    // 被丢弃（alloc.rs 的「缓冲池丢弃非标准容量块」分支）→ 每包分配一次丢一次；
+    // 池化块容量恒等于 tier 大小，归还即回收。
+    let mut b = Buffer::new_pooled(src.len().max(1));
+    // 池化块容量 >= 请求量 ⇒ 恒写满；写不满即本函数的构造不变式被破坏，
     // 而载荷截断不报错（debug_assert 在 release 下消失）→ 用 release 也生效的断言。
     let written = b.write_from(src);
-    assert_eq!(written, src.len(), "Buffer::with_capacity 已按载荷取块");
+    assert_eq!(written, src.len(), "Buffer::new_pooled 已按载荷取块");
     b
 }
 
