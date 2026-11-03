@@ -105,7 +105,7 @@ impl TunDevice {
         if let Some(dev) = Self::from_inherited_env(&name_str, mtu)? {
             return Ok(dev);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         crate::tun_fd::refuse_unsupported()?;
 
         let dev = DeviceBuilder::new()

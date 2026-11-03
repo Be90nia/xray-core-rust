@@ -9,9 +9,24 @@
 //! - 末步置非阻塞（Go `unix.SetNonblock`）：tokio `AsyncFd` 的前提。
 //!
 //! 平台面：
-//! - **Linux**：完整实现（`linux` 子模块 + `inherit_from_env`）。
-//! - **其他平台**（Windows/macOS/BSD）：未实现 fd 继承。
+//! - **Linux / Android**：完整实现（`linux` 子模块 + `inherit_from_env`）。两者同为 Linux
+//!   内核，`TUNGETIFF` / `fcntl` 的 ioctl 编码一致。
+//! - **其他平台**（Windows/macOS/BSD/iOS）：未实现 fd 继承。
 //! - 这些平台 env 设置即由 `refuse_unsupported` 显式报错，禁静默回退直开。
+//!
+//! Android 注入契约（Go `proxy/tun/tun_android.go::NewTun` 对齐）：
+//! - 宿主（App 的 `VpnService`）建 TUN fd → 按**既有 env 机制**把 fd 号交给核心（`xray.tun.fd` /
+//!   `XRAY_TUN_FD`）。核心与宿主同进程，fd 可用。
+//! - 核心**接管 fd 副本**（`F_DUPFD_CLOEXEC`）：核心只关自己的副本，宿主原 fd 不受影响（Go：`the
+//!   descriptor stays with the application`）。
+//! - 设备名**不**与配置 `name` 比对（宿主自定接口名，如 `tun0`；Go 同）——策略 [`ANDROID_POLICY`] 的
+//!   `compare_device_name = false` 表达。
+//! - **拒绝 `IFF_VNET_HDR`**（[`ANDROID_POLICY`] 的 `allow_vnet_hdr = false`）：Go Android 走
+//!   `newFdTun(fd, 0)`（无 virtio 头路径），Rust 侧照收会**静默错帧** ⇒
+//!   显式报错，不静默按裸包解析。
+//!
+//! 三个平台差异点集中在 [`InheritPolicy`]（Linux / Android 各一份常量），
+//! Linux 策略 = 现网行为逐字不变。
 //!
 //! vnet_hdr 面（bd y93up，对齐 Go）：带 `IFF_VNET_HDR` 的继承 fd 照常接管。
 //! tun-rs 的 `from_fd` 把设备记成裸包模式（读写原语 = 裸 read/write），因此
@@ -26,6 +41,60 @@ pub const TUN_FD_KEYS: [&str; 2] = ["xray.tun.fd", "XRAY_TUN_FD"];
 
 /// 进程间传递的文件描述符编号（Windows 上无此语义，见 `refuse_unsupported`）。
 pub type TunFd = i32;
+
+/// 平台 fd 接管策略：Linux / Android 的三个语义差异点集中于此。
+///
+/// Linux 侧保持现网行为逐字不变；Android 侧对齐 Go `proxy/tun/tun_android.go`。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InheritPolicy {
+    /// 是否比对设备名与配置 `name`（Android 宿主自定接口名 → 否）。
+    pub compare_device_name: bool,
+    /// 是否接管 fd 副本（Android：宿主仍持原 fd → 是，核心只关副本）。
+    pub dup_fd: bool,
+    /// 是否接受带 `IFF_VNET_HDR` 的 fd（Android 无 virtio 头路径 → 否）。
+    pub allow_vnet_hdr: bool,
+}
+
+/// Linux 接管策略 = 现网行为（比对名 / 直接接管 / 接受 virtio 头）。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub const LINUX_POLICY: InheritPolicy =
+    InheritPolicy { compare_device_name: true, dup_fd: false, allow_vnet_hdr: true };
+
+/// Android 接管策略（Go `proxy/tun/tun_android.go`）：不比对名 / 接管副本 / 拒 virtio 头。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+pub const ANDROID_POLICY: InheritPolicy =
+    InheritPolicy { compare_device_name: false, dup_fd: true, allow_vnet_hdr: false };
+
+/// 按策略算出应当比对的期望设备名（不比对时返回空串 ⇒ verify 跳过比对）。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[must_use]
+pub fn expected_name_for<'a>(policy: &InheritPolicy, configured: &'a str) -> &'a str {
+    if policy.compare_device_name { configured } else { "" }
+}
+
+/// 按策略判定设备旗标是否可接管（`None` = 可接管；`Some(reason)` = 拒绝原因）。
+///
+/// 纯函数：可在任意平台（含 Windows）单测 Android 策略的旗标语义。
+#[cfg(any(target_os = "linux", target_os = "android", test))]
+#[must_use]
+pub fn flags_reject_reason(policy: &InheritPolicy, flags: u16) -> Option<&'static str> {
+    // 与 Linux `verify` 的既有判定同源（IFF_TUN / IFF_NO_PI / IFF_VNET_HDR）。
+    const IFF_TUN: u16 = 0x0001;
+    const IFF_NO_PI: u16 = 0x1000;
+    const IFF_VNET_HDR: u16 = 0x4000;
+
+    if flags & IFF_TUN == 0 {
+        return Some("is not a TUN device (IFF_TUN unset)");
+    }
+    if flags & IFF_NO_PI == 0 {
+        return Some("TUN device must use IFF_NO_PI");
+    }
+    if !policy.allow_vnet_hdr && flags & IFF_VNET_HDR != 0 {
+        return Some("carries IFF_VNET_HDR which is not supported on this platform");
+    }
+    None
+}
 
 fn invalid(msg: String) -> TunError {
     TunError::InvalidConfig(format!("{}: {msg}", TUN_FD_KEYS[0]))
@@ -73,7 +142,7 @@ pub fn from_env() -> Result<Option<TunFd>> {
 }
 
 /// 平台无 fd 继承能力时的门闸：env 设置即显式报错，未设置返回 `Ok(())`（照常直开）。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
 pub fn refuse_unsupported() -> Result<()> {
     if env_raw().is_none_or(|v| v.is_empty()) {
         return Ok(());
@@ -85,8 +154,8 @@ pub fn refuse_unsupported() -> Result<()> {
     )))
 }
 
-/// 继承来的 TUN 设备描述（Linux）。
-#[cfg(target_os = "linux")]
+/// 继承来的 TUN 设备描述（Linux / Android）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[derive(Debug)]
 pub struct InheritedTun {
     /// 已校验为 TUN 设备、且已置非阻塞的 fd。所有权**仍归宿主进程**：本函数不开
@@ -100,27 +169,44 @@ pub struct InheritedTun {
     pub vnet_hdr: bool,
 }
 
-/// 继承路径入口（Linux）：读 env → 解析 → 校验 fd。
+/// 继承路径入口（Linux / Android）：读 env → 解析 → 校验 fd。
 ///
 /// `expected_name` 为空表示配置未指定设备名（不校验）；非空时实际名必须一致
-/// （Go `openFromEnv` 末段）。
-#[cfg(target_os = "linux")]
+/// （Go `openFromEnv` 末段）。平台差异由 [`InheritPolicy`] 表达：Linux 用
+/// [`LINUX_POLICY`]（比对名）；Android 用 [`ANDROID_POLICY`]（不比对名，走
+/// [`expected_name_for`] ⇒ 传空串）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn inherit_from_env(expected_name: &str) -> Result<Option<InheritedTun>> {
     let Some(fd) = from_env()? else {
         return Ok(None);
     };
-    linux::verify(fd, expected_name).map(Some)
+    let policy = platform_policy();
+    let expected = expected_name_for(&policy, expected_name);
+    linux::verify(fd, expected, &policy).map(Some)
+}
+
+/// 当前平台的接管策略（Linux = 现网行为；Android = Go `tun_android.go`）。
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn platform_policy() -> InheritPolicy {
+    #[cfg(target_os = "android")]
+    {
+        ANDROID_POLICY
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        LINUX_POLICY
+    }
 }
 
 /// 清继承 fd 所在 TUN 设备的 offload mask（`TUNSETOFFLOAD(0)`，Linux）。
 ///
 /// 接管带 `IFF_VNET_HDR` 的 fd 时必须在首个读之前调用——见 [`InheritedTun::vnet_hdr`]。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn clear_offload(fd: TunFd) -> Result<()> {
     linux::clear_offload(fd)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux {
     use std::{
         ffi::{c_int, c_ulong},
@@ -134,8 +220,8 @@ mod linux {
     // 编码（x86_64/aarch64/riscv64 一致；mips 系不同，本仓不覆盖）。
     // TUNGETIFF = _IOR('T', 210, struct ifreq)。
     const TUNGETIFF: c_ulong = 0x8004_54d2;
-    const IFF_TUN: u16 = 0x0001;
-    const IFF_NO_PI: u16 = 0x1000;
+    // IFF_TUN / IFF_NO_PI 判定已上移到 `super::flags_reject_reason`（平台策略共用）；
+    // 此处只留 verify 自身仍消费的 vnet 头位。
     const IFF_VNET_HDR: u16 = 0x4000;
 
     const F_GETFL: c_int = 3;
@@ -166,7 +252,11 @@ mod linux {
     const _: () = assert!(std::mem::size_of::<IfReq>() == 40);
     const _: () = assert!(std::mem::align_of::<IfReq>() == 8);
 
-    pub(super) fn verify(fd: TunFd, expected_name: &str) -> Result<super::InheritedTun> {
+    pub(super) fn verify(
+        fd: TunFd,
+        expected_name: &str,
+        policy: &super::InheritPolicy,
+    ) -> Result<super::InheritedTun> {
         let mut req = IfReq { name: [0; 16], union: IfReqUnion { _align: [0; 3] } };
         // SAFETY: req 是 40 字节的 ifreq（上方 const assert 钉死）；fd 由调用方
         // 交来，TUNGETIFF 只写 ifr_name/ifr_flags，不越过 req 边界。
@@ -179,11 +269,8 @@ mod linux {
         }
         // SAFETY: TUNGETIFF 成功返回即已写入联合体（flags 占前 2 字节）。
         let flags = unsafe { req.union.flags };
-        if flags & IFF_TUN == 0 {
-            return Err(device_err(format!("fd {fd} is not a TUN device (IFF_TUN unset)")));
-        }
-        if flags & IFF_NO_PI == 0 {
-            return Err(device_err(format!("fd {fd} TUN device must use IFF_NO_PI")));
+        if let Some(reason) = super::flags_reject_reason(policy, flags) {
+            return Err(device_err(format!("fd {fd} {reason}")));
         }
         let vnet_hdr = flags & IFF_VNET_HDR != 0;
         let actual = ifreq_name(&req);
@@ -194,7 +281,27 @@ mod linux {
             )));
         }
         set_nonblocking(fd)?;
+        // Android：宿主仍持原 fd（Go `tun_android.go`「the descriptor stays with
+        // the application」）→ 核心接管副本，核心只关副本。
+        let fd = if policy.dup_fd { dup_cloexec(fd)? } else { fd };
         Ok(super::InheritedTun { fd, name: actual, vnet_hdr })
+    }
+
+    /// `F_DUPFD_CLOEXEC`（Linux/Android 通用值 1030）——复制 fd 副本。
+    ///
+    /// 副本与原 fd 共享同一 open file description（非阻塞状态随之共享），但
+    /// 关闭互不影响：核心只关副本，宿主原 fd 仍可用。
+    fn dup_cloexec(fd: TunFd) -> Result<TunFd> {
+        const F_DUPFD_CLOEXEC: c_int = 1030;
+        // SAFETY: fcntl(F_DUPFD_CLOEXEC) 只读 fd 并返回新 fd 号（不写内存）。
+        let dup = unsafe { fcntl(fd, F_DUPFD_CLOEXEC, 0) };
+        if dup < 0 {
+            return Err(device_err(format!(
+                "fd {fd} fcntl(F_DUPFD_CLOEXEC) failed: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        Ok(dup)
     }
 
     /// 清继承 fd 所在 TUN 设备的 offload mask（`TUNSETOFFLOAD(0)`）。
@@ -332,7 +439,7 @@ pub(crate) mod tests {
     }
 
     /// 接线证明：`TunDevice::create` 在平台无继承能力时从 env 直接报错，不回退直开。
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[test]
     fn create_wires_env_check_before_device_open() {
         let _guard = lock_env();
@@ -345,7 +452,7 @@ pub(crate) mod tests {
         clear_env();
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[test]
     fn unsupported_platform_refuses_only_when_env_set() {
         let _guard = lock_env();
@@ -390,5 +497,56 @@ pub(crate) mod tests {
         assert!(msg.contains(">= 3"), "got: {msg}");
         assert!(!msg.contains("TUNGETIFF"), "解析段就该失败: {msg}");
         clear_env();
+    }
+
+    // ---- 策略层纯逻辑（任意平台可跑，含 Windows）----
+
+    const IFF_TUN: u16 = 0x0001;
+    const IFF_NO_PI: u16 = 0x1000;
+    const IFF_VNET_HDR: u16 = 0x4000;
+
+    /// Android 策略下期望设备名恒为空串 ⇒ 校验期不比对设备名（Go 同）。
+    #[test]
+    fn android_policy_never_compares_device_name() {
+        assert_eq!(expected_name_for(&ANDROID_POLICY, "tun0"), "");
+        assert_eq!(expected_name_for(&ANDROID_POLICY, ""), "");
+        // Linux 策略照旧比对配置名。
+        assert_eq!(expected_name_for(&LINUX_POLICY, "xray0"), "xray0");
+    }
+
+    /// 旗标校验三种拒绝原因（非 TUN / 缺 IFF_NO_PI / 带 IFF_VNET_HDR）。
+    #[test]
+    fn flags_reject_reason_covers_three_cases() {
+        // 非 TUN。
+        let reason = flags_reject_reason(&ANDROID_POLICY, 0).expect("非 TUN 必须拒绝");
+        assert!(reason.contains("IFF_TUN"), "got: {reason}");
+        // 缺 IFF_NO_PI。
+        let reason = flags_reject_reason(&ANDROID_POLICY, IFF_TUN).expect("缺 IFF_NO_PI 必须拒绝");
+        assert!(reason.contains("IFF_NO_PI"), "got: {reason}");
+        // 带 IFF_VNET_HDR：Android 拒绝（无 virtio 头路径，禁静默错帧）。
+        let reason = flags_reject_reason(&ANDROID_POLICY, IFF_TUN | IFF_NO_PI | IFF_VNET_HDR)
+            .expect("Android 必须拒绝 IFF_VNET_HDR");
+        assert!(reason.contains("IFF_VNET_HDR"), "got: {reason}");
+        // 合法旗标组合接受。
+        assert_eq!(flags_reject_reason(&ANDROID_POLICY, IFF_TUN | IFF_NO_PI), None);
+    }
+
+    /// Linux 策略保留 virtio 头支持（现网行为逐字不变：带 IFF_VNET_HDR 照常接管）。
+    #[test]
+    fn linux_policy_still_allows_vnet_hdr() {
+        assert_eq!(flags_reject_reason(&LINUX_POLICY, IFF_TUN | IFF_NO_PI | IFF_VNET_HDR), None);
+    }
+
+    /// 两平台策略的三个差异点逐条钉死（防漂移）。
+    #[test]
+    fn policy_differences_are_pinned() {
+        assert_eq!(
+            LINUX_POLICY,
+            InheritPolicy { compare_device_name: true, dup_fd: false, allow_vnet_hdr: true }
+        );
+        assert_eq!(
+            ANDROID_POLICY,
+            InheritPolicy { compare_device_name: false, dup_fd: true, allow_vnet_hdr: false }
+        );
     }
 }
