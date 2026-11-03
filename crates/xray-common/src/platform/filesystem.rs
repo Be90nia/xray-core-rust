@@ -145,9 +145,10 @@ fn is_nul_device_name(file: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 进程级 env 变更互斥锁（测试并行时串行化）。
-    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    // 进程级 env 变更互斥锁（测试并行时串行化）：与 `platform::tests`（读
+    // `xray.location.asset`）共用同一把锁——env 是进程全局，写侧不持锁则读侧会
+    // 读到写侧的临时目录。
+    use crate::platform::ENV_LOCK;
 
     #[allow(clippy::disallowed_methods, reason = "测试：临时目录唯一名（pid+纳秒）")]
     fn unique_dir(label: &str) -> PathBuf {

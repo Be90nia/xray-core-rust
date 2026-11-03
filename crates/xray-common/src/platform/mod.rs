@@ -20,6 +20,15 @@ static CONFDIR_LOCATION: LazyLock<EnvFlag> =
 /// Go `platform.AssetLocation`。
 static ASSET_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.asset"));
 
+/// 进程级 env 读写的测试互斥锁。
+///
+/// env 是进程全局：`platform::filesystem` 的用例会临时写 `XRAY_LOCATION_ASSET`
+/// /`XRAY_LOCATION_CERT`，`platform::tests` 需读同一批键。两侧共用本锁，
+/// 写窗口与读窗口才互斥——否则读侧会读到写侧的临时目录（并行测试 ⇒ 偶发红）。
+/// `parking_lot` 锁无毒化：持锁用例 panic 后锁仍可继续使用。
+#[cfg(test)]
+pub(crate) static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Go `platform.CertLocation`。
 static CERT_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.cert"));
 
@@ -198,6 +207,9 @@ mod tests {
     /// 无 env 且共享路径无 .dat 时回落 exe 目录（DNS 侧原回退 cwd 的回归锚点）。
     #[test]
     fn asset_dir_defaults_to_env_or_exe_dir() {
+        // env 是进程全局：`platform::filesystem` 的用例会临时写
+        // `XRAY_LOCATION_ASSET`。持共享锁读，避免读到写侧的临时目录。
+        let _g = ENV_LOCK.lock();
         if std::env::var("xray.location.asset").is_err()
             && std::env::var("XRAY_LOCATION_ASSET").is_err()
         {

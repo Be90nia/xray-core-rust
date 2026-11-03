@@ -27,12 +27,21 @@ pub fn init_global_conv(seed: u16) {
     GLOBAL_CONV.store(u32::from(seed), Ordering::SeqCst);
 }
 
-/// 原子递增并返回下一个 conv（对应 Go `atomic.AddUint32(&globalConv, 1)` as uint16）。
+/// conv 计数核心：对给定计数器原子递增并返回下一个 conv。
 ///
-/// 注意：Go `AddUint32` 返回新值，再转 uint16。这里 1:1 对齐：先 fetch_add（返回旧值）
-/// 后 +1。截断到 u16 与 Go 一致（wrap at 65536）。
+/// 对应 Go `atomic.AddUint32(&globalConv, 1)` as uint16。注意：Go `AddUint32`
+/// 返回新值，再转 uint16。这里 1:1 对齐：先 fetch_add（返回旧值）后 +1。
+/// 截断到 u16 与 Go 一致（wrap at 65536）。
+///
+/// 计数器是入参而非直接读进程级全局：测试可注入局部计数器，避免多条测试
+/// 共享同一全局状态而互相干扰（libtest 默认并行执行）。
+fn conv_next(counter: &AtomicU32) -> u16 {
+    counter.fetch_add(1, Ordering::SeqCst).wrapping_add(1) as u16
+}
+
+/// 原子递增并返回下一个 conv（进程级全局计数器实例，对应 Go `globalConv`）。
 pub fn next_conv() -> u16 {
-    GLOBAL_CONV.fetch_add(1, Ordering::SeqCst).wrapping_add(1) as u16
+    conv_next(&GLOBAL_CONV)
 }
 
 /// 包输入 trait（对应 Go `fetchInput` 的 `io.Reader`）。
@@ -90,31 +99,49 @@ mod tests {
     use super::*;
     use crate::segment::{CmdOnlySegment, Command, Segment};
 
+    /// 局部 conv 计数器（测试注入点）：每条用例独占，不共享进程级全局状态。
+    fn local_conv(seed: u16) -> AtomicU32 {
+        AtomicU32::new(u32::from(seed))
+    }
+
     #[test]
     fn next_conv_increments_atomically() {
-        init_global_conv(100);
-        assert_eq!(next_conv(), 101);
-        assert_eq!(next_conv(), 102);
-        assert_eq!(next_conv(), 103);
+        let counter = local_conv(100);
+        assert_eq!(conv_next(&counter), 101);
+        assert_eq!(conv_next(&counter), 102);
+        assert_eq!(conv_next(&counter), 103);
     }
 
     #[test]
     fn next_conv_wraps_at_u16_boundary() {
-        init_global_conv(u16::MAX);
-        assert_eq!(next_conv(), 0);
+        let counter = local_conv(u16::MAX);
+        assert_eq!(conv_next(&counter), 0);
     }
 
+    /// 显式重置（seed）后单步递增：seed → seed+1。
+    ///
+    /// 原名 `global_conv_seeds_randomly_on_first_access` 名不符实（随机播种只有
+    /// 一次，无法由单测断言）；随机播种路径改由
+    /// `global_conv_first_access_seeds_then_increments` 覆盖。
     #[test]
-    fn global_conv_seeds_randomly_on_first_access() {
-        // 验证 5wek globalConv 随机初始化：Go `var globalConv uint32 = dice.RollUint16()`
-        // → Rust LazyLock 首访 roll_uint16 随机。两次「reset」种子应得到不同首值。
-        // 注：直接断言 GLOBAL_CONV 不可行（私有 static），但 init_global_conv
-        // 会覆写 LazyLock 首访值；此处改为两次独立 reset 路径下的单步增长合法性。
-        // 真正随机性靠 LazyLock 自检（构造期触发 roll_uint16()）。
-        init_global_conv(0);
-        assert_eq!(next_conv(), 1);
-        init_global_conv(0x1234);
-        assert_eq!(next_conv(), 0x1235);
+    fn conv_counter_reseed_then_increment() {
+        let c1 = local_conv(0);
+        assert_eq!(conv_next(&c1), 1);
+        let c2 = local_conv(0x1234);
+        assert_eq!(conv_next(&c2), 0x1235);
+    }
+
+    /// 进程级全局计数器的接线：`init_global_conv` 覆写 → `next_conv` 自增。
+    ///
+    /// 本测试二进制内**唯一**触碰 `GLOBAL_CONV` 的用例（其余 conv 用例用局部
+    /// 计数器）：独占即无并发干扰。新增触碰全局的用例必须与本用例共用闸，
+    /// 否则会重现「共享全局 + libtest 并行」的 flake。
+    #[test]
+    fn global_conv_first_access_seeds_then_increments() {
+        // 首次访问触发 LazyLock 随机播种（Go `dice.RollUint16()` 语义），
+        // 随后显式覆写为定标值。
+        init_global_conv(100);
+        assert_eq!(next_conv(), 101);
     }
 
     struct MockInput {
