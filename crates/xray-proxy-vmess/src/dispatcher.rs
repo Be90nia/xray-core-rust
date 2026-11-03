@@ -42,8 +42,9 @@ use crate::{
     encoding::{
         ChunkNonceGenerator, VERSION,
         body_chunk::{
-            AEADSizeParserAdapter, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter,
-            SizeParser, make_authenticated_length_size_parser,
+            AEADSizeParserAdapter, ChunkFrame, ChunkNonceAdapter, PlainSizeParser,
+            ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser,
+            write_chunk_frame,
         },
         client::ClientSession,
         generate_chacha20poly1305_key,
@@ -939,6 +940,21 @@ impl AeadCipher for BodyCipher {
             BodyCipher::Chacha(c) => c.open_in_place(nonce, aad, ciphertext),
         }
     }
+
+    /// 原地 seal（数据面上行热路径）：不覆写则落到 trait 默认实现 seal+split，
+    /// 会静默把载荷再搬一遍。
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),
+            BodyCipher::Chacha(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),
+        }
+    }
 }
 
 /// 按 resolved security 构造请求/响应 body cipher（同一算法，不同 key）。
@@ -978,70 +994,55 @@ async fn pump_up<C, R, W>(
     W: AsyncWrite + Unpin,
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    let mut buf = [0u8; PUMP_BUF];
-    let mut chunk_buf = Vec::with_capacity(PUMP_BUF + 96);
+    // 明文直接读进装帧块（原地覆写为密文）⇒ 用户载荷零拷贝
+    let mut frame = ChunkFrame::new();
+    let tag_len = cipher.tag_size();
     loop {
-        match server_r.read(&mut buf).await {
+        frame.clear();
+        let n = match server_r.read(frame.plaintext_read_buf(tag_len)).await {
             Ok(0) => break,
-            Ok(n) => {
-                if write_one_chunk(
-                    &mut stream_w,
-                    &buf[..n],
-                    &cipher,
-                    &mut nonce_gen,
-                    size_parser.as_mut(),
-                    global_padding,
-                    &mut chunk_buf,
-                )
-                .await
-                .is_err()
-                {
-                    break;
-                }
-            },
+            Ok(n) => n,
             Err(e) => {
                 crate::VMESS_LOG.debug(format!("vmess up body plaintext read failed error={e}"));
                 break;
             },
+        };
+        frame.commit_plaintext(n);
+        let nonce = nonce_gen.next_ref();
+        if write_chunk_frame(
+            &mut stream_w,
+            &mut frame,
+            n,
+            &cipher,
+            nonce,
+            size_parser.as_mut(),
+            global_padding,
+        )
+        .await
+        .is_err()
+        {
+            break;
         }
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，服务端 decode 看到 plaintext 为空即请求
     // body 结束。`NoTerminationSignal` 实验（Go outbound.go:180）时整块省略，靠连接
     // 关闭让服务端识别流结束。
     if termination_signal {
-        let _ = write_one_chunk(
+        frame.clear();
+        let nonce = nonce_gen.next_ref();
+        let _ = write_chunk_frame(
             &mut stream_w,
-            &[],
+            &mut frame,
+            0,
             &cipher,
-            &mut nonce_gen,
+            nonce,
             size_parser.as_mut(),
             global_padding,
-            &mut chunk_buf,
         )
         .await;
     }
     let _ = stream_w.flush().await;
     let _ = stream_w.shutdown().await;
-}
-
-/// 写单个 chunk `[size_field][sealed][padding]`（对齐 body_chunk::write_one_chunk 的
-/// SHAKE128 流消费顺序：next_padding_len → encode，与 decode 侧对称）。
-async fn write_one_chunk<W, C>(
-    writer: &mut W,
-    data: &[u8],
-    cipher: &C,
-    nonce_gen: &mut ChunkNonceGenerator,
-    size_parser: &mut (dyn SizeParser + Send),
-    global_padding: bool,
-    chunk_buf: &mut Vec<u8>,
-) -> std::io::Result<()>
-where
-    W: AsyncWrite + Unpin,
-    C: AeadCipher,
-{
-    let nonce = nonce_gen.next_ref();
-    encode_frame_into(chunk_buf, data, cipher, nonce, size_parser, global_padding)?;
-    writer.write_all(chunk_buf).await
 }
 
 /// 把一帧 `[size_field][sealed][padding]` 构进调用方复用的缓冲（同步、零中间 Vec）。
@@ -1571,29 +1572,22 @@ mod tests {
         assert!(eof.is_none(), "clean EOF must be None");
     }
 
-    /// wire 字节对拍（判别器）：write_one_chunk 输出必须逐字节等于手工
-    /// 构成的 `[size_field || seal(data) || padding]`——零拷贝改写不得改 wire。
+    /// wire 字节对拍（判别器）：原地 seal 装帧输出必须逐字节等于手工构成的
+    /// `[size_field || seal(data) || padding]`——零拷贝改写不得改 wire。
     #[tokio::test]
     async fn write_one_chunk_wire_parity() {
         let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
         let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
         let mut sp = PlainSizeParser;
-        let mut chunk_buf = Vec::with_capacity(4096);
+        let mut frame = ChunkFrame::new();
+        frame.write_plaintext(b"hello wire");
         let mut out = Vec::new();
-        write_one_chunk(
-            &mut out,
-            b"hello wire",
-            &cipher,
-            &mut nonce_gen,
-            &mut sp,
-            false,
-            &mut chunk_buf,
-        )
-        .await
-        .expect("write chunk");
+        write_chunk_frame(&mut out, &mut frame, 10, &cipher, nonce_gen.next_ref(), &mut sp, false)
+            .await
+            .expect("write chunk");
         // 参考构成：分配式 seal + size_field 手工拼接
         let mut ref_nonce = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
-        let sealed = cipher.seal(&ref_nonce.next(), &[], b"hello wire").expect("seal");
+        let sealed = cipher.seal(ref_nonce.next_ref(), &[], b"hello wire").expect("seal");
         let mut expected = vec![0u8; 2];
         sp.encode(u16::try_from(sealed.len()).expect("small"), &mut expected);
         expected.extend_from_slice(&sealed);
@@ -1615,6 +1609,25 @@ mod tests {
             Poll::Ready(Ok(buf.len()))
         }
 
+        // 裸 TCP 形态：底层支持 vectored ⇒ 一帧（size/密文/padding）一次 syscall 交付
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            let mut total = 0;
+            for b in bufs {
+                self.buf.extend_from_slice(b);
+                total += b.len();
+            }
+            Poll::Ready(Ok(total))
+        }
+
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
@@ -1624,32 +1637,143 @@ mod tests {
         }
     }
 
-    /// 『零中间 Vec + 合并单次写』结构断言：padding 开启时旧实现 3 次
-    /// write（size_field/sealed/padding 各一次），新实现必须每 chunk 1 次；
-    /// chunk_buf 跨 chunk 复用不扩容（零中间分配的结构性代理断言）。
+    /// 『原地密封 + 一次向量写』结构断言：padding 开启时一帧是 3 段
+    /// （size_field / 密文‖tag / padding），仍须 1 次 `poll_write_vectored`；
+    /// 装帧块跨 chunk 复用不扩容（零中间分配的结构性代理断言）。
     #[tokio::test]
     async fn write_one_chunk_single_write_and_buffer_reuse() {
         let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
         let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
         let mut sp = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
-        let cap = PUMP_BUF + 96;
-        let mut chunk_buf = Vec::with_capacity(cap);
+        let mut frame = ChunkFrame::new();
+        let cap = frame.plaintext_read_buf(cipher.tag_size()).len();
         let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
+        let pt = b"payload bytes for one chunk";
         for _ in 0..2 {
-            write_one_chunk(
+            frame.clear();
+            frame.write_plaintext(pt);
+            write_chunk_frame(
                 &mut w,
-                b"payload bytes for one chunk",
+                &mut frame,
+                pt.len(),
                 &cipher,
-                &mut nonce_gen,
+                nonce_gen.next_ref(),
                 &mut sp,
                 true,
-                &mut chunk_buf,
             )
             .await
             .expect("write chunk");
         }
-        assert_eq!(w.writes, 2, "each chunk must be one write_all (old impl: 3)");
-        assert!(chunk_buf.capacity() <= cap, "chunk_buf must be reused without growth");
+        assert_eq!(w.writes, 2, "each chunk must be one vectored write (3 segments)");
+        frame.clear(); // 与泵一致：每帧先 clear 再取读区
+        assert_eq!(
+            frame.plaintext_read_buf(cipher.tag_size()).len(),
+            cap,
+            "frame block must be reused without growth"
+        );
+        assert!(!w.buf.is_empty());
+    }
+
+    /// size parser 三态：Plain（默认）/ Shake（CHUNK_MASKING）/ AEAD（AuthenticatedLength）。
+    #[derive(Clone, Copy)]
+    enum SpKind {
+        Plain,
+        Shake,
+        AeadLen,
+    }
+
+    impl SpKind {
+        fn make(self) -> Box<dyn SizeParser + Send> {
+            match self {
+                SpKind::Plain => Box::new(PlainSizeParser),
+                SpKind::Shake => Box::new(ShakeSizeParserAdapter::new(&[0x11u8; 16])),
+                SpKind::AeadLen => Box::new(
+                    make_authenticated_length_size_parser(
+                        &[0x22u8; 16],
+                        &[0x33u8; 16],
+                        SecurityType::Aes128Gcm,
+                    )
+                    .expect("aead length parser"),
+                ),
+            }
+        }
+    }
+
+    /// wire 三路对拍（判别器）：同一 plaintext+nonce 下
+    /// ① UDP 路径 `encode_frame_into`（Vec 构帧 + 分配式 seal）
+    /// ② TCP 路径 `write_chunk_frame`（原地 seal + 2~3 段写）
+    /// ③ 手工 `cipher.seal()` 构成 `[size_field][sealed][padding]`
+    /// 三者逐字节相同 ⇒ 原地零拷贝改写没改 wire，两条构帧路径也没漂移。
+    #[tokio::test]
+    async fn write_one_chunk_in_place_matches_seal_and_vec_path() {
+        let aes = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
+        let chacha = ChaCha20Poly1305Aead::new(&[0x11u8; 32]).expect("chacha");
+        let ciphers: [(&str, &dyn AeadCipher); 2] = [("aes128gcm", &aes), ("chacha20", &chacha)];
+        // 空（终止 chunk 形态）/ 小载荷 / 读区上界（块容量 − tag）
+        let payloads: [&[u8]; 3] = [b"", b"hello wire", &[0x5Au8; PUMP_BUF - 16]];
+        for (name, cipher) in ciphers {
+            for kind in [SpKind::Plain, SpKind::Shake, SpKind::AeadLen] {
+                for pt in payloads {
+                    assert_wire_triplet(name, cipher, pt, kind, false).await;
+                }
+                assert_wire_triplet(name, cipher, b"padded chunk", kind, true).await;
+            }
+        }
+    }
+
+    async fn assert_wire_triplet(
+        name: &str,
+        cipher: &dyn AeadCipher,
+        pt: &[u8],
+        kind: SpKind,
+        global_padding: bool,
+    ) {
+        let nonce = [0x3Cu8; 12];
+
+        // ① UDP 路径：Vec 构帧
+        let mut vec_frame = Vec::with_capacity(pt.len() + 160);
+        encode_frame_into(&mut vec_frame, pt, cipher, &nonce, kind.make().as_mut(), global_padding)
+            .expect("vec 构帧");
+
+        // ② TCP 路径：原地 seal + 分段写（未实现 vectored ⇒ 逐段顺序写，字节序不变）
+        let mut frame = ChunkFrame::new();
+        frame.write_plaintext(pt);
+        let mut sink = CountingWriter { buf: Vec::new(), writes: 0 };
+        write_chunk_frame(
+            &mut sink,
+            &mut frame,
+            pt.len(),
+            cipher,
+            &nonce,
+            kind.make().as_mut(),
+            global_padding,
+        )
+        .await
+        .expect("原地密封装帧");
+        let got = &sink.buf;
+
+        // ③ 手工参考：seal() + [size][sealed]（padding 长度同序取自 SHAKE128 流）
+        let mut sp = kind.make();
+        let sb = sp.size_bytes();
+        let padding = if global_padding { usize::from(sp.next_padding_len()) } else { 0 };
+        let sealed = cipher.seal(&nonce, &[], pt).expect("seal");
+        let mut want = vec![0u8; sb];
+        sp.encode(u16::try_from(sealed.len() + padding).expect("fits u16"), &mut want);
+        want.extend_from_slice(&sealed);
+
+        let payload_end = sb + sealed.len();
+        assert_eq!(got[..payload_end], want[..], "{name}: size+密文段必须等于 seal() 构成");
+        if padding == 0 {
+            assert_eq!(got.len(), want.len(), "{name}: 无 padding 帧长");
+            assert_eq!(got, &want[..], "{name}: 原地 seal wire 必须等于 seal() 构成");
+            assert_eq!(got, &vec_frame[..], "{name}: 两条构帧路径不得漂移");
+        } else {
+            // padding 是随机字节：只钉长度（SHAKE128 流同源 ⇒ 长度必须一致）
+            assert_eq!(got.len(), want.len() + padding, "{name}: 帧长（含 padding）");
+            assert_eq!(got[payload_end..].len(), padding, "{name}: padding 段长度");
+            assert_eq!(got[..payload_end], vec_frame[..payload_end], "{name}: padding 档前段一致");
+            assert_eq!(got.len(), vec_frame.len(), "{name}: padding 档帧长一致");
+        }
     }
 
     /// 41se0：Go `infra/conf/vmess.go:26` 用 `strings.ToLower(a.Security)` 匹配，

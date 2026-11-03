@@ -29,8 +29,8 @@ use crate::{
     encoding::{
         ChunkNonceGenerator,
         body_chunk::{
-            PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
-            make_authenticated_length_size_parser,
+            ChunkFrame, PlainSizeParser, ShakeSizeParserAdapter, SizeParser,
+            make_authenticated_length_size_parser, write_chunk_frame,
         },
         generate_chacha20poly1305_key,
         server::{ServerSession, SessionHistory},
@@ -118,6 +118,21 @@ impl AeadCipher for BodyCipher {
         match self {
             BodyCipher::Aes(c) => c.open_in_place(nonce, aad, ciphertext),
             BodyCipher::Chacha(c) => c.open_in_place(nonce, aad, ciphertext),
+        }
+    }
+
+    /// 原地 seal（数据面下行热路径）：不覆写则落到 trait 默认实现 seal+split，
+    /// 会静默把载荷再搬一遍。
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), xray_crypto::aead::CryptoError> {
+        match self {
+            BodyCipher::Aes(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),
+            BodyCipher::Chacha(c) => c.seal_in_place_with_tag(nonce, aad, payload, tag),
         }
     }
 }
@@ -495,74 +510,54 @@ async fn pump_response_body<C, W>(
     W: AsyncWrite + Unpin,
 {
     let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    let mut buf = [0u8; PUMP_BUF];
-    let mut chunk_buf = Vec::with_capacity(PUMP_BUF + 96);
+    // 明文直接读进装帧块（原地覆写为密文）⇒ 用户载荷零拷贝
+    let mut frame = ChunkFrame::new();
+    let tag_len = cipher.tag_size();
     loop {
-        match server_r.read(&mut buf).await {
+        frame.clear();
+        let n = match server_r.read(frame.plaintext_read_buf(tag_len)).await {
             Ok(0) => break,
-            Ok(n) => {
-                // SHAKE128 流消费顺序：next_padding_len → encode（与 decode 侧对称）
-                let padding_size =
-                    if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-                let sb = size_parser.size_bytes();
-                let nonce = nonce_gen.next_ref();
-                chunk_buf.clear();
-                chunk_buf.resize(sb, 0);
-                if let Err(e) = cipher.seal_into(nonce, &[], &buf[..n], &mut chunk_buf) {
-                    crate::VMESS_LOG
-                        .debug(format!("vmess response body chunk seal failed error={e}"));
-                    break;
-                }
-                if padding_size > 0 {
-                    use rand::RngCore;
-                    let start = chunk_buf.len();
-                    chunk_buf.resize(start + padding_size, 0);
-                    rand::rng().fill_bytes(&mut chunk_buf[start..]);
-                }
-                // size 字段 u16：超出即中止流（静默回退 u16::MAX 会致收端错位）
-                let size_value = match u16::try_from(chunk_buf.len() - sb) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        crate::VMESS_LOG.error(format!(
-                            "vmess response chunk size exceeds u16; aborting body stream len={}",
-                            chunk_buf.len() - sb
-                        ));
-                        break;
-                    },
-                };
-                size_parser.encode(size_value, &mut chunk_buf[..sb]);
-                if stream_w.write_all(&chunk_buf).await.is_err() {
-                    break;
-                }
-            },
+            Ok(n) => n,
             Err(e) => {
                 crate::VMESS_LOG
                     .debug(format!("vmess response body plaintext read failed error={e}"));
                 break;
             },
+        };
+        frame.commit_plaintext(n);
+        let nonce = nonce_gen.next_ref();
+        if let Err(e) = write_chunk_frame(
+            &mut stream_w,
+            &mut frame,
+            n,
+            &cipher,
+            nonce,
+            size_parser.as_mut(),
+            global_padding,
+        )
+        .await
+        {
+            // 对端关闭 / 加密失败都在这里收口（旧实现写失败静默、seal 失败 debug）
+            crate::VMESS_LOG.debug(format!("vmess response body chunk write failed error={e}"));
+            break;
         }
     }
     // 写终止 chunk：seal([]) → 仅 tag 字节，客户端 decode 看到 plaintext 为空即返回
     if !no_termination {
-        let sb = size_parser.size_bytes();
+        frame.clear();
         let nonce = nonce_gen.next_ref();
-        chunk_buf.clear();
-        chunk_buf.resize(sb, 0);
-        if cipher.seal_into(nonce, &[], &[], &mut chunk_buf).is_ok() {
-            // 终止 chunk 明文为空：size 恒 = tag 长度，try_from 不可能失败；
-            // 失败 = 缓冲被污染，跳过终止写并记 error，禁回退 u16::MAX 制造收端错位
-            match u16::try_from(chunk_buf.len() - sb) {
-                Ok(v) => {
-                    size_parser.encode(v, &mut chunk_buf[..sb]);
-                    let _ = stream_w.write_all(&chunk_buf).await;
-                },
-                Err(_) => {
-                    crate::VMESS_LOG.error(format!(
-                        "vmess termination chunk size exceeds u16; skipping termination len={}",
-                        chunk_buf.len() - sb
-                    ));
-                },
-            }
+        if let Err(e) = write_chunk_frame(
+            &mut stream_w,
+            &mut frame,
+            0,
+            &cipher,
+            nonce,
+            size_parser.as_mut(),
+            global_padding,
+        )
+        .await
+        {
+            crate::VMESS_LOG.debug(format!("vmess termination chunk write failed error={e}"));
         }
     }
     let _ = stream_w.flush().await;
