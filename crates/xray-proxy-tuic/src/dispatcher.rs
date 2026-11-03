@@ -5,10 +5,11 @@
 //!
 //! ## Connection wrapper
 //!
-//! [`TuicConn`] 直接暴露 quinn `SendStream` / `RecvStream`（quinn 0.11
-//! 错误类型不兼容 tokio io::Error，刻意不 impl AsyncRead/AsyncWrite）。
-//! 这里用 `tokio::io::duplex + spawn pump` 桥接到 AsyncRead+AsyncWrite，
-//! 与 anytls 的 AnytlsConn 同模式。
+//! [`TuicConn`] 直接暴露 quinn `SendStream` / `RecvStream`；quinn 0.11 给两者
+//! 各 impl 了 tokio `AsyncWrite` / `AsyncRead`（poll 式，错误映射成 io::Error），
+//! 所以 [`TuicConnection`] 逐方法委托即可——零中转缓冲、零托管任务。
+//! （旧实现是 `tokio::io::duplex + spawn pump`：每方向 2 次额外 memcpy + 1 个
+//! 任务 + 一次调度往返。）
 //!
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
@@ -23,8 +24,7 @@ use std::{
     time::Duration,
 };
 
-use skeleton_infra::fx::Spawned;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address as XrayAddress, destination::Destination};
 use xray_frame::{LogFacade, PluginContext, deadline::Budget};
@@ -42,15 +42,12 @@ use crate::{
 /// （坑约束⑫热路径零每包开销）。
 static DISPATCH_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
-/// TUIC duplex 缓冲（与 anytls 一致：64 KiB）。
-const DUPLEX_BUF_SIZE: usize = 64 * 1024;
-
-/// TUIC 连接包装：内部用 `tokio::io::duplex` 桥接 quinn SendStream/RecvStream。
+/// TUIC 连接包装：直接委托 quinn `SendStream` / `RecvStream`。
 ///
-/// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
+/// quinn 的流本身是 poll 式的，不需要中转缓冲也不需要桥接任务。
 pub struct TuicConnection {
-    inner: DuplexStream,
-    _pump: Spawned<()>,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
 }
 
 impl AsyncRead for TuicConnection {
@@ -59,7 +56,8 @@ impl AsyncRead for TuicConnection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        // 全限定：quinn 另有 inherent `poll_read(&mut self, cx, &mut [u8])`，裸调用会选错
+        <quinn::RecvStream as AsyncRead>::poll_read(Pin::new(&mut self.recv), cx, buf)
     }
 }
 
@@ -69,15 +67,17 @@ impl AsyncWrite for TuicConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        // 全限定：inherent `SendStream::poll_write` 返回 `WriteError`，不走 io::Error 映射
+        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        // quinn 的 poll_shutdown = `SendStream::finish()`（通知对端写方向关闭）
+        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
     }
 }
 
@@ -112,11 +112,11 @@ pub fn dest_to_tuic_address(dest: &Destination) -> Result<Address, String> {
 /// # Panics
 ///
 /// 不会 panic；任何错误以 `Err(String)` 返回。
-pub fn make_dial_fn(client: Arc<TuicClient>, ctx: Arc<PluginContext>) -> DialFn {
+/// `ctx` 已无消费方（委托路径不再 spawn 任务），保留形参只因装配面签名不变。
+pub fn make_dial_fn(client: Arc<TuicClient>, _ctx: Arc<PluginContext>) -> DialFn {
     client.start_heartbeat(HEARTBEAT_INTERVAL);
     Arc::new(move |dest: &Destination| {
         let client = Arc::clone(&client);
-        let ctx = Arc::clone(&ctx);
         let addr = match dest_to_tuic_address(dest) {
             Ok(a) => a,
             Err(e) => {
@@ -130,7 +130,7 @@ pub fn make_dial_fn(client: Arc<TuicClient>, ctx: Arc<PluginContext>) -> DialFn 
                 .await
                 .map_err(|_| "tuic dial: timed out".to_string())?
                 .map_err(|e| format!("tuic dial: {e}"))?;
-            Ok(Box::new(TuicConnection::from_conn(&ctx, conn)) as Box<dyn Connection>)
+            Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
         })
     })
 }
@@ -152,7 +152,7 @@ pub fn make_dial_fn_lazy(
     password: String,
     rustls_config: Arc<rustls::ClientConfig>,
     options: crate::client::TuicConnectOptions,
-    ctx: Arc<PluginContext>,
+    _ctx: Arc<PluginContext>,
 ) -> DialFn {
     use tokio::sync::OnceCell;
     let client: Arc<OnceCell<Arc<TuicClient>>> = Arc::new(OnceCell::new());
@@ -169,7 +169,6 @@ pub fn make_dial_fn_lazy(
         let rustls_config = Arc::clone(&rustls_config);
         let pool = pool.clone();
         let options = options.clone();
-        let ctx = Arc::clone(&ctx);
         let addr = match dest_to_tuic_address(dest) {
             Ok(a) => a,
             Err(e) => {
@@ -215,7 +214,7 @@ pub fn make_dial_fn_lazy(
                     return Err("tuic dial: timed out".to_string());
                 },
             };
-            Ok(Box::new(TuicConnection::from_conn(&ctx, conn)) as Box<dyn Connection>)
+            Ok(Box::new(TuicConnection::from_conn(conn)) as Box<dyn Connection>)
         })
     })
 }
@@ -224,77 +223,10 @@ pub fn make_dial_fn_lazy(
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 
 impl TuicConnection {
-    /// 从 TuicConn 构造：拆 send/recv，spawn pump，返回 duplex 客户端包装。
-    fn from_conn(ctx: &PluginContext, conn: TuicConn) -> Self {
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        let pump = ctx
-            .spawn(pump_streams(conn.send, conn.recv, server_io))
-            .expect("plugin ctx FxScope is never closed (assembly-owned)");
-        Self { inner: client_io, _pump: pump }
+    /// 从 TuicConn 构造：拆 send/recv 后直接持有（不再桥接）。
+    fn from_conn(conn: TuicConn) -> Self {
+        Self { send: conn.send, recv: conn.recv }
     }
-}
-
-/// 双向桥接 quinn SendStream/RecvStream 与 duplex 的 server 端。
-///
-/// 任一方向 EOF 或出错都终止。up 结束前调 `send.finish()` 通知对端写方向关闭；
-/// down 结束前调 `wr.shutdown()` 通知 duplex client 读端 EOF。
-async fn pump_streams(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    server_io: DuplexStream,
-) {
-    let log = &*DISPATCH_LOG;
-    let (mut rd, mut wr) = tokio::io::split(server_io);
-
-    // up: duplex rd → quinn send（数据从本地 outbound 写向 TUIC 服务端）
-    let up = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = send.write_all(&buf[..n]).await {
-                        log.debug(format!("tuic pump up send error: {e}"));
-                        break;
-                    }
-                },
-                Err(e) => {
-                    log.debug(format!("tuic pump up read error: {e}"));
-                    break;
-                },
-            }
-        }
-        // 通知 TUIC server：客户端写方向已关闭
-        let _ = send.finish();
-    };
-
-    // down: quinn recv → duplex wr（数据从 TUIC 服务端读到本地 outbound）
-    let down = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(Some(n)) => {
-                    if n == 0 {
-                        continue;
-                    }
-                    if let Err(e) = wr.write_all(&buf[..n]).await {
-                        log.debug(format!("tuic pump down write error: {e}"));
-                        break;
-                    }
-                },
-                Ok(None) => break, // stream ended
-                Err(e) => {
-                    log.debug(format!("tuic pump down read error: {e}"));
-                    break;
-                },
-            }
-        }
-        // 通知 duplex client：TUIC server 读方向已结束
-        let _ = wr.shutdown().await;
-    };
-
-    tokio::join!(up, down);
 }
 
 #[cfg(test)]

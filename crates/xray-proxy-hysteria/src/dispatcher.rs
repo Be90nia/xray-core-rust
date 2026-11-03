@@ -1,7 +1,8 @@
 //! Hysteria outbound → DialBridge 适配器。
 //!
 //! 把 `HysteriaClient`（QUIC stream）接入 dispatcher 的 `DialBridge`：
-//! `make_dial_fn` 闭包内部 dial → `HysteriaClient::tcp()` → pump 桥接到 duplex。
+//! `make_dial_fn` 闭包内部 dial → `HysteriaClient::tcp()` → `HysteriaConn`
+//! （poll 式适配器，无中转缓冲/无 pump 任务）；UDP 走 XUDP 帧语义桥。
 
 use std::{
     io,
@@ -21,7 +22,7 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 use xray_frame::{LogFacade, PluginContext};
 use xray_transport::connection::Connection;
 use xray_transport_hysteria::{
-    conn::{InterConn, InterStreamConn},
+    conn::{HysteriaConn, InterConn},
     dialer::{ClientManager, DialDestination, HysteriaTransport},
     proto_config::Config as ProtoConfig,
 };
@@ -48,18 +49,19 @@ const GLOBAL_ID_LEN: usize = 8;
 /// 单个 UDP datagram 读缓冲上限。
 const RECV_BUF_SIZE: usize = 65535;
 
-/// Hysteria 连接包装：内部用 `tokio::io::duplex` 桥接底层连接。
+/// Hysteria UDP 连接包装：内部用 `tokio::io::duplex` 桥接 `InterConn`。
 ///
-/// - TCP：duplex 字节流 ↔ `InterStreamConn`（QUIC stream）
-/// - UDP：duplex 内的 XUDP 帧流 ↔ `InterConn`（QUIC datagram session）
+/// duplex 内的 XUDP 帧流 ↔ `InterConn`（QUIC datagram session）——这是**语义**
+/// 桥（XUDP 拆帧/组帧 + defrag + 分片），不是纯中转，故保留 pump。
+/// TCP 路径不经这里：`InterStreamConn` 直接由 `HysteriaConn` 包装（零中转）。
 ///
 /// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
-pub struct HysteriaConnection {
+pub struct HysteriaUdpConnection {
     inner: DuplexStream,
     _pump: Spawned<()>,
 }
 
-impl AsyncRead for HysteriaConnection {
+impl AsyncRead for HysteriaUdpConnection {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -69,7 +71,7 @@ impl AsyncRead for HysteriaConnection {
     }
 }
 
-impl AsyncWrite for HysteriaConnection {
+impl AsyncWrite for HysteriaUdpConnection {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -87,7 +89,7 @@ impl AsyncWrite for HysteriaConnection {
     }
 }
 
-impl Connection for HysteriaConnection {
+impl Connection for HysteriaUdpConnection {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
@@ -97,19 +99,7 @@ impl Connection for HysteriaConnection {
     }
 }
 
-impl HysteriaConnection {
-    /// 从 InterStreamConn 构造：spawn pump 桥接，返回 duplex 客户端包装。
-    fn from_stream(ctx: &PluginContext, stream: Arc<InterStreamConn>) -> Self {
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        let pump = ctx
-            .spawn(pump_hysteria_stream(stream, server_io))
-            .expect("plugin ctx FxScope is never closed (assembly-owned)");
-        Self { inner: client_io, _pump: pump }
-    }
-}
-
-impl HysteriaConnection {
+impl HysteriaUdpConnection {
     /// 从 InterConn（UDP session）构造：spawn XUDP↔UdpMessage 桥接 pump。
     fn from_udp(ctx: &PluginContext, conn: Arc<InterConn>, default_dest: Destination) -> Self {
         let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF_SIZE);
@@ -119,56 +109,6 @@ impl HysteriaConnection {
             .expect("plugin ctx FxScope is never closed (assembly-owned)");
         Self { inner: client_io, _pump: pump }
     }
-}
-
-async fn pump_hysteria_stream(stream: Arc<InterStreamConn>, server_io: DuplexStream) {
-    let log = &*DISPATCH_LOG;
-    let (mut rd, mut wr) = tokio::io::split(server_io);
-    let stream_down = Arc::clone(&stream);
-
-    // up: duplex rd → hysteria stream write
-    let up = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = stream.write(&buf[..n]).await {
-                        log.debug(format!("hysteria pump up write error: {e}"));
-                        break;
-                    }
-                },
-                Err(e) => {
-                    log.debug(format!("hysteria pump up read error: {e}"));
-                    break;
-                },
-            }
-        }
-        let _ = stream.close().await;
-    };
-
-    // down: hysteria stream read → duplex wr
-    let down = async move {
-        let mut buf = vec![0u8; 8 * 1024];
-        loop {
-            match stream_down.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = wr.write_all(&buf[..n]).await {
-                        log.debug(format!("hysteria pump down write error: {e}"));
-                        break;
-                    }
-                },
-                Err(e) => {
-                    log.debug(format!("hysteria pump down read error: {e}"));
-                    break;
-                },
-            }
-        }
-        let _ = wr.shutdown().await;
-    };
-
-    tokio::join!(up, down);
 }
 
 /// XUDP 帧 ↔ hysteria UdpMessage 双向桥（对应 Go `Client.Process` UDP 分支）。
@@ -383,8 +323,8 @@ pub(crate) fn parse_udp_source(addr: &str) -> Option<Destination> {
 ///
 /// 闭包捕获 `HysteriaConfig` + `Arc<dyn HysteriaTransport>`。
 /// 首次 dial 时通过 `OnceCell` lazy init `ClientManager`，
-/// 然后 `client_manager.get_or_create` → 按 dest.network 走 `client.tcp()`（QUIC stream）
-/// 或 `client.udp()`（QUIC datagram session）→ pump 桥接到 duplex。
+/// 然后 `client_manager.get_or_create` → 按 dest.network 走 `client.tcp()`（QUIC stream
+/// → `HysteriaConn` 直连）或 `client.udp()`（QUIC datagram session → XUDP 语义桥）。
 ///
 /// # Panics
 /// 不会 panic；任何错误以 `Err(String)` 返回。
@@ -438,8 +378,11 @@ pub fn make_hysteria_dial_fn(
                 Network::TCP => {
                     let result = client.tcp(dest.address(), dest.port()).await;
                     match result {
-                        Ok(stream) => Ok(Box::new(HysteriaConnection::from_stream(&ctx, stream))
-                            as Box<dyn Connection>),
+                        // QUIC stream 直连 `HysteriaConn`（poll 式适配器）：无 duplex、
+                        // 无 pump 任务，每方向省掉两跳 memcpy 与一次调度往返。
+                        Ok(stream) => {
+                            Ok(Box::new(HysteriaConn::new(stream)) as Box<dyn Connection>)
+                        },
                         Err(e) => {
                             DISPATCH_LOG.warn(format!(
                                 "hysteria tcp dial failed: {e} server={server_addr_str} \
@@ -453,7 +396,7 @@ pub fn make_hysteria_dial_fn(
                 Network::UDP => {
                     let result = client.udp().await;
                     match result {
-                        Ok(conn) => Ok(Box::new(HysteriaConnection::from_udp(&ctx, conn, dest))
+                        Ok(conn) => Ok(Box::new(HysteriaUdpConnection::from_udp(&ctx, conn, dest))
                             as Box<dyn Connection>),
                         Err(e) => {
                             DISPATCH_LOG.warn(format!(
@@ -484,7 +427,7 @@ mod tests {
         address::Address, destination::Destination, network::Network, port::Port,
     };
     use xray_transport_hysteria::{
-        conn::QuicConn,
+        conn::{QuicConn, QuicStream},
         dialer::{DialDestination, HysteriaTransport, QuicConfig},
     };
     use xray_xudp::packet::{PacketReader, PacketWriter};
@@ -949,5 +892,164 @@ mod tests {
 
         assert_eq!(before, PACKETS * 2, "改前 clone = data Vec + addr String; got {before}");
         assert_eq!(after, 0, "改后按值直通 0 alloc; got {after}");
+    }
+
+    /// 测试用 QUIC stream：下行字节排队 + 上行写记录。
+    ///
+    /// 构造时预置 TCPResponse 帧；`client.tcp()` 的首包（TCPRequest 帧）只记录
+    /// 不回声，之后的写按序回灌下行队列（模拟 hysteria server 的 echo）。
+    #[derive(Debug)]
+    struct TcpEchoStream {
+        down: parking_lot::Mutex<std::collections::VecDeque<u8>>,
+        up: parking_lot::Mutex<Vec<Vec<u8>>>,
+        request_done: std::sync::atomic::AtomicBool,
+        notify: tokio::sync::Notify,
+        local: SocketAddr,
+        remote: SocketAddr,
+    }
+
+    impl TcpEchoStream {
+        fn new(resp_frame: Vec<u8>) -> Arc<Self> {
+            let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+            Arc::new(Self {
+                down: parking_lot::Mutex::new(resp_frame.into()),
+                up: parking_lot::Mutex::new(Vec::new()),
+                request_done: std::sync::atomic::AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+                local,
+                remote: local,
+            })
+        }
+
+        /// 记录一次上行写；非首包（非 TCPRequest 帧）按字节回灌下行队列。
+        fn record_up(&self, buf: &[u8]) -> usize {
+            let is_request = !self.request_done.swap(true, std::sync::atomic::Ordering::SeqCst);
+            self.up.lock().push(buf.to_vec());
+            if !is_request {
+                self.down.lock().extend(buf.iter().copied());
+                // notify_one 存一个 permit：读侧未注册时也不丢唤醒
+                self.notify.notify_one();
+            }
+            buf.len()
+        }
+    }
+
+    impl QuicStream for TcpEchoStream {
+        fn read<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move {
+                loop {
+                    {
+                        let mut down = self.down.lock();
+                        if !down.is_empty() {
+                            let n = buf.len().min(down.len());
+                            for (i, slot) in buf[..n].iter_mut().enumerate() {
+                                *slot = down[i];
+                            }
+                            down.drain(..n);
+                            return Ok(n);
+                        }
+                    }
+                    self.notify.notified().await;
+                }
+            })
+        }
+
+        fn write<'a>(
+            &'a self,
+            buf: &'a [u8],
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.record_up(buf)) })
+        }
+
+        fn poll_write(
+            &self,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(self.record_up(buf)))
+        }
+
+        fn cancel_read(&self, _code: u64) {}
+
+        fn close(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+
+        fn remote_addr(&self) -> SocketAddr {
+            self.remote
+        }
+    }
+
+    struct TcpMockTransport {
+        stream: Arc<TcpEchoStream>,
+        conn: Arc<MockEchoConn>,
+    }
+
+    impl HysteriaTransport for TcpMockTransport {
+        fn dial_and_authenticate(
+            &self,
+            _dest: &DialDestination,
+            _quic_config: &QuicConfig,
+            _auth_token: &str,
+            _brutal_down_bps: u64,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn QuicConn>>> + Send>> {
+            let conn = Arc::clone(&self.conn) as Arc<dyn QuicConn>;
+            Box::pin(async move { Ok(conn) })
+        }
+
+        fn open_stream(
+            &self,
+            _conn: &Arc<dyn QuicConn>,
+        ) -> Pin<Box<dyn Future<Output = std::io::Result<Arc<dyn QuicStream>>> + Send>> {
+            let stream = Arc::clone(&self.stream) as Arc<dyn QuicStream>;
+            Box::pin(async move { Ok(stream) })
+        }
+    }
+
+    /// TCP 路径去掉 duplex+pump 后：Connection 直接落在 QUIC stream 上，
+    /// 1 MiB 双向 echo 字节一致，且 TCPRequest 帧前缀只出现在首包。
+    #[tokio::test]
+    async fn tcp_dial_fn_relays_echo_without_pump() {
+        // TCPResponse：status=0(ok) + msg_len=0 + pad_len=0
+        let stream = TcpEchoStream::new(vec![0, 0, 0]);
+        let (udp_conn, _seen) = MockEchoConn::new();
+        let transport = TcpMockTransport { stream: Arc::clone(&stream), conn: udp_conn };
+        let dial = make_hysteria_dial_fn(
+            HysteriaConfig::new("127.0.0.1:443", "secret"),
+            Arc::new(transport),
+            Arc::new(xray_frame::PluginContext::for_plugin("hysteria")),
+        );
+        let target =
+            Destination::new(Address::new_domain("echo.example.com"), Port::new(80), Network::TCP);
+
+        const PAYLOAD: usize = 1024 * 1024;
+        let expected: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut conn = dial(&target).await.expect("tcp dial should succeed");
+            conn.write_all(&expected).await.expect("write 1 MiB");
+            let mut got = vec![0u8; PAYLOAD];
+            conn.read_exact(&mut got).await.expect("read 1 MiB back");
+            assert_eq!(got, expected, "1 MiB round trip must be byte-identical");
+        })
+        .await
+        .expect("timed out: de-duplex 路径不应需要额外调度往返");
+
+        let ups = stream.up.lock();
+        assert_eq!(ups.len(), 2, "首包 TCPRequest + 一个 1 MiB 载荷写");
+        assert_eq!(ups[0][..2], [0x44, 0x01], "首包必须带 FrameTypeTCPRequest varint(0x401)");
+        assert!(
+            ups[0].windows(b"echo.example.com".len()).any(|w| w == b"echo.example.com"),
+            "TCPRequest body 必须带目标地址: {:?}",
+            &ups[0][..ups[0].len().min(80)]
+        );
+        assert_eq!(ups[1], expected, "后续写必须是裸字节（无第二次前缀）");
     }
 }

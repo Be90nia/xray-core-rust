@@ -134,18 +134,29 @@ async fn dispatcher_e2e_tuic_loopback_echo() {
     let mut w = inbound.writer;
     let mut r = inbound.reader;
 
-    // 6. 写 payload → TUIC → mock server → dial echo → echo 回流
-    let payload = b"hello tuic via dispatcher";
+    // 6. 写 payload → TUIC → mock server → dial echo → echo 回流 （1 MiB：quinn
+    //    流直连后大载荷路径也要逐字节一致）
+    const PAYLOAD: usize = 1024 * 1024;
+    let payload: Vec<u8> = (0..PAYLOAD).map(|i| (i % 251) as u8).collect();
     let mut mb = MultiBuffer::new();
-    mb.merge_bytes(payload);
+    mb.merge_bytes(&payload);
     w.write_multi_buffer(mb).await.unwrap();
 
-    let resp = tokio::time::timeout(Duration::from_secs(30), r.read_multi_buffer())
-        .await
-        .expect("timeout waiting for echo response")
-        .unwrap();
+    let mut got: Vec<u8> = Vec::with_capacity(PAYLOAD);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while got.len() < PAYLOAD {
+            let chunk = r.read_multi_buffer().await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&chunk.to_vec());
+        }
+    })
+    .await
+    .expect("timeout waiting for 1 MiB echo response");
 
-    assert_eq!(resp.to_vec(), payload);
+    assert_eq!(got.len(), PAYLOAD, "1 MiB 必须全部回环");
+    assert_eq!(got, payload, "1 MiB 往返必须逐字节一致");
 
     w.shutdown();
     drop(w);

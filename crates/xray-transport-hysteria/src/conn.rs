@@ -386,6 +386,27 @@ impl InterStreamConn {
     }
 }
 
+/// 在途 read future：完成时交出 `(scratch, n)`——scratch 归还槽内复用（T17）。
+type ReadFuture = Pin<Box<dyn Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>;
+
+/// 读侧槽：在途 read future + 可复用读缓冲。
+///
+/// T17（同 `KcpConn::read_scratch` 手法）：原实现每次起新读都
+/// `vec![0u8; remaining]` 新分配，读进 tmp 再拷给调用方；scratch 现在常驻此槽，
+/// 在途期由 future 持有（读出后随 `(scratch, n)` 归还），稳态零分配。
+struct ReadSlot {
+    /// 在途 future（`None` = 无读在飞）。
+    reading: Option<ReadFuture>,
+    /// 复用读缓冲；在途期间被 future 借走（槽内留空 Vec）。
+    scratch: Vec<u8>,
+}
+
+impl ReadSlot {
+    fn new() -> Self {
+        Self { reading: None, scratch: Vec::new() }
+    }
+}
+
 /// `InterStreamConn` → `xray_transport::connection::Connection` 适配器。
 ///
 /// `InterStreamConn` 的 async read/write 是 `&self`（内部用 `Arc<dyn QuicStream>`），
@@ -395,11 +416,8 @@ impl InterStreamConn {
 /// 能重入同一 future。
 pub struct HysteriaConn {
     inner: Arc<InterStreamConn>,
-    /// 缓存进行中的 read future。
-    #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
-    read_state: parking_lot::Mutex<
-        Option<Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>>,
-    >,
+    /// 读侧槽（在途 future + 复用缓冲，T17）。
+    read_state: parking_lot::Mutex<ReadSlot>,
     /// 缓存进行中的 write future。
     #[allow(clippy::type_complexity)] // 签名类型即业务语义，抽 type alias 反而更晦涩
     write_state: parking_lot::Mutex<
@@ -418,7 +436,7 @@ impl HysteriaConn {
     pub fn new(inner: Arc<InterStreamConn>) -> Self {
         Self {
             inner,
-            read_state: parking_lot::Mutex::new(None),
+            read_state: parking_lot::Mutex::new(ReadSlot::new()),
             write_state: parking_lot::Mutex::new(None),
             close_state: parking_lot::Mutex::new(None),
         }
@@ -449,30 +467,33 @@ impl tokio::io::AsyncRead for HysteriaConn {
         }
 
         let mut state = self.read_state.lock();
-        if state.is_none() {
-            // 创建新 read future（读入临时 buffer，不借用 caller 的 buf）
+        if state.reading.is_none() {
+            // 创建新 read future（读入常驻 scratch，不借用 caller 的 buf）
             let inner = Arc::clone(&self.inner);
-            *state = Some(Box::pin(async move {
-                let mut tmp = vec![0u8; remaining];
-                let n = inner.read(&mut tmp).await?;
-                tmp.truncate(n);
-                Ok(tmp)
+            let mut scratch = std::mem::take(&mut state.scratch);
+            if scratch.len() < remaining {
+                scratch.resize(remaining, 0);
+            }
+            state.reading = Some(Box::pin(async move {
+                let n = inner.read(&mut scratch[..remaining]).await?;
+                Ok((scratch, n))
             }));
         }
 
         // state 一定有值：None 分支上方已装入
-        let fut = state.as_mut().expect("state set above when None");
+        let fut = state.reading.as_mut().expect("state set above when None");
         match fut.as_mut().poll(cx) {
             std::task::Poll::Ready(result) => {
                 // 清除缓存
-                *state = None;
+                state.reading = None;
                 match result {
-                    Ok(data) => {
-                        if data.is_empty() {
+                    Ok((scratch, n)) => {
+                        state.scratch = scratch;
+                        if n == 0 {
                             // EOF
                             std::task::Poll::Ready(Ok(()))
                         } else {
-                            buf.put_slice(&data);
+                            buf.put_slice(&state.scratch[..n]);
                             std::task::Poll::Ready(Ok(()))
                         }
                     },
@@ -1263,5 +1284,34 @@ mod tests {
         let stream = FeedStream { data: std::sync::Mutex::new(frame), local, remote: local };
         let err = read_tcp_response_stream(&stream).await.unwrap_err();
         assert!(err.to_string().contains("pad_len 4097 > 4096"), "got {err}");
+    }
+
+    /// T17：`poll_read` 复用常驻 scratch（原每次 `vec![0u8; remaining]`），
+    /// 且数据/EOF 语义不变。
+    #[tokio::test]
+    async fn hysteria_conn_poll_read_reuses_scratch_and_keeps_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let stream = FeedStream {
+            data: std::sync::Mutex::new(b"hello world".to_vec()),
+            local,
+            remote: local,
+        };
+        let inner = Arc::new(InterStreamConn::new(Arc::new(stream), local, local, false));
+        let mut conn = HysteriaConn::new(inner);
+
+        let mut first = [0u8; 5];
+        conn.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"hello");
+        assert!(conn.read_state.lock().scratch.len() >= 5, "读缓冲必须留在槽里供复用（T17）");
+
+        let mut rest = [0u8; 6];
+        conn.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b" world");
+        assert_eq!(conn.read_state.lock().scratch.len(), 6, "复用同一块缓冲（按最大请求增长）");
+
+        let mut tail = [0u8; 4];
+        assert_eq!(conn.read(&mut tail).await.unwrap(), 0, "数据耗尽 = EOF（不得回填残留字节）");
     }
 }
