@@ -39,7 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **热路径日志**（W6 `8a200d7b`）：transport 族 40 站 → `HotLog`（栈缓冲、先过滤后格式化）；**40/40 消息逐字保留**；p7lm 调查通道 9 处一字未动（其 trace 税曾把优化实测毒化成伪影约 36% 吞吐）；A′/B 真单变量交错 3 窗口 Δ 在噪声内
 - **红线受控入口接线**（W7 `23769fa0`）：vless vision 数据面错误事件 `tracing::event!` → `redline::event`（结构化 `error` 字段**折叠进 message**，`redline` API 零扩张）；`redline_sites` 四门 4/4（改前 3/1）
 - **任务托管归 scope**（W4 `b46d6058`）：mux carrier 4 处 → arm scope（与 inbound 同寿命）、SS 泵 → 每连接 `ConnScope`；`inbound.rs` 生产裸 `tokio::spawn` 清零。**停机语义有意收紧**：泵/carrier 随 arm scope 关闭被级联取消（原 detached 跑完）
-- **运行期注册表**（C-R1a `554377d7`）：`SimpleOhm` 的两张 tag→handler 表 → udf `BoundedRegistry`（对外 API **逐字不变**，commander/reverse 零改动）；cap 4096 + `Eviction::Reject` + `error!` 留痕（fail-closed，不静默丢 handler）；`--features dispatcher-dual-write` 双表漂移 0
+- **运行期注册表**（C-R1a `554377d7`）：`SimpleOhm` 的两张 tag→handler 表 → udf `BoundedRegistry`（对外 API **逐字不变**，commander/reverse 零改动）；cap 4096 + `Eviction::Reject` + `error!` 留痕（fail-closed，不静默丢 handler）；`dispatcher-dual-write` 对照仪器（漂移 0 已验证）随后由 bd `b6mco` 删除，双表合并为单表（省每次**登记**一次表写；每请求读成本不变）
 - **重试编排**（C-R2 `12a3ff2b`）：kcp `RetryableWriter` → udf `std_ext::retry`（固定间隔截平形；`Exhausted.last` 原样回灌）；行为差仅两处严格改善（末次不空睡、零间隔 fail-closed）
 
 ### Fixed

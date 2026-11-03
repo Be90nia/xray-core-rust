@@ -3,9 +3,9 @@
 //! 契约源：`docs/architecture/xray-frame-契约级任务书-P1P4.md` §P3-1
 //! 「dispatcher 中央 match 臂 → Registry 查表」。dispatcher 中央 match 臂
 //! （`xray-app-dispatcher/src/default.rs` `dispatch_link`）的退役路径按四阶段
-//! 迁移：S0 旧臂基线（dispatcher 侧 feature flag `dispatcher-dual-write`）→
-//! **S1 本查表面旁路并存** → S2 双写对照差异率必须为 0 → S3 切查表 →
-//! S4 删旧臂。本件只落 S1 骨架，不接管任何生产分发路径。
+//! 迁移：S0 旧臂基线 → **S1 本查表面旁路并存** → S2 双写对照差异率必须为 0 →
+//! S3 切查表 → S4 删旧臂。S0/S2 的对照仪器（dispatcher 侧 feature flag 与其
+//! 记录环）已随 S4 收尾删除，本件保留为查表能力的框架侧实现。
 //!
 //! **fail-visible 铁律**（L5 / Go `default.go:469-470` DO NOT CHANGE）：查表
 //! 未命中 = 配置错配 → [`Lookup::Missing`] 上抛由调用方停机，**禁**回落

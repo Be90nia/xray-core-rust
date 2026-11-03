@@ -18,9 +18,8 @@ xray-xudp = { path = "../xray-xudp" }
 # path 形态同各 app crate（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov"] }
 # bd 4a1zy：后台任务托管面走 xray-frame `compat::ManagedScope`（组合包装 udf
-# `FxScope` + fail-visible 报告）。此前仅测试面消费（P3-1 S2 双写对照
-# tests/dual_write_parity.rs 的新路 = xray-frame `dispatch::lookup`）；生产托管
-# 收敛后为常规依赖（依赖方向合规：xray-frame 零 xray-core/proxy 依赖，无环）。
+# `FxScope` + fail-visible 报告），生产托管为常规依赖（依赖方向合规：xray-frame
+# 零 xray-core/proxy 依赖，无环）。
 xray-frame = { path = "../xray-frame" }
 thiserror.workspace = true
 tokio.workspace = true
@@ -32,9 +31,3 @@ ring.workspace = true
 
 [dev-dependencies]
 xray-app-stats = { path = "../xray-app-stats" }
-
-[features]
-# P3-1 S0/S2 对照基线开关：default 关。S4 后本 flag 只门「对照/记录面」
-# （record 环 + in-vivo 对照器 + 注入自检）；出站选择面（影子查表）无条件编译
-# ——S4 删旧臂后它是唯一选择路径。
-dispatcher-dual-write = []
