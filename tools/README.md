@@ -7,7 +7,7 @@
 
 | 类别 | 脚本 | 用途 |
 |---|---|---|
-| 性能 | `loopback_alloc_bench.py` | alloc/MB + loopback 吞吐基线采样（DEBT-023 钩子）|
+| 性能 | `loopback_alloc_bench.py` | alloc/MB + loopback 吞吐基线采样（DEBT-023 钩子）；`--topo` 选 vless-xhttp-reality / ss2022-tcp / vmess-tls-ws，`--ab` 同窗交错 A/B，`--frames` 帧粒度 |
 | 性能 | `pgo_workload.py` | PGO 训练数据（profile 优化）|
 | 依赖 | `check_stress_leak.py` | 压测泄漏检查（s9/s10 战役工具）|
 | 构建 | `inject_btls_cache.py` / `inject_btls_post_handshake.py` | btls-sys 冷编产物注入（绕 OMP 冷编坑）|
@@ -22,8 +22,12 @@
 ## 用法示例
 
 ```bash
-# alloc/MB baseline
+# alloc/MB baseline（默认拓扑 = vless+xhttp+reality，历史口径）
 python tools/loopback_alloc_bench.py --tag my-feature --xray target/release/xray.exe --runs 3
+
+# SS / VMess 协议路径（+ 帧粒度 / 双向 / 同窗交错 A/B）
+python tools/loopback_alloc_bench.py --xray target/release/xray.exe --tag ss1 --topo ss2022-tcp --runs 1 --alloc-stats --frames
+python tools/loopback_alloc_bench.py --xray new.exe --ab old.exe --ab-runs 3 --topo vmess-tls-ws
 
 # btls-sys 冷编产物注入（CI 跑冷 worktree 必做）
 python tools/inject_btls_cache.py
