@@ -79,6 +79,16 @@ pub trait Authenticator: Send + Sync {
 
     /// 加密并认证明文。
     fn seal(&self, dst: &mut [u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// 把 `plaintext` 的密文（含 tag）追加到调用方缓冲 `dst`，不返回中间 Vec。
+    ///
+    /// 默认实现 = [`Self::seal`] + 追加；AEAD 后端覆盖后直接在 `dst` 尾段原地
+    /// 加密（`AuthenticationWriter` 每 chunk 省一次分配 + 两次全量拷贝）。
+    /// 失败时 `dst` 逐字节回到调用前（不变量见 `AeadCipher::seal_into`）。
+    fn seal_into(&self, dst: &mut Vec<u8>, plaintext: &[u8]) -> Result<(), CryptoError> {
+        dst.extend_from_slice(&self.seal(&mut [], plaintext)?);
+        Ok(())
+    }
 }
 
 // ========== AEADAuthenticator ==========
@@ -135,6 +145,18 @@ impl<A: AeadCipher + Send + Sync> Authenticator for AEADAuthenticator<A> {
         let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal(&iv, &aad, plaintext)
     }
+
+    fn seal_into(&self, dst: &mut Vec<u8>, plaintext: &[u8]) -> Result<(), CryptoError> {
+        let iv = (self.nonce_generator)();
+        if iv.len() != self.cipher.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.cipher.nonce_size(),
+                actual: iv.len(),
+            });
+        }
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
+        self.cipher.seal_into(&iv, &aad, plaintext, dst)
+    }
 }
 
 // ========== DynamicAEADAuthenticator ==========
@@ -184,6 +206,16 @@ impl Authenticator for DynamicAEADAuthenticator {
         }
         let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal(&iv, &aad, plaintext)
+    }
+
+    fn seal_into(&self, dst: &mut Vec<u8>, plaintext: &[u8]) -> Result<(), CryptoError> {
+        let iv = (self.nonce_generator)();
+        let expected = self.cipher.nonce_size();
+        if iv.len() != expected {
+            return Err(CryptoError::InvalidNonceLength { expected, actual: iv.len() });
+        }
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
+        self.cipher.seal_into(&iv, &aad, plaintext, dst)
     }
 }
 

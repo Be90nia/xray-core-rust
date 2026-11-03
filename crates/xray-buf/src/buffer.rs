@@ -35,6 +35,18 @@ pub struct Buffer {
     udp: Option<std::net::SocketAddr>,
 }
 
+/// 原地 seal 窗口：[`Buffer::seal_window`] 借出的两块**同一分配内相邻**可变切片。
+///
+/// `payload` 的尾地址 == `tag` 的首地址，因此 AEAD 原地加密后 wire 上的
+/// `[ciphertext][tag]` 是连续一段，无需第二块缓冲。
+#[must_use = "seal 窗口须被消费（写入密文与 tag）或显式丢弃"]
+pub struct SealWindow<'a> {
+    /// 数据区 `[start, end)`：当前为明文，调用方覆写为密文（长度不变）。
+    pub payload: &'a mut [u8],
+    /// 紧随数据区的 tag 区 `[end, end + tag_len)`：调用方写入 AEAD tag。
+    pub tag: &'a mut [u8],
+}
+
 impl Buffer {
     // ========== 构造函数 ==========
 
@@ -227,21 +239,60 @@ impl Buffer {
         self.capacity() - self.end
     }
 
-    /// 返回可写区域的可变引用（end 之后的空间）。
+    /// 尾部预留空间（rear headroom）字节数 = `capacity - end`。
     ///
-    /// 用于直接写入操作（如系统调用 read）。
-    /// 注意：返回的切片长度为 BytesMut 的剩余容量，不是 free()。
+    /// 只读视图：不触分配路径、不改 `start`/`end`。语义上等于 [`free`](Self::free)，
+    /// 但命名区分「尾部可写区」与「整块剩余可写空间」，供原地 seal 的能力层引用。
+    #[inline]
+    pub fn rear_headroom(&self) -> usize {
+        self.free()
+    }
+
+    /// 借出「数据区（将被原地覆写为密文）」+「紧随其后的 tag 区」两块**相邻**可变切片。
+    ///
+    /// 原地 AEAD：`payload` 覆写为密文（长度不变），`tag` 写入 AEAD tag ⇒ 同一分配内
+    /// `[ciphertext][tag]` 连续，wire 上一段连续字节，不需要第二块缓冲。
+    ///
+    /// 返回 `None` ⇔ 尾部空间不足（`rear_headroom() < tag_len`）——**绝不静默截断**，
+    /// 且此时 `Buffer` 一字节未动（调用方仍可取回原明文）。
+    ///
+    /// 不变式：调用期间 `start`/`end` 不变，**不谎报底层 `BytesMut` 的 `len`**；
+    /// 写完 tag 后调用方须显式 [`advance_write`](Self::advance_write)`(tag_len)` 提交。
+    pub fn seal_window(&mut self, tag_len: usize) -> Option<SealWindow<'_>> {
+        if tag_len > self.rear_headroom() {
+            return None;
+        }
+        let start = self.start;
+        let end = self.end;
+        let m = self.pooled_mut();
+        let cap = m.capacity();
+        assert!(end <= cap, "seal_window 前写游标越界: end={end}, cap={cap}");
+        let base = m.as_mut_ptr();
+        // SAFETY: ①start <= end <= cap 且 end + tag_len <= cap（rear_headroom 已确认）
+        // ⇒ 两段都在同一分配容量内、互不重叠且相邻（payload 尾地址 == tag 首地址）
+        // ②u8 无无效位模式；tag 落在尾部可写区（可能跨 `len` 的未初始化 spare），
+        // 调用方负责写满后经 advance_write 提交，写入前不得读该切片
+        let payload = unsafe { std::slice::from_raw_parts_mut(base.add(start), end - start) };
+        let tag = unsafe { std::slice::from_raw_parts_mut(base.add(end), tag_len) };
+        Some(SealWindow { payload, tag })
+    }
+
+    /// 返回可写区域的可变引用：**逻辑可写区** `[end, capacity)`，长度 = [`free`](Self::free)。
+    ///
+    /// 用于直接写入操作（如系统调用 read）。**不谎报底层 `BytesMut` 的 `len`**（历史
+    /// `set_len(capacity)` 会把已初始化字节数谎报成容量，令 `into_bytes` 等按 len 取数的
+    /// 路径把死字节当数据外发）；越过 `len` 的部分是未初始化 spare 区。调用方写完**必须**
+    /// [`advance_write`](Self::advance_write) 提交，写入前不得读该切片。
     pub fn writable_bytes(&mut self) -> &mut [u8] {
         let end = self.end;
         let m = self.pooled_mut();
         let cap = m.capacity();
-        // SAFETY: 扩展 len 到 capacity 以暴露可写区域
-        if cap > m.len() {
-            unsafe {
-                m.set_len(cap);
-            }
-        }
-        &mut m[end..]
+        assert!(end <= cap, "writable_bytes 前写游标越界: end={end}, cap={cap}");
+        let base = m.as_mut_ptr();
+        // SAFETY: end <= cap ⇒ 切片在同一分配内；u8 无无效位模式。
+        // [end, cap) 可能跨 `len`（[end, len) 是已初始化的死字节，[len, cap) 是 spare），
+        // 视图只用于写入，写入后经 advance_write 提交。
+        unsafe { std::slice::from_raw_parts_mut(base.add(end), cap - end) }
     }
 
     /// 将写游标前进 n 字节（确认写入了 n 字节）。
@@ -454,13 +505,21 @@ impl Buffer {
     /// 消费缓冲区，返回 `Bytes`（零拷贝冻结）。
     ///
     /// 对应 Go 的将 Buffer 内容转为字节切片的场景。
+    ///
+    /// 双态都按**逻辑游标**取数（`[start, end)`）：底层 `BytesMut` 的 `len` 可能大于
+    /// 逻辑长度（`clear`/`resize` 收缩/历史 len 谎报），按 `len` 取会把池块里上一次
+    /// 连接的残留字节当数据外发（跨连接明文泄漏 + wire 帧长错乱）。
     pub fn into_bytes(mut self) -> Bytes {
+        let logical = self.len();
         match &mut self.inner {
             Inner::Pooled(m) => {
+                // 取出所有权：尾部余块随 Bytes 离开池（与 `split()` 的旧行为一致），
+                // 也避免把「部分容量」的块按错误分层归还给池。
+                let mut owned = std::mem::replace(m, BytesMut::new());
                 if self.start > 0 {
-                    m.advance(self.start);
+                    owned.advance(self.start);
                 }
-                m.split().freeze()
+                owned.split_to(logical).freeze()
             },
             Inner::Frozen(b) => b.slice(self.start..self.end),
         }

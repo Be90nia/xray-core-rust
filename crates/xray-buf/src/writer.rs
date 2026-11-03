@@ -100,12 +100,17 @@ async fn write_vectored_all<W: AsyncWrite + Unpin + ?Sized>(
     w: &mut W,
     buffers: &[Buffer],
 ) -> Result<()> {
-    let mut slices: Vec<IoSlice<'_>> = buffers
-        .iter()
-        .map(|b| IoSlice::new(b.bytes()))
-        // ponytail: Vec.remove(0) 前进——块数 ≤8，O(n²) 无关紧要
-        .filter(|s| !s.is_empty())
-        .collect();
+    let slices: Vec<IoSlice<'_>> =
+        buffers.iter().map(|b| IoSlice::new(b.bytes())).filter(|s| !s.is_empty()).collect();
+    write_iovecs_all(w, slices).await
+}
+
+/// 向量写核心：一次 `poll_write_vectored` 交付全部 iovec，部分写时从断点
+/// 续写剩余段（调用方保证 `slices.len() <= MAX_SEGMENTS_PER_WRITE`）。
+async fn write_iovecs_all<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    mut slices: Vec<IoSlice<'_>>,
+) -> Result<()> {
     while !slices.is_empty() {
         let n = poll_fn(|cx| Pin::new(&mut *w).poll_write_vectored(cx, &slices))
             .await
@@ -116,6 +121,7 @@ async fn write_vectored_all<W: AsyncWrite + Unpin + ?Sized>(
                 false,
             ));
         }
+        // ponytail: Vec.remove(0) 前进——块数 ≤8，O(n²) 无关紧要
         let mut rem = n;
         while rem > 0 && !slices.is_empty() {
             let len = slices[0].len();
@@ -129,6 +135,51 @@ async fn write_vectored_all<W: AsyncWrite + Unpin + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// 单批向量写段数上限（8）：沿用 `xray-transport` `VECTORED_BATCH` 与
+/// `readv::MAX_READV` 现值，远低于 Linux IOV_MAX(1024) 与 Windows `WSASend` 上限。
+///
+/// 超限一律**分批多次写**，绝不合并成单块——合并 = 用户态再多搬一遍全量字节，
+/// 与「0 遍」目标物理互斥。
+pub const MAX_SEGMENTS_PER_WRITE: usize = 8;
+
+/// 多段向量写：段序即线序，按 [`MAX_SEGMENTS_PER_WRITE`] 分批交付。
+///
+/// - 底层支持 vectored（裸 TCP 等）→ 每批一次 `poll_write_vectored`；
+/// - 底层不支持（TLS 包装层 `is_write_vectored()==false`）→ 逐段顺序写， 字节序不变、仍零拷贝，只是
+///   syscall 变多。
+pub async fn write_segments<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    segments: &[&[u8]],
+) -> Result<()> {
+    if !w.is_write_vectored() {
+        for seg in segments {
+            if seg.is_empty() {
+                continue;
+            }
+            w.write_all(seg).await.map_err(|e| io::classify_io_error(e, false))?;
+        }
+        return Ok(());
+    }
+    for batch in segments.chunks(MAX_SEGMENTS_PER_WRITE) {
+        let slices: Vec<IoSlice<'_>> = batch.iter().map(|s| IoSlice::new(s)).collect();
+        write_iovecs_all(w, slices).await?;
+    }
+    Ok(())
+}
+
+/// 两段帧写：`head`（长度块/帧头）在前、`body`（载荷密文）在后，一次向量写发出。
+///
+/// 原地 AEAD 后 `body` 与 tag 已在同一 [`Buffer`] 内连续（见
+/// [`Buffer::seal_window`](crate::buffer::Buffer::seal_window)），因此帧
+/// `[head][body]` 全链在用户态零拷贝。
+pub async fn write_two_segments<W: AsyncWrite + Unpin + ?Sized>(
+    w: &mut W,
+    head: &[u8],
+    body: &[u8],
+) -> Result<()> {
+    write_segments(w, &[head, body]).await
 }
 
 // ========== BufferedWriter ==========

@@ -20,6 +20,8 @@
 //! - `encrypted_payload`: AEAD 密文（len + overhead）
 //! - `padding`: 随机填充字节
 
+use std::borrow::Cow;
+
 use xray_buf::{
     buffer::Buffer,
     io::{self, Writer},
@@ -99,33 +101,26 @@ impl<'a> AuthenticationWriter<'a> {
             )));
         }
 
-        let mut eb = Buffer::with_capacity(total_size);
+        // 单次分配贯穿封装：size 段 → 尾段原地 seal → padding。
+        // 旧实现：「auth.seal 返回中间 Vec」+「拷进 Buffer」= 多一次分配 + 两次全量拷贝。
+        let mut out = Vec::with_capacity(total_size);
+        out.resize(size_bytes, 0);
 
         // 1. 编码 size (encryptedSize + paddingSize) 到前 sizeBytes 字节
         let size_value = (encrypted_size + padding_size) as u16;
-        {
-            let writable = eb.writable_bytes();
-            self.size_encoder.encode(size_value, &mut writable[..size_bytes]);
-        }
-        eb.advance_write(size_bytes);
+        self.size_encoder.encode(size_value, &mut out[..size_bytes]);
 
-        // 2. seal 加密 payload
-        let sealed = self.auth.seal(&mut [], data)?;
-        {
-            let writable = eb.writable_bytes();
-            let seal_len = sealed.len().min(writable.len());
-            writable[..seal_len].copy_from_slice(&sealed[..seal_len]);
-        }
-        eb.advance_write(sealed.len());
+        // 2. seal 加密 payload（直接追加进 out 尾段）
+        self.auth.seal_into(&mut out, data)?;
 
         // 3. 填充 padding 随机字节
         if padding_size > 0 {
-            let writable = eb.writable_bytes();
-            crate::rand_bytes_between(&mut writable[..padding_size], 0, 255);
-            eb.advance_write(padding_size);
+            let start = out.len();
+            out.resize(start + padding_size, 0);
+            crate::rand_bytes_between(&mut out[start..], 0, 255);
         }
 
-        Ok(eb)
+        Ok(Buffer::from_vec(out))
     }
 
     /// Stream 模式写入。
@@ -149,8 +144,14 @@ impl<'a> AuthenticationWriter<'a> {
 
         while !mb.is_empty() {
             let chunk = mb.split_bytes(payload_size);
-            let chunk_data = chunk.to_vec();
-            match self.seal(&chunk_data) {
+            // split 未跨块（常见路径）直接借明文，免去一次中间 Vec 拷贝。
+            let flat: Cow<'_, [u8]> =
+                if let (1, Some(buf)) = (chunk.buffer_count(), chunk.iter().next()) {
+                    Cow::Borrowed(buf.bytes())
+                } else {
+                    Cow::Owned(chunk.to_vec())
+                };
+            match self.seal(&flat) {
                 Ok(encrypted_buf) => mb2_write.push(encrypted_buf),
                 Err(_) => {
                     return Err(io::Error::WriteError("seal failed in write_stream".into()));

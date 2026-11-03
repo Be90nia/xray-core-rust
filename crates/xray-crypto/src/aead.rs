@@ -117,6 +117,46 @@ pub trait AeadCipher {
         Ok(())
     }
 
+    /// Like [`Self::seal`] but encrypts **in place**: `payload` is overwritten
+    /// with its ciphertext (same length) and the authentication tag lands in
+    /// `tag` (which must be exactly [`Self::tag_size`] bytes).
+    ///
+    /// This is the zero-copy seal entry point: with a buffer whose tail carries
+    /// `tag_size` bytes of uninitialized spare (see
+    /// `xray_buf::buffer::Buffer::seal_window`), `[ciphertext][tag]` ends up
+    /// contiguous in one allocation — the wire frame can then be emitted with a
+    /// vectored write, no second copy of the payload.
+    ///
+    /// The default implementation falls back to [`Self::seal`] + split (one
+    /// extra copy of the payload); hot backends override it.
+    ///
+    /// # Invariant
+    ///
+    /// On `Err`, `payload` and `tag` are left byte-for-byte as they were before
+    /// the call — a caller must never be able to ship plaintext where
+    /// ciphertext is expected.
+    ///
+    /// # Errors
+    ///
+    /// - `CryptoError::InvalidNonceLength` if `nonce.len() != nonce_size()`, or `tag.len() !=
+    ///   tag_size()`.
+    /// - `CryptoError::EncryptionError` if sealing fails.
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
+        // seal 会复核 nonce 长度；此处已校验，错误面只剩加密失败。
+        let sealed = self.seal(nonce, aad, payload)?;
+        let (ct, t) = sealed.split_at(payload.len());
+        payload.copy_from_slice(ct);
+        tag.copy_from_slice(t);
+        Ok(())
+    }
+
     /// Decrypts and verifies `ciphertext` with `nonce` and `aad`.
     ///
     /// The `ciphertext` must include the authentication tag.
@@ -146,6 +186,31 @@ pub trait AeadCipher {
         ciphertext[..plaintext.len()].copy_from_slice(&plaintext);
         Ok(&mut ciphertext[..plaintext.len()])
     }
+}
+
+// ---------------------------------------------------------------------------
+// 原地 seal 的入参校验
+// ---------------------------------------------------------------------------
+
+/// `seal_in_place_with_tag` 的入参校验：nonce 长度 + tag 区长度。
+///
+/// 返回 `Err` 时**一字节未写**（调用方缓冲保持原样），因此各后端可以把它放在
+/// 真正加密之前当唯一的前置失败面——这也是原地 seal 的「失败不污染」不变量
+/// 能成立的原因（ring `seal_in_place_separate_tag` / rustcrypto
+/// `encrypt_inout_detached` 的其余失败面都在写缓冲之前）。
+fn check_seal_in_place(
+    nonce_size: usize,
+    tag_size: usize,
+    nonce: &[u8],
+    tag: &[u8],
+) -> Result<(), CryptoError> {
+    if nonce.len() != nonce_size {
+        return Err(CryptoError::InvalidNonceLength { expected: nonce_size, actual: nonce.len() });
+    }
+    if tag.len() != tag_size {
+        return Err(CryptoError::InvalidNonceLength { expected: tag_size, actual: tag.len() });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -229,6 +294,24 @@ impl AeadCipher for Aes128Gcm {
     #[inline]
     fn nonce_size(&self) -> usize {
         12
+    }
+
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let t = self
+            .key
+            .seal_in_place_separate_tag(ring_nonce, Aad::from(aad), payload)
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        tag.copy_from_slice(t.as_ref());
+        Ok(())
     }
 
     #[inline]
@@ -371,6 +454,24 @@ impl AeadCipher for Aes256Gcm {
     #[inline]
     fn nonce_size(&self) -> usize {
         12
+    }
+
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
+        let ring_nonce = Nonce::try_assume_unique_for_key(nonce)
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        let t = self
+            .key
+            .seal_in_place_separate_tag(ring_nonce, Aad::from(aad), payload)
+            .map_err(|_| CryptoError::EncryptionError("seal failed".into()))?;
+        tag.copy_from_slice(t.as_ref());
+        Ok(())
     }
 
     #[inline]
@@ -854,6 +955,25 @@ impl AeadCipher for ChaCha20Poly1305Aead {
         CHACHA20POLY1305_NONCE_SIZE
     }
 
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
+        let nonce_arr: chacha20poly1305::Nonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
+        let t = self
+            .inner
+            .encrypt_inout_detached(&nonce_arr, aad, payload.into())
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        tag.copy_from_slice(t.as_ref());
+        Ok(())
+    }
+
     #[inline]
     fn tag_size(&self) -> usize {
         POLY1305_TAG_SIZE
@@ -1004,6 +1124,25 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         XCHACHA20POLY1305_NONCE_SIZE
     }
 
+    fn seal_in_place_with_tag(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &mut [u8],
+    ) -> Result<(), CryptoError> {
+        check_seal_in_place(self.nonce_size(), self.tag_size(), nonce, tag)?;
+        let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
+        let t = self
+            .inner
+            .encrypt_inout_detached(&nonce_arr, aad, payload.into())
+            .map_err(|e| CryptoError::EncryptionError(e.to_string()))?;
+        tag.copy_from_slice(t.as_ref());
+        Ok(())
+    }
+
     #[inline]
     fn tag_size(&self) -> usize {
         POLY1305_TAG_SIZE
@@ -1042,6 +1181,64 @@ impl AeadCipher for XChaCha20Poly1305Aead {
         self.inner
             .decrypt(&nonce_arr, Payload { msg: ciphertext, aad })
             .map_err(|e| CryptoError::EncryptionError(e.to_string()))
+    }
+
+    fn seal_into(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        plaintext: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        match self.inner.encrypt_inout_detached(&nonce_arr, aad, (&mut out[start..]).into()) {
+            Ok(tag) => {
+                out.extend_from_slice(tag.as_ref());
+                Ok(())
+            },
+            Err(e) => {
+                out.truncate(start);
+                Err(CryptoError::EncryptionError(e.to_string()))
+            },
+        }
+    }
+
+    fn open_in_place<'a>(
+        &self,
+        nonce: &[u8],
+        aad: &[u8],
+        ciphertext: &'a mut [u8],
+    ) -> Result<&'a mut [u8], CryptoError> {
+        if nonce.len() != self.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.nonce_size(),
+                actual: nonce.len(),
+            });
+        }
+        let nonce_arr: chacha20poly1305::XNonce = nonce.try_into().map_err(|_| {
+            CryptoError::InvalidNonceLength { expected: self.nonce_size(), actual: nonce.len() }
+        })?;
+        let ct_len = ciphertext
+            .len()
+            .checked_sub(self.tag_size())
+            .ok_or(CryptoError::AuthenticationFailed)?;
+        let (ct, tag) = ciphertext.split_at_mut(ct_len);
+        let tag_arr = chacha20poly1305::aead::Tag::<XChaCha20Poly1305>::try_from(&*tag)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        self.inner
+            .decrypt_inout_detached(&nonce_arr, aad, ct.into(), &tag_arr)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        Ok(ct)
     }
 }
 
@@ -1106,6 +1303,100 @@ mod tests {
             ]
             .concat();
             assert_eq!(out, expected);
+        }
+    }
+
+    /// 默认 impl（seal + split）与 4 个覆盖 impl 都必须与 `seal()` 逐字节等价，
+    /// 且 tag 落在独立 tag 区——原地 seal 是 SS/VMess 写侧零拷贝的地基。
+    #[test]
+    fn seal_in_place_matches_seal_all_backends() {
+        /// 只覆写 seal/open → 走 trait 默认 `seal_in_place_with_tag`（兜底路径）。
+        struct DefaultOnly(Aes128Gcm);
+        impl AeadCipher for DefaultOnly {
+            fn nonce_size(&self) -> usize {
+                self.0.nonce_size()
+            }
+
+            fn tag_size(&self) -> usize {
+                self.0.tag_size()
+            }
+
+            fn key_size(&self) -> usize {
+                self.0.key_size()
+            }
+
+            fn seal(&self, nonce: &[u8], aad: &[u8], p: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                self.0.seal(nonce, aad, p)
+            }
+
+            fn open(&self, nonce: &[u8], aad: &[u8], c: &[u8]) -> Result<Vec<u8>, CryptoError> {
+                self.0.open(nonce, aad, c)
+            }
+        }
+
+        let key = [5u8; 32];
+        let ciphers: Vec<(&str, Box<dyn AeadCipher>)> = vec![
+            ("aes-128-gcm", Box::new(Aes128Gcm::new(&key[..16]).expect("aes128"))),
+            ("aes-256-gcm", Box::new(Aes256Gcm::new(&key).expect("aes256"))),
+            ("chacha20-poly1305", Box::new(ChaCha20Poly1305Aead::new(&key).expect("chacha"))),
+            ("xchacha20-poly1305", Box::new(XChaCha20Poly1305Aead::new(&key).expect("xchacha"))),
+            (
+                "trait-default-fallback",
+                Box::new(DefaultOnly(Aes128Gcm::new(&key[..16]).expect("aes128"))),
+            ),
+        ];
+        let plaintext: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        for (name, cipher) in ciphers {
+            let nonce = vec![7u8; cipher.nonce_size()];
+            let aad = b"ss-chunk-aad";
+            let expected = cipher.seal(&nonce, aad, &plaintext).expect("seal");
+
+            let mut payload = plaintext.clone();
+            let mut tag = vec![0xEEu8; cipher.tag_size()];
+            cipher.seal_in_place_with_tag(&nonce, aad, &mut payload, &mut tag).expect(name);
+
+            assert_eq!(payload, expected[..plaintext.len()], "{name}: 载荷原地成密文");
+            assert_eq!(tag, expected[plaintext.len()..], "{name}: tag 落独立 tag 区");
+            let mut wire = payload;
+            wire.extend_from_slice(&tag);
+            assert_eq!(wire, expected, "{name}: [ciphertext][tag] 与 seal() 逐字节相同");
+
+            // 原地密文自洽：标准 open_in_place 能解回（wire 直接可解）。
+            let mut back = wire;
+            let plain = cipher.open_in_place(&nonce, aad, &mut back).expect(name);
+            assert_eq!(plain, &plaintext[..], "{name}: 原地密文可被标准 open 解回");
+        }
+    }
+
+    /// 原地 seal 的失败面：非法 nonce 长度 / 错 tag 区长度 → Err 且载荷一字节不动
+    /// （否则明文会被当密文发上线）。
+    #[test]
+    fn seal_in_place_error_leaves_payload_untouched() {
+        let key = [6u8; 32];
+        let ciphers: Vec<Box<dyn AeadCipher>> = vec![
+            Box::new(Aes128Gcm::new(&key[..16]).expect("aes128")),
+            Box::new(Aes256Gcm::new(&key).expect("aes256")),
+            Box::new(ChaCha20Poly1305Aead::new(&key).expect("chacha")),
+            Box::new(XChaCha20Poly1305Aead::new(&key).expect("xchacha")),
+        ];
+        for cipher in ciphers {
+            let before = b"plaintext-must-not-survive-as-ciphertext".to_vec();
+            let nonce = vec![0u8; cipher.nonce_size()];
+            let mut payload = before.clone();
+            let mut tag = vec![0xAAu8; cipher.tag_size()];
+
+            assert!(
+                cipher.seal_in_place_with_tag(&nonce[..1], b"", &mut payload, &mut tag).is_err()
+            );
+            assert_eq!(payload, before, "错 nonce 长度后载荷必须逐字节不变");
+            assert_eq!(tag, vec![0xAAu8; cipher.tag_size()], "错 nonce 长度后 tag 区不得被写");
+
+            let mut short_tag = vec![0xAAu8; cipher.tag_size() - 1];
+            assert!(
+                cipher.seal_in_place_with_tag(&nonce, b"", &mut payload, &mut short_tag).is_err()
+            );
+            assert_eq!(payload, before, "错 tag 区长度后载荷必须逐字节不变");
+            assert_eq!(short_tag, vec![0xAAu8; cipher.tag_size() - 1], "短 tag 区保持原样");
         }
     }
 
