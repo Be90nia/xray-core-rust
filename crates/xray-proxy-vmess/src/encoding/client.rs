@@ -56,6 +56,18 @@ pub struct ClientSession {
     pub response_header: u8,
 }
 
+/// 响应头 AEAD length 段的线上长度（2B 长度 + 16B tag）。
+const RESP_HEADER_LEN_SEALED: usize = 18;
+
+/// 响应头增量解码结果（poll 直挂连接用：wire 半头是正常中间态，不得报错）。
+#[derive(Debug, Clone)]
+pub(crate) enum ResponseHeaderProgress {
+    /// 已解出：响应头 + 本条响应头占用的线上字节数。
+    Done(ResponseHeader, usize),
+    /// 字节不足：还需累计这么多字节。
+    Need(usize),
+}
+
 impl ClientSession {
     /// 创建新会话：生成 33B 随机（16 key + 16 iv + 1 header），派生 body key/IV。
     #[must_use]
@@ -256,36 +268,63 @@ impl ClientSession {
         &self,
         reader: &mut R,
     ) -> Result<ResponseHeader> {
+        let mut buf = Vec::new();
+        let mut need = RESP_HEADER_LEN_SEALED;
+        loop {
+            let have = buf.len();
+            buf.resize(need, 0);
+            reader.read_exact(&mut buf[have..])?;
+            match self.decode_response_header_from_buf(&buf)? {
+                ResponseHeaderProgress::Done(header, _) => return Ok(header),
+                ResponseHeaderProgress::Need(n) => need = n,
+            }
+        }
+    }
+
+    /// 从**已读到的字节**解响应头（poll 直挂连接用）。
+    ///
+    /// 与 [`decode_response_header`](Self::decode_response_header) 同算法、同线上字节，
+    /// 唯一区别：字节不够时返回 [`ResponseHeaderProgress::Need`] 而不是报错——服务端会把
+    /// 响应头缓冲到首块下行数据才 flush（Go `SetFlushNext`），**半截响应头是正常中间态**。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`decode_response_header`](Self::decode_response_header)（仅在实际解出的字节非法时）。
+    pub(crate) fn decode_response_header_from_buf(
+        &self,
+        buf: &[u8],
+    ) -> Result<ResponseHeaderProgress> {
         // 1. 派生 len key/IV
         let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
         let len_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_LEN_IV]);
-        let len_nonce = &len_iv_full[..12];
         let len_cipher = Aes128Gcm::new(&len_key)?;
 
-        // 2. 读 18B 加密 length + AEAD Open
-        let mut encrypted_len = [0u8; 18];
-        reader.read_exact(&mut encrypted_len)?;
+        // 2. 18B 加密 length + AEAD Open
+        if buf.len() < RESP_HEADER_LEN_SEALED {
+            return Ok(ResponseHeaderProgress::Need(RESP_HEADER_LEN_SEALED));
+        }
         let decrypted_len_bytes = len_cipher
-            .open(len_nonce, &[], &encrypted_len)
+            .open(&len_iv_full[..12], &[], &buf[..RESP_HEADER_LEN_SEALED])
             .map_err(|_| VmessError::DecryptResponseHeaderLengthFailed)?;
         if decrypted_len_bytes.len() < 2 {
             return Err(VmessError::ReadResponseHeaderFailed);
         }
         let payload_len = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
+        let total = RESP_HEADER_LEN_SEALED + usize::from(payload_len) + 16;
+        if buf.len() < total {
+            return Ok(ResponseHeaderProgress::Need(total));
+        }
 
         // 3. 派生 payload key/IV
         let payload_key =
             aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
         let payload_iv_full =
             aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
-        let payload_nonce = &payload_iv_full[..12];
         let payload_cipher = Aes128Gcm::new(&payload_key)?;
 
-        // 4. 读 (payload_len+16)B 加密 payload + AEAD Open
-        let mut encrypted_payload = vec![0u8; usize::from(payload_len) + 16];
-        reader.read_exact(&mut encrypted_payload)?;
+        // 4. (payload_len+16)B 加密 payload + AEAD Open
         let payload = payload_cipher
-            .open(payload_nonce, &[], &encrypted_payload)
+            .open(&payload_iv_full[..12], &[], &buf[RESP_HEADER_LEN_SEALED..total])
             .map_err(|_| VmessError::DecryptResponseHeaderPayloadFailed)?;
 
         // 5. 解析 payload
@@ -302,7 +341,10 @@ impl ClientSession {
         let option = Bitmask::new(payload[1]);
         // payload[2] = cmd_id, payload[3] = data_len
         let response_command = Self::parse_response_command(&payload[2..])?;
-        Ok(ResponseHeader { command: Command::Tcp, option, response_command })
+        Ok(ResponseHeaderProgress::Done(
+            ResponseHeader { command: Command::Tcp, option, response_command },
+            total,
+        ))
     }
 
     /// 解析 VMess 响应命令。
@@ -517,46 +559,17 @@ impl ClientSession {
         &self,
         reader: &mut R,
     ) -> Result<ResponseHeader> {
-        let len_key = aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_LEN_KEY]);
-        let len_iv_full = aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_LEN_IV]);
-        let len_nonce = &len_iv_full[..12];
-        let len_cipher = Aes128Gcm::new(&len_key)?;
-
-        let mut encrypted_len = [0u8; 18];
-        reader.read_exact(&mut encrypted_len).await?;
-        let decrypted_len_bytes = len_cipher
-            .open(len_nonce, &[], &encrypted_len)
-            .map_err(|_| VmessError::DecryptResponseHeaderLengthFailed)?;
-        if decrypted_len_bytes.len() < 2 {
-            return Err(VmessError::ReadResponseHeaderFailed);
+        let mut buf = Vec::new();
+        let mut need = RESP_HEADER_LEN_SEALED;
+        loop {
+            let have = buf.len();
+            buf.resize(need, 0);
+            reader.read_exact(&mut buf[have..]).await?;
+            match self.decode_response_header_from_buf(&buf)? {
+                ResponseHeaderProgress::Done(header, _) => return Ok(header),
+                ResponseHeaderProgress::Need(n) => need = n,
+            }
         }
-        let payload_len = u16::from_be_bytes([decrypted_len_bytes[0], decrypted_len_bytes[1]]);
-
-        let payload_key =
-            aead::kdf16(&self.response_body_key, &[consts::AEAD_RESP_HEADER_PAYLOAD_KEY]);
-        let payload_iv_full =
-            aead::kdf(&self.response_body_iv, &[consts::AEAD_RESP_HEADER_PAYLOAD_IV]);
-        let payload_nonce = &payload_iv_full[..12];
-        let payload_cipher = Aes128Gcm::new(&payload_key)?;
-
-        let mut encrypted_payload = vec![0u8; usize::from(payload_len) + 16];
-        reader.read_exact(&mut encrypted_payload).await?;
-        let payload = payload_cipher
-            .open(payload_nonce, &[], &encrypted_payload)
-            .map_err(|_| VmessError::DecryptResponseHeaderPayloadFailed)?;
-
-        if payload.len() < 4 {
-            return Err(VmessError::ReadResponseHeaderFailed);
-        }
-        if payload[0] != self.response_header {
-            return Err(VmessError::UnexpectedResponseHeader {
-                expected: self.response_header,
-                actual: payload[0],
-            });
-        }
-        let option = Bitmask::new(payload[1]);
-        let response_command = Self::parse_response_command(&payload[2..])?;
-        Ok(ResponseHeader { command: Command::Tcp, option, response_command })
     }
 
     /// 解码响应 body（async 版）。
@@ -768,6 +781,62 @@ mod tests {
         let mut reader = &buf[..];
         let decoded = client_session.decode_response_header(&mut reader).expect("client decode");
         assert_eq!(decoded.option.bits(), 0);
+    }
+
+    /// 响应头**半截**是正常中间态（Go `SetFlushNext` 把响应头缓冲到首块下行数据）：
+    /// 按已读字节解时，任何真前缀都只能返回 `Need`，**禁止报错**；整头到齐才 `Done`。
+    ///
+    /// 判别器覆盖两段：① < 18B（连长度段都不够）② 18B ≤ n < 全长（长度已解出、
+    /// payload 半截）——② 是旧 `read_exact` 形态唯一会阻塞的窗口，也是直挂 poll 形态
+    /// 最容易误报错的位置。
+    #[test]
+    fn response_header_partial_bytes_needs_more_without_error() {
+        use xray_common::protocol::ResponseHeader;
+
+        use crate::{
+            encoding::server::{ServerSession, SessionHistory},
+            validator::{MemoryUser, TimedUserValidator},
+        };
+
+        let validator = TimedUserValidator::new();
+        let history = SessionHistory::new();
+        let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+        validator
+            .add(MemoryUser::new("bob@example.com", crate::account::MemoryAccount::new(uuid)))
+            .expect("add");
+        let client_session = ClientSession::new();
+        let mut server = ServerSession::new(&validator, &history);
+        server.request_body_key = client_session.request_body_key;
+        server.request_body_iv = client_session.request_body_iv;
+        server.response_header = client_session.response_header;
+
+        let resp_header = ResponseHeader {
+            command: Command::Tcp,
+            option: Bitmask::new(0),
+            response_command: ResponseCommand::None,
+        };
+        let mut wire: Vec<u8> = Vec::new();
+        server.encode_response_header(&resp_header, &mut wire).expect("server encode");
+        assert!(wire.len() > RESP_HEADER_LEN_SEALED, "响应头必须跨过第二段才有判别力");
+
+        for n in 0..wire.len() {
+            match client_session
+                .decode_response_header_from_buf(&wire[..n])
+                .expect("半截响应头不得报错")
+            {
+                ResponseHeaderProgress::Need(need) => {
+                    assert!(n < need, "Need({need}) 必须大于已有 {n} 字节");
+                },
+                ResponseHeaderProgress::Done(..) => panic!("{n}B 不足以解出响应头"),
+            }
+        }
+        match client_session.decode_response_header_from_buf(&wire).expect("整头") {
+            ResponseHeaderProgress::Done(decoded, used) => {
+                assert_eq!(decoded.option.bits(), 0);
+                assert_eq!(used, wire.len(), "消费字节数必须等于响应头线长");
+            },
+            ResponseHeaderProgress::Need(need) => panic!("整头到齐仍报缺 {need}B"),
+        }
     }
 
     #[test]

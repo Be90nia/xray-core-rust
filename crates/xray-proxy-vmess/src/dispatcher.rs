@@ -6,10 +6,10 @@
 //!
 //! ## 范围
 //!
-//! VMess over **raw TCP**：请求头 AEAD 加密 + body chunk AEAD 加密（duplex pump）。
-//! [`make_vmess_dial_fn`] 闭包拨号到 VMess 服务器 → 写 AEAD 请求头 → 读响应头 →
-//! 返回 [`VmessConn`]（内部 spawn 双向 pump：明文↔chunk 密文）。transport 层补全后
-//! 可注入 TLS-wrapped 拨号闭包。仅支持 PlainSizeParser（默认 body 选项）。
+//! VMess over **raw TCP**：请求头 AEAD 加密 + body chunk AEAD 加密。
+//! [`make_vmess_dial_fn`] 闭包拨号到 VMess 服务器 → 写 AEAD 请求头 →
+//! 返回 [`VmessConn`]（读写两半**直挂** chunk AEAD wire：无 duplex 环、无泵任务；
+//! 响应头在读半惰性解码）。transport 层补全后可注入 TLS-wrapped 拨号闭包。
 //!
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
@@ -21,8 +21,9 @@ use std::{
     task::{Context, Poll},
 };
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use skeleton_infra::fx::Spawned;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use xray_app_dispatcher::{
     default::DialFn,
     udp_session::{XudpReframer, XudpUnframer},
@@ -42,11 +43,10 @@ use crate::{
     encoding::{
         ChunkNonceGenerator, VERSION,
         body_chunk::{
-            AEADSizeParserAdapter, ChunkFrame, ChunkNonceAdapter, PlainSizeParser,
-            ShakeSizeParserAdapter, SizeParser, make_authenticated_length_size_parser,
-            write_chunk_frame,
+            AEADSizeParserAdapter, ChunkNonceAdapter, PlainSizeParser, ShakeSizeParserAdapter,
+            SizeParser, make_authenticated_length_size_parser,
         },
-        client::ClientSession,
+        client::{ClientSession, ResponseHeaderProgress},
         generate_chacha20poly1305_key,
         server::has_aes_gcm_hardware_support,
     },
@@ -250,8 +250,8 @@ use std::str::FromStr;
 /// 闭包捕获 `Arc<VmessOutboundConfig>`，每次调用：
 /// 1. `dial` 到 VMess 服务器 → `Box<dyn Connection>`
 /// 2. 解析 security（Auto → 具体算法）+ `encode_request_header` 写 AEAD 加密请求头
-/// 3. `decode_response_header_async` 读服务端响应头（消费字节）
-/// 4. 返回 [`VmessConn`]（内部 spawn 双向 chunk AEAD pump）
+/// 3. 返回 [`VmessConn`]：读写两半直挂 chunk AEAD wire，响应头由读半**惰性**解码
+///    （服务端把它缓冲到首块下行数据才 flush，dial 阶段同步等待会双向死锁）
 ///
 /// # Panics
 ///
@@ -355,9 +355,9 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
             let resp_size_parser =
                 build_size_parser(authenticated_length, use_masking, resp_iv, &session, security)
                     .map_err(|e| format!("vmess build response size parser: {e}"))?;
-            // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界 必须保持，duplex
-            //    流桥会合并多次 write 破坏边界）；TCP：VmessConn （内部 spawn 双向 chunk
-            //    pump；响应头在 down pump 内惰性解码）。
+            // 7. UDP：VmessUdpConn（chunk 即 packet，Go 非 cone 语义——packet 边界必须保持，
+            //    按字节流的连接会合并多次 write 破坏边界）；TCP：VmessConn（读写两半直挂 chunk
+            //    wire，响应头在读半惰性解码）。
             if is_udp {
                 return Ok(Box::new(VmessUdpConn::from_udp_conn(
                     &ctx,
@@ -376,7 +376,6 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
                 )) as Box<dyn Connection>);
             }
             Ok(Box::new(VmessConn::from_conn(
-                &ctx,
                 conn,
                 session,
                 req_cipher,
@@ -393,25 +392,69 @@ pub fn make_vmess_dial_fn(config: Arc<VmessOutboundConfig>, ctx: Arc<PluginConte
     })
 }
 
-/// Duplex 缓冲（与 chunk payload 上限 8 KiB 对齐，留足一个 chunk 余量）。
-const DUPLEX_BUF: usize = 16_384;
+/// 下行 wire 缓冲预留（与旧泵的 `pending.reserve` 同档）。
+const DOWN_RESERVE: usize = 16 * 1024;
 
-/// Pump 单次 read 缓冲（与 body_chunk `DEFAULT_PAYLOAD_SIZE` 对齐）。
-const PUMP_BUF: usize = 8192;
-
-/// VMess outbound 连接包装：内部用 `tokio::io::duplex` 桥接底层连接的 chunk AEAD 加密。
+/// VMess outbound 连接：读写两半各自直挂 chunk AEAD wire（**删 duplex 中转层**）。
 ///
-/// `_pump` 字段保证桥接 task 生命周期与连接一致——drop 时自动 abort。
+/// 旧实现（`tokio::io::duplex` + `pump_up`/`pump_down` 两个 task）：每方向固定多
+/// 2 遍中转 memcpy（写进环 + 读出环）+ 一次 task 唤醒，且上行 chunk 边界由泵任务的
+/// 读调度决定（与调用方写入节奏脱钩，请求-响应模式下每帧都多一次唤醒）。
+///
+/// 新实现：
+/// - **写半**：明文进单 chunk 容量暂存 → `encode_frame_into` **同步构帧**（与 UDP
+///   路径同一份构帧代码）→ 直落 wire；一次 [`AsyncWrite::poll_write`] 出一个 chunk。
+/// - **读半**：wire 字节直落 `BytesMut` → 响应头按**已读字节增量解码**（不足即再读，
+///   半截响应头是正常中间态）→ chunk `open_in_place` 原地解密 → 交付调用方。
+///
+/// **wire 不变量**：帧格式 / nonce 序号 / 构帧代码与旧泵同源——`encode_frame_into`
+/// 与旧 `write_chunk_frame` 的逐字节一致由 `write_one_chunk_in_place_matches_seal_and_vec_path`
+/// 钉死。
 pub struct VmessConn {
-    inner: DuplexStream,
-    _pump: Spawned<()>,
+    wire: Box<dyn Connection>,
+    session: ClientSession,
+    // ---- 上行 ----
+    req_cipher: BodyCipher,
+    req_nonce: ChunkNonceGenerator,
+    /// Mutex 仅为 `Connection::Sync`（poll 单线程独占，锁无竞争）；
+    /// `ShakeSizeParserAdapter` 内部 XofReader 非 Sync，无法裸存。
+    req_size_parser: parking_lot::Mutex<Box<dyn SizeParser + Send>>,
+    req_padding: bool,
+    /// `NoTerminationSignal` 实验：关闭时不写终止 chunk。
+    termination_signal: bool,
+    /// 单 chunk 明文容量（构帧预算，与 UDP 路径同源）。
+    up_cap: usize,
+    /// 上行明文暂存。
+    stage: Vec<u8>,
+    /// 待落线帧与其游标。
+    frame: Vec<u8>,
+    frame_pos: usize,
+    /// 终止 chunk 已构帧（重入 `poll_shutdown` 不再重复取 nonce）。
+    up_done: bool,
+    // ---- 下行 ----
+    resp_cipher: BodyCipher,
+    resp_nonce: ChunkNonceGenerator,
+    resp_size_parser: parking_lot::Mutex<Box<dyn SizeParser + Send>>,
+    resp_padding: bool,
+    /// 未解帧的 wire 字节（`split_to` 切帧为 O(1)）。
+    pending: BytesMut,
+    /// 已解出的明文待交付（chunk 大于调用方缓冲时保留余量）。
+    plain: Bytes,
+    /// 响应头已解完。
+    hdr_done: bool,
+    /// 已解出 size 字段、等帧体到齐时的 `(总长, padding)`。
+    ///
+    /// SHAKE128 流是**有状态**的（`next_padding_len` → `decode` 各推进一次），
+    /// 帧体未到齐时不得重算，否则流位置漂移、后续 chunk 全错。
+    chunk_hdr: Option<(usize, usize)>,
+    /// 下行结束（终止 chunk / EOF / 解密失败）。
+    down_done: bool,
 }
 
 impl VmessConn {
-    /// 从底层连接构造：spawn 双向 pump（明文 duplex ↔ chunk 密文 wire），返回 duplex 客户端包装。
+    /// 从已写完请求头的底层连接构造（响应头由读半惰性解码）。
     #[allow(clippy::too_many_arguments)] // 与 Go dial 参数集一一对应
     fn from_conn(
-        ctx: &PluginContext,
         conn: Box<dyn Connection>,
         session: ClientSession,
         req_cipher: BodyCipher,
@@ -424,68 +467,236 @@ impl VmessConn {
         resp_padding: bool,
         termination_signal: bool,
     ) -> Self {
-        let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
-        let (stream_r, stream_w) = tokio::io::split(conn);
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        let pump = ctx
-            .spawn(async move {
-                let (server_r, mut server_w) = tokio::io::split(server_io);
-                // up: 明文 duplex → chunk 加密 → wire（请求 body）
-                let up = pump_up(
-                    server_r,
-                    stream_w,
-                    req_cipher,
-                    req_iv,
-                    req_size_parser,
-                    req_padding,
-                    termination_signal,
-                );
-                // down: 先惰性解码响应头，再 chunk 解密 → 明文 duplex。
-                // 与 up 并发执行：服务端（Go SetFlushNext）把响应头缓冲到首块下行数据，
-                // 上行数据必须先于响应头到达，因此不能在 dial 阶段同步等待响应头。
-                let down = async move {
-                    let mut sr = stream_r;
-                    if let Err(e) = session.decode_response_header_async(&mut sr).await {
-                        crate::VMESS_LOG
-                            .debug(format!("vmess decode response header failed error={e}"));
-                        let _ = server_w.shutdown().await;
-                        return;
-                    }
-                    pump_down(sr, server_w, resp_cipher, resp_iv, resp_size_parser, resp_padding)
-                        .await;
-                };
-                tokio::join!(up, down);
-            })
-            .expect("plugin ctx FxScope is never closed (assembly-owned)");
-        Self { inner: client_io, _pump: pump }
+        let up_cap = crate::encoding::body_chunk::single_chunk_capacity(
+            &req_cipher,
+            req_size_parser.as_ref(),
+        );
+        Self {
+            wire: conn,
+            session,
+            req_cipher,
+            req_nonce: ChunkNonceGenerator::new(&req_iv, 12),
+            req_size_parser: parking_lot::Mutex::new(req_size_parser),
+            req_padding,
+            termination_signal,
+            up_cap,
+            stage: Vec::with_capacity(up_cap),
+            frame: Vec::with_capacity(up_cap + 96),
+            frame_pos: 0,
+            up_done: false,
+            resp_cipher,
+            resp_nonce: ChunkNonceGenerator::new(&resp_iv, 12),
+            resp_size_parser: parking_lot::Mutex::new(resp_size_parser),
+            resp_padding,
+            pending: BytesMut::new(),
+            plain: Bytes::new(),
+            hdr_done: false,
+            chunk_hdr: None,
+            down_done: false,
+        }
+    }
+
+    /// 把暂存明文（或终止 chunk 的空载荷）构帧进 `frame`。
+    fn seal_frame(&mut self, termination: bool) -> std::io::Result<()> {
+        let Self { frame, stage, req_cipher, req_nonce, req_size_parser, req_padding, .. } = self;
+        let data: &[u8] = if termination { &[] } else { &stage[..stage.len().min(self.up_cap)] };
+        let nonce = req_nonce.next_ref();
+        encode_frame_into(
+            frame,
+            data,
+            req_cipher,
+            nonce,
+            req_size_parser.get_mut().as_mut(),
+            *req_padding,
+        )?;
+        self.frame_pos = 0;
+        self.stage.clear();
+        Ok(())
+    }
+
+    /// 推进待落线帧。`Pending` = wire 未就绪（帧留存，后续 poll 续推）。
+    fn poll_out(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.frame_pos < self.frame.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut self.wire).poll_write(cx, &self.frame[self.frame_pos..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.frame_pos += n;
+        }
+        if !self.frame.is_empty() {
+            self.frame.clear();
+            self.frame_pos = 0;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// 响应头增量解码：返回「本轮是否有进展」（不足 = false，继续读）。
+    fn try_decode_header(&mut self) -> std::io::Result<bool> {
+        match self.session.decode_response_header_from_buf(&self.pending) {
+            Ok(ResponseHeaderProgress::Need(_)) => Ok(false),
+            Ok(ResponseHeaderProgress::Done(_header, used)) => {
+                self.pending.advance(used);
+                self.hdr_done = true;
+                Ok(true)
+            },
+            Err(e) => {
+                crate::VMESS_LOG.debug(format!("vmess decode response header failed error={e}"));
+                self.down_done = true;
+                Ok(false)
+            },
+        }
+    }
+
+    /// 响应 body chunk 增量解码：整帧到齐才推进 nonce；不足返回 false。
+    fn try_decode_chunk(&mut self) -> std::io::Result<bool> {
+        let Self { resp_cipher, resp_nonce, resp_size_parser, resp_padding, pending, .. } = self;
+        let sp = resp_size_parser.get_mut();
+        let sb = sp.size_bytes();
+        let (total, padding) = match self.chunk_hdr {
+            Some(v) => v,
+            None => {
+                if pending.len() < sb {
+                    return Ok(false);
+                }
+                // SHAKE128 流消费顺序：next_padding_len → decode（与 encode 侧对称）
+                let padding = if *resp_padding { usize::from(sp.next_padding_len()) } else { 0 };
+                let total = usize::from(sp.decode(&pending[..sb]));
+                if total == 0 {
+                    // 兼容 Go AuthenticationReader 的 size==0 → EOF 语义
+                    self.down_done = true;
+                    return Ok(true);
+                }
+                self.chunk_hdr = Some((total, padding));
+                (total, padding)
+            },
+        };
+        if pending.len() < sb + total {
+            return Ok(false);
+        }
+        // 整帧切出（size 段 + 密文‖tag + padding），wire 缓冲 O(1) 前移
+        let mut blob = pending.split_to(sb + total);
+        // 恶意/错乱 padding > total 时不得下溢（与 ChunkReader 同口径）
+        let cipher_len = total.saturating_sub(padding);
+        let nonce = resp_nonce.next_ref();
+        let plaintext_len =
+            match resp_cipher.open_in_place(nonce, &[], &mut blob[sb..sb + cipher_len]) {
+                Ok(pt) => pt.len(),
+                Err(e) => {
+                    crate::VMESS_LOG.debug(format!("vmess down body chunk open failed error={e}"));
+                    self.down_done = true;
+                    return Ok(true);
+                },
+            };
+        self.chunk_hdr = None;
+        if plaintext_len == 0 {
+            // 终止 chunk（seal([])）→ 响应 body 结束
+            self.down_done = true;
+            return Ok(true);
+        }
+        blob.advance(sb);
+        let mut plain = blob.freeze();
+        plain.truncate(plaintext_len); // 丢弃尾部 padding
+        self.plain = plain;
+        Ok(true)
     }
 }
 
 impl AsyncRead for VmessConn {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        let me = self.get_mut();
+        // 写半顺带推进：下行等响应期间上行帧不能停在暂存里（旧泵两 task 并发同效）
+        if let Poll::Ready(Err(e)) = me.poll_out(cx) {
+            return Poll::Ready(Err(e));
+        }
+        loop {
+            // ① 已解出的明文交付（chunk 大于调用方缓冲时保留余量）
+            if !me.plain.is_empty() {
+                let n = me.plain.len().min(buf.remaining());
+                buf.put_slice(&me.plain[..n]);
+                me.plain.advance(n);
+                return Poll::Ready(Ok(()));
+            }
+            if me.down_done {
+                return Poll::Ready(Ok(())); // EOF
+            }
+            // ② 增量解帧（响应头 → body chunk）
+            let progressed =
+                if me.hdr_done { me.try_decode_chunk()? } else { me.try_decode_header()? };
+            if progressed || me.down_done {
+                continue;
+            }
+            // ③ 需要更多 wire 字节：直读进 pending 的 spare 区（零中转拷贝）
+            me.pending.reserve(DOWN_RESERVE);
+            let n = {
+                let spare = me.pending.spare_capacity_mut();
+                let mut rb = ReadBuf::uninit(spare);
+                match Pin::new(&mut me.wire).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => rb.filled().len(),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            };
+            if n == 0 {
+                me.down_done = true;
+                return Poll::Ready(Ok(()));
+            }
+            // SAFETY: 刚由底层读入 `n` 个已初始化字节到 pending 的 spare 区，
+            // `n ≤ spare.len()`，写入范围与已初始化范围严格一致。
+            unsafe { me.pending.advance_mut(n) };
+        }
     }
 }
 
 impl AsyncWrite for VmessConn {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let me = self.get_mut();
+        // ① 待落线帧先冲刷（wire 未就绪 → 背压，未消费任何明文）
+        std::task::ready!(me.poll_out(cx))?;
+        // ② 明文进暂存 → 构帧（一次 poll_write 一个 chunk，对齐 Go AuthenticationWriter）
+        let n = buf.len().min(me.up_cap.saturating_sub(me.stage.len()));
+        me.stage.extend_from_slice(&buf[..n]);
+        if n > 0 {
+            if let Err(e) = me.seal_frame(false) {
+                return Poll::Ready(Err(std::io::Error::other(format!("vmess chunk frame: {e}"))));
+            }
+            // ③ 立刻落线（wire Pending 时帧留存，后续 poll_read/poll_write 续推）
+            if let Poll::Ready(Err(e)) = me.poll_out(cx) {
+                return Poll::Ready(Err(e));
+            }
+        }
+        Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        std::task::ready!(me.poll_out(cx))?;
+        Pin::new(&mut me.wire).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        // 终止 chunk（seal([])）：服务端 decode 看到空明文即请求 body 结束；
+        // `NoTerminationSignal` 实验时省略，靠连接关闭让服务端识别流结束。
+        if !me.up_done {
+            me.up_done = true;
+            if me.termination_signal {
+                me.seal_frame(true)
+                    .map_err(|e| std::io::Error::other(format!("vmess termination: {e}")))?;
+            }
+        }
+        std::task::ready!(me.poll_out(cx))?;
+        std::task::ready!(Pin::new(&mut me.wire).poll_flush(cx))?;
+        Pin::new(&mut me.wire).poll_shutdown(cx)
     }
 }
 
@@ -503,8 +714,8 @@ impl Connection for VmessConn {
 ///
 /// 上行：每次 [`AsyncWrite::poll_write`] 把传入 buf 按 XUDP 帧切成裸载荷，
 /// 每包编码为**恰好一个** chunk（AEAD seal，见
-/// [`crate::encoding::body_chunk::encode_single_chunk`]）直写底层连接——duplex
-/// 流桥会合并多次 write 破坏 packet 边界，故不走 [`VmessConn`] 的 duplex 泵。
+/// [`crate::encoding::body_chunk::encode_single_chunk`]）直写底层连接——按字节流的
+/// [`VmessConn`] 会合并多次 write 破坏 packet 边界，故 UDP 不走它的读写两半。
 /// 下行：spawn task 惰性解响应头后逐 chunk 解密，包经 mpsc 队列交付，
 /// [`AsyncRead::poll_read`] 每次返回一个 packet（裹回 XUDP 帧）。
 ///
@@ -978,71 +1189,6 @@ fn build_body_ciphers(
         other => Err(VmessError::Other(format!("unsupported body security: {other:?}"))),
     }
 }
-/// size_field 由 SizeParser 编码——CHUNK_MASKING 时 SHAKE128 掩码）。nonce 跨块自增。
-/// 流结束（EOF/错误）时写终止 chunk `seal([])`。
-async fn pump_up<C, R, W>(
-    mut server_r: R,
-    mut stream_w: W,
-    cipher: C,
-    iv: [u8; 16],
-    mut size_parser: Box<dyn SizeParser + Send>,
-    global_padding: bool,
-    termination_signal: bool,
-) where
-    C: AeadCipher + Send,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    // 明文直接读进装帧块（原地覆写为密文）⇒ 用户载荷零拷贝
-    let mut frame = ChunkFrame::new();
-    let tag_len = cipher.tag_size();
-    loop {
-        frame.clear();
-        let n = match frame.read_plaintext(&mut server_r, tag_len).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                crate::VMESS_LOG.debug(format!("vmess up body plaintext read failed error={e}"));
-                break;
-            },
-        };
-        let nonce = nonce_gen.next_ref();
-        if write_chunk_frame(
-            &mut stream_w,
-            &mut frame,
-            n,
-            &cipher,
-            nonce,
-            size_parser.as_mut(),
-            global_padding,
-        )
-        .await
-        .is_err()
-        {
-            break;
-        }
-    }
-    // 写终止 chunk：seal([]) → 仅 tag 字节，服务端 decode 看到 plaintext 为空即请求
-    // body 结束。`NoTerminationSignal` 实验（Go outbound.go:180）时整块省略，靠连接
-    // 关闭让服务端识别流结束。
-    if termination_signal {
-        frame.clear();
-        let nonce = nonce_gen.next_ref();
-        let _ = write_chunk_frame(
-            &mut stream_w,
-            &mut frame,
-            0,
-            &cipher,
-            nonce,
-            size_parser.as_mut(),
-            global_padding,
-        )
-        .await;
-    }
-    let _ = stream_w.flush().await;
-    let _ = stream_w.shutdown().await;
-}
 
 /// 把一帧 `[size_field][sealed][padding]` 构进调用方复用的缓冲（同步、零中间 Vec）。
 ///
@@ -1080,64 +1226,13 @@ pub(crate) fn encode_frame_into(
     Ok(())
 }
 
-/// 下行 pump：从 wire 读 VMess 响应 body chunk 流 → 解密为明文写入 duplex。
-///
-/// nonce 跨块自增。终止 chunk（解密后 plaintext 为空）/ EOF / 解密失败时 break，
-/// 然后 shutdown duplex 写半边，让上层 reader 看到 EOF。
-async fn pump_down<C, R, W>(
-    mut stream_r: R,
-    mut server_w: W,
-    cipher: C,
-    iv: [u8; 16],
-    mut size_parser: Box<dyn SizeParser + Send>,
-    global_padding: bool,
-) where
-    C: AeadCipher + Send,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
-    let mut size_field = Vec::with_capacity(18);
-    let mut ciphertext = Vec::with_capacity(PUMP_BUF + 96);
-    loop {
-        // SHAKE128 流消费顺序：next_padding_len → decode（与 encode 侧对称）
-        let padding_size =
-            if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-        let sb = size_parser.size_bytes();
-        size_field.resize(sb, 0);
-        if stream_r.read_exact(&mut size_field).await.is_err() {
-            break;
-        }
-        let total_size = size_parser.decode(&size_field);
-        if total_size == 0 {
-            break; // 兼容 Go AuthenticationReader 的 size==0 → EOF 语义
-        }
-        ciphertext.resize(usize::from(total_size), 0);
-        if stream_r.read_exact(&mut ciphertext).await.is_err() {
-            break;
-        }
-        let cipher_len = ciphertext.len().saturating_sub(padding_size);
-        let nonce = nonce_gen.next_ref();
-        #[allow(clippy::redundant_guards)] // is_empty 守卫表达终止 chunk 语义，模式嵌套反而晦涩
-        match cipher.open_in_place(nonce, &[], &mut ciphertext[..cipher_len]) {
-            Ok(pt) if pt.is_empty() => break, // 终止 chunk
-            Ok(pt) => {
-                if server_w.write_all(pt).await.is_err() {
-                    break;
-                }
-            },
-            Err(e) => {
-                crate::VMESS_LOG.debug(format!("vmess down body chunk open failed error={e}"));
-                break;
-            },
-        }
-    }
-    let _ = server_w.shutdown().await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::body_chunk::{ChunkFrame, write_chunk_frame};
+
+    /// 单 chunk 读窗上限（与 body_chunk `DEFAULT_PAYLOAD_SIZE` 对齐）。
+    const PUMP_BUF: usize = 8192;
 
     fn test_ctx() -> Arc<PluginContext> {
         Arc::new(PluginContext::for_plugin("vmess"))
@@ -1400,6 +1495,72 @@ mod tests {
             body_arrived.load(Ordering::SeqCst),
             "server must receive body without having sent the response header"
         );
+    }
+
+    /// 响应头**分两段到达**（第一段 < 18B 长度段）时，直挂读半不得报错/丢字节：
+    /// 半截响应头是 Go `SetFlushNext` 的正常中间态，必须等第二段到达后正常解出，
+    /// 随后的 body chunk 也要照常解密交付。
+    #[tokio::test]
+    async fn response_header_arriving_in_two_pieces_still_decodes() {
+        use xray_common::protocol::ResponseHeader;
+
+        use crate::{
+            encoding::server::{ServerSession, SessionHistory},
+            validator::{MemoryUser, TimedUserValidator, Validator},
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_port = listener.local_addr().unwrap().port();
+
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试脚手架起阻塞 OS 线程持 accept（半截响应头时序回归探针）；无 PluginContext 可穿，按 clippy.toml 指引逐处登记"
+        )]
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut sock, _) = listener.accept().expect("accept");
+            let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+            let validator = TimedUserValidator::new();
+            validator
+                .add(MemoryUser::new("t@example.com", MemoryAccount::new(uuid)))
+                .expect("add user");
+            let history = SessionHistory::new();
+            let mut server = ServerSession::new(&validator, &history);
+            let (req, _) = server.decode_request_header(&mut sock).expect("decode header");
+            let resp = ResponseHeader::new(Command::Tcp);
+            let mut head: Vec<u8> = Vec::new();
+            server.encode_response_header(&resp, &mut head).expect("encode response header");
+            let mut body: Vec<u8> = Vec::new();
+            server.encode_response_body(&req, b"pong", &mut body).expect("encode body");
+            // 第一段：只发 10B（< 18B 长度段）后停顿，迫使客户端读半停在半截响应头
+            sock.write_all(&head[..10]).expect("write head part 1");
+            sock.flush().expect("flush part 1");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sock.write_all(&head[10..]).expect("write head part 2");
+            sock.write_all(&body).expect("write body");
+            sock.flush().expect("flush part 2");
+            let mut b = [0u8; 1];
+            let _ = sock.read(&mut b);
+        });
+
+        let uuid = UUID::parse("66ad4540-b58c-4ad2-9926-ea63445a9b57").expect("uuid");
+        let cfg = Arc::new(VmessOutboundConfig::new(
+            uuid,
+            Address::from_ipv4_bytes([127, 0, 0, 1]),
+            Port::new(server_port),
+        ));
+        let dial = make_vmess_dial_fn(cfg, test_ctx());
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
+        let mut conn = dial(&dest).await.expect("dial");
+
+        use tokio::io::AsyncReadExt;
+        let mut got = [0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), conn.read_exact(&mut got))
+            .await
+            .expect("半截响应头不得让读半挂死")
+            .expect("read pong");
+        assert_eq!(&got, b"pong", "响应头两段后 body chunk 必须正常解密");
     }
 
     /// 构造一帧 XUDP（link 侧表示；vmess crate 不依赖 xray-xudp，手拼线格式）：
@@ -1914,22 +2075,68 @@ mod tests {
     #[tokio::test]
     async fn no_termination_signal_omits_final_empty_chunk() {
         async fn wire_len(termination_signal: bool) -> usize {
-            let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
-            let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
-            let data: &[u8] = b"hello";
-            pump_up(
-                data,
-                &mut w,
-                cipher,
+            let data_cipher = || BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher"));
+            let wire = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let mut conn = VmessConn::from_conn(
+                Box::new(SinkConn(Arc::clone(&wire))),
+                ClientSession::new(),
+                data_cipher(),
                 [0xAAu8; 16],
                 Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>,
                 false,
+                data_cipher(),
+                [0x11u8; 16],
+                Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>,
+                false,
                 termination_signal,
-            )
-            .await;
-            w.buf.len()
+            );
+            conn.write_all(b"hello").await.expect("write body");
+            conn.shutdown().await.expect("shutdown");
+            wire.lock().len()
         }
         assert_eq!(wire_len(true).await, 23 + 18, "默认写终止 chunk（2 size + 16 tag）");
         assert_eq!(wire_len(false).await, 23, "NoTerminationSignal 只留数据帧");
+    }
+
+    /// 只吞不吐的连接桩（量上行 wire 字节；读侧恒 EOF）。
+    struct SinkConn(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl AsyncRead for SinkConn {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for SinkConn {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.0.lock().extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Connection for SinkConn {
+        fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
     }
 }
