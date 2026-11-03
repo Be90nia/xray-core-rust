@@ -265,29 +265,48 @@ impl<C: XmuxConn + 'static> XmuxManager<C> {
 
 // ===== 切片 v7w9: 进程全局 XmuxManager 池 =====
 
-use std::collections::HashMap;
-
 use parking_lot::Mutex as PMutex;
+use skeleton_infra::memgov::{BoundedRegistry, Eviction};
+
+/// 进程级 keyed 容量上界（条目数 = 不同（目标+配置）的 manager 数）。
+///
+/// 依据：每 outbound 目标+配置内容一个 manager（Go `globalDialerMap` 同构），进程级
+/// outbound 数量级 ≤ 数百，1024 触顶即异常配置。策略 = [`Eviction::Reject`]
+/// （fail-closed **不淘汰**）：`EvictOldest` 是 BTreeMap 字典序首键淘汰（非「最旧
+/// 使用」），会挤掉在表 key、破坏其复用；`Reject` 触顶时新 manager 照常返回调用方
+/// （一次性、不入缓存），既有条目与复用不受影响——对齐「OnlineMap fail-closed,
+/// no eviction」铁律。证伪钉死：
+/// `tests::evict_oldest_would_break_reuse_hence_reject`。
+const MANAGER_POOL_MAX_KEYS: usize = 1024;
 
 /// 进程级 `XmuxManager` 缓存——按 string key 缓存 `Arc<XmuxManager<C>>`。
 ///
 /// 对应 Go `transport/internet/splithttp/dialer.go:46-79` 的 `globalDialerMap`
 /// （按 dialerConf{dest, streamSettings} 复用）。Rust 端用 `String` 作为通用 key。
 ///
-/// **不可池化判定**（2026-11-02，依据见 `reports/audit-2026-11-02/udf-pool-migration.md`
-/// §2-4）：值是长期共享句柄 `Arc<XmuxManager<C>>`（多个请求并发持有 + 内部持活
-/// HTTP/2 连接与后台连接生命周期 + 条目永不归还），与「独占借用 → 归还」的池语义
-/// 冲突。本件是 **keyed 注册表**（对应 Go `globalDialerMap`），保持现状；要收敛只能
-/// 换 udf `BoundedRegistry`，但那要引入容量上界（新配置面 = 语义变更，另票）。
+/// **注册表宿主 = udf [`BoundedRegistry`]（2026-11-02 复核交付⑦）**：本件是 keyed
+/// **注册表**、不是借还池——值是长期共享句柄（多请求并发持有同一 `Arc`、条目永不
+/// 归还，内部持活 HTTP/2 连接与后台连接生命周期），「独占借用 → 归还」的池语义
+/// （`ObjectPool`/`PoolManaged`）不适用（§3.5.4：注册表禁整面 impl `PoolManaged`）。
+/// 容量与淘汰语义见 `MANAGER_POOL_MAX_KEYS`。
 pub struct ManagerPool<C: XmuxConn + 'static> {
-    map: PMutex<HashMap<String, Arc<XmuxManager<C>>>>,
+    map: PMutex<BoundedRegistry<String, Arc<XmuxManager<C>>>>,
 }
 impl<C: XmuxConn + 'static> ManagerPool<C> {
     pub fn new() -> Self {
-        Self { map: PMutex::new(HashMap::new()) }
+        Self { map: PMutex::new(BoundedRegistry::new(MANAGER_POOL_MAX_KEYS, Eviction::Reject)) }
     }
 
-    /// 获取或创建并缓存 manager。
+    /// 指定容量/策略构造（测试注入小上限与淘汰策略用；生产走 [`Self::new`]）。
+    #[cfg(test)]
+    fn with(max_keys: usize, evict: Eviction) -> Self {
+        Self { map: PMutex::new(BoundedRegistry::new(max_keys, evict)) }
+    }
+
+    /// 获取或创建并缓存 manager（同 key 复用同一 `Arc`，Go `globalDialerMap` 语义）。
+    ///
+    /// 表满（`Reject`）＝ fail-closed：`mk()` 新建的 manager **照常返回**调用方但
+    /// 不入缓存（该次一次性使用），既有条目与复用不受影响。
     pub fn get_or<F>(&self, key: &str, mk: F) -> Arc<XmuxManager<C>>
     where
         F: FnOnce() -> Arc<XmuxManager<C>>,
@@ -297,7 +316,8 @@ impl<C: XmuxConn + 'static> ManagerPool<C> {
             return m.clone();
         }
         let m = mk();
-        g.insert(key.to_string(), m.clone());
+        // 满即不入表（一次性）；同 key 走覆盖路径永不触淘汰（上方 get 未命中才到这）。
+        let _ = g.insert(key.to_string(), m.clone());
         m
     }
 
@@ -727,5 +747,56 @@ mod tests {
         });
         assert!(!Arc::ptr_eq(&m1, &m2));
         assert_eq!(pool.len(), 2);
+    }
+
+    fn mock_manager(id: usize) -> Arc<XmuxManager<FakeConn>> {
+        Arc::new(XmuxManager::new(XmuxConfig::default(), move || FakeConn::new(id)))
+    }
+
+    /// 复用率实测（迁移前后同口径）：同 key 连续取多次恒同一 `Arc`、factory 恰
+    /// 跑一次；不同 key 各自入表。守护 `get_or` 复用语义不因注册表换宿主
+    /// （HashMap → BoundedRegistry）被稀释。
+    #[test]
+    fn manager_pool_reuse_rate_is_preserved_across_registry_swap() {
+        let pool: ManagerPool<FakeConn> = ManagerPool::new();
+        let first = pool.get_or("k", || mock_manager(0));
+        for _ in 0..8 {
+            let again = pool.get_or("k", || panic!("factory must run exactly once"));
+            assert!(Arc::ptr_eq(&first, &again), "same key must reuse one manager");
+        }
+        for i in 0..8usize {
+            let _ = pool.get_or(&format!("k{i}"), || mock_manager(i));
+        }
+        assert_eq!(pool.len(), 9, "9 distinct keys => 9 entries");
+    }
+
+    /// 反向自检：容量上界真实生效（max=1）——第二个 key 的 manager 照常返回但
+    /// 不入表（`Reject`，fail-closed 不淘汰），且首个 key 的复用不受溢出影响。
+    /// 若上界失效（无界直插），len 断言红。
+    #[test]
+    fn manager_pool_rejects_overflow_and_keeps_existing_reuse() {
+        let pool: ManagerPool<FakeConn> = ManagerPool::with(1, Eviction::Reject);
+        let m1 = pool.get_or("a", || mock_manager(1));
+        let m2 = pool.get_or("b", || mock_manager(2));
+        assert!(!Arc::ptr_eq(&m1, &m2), "distinct keys get distinct managers");
+        assert_eq!(pool.len(), 1, "overflow entry must not enter the registry");
+        let m1_again = pool.get_or("a", || panic!("existing key must be reused"));
+        assert!(Arc::ptr_eq(&m1, &m1_again), "Reject must not break existing reuse");
+    }
+
+    /// 证伪钉死（生产选 `Reject` 的依据）：`EvictOldest` 按 BTreeMap 字典序首键
+    /// 淘汰（`"a" < "b"` ⇒ key "a" 被挤出），同 key 复用随之破坏——日后若有人把
+    /// 生产策略改成淘汰，本断言翻红即拦截。
+    #[test]
+    fn evict_oldest_would_break_reuse_hence_reject() {
+        let pool: ManagerPool<FakeConn> = ManagerPool::with(1, Eviction::EvictOldest);
+        let m1 = pool.get_or("a", || mock_manager(1));
+        let _m2 = pool.get_or("b", || mock_manager(2));
+        let m1_again = pool.get_or("a", || mock_manager(3));
+        assert!(
+            !Arc::ptr_eq(&m1, &m1_again),
+            "EvictOldest evicts the lexicographic first key ('a'<'b') and breaks reuse; \
+             production must stay on Eviction::Reject"
+        );
     }
 }
