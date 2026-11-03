@@ -210,6 +210,13 @@ fn probe_conn_alive(conn: &mut Box<dyn Connection>) -> bool {
 ///
 /// 锁粒度 = `HashMap<PoolKey, _>` 全锁；通常 outbound key 数 < 100，单次操作
 /// O(1)~O(small) 可接受。需要按 key 锁可后续切片（k9qg 短期不必要）。
+///
+/// **为何不用 udf `ObjectPool`**（2026-11-02 判定，依据 + 实测见
+/// `reports/audit-2026-11-02/udf-pool-migration.md`）：值是外部拨号器**按值插入**
+/// 的已握手连接（池无 factory 可造，`release(key, conn)` 无处安放）、取出即永久
+/// 移交（设计上无归还路径，`detach` 会让宇宙 −1），且 [`PoolStats::entries`] 需
+/// 枚举 idle 条目而池无该读面。本件是「按 key 的空闲连接注册表 + TTL/容量淘汰」，
+/// **不是**借还池（CLAUDE.md §3.5.4 反模式：注册表禁整面 impl `PoolManaged`）。
 pub struct WsConnectionPool {
     inner: Arc<Mutex<HashMap<PoolKey, VecDeque<PoolEntry>>>>,
     /// pool 配置：`parking_lot::Mutex` 保护（同步、轻量、非阻塞）。

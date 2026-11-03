@@ -50,6 +50,13 @@ struct UdpPacket {
 ///
 /// recv_loop 与 read_from 消费端共享：buf 随 [`UdpPacket`] 零拷贝流转，
 /// 消费端拷出数据后归还（对齐 Go `ReadFrom` 的 `pool.Put`）。
+///
+/// **为何不用 udf `ObjectPool`**（2026-11-02 判定，依据 + 实测见
+/// `reports/audit-2026-11-02/udf-pool-migration.md`）：buf 按值随 [`UdpPacket`]
+/// 过 mpsc 到另一任务、稍后归还，而 `Pooled<'p, T>` 借用池、非 `'static`；池只有
+/// 「工厂出对象 → Drop 归还」一个句式，**无按值插入入口**（`release` 私有）。
+/// 「借一槽把块换进去」的组合实测让每次归还白构一块（`constructed` 每轮 +N、
+/// idle 恒 1 ⇒ 池退化成恒分配）。解锁前提 = udf 补 `insert` / `acquire_owned`。
 #[derive(Default)]
 struct BufPool {
     bufs: Mutex<VecDeque<Vec<u8>>>,

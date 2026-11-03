@@ -273,6 +273,12 @@ use parking_lot::Mutex as PMutex;
 ///
 /// 对应 Go `transport/internet/splithttp/dialer.go:46-79` 的 `globalDialerMap`
 /// （按 dialerConf{dest, streamSettings} 复用）。Rust 端用 `String` 作为通用 key。
+///
+/// **不可池化判定**（2026-11-02，依据见 `reports/audit-2026-11-02/udf-pool-migration.md`
+/// §2-4）：值是长期共享句柄 `Arc<XmuxManager<C>>`（多个请求并发持有 + 内部持活
+/// HTTP/2 连接与后台连接生命周期 + 条目永不归还），与「独占借用 → 归还」的池语义
+/// 冲突。本件是 **keyed 注册表**（对应 Go `globalDialerMap`），保持现状；要收敛只能
+/// 换 udf `BoundedRegistry`，但那要引入容量上界（新配置面 = 语义变更，另票）。
 pub struct ManagerPool<C: XmuxConn + 'static> {
     map: PMutex<HashMap<String, Arc<XmuxManager<C>>>>,
 }

@@ -35,6 +35,13 @@ fn pool_max_blocks(chunk: usize) -> usize {
 }
 
 /// 空闲块账本。归还可能发生在 hyper 的任意 worker 线程，故加锁。
+///
+/// **为何不用 udf `ObjectPool`**（2026-11-02 判定，依据 + 实测见
+/// `reports/audit-2026-11-02/udf-pool-migration.md`）：[`PooledBuf`] 是
+/// `Bytes::from_owner` 的所有者、必须 `'static`，而归还点是任意线程的引用计数
+/// 归零 drop——`Pooled<'p, T>` 借用池，两处都装不进去；「借一槽换进去」的归还
+/// 组合实测让 `constructed` 每轮 +N（池退化成恒分配）。解锁前提 = udf 补
+/// `acquire_owned`。
 struct BufPool {
     chunk: usize,
     max_blocks: usize,
