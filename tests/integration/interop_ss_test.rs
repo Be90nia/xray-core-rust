@@ -299,12 +299,12 @@ async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, 
         // SS-2022 响应必须走 pump 语义（try_open_chunk + 手动喂数据）：
         // 响应线上是 resp_salt || fixed header chunk || var chunk，read_chunk 是
         // legacy-only，会把 server salt 误当 size chunk（bd vl7v）。
-        let mut pending: Vec<u8> = Vec::new();
+        let mut pending = bytes::BytesMut::new();
         let mut wire = [0u8; 4096];
         let response = loop {
             match stream.try_open_chunk(&mut pending) {
                 Ok(ChunkOut::Message(data)) => break data,
-                Ok(ChunkOut::End) => break Vec::new(),
+                Ok(ChunkOut::End) => break bytes::Bytes::new(),
                 Ok(ChunkOut::NeedMore) => {
                     let n =
                         stream.get_mut().read(&mut wire).await.map_err(std::io::Error::other)?;
@@ -319,7 +319,7 @@ async fn run_go_ss2022_server_rust_client(method: &'static str, psk_len: usize, 
             }
         };
         assert_eq!(
-            response.as_slice(),
+            &response[..],
             PAYLOAD,
             "SS-2022 echo mismatch: got {} bytes, expected {}",
             response.len(),

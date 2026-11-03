@@ -109,6 +109,8 @@ xray-mux = { path = "../crates/xray-mux" }
 xray-app-dispatcher = { path = "../crates/xray-app-dispatcher" }
 xray-transport = { path = "../crates/xray-transport" }
 xray-buf = { path = "../crates/xray-buf" }
+# SS-2022 的 try_open_chunk 以 bytes::BytesMut 为缓冲（租用 API 面），集成测试需直接构造。
+bytes = { workspace = true }
 xray-proto = { path = "../crates/xray-proto", features = ["grpc-client"] }
 # bd jezb：proxyman command 操作 TypedMessage 的 value 是 protobuf 编码（AddUserOperation）。
 prost = { workspace = true }
