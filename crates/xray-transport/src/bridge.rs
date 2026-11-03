@@ -106,6 +106,11 @@ pub async fn bridge_connections_with_splice(
             if writer.write_all(&buf[..n]).await.is_err() {
                 break;
             }
+            // 写穿语义（同 write_all_mb）：TLS 层 SSL_write 缓冲语义下尾 chunk
+            // 不 flush 不上线；Go `crypto/tls` 的 Write 直接落底层 conn。
+            if writer.flush().await.is_err() {
+                break;
+            }
         }
         xray_buf::alloc::release(buf);
         let _ = writer.shutdown().await;
@@ -225,6 +230,17 @@ where
 /// 组 IoSlice 栈数组（每批 ≤8，对齐 Go readv 上界）经 `write_all_vectored`
 /// 单/少次 syscall 摊销；非 vectored 半部（TLS/wrapper 等）降级逐 Buffer
 /// `write_all`。两条路径均零数据拷贝、零堆分配。
+///
+/// **写穿语义（flush）**：每批写完显式 `flush()` 一次——TLS 层（btls/BoringSSL）
+/// 的 `SSL_write` 是缓冲语义，尾 record 滞留 session 缓冲；上层不 flush 时
+/// 尾 chunk 直到下一次写/关闭才上线，对端凑不齐请求 → 双向死锁。Go 侧无此坑：
+/// `crypto/tls` 的 `Conn.Write` 直接把 record 写进底层 conn（conn.go:952-958
+/// `write()` → `c.conn.Write`，仅握手期 buffering），即 Go 是**写穿**语义。
+/// 本函数补齐 flush = 与 Go 的写穿语义对齐；裸 TCP 的 `poll_flush` 是空操作
+/// （零 syscall 代价），TLS 侧则是把已缓冲 record 推上线。
+///
+/// flush 只影响**上线时机**，不改字节内容与顺序；TLS record 边界仍由 TLS 栈
+/// 自己分（wire 不变量，本函数不碰）。
 async fn write_all_mb<W>(w: &mut W, mb: &xray_buf::multi::MultiBuffer) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
@@ -264,6 +280,7 @@ where
                 io::IoSlice::advance_slices(&mut pending, written);
             }
         }
+        w.flush().await?;
         return Ok(());
     }
 
@@ -273,6 +290,7 @@ where
             w.write_all(bytes).await?;
         }
     }
+    w.flush().await?;
     Ok(())
 }
 
@@ -2191,6 +2209,143 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "3 buffers must aggregate into a single poll_write_vectored"
+        );
+    }
+
+    /// 写穿语义（flush）：TLS 层 `SSL_write` 是缓冲语义，尾 record 不 flush
+    /// 不上线（Go `crypto/tls` 的 Write 直接落底层 conn）。`write_all_mb` 写完
+    /// 一批必须 flush 一次。
+    #[tokio::test]
+    async fn write_all_mb_flushes_after_batch() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use parking_lot::Mutex;
+
+        struct FlushCountingMock {
+            sink: Arc<Mutex<Vec<u8>>>,
+            flushes: Arc<AtomicUsize>,
+            vectored: bool,
+        }
+        impl tokio::io::AsyncWrite for FlushCountingMock {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.sink.lock().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let mut sink = self.sink.lock();
+                let mut total = 0;
+                for b in bufs {
+                    sink.extend_from_slice(b);
+                    total += b.len();
+                }
+                Poll::Ready(Ok(total))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                self.vectored
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                self.flushes.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
+            xray_buf::buffer::Buffer::from_vec(b"abc".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"def".to_vec()),
+        ]);
+        for vectored in [false, true] {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let mut w = FlushCountingMock {
+                sink: Arc::clone(&sink),
+                flushes: Arc::clone(&flushes),
+                vectored,
+            };
+            write_all_mb(&mut w, &mb).await.unwrap();
+            assert_eq!(&*sink.lock(), b"abcdef");
+            assert_eq!(
+                flushes.load(Ordering::SeqCst),
+                1,
+                "每批写完必须 flush 一次（vectored={vectored}）"
+            );
+        }
+    }
+
+    /// **尾部 chunk 立即到达对端**（flush 写穿语义的正向证据）：模拟 TLS 层
+    /// （btls/BoringSSL）的缓冲语义——`poll_write` 只把密文收进 session 缓冲，
+    /// `poll_flush` 才落底层 conn。改前（桥层不 flush）尾部 chunk 滞留缓冲
+    /// 不出，对端永远凑不齐请求；改后（每批 flush）尾部立即到达对端。
+    #[tokio::test]
+    async fn write_all_mb_flush_pushes_tail_chunk_to_peer() {
+        use std::sync::{Arc, Mutex};
+
+        /// 缓冲写者：poll_write 进内部缓冲，poll_flush 才把缓冲推上 wire。
+        struct BufferedWriter {
+            wire: Arc<Mutex<Vec<u8>>>,
+            pending: Vec<u8>,
+        }
+        impl tokio::io::AsyncWrite for BufferedWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.pending.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                let pending = std::mem::take(&mut self.pending);
+                self.wire.lock().unwrap().extend_from_slice(&pending);
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let mut w = BufferedWriter { wire: Arc::clone(&wire), pending: Vec::new() };
+        let mb = xray_buf::multi::MultiBuffer::from_buffers(vec![
+            xray_buf::buffer::Buffer::from_vec(b"head-".to_vec()),
+            xray_buf::buffer::Buffer::from_vec(b"tail-chunk".to_vec()),
+        ]);
+        write_all_mb(&mut w, &mb).await.unwrap();
+        assert_eq!(
+            &*wire.lock().unwrap(),
+            b"head-tail-chunk",
+            "尾部 chunk 必须已到达对端（flush 写穿；否则滞留 session 缓冲）"
         );
     }
 

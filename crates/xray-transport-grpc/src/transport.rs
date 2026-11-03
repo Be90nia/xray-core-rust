@@ -433,27 +433,19 @@ where
             }
             let mut recv_stream = resp.into_body();
             let mut acc: Vec<u8> = Vec::new();
+            // 读游标：原实现每解出一帧就 `acc.drain(..used)`（尾部整体 memmove，
+            // 帧越小越亏）。改为游标 + 每轮 chunk 末尾一次性前移（O(1) 摊销）。
+            let mut pos: usize = 0;
             while let Some(d) = recv_stream.data().await {
                 let d = d.map_err(io_err)?;
                 let _ = recv_stream.flow_control().release_capacity(d.len());
                 acc.extend_from_slice(&d);
-                loop {
-                    let frame = if multi_mode {
-                        crate::encoding::decode_multi_hunk_frame(&acc, None).map_err(io_err)?
-                    } else {
-                        crate::encoding::decode_hunk_frame(&acc, None)
-                            .map_err(io_err)?
-                            .map(|(used, data)| (used, vec![data]))
-                    };
-                    match frame {
-                        Some((used, datas)) => {
-                            acc.drain(..used);
-                            for data in datas {
-                                wr.write_all(&data).await?;
-                            }
-                        },
-                        None => break,
-                    }
+                drain_grpc_frames(&acc, &mut pos, &mut wr, multi_mode).await?;
+                // 内层收帧结束：一次性丢弃已消费前缀（每 h2 chunk 一次 memmove，
+                // 原实现每帧一次）。
+                if pos > 0 {
+                    acc.drain(..pos);
+                    pos = 0;
                 }
             }
             Ok::<_, io::Error>(())
@@ -918,27 +910,17 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             };
             let r = async {
                 let mut acc: Vec<u8> = Vec::new();
+                // 读游标（同 client 侧）：游标推进 + 每 chunk 一次性前移，
+                // 免每帧一次 `drain` 的尾部 memmove。
+                let mut pos: usize = 0;
                 while let Some(d) = recv_body.data().await {
                     let d = d.map_err(io_err)?;
                     let _ = recv_body.flow_control().release_capacity(d.len());
                     acc.extend_from_slice(&d);
-                    loop {
-                        let frame = if multi_mode {
-                            crate::encoding::decode_multi_hunk_frame(&acc, None).map_err(io_err)?
-                        } else {
-                            crate::encoding::decode_hunk_frame(&acc, None)
-                                .map_err(io_err)?
-                                .map(|(u, data)| (u, vec![data]))
-                        };
-                        match frame {
-                            Some((used, datas)) => {
-                                acc.drain(..used);
-                                for data in datas {
-                                    wr.write_all(&data).await?;
-                                }
-                            },
-                            None => break,
-                        }
+                    drain_grpc_frames(&acc, &mut pos, &mut wr, multi_mode).await?;
+                    if pos > 0 {
+                        acc.drain(..pos);
+                        pos = 0;
                     }
                 }
                 Ok::<_, io::Error>(())
@@ -982,6 +964,38 @@ fn parse_config(s: &StreamSettings) -> io::Result<Config> {
 }
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+/// 从累积缓冲解出尽可能多的 gRPC 帧并写入 `wr`。
+///
+/// 借用化解码（P1 F5 既有件 `decode_*_hunk_frame_ref`）：未压缩帧直写下游，
+/// 免每帧一次 `Vec` 分配 + 全量拷贝。`pos` 是读游标——已消费前缀由调用方在
+/// 一轮 chunk 结束时一次性前移（免每帧一次 `drain` 的尾部 memmove）。
+///
+/// 缓冲里没有完整帧时直接返回（调用方继续读）。
+async fn drain_grpc_frames<W>(
+    acc: &[u8],
+    pos: &mut usize,
+    wr: &mut W,
+    multi_mode: bool,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let frame: Option<(usize, Vec<crate::encoding::HunkData<'_>>)> = if multi_mode {
+            crate::encoding::decode_multi_hunk_frame_ref(&acc[*pos..], None).map_err(io_err)?
+        } else {
+            crate::encoding::decode_hunk_frame_ref(&acc[*pos..], None)
+                .map_err(io_err)?
+                .map(|(used, data)| (used, vec![data]))
+        };
+        let Some((used, datas)) = frame else { return Ok(()) };
+        for data in datas {
+            wr.write_all(data.as_slice()).await?;
+        }
+        *pos += used;
+    }
 }
 
 struct DuplexConn {

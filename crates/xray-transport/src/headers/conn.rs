@@ -174,17 +174,15 @@ impl<C: AsyncRead + Unpin> AsyncRead for HeaderConn<C> {
     }
 }
 
-impl<C: AsyncWrite + Unpin> AsyncWrite for HeaderConn<C> {
-    /// 对应 Go `Conn.Write`（http.go:206-216）：首写先发完 header 前缀再发 payload。
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if let Some((hdr, off)) = &mut this.prefix {
+impl<C: AsyncWrite + Unpin> HeaderConn<C> {
+    /// 首写注入 header 前缀（Go `oneTimeWriter`）：前缀写完即清空 `prefix`。
+    ///
+    /// 前缀字节**不计入** `poll_write` / `poll_write_vectored` 的返回值——与既有
+    /// 行为一致（Go `http.Conn.Write` 同样把 header 单独写到底层 conn）。
+    fn poll_write_prefix(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some((hdr, off)) = &mut self.prefix {
             while *off < hdr.len() {
-                match Pin::new(&mut this.inner).poll_write(cx, &hdr[*off..]) {
+                match Pin::new(&mut self.inner).poll_write(cx, &hdr[*off..]) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Ready(Ok(0)) => {
@@ -196,9 +194,47 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for HeaderConn<C> {
                     Poll::Ready(Ok(n)) => *off += n,
                 }
             }
-            this.prefix = None;
+            self.prefix = None;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<C: AsyncWrite + Unpin> AsyncWrite for HeaderConn<C> {
+    /// 对应 Go `Conn.Write`（http.go:206-216）：首写先发完 header 前缀再发 payload。
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_write_prefix(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {},
         }
         Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    /// 向量写能力透传（y1yx 聚合写）：伪装头只影响**首写**，之后的载荷走
+    /// writev 聚合（syscall ÷8），字节序不变——与既有 `poll_write` 的
+    /// 「前缀先写、载荷后写」同序。
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.poll_write_prefix(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {},
+        }
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -253,6 +289,15 @@ impl<C: Connection> Connection for HeaderConn<C> {
     fn close_write(&mut self) -> io::Result<()> {
         self.inner.close_write()
     }
+
+    /// F3：TLS 读批信号透传（伪装头在 TLS 之内/之外都只是首读首写，字节流本身透明）。
+    fn tls_readbuf_size(&self) -> usize {
+        self.inner.tls_readbuf_size()
+    }
+
+    // `is_raw_tcp` / `raw_tcp_clone` 不转发：Go 的 `headers/http.Conn` 同样不是
+    // 裸 TCP（`IsRAWTransportWithoutSecurity` 只认 `*net.TCPConn` 等三型），
+    // 转发会让本仓多出 readv 批读腿 + splice 候选 = 与 Go 行为分叉。
 }
 
 fn to_io_err(e: &HeaderError) -> io::Error {
@@ -327,6 +372,25 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for MaybeHeaderConn<C> {
         match self.get_mut() {
             Self::Plain(c) => Pin::new(c).poll_flush(cx),
             Self::Wrapped(c) => Pin::new(c).poll_flush(cx),
+        }
+    }
+
+    /// 向量写能力透传（同 [`HeaderConn`]）：包装层不得吃掉上层的多块聚合写。
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(c) => c.is_write_vectored(),
+            Self::Wrapped(c) => c.is_write_vectored(),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(c) => Pin::new(c).poll_write_vectored(cx, bufs),
+            Self::Wrapped(c) => Pin::new(c).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -496,6 +560,81 @@ mod tests {
         server.write_all(b"pong").await.expect("server write（注入 response header）");
         client.read_exact(&mut buf).await.expect("client read（吞 response header）");
         assert_eq!(&buf, b"pong");
+    }
+
+    /// 向量写透传（T3）：伪装头只影响**首写**——向量写必须先注入 header 前缀，
+    /// 再把多块载荷一次写出（字节序 = 前缀 + 载荷，与逐块写一致）。
+    #[tokio::test]
+    async fn client_vectored_write_injects_header_then_payload() {
+        use std::{
+            io,
+            pin::Pin,
+            sync::{Arc, Mutex},
+            task::{Context, Poll},
+        };
+
+        /// 支持向量写的 sink（`is_write_vectored = true`）。
+        #[derive(Clone)]
+        struct VectoredSink {
+            sink: Arc<Mutex<Vec<u8>>>,
+        }
+        impl tokio::io::AsyncRead for VectoredSink {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl tokio::io::AsyncWrite for VectoredSink {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.sink.lock().unwrap().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let mut sink = self.sink.lock().unwrap();
+                let mut total = 0;
+                for b in bufs {
+                    sink.extend_from_slice(b);
+                    total += b.len();
+                }
+                Poll::Ready(Ok(total))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let sink = VectoredSink { sink: Arc::new(Mutex::new(Vec::new())) };
+        let mut client = HeaderConn::client(sink.clone(), &auth());
+        assert!(client.is_write_vectored(), "向量写能力必须透传");
+
+        let bufs = [io::IoSlice::new(b"abc"), io::IoSlice::new(b"def")];
+        let written = client.write_vectored(&bufs).await.expect("vectored write");
+        assert_eq!(written, 6, "向量写应一次写完载荷（tokio write_vectored 写全部 buf）");
+
+        let written = sink.sink.lock().unwrap().clone();
+        assert!(written.starts_with(b"GET "), "首写必须先注入伪装头：{written:?}");
+        assert!(written.ends_with(b"abcdef"), "向量写载荷必须完整上线（尾部）：{written:?}");
     }
 
     /// 服务端校验 URI：错误 path → read 报错 + shutdown 写 404

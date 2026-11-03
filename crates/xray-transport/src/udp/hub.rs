@@ -23,8 +23,13 @@ use tokio::{
 
 // hot-log 归口（能力收敛方案 §2 面 4）: UDP hub recv 循环内每包收发错误/缓存满记录
 // —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
-/// UDP 收包缓冲区大小（对应 Go `finalmask.UDPSize = 4096`）。
-const UDP_BUFFER_SIZE: usize = 4096;
+/// UDP 收包缓冲区大小（对应 Go `common/buf.Size = 8192`）。
+///
+/// Go `transport/internet/udp/hub.go::start` 用 `buffer := buf.New()`（池化
+/// 8192 字节）+ `ReadFrom(rawBytes)` 直读进池缓冲，收包上限 = 8192。
+/// 旧值 4096 误引 Go `finalmask.UDPSize`（那是 finalmask 载荷尺寸、不是 UDP
+/// 收包尺寸）⇒ >4096B 的数据报被**静默截断**（Go 能收 8KB）。现与 Go 对齐。
+const UDP_BUFFER_SIZE: usize = 8192;
 
 /// 默认收包 channel 容量（对应 Go `Hub.capacity = 256`）。
 const DEFAULT_CACHE_CAPACITY: usize = 256;
@@ -700,6 +705,27 @@ mod tests {
 
         assert_eq!(&buf[..n], b"world");
         assert_eq!(from, hub_addr);
+    }
+
+    /// 大数据报不被截断（Go `buf.Size = 8192` 对齐）：旧实现收包缓冲 4096 ⇒
+    /// >4096B 的数据报被静默截断（Go 能收 8KB）。
+    #[tokio::test]
+    async fn udp_hub_receives_large_datagram_intact() {
+        let hub =
+            UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None).await.expect("listen 失败");
+        let hub_addr = hub.local_addr().expect("local_addr 失败");
+        let mut rx = hub.receive();
+
+        let sender = UdpSocket::bind("127.0.0.1:0").await.expect("bind sender");
+        let payload: Vec<u8> = (0..7000u32).map(|i| (i % 251) as u8).collect();
+        sender.send_to(&payload, hub_addr).await.expect("send_to 失败");
+
+        let packet = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("hub 关闭前应收到包");
+        assert_eq!(packet.payload.len(), payload.len(), "大数据报必须完整收下（不得按 4096 截断）");
+        assert_eq!(packet.payload, payload);
     }
 
     #[tokio::test]

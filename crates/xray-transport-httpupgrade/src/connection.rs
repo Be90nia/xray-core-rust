@@ -82,6 +82,20 @@ impl<C: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for HttpUpgradeConn
         std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    /// 转发向量写能力（y1yx 聚合写）：Upgrade 之后的字节流与 inner 是同一条流，
+    /// 内层支持 writev 时上层可把多块一次写出（syscall ÷8），字节序不变。
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -111,6 +125,28 @@ impl<C: xray_transport::connection::Connection + Unpin> xray_transport::connecti
     fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         self.inner.local_addr()
     }
+
+    /// F3：TLS 读批信号透传（rustls 64KB 读批，减少 poll 往返；btls 缺省 0）。
+    ///
+    /// httpupgrade over TLS 时 inner 是 TLS 流，读批由 TLS 栈决定——包装层不转发
+    /// 即白丢 64KB 读批（utls.rs `tls_readbuf_size` 注释记 harness 148→332 MB/s）。
+    /// 只影响读缓冲尺寸，不改字节流内容（TLS record 边界由 TLS 栈自己定）。
+    fn tls_readbuf_size(&self) -> usize {
+        self.inner.tls_readbuf_size()
+    }
+
+    // `is_raw_tcp` / `raw_tcp_clone` **不转发**（Go 对齐 + 语义约束）：
+    // 1. Go 侧 httpupgrade 连接不是裸 TCP：客户端返回 `*httpupgrade.ConnRF`
+    //    （dialer.go:126-130）、服务端返回 `*httpupgrade.connection` （hub.go
+    //    newConnection）——两者都不是 `*net.TCPConn`，故 Go 的
+    //    `IsRAWTransportWithoutSecurity`（proxy/proxy.go:820-829）判 **false**： Go 的 httpupgrade
+    //    同样走 SingleReader（8KB），无 readv 批读、无 splice。 转发会让本仓比 Go 多出 readv 批读腿
+    //    + splice 候选 = 行为分叉。
+    // 2. splice 准入面：转发 `is_raw_tcp` 会让 Linux splice 路径把 httpupgrade 纳入候选（vision
+    //    splice gate 是红线，CLAUDE.md §4）。
+    // 3. readv dup 读腿会绕过本 wrapper 的 `pending`（101 响应同批到达时已消费 的余留字节）→
+    //    丢首包。
+    // 结论：保持缺省 false（包装层天然拒绝），与 Go 逐字节一致。
 }
 
 #[cfg(test)]
@@ -132,5 +168,94 @@ mod tests {
     fn none_override_preserved() {
         let conn = HttpUpgradeConnection::new(42u8, None);
         assert!(conn.remote_addr_override.is_none());
+    }
+
+    /// 快路径透传（T1）：Upgrade 之后的字节流与 inner 同一条流——
+    /// ① 向量写能力（writev 聚合）② TLS 64KB 读批（F3）必须透传；
+    /// ③ `is_raw_tcp` 必须**保持 false**（Go 的 httpupgrade 连接不是裸 TCP，
+    /// `IsRAWTransportWithoutSecurity` 判 false；转发会让本仓多出 readv 批读腿
+    /// + splice 候选 = 与 Go 行为分叉）。
+    #[test]
+    fn forwards_fast_path_signals_but_not_raw_tcp() {
+        use std::{
+            io,
+            pin::Pin,
+            task::{Context, Poll},
+        };
+
+        use tokio::io::AsyncWrite as _;
+        use xray_transport::connection::Connection as _;
+
+        /// 内层 mock：支持向量写 + 报 64KB 读批 + 是裸 TCP。
+        struct Inner {
+            written: Vec<u8>,
+        }
+        impl tokio::io::AsyncRead for Inner {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl tokio::io::AsyncWrite for Inner {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.written.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_write_vectored(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                bufs: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                let mut total = 0;
+                for b in bufs {
+                    self.written.extend_from_slice(b);
+                    total += b.len();
+                }
+                Poll::Ready(Ok(total))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl xray_transport::connection::Connection for Inner {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn is_raw_tcp(&self) -> bool {
+                true
+            }
+
+            fn tls_readbuf_size(&self) -> usize {
+                64 * 1024
+            }
+        }
+
+        let conn = HttpUpgradeConnection::new(Inner { written: Vec::new() }, None);
+        assert!(conn.is_write_vectored(), "向量写能力必须透传（否则丢 writev 聚合）");
+        assert_eq!(conn.tls_readbuf_size(), 64 * 1024, "TLS 读批信号必须透传");
+        assert!(!conn.is_raw_tcp(), "httpupgrade 不得声明裸 TCP（Go 语义 + splice 红线）");
+        assert!(conn.raw_tcp_clone().is_none(), "不得暴露裸 TCP 克隆（splice 准入面）");
     }
 }

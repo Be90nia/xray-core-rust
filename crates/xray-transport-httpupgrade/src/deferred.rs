@@ -96,7 +96,9 @@ impl<IO: AsyncRead + Unpin> AsyncRead for DeferredResponseReader<IO> {
                         State::ReadingResponse(rb) => rb,
                         _ => unreachable!(),
                     };
-                    let mut chunk = [0u8; 1024];
+                    // 4KB 栈块（读 101 响应头）：比 1KB 版少 4 倍读 syscall，
+                    // 栈帧仍在 4KB 量级（vision 的 16KB 栈帧教训见 vision_conn.rs）。
+                    let mut chunk = [0u8; 4096];
                     let mut read_buf = ReadBuf::new(&mut chunk);
                     let result = Pin::new(&mut self.inner).poll_read(cx, &mut read_buf);
                     match result {
@@ -165,6 +167,20 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for DeferredResponseReader<IO> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    /// 向量写能力透传（与 [`crate::connection::HttpUpgradeConnection`] 同型）：
+    /// ed>0 的延迟读路径同样不得吃掉上层的多块聚合写。
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -184,6 +200,15 @@ impl<IO: xray_transport::connection::Connection + Unpin> xray_transport::connect
     fn local_addr(&self) -> io::Result<Option<std::net::SocketAddr>> {
         self.inner.local_addr()
     }
+
+    /// F3：TLS 读批信号透传（同 `HttpUpgradeConnection`：包装层不得吃掉 64KB 读批）。
+    fn tls_readbuf_size(&self) -> usize {
+        self.inner.tls_readbuf_size()
+    }
+
+    // `is_raw_tcp` / `raw_tcp_clone` 不转发——理由同 `HttpUpgradeConnection`：
+    // Go 的 httpupgrade 连接不是裸 TCP（`IsRAWTransportWithoutSecurity` = false），
+    // 转发会让本仓多出 readv 批读腿 + splice 候选（行为分叉 + 红线邻接）。
 }
 
 /// 在字节流中查找 `\r\n\r\n` 位置。

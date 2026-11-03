@@ -145,7 +145,9 @@ where
                             continue; // 空消息：跳过拿下一条
                         }
                         // 数据大时可一次填满 buf，剩余留 read_buf。
-                        let data: Vec<u8> = data.into(); // Bytes/Vec 统一
+                        // 直接借 `Bytes` 的切片（不转 Vec）：`Bytes → Vec` 在
+                        // 引用计数 >1 时是整段拷贝 + 一次分配（多连接复用同一
+                        // 缓冲时必现），借切片则零额外拷贝。
                         let n = std::cmp::min(data.len(), buf.remaining());
                         buf.put_slice(&data[..n]);
                         if n < data.len() {

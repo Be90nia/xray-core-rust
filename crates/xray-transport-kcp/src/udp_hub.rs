@@ -48,6 +48,9 @@ pub struct StdUdpHub {
 /// 读超时：关闭延迟上界（轮询粒度）。
 const READ_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// UDP 收包缓冲大小（Go `common/buf.Size = 8192`）。
+const KCP_RECV_BUF_SIZE: usize = 8192;
+
 impl StdUdpHub {
     /// 绑定 UDP socket（对应 Go `net.ListenUDP`）。
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
@@ -85,9 +88,11 @@ fn is_transient(e: &io::Error) -> bool {
 
 impl UdpHub for StdUdpHub {
     fn receive(&self) -> Option<(Vec<u8>, SocketAddr)> {
-        // 对齐 Go 端 udp_hub 收包 buffer：基线 buf.Size=8192，但 KCP mss 默认 1350
-        // 加上 udpmask/TLS 包装后单包远大于 1500 MTU；任务票规格 2048 兼容 jumbo frame。
-        let mut buf = [0u8; 2048];
+        // 对齐 Go 端收包 buffer：Go `kcp/dialer.go::fetchInput` 用
+        // `payload := buf.New()`（`common/buf.Size = 8192`）+ `ReadFrom(input)`
+        // 直读，单包上限 8192。旧值 2048 ⇒ mtu 配大（如 4000）的对端发来的
+        // 数据报被**静默截断**（Go 能收全）→ 校验错/解包失败。
+        let mut buf = [0u8; KCP_RECV_BUF_SIZE];
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return None;
@@ -146,8 +151,9 @@ pub struct StdPacketInput {
 
 impl PacketInput for StdPacketInput {
     fn read_packet(&mut self) -> Option<Vec<u8>> {
-        // 对齐 receive 路径：2048 字节，覆盖 udpmask/TLS 包装后单 segment 长度。
-        let mut buf = [0u8; 2048];
+        // 对齐 receive 路径：8192 字节（Go `buf.Size`），覆盖 udpmask/TLS 包装后
+        // 单 segment 长度与大 mtu 配置。
+        let mut buf = [0u8; KCP_RECV_BUF_SIZE];
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return None;
@@ -285,6 +291,21 @@ mod tests {
         let (p2, _) = hub_b.receive().unwrap();
         assert_eq!(p1, b"first");
         assert_eq!(p2, b"second");
+    }
+
+    /// 大数据报不被截断（Go `buf.Size = 8192` 对齐）：旧收包缓冲 2048 ⇒
+    /// mtu 配大（如 4000）的对端发来的数据报被静默截断（Go 能收全）。
+    #[test]
+    fn receive_keeps_large_datagram_intact() {
+        let hub_a = StdUdpHub::bind("127.0.0.1:0").unwrap();
+        let hub_b = StdUdpHub::bind("127.0.0.1:0").unwrap();
+        let addr_b = hub_b.local_addr().unwrap();
+
+        let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        hub_a.write_to(&payload, addr_b).unwrap();
+        let (got, _src) = hub_b.receive().expect("recv");
+        assert_eq!(got.len(), payload.len(), "大数据报必须完整收下（不得按 2048 截断）");
+        assert_eq!(got, payload);
     }
 
     #[test]
