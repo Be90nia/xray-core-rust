@@ -15,6 +15,7 @@
 //! - Go `init()` 全局注册：Rust 无副作用全局。
 
 use std::{
+    borrow::Cow,
     net::IpAddr,
     sync::{Arc, OnceLock},
 };
@@ -71,6 +72,10 @@ pub struct DnsServiceConfig {
     pub matcher_infos: Vec<DomainMatcherInfo>,
 }
 
+/// 域名匹配器 + 伴生索引 `(matcher, matcher_infos)`。
+type MatcherSlot =
+    (Option<Box<dyn xray_geodata::matcher::domain::DomainMatcher>>, Vec<DomainMatcherInfo>);
+
 /// 顶层 DNS 服务。对应 Go `DNS` struct。
 pub struct DnsService {
     cfg: DnsServiceConfig,
@@ -78,12 +83,14 @@ pub struct DnsService {
     /// `Server::start_managed_tasks` 逐 NS 注单并 spawn cleanup 托管任务。
     /// 停机闸 = `Feature::close`（拒新）；在途排空由宿主 `scope().shutdown()`。
     fx: Arc<FxScope>,
-    /// 域名匹配器（option，对应 Go `domainMatcher geodata.DomainMatcher`）。
+    /// 域名匹配器 + 伴生索引 `(matcher, matcher_infos)`。
+    ///
     /// ponytail: 当前 `StaticHosts` 内部已持有 matcher，此处保留独立 matcher
     /// 仅为 `sort_clients` 用，等 xray-geodata 暴露 `build_many` API 后接入。
-    matcher: Mutex<Option<Box<dyn xray_geodata::matcher::domain::DomainMatcher>>>,
-    /// 域名匹配信息列表（matcher rule_id → DomainMatcherInfo）。
-    matcher_infos: Mutex<Vec<DomainMatcherInfo>>,
+    ///
+    /// 两者必须同步生效（`set_matcher` 同一次写入），故同锁保护：此前是两把独立
+    /// `Mutex`，每查询两次全局加锁且锁序隐式（O23）。
+    matcher: Mutex<MatcherSlot>,
 }
 
 impl DnsService {
@@ -95,8 +102,7 @@ impl DnsService {
         Self {
             cfg,
             fx: Arc::new(FxScope::new()),
-            matcher: Mutex::new(domain_matcher),
-            matcher_infos: Mutex::new(matcher_infos),
+            matcher: Mutex::new((domain_matcher, matcher_infos)),
         }
     }
 
@@ -117,8 +123,7 @@ impl DnsService {
         matcher: Box<dyn xray_geodata::matcher::domain::DomainMatcher>,
         infos: Vec<DomainMatcherInfo>,
     ) {
-        *self.matcher.lock() = Some(matcher);
-        *self.matcher_infos.lock() = infos;
+        *self.matcher.lock() = (Some(matcher), infos);
     }
 
     /// 客户端数量。
@@ -163,35 +168,48 @@ impl DnsService {
         let mut ordered: Vec<Arc<Client>> = Vec::with_capacity(self.cfg.clients.len());
         let mut used = vec![false; self.cfg.clients.len()];
         let mut has_match = false;
+        // finalQuery 提前返回：命中标记先记下，日志在**锁外**发（O23）。
+        let mut matched_final = false;
 
-        // 优先：matcher 命中。
-        let matcher_opt = self.matcher.lock();
-        let infos = self.matcher_infos.lock();
-        if let Some(matcher) = matcher_opt.as_ref() {
-            let mut matches = matcher.match_domain(&domain.to_lowercase());
-            matches.sort_unstable();
-            for rule_id in matches {
-                let id = rule_id as usize;
-                if id >= infos.len() {
-                    continue;
-                }
-                let info = &infos[id];
-                let idx = usize::from(info.client_idx);
-                if idx >= self.cfg.clients.len() || used[idx] {
-                    continue;
-                }
-                used[idx] = true;
-                ordered.push(Arc::clone(&self.cfg.clients[idx]));
-                has_match = true;
-                if self.cfg.clients[idx].final_query {
-                    // Go dns.go:293 — finalQuery 提前返回前输出 logDecision。
-                    emit_decision(&ordered);
-                    return ordered;
+        // 优先：matcher 命中（matcher + infos 同锁，单次加锁）。
+        {
+            let guard = self.matcher.lock();
+            let (matcher, infos) = &*guard;
+            if let Some(matcher) = matcher {
+                // DNS 名通常已是小写 → 免构造规范化副本（O23：省 1 次 String）。
+                let lowered = if domain.chars().any(char::is_uppercase) {
+                    Cow::Owned(domain.to_lowercase())
+                } else {
+                    Cow::Borrowed(domain)
+                };
+                let mut matches = matcher.match_domain(&lowered);
+                matches.sort_unstable();
+                for rule_id in matches {
+                    let id = rule_id as usize;
+                    if id >= infos.len() {
+                        continue;
+                    }
+                    let info = &infos[id];
+                    let idx = usize::from(info.client_idx);
+                    if idx >= self.cfg.clients.len() || used[idx] {
+                        continue;
+                    }
+                    used[idx] = true;
+                    ordered.push(Arc::clone(&self.cfg.clients[idx]));
+                    has_match = true;
+                    if self.cfg.clients[idx].final_query {
+                        // Go dns.go:293 — finalQuery 提前返回前输出 logDecision。
+                        matched_final = true;
+                        break;
+                    }
                 }
             }
         }
-        drop(matcher_opt);
-        drop(infos);
+
+        if matched_final {
+            emit_decision(&ordered);
+            return ordered;
+        }
 
         // Fallback：按顺序遍历。
         if !(self.cfg.disable_fallback || (self.cfg.disable_fallback_if_match && has_match)) {

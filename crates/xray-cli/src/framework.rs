@@ -47,6 +47,7 @@ use xray_frame::{
     context::PluginContext,
     error::PluginError,
     plugin::{Lifecycle, Plugin, PluginContract},
+    pool::{BufferPool, ManagedBufferPool, XrayBufPool},
 };
 use xray_proxy_anytls::AnytlsPlugin;
 use xray_proxy_blackhole::BlackholePlugin;
@@ -79,12 +80,22 @@ struct AssemblyProbe {
     /// build 期看到的自己那段配置（缺段 = None——探针容忍缺段，fail-fast 归
     /// 真插件 `ctx.section()?`；段路由测试经此读回断言）。
     section_seen: Arc<Mutex<Option<serde_json::Value>>>,
+    /// bd 2bmns G-8：build 期校验**装配根**注入了缓冲池（坑约束 4）。
+    ///
+    /// 只有 [`assemble`] 注册的探针打开它——其它测试经
+    /// `build_plugins_from_config` 权威管线自建 ctx，没有装配根，不该被此校验拦。
+    require_pool: bool,
 }
 
 const PROBE_CONTRACT: PluginContract =
     PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
 
 impl AssemblyProbe {
+    /// 生产装配入口（[`assemble`]）用的探针：额外校验缓冲池已注入。
+    fn production() -> Self {
+        Self { require_pool: true, ..Self::default() }
+    }
+
     #[cfg(test)] // 测试观察锚（断言段路由投影值）；生产 build 不编译
     fn section_seen(&self) -> Arc<Mutex<Option<serde_json::Value>>> {
         Arc::clone(&self.section_seen)
@@ -109,6 +120,15 @@ impl Plugin for AssemblyProbe {
     }
 
     fn build(&self, ctx: &mut PluginContext) -> std::result::Result<(), PluginError> {
+        // bd 2bmns G-8 canary：装配根必须注入共享缓冲池（坑约束 4）。这里借一块
+        // 立刻归还——未注入时 `ctx.pool()` 在 build 期就 fail-visible，不必等到
+        // 某个协议运行期才炸在数据面上。
+        if self.require_pool {
+            let _probe_buf = ctx
+                .pool()
+                .acquire(4096)
+                .map_err(|e| PluginError::Other(format!("assembly pool: {e:?}").into()))?;
+        }
         if let Ok(section) = ctx.section() {
             *self.section_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(section.clone());
@@ -738,8 +758,19 @@ fn assemble(config_root: serde_json::Value, families: &[RegisteredFamily]) -> Re
     };
     Framework::builder(options)
         .and_then(|builder| {
-            let mut builder =
-                builder.with_config(config_root).register(Arc::new(AssemblyProbe::default()))?;
+            // bd 2bmns G-8：装配根共享缓冲池（坑约束 4）——协议插件取 `ctx.pool()`
+            // 不再 panic。容量保守默认（并发借出 1024 / 常驻 64），池懒分配。
+            const POOL_MAX: usize = 1024;
+            const POOL_IDLE_CAP: usize = 64;
+            let pool: Arc<dyn BufferPool> = Arc::new(ManagedBufferPool::new(
+                XrayBufPool::new(POOL_MAX, POOL_IDLE_CAP),
+                POOL_MAX,
+                POOL_IDLE_CAP,
+            ));
+            let mut builder = builder
+                .with_pool(pool)
+                .with_config(config_root)
+                .register(Arc::new(AssemblyProbe::production()))?;
             for family in families {
                 builder = builder.register(Arc::clone(&family.plugin))?;
             }

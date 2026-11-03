@@ -606,13 +606,44 @@ fn https_handshake<'a>(
     Ok(rustls::Stream::new(&mut *conn, &mut *tcp))
 }
 
-/// `GeodataReloader` 实现：调用全局 IP + 域名注册表的 reload。
+/// geodata 热更完成后的派生消费方回调（bd 2bmns G-2）。
+///
+/// 谁在热更后必须重建自己的 geodata 派生状态，谁注册一个：路由的
+/// geosite/geoip matcher 是装配期从 `.dat` 文件**本地构建**的（`xray-app-router`
+/// 不经 `DOMAIN_REG`/`IP_REG`），只有让装配面重新从文件派生一次，热更才真正
+/// 反映到路由匹配。回调失败 = 热更失败（fail-visible，不静默留旧规则）。
+pub type ReloadListener = Arc<dyn Fn() -> Result<(), GeodataError> + Send + Sync>;
+
+/// 全进程热更监听表。
+///
+/// 全局表是装配序逼出来的：geodata feature 由 `xray-core::register` 的工厂
+/// 先造（无上下文可用），路由在装配后段才建好，两者无法互相持有。测试用
+/// [`clear_reload_listeners`] 隔离。
+static RELOAD_LISTENERS: std::sync::LazyLock<parking_lot::Mutex<Vec<ReloadListener>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(Vec::new()));
+
+/// 注册 geodata 热更监听。生产唯一注册点 = `xray-core::wiring`（路由装配后）。
+pub fn register_reload_listener(listener: ReloadListener) {
+    RELOAD_LISTENERS.lock().push(listener);
+}
+
+/// 清空热更监听（测试隔离 / 停机卸载）。
+pub fn clear_reload_listeners() {
+    RELOAD_LISTENERS.lock().clear();
+}
+
+/// 当前已注册的监听数（测试断言用）。
+#[must_use]
+pub fn reload_listener_count() -> usize {
+    RELOAD_LISTENERS.lock().len()
+}
+
+/// `GeodataReloader` 实现：调用全局 IP + 域名注册表的 reload，随后逐个触发
+/// 热更监听（bd 2bmns G-2：路由规则重建）。
 ///
 /// 对应 Go `app/geodata/geodata.go:88-90 reload() = IPReg.Reload() + DomainReg.Reload()`。
-/// 当前未喂入新规则（GeoIP/GeoSite 数据 → rule 解析留给后续 batch），但调用真实
-/// `reload_with` 经 IP_REG/DOMAIN_REG 触达所有 matcher，达到"接口通"目标。
-///
-/// ponytail: 后续 batch 接 geodata loader 时，把"已加载的 rules"作为参数喂入。
+/// `IP_REG`/`DOMAIN_REG` 只有注册进去的 matcher 才会被重建（本仓路由 matcher 是
+/// 本地的，故这两步对路由恒为空操作——真正的路由刷新走 [`RELOAD_LISTENERS`]）。
 pub struct ReloadBothRegistries;
 
 impl GeodataReloader for ReloadBothRegistries {
@@ -632,6 +663,19 @@ impl GeodataReloader for ReloadBothRegistries {
         if let Err(e) = DOMAIN_REG.reload_with(Vec::new()) {
             tracing::warn!(target: "xray_app_geodata", "DOMAIN_REG.reload failed: {e}");
             return Err(GeodataError::ReloadFailed(format!("DOMAIN_REG: {e}")));
+        }
+        // bd 2bmns G-2：注册表的 matcher 是空的，真正的派生消费方（路由规则）
+        // 由监听方自行从新 `.dat` 重新派生。任一失败 → 整次热更失败。
+        let listeners: Vec<ReloadListener> = RELOAD_LISTENERS.lock().clone();
+        for (idx, listener) in listeners.iter().enumerate() {
+            if let Err(e) = listener() {
+                tracing::warn!(
+                    target: "xray_app_geodata",
+                    listener = idx,
+                    "geodata reload listener failed: {e}"
+                );
+                return Err(GeodataError::ReloadFailed(format!("listener#{idx}: {e}")));
+            }
         }
         Ok(())
     }

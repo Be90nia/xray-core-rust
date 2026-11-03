@@ -810,6 +810,42 @@ mod tests {
         assert!(cfg.build().is_err(), "unknown scheme must fail the build");
     }
 
+    /// bd 2bmns G-4：`script`（Go 走 Lua 调度引擎）本仓不支持 → 显式拒启并给替代
+    /// 路径，不得静默忽略（静默 = 查询走向与配置意图完全不同）。
+    ///
+    /// 反向断言：删掉 `build` 里的 script 拒启块，本测试变红（配置被静默接受）。
+    #[test]
+    fn build_rejects_unsupported_lua_script() {
+        let json = r#"{
+            "servers": [{"address": "8.8.8.8"}],
+            "script": "function dispatch(ctx) return ctx.server end"
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.build().map(|_| ()).expect_err("dns script must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not supported"), "unexpected error: {msg}");
+        assert!(msg.contains("domains"), "错误必须指出替代路径: {msg}");
+
+        // 空串 = 未设置（Go `if script != ""` 同语义），放行。
+        let empty: DnsAppConfig =
+            serde_json::from_str(r#"{"servers":[{"address":"8.8.8.8"}],"script":""}"#).unwrap();
+        assert!(empty.build().is_ok(), "empty script must be accepted");
+    }
+
+    /// bd 2bmns G-9：`servers[].id` 在 Go 侧只服务 Lua 脚本桥（`app/dns/lua.go`），
+    /// 而 Lua 已不支持的当下它**在 Go 里同样无消费方**。故此处语义 = 接受且惰性
+    /// （Go 兼容），不是"解析了却偷偷丢掉一个会改变行为的键"。
+    #[test]
+    fn servers_id_is_accepted_as_inert_metadata() {
+        let json = r#"{
+            "servers": [{"address": "8.8.8.8", "id": "primary", "tag": "dns-primary"}]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("id must not block the build");
+        assert_eq!(built.clients.len(), 1);
+        assert!(!built.clients[0].tag.is_empty(), "运行期寻址键 = tag（id 不参与）");
+    }
+
     /// bd wmdn③ 回归：nameserver domains 规则解析失败 → 启动硬错（Go
     /// infra/conf/dns.go:89-92），不再 warn+skip 静默丢规则。
     #[test]

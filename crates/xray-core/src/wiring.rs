@@ -763,8 +763,17 @@ fn build_adapter(
     ohm: Arc<dyn OutboundHandlerSelector>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Arc<RouterAdapter>, WiringError> {
-    let datadir = resolve_asset_dir();
-    let geo_loader = Some(Arc::new(GeoDataLoader::new(datadir.clone())));
+    build_adapter_in(config, ohm, observer, &resolve_asset_dir())
+}
+
+/// [`build_adapter`] 的资产目录显式版（测试注入用）。
+fn build_adapter_in(
+    config: xray_proto::xray::app::router::Config,
+    ohm: Arc<dyn OutboundHandlerSelector>,
+    observer: Option<Arc<dyn ObservationProvider>>,
+    datadir: &std::path::Path,
+) -> Result<Arc<RouterAdapter>, WiringError> {
+    let geo_loader = Some(Arc::new(GeoDataLoader::new(datadir.to_path_buf())));
     let router = Router::init(&config, ohm, observer, geo_loader).map_err(|e| match e {
         // proto 变体 geo 规则（GeoSiteRule/GeoIPRule 字段）在 init 期加载 .dat，
         // 失败同样拒启（bd il49）。
@@ -774,7 +783,31 @@ fn build_adapter(
         )),
         other => WiringError::RouterInit(other.to_string()),
     })?;
+    register_geodata_router_reload(&router, &config);
     Ok(Arc::new(RouterAdapter::new(router)))
+}
+
+/// 把 geodata 热更接到本 `Router`（bd 2bmns G-2）。
+///
+/// 路由的 geosite/geoip matcher 是装配期从 `.dat` **本地构建**的（不注册进
+/// `DOMAIN_REG`/`IP_REG`），所以 cron 热更换了文件之后，只有重跑一次规则派生
+/// 才会反映到匹配结果上——否则「下载了、swap 了，路由照旧」。
+///
+/// `Weak` 持有 Router：释放后监听自动 no-op（反复装配不累积活引用）。
+fn register_geodata_router_reload(
+    router: &Arc<Router>,
+    config: &xray_proto::xray::app::router::Config,
+) {
+    let weak = Arc::downgrade(router);
+    let config = config.clone();
+    xray_app_geodata::register_reload_listener(Arc::new(move || {
+        let Some(router) = weak.upgrade() else { return Ok(()) };
+        router.reload_rules(&config, false).map_err(|e| {
+            xray_app_geodata::GeodataError::ReloadFailed(format!(
+                "router rules rebuild after geodata reload: {e}"
+            ))
+        })
+    }));
 }
 
 /// JSON → proto `Config` 转换（Go `infra/conf/router.go` `parseFieldRule` +
@@ -788,8 +821,9 @@ fn build_adapter(
 /// 对齐 Go 语义：规则解析失败（未知前缀形态 / 非法 CIDR / geoip.dat 缺失或
 /// 缺 code）返回 Err，由调用方拒启（Go Build 失败即拒绝启动），不再静默丢规则。
 ///
-/// `rule_set` 依赖 proto 更新（当前 `RoutingRule` 无该字段，见
-/// `xray-app-router/src/rule_set.rs`），暂以 TODO 标记，待 proto 升级后接入。
+/// `ruleSet` 顶层键：本仓自造扩展（Go 无），但 proto `RoutingRule` 无引用字段且
+/// `protos/` 只读 —— 加载出来无人可引用，故非空即拒启（bd 2bmns G-1，见
+/// `xray-app-router/src/rule_set.rs` 的状态声明）。
 ///
 /// 公开面（bd 9c8k6 ②）：`xray api adrules` 需要把 JSON 配置编译成与生产装配
 /// **同一套** `xray.app.router.Config`（含 balancers），禁 CLI 侧自造方言。
@@ -1044,57 +1078,22 @@ fn parse_routing_json_to_proto_in(
             });
         }
     }
-    // kfbd：顶层 `ruleSet` JSON 数组 → 显式校验 + 加载。proto 暂未升级支持
-    // RoutingRule.rule_set 引用字段（见 xray-app-router/src/rule_set.rs TODO），
-    // 故 Registry 不会被 Router 使用；但配置错误必须现在就暴露，不能等到
-    // 远端首次请求才发现错配。
-    if let Some(arr) = v.get("ruleSet").and_then(|x| x.as_array()) {
-        #[allow(unused_mut)] // 存量清零批次
-        let mut registry = xray_app_router::RuleSetRegistry::new();
-        let mut seen_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for rs in arr {
-            let tag = rs.get("tag").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            if tag.is_empty() {
-                return Err(WiringError::JsonParse("ruleSet entry missing tag".into()));
-            }
-            if !seen_tags.insert(tag.clone()) {
-                return Err(WiringError::JsonParse(format!("duplicate ruleSet tag '{tag}'")));
-            }
-            let r#type = rs.get("type").and_then(|x| x.as_str()).unwrap_or("");
-            let path = rs.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let url = rs.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let format = rs.get("format").and_then(|x| x.as_str()).unwrap_or("json");
-            let (rs_type, rs_format) = match (r#type, format) {
-                ("file", "json") | ("", "json") if !path.is_empty() => {
-                    (xray_app_router::RuleSetType::File, xray_app_router::RuleSetFormat::Json)
-                },
-                ("file", _) => {
-                    return Err(WiringError::JsonParse(format!(
-                        "ruleSet '{tag}': unsupported format '{format}', only 'json' is implemented"
-                    )));
-                },
-                ("remote", _) | ("", _) if !url.is_empty() => {
-                    return Err(WiringError::JsonParse(format!(
-                        "ruleSet '{tag}': remote rule_set download is not implemented (set type='file' and provide path)"
-                    )));
-                },
-                (other, _) => {
-                    return Err(WiringError::JsonParse(format!(
-                        "ruleSet '{tag}': unknown type '{other}', must be 'file' (path) or omit + provide path"
-                    )));
-                },
-            };
-            let cfg_rs = xray_app_router::RuleSetConfig {
-                tag: tag.clone(),
-                rule_set_type: rs_type,
-                format: rs_format,
-                path,
-                url,
-            };
-            registry
-                .load(&cfg_rs)
-                .map_err(|e| WiringError::JsonParse(format!("ruleSet '{tag}': {e}")))?;
-        }
+    // bd 2bmns G-1 裁决：`ruleSet` 是本仓自造扩展（Go 26.10.17 全仓零命中），而
+    // proto `RoutingRule` 没有「引用某个 ruleSet 的 tag」字段（`protos/` 只读红线）。
+    // 因此加载出来的规则集**不可能被任何规则引用**——此前"读文件 + 逐条校验 + 丢弃"
+    // 会让用户以为它生效（且规则集文件坏了能拒启、好了却毫无作用）。改为出现即
+    // 拒启：不支持的键必须 fail-visible，禁静默吞。
+    if let Some(arr) = v.get("ruleSet").and_then(|x| x.as_array())
+        && !arr.is_empty()
+    {
+        let tags: Vec<&str> =
+            arr.iter().filter_map(|rs| rs.get("tag").and_then(|x| x.as_str())).collect();
+        return Err(WiringError::JsonParse(format!(
+            "routing.ruleSet is not supported in this build: proto RoutingRule has no \
+             ruleSet reference field, so loaded sets can never be consulted by the router \
+             (offending tags: [{}]). Remove the key or inline the rules under \"rules\"",
+            tags.join(", ")
+        )));
     }
 
     // 编码一次以验证 Config 结构合法（同 prost 语义）
@@ -1889,22 +1888,38 @@ mod tests {
 
     // ---- balancer 策略 JSON 装配（h81 验收点）----
 
-    /// JSON → RouterAdapter，传入 observer（h81：build_balancer 不再拒绝 leastping）。
+    /// bd 2bmns G-7：`leastping` 缺 observatory 时**拒启**（Go `Router.Init` →
+    /// `common.Must(core.RequireFeatures(observatory))` panic = 启动失败）。
+    /// 此前静默回落 `fallbackTag`，用户配了 leastping 实际却固定走一个出站。
     #[test]
-    fn build_adapter_with_balancer_leastping_succeeds() {
+    fn build_adapter_with_balancer_leastping_without_observer_fails() {
         let json = br#"{
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping","fallbackTag":"fb"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let adapter = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
-            .expect("leastping balancer should build even without observer");
-        // 没 observer → fallback
-        let dest = Destination::new(
-            Address::Domain("x.test".into()),
-            Port::new(443),
-            xray_common::net::network::Network::TCP,
+        let err = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
+            .map(|_| ())
+            .expect_err("leastping without observatory must be rejected");
+        assert!(
+            err.to_string().contains("requires the observatory app"),
+            "unexpected error: {err}"
         );
-        assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("fb"));
+    }
+
+    /// bd 2bmns G-7：`leastload` 同款——缺 observatory 拒启，不静默回落。
+    #[test]
+    fn build_adapter_with_balancer_leastload_without_observer_fails() {
+        let json = br#"{
+            "balancers":[{"tag":"bl","selector":["a","b"],"strategy":"leastload"}],
+            "rules":[{"balancerTag":"bl","domain":["x.test"]}]
+        }"#;
+        let err = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
+            .map(|_| ())
+            .expect_err("leastload without observatory must be rejected");
+        assert!(
+            err.to_string().contains("requires the observatory app"),
+            "unexpected error: {err}"
+        );
     }
 
     /// selector 适配器：SimpleOhm tagged handlers 按 selector 前缀匹配（Go
@@ -2094,6 +2109,114 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xray-wiring-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp asset dir");
         dir
+    }
+
+    /// geodata 热更监听是全进程表（bd 2bmns G-2）——热更类测试串行，避免互相触发。
+    static RELOAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// bd 2bmns G-1：`ruleSet` 明示不接线——非空即拒启，不静默吞。
+    ///
+    /// 反向断言：删掉 `parse_routing_json_to_proto_in` 里的拒启块，本测试立刻变红
+    /// （配置会被"读文件后丢弃"静默接受）。
+    #[test]
+    fn routing_rule_set_is_rejected_explicitly() {
+        let dir = temp_asset_dir("ruleset");
+        let json = br#"{
+            "ruleSet": [{"tag": "geo", "type": "file", "format": "json", "path": "geo.json"}],
+            "rules": [{"outboundTag": "proxy", "domain": ["example.com"]}]
+        }"#;
+        let err = parse_routing_json_to_proto_in(json, &dir).expect_err("ruleSet must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("routing.ruleSet is not supported"), "unexpected error: {msg}");
+        assert!(msg.contains("geo"), "offending tag must be named: {msg}");
+
+        // 空数组 = 未配置（等价 no-op），不得误伤。
+        let ok = parse_routing_json_to_proto_in(br#"{"ruleSet":[],"rules":[]}"#, &dir);
+        assert!(ok.is_ok(), "empty ruleSet must be a no-op");
+    }
+
+    /// bd 2bmns G-2：geodata 热更必须让**路由规则**跟着换。
+    ///
+    /// 装配期 matcher 是从 `.dat` 本地构建的（不注册进 `DOMAIN_REG`/`IP_REG`），
+    /// 所以「下载 + swap .dat」本身不会改变匹配结果；只有热更回调里重跑规则派生
+    /// 才行。此前 cron 热更后路由照旧 = 用户以为规则集更新了其实没有。
+    ///
+    /// 反向断言：删掉 `register_geodata_router_reload` 调用，第三段断言变红。
+    #[test]
+    fn geodata_reload_rebuilds_router_rules() {
+        use xray_app_geodata::downloader::{GeodataReloader, ReloadBothRegistries};
+
+        fn geosite_dat(domains: &[&str]) -> Vec<u8> {
+            use prost::Message;
+            use xray_proto::xray::common::geodata::{Domain, GeoSite, GeoSiteList};
+            let hot = GeoSite {
+                code: "HOT".into(),
+                // r#type 3 = Full（`proto_domain_type_to_matcher`）
+                domain: domains
+                    .iter()
+                    .map(|d| Domain { r#type: 3, value: (*d).into(), attribute: vec![] })
+                    .collect(),
+            };
+            GeoSiteList { entry: vec![hot] }.encode_to_vec()
+        }
+
+        let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        xray_app_geodata::clear_reload_listeners();
+
+        let dir = temp_asset_dir("geodata-reload");
+        std::fs::write(dir.join("geosite.dat"), geosite_dat(&["old.example"])).unwrap();
+
+        let json = br#"{"rules":[{"outboundTag":"routed","domain":["geosite:hot"]}]}"#;
+        let cfg = parse_routing_json_to_proto_in(json, &dir).expect("parse routing json");
+        let adapter =
+            build_adapter_in(cfg, Arc::new(NotImplementedSelector), None, &dir).expect("adapter");
+
+        let pick = |domain: &str| {
+            let dest = Destination::new(
+                Address::Domain(domain.into()),
+                Port::new(443),
+                xray_common::net::network::Network::TCP,
+            );
+            adapter.pick_outbound_tag(&dest)
+        };
+
+        assert_eq!(pick("old.example").as_deref(), Some("routed"), "初始 .dat 命中");
+        assert_eq!(pick("new.example"), None, "新域名尚未进 .dat");
+
+        // 热更：换文件 + 触发 reload（生产 = cron 回调 → ReloadBothRegistries）。
+        std::fs::write(dir.join("geosite.dat"), geosite_dat(&["old.example", "new.example"]))
+            .unwrap();
+        ReloadBothRegistries.reload().expect("geodata reload");
+
+        assert_eq!(
+            pick("new.example").as_deref(),
+            Some("routed"),
+            "热更后路由规则必须用新 .dat 重建"
+        );
+        assert_eq!(pick("old.example").as_deref(), Some("routed"), "旧域名仍在（未丢规则）");
+
+        xray_app_geodata::clear_reload_listeners();
+    }
+
+    /// 监听注册面自检（G-2 的第二半）：装配后必须恰好留下一个本 Router 的监听，
+    /// 且 `reload_listener_count` 清空后归零（防全局表泄漏）。
+    #[test]
+    fn geodata_reload_listener_is_registered_and_clearable() {
+        let _guard = RELOAD_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        xray_app_geodata::clear_reload_listeners();
+        assert_eq!(xray_app_geodata::reload_listener_count(), 0);
+
+        let dir = temp_asset_dir("geodata-listener");
+        let json = br#"{"rules":[{"outboundTag":"x","domain":["a.example"]}]}"#;
+        let cfg = parse_routing_json_to_proto_in(json, &dir).expect("parse");
+        let adapter =
+            build_adapter_in(cfg, Arc::new(NotImplementedSelector), None, &dir).expect("adapter");
+        // 同进程并行的其它装配测试也可能注册（全局表），故断言 ≥1 而非 ==1。
+        assert!(xray_app_geodata::reload_listener_count() >= 1, "装配必须注册热更监听");
+
+        drop(adapter);
+        xray_app_geodata::clear_reload_listeners();
+        assert_eq!(xray_app_geodata::reload_listener_count(), 0);
     }
 
     /// Go 官方样例前缀形态逐项断言 proto 字段（Go 对照 infra/conf/router.go

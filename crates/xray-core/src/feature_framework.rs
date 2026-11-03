@@ -27,6 +27,7 @@ use xray_frame::{
     context::PluginContext,
     error::PluginError,
     plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep},
+    pool::{BufferPool, ManagedBufferPool, XrayBufPool},
 };
 
 /// Feature 适配壳的条款声明：12 条协议运行时条款全部不适用——真源在协议
@@ -126,6 +127,18 @@ impl Plugin for FeaturePlugin {
     }
 }
 
+/// 装配根共享缓冲池（坑约束 4 / bd 2bmns G-8）。
+///
+/// `PluginContext::pool()` 未注入即装配期 panic（fail-visible），而生产装配此前
+/// 从不在 builder 上调 `with_pool`——坑约束「缓冲必走 BufferPool 接缝」因此只在
+/// 测试里成立。容量取保守默认（并发借出 1024 / 常驻 64）；池懒分配，无消费方
+/// 时零成本。
+fn production_buffer_pool() -> Arc<dyn BufferPool> {
+    const MAX: usize = 1024;
+    const IDLE_CAP: usize = 64;
+    Arc::new(ManagedBufferPool::new(XrayBufPool::new(MAX, IDLE_CAP), MAX, IDLE_CAP))
+}
+
 /// 按注册序把全部 feature 经框架装配启动（[`crate::instance::Instance::start`]
 /// 的 feature-on 路径）。失败 = 已启动者已被框架逆序回滚（stop →
 /// `Feature::close`）。
@@ -140,7 +153,8 @@ pub(super) fn bring_up_features(features: &[Arc<dyn Feature>]) -> Result<()> {
         id_fingerprint: None,
         shutdown_timeout: None,
     };
-    let mut builder = Framework::builder(opts).map_err(to_feature_err)?;
+    let mut builder =
+        Framework::builder(opts).map_err(to_feature_err)?.with_pool(production_buffer_pool());
     let mut seen: HashMap<&'static str, usize> = HashMap::with_capacity(features.len());
     for feat in features {
         let base = feat.feature_name();

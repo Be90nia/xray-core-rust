@@ -451,6 +451,19 @@ fn metrics_factory() -> FeatureFactory {
                 message: format!("invalid metrics config: {e}"),
             })?;
 
+        // bd 2bmns G-6：`tags` 是 Rust 扩展（Go `metrics.Config` 只有 tag/listen），
+        // 但曝光层（`MetricsConfig` → `format_prometheus`）没有 per-tag 过滤面，
+        // 配了也无处生效。此前解析后直接丢弃——改为显式拒启（不静默吞）。
+        if json_cfg.tags.as_ref().is_some_and(|t| !t.is_empty()) {
+            return Err(FeatureError::ConfigInvalid {
+                name: "metrics",
+                message: "metrics.tags is not supported in this build (the Prometheus \
+                          exposition has no per-tag filtering); remove the key and use \
+                          \"tag\"/\"listen\""
+                    .into(),
+            });
+        }
+
         // hfwq：Go metrics.go:8-11 tag 字段接线（listen 兼容形态；inbound
         // handler 供路由暴露属架构接线，与 4qjw 同类设计先行票，此处只保字段不丢）。
         let proto = xray_proto::xray::app::metrics::Config {
@@ -931,10 +944,12 @@ fn geodata_factory() -> FeatureFactory {
 /// 非 https / asset file 本地缺失 → `ConfigInvalid` 硬错（bd onx4：启动期致命）。
 /// cron 为空则原样放行（start 时不调度，与 Go `if config.cron == ""` 等价）。
 ///
-/// bd 3nt18：`geodata.outbound` 目前在 Rust 侧**无接线**（`RealAssetDownloader`
-/// 不带 dispatcher，Go `app/geodata/geodata.go:28-40` 走 tagged dispatcher）——
-/// 配了它仍会直连 GitHub 下载 = 出口 IP 暴露 + 墙内失败，且零日志。既然消费不了，
-/// 该键出现即拒启（fail-visible），不做"读进来扔掉"。
+/// bd 3nt18 / bd 2bmns G-3：`geodata.outbound` 在 Rust 侧**无接线**
+/// （`RealAssetDownloader` 不带 dispatcher，Go `app/geodata/geodata.go:28-40` 走
+/// tagged dispatcher）——配了它仍会直连 GitHub 下载 = 出口 IP 暴露 + 墙内失败。
+/// 接线需要「dispatcher 背书的同步下载器」（outbound handler 是异步 Link，得先有
+/// async→sync 桥），属装配面新件，未在本票范围；既然消费不了，该键出现即拒启
+/// （fail-visible），不做"读进来扔掉"。
 fn map_geodata_config(
     json_cfg: xray_conf::app_config::GeodataConfig,
 ) -> Result<xray_app_geodata::GeodataConfig, FeatureError> {
@@ -943,8 +958,9 @@ fn map_geodata_config(
         return Err(FeatureError::ConfigInvalid {
             name: "geodata",
             message: format!(
-                "geodata.outbound `{outbound}` is not wired in this build (asset downloads \
-                 always dial directly); remove the key or download assets out-of-band"
+                "geodata.outbound `{outbound}` is not supported in this build: asset \
+                 downloads have no dispatcher bound (they always dial directly, exposing \
+                 this host's egress IP). Remove the key or download assets out-of-band"
             ),
         });
     }
@@ -1595,6 +1611,24 @@ mod tests {
         let json = br#"{"listen": "127.0.0.1:9100"}"#;
         let feat = registry::create_feature("metrics", json).expect("metrics config should build");
         assert_eq!(feat.feature_name(), "metrics");
+    }
+
+    /// bd 2bmns G-6：`metrics.tags` 是 Rust 扩展，但曝光层没有 per-tag 过滤面 →
+    /// 配了即拒启（此前解析后静默丢弃）。
+    #[test]
+    fn metrics_factory_rejects_unsupported_tags() {
+        register_all_features();
+        let err = registry::create_feature(
+            "metrics",
+            br#"{"listen": "127.0.0.1:9100", "tags": ["inbound-a"]}"#,
+        )
+        .map(|_| ())
+        .expect_err("metrics.tags must be rejected");
+        assert!(err.to_string().contains("metrics.tags"), "unexpected error: {err}");
+
+        // 空数组 = 未配置（不误伤只写 `"tags": []` 的配置）。
+        registry::create_feature("metrics", br#"{"listen": "127.0.0.1:9102", "tags": []}"#)
+            .expect("empty tags must build");
     }
 
     #[test]

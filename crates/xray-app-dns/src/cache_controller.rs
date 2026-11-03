@@ -47,9 +47,10 @@ pub struct CacheController {
     pub serve_stale: bool,
     /// 过期数据可服务的负 TTL（Go `serveExpiredTTL` 存为 `-int32(原值)`）。
     pub serve_expired_ttl_secs: i32,
-    /// 负缓存 TTL（秒）。0 = 禁用。Go cache 无显式字段——当前 NXDOMAIN 按
-    /// 响应 TTL 走正缓存 upsert（`fetch` 只写真实响应），本字段暂无行为
-    /// 消费方，保留 config 透传面（jsonconf `negativeTtlSecs`）。
+    /// 负答案缓存 TTL（秒）。0 = 不覆写（跟响应自带 TTL，Go 行为）。
+    /// Go cache 无此字段（Rust 扩展，jsonconf `negativeTtlSecs`）；
+    /// 大于 0 时 `nameserver::cached::fetch` 用它覆写负答案（rcode 非 NO_ERROR
+    /// 或 A/AAAA 空表）的过期时刻（bd 2bmns G-5）。
     pub negative_ttl_secs: u32,
     ips: RwLock<HashMap<String, Arc<Record>>>,
     /// 缓存生命周期峰值，用于收缩阈值计算。

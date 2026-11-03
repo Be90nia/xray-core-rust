@@ -223,7 +223,7 @@ pub async fn fetch<S: CachedNameserver>(
     // singleflight：如果已有同名查询在进行，等待其结果；否则成为领导者。
     // 领导者条目由 SfLeaderGuard 在 Drop 时移除——正常完成、错误、被上层
     // abort（如 parallel_query 的 abort_all）都保证不泄漏。
-    let outcome = {
+    let mut outcome = {
         let mut sf = cache.single_flight.lock().await;
         if let Some(tx) = sf.get(&sf_key).cloned() {
             drop(sf);
@@ -254,6 +254,19 @@ pub async fn fetch<S: CachedNameserver>(
         }
     };
     let now = cache.clock().now_instant();
+
+    // bd 2bmns G-5：`negativeTtlSecs`（Rust 扩展，Go 无此 JSON 字段）覆写**负答案**
+    // 的缓存 TTL。负答案 = rcode 非 NO_ERROR（NXDOMAIN/SERVFAIL…）或 A/AAAA 空表；
+    // 0/未配 = 不覆写，跟响应自带 TTL（Go 行为）。此前该字段只存不用。
+    let negative_ttl = cache.negative_ttl_secs;
+    if negative_ttl > 0 {
+        for rec in [outcome.rec_v4.as_mut(), outcome.rec_v6.as_mut()].into_iter().flatten() {
+            if rec.rcode == crate::dnscommon::rcode::NO_ERROR && !rec.ips.is_empty() {
+                continue;
+            }
+            rec.expire = now + Duration::from_secs(u64::from(negative_ttl));
+        }
+    }
 
     // 缓存结果。仅写入上游真实响应（含 NXDOMAIN 的 rcode=3 记录，TTL 取响应
     // TTL）；上游超时/失败（rec=None）不写任何缓存——Go 从不缓存失败，修复前
@@ -623,6 +636,48 @@ mod tests {
         let err = query_ip(server.clone(), "neg.example.com", v4_only_option()).await.unwrap_err();
         assert!(matches!(err, DnsError::RCodeError(3)), "应直接返回负缓存 rcode 错误");
         assert_eq!(server.calls.load(Ordering::SeqCst), 0, "TTL 内负缓存命中不得打上游");
+    }
+
+    /// bd 2bmns G-5：`negativeTtlSecs` 真的生效——负答案（NXDOMAIN / 空表）的
+    /// 缓存 TTL 被它覆写，不再是响应自带 TTL。此前该字段只存不用。
+    ///
+    /// 反向断言：删掉 `fetch` 里的 negative TTL 覆写块，TTL 断言立刻变红
+    /// （剩 ~3600s 而不是 ~30s）。
+    #[tokio::test]
+    async fn negative_ttl_secs_overrides_negative_answer_ttl() {
+        use crate::dnscommon::rcode;
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 30));
+        let neg = ip_record(1, vec![], Duration::from_secs(3600), rcode::NX_DOMAIN, Instant::now());
+        let server = StubServer { cache: cache.clone(), rec_v4: Some(neg), rec_v6: None };
+
+        let err = query_ip(Arc::new(server), "neg.example.com", v4_only_option())
+            .await
+            .expect_err("NXDOMAIN 必须作为错误上抛");
+        assert!(matches!(err, DnsError::RCodeError(3)), "unexpected: {err}");
+
+        let rec = cache.find_records("neg.example.com.").expect("负答案必须入缓存");
+        let ttl = rec.a.as_ref().expect("v4 record").ttl_seconds(cache.clock().now_instant());
+        assert!((29..=30).contains(&ttl), "negativeTtlSecs=30 必须覆写缓存 TTL，实际 {ttl}");
+    }
+
+    /// 0 = 不覆写（跟响应自带 TTL，Go 行为）——默认值不得砍断正常负缓存。
+    #[tokio::test]
+    async fn negative_ttl_zero_keeps_response_ttl() {
+        use crate::dnscommon::rcode;
+
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        let neg = ip_record(1, vec![], Duration::from_secs(3600), rcode::NX_DOMAIN, Instant::now());
+        let server = StubServer { cache: cache.clone(), rec_v4: Some(neg), rec_v6: None };
+
+        let err = query_ip(Arc::new(server), "zero.example.com", v4_only_option())
+            .await
+            .expect_err("NXDOMAIN 必须作为错误上抛");
+        assert!(matches!(err, DnsError::RCodeError(3)), "unexpected: {err}");
+
+        let rec = cache.find_records("zero.example.com.").expect("负答案必须入缓存");
+        let ttl = rec.a.as_ref().expect("v4 record").ttl_seconds(cache.clock().now_instant());
+        assert!(ttl > 3000, "0 = 不覆写，应保留响应 TTL，实际 {ttl}");
     }
 
     /// bd rofg② 回归：上游失败（rec=None + errors 非空）不写 rcode=3 负缓存

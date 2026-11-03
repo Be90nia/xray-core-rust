@@ -377,9 +377,12 @@ pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
 /// - 策略名 `ToLower` 归一（Go config.go:122）
 /// - `""` 与 `random` 同走 RandomStrategy（Go config.go:153-161 fallthrough）
 /// - `roundrobin` 不依赖 observer
-/// - `leastping` / `leastload` 依赖 observer。无 observer 时**仍构建**，但 策略在 `pick_outbound`
-///   时返回空 → `Balancer` 走 `fallback_tag`（与 Go 无 observatory 时返回空字符串 → fallback
-///   的行为一致）。
+/// - `leastping` / `leastload` 依赖 observer：**无 observer 即拒建**（bd 2bmns G-7）。Go 在
+///   `Router.Init` 里对这两个策略调 `InjectContext` →
+///   `common.Must(core.RequireFeatures(observatory))`，缺 observatory 直接 panic
+///   （`strategy_leastping.go:22-28` / `strategy_leastload.go:62-67`）= 启动失败。 此前本仓填 Stub
+///   策略恒返回空 → Balancer 静默走 `fallback_tag`，用户配了 leastping
+///   却在直连一个固定出站，属静默降级。
 /// - 其余策略名报错（Go config.go:162-163 "unrecognized balancer type"）
 ///
 /// `strategy_settings`（TypedMessage 反序列化）当前不解析：LeastLoad 用
@@ -389,6 +392,14 @@ fn build_balancer(
     ohm: &Arc<dyn OutboundHandlerSelector>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Balancer, RouterError> {
+    /// 观测型策略缺 observatory 的统一错误（对应 Go `common.Must` 的启动期炸）。
+    fn require_observer(strategy: &str) -> RouterError {
+        RouterError::Other(format!(
+            "balancer strategy '{strategy}' requires the observatory app; configure an \
+             \"observatory\" section or switch to 'random'/'roundrobin'"
+        ))
+    }
+
     let strategy: Arc<dyn BalancingStrategy> = match br.strategy.to_ascii_lowercase().as_str() {
         // fallback 语义在 Balancer（Go balancing.go），策略不掺 fallback。
         "random" => Arc::new(crate::strategy_random::RandomStrategy::new(
@@ -396,42 +407,35 @@ fn build_balancer(
             ohm.clone(),
         )),
         "leastping" => {
-            if let Some(obs) = observer {
-                // ga1k：把 balancer 的 outbound_selector 作为候选列表注入策略，
-                // 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 一致。
-                Arc::new(crate::strategy_leastping::LeastPingStrategy::new(
-                    obs,
-                    br.outbound_selector.clone(),
-                ))
-            } else {
-                Arc::new(StubLeastPingStrategy)
-            }
+            let obs = observer.ok_or_else(|| require_observer("leastping"))?;
+            // ga1k：把 balancer 的 outbound_selector 作为候选列表注入策略，
+            // 与 Go `LeastPingStrategy.PickOutbound(strings []string)` 一致。
+            Arc::new(crate::strategy_leastping::LeastPingStrategy::new(
+                obs,
+                br.outbound_selector.clone(),
+            ))
         },
         "leastload" => {
-            // 同 leastping；observer 缺失时返回空 → fallback。
-            if let Some(obs) = observer {
-                let cfg = br
-                    .strategy_settings
-                    .as_ref()
-                    .and_then(|ss| {
-                        // 反序列化 TypedMessage → StrategyLeastLoadConfig。
-                        // proto Any 解码需 xray-proto Any 支持；此处 try_decode 失败回退默认。
-                        let any = &ss.value;
-                        prost::Message::decode(any.as_slice()).ok()
-                    })
-                    .unwrap_or_default();
-                Arc::new(
-                    crate::strategy_leastload::LeastLoadStrategy::new(
-                        &cfg,
-                        br.outbound_selector.clone(),
-                        ohm.clone(),
-                        obs,
-                    )
-                    .map_err(|e| RouterError::Other(format!("leastload config: {e}")))?,
+            let obs = observer.ok_or_else(|| require_observer("leastload"))?;
+            let cfg = br
+                .strategy_settings
+                .as_ref()
+                .and_then(|ss| {
+                    // 反序列化 TypedMessage → StrategyLeastLoadConfig。
+                    // proto Any 解码需 xray-proto Any 支持；此处 try_decode 失败回退默认。
+                    let any = &ss.value;
+                    prost::Message::decode(any.as_slice()).ok()
+                })
+                .unwrap_or_default();
+            Arc::new(
+                crate::strategy_leastload::LeastLoadStrategy::new(
+                    &cfg,
+                    br.outbound_selector.clone(),
+                    ohm.clone(),
+                    obs,
                 )
-            } else {
-                Arc::new(StubLeastLoadStrategy)
-            }
+                .map_err(|e| RouterError::Other(format!("leastload config: {e}")))?,
+            )
         },
         "" => Arc::new(crate::strategy_random::RandomStrategy::new(
             br.outbound_selector.clone(),
@@ -450,22 +454,6 @@ fn build_balancer(
     };
 
     Ok(Balancer::new(br.outbound_selector.clone(), strategy, ohm.clone(), br.fallback_tag.clone()))
-}
-
-/// 无 observer 时的 LeastPing 占位：始终返回空 → Balancer 走 fallback。
-struct StubLeastPingStrategy;
-impl BalancingStrategy for StubLeastPingStrategy {
-    fn pick_outbound(&self) -> Result<String, RouterError> {
-        Err(RouterError::EmptyBalancerResult)
-    }
-}
-
-/// 无 observer 时的 LeastLoad 占位：始终返回空 → Balancer 走 fallback。
-struct StubLeastLoadStrategy;
-impl BalancingStrategy for StubLeastLoadStrategy {
-    fn pick_outbound(&self) -> Result<String, RouterError> {
-        Err(RouterError::EmptyBalancerResult)
-    }
 }
 
 #[cfg(test)]
@@ -844,8 +832,11 @@ mod tests {
         assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "b");
     }
 
+    /// bd 2bmns G-7：`leastping` 无 observatory → **拒建**（Go `Router.Init` →
+    /// `LeastPingStrategy.InjectContext` → `common.Must(RequireFeatures)` panic）。
+    /// 此前填 Stub 恒返回空 → Balancer 静默走 `fallback_tag`，用户以为在建负载均衡。
     #[test]
-    fn test_build_balancer_leastping_without_observer_falls_back() {
+    fn test_build_balancer_leastping_without_observer_errors() {
         let cfg = Config {
             balancing_rule: vec![balancing_rule_with("leastping", "bl", "fallback")],
             rule: vec![simple_balance_rule("bl")],
@@ -853,10 +844,8 @@ mod tests {
         };
 
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
-        // 无 observer：构建仍成功，pick 时走 fallback_tag
-        let r = Router::init(&cfg, ohm, None, None).unwrap();
-        let ctx = RoutingData::new().with_target_domain("x.test");
-        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fallback");
+        let err = Router::init(&cfg, ohm, None, None).map(|_| ()).expect_err("leastping 必须拒建");
+        assert!(err.to_string().contains("requires the observatory app"), "unexpected: {err}");
     }
 
     #[test]
@@ -884,8 +873,10 @@ mod tests {
         assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "b");
     }
 
+    /// bd 2bmns G-7：`leastload` 无 observatory → 拒建（同 leastping，
+    /// Go `LeastLoadStrategy.InjectContext` 的 `common.Must`）。
     #[test]
-    fn test_build_balancer_leastload_without_observer_falls_back() {
+    fn test_build_balancer_leastload_without_observer_errors() {
         let cfg = Config {
             balancing_rule: vec![balancing_rule_with("leastload", "bl", "fb-tag")],
             rule: vec![simple_balance_rule("bl")],
@@ -893,9 +884,8 @@ mod tests {
         };
 
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
-        let r = Router::init(&cfg, ohm, None, None).unwrap();
-        let ctx = RoutingData::new().with_target_domain("x.test");
-        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fb-tag");
+        let err = Router::init(&cfg, ohm, None, None).map(|_| ()).expect_err("leastload 必须拒建");
+        assert!(err.to_string().contains("requires the observatory app"), "unexpected: {err}");
     }
 
     #[test]
@@ -956,11 +946,20 @@ mod tests {
             rule: vec![simple_balance_rule("bl")],
             ..Config::default()
         };
+        let obs = Arc::new(MemoryObservationProvider::new());
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", true, 100),
+                obs_with_alive("b", true, 50),
+                obs_with_alive("c", true, 200),
+            ],
+        });
         let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
-        // 无 observer 时 leastload 仍构建并走 fallback（同 leastping 行为）。
-        let r = Router::init(&cfg, ohm, None, None).unwrap();
+        // bd 2bmns G-7 后 leastload 必须有 observer 才能建；这里同时证明大小写
+        // 归一（未归一 → UnknownBalancerType，unwrap 立刻炸）。
+        let r = Router::init(&cfg, ohm, Some(obs), None).unwrap();
         let ctx = RoutingData::new().with_target_domain("x.test");
-        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "fb");
+        assert_eq!(r.pick_route(&ctx).unwrap().outbound_tag, "b");
     }
 
     #[test]

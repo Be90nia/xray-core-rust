@@ -154,7 +154,10 @@ pub struct MetricsConfig {
     /// Prometheus 监听地址（如 `"127.0.0.1:9100"`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
-    /// Rust 扩展：是否在 metrics 中包含 tag 标签。
+    /// Rust 扩展（Go `metrics.Config` 无此键）。
+    ///
+    /// **当前不支持**：本仓 metrics 曝光层没有 per-tag 过滤面，配了也无处生效，
+    /// 故装配期非空即拒启（bd 2bmns G-6，`xray-core::register::metrics_factory`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
@@ -211,6 +214,9 @@ pub struct GeodataConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cron: Option<String>,
     /// 用于下载 assets 的 outbound tag。对应 Go `Outbound string`（geodata.go:44）。
+    ///
+    /// **当前不支持**：本仓下载器不接 dispatcher（恒直连），配了会暴露出口 IP 且
+    /// 墙内失败，故装配期非空即拒启（bd 2bmns G-3，`xray-core::register`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound: Option<String>,
     /// 待加载/定时更新的资源列表。对应 Go `Assets []*GeodataAssetConfig`。
