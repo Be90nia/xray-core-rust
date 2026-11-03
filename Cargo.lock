@@ -6143,6 +6143,7 @@ dependencies = [
  "async-trait",
  "base64",
  "boringtun",
+ "bytes",
  "futures",
  "hex",
  "prost",
