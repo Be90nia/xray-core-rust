@@ -175,9 +175,17 @@ impl Connection for SsConnection {
 async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: DuplexStream) {
     let log = &*SS_LOG;
     let (mut rd, mut wr) = tokio::io::split(server_io);
-    let mut up_buf = vec![0u8; 8 * 1024];
-    let mut down_buf = vec![0u8; 16 * 1024];
-    let mut pending: Vec<u8> = Vec::new();
+    // 上行明文直接读进池化 Buffer 的尾部可写区：`write_chunk_in_place` 把明文**原地**
+    // 覆写为密文、tag 写进尾部 headroom，再按 [sealed_size][ciphertext+tag] 两段向量写
+    // 落线 ⇒ 稳态用户态 0 拷贝（无「明文另拷一块再加密」）。
+    let mut up_buf = xray_buf::buffer::Buffer::new_pooled(8 * 1024);
+    // 每轮读入上限：既要留 tag headroom，也要守住单 chunk 载荷上限（帧边界=wire 契约）。
+    let up_cap =
+        up_buf.capacity().saturating_sub(stream.tag_size()).min(stream.max_chunk_payload());
+    // 解帧缓冲用 BytesMut：`try_open_chunk` 从头部 `split_to` 切密文段是 O(1)
+    // （无 drain 搬移、无逐帧分配），原地解密后直接交付；下行单次读用 `read_buf`
+    // 直读进它的 spare 区（不再经中转缓冲搬一遍）。
+    let mut pending = bytes::BytesMut::new();
     // SS-2022 客户端请求头首写待发兜底（Go 在 Process 里立即写请求头，Rust 首写
     // 在 pump 侧才出现）：上游 200ms 内无数据也必须发出（padding-only 请求），
     // 否则 server-speaks-first 目标（FTP/SMTP banner）会双向等死锁。
@@ -207,8 +215,12 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
             }
         }
         tokio::select! {
-            // up: 明文 duplex 读 → 加密 chunk 写到 SS wire
-            n = rd.read(&mut up_buf) => {
+            // up: 明文 duplex 读 → 原地 seal 的加密 chunk 写到 SS wire
+            n = async {
+                let spare = up_buf.writable_bytes();
+                let cap = spare.len().min(up_cap);
+                rd.read(&mut spare[..cap]).await
+            } => {
                 match n {
                     Ok(0) => {
                         // 半关闭：请求头尚未落线（无任何首写）时兜底发出
@@ -218,9 +230,12 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                         break;
                     }
                     Ok(n) => {
-                        if stream.write_chunk(&up_buf[..n]).await.is_err() {
+                        up_buf.advance_write(n);
+                        if stream.write_chunk_in_place(&mut up_buf).await.is_err() {
                             break;
                         }
+                        // 池化块留在本连接复用：只重置读写游标（密文已被写出）。
+                        up_buf.clear();
                         if stream.flush().await.is_err() {
                             break;
                         }
@@ -251,14 +266,21 @@ async fn pump_ss_stream(mut stream: SSStream<Box<dyn Connection>>, server_io: Du
                     t.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(3600));
                 }
             }
-            // down: cancel-safe 单次底层读 → pending（解帧在循环顶部同步完成）
-            n = stream.get_mut().read(&mut down_buf) => {
+            // down: cancel-safe 单次底层读，直读进 `pending` 的 spare 区
+            // （解帧在循环顶部同步完成；无中转缓冲 = 无「读完再 extend 一遍」）
+            n = async {
+                // 先保 16 KiB spare：BytesMut 的 chunk_mut 只在容量用尽时补 64B，
+                // 不预留会退化成逐 64B 读。
+                pending.reserve(16 * 1024);
+                stream.get_mut().read_buf(&mut pending).await
+            } => {
                 match n {
                     Ok(0) => {
                         let _ = wr.shutdown().await;
                         break;
                     }
-                    Ok(n) => pending.extend_from_slice(&down_buf[..n]),
+                    // 新字节已直接落在 pending 尾部，无需搬移
+                    Ok(_) => {}
                     Err(e) => {
                         log.debug(format!("ss pump down read error: {e}"));
                         break;
@@ -1026,6 +1048,92 @@ mod tests {
             "ss TCP dial must route through dial_system with the unresolved server domain, \
              seen: {seen:?}"
         );
+    }
+
+    /// half-close 专项（client→server）：客户端只关写方向后，服务端仍能读完客户端
+    /// 已发出的全部字节（EOF 只结束读，不丢已到数据）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ss_pump_half_close_client_to_server_delivers_all_bytes() {
+        use tokio::net::TcpListener;
+
+        use crate::inbound::SsInbound;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let inbound_addr = listener.local_addr().unwrap();
+        let ib = Arc::new(SsInbound::new(make_account(), "u@halfclose.c2s"));
+        let server = xray_common::testing::spawn("ss-halfclose-c2s", async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (_header, mut ss) = ib.handle_conn(conn).await.expect("handshake");
+            let mut got = Vec::new();
+            while let Some(chunk) = ss.read_chunk().await.expect("server read") {
+                got.extend_from_slice(&chunk);
+            }
+            got
+        });
+
+        let cfg = Arc::new(SsOutboundConfig::new(
+            make_account(),
+            Address::new_domain("127.0.0.1"),
+            inbound_addr.port(),
+        ));
+        let dial_fn = make_ss_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
+        let mut conn = dial_fn(&dest).await.expect("dial");
+
+        let payload: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+        conn.write_all(&payload).await.expect("write 64KiB");
+        conn.flush().await.expect("flush");
+        // 半关闭：只关写方向，读方向仍可用
+        conn.shutdown().await.expect("half close");
+
+        let got = server.await.expect("server join");
+        assert_eq!(got.len(), payload.len(), "half-close 后服务端必须收到全部 64KiB");
+        assert!(got == payload, "字节内容必须一致");
+    }
+
+    /// half-close 专项（server→client）：服务端写完即关写方向，客户端仍要读完
+    /// 全部 64 KiB（不是提前 EOF）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ss_pump_half_close_server_to_client_delivers_all_bytes() {
+        use tokio::net::TcpListener;
+
+        use crate::inbound::SsInbound;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let inbound_addr = listener.local_addr().unwrap();
+        let ib = Arc::new(SsInbound::new(make_account(), "u@halfclose.s2c"));
+        let payload: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+        let server_payload = payload.clone();
+        let server = xray_common::testing::spawn("ss-halfclose-s2c", async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (_header, mut ss) = ib.handle_conn(conn).await.expect("handshake");
+            ss.write_chunk(&server_payload).await.expect("write 64KiB");
+            ss.flush().await.expect("flush");
+            ss.shutdown().await.expect("half close write side");
+        });
+
+        let cfg = Arc::new(SsOutboundConfig::new(
+            make_account(),
+            Address::new_domain("127.0.0.1"),
+            inbound_addr.port(),
+        ));
+        let dial_fn = make_ss_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("example.com"), Port::new(80));
+        let mut conn = dial_fn(&dest).await.expect("dial");
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = conn.read(&mut buf).await.expect("client read");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        server.await.expect("server join");
+
+        assert_eq!(got.len(), payload.len(), "半关闭只结束流，不得截断已发数据");
+        assert!(got == payload, "字节内容必须一致");
     }
 
     #[test]

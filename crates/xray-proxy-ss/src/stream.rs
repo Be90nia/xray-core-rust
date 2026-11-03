@@ -12,12 +12,18 @@
 //! 不实现 `AsyncRead`/`AsyncWrite` trait（Pin 复杂，SS chunk 天然是分帧语义）。
 //! 提供 `write_chunk`/`read_chunk`/`flush`/`shutdown` 四个 async 方法，桥接时用循环。
 
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     config::MemoryAccount,
     error::{Result, SsError},
 };
+
+/// 单 chunk 的 Go 缓冲大小（`buf.Size`）：载荷上限 = 该值 − 2B size 段 − tag。
+///
+/// 分块粒度属 wire 契约（帧边界不变），写侧/读侧/pump 读入量都以此为上限。
+const GO_BUF_SIZE: usize = 8192;
 
 /// SS 流式 AEAD 读写器（**读/写双方向独立 AEAD+nonce**）。
 ///
@@ -51,6 +57,8 @@ pub struct SSStream<C> {
     plain_prefix: Vec<u8>,
     /// 写路径复用缓冲：单 chunk（sealed_size+sealed_payload）拼此缓冲单次写出，
     /// 避免每 chunk 两个中间 Vec + 两次 write（size 段 ~18B 单独成包）。
+    /// 原地 seal 路径（[`Self::write_chunk_in_place`]）下只放 sealed size 段
+    /// （2B + tag），载荷密文留在调用方缓冲里。
     write_buf: Vec<u8>,
 }
 
@@ -206,7 +214,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
     /// 客户端的**第一个** `write_chunk` 应传 addr+port（SS 地址格式），作为首帧。
     ///
     /// 超过单块上限时自动分块（对应 Go `AuthenticationWriter.writeStream` 按
-    /// `buf.Size(8192) - tag - 2` 分块），调用方无需关心大小。
+    /// `GO_BUF_SIZE - tag - 2` 分块，见 [`Self::max_chunk_payload`]），调用方无需关心大小。
     /// 空输入不产生任何 chunk（size=0 是流结束标记，不能由本方法发出）。
     ///
     /// # Errors
@@ -221,7 +229,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         // variable chunk，超出 u16 varHeaderLen 容量的尾段才走常规 body chunk。
         if self.pending_client_2022.is_some() {
             let rest = self.emit_pending_client_2022(plaintext).await?;
-            let max_payload = 8192 - self.tag_size - 2;
+            let max_payload = self.max_chunk_payload();
             for part in rest.chunks(max_payload.max(1)) {
                 self.write_single_chunk(part).await?;
             }
@@ -241,7 +249,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.tag_size = aead.tag_size();
             self.write_nonce = vec![0xFFu8; aead.nonce_size()];
             self.write_aead = std::sync::Arc::from(aead);
-            let first_len = plaintext.len().min(8192 - self.tag_size - 2);
+            let first_len = plaintext.len().min(self.max_chunk_payload());
             // SS2022 响应 fixed 头 epoch 为协议 wire 字段（sing writeResponse 对齐）。
             let epoch = xray_frame::compat::clock()
                 .now_system()
@@ -276,8 +284,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.inner.write_all(&head).await?;
             rest = &plaintext[first_len..];
         }
-        // 8192 = Go buf.Size；tag_size+2 是 size chunk 的 wire 开销。
-        let max_payload = 8192 - self.tag_size - 2;
+        let max_payload = self.max_chunk_payload();
         for part in rest.chunks(max_payload.max(1)) {
             self.write_single_chunk(part).await?;
         }
@@ -304,6 +311,86 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
         self.inner.write_all(&self.write_buf).await?;
         Ok(())
+    }
+
+    /// 原地 seal 写一个 chunk：载荷**零拷贝**（明文被就地覆写为密文）。
+    ///
+    /// 调用方缓冲里的明文段 `[start, end)` 原地加密，tag 写入缓冲尾部 headroom
+    /// （`xray_buf::buffer::Buffer::seal_window`），随后
+    /// `[sealed_size][ciphertext][tag]` 用一次向量写（`write_two_segments`）落线：
+    /// 用户态不再搬载荷，底层不支持 vectored 时退化为两次顺序写、**字节序不变**。
+    ///
+    /// 前置与退化：
+    /// - 缓冲尾部 headroom ≥ `tag_size` 且 `len ≤ u16::MAX` 才走原地路径，否则回退
+    ///   [`Self::write_chunk`] 的拷贝路径（pump 按块上限读入，稳态不触达）；
+    /// - SS-2022 握手首写（`pending_client_2022`／`pending_server_2022`）要先算长度再拼
+    ///   prefix，同样回退拷贝路径（每连接一次，非稳态）。
+    ///
+    /// nonce 推进次序与 [`Self::write_chunk`] **完全一致**（size 段先、payload 段后）；
+    /// AEAD 失败时载荷一字节未改（原地 seal 的失败不污染不变量）。
+    ///
+    /// # Errors
+    /// - [`SsError::AeadSeal`]：AEAD 加密失败。
+    /// - [`SsError::Io`]：底层写失败。
+    pub async fn write_chunk_in_place(&mut self, buf: &mut xray_buf::buffer::Buffer) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // shortcut: 非池化来源/超块缓冲直接传进来时回退拷贝路径；出现第二类调用方
+        // （非 pump 的裸 slice 生产者）时升级为「分块原位 seal」。
+        let fits = buf.rear_headroom() >= self.tag_size && buf.len() <= u16::MAX as usize;
+        if !fits || self.pending_client_2022.is_some() || self.pending_server_2022.is_some() {
+            return self.write_chunk(buf.bytes()).await;
+        }
+        let tag_size = self.tag_size;
+
+        // ① size 段：2B 明文原地 seal 进复用缓冲（tag 紧随其后），nonce 先推进。
+        increment_nonce_bytes(&mut self.write_nonce);
+        let plain_size =
+            u16::try_from(buf.len()).map_err(|_| SsError::InsufficientData(buf.len()))?;
+        self.write_buf.clear();
+        self.write_buf.resize(2 + tag_size, 0);
+        self.write_buf[..2].copy_from_slice(&plain_size.to_be_bytes());
+        let (size_plain, size_tag) = self.write_buf.split_at_mut(2);
+        self.write_aead
+            .seal_in_place_with_tag(&self.write_nonce, &[], size_plain, size_tag)
+            .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+
+        // ② payload 段：调用方缓冲原地 seal（密文覆写明文，tag 落尾部 headroom）。
+        increment_nonce_bytes(&mut self.write_nonce);
+        let payload_len = buf.len();
+        {
+            // `fits` 已保证尾部 headroom ≥ tag_size ⇒ 不会 None；分支仍保持 fail-visible。
+            let window = buf.seal_window(tag_size).ok_or(SsError::InsufficientData(payload_len))?;
+            self.write_aead
+                .seal_in_place_with_tag(&self.write_nonce, &[], window.payload, window.tag)
+                .map_err(|e| SsError::AeadSeal(e.to_string()))?;
+        }
+        // seal_window 只借出视图、不推进 end：tag 写完必须显式提交。
+        buf.advance_write(tag_size);
+
+        // ③ 两段向量写：[sealed_size][ciphertext+tag]（同一分配内连续，无拼装）。
+        xray_buf::writer::write_two_segments(&mut self.inner, &self.write_buf, buf.bytes())
+            .await
+            .map_err(|e| SsError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 单块 wire 开销：size/payload 两段的 AEAD tag 字节数。
+    ///
+    /// 原地 seal（[`Self::write_chunk_in_place`]）要求调用方缓冲尾部至少留这么多
+    /// headroom，因此 pump 读入量 = `capacity - tag_size()`。
+    #[must_use]
+    pub fn tag_size(&self) -> usize {
+        self.tag_size
+    }
+
+    /// 单 chunk 载荷上限：`GO_BUF_SIZE - tag_size - 2`（2B = size 段明文长度）。
+    ///
+    /// 与 Go `AuthenticationWriter.writeStream` 的分块粒度一致（帧边界属 wire 契约）。
+    #[must_use]
+    pub fn max_chunk_payload(&self) -> usize {
+        GO_BUF_SIZE.saturating_sub(self.tag_size + 2)
     }
 
     /// 写一个 raw chunk（直接 seal，无 size prefix）。
@@ -522,19 +609,23 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 
     /// 从应用层缓冲 `pending` 解出一个完整 SS chunk（`try_open_chunk` 返回态）。
     ///
-    /// - `NeedMore`：数据不足（不推进 nonce、不改缓冲语义之外的状态）
-    /// - `Message`：解出一帧明文（nonce 推进，wire 字节从 pending drain）
+    /// - `NeedMore`：数据不足（不推进 nonce、不消费缓冲）
+    /// - `Message`：解出一帧明文（nonce 推进，wire 字节从 pending 头部切走）
     /// - `End`：0 长度 chunk = 流结束标记
     ///
     /// 与 [`Self::read_chunk`] 的区别：读来源是调用方维护的缓冲而非直接 IO，
     /// 使 pump 层可以用 cancel-safe 的单次底层 read 喂数据（`Box<dyn Connection>`
     ///     `无 TcpStream::readable）。半帧状态存 `Self::pending_payload`。`
-    pub fn try_open_chunk(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+    ///
+    /// 拷贝账：wire 段由 `BytesMut::split_to` O(1) 切出，`open_in_place` 原地解密后
+    /// `freeze` 直接交付——每帧 0 分配 0 拷贝（旧实现 `drain(..n).collect()` +
+    /// `open` 的中间 Vec = 每帧 4 分配 4 拷贝）。
+    pub fn try_open_chunk(&mut self, pending: &mut BytesMut) -> Result<ChunkOut> {
         if !self.plain_prefix.is_empty() {
-            return Ok(ChunkOut::Message(std::mem::take(&mut self.plain_prefix)));
+            return Ok(ChunkOut::Message(Bytes::from(std::mem::take(&mut self.plain_prefix))));
         }
         // SS-2022 响应分阶段 rekey（缓冲版）—— sing clientConn.readResponse。
-        // 必须在 legacy rekey 前推进：salt 已 drained 字节不可恢复，状态机需顺序消费。
+        // 必须在 legacy rekey 前推进：salt 等被切走的字节不可恢复，状态机需顺序消费。
         if self.response_rekey_2022.is_some() {
             return self.drive_2022_rekey(pending);
         }
@@ -545,7 +636,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                 self.response_rekey = Some(account);
                 return Ok(ChunkOut::NeedMore);
             }
-            let iv: Vec<u8> = pending.drain(..iv_size).collect();
+            let iv = pending.split_to(iv_size);
             let aead =
                 account.cipher.create_aead(&account.key, &iv)?.ok_or(SsError::UnsupportedCipher)?;
             self.tag_size = aead.tag_size();
@@ -553,47 +644,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.read_aead = std::sync::Arc::from(aead);
         }
 
-        // 半帧恢复：size chunk 已解，直接等 payload
-        let wire_len = if let Some(n) = self.pending_payload {
-            n
-        } else {
-            let size_wire_len = 2 + self.tag_size;
-            if pending.len() < size_wire_len {
-                return Ok(ChunkOut::NeedMore);
-            }
-            let size_buf: Vec<u8> = pending.drain(..size_wire_len).collect();
-            increment_nonce_bytes(&mut self.read_nonce);
-            let size_plain = self
-                .read_aead
-                .open(&self.read_nonce, &[], &size_buf)
-                .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-            if size_plain.len() < 2 {
-                return Err(SsError::InsufficientData(size_plain.len()));
-            }
-            let payload_len = u16::from_be_bytes([size_plain[0], size_plain[1]]) as usize;
-            if payload_len == 0 {
-                return Ok(ChunkOut::End);
-            }
-            let wire = payload_len + self.tag_size;
-            self.pending_payload = Some(wire);
-            wire
-        };
-
-        if pending.len() < wire_len {
-            return Ok(ChunkOut::NeedMore);
-        }
-        let payload_buf: Vec<u8> = pending.drain(..wire_len).collect();
-        self.pending_payload = None;
-        increment_nonce_bytes(&mut self.read_nonce);
-        let plaintext = self
-            .read_aead
-            .open(&self.read_nonce, &[], &payload_buf)
-            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-        Ok(ChunkOut::Message(plaintext))
+        self.try_open_chunk_body(pending)
     }
 
     /// SS-2022 响应 rekey 状态机：salt → fixed → var（sing `readResponse` 缓冲版）。
-    fn drive_2022_rekey(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+    fn drive_2022_rekey(&mut self, pending: &mut BytesMut) -> Result<ChunkOut> {
         // 循环推进各阶段；任一阶段需更多字节 → NeedMore（状态保留）。
         // rekey 完成 → 退出落到下面的 half-frame / body loop。
         while let Some(stage) = self.response_rekey_2022.take() {
@@ -605,7 +660,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                             Some(Rekey2022::Salt { psk, kind, request_salt });
                         return Ok(ChunkOut::NeedMore);
                     }
-                    let salt: Vec<u8> = pending.drain(..salt_size).collect();
+                    let salt = pending.split_to(salt_size);
                     let subkey = crate::ss2022::derive_session_subkey(&psk, &salt, kind);
                     let aead = crate::ss2022::key::build_aead(kind, &subkey)
                         .map_err(|e| SsError::InitDecode(e.to_string()))?;
@@ -623,11 +678,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                             Some(Rekey2022::Fixed { fixed_plain, request_salt });
                         return Ok(ChunkOut::NeedMore);
                     }
-                    let buf: Vec<u8> = pending.drain(..wire).collect();
+                    let mut buf = pending.split_to(wire);
                     increment_nonce_bytes(&mut self.read_nonce);
                     let plain = self
                         .read_aead
-                        .open(&self.read_nonce, &[], &buf)
+                        .open_in_place(&self.read_nonce, &[], buf.as_mut())
                         .map_err(|e| SsError::AeadOpen(e.to_string()))?;
                     if plain.len() != fixed_plain {
                         return Err(SsError::InsufficientData(plain.len()));
@@ -684,24 +739,26 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
                         self.response_rekey_2022 = Some(Rekey2022::Var { var_len });
                         return Ok(ChunkOut::NeedMore);
                     }
-                    let buf: Vec<u8> = pending.drain(..wire).collect();
+                    let mut buf = pending.split_to(wire);
                     increment_nonce_bytes(&mut self.read_nonce);
-                    let plain = self
+                    let plaintext_len = self
                         .read_aead
-                        .open(&self.read_nonce, &[], &buf)
-                        .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-                    return Ok(ChunkOut::Message(plain));
+                        .open_in_place(&self.read_nonce, &[], buf.as_mut())
+                        .map_err(|e| SsError::AeadOpen(e.to_string()))?
+                        .len();
+                    buf.truncate(plaintext_len);
+                    return Ok(ChunkOut::Message(buf.freeze()));
                 },
             }
         }
-        // rekey 完成；进入正常 body 解帧（沿用下方 half-frame + size/payload 路径）。
-        // 重新进入 try_open_chunk 本体后半（跳过本轮 rekey 块直接到 body loop）。
-        // 这里通过递归调用 try_open_chunk 自身避免代码重复；pending 不含被本函数消耗字节。
+        // rekey 完成；进入正常 body 解帧（half-frame + size/payload 路径）。
+        // 复用 `try_open_chunk_body` 避免与 `try_open_chunk` 本体重复；
+        // pending 不含被本函数切走的字节。
         self.try_open_chunk_body(pending)
     }
 
     /// `try_open_chunk` 的 size/payload 解帧主体（在 SS-2022 rekey 完成后调用）。
-    fn try_open_chunk_body(&mut self, pending: &mut Vec<u8>) -> Result<ChunkOut> {
+    fn try_open_chunk_body(&mut self, pending: &mut BytesMut) -> Result<ChunkOut> {
         let wire_len = if let Some(n) = self.pending_payload {
             n
         } else {
@@ -709,11 +766,11 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             if pending.len() < size_wire_len {
                 return Ok(ChunkOut::NeedMore);
             }
-            let size_buf: Vec<u8> = pending.drain(..size_wire_len).collect();
+            let mut size_buf = pending.split_to(size_wire_len);
             increment_nonce_bytes(&mut self.read_nonce);
             let size_plain = self
                 .read_aead
-                .open(&self.read_nonce, &[], &size_buf)
+                .open_in_place(&self.read_nonce, &[], size_buf.as_mut())
                 .map_err(|e| SsError::AeadOpen(e.to_string()))?;
             if size_plain.len() < 2 {
                 return Err(SsError::InsufficientData(size_plain.len()));
@@ -730,14 +787,16 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         if pending.len() < wire_len {
             return Ok(ChunkOut::NeedMore);
         }
-        let payload_buf: Vec<u8> = pending.drain(..wire_len).collect();
+        let mut payload_buf = pending.split_to(wire_len);
         self.pending_payload = None;
         increment_nonce_bytes(&mut self.read_nonce);
-        let plaintext = self
+        let plaintext_len = self
             .read_aead
-            .open(&self.read_nonce, &[], &payload_buf)
-            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-        Ok(ChunkOut::Message(plaintext))
+            .open_in_place(&self.read_nonce, &[], payload_buf.as_mut())
+            .map_err(|e| SsError::AeadOpen(e.to_string()))?
+            .len();
+        payload_buf.truncate(plaintext_len);
+        Ok(ChunkOut::Message(payload_buf.freeze()))
     }
 
     /// 读一个 raw chunk（直接 open，无 size prefix），指定 wire 长度。
@@ -869,8 +928,8 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
 pub enum ChunkOut {
     /// 缓冲数据不足，等待更多 wire 字节。
     NeedMore,
-    /// 解出一帧明文。
-    Message(Vec<u8>),
+    /// 解出一帧明文（零拷贝：借用/接管调用方缓冲切出的密文段）。
+    Message(Bytes),
     /// 0 长度 chunk = 流结束标记。
     End,
 }
@@ -1023,6 +1082,97 @@ mod tests {
 
         let received = server.read_chunk().await.expect("read");
         assert_eq!(received.as_deref(), Some(payload.as_slice()));
+    }
+
+    /// 原地 seal 写路径必须与「明文另拷一块再 `cipher.seal`」的旧路径**逐字节相同**
+    /// ——wire 一字节不变，nonce 推进次序（size 段 [0..]、payload 段 [1,0..]）一致。
+    #[tokio::test]
+    async fn write_chunk_in_place_wire_identical_to_seal() {
+        let account = make_account(CipherType::Aes256Gcm, "test-password");
+        let iv = random_iv(&account);
+        let payload: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+
+        // 旧路径：write_chunk（seal_into 落到复用缓冲）
+        let (copy_half, mut copy_wire) = duplex(64 * 1024);
+        let mut copy_stream = SSStream::new_client(copy_half, &account, &iv).expect("client");
+        copy_stream.write_chunk(&payload).await.expect("write_chunk");
+        copy_stream.flush().await.expect("flush");
+
+        // 新路径：原地 seal（池化 Buffer 尾部留 tag headroom）
+        let (in_place_half, mut in_place_wire) = duplex(64 * 1024);
+        let mut in_place_stream =
+            SSStream::new_client(in_place_half, &account, &iv).expect("client");
+        let mut buf = xray_buf::buffer::Buffer::new_pooled(8192);
+        assert_eq!(buf.write_from(&payload), payload.len(), "明文落进池化块");
+        in_place_stream.write_chunk_in_place(&mut buf).await.expect("in-place seal");
+        in_place_stream.flush().await.expect("flush");
+
+        // 期望值：直接按 wire 次序（首帧 size 段 → payload 段）用 cipher.seal 算出
+        let aead = account
+            .cipher
+            .create_aead(&account.key, &iv)
+            .expect("aead init")
+            .expect("cipher present");
+        let mut nonce = vec![0xFFu8; aead.nonce_size()];
+        increment_nonce_bytes(&mut nonce);
+        let mut expected = aead
+            .seal(&nonce, &[], &u16::try_from(payload.len()).unwrap().to_be_bytes())
+            .expect("size");
+        increment_nonce_bytes(&mut nonce);
+        expected.extend_from_slice(&aead.seal(&nonce, &[], &payload).expect("payload"));
+
+        let mut copy_bytes = vec![0u8; expected.len()];
+        copy_wire.read_exact(&mut copy_bytes).await.expect("read copy wire");
+        let mut in_place_bytes = vec![0u8; expected.len()];
+        in_place_wire.read_exact(&mut in_place_bytes).await.expect("read in-place wire");
+
+        assert_eq!(copy_bytes, expected, "write_chunk 与 cipher.seal 逐字节对拍");
+        assert_eq!(in_place_bytes, expected, "原地 seal 与 cipher.seal 逐字节对拍");
+        assert_eq!(in_place_bytes, copy_bytes, "原地 seal 与 write_chunk wire 逐字节相同");
+    }
+
+    /// 半帧（size 已解、payload 未齐）**不得推进** payload 的 nonce：
+    /// 两次 NeedMore 之间 nonce 冻结，补齐后恰好再推进一次即解出明文。
+    #[tokio::test]
+    async fn try_open_chunk_half_frame_does_not_advance_nonce() {
+        let account = make_account(CipherType::Aes128Gcm, "test-password");
+        let iv = random_iv(&account);
+        let payload = b"half-frame payload bytes";
+
+        // 先按正常写路径产出一帧完整 wire
+        let (write_half, mut wire_rd) = duplex(8 * 1024);
+        let mut writer = SSStream::new_client(write_half, &account, &iv).expect("client");
+        writer.write_chunk(payload).await.expect("write");
+        writer.flush().await.expect("flush");
+        let mut wire = vec![0u8; 2 + 16 + payload.len() + 16];
+        wire_rd.read_exact(&mut wire).await.expect("read wire");
+
+        let (read_half, _keep_alive) = duplex(8 * 1024);
+        let mut reader = SSStream::new_client(read_half, &account, &iv).expect("client");
+        let mut pending = BytesMut::new();
+        let size_wire = 2 + 16;
+
+        // ① 只有 size 段：payload nonce 不得推进（半帧状态记下 wire 长度）
+        pending.extend_from_slice(&wire[..size_wire]);
+        assert!(
+            matches!(reader.try_open_chunk(&mut pending), Ok(ChunkOut::NeedMore)),
+            "size 段已解、payload 未到必须 NeedMore"
+        );
+        let nonce_after_size = reader.read_nonce.clone();
+
+        // ② payload 只到一部分（tag 未齐）：仍 NeedMore，nonce 冻结
+        pending.extend_from_slice(&wire[size_wire..size_wire + 5]);
+        assert!(matches!(reader.try_open_chunk(&mut pending), Ok(ChunkOut::NeedMore)));
+        assert_eq!(reader.read_nonce, nonce_after_size, "半帧期间 payload nonce 不得推进");
+
+        // ③ 补齐剩余：解出明文（nonce 恰好推进一次），wire 字节全消费
+        pending.extend_from_slice(&wire[size_wire + 5..]);
+        match reader.try_open_chunk(&mut pending) {
+            Ok(ChunkOut::Message(pt)) => assert_eq!(pt.as_ref(), payload),
+            Ok(_) => panic!("补齐后必须解出明文"),
+            Err(e) => panic!("补齐后解帧失败: {e}"),
+        }
+        assert!(pending.is_empty(), "wire 字节必须全部消费");
     }
 
     /// 单块上限 = 8192 - tag(16) - 2 = 8174。跨块 payload 自动分块，读侧多 chunk 重组。
@@ -1217,7 +1367,7 @@ mod tests {
         fixed_plain.extend_from_slice(&echo_salt);
         fixed_plain.extend_from_slice(&0u16.to_be_bytes());
         let sealed = server_aead.seal(&[0u8; 12], &[], &fixed_plain).unwrap();
-        let mut wire = resp_salt.to_vec();
+        let mut wire = BytesMut::from(resp_salt.as_slice());
         wire.extend_from_slice(&sealed);
 
         // client：占位 aead + mark rekey，直接驱动缓冲状态机
@@ -1256,7 +1406,7 @@ mod tests {
         fixed_plain.extend_from_slice(&request_salt);
         fixed_plain.extend_from_slice(&0u16.to_be_bytes());
         let sealed = server_aead.seal(&[0u8; 12], &[], &fixed_plain).unwrap();
-        let mut wire = resp_salt.to_vec();
+        let mut wire = BytesMut::from(resp_salt.as_slice());
         wire.extend_from_slice(&sealed);
 
         let client_aead = crate::ss2022::key::build_aead(kind, &[0u8; 16]).unwrap();

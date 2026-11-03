@@ -1189,12 +1189,12 @@ mod tests {
             stream.flush().await.unwrap();
             // SS-2022 响应必须走 try_open_chunk（read_chunk 是 legacy 路径，
             // 不跑 drive_2022_rekey 响应头状态机）
-            let mut pending: Vec<u8> = Vec::new();
+            let mut pending = bytes::BytesMut::new();
             let mut down_buf = vec![0u8; 16 * 1024];
             loop {
                 match stream.try_open_chunk(&mut pending) {
                     Ok(crate::stream::ChunkOut::Message(p)) => {
-                        assert_eq!(p, payload, "relay e2e roundtrip");
+                        assert_eq!(p.as_ref(), payload, "relay e2e roundtrip");
                         return;
                     },
                     Ok(crate::stream::ChunkOut::End) => {
