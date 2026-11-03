@@ -258,20 +258,37 @@ mod tests {
     }
 
     /// k16um 验收判据①：`alloc(64KB)` 拿到精确 64KB 层块（不再向上吃 128KB），
-    /// 且归还后同层复用（档位命中率表的主锚：64KB 请求错配 2x → 0）。
+    /// 且**归还后同块复用**。
+    ///
+    /// 池的真实语义（判据成立的前提）：归还进**本线程** TLS 层缓存（LIFO，
+    /// ≤8 块/层/线程），下一次同线程 `alloc` **先弹 TLS** ⇒ 同块必然复用；
+    /// 跨线程/分片路径不保证身份（Go `sync.Pool` 同样无身份保证）。
+    ///
+    /// 必须走 `release()` 归还池：直接 `drop()` 只把块还给**堆分配器**，下次
+    /// `alloc` 是新鲜分配——地址是否相同纯属分配器 free-list 的巧合，并行负载
+    /// 下必漂（2026-11-03 workspace 门禁红点实证：本地绿、并行红）。
     #[test]
     fn alloc_64k_request_lands_exact_tier() {
         let _g = POOL_TEST_LOCK.lock();
         clear();
         let first = alloc(64 * 1024);
-        assert_eq!(first.capacity(), 64 * 1024, "64KB 请求必须落精确 64KB 层（A4 错配修复）");
+        assert_eq!(first.capacity(), 64 * 1024, "64KB 请求必须落精确 64KB 层（A2 错配修复）");
         let addr = first.as_ptr() as usize;
-        drop(first);
+        release(first);
 
+        // 归还后同线程再取：TLS 层缓存先弹 ⇒ 同块复用（无新鲜分配）。
         let second = alloc(64 * 1024);
         assert_eq!(second.capacity(), 64 * 1024);
         assert_eq!(second.as_ptr() as usize, addr, "64KB 层块必须可归还复用");
-        drop(second);
+        release(second);
+
+        // 连续取块（跨过 TLS 8 块上限 ⇒ 走分片 / 新鲜分配路径）：容量恒为 64KB；
+        // 任何一次拿到 131072 即为「64KB 请求被重新路由到 128KB 层」的回归。
+        for _ in 0..32 {
+            let b = alloc(64 * 1024);
+            assert_eq!(b.capacity(), 64 * 1024, "64KB 请求在任何取块路径上都必须精确 64KB");
+            release(b);
+        }
         clear();
     }
 
