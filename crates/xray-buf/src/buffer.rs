@@ -58,7 +58,7 @@ impl Buffer {
     }
 
     /// 从分配池取一个可容纳 `size` 的块：按 [`crate::alloc`] 分层**向上取整**
-    /// （64KB 请求 → 128KB 层），Drop / [`Buffer::release`] 归还池。
+    /// （9KB 请求 → 32KB 层；64KB 请求 → 64KB 精确档），Drop / [`Buffer::release`] 归还池。
     ///
     /// 与 [`Buffer::with_capacity`] 的区别：那个走裸 `BytesMut::with_capacity`，
     /// 每次调用都是新鲜分配且容量不落层（释放即弃）；本函数稳态零新鲜分配。
@@ -661,7 +661,11 @@ mod tests {
     fn test_pooled_buffer_is_reused_after_drop() {
         init();
         let mut first = Buffer::new_pooled(64 * 1024);
-        assert_eq!(first.capacity(), 128 * 1024, "64KB 请求向上取 128KB 层");
+        assert_eq!(
+            first.capacity(),
+            64 * 1024,
+            "64KB 请求落 64KB 精确档（k16um：不再向上吃 128KB）"
+        );
         let addr = first.writable_bytes().as_ptr() as usize;
         drop(first);
 

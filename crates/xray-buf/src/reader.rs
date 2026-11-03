@@ -29,7 +29,7 @@ use crate::{
 pub struct SingleReader {
     inner: Box<dyn AsyncRead + Unpin + Send>,
     /// 读缓冲请求容量（构造期已归一：`0` → 缺省 [`alloc::DEFAULT_SIZE`]）。
-    /// 缓冲取自分层池，实际块容量按此向上取层（64KB 请求 → 128KB 层）。
+    /// 缓冲取自分层池，实际块容量按此向上取层（64KB 请求 → 64KB 精确档）。
     capacity: usize,
 }
 
@@ -42,7 +42,7 @@ impl SingleReader {
     /// 以指定单次读取容量创建；`capacity == 0` 等价 [`SingleReader::new`]（8KB）。
     ///
     /// 缓冲走池（[`Buffer::new_pooled`]），读毕随 `Buffer` Drop 归池 ⇒ 稳态
-    /// 零新鲜分配。F3 的读窗口语义不变：64KB 请求 ⇒ 窗口 128KB 层块。
+    /// 零新鲜分配。F3 的读窗口语义不变：64KB 请求 ⇒ 窗口 64KB 精确档层块。
     pub fn with_capacity(r: impl AsyncRead + Unpin + Send + 'static, capacity: usize) -> Self {
         let capacity = if capacity == 0 { alloc::DEFAULT_SIZE } else { capacity };
         Self { inner: Box::new(r), capacity }
@@ -424,8 +424,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_reader_buffer_comes_from_pool() {
-        // 票 4y9ns：读缓冲必须取自池分层块（64KB 请求 → 128KB 层），
-        // 而非每次 `BytesMut::with_capacity(64KB)` 新鲜分配（曾占 cli 分配 46%）。
+        // 票 4y9ns：读缓冲必须取自池分层块（64KB 请求 → 64KB 精确档，k16um 前
+        // 落 128KB 层），而非每次 `BytesMut::with_capacity(64KB)` 新鲜分配
+        // （曾占 cli 分配 46%）。
         use tokio::io::AsyncWriteExt;
         let (mut tx, rx) = tokio::io::duplex(64 * 1024);
         tx.write_all(&vec![0xCDu8; 1024]).await.expect("write failed");
@@ -436,8 +437,8 @@ mod tests {
         let buf = mb.iter().next().expect("应含一个缓冲区");
         assert_eq!(
             buf.capacity(),
-            128 * 1024,
-            "64KB 请求须落 128KB 池层（裸 with_capacity 会得到精确 64KB 新鲜块）"
+            64 * 1024,
+            "64KB 请求须落 64KB 池层精确档（裸 with_capacity 会得到精确 64KB 新鲜块，无法区分）"
         );
     }
 }

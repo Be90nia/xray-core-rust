@@ -7,7 +7,8 @@
 //! - Tier 0: 2KB   (2048 bytes)
 //! - Tier 1: 8KB   (8192 bytes) — 默认缓冲区大小
 //! - Tier 2: 32KB  (32768 bytes)
-//! - Tier 3: 128KB (131072 bytes)
+//! - Tier 3: 64KB  (65536 bytes) — k16um：消除「要 64KB 拿 128KB」的 2x 档位错配
+//! - Tier 4: 128KB (131072 bytes)
 
 use std::{
     cell::RefCell,
@@ -21,7 +22,7 @@ use parking_lot::Mutex;
 pub const DEFAULT_SIZE: usize = 8192;
 
 /// 缓冲区分层大小
-const TIER_SIZES: [usize; 4] = [2048, 8192, 32768, 131072];
+const TIER_SIZES: [usize; 5] = [2048, 8192, 32768, 65536, 131072];
 
 /// TLS 每层最大缓存数量
 const TLS_MAX_PER_TIER: usize = 8;
@@ -30,7 +31,7 @@ const TLS_MAX_PER_TIER: usize = 8;
 const SHARD_COUNT: usize = 8;
 
 /// 全局池每分片每层上限：超出直接丢弃，防高水位无限堆积。
-/// 8 分片 × 64 块：tier0 上限 1MB、tier3 上限 64MB。
+/// 8 分片 × 64 块：tier0 上限 1MB、tier3 上限 32MB、tier4 上限 64MB。
 const SHARD_MAX_PER_TIER: usize = 64;
 
 /// 惰性收缩间隔（近似 Go sync.Pool 被 GC 周期性清池的节奏）。
@@ -52,14 +53,14 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
-/// 全局池分片：每个分片包含4个层的 Vec<BytesMut>
+/// 全局池分片：每个分片包含 5 个层的 Vec<BytesMut>
 struct Shard {
-    tiers: [Vec<BytesMut>; 4],
+    tiers: [Vec<BytesMut>; 5],
 }
 
 impl Shard {
     const fn new() -> Self {
-        Self { tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
+        Self { tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
     }
 }
 
@@ -97,8 +98,8 @@ static SHARD_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// TLS 缓存：每层维护一个 Vec<BytesMut>，最多 TLS_MAX_PER_TIER 个
-    static TLS_CACHE: RefCell<[Vec<BytesMut>; 4]> = const {
-        RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new()])
+    static TLS_CACHE: RefCell<[Vec<BytesMut>; 5]> = const {
+        RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()])
     };
 }
 
@@ -247,9 +248,31 @@ mod tests {
         assert_eq!(select_tier(8192), Some(1));
         assert_eq!(select_tier(10000), Some(2));
         assert_eq!(select_tier(32768), Some(2));
+        // k16um：64KB 精确档（原 50000/131072 都落 128KB 层）
+        assert_eq!(select_tier(32769), Some(3));
+        assert_eq!(select_tier(65536), Some(3));
         assert_eq!(select_tier(50000), Some(3));
-        assert_eq!(select_tier(131072), Some(3));
+        assert_eq!(select_tier(65537), Some(4));
+        assert_eq!(select_tier(131072), Some(4));
         assert_eq!(select_tier(200000), None);
+    }
+
+    /// k16um 验收判据①：`alloc(64KB)` 拿到精确 64KB 层块（不再向上吃 128KB），
+    /// 且归还后同层复用（档位命中率表的主锚：64KB 请求错配 2x → 0）。
+    #[test]
+    fn alloc_64k_request_lands_exact_tier() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        let first = alloc(64 * 1024);
+        assert_eq!(first.capacity(), 64 * 1024, "64KB 请求必须落精确 64KB 层（A4 错配修复）");
+        let addr = first.as_ptr() as usize;
+        drop(first);
+
+        let second = alloc(64 * 1024);
+        assert_eq!(second.capacity(), 64 * 1024);
+        assert_eq!(second.as_ptr() as usize, addr, "64KB 层块必须可归还复用");
+        drop(second);
+        clear();
     }
 
     #[test]

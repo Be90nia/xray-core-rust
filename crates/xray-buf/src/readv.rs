@@ -24,6 +24,7 @@ use std::{
 use tokio::net::tcp::OwnedReadHalf;
 
 use crate::{
+    alloc,
     buffer::Buffer,
     io::{self, Reader, Result},
     multi::MultiBuffer,
@@ -118,6 +119,16 @@ impl AllocStrategy {
 /// readv 单次 read 的最大 iovec 数（= [`AllocStrategy`] 上界，Go readv_reader.go:34）。
 const MAX_READV: usize = 8;
 
+/// 读块尺寸升窗上限（64KB 池层精确档）。纯内部分配策略，与 wire 无关（k16um A3：
+/// Go 侧本无块尺寸升窗，本仓按 2026-11-02 设计基准自主引入）。
+const READ_BLOCK_MAX: usize = 64 * 1024;
+
+/// 升窗触发：连续 N 轮「readv 顶格（`count == MAX_READV`）且全部缓冲填满」。
+/// 顶格满载 = 稳态大吞吐（每轮 8×8KB=64KB 全收），此时升 64KB 块把单轮读入
+/// 提到 8×64KB=512KB，syscall/MB 降 8x。小流/慢流永远到不了顶格 ⇒ 行为与
+/// 现状逐字节一致（早期轮次批边界不变，vision 门判定面零扰动）。
+const FULL_STREAK_TO_UPGRADE: u32 = 2;
+
 /// 栈上 iovec 批：`read_vectored` 切片与容量表，零堆分配构建。
 struct IovecBatch<'a> {
     slices: [IoSliceMut<'a>; MAX_READV],
@@ -176,14 +187,52 @@ fn release_slots(bufs: &mut [Option<Buffer>; MAX_READV]) {
 
 // ========== ReadVReader（Go readv_reader.go:53-145） ==========
 
+/// k16um A3 升窗状态转移（纯函数）：给定当前 `(block_size, full_streak)` 与本轮
+/// 观测 `(n, total_cap, count)`，返回新 `(block_size, full_streak)`。
+/// [`ReadVReader::note_round`] 是它在 reader 状态上的薄封装。
+fn next_read_block(
+    block_size: usize,
+    full_streak: u32,
+    n: usize,
+    total_cap: usize,
+    count: u32,
+) -> (usize, u32) {
+    if n == total_cap {
+        if count as usize >= MAX_READV {
+            let streak = full_streak + 1;
+            let bs = if streak >= FULL_STREAK_TO_UPGRADE && block_size < READ_BLOCK_MAX {
+                READ_BLOCK_MAX
+            } else {
+                block_size
+            };
+            (bs, streak)
+        } else {
+            (block_size, 0)
+        }
+    } else if n * 2 < total_cap {
+        (alloc::DEFAULT_SIZE, 0)
+    } else {
+        (block_size, full_streak)
+    }
+}
+
 /// Scatter-gather 读取器，对应 Go `ReadVReader`。
 ///
 /// 持有 TCP 读半部（Rust 侧等价 Go 的 `io.Reader + syscall.RawConn` 对）：
 /// `current == 1` 时单缓冲读（Go ReadBuffer 分支），填满即扩容到 2；
 /// `current >= 2` 时一次 `readv` 填多缓冲，按实填数调整策略。
+///
+/// 块尺寸升窗（k16um A3，Go 无此机制）：readv **顶格满载**（`count == 8` 且
+/// 全部缓冲填满）连续 [`FULL_STREAK_TO_UPGRADE`] 轮后，读块从 8KB 升到
+/// [`READ_BLOCK_MAX`]（64KB 池层），单轮读入 64KB → 512KB；显著欠载（单轮
+/// 填充 < 半载）回落 8KB。小流/慢流到不了顶格 ⇒ 批边界与升窗前逐字节一致。
 pub struct ReadVReader {
     src: ReadVSource,
     alloc: AllocStrategy,
+    /// 当前读块尺寸（起步 [`alloc::DEFAULT_SIZE`]，块走池精确档）。
+    block_size: usize,
+    /// 连续「顶格满载」轮数（升窗计数，任何非顶格满载轮清零）。
+    full_streak: u32,
 }
 
 /// readv 读源。
@@ -225,19 +274,48 @@ impl ReadVReader {
     /// 对应 Go `NewReadVReader`。
     #[must_use]
     pub fn new(src: OwnedReadHalf) -> Self {
-        Self { src: ReadVSource::Half(src), alloc: AllocStrategy::new() }
+        Self {
+            src: ReadVSource::Half(src),
+            alloc: AllocStrategy::new(),
+            block_size: alloc::DEFAULT_SIZE,
+            full_streak: 0,
+        }
     }
 
     /// 整流读源（dup 读腿装配；`ReadVSource::Whole` 变体，drop 语义见类型注释）。
     #[must_use]
     pub fn new_whole(src: tokio::net::TcpStream) -> Self {
-        Self { src: ReadVSource::Whole(src), alloc: AllocStrategy::new() }
+        Self {
+            src: ReadVSource::Whole(src),
+            alloc: AllocStrategy::new(),
+            block_size: alloc::DEFAULT_SIZE,
+            full_streak: 0,
+        }
     }
 
     /// 当前分配策略（测试与观测用）。
     #[must_use]
     pub const fn alloc_strategy(&self) -> &AllocStrategy {
         &self.alloc
+    }
+
+    /// 当前读块尺寸（升窗观测用）。
+    #[must_use]
+    pub const fn read_block_size(&self) -> usize {
+        self.block_size
+    }
+
+    /// 一轮读取结束后的块尺寸升降窗判定（k16um A3）。
+    ///
+    /// - 顶格满载（`count == MAX_READV` 且 `n == total_cap`）连续 [`FULL_STREAK_TO_UPGRADE`] 轮 →
+    ///   块升 [`READ_BLOCK_MAX`]；
+    /// - 显著欠载（`n < total_cap / 2`）→ 回落 [`alloc::DEFAULT_SIZE`]；
+    /// - 其余（爬升期满载 / 半载以上欠载）维持现状。
+    fn note_round(&mut self, n: usize, total_cap: usize, count: u32) {
+        let (block_size, full_streak) =
+            next_read_block(self.block_size, self.full_streak, n, total_cap, count);
+        self.block_size = block_size;
+        self.full_streak = full_streak;
     }
 
     /// 就绪等待 + 非阻塞 `readv` 循环。
@@ -271,7 +349,7 @@ impl ReadVReader {
         // 栈上构建：填缓冲槽 → 拼 iovec（对应 Go posixReader.Init 直写 bs[nBuf].v）。
         let mut bufs: [Option<Buffer>; MAX_READV] = std::array::from_fn(|_| None);
         for slot in bufs.iter_mut().take(n_bufs) {
-            *slot = Some(Buffer::new());
+            *slot = Some(Buffer::new_pooled(self.block_size));
         }
         let mut batch = IovecBatch::build(&mut bufs, n_bufs);
 
@@ -295,6 +373,9 @@ impl ReadVReader {
         let mb = distribute_slots(n, &mut bufs, &lens, n_iov);
         // Go :143：多缓冲读按实填缓冲数调整。
         self.alloc.adjust(mb.buffer_count() as u32);
+        // 块尺寸升窗判定：顶格满载连续命中 → 升 64KB；显著欠载 → 回落（k16um A3）。
+        let total_cap = n_bufs * self.block_size;
+        self.note_round(n, total_cap, self.alloc.current());
         Ok(mb)
     }
 
@@ -302,7 +383,7 @@ impl ReadVReader {
     /// 分配 1 个池化 Buffer 直读；填满（IsFull）→ adjust(1) → 扩到 2，
     /// 下次起用 readv 多缓冲。
     async fn read_multi_single(&mut self) -> Result<MultiBuffer> {
-        let mut buf = Buffer::new();
+        let mut buf = Buffer::new_pooled(self.block_size);
         let cap = buf.writable_bytes().len();
         let read = self.read_ready_single(buf.writable_bytes()).await;
         let n = match read {
@@ -321,6 +402,9 @@ impl ReadVReader {
         if n >= cap {
             self.alloc.adjust(1);
         }
+        // 块尺寸升窗判定与多缓冲路径同源；count==1 时升窗分支天然不触发，
+        // 只保留显著欠载回落语义（k16um A3）。
+        self.note_round(n, cap, self.alloc.current());
         let mut mb = MultiBuffer::with_capacity(1);
         mb.push(buf);
         Ok(mb)
@@ -655,4 +739,84 @@ mod tests {
 
     // bd fwhh：IovecBatch::build 的 lens 与被删 Vec 版 buffer_iovecs 同源，
     // 正确性由 distribute_slots_byte_conservation_and_release 覆盖。
+
+    // ========== k16um A3：读块尺寸升窗 ==========
+
+    /// 端到端（真实 TCP）：1MiB 连续灌入驱动「顶格满载 ×2 轮」升窗（8KB→64KB），
+    /// 随后 4B 孤星读构成 <半载轮 → 回落 8KB；全程字节守恒。
+    /// 回落前置有序性由分阶段写入保证：bulk 写完 sleep 200ms 再发 tail，
+    /// 接收侧必先把 1MiB 消化完（每轮耗时毫秒级）。
+    #[tokio::test]
+    async fn read_block_upgrades_on_sustained_full_rounds_then_falls_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        const BULK: usize = 1024 * 1024;
+        use tokio::io::AsyncWriteExt;
+        let writer = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(&vec![0x5Au8; BULK]).await.expect("bulk write");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            s.write_all(b"tail").await.expect("tail write");
+            s.shutdown().await.unwrap();
+        });
+
+        let (sock, _) = listener.accept().await.unwrap();
+        let (rd, _wr) = sock.into_split();
+        let mut reader = ReadVReader::new(rd);
+
+        let mut total = 0usize;
+        let mut upgraded = false;
+        let mut saw_tail = false;
+        loop {
+            let mb = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read_multi())
+                .await
+                .expect("read timeout")
+                .expect("read ok");
+            if mb.is_empty() {
+                break;
+            }
+            total += mb.len();
+            if total > BULK {
+                saw_tail = true;
+                assert_eq!(
+                    reader.read_block_size(),
+                    alloc::DEFAULT_SIZE,
+                    "孤星欠载轮（4B << 半载）必须把读块回落 8KB"
+                );
+            } else if reader.read_block_size() == READ_BLOCK_MAX {
+                upgraded = true;
+            }
+        }
+        writer.await.unwrap();
+        assert!(upgraded, "连续顶格满载必须把读块升到 64KB（实测全程未升窗）");
+        assert!(saw_tail, "tail 轮未观测到（写入时序破坏）");
+        assert_eq!(total, BULK + 4, "升窗/回落全程字节守恒");
+    }
+
+    /// 升窗判定状态机（纯函数）：顶格满载计数、爬升期不计、半载维持、欠载回落。
+    #[test]
+    fn note_round_state_machine() {
+        let base = alloc::DEFAULT_SIZE;
+        // 爬升期满载（count<8）不计 streak
+        assert_eq!(next_read_block(base, 0, base, base, 1), (base, 0));
+        // 顶格满载第 1 轮：计数未达阈值，块不变
+        let cap8 = MAX_READV * base;
+        assert_eq!(next_read_block(base, 0, cap8, cap8, MAX_READV as u32), (base, 1));
+        // 顶格满载第 2 轮：升窗
+        assert_eq!(next_read_block(base, 1, cap8, cap8, MAX_READV as u32), (READ_BLOCK_MAX, 2));
+        // 已升窗后顶格满载：维持 64KB
+        let cap64 = MAX_READV * READ_BLOCK_MAX;
+        assert_eq!(
+            next_read_block(READ_BLOCK_MAX, 2, cap64, cap64, MAX_READV as u32),
+            (READ_BLOCK_MAX, 3)
+        );
+        // 半载以上欠载：块与 streak 均维持
+        assert_eq!(
+            next_read_block(READ_BLOCK_MAX, 2, cap64 * 3 / 4, cap64, 6),
+            (READ_BLOCK_MAX, 2)
+        );
+        // 显著欠载：回落 8KB + streak 清零
+        assert_eq!(next_read_block(READ_BLOCK_MAX, 2, 4, cap64, 1), (base, 0));
+    }
 }
