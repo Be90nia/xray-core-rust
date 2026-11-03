@@ -570,7 +570,7 @@ fn default_feature_factory(kind: &'static str) -> FeatureFactory {
 
 /// 真实 stats Feature：包装 `xray_app_stats::Manager`（对应 Go `app/stats.Instance`）。
 ///
-/// 替代 `DefaultStatsFeature`（NoopManager）——counter/online_map/channel 可真实注册与计数，
+/// counter/online_map/channel 可真实注册与计数，
 /// api/其它 feature 经 [`xray_features::stats::Manager`] trait 消费。
 pub struct AppStatsFeature {
     manager: std::sync::Arc<xray_app_stats::Manager>,

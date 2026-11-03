@@ -79,11 +79,11 @@ mod tests {
     }
 
     #[test]
-    fn stats_error_from_manager_not_implemented() {
-        let inner = xray_features::stats::ManagerError::NotImplemented;
+    fn stats_error_from_manager_channel_start() {
+        let inner = xray_features::stats::ManagerError::ChannelStart("channel closed".into());
         let e: StatsError = inner.into();
         assert!(matches!(e, StatsError::Manager(_)));
-        assert_eq!(e.to_string(), "not implemented");
+        assert_eq!(e.to_string(), "channel start failed: channel closed");
     }
 
     #[test]

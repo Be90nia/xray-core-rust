@@ -12,13 +12,13 @@
 //!
 //! 业务核心（独立可测）：
 //! - [`sniffer`] — `SniffResult` trait、`Sniffer` 编排框架、`CompositeSniffResult` 组合结果、
-//!   `ProtocolSniffer` trait（具体协议解析器留 TODO）
+//!   `ProtocolSniffer` trait（各协议解析器由 `xray-core` 装配时注入）
 //! - [`stats`] — `SizeStatWriter` / `SizeStatReader` 字节计数包装
 //! - [`error`] — `DispatcherError` 错误类型
 //!
-//! IO 边界（trait + NotImplemented 占位）：
+//! IO 边界（trait + 真实实现）：
 //! - [`default`] — `DefaultDispatcher`、`DispatchHandler`/`OutboundHandlerManager`/`RoutingRouter`
-//!   trait。完整 `Dispatch`/`DispatchLink` 流程依赖 transport 全链路，主体留 TODO
+//!   trait。`dispatch`/`dispatch_link` 流程已实装（嗅探 + 路由 + 计数 + 兜底选择面）
 //! - [`fakednssniffer`] — `FakeDnsEngine` trait、`FakeDnsSnifferFactory` 占位
 //!
 //! ## 关键决策（详见 docs/translation-conventions.md §10）

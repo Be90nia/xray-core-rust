@@ -5,15 +5,16 @@
 //! # 设计
 //!
 //! - `Router` 持有规则列表 + 平衡器映射，提供 `pick_route` 同步接口。
-//! - 域名策略（`DomainStrategy`）保留为字段，但**当前实现不执行 DNS 解析** （`xray-features::dns`
-//!   与本 crate trait 不兼容，留待接入）。
+//! - 域名策略（`DomainStrategy`）经 `set_dns_client` 注入的 DNS client 执行解析
+//!   （`pick_route_resolved`；生产注入见 `xray-core/src/wiring.rs`）。
 //! - IO 边界（出站选择、观测器、dispatcher）通过 trait + Arc 注入。
 //!
 //! # IO 边界
 //!
-//! - `OutboundHandlerSelector` 当前必须提供（即使 `NotImplementedSelector`）。
-//! - `ObservationProvider` 仅 LeastPing/LeastLoad 策略需要。
-//! - DNS 解析路径：TODO（等上层接入）。
+//! - `OutboundHandlerSelector` 必须提供（生产实现见 `xray-core::wiring::OhmOutboundSelector`）。
+//! - `ObservationProvider` 仅 LeastPing/LeastLoad 策略需要（生产实现见
+//!   `xray-core::wiring::ObservatoryProviderBridge`）。
+//! - DNS 解析路径：经 `set_dns_client` 注入后由 `pick_route_resolved` 执行。
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -465,7 +466,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::*;
-    use crate::{balancing::NotImplementedSelector, context::RoutingData};
+    use crate::{balancing::SimpleSelector, context::RoutingData};
 
     fn simple_tag_rule(tag: &str, domain: &str) -> RoutingRule {
         use xray_proto::xray::{
@@ -500,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_empty_router_returns_no_clue() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         let ctx = RoutingData::new().with_target_domain("any");
         assert!(matches!(r.pick_route(&ctx), Err(RouterError::NoClue)));
     }
@@ -509,7 +510,7 @@ mod tests {
     fn test_simple_router_picks_matching_rule() {
         let cfg =
             Config { rule: vec![simple_tag_rule("direct", "example.com")], ..Config::default() };
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
+        let r = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None).unwrap();
         let hit = RoutingData::new().with_target_domain("example.com");
         let miss = RoutingData::new().with_target_domain("other.io");
         assert_eq!(
@@ -521,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_add_and_remove_rule() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         r.add_rule("rule1".into(), simple_tag_rule("tag1", "a.com")).unwrap();
         assert!(r.list_rules().iter().any(|(_, rt)| rt == "rule1"));
 
@@ -541,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_reload_rules_replaces_all() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
         let cfg = Config {
             rule: vec![RoutingRule { rule_tag: "r2".into(), ..simple_tag_rule("t2", "b.com") }],
@@ -555,7 +556,7 @@ mod tests {
     /// bd 9c8k6 ①：shouldAppend=true 保留旧规则并追加（Go 语义）。
     #[test]
     fn test_reload_rules_append_keeps_old_and_rejects_dup_tag() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         r.add_rule("r1".into(), simple_tag_rule("t1", "a.com")).unwrap();
         let cfg = Config {
             rule: vec![RoutingRule { rule_tag: "r2".into(), ..simple_tag_rule("t2", "b.com") }],
@@ -581,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_override_balancer_not_found() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         let err = r.override_balancer("nope", "target").unwrap_err();
         assert!(matches!(err, RouterError::BalancerNotFound(_)));
     }
@@ -589,7 +590,7 @@ mod tests {
     #[test]
     fn test_domain_strategy_from_config() {
         let cfg = Config { domain_strategy: 3, ..Config::default() };
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None).unwrap();
+        let r = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None).unwrap();
         assert_eq!(r.domain_strategy(), DomainStrategy::IpOnDemand);
     }
 
@@ -691,7 +692,8 @@ mod tests {
         let loader = Arc::new(GeoDataLoader::new(dir.clone()));
 
         let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
+        let r =
+            Router::init(&cfg, Arc::new(SimpleSelector::default()), None, Some(loader)).unwrap();
 
         // 命中 CN CIDR 192.168.0.0/16
         let hit = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
@@ -713,7 +715,8 @@ mod tests {
         let loader = Arc::new(GeoDataLoader::new(dir.clone()));
 
         let cfg = Config { rule: vec![geosite_rule()], ..Config::default() };
-        let r = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader)).unwrap();
+        let r =
+            Router::init(&cfg, Arc::new(SimpleSelector::default()), None, Some(loader)).unwrap();
 
         // baidu.com 是 Full 类型，应命中
         let hit_full = RoutingData::new().with_target_domain("baidu.com");
@@ -735,7 +738,7 @@ mod tests {
         // loader = None 时 GeoIP/GeoSite 变体 warn 并 skip，不 panic
         let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
         // loader = None 时 GeoIP 变体被 skip，IPMatcher 收到空 vec 返回错（GeodataBuild）
-        let result = Router::init(&cfg, Arc::new(NotImplementedSelector), None, None);
+        let result = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None);
         assert!(result.is_err(), "expected error when geoip rule present but no loader");
     }
 
@@ -747,7 +750,7 @@ mod tests {
         let loader = Arc::new(GeoDataLoader::new(dir.clone()));
 
         let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
-        let err = Router::init(&cfg, Arc::new(NotImplementedSelector), None, Some(loader))
+        let err = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, Some(loader))
             .err()
             .expect("expected init failure when geoip.dat missing");
         assert!(
@@ -766,7 +769,7 @@ mod tests {
 
     use xray_proto::xray::core::app::observatory::{ObservationResult, OutboundStatus};
 
-    use crate::balancing::{MemoryObservationProvider, SimpleSelector};
+    use crate::balancing::MemoryObservationProvider;
     /// 简单 tag 规则（domain="x.test" → tag）；用于挂上 BalancingRule。
     fn simple_balance_rule(balancer_tag: &str) -> RoutingRule {
         use xray_proto::xray::{

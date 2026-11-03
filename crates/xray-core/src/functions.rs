@@ -48,7 +48,6 @@ use crate::{
     inbound::spawn_inbounds,
     outbound::register_outbounds,
     register::{register_all_features, register_all_transports},
-    router::DispatchRouter,
 };
 
 /// AccessLogSink → LogInstance 桥（bd 4uu）。
@@ -196,30 +195,16 @@ pub fn start_from_built(
 ///
 /// # Routing 自动接入
 ///
-/// 如果 `built.apps` 含 `kind="routing"` 项，优先用 `xray-app-router` 的完整
+/// 如果 `built.apps` 含 `kind="routing"` 项，用 `xray-app-router` 的完整
 /// [`crate::wiring::RouterAdapter`]（rich RoutingContext + DNS resolved 选路）；
-/// 失败时回退 [`PatternRouter`](crate::router::PatternRouter)；否则走纯 default
-/// outbound 路径。三条路径统一经 [`DefaultDispatcher`]（sniffing + routing + stats）。
+/// 无 routing app 时走纯 default outbound 路径。两条路径统一经
+/// [`DefaultDispatcher`]（sniffing + routing + stats）。
 pub async fn start_full(
     built: &xray_conf::BuiltConfig,
 ) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
     // 生产路径自持 loopback sink（register_outbounds 内已喂给 loopback handler），
     // 调用方无需取用。
-    let (instance, ohm, handles, _loopback_sink) = start_full_dispatched(built, None, None).await?;
-    Ok((instance, ohm, handles))
-}
-
-/// 带路由的完整启动路径：Instance + SimpleOhm + outbounds + router + inbounds。
-///
-/// router 经 [`crate::wiring::DispatchRouterBridge`] 暴露为 dispatcher 的
-/// `RoutingRouter`，与 [`start_full`] 的 RouterAdapter 路径同样经
-/// [`DefaultDispatcher::dispatch_link`] 分发（仅目标地址参与规则匹配）。
-pub async fn start_full_with_router(
-    built: &xray_conf::BuiltConfig,
-    router: Arc<dyn DispatchRouter>,
-) -> Result<(Arc<Instance>, Arc<SimpleOhm>, Vec<tokio::task::JoinHandle<()>>), CoreFunctionError> {
-    let (instance, ohm, handles, _loopback_sink) =
-        start_full_dispatched(built, Some(router), None).await?;
+    let (instance, ohm, handles, _loopback_sink) = start_full_dispatched(built, None).await?;
     Ok((instance, ohm, handles))
 }
 
@@ -248,7 +233,7 @@ pub async fn start_full_with_outbound_handlers(
     ),
     CoreFunctionError,
 > {
-    start_full_dispatched(built, None, Some(handlers)).await
+    start_full_dispatched(built, Some(handlers)).await
 }
 
 /// 共用装配路径（方案 B）：Instance + SimpleOhm + outbounds + DefaultDispatcher + inbounds。
@@ -263,8 +248,6 @@ pub async fn start_full_with_outbound_handlers(
 /// `dns_router` 仅用于 DNS client 注入（domainStrategy 解析）。
 async fn start_full_dispatched(
     built: &xray_conf::BuiltConfig,
-    // 外部注入路由器（`start_full_with_router` 路径）；None 时按 routing app 自动装配。
-    routing_override: Option<Arc<dyn DispatchRouter>>,
     // B5 framework 注入（仅 feature 路径产 Some）：出站 handler 由调用方灌入，
     // 跳过 register_outbounds 生产构建；None = 生产路径，行为不变。
     external_outbounds: Option<Vec<Arc<dyn xray_app_dispatcher::DispatchHandler>>>,
@@ -296,11 +279,7 @@ async fn start_full_dispatched(
     // 访问控制静默失效（E1：`port:"18500,bad-port"` 后屏蔽规则不生效、流量直连）。
     // 适配器句柄保留：commander RoutingService 注入（bd lu37q）需要同一个 Router。
     let mut routing_adapter: Option<Arc<crate::wiring::RouterAdapter>> = None;
-    let (routing_router, dns_router) = if let Some(r) = routing_override {
-        let bridge = Arc::new(crate::wiring::DispatchRouterBridge::new(Arc::clone(&r)))
-            as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-        (Some(bridge), Some(r))
-    } else {
+    let routing_router: Option<Arc<dyn xray_app_dispatcher::default::RoutingRouter>> =
         match built.apps.iter().find(|a| a.kind == "routing") {
             Some(a) => {
                 // 观测器：observatory app 存在时桥接（leastping/leastload 观测数据源，
@@ -309,24 +288,21 @@ async fn start_full_dispatched(
                     instance
                         .get_feature::<xray_app_observatory::ObservatoryFeature>()
                         .map(|f| Arc::new(crate::wiring::ObservatoryProviderBridge(f)) as Arc<_>);
-                let adapter =
-                    crate::wiring::build_router_adapter_from_json_with_ohm(&a.data, &ohm, observer)
-                        .map_err(|e| {
-                            CoreFunctionError::InstanceInit(format!("router init failed: {e}"))
-                        })?;
+                let adapter = crate::wiring::build_router_adapter_from_json_with_ohm(
+                    &a.data,
+                    Arc::clone(&ohm),
+                    observer,
+                )
+                .map_err(|e| CoreFunctionError::InstanceInit(format!("router init failed: {e}")))?;
                 routing_adapter = Some(Arc::clone(&adapter));
-                let routing =
-                    Arc::clone(&adapter) as Arc<dyn xray_app_dispatcher::default::RoutingRouter>;
-                let dns_side = Arc::clone(&adapter) as Arc<dyn DispatchRouter>;
-                (Some(routing), Some(dns_side))
+                Some(Arc::clone(&adapter) as Arc<dyn xray_app_dispatcher::default::RoutingRouter>)
             },
-            None => (None, None),
-        }
-    };
+            None => None,
+        };
 
     // DNS 注入（对应 Go 装配链：instance 创建后 router.dns = core.GetFeature(dns)）：
     // routing domainStrategy（IpOnDemand/IpIfNonMatch）解析经 DnsClient 查询。
-    if let Some(r) = dns_router.as_ref() {
+    if let Some(r) = routing_adapter.as_ref() {
         if let Some(dns) = instance.get_feature::<xray_app_dns::DnsService>() {
             r.set_dns_client(Arc::clone(&dns) as Arc<dyn xray_features::dns::DnsClient>);
         } else if let Some(local) = instance.get_feature::<xray_features::dns::DefaultDnsFeature>()
@@ -549,7 +525,7 @@ async fn start_full_dispatched(
         .map_err(|e| CoreFunctionError::InstanceStart(e.to_string()))?;
     tracing::info!(
         inbounds = handles.len(),
-        routed = dns_router.is_some(),
+        routed = routing_adapter.is_some(),
         "Xray instance started via DefaultDispatcher (sniffing+stats+routing+accesslog)"
     );
 
@@ -4654,8 +4630,12 @@ mod tests {
 
             // wiring 层直连二分：同一 JSON 经 build_router_adapter 后 IP dest 应
             // 命中 block（区分 wiring 解析/展开 vs dispatcher ctx 传递）。
-            let adapter = crate::wiring::build_router_adapter_from_json(&cfg.apps[0].data)
-                .expect("adapter build with geoip rule");
+            let adapter = crate::wiring::build_router_adapter_from_json_with_ohm(
+                &cfg.apps[0].data,
+                Arc::new(SimpleOhm::new()),
+                None,
+            )
+            .expect("adapter build with geoip rule");
             let probe_dest = xray_common::net::destination::Destination::new(
                 xray_common::net::address::Address::IPv4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
                 xray_common::net::port::Port::new(80),

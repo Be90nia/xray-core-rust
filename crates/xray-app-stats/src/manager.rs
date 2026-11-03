@@ -169,7 +169,7 @@ impl ManagerTrait for Manager {
         tracing::debug!("create new channel {name}");
         let c: Arc<dyn Channel> = Arc::new(StatsChannel::new(ChannelConfig::default()));
         if self.running.load(Ordering::SeqCst) {
-            c.start().map_err(|_| ManagerError::NotImplemented)?;
+            c.start().map_err(|e| ManagerError::ChannelStart(e.to_string()))?;
         }
         channels.insert(name.to_string(), Arc::clone(&c));
         Ok(c)
@@ -210,8 +210,8 @@ impl Manager {
         self.running.store(true, Ordering::SeqCst);
         let channels = self.channels.read();
         for c in channels.values() {
-            // Channel::start 失败映射为 NotImplemented（Go 等价行为）
-            c.start().map_err(|_| ManagerError::NotImplemented)?;
+            // Channel::start 失败：Go `Channel.Start()` 返回 error（不是「未实现」）。
+            c.start().map_err(|e| ManagerError::ChannelStart(e.to_string()))?;
         }
         Ok(())
     }

@@ -23,7 +23,7 @@ use xray_app_dispatcher::{
 };
 use xray_app_router::{
     Router,
-    balancing::{NotImplementedSelector, ObservationProvider, OutboundHandlerSelector},
+    balancing::{ObservationProvider, OutboundHandlerSelector},
     context::RoutingData as RouterRoutingData,
     error::RouterError,
 };
@@ -43,12 +43,7 @@ use xray_mux::client::MUX_COOL_ADDRESS;
 use xray_proto::xray::common::geodata::CidrRule;
 use xray_transport::link::Link;
 
-use crate::router::DispatchRouter;
-
 /// 把 `xray_app_router::Router` 暴露为 dispatcher 的 [`RoutingRouter`]。
-///
-/// 同时实现 [`DispatchRouter`]，便于现有的 `start_full_with_router` 路径
-/// （走 `RoutingHandler` 包装）直接使用，无需切换到 `DefaultDispatcher`。
 pub struct RouterAdapter {
     router: Arc<Router>,
 }
@@ -155,10 +150,13 @@ impl RoutingRouter for RouterAdapter {
     }
 }
 
-/// 同一适配器也实现 [`DispatchRouter`]——便于 `start_full_with_router` 现有路径
-/// （走 `RoutingHandler`，不依赖 `DefaultDispatcher`）直接复用完整 Router。
-impl DispatchRouter for RouterAdapter {
-    fn pick_outbound_tag(&self, dest: &Destination) -> Option<String> {
+impl RouterAdapter {
+    /// `Destination` 直查入口：仅目标地址/端口/网络（无 source/user 上下文）。
+    ///
+    /// 生产选路走 [`RoutingRouter`]（dispatcher 侧完整 `RoutingContext`）；本方法供
+    /// 「给定目标地址选出站 tag」的直查场景（如 geoip 规则命中判定）。
+    #[must_use]
+    pub fn pick_outbound_tag(&self, dest: &Destination) -> Option<String> {
         let data = dest_to_routing_data(dest);
         match self.router.pick_route(&data) {
             Ok(route) => Some(route.outbound_tag),
@@ -167,7 +165,7 @@ impl DispatchRouter for RouterAdapter {
     }
 
     /// 带 DNS 解析的选路：委托 [`Router::pick_route_resolved`]（domainStrategy 分支）。
-    fn pick_outbound_tag_resolved<'a>(
+    pub fn pick_outbound_tag_resolved<'a>(
         &'a self,
         dest: &'a Destination,
     ) -> std::pin::Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
@@ -181,7 +179,7 @@ impl DispatchRouter for RouterAdapter {
     }
 
     /// 注入 DNS 解析能力（domainStrategy IpOnDemand/IpIfNonMatch 用）。
-    fn set_dns_client(&self, dns: std::sync::Arc<dyn xray_features::dns::DnsClient>) {
+    pub fn set_dns_client(&self, dns: std::sync::Arc<dyn xray_features::dns::DnsClient>) {
         self.router.set_dns_client(dns);
     }
 }
@@ -199,61 +197,6 @@ fn dest_to_routing_data(dest: &Destination) -> RouterRoutingData {
 }
 
 // ========== 生产接线（方案 B）：DefaultDispatcher 入口桥 ==========
-
-/// 把任意 [`DispatchRouter`] 暴露为 dispatcher 的 [`RoutingRouter`]。
-///
-/// `start_full_with_router(built, router: Arc<dyn DispatchRouter>)` 的适配层：
-/// `pick_route` 走同步 `pick_outbound_tag`（仅目标地址），`pick_route_resolved`
-/// 走 DNS 解析版。RouterAdapter 自身双 trait 实现时无需经过本桥。
-pub struct DispatchRouterBridge {
-    inner: Arc<dyn DispatchRouter>,
-}
-
-impl DispatchRouterBridge {
-    #[must_use]
-    pub fn new(inner: Arc<dyn DispatchRouter>) -> Self {
-        Self { inner }
-    }
-}
-
-impl std::fmt::Debug for DispatchRouterBridge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DispatchRouterBridge").finish()
-    }
-}
-
-/// 从 RoutingContext 提取目标 [`Destination`]（桥接用，仅目标地址/端口/网络）。
-fn ctx_target_dest(ctx: &dyn DispRoutingContext) -> Destination {
-    let addr = match ctx.get_target_ips().first() {
-        Some(std::net::IpAddr::V4(ip)) => Address::IPv4(*ip),
-        Some(std::net::IpAddr::V6(ip)) => Address::IPv6(*ip),
-        None => Address::Domain(ctx.get_target_domain().to_string()),
-    };
-    Destination::new(addr, ctx.get_target_port(), ctx.get_network())
-}
-
-impl RoutingRouter for DispatchRouterBridge {
-    fn pick_route(&self, ctx: &dyn DispRoutingContext) -> Result<DispRoute, DispatcherError> {
-        match self.inner.pick_outbound_tag(&ctx_target_dest(ctx)) {
-            Some(tag) => Ok(DispRoute::new(tag)),
-            None => Err(DispatcherError::Other("no route matched".into())),
-        }
-    }
-
-    fn pick_route_resolved<'a>(
-        &'a self,
-        ctx: &'a dyn DispRoutingContext,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let dest = ctx_target_dest(ctx);
-            match self.inner.pick_outbound_tag_resolved(&dest).await {
-                Some(tag) => Ok(DispRoute::new(tag)),
-                None => Err(DispatcherError::Other("no route matched".into())),
-            }
-        })
-    }
-}
 
 /// `BuiltInbound.sniffing` JSON → dispatcher [`SniffingRequest`]。
 ///
@@ -675,22 +618,17 @@ impl InboundDispatchHandler {
 /// 对应 Go `outbound.HandlerSelector.Select`（app/proxyman/outbound/outbound.go:164）：
 /// tagged handler 全集按 selectors 前缀匹配，返回排序后的 tag 列表；空 selectors
 /// 返回空（走 Balancer fallback）。
+///
+/// 持 `Arc<SimpleOhm>`（而非裸指针）：适配器与被选表同生共死，无需调用方保证
+/// 生命周期（先前的 `*const SimpleOhm` + `unsafe impl Send/Sync` 已随之删除）。
 struct OhmOutboundSelector {
-    inner: *const SimpleOhm,
+    inner: Arc<SimpleOhm>,
 }
-
-// Safety: SimpleOhm 是 Send + Sync；指针所指 ohm 由装配方持有（`start_full_dispatched`
-// 的 `ohm: Arc<SimpleOhm>`）覆盖 RouterAdapter 整个生命周期（outbound.rs::OhmRef 同款）。
-unsafe impl Send for OhmOutboundSelector {}
-// Safety: 同上；内部仅读 RwLock（list_tags），无 &mut。
-unsafe impl Sync for OhmOutboundSelector {}
 
 impl OutboundHandlerSelector for OhmOutboundSelector {
     fn select_outbounds(&self, selectors: &[String]) -> Result<Vec<String>, RouterError> {
-        // Safety: 指针在适配器生命周期内有效（见 unsafe impl 注释）
-        let ohm: &SimpleOhm = unsafe { &*self.inner };
         let mut tags: Vec<String> = Vec::new();
-        for tag in ohm.list_tags() {
+        for tag in self.inner.list_tags() {
             if selectors.iter().any(|s| tag.starts_with(s.as_str())) {
                 tags.push(tag);
             }
@@ -719,41 +657,22 @@ impl ObservationProvider for ObservatoryProviderBridge {
 /// 为 proto `Config` → `Router::init`。其他 proto 字段（balancer、user、protocol 等）
 /// 留空——这些字段在 dispatcher 提供完整 `RoutingContext` 时才会被规则匹配用到。
 ///
-/// balancer selector 为 `NotImplementedSelector`（无 ohm 可选）——balancer 规则
-/// 一律走 fallback。生产装配用 [`build_router_adapter_from_json_with_ohm`]。
+/// balancer selector 接真实 [`SimpleOhm`]
+/// （Go `Balancer.SelectOutbounds` 语义），并传入观测器使 `leastping` / `leastload`
+/// 策略能拿到观测数据。
 ///
 /// # Errors
 ///
 /// - JSON 解析失败
 /// - `Router::init` 失败（如重复 ruleTag、geoip 规则但无 loader）
-pub fn build_router_adapter_from_json(
-    routing_json: &[u8],
-) -> Result<Arc<RouterAdapter>, WiringError> {
-    build_adapter(
-        parse_routing_json_to_proto(routing_json)?,
-        Arc::new(NotImplementedSelector),
-        None,
-    )
-}
-
-/// 同 [`build_router_adapter_from_json`]，balancer selector 接真实 [`SimpleOhm`]
-/// （Go `Balancer.SelectOutbounds` 语义），并传入观测器使 `leastping` / `leastload`
-/// 策略能拿到观测数据。
-///
-/// `ohm` 必须在返回的 RouterAdapter 整个生命周期内存活（生产路径 `ohm: Arc<SimpleOhm>`
-/// 由 Instance 持有，天然满足）。
-///
-/// # Errors
-///
-/// 同 [`build_router_adapter_from_json`]。
 pub fn build_router_adapter_from_json_with_ohm(
     routing_json: &[u8],
-    ohm: &SimpleOhm,
+    ohm: Arc<SimpleOhm>,
     observer: Option<Arc<dyn ObservationProvider>>,
 ) -> Result<Arc<RouterAdapter>, WiringError> {
     build_adapter(
         parse_routing_json_to_proto(routing_json)?,
-        Arc::new(OhmOutboundSelector { inner: std::ptr::from_ref(ohm) }),
+        Arc::new(OhmOutboundSelector { inner: ohm }),
         observer,
     )
 }
@@ -822,8 +741,7 @@ fn register_geodata_router_reload(
 /// 缺 code）返回 Err，由调用方拒启（Go Build 失败即拒绝启动），不再静默丢规则。
 ///
 /// `ruleSet` 顶层键：本仓自造扩展（Go 无），但 proto `RoutingRule` 无引用字段且
-/// `protos/` 只读 —— 加载出来无人可引用，故非空即拒启（bd 2bmns G-1，见
-/// `xray-app-router/src/rule_set.rs` 的状态声明）。
+/// `protos/` 只读 —— 加载出来无人可引用，故非空即拒启（bd 2bmns G-1）。
 ///
 /// 公开面（bd 9c8k6 ②）：`xray api adrules` 需要把 JSON 配置编译成与生产装配
 /// **同一套** `xray.app.router.Config`（含 balancers），禁 CLI 侧自造方言。
@@ -1457,6 +1375,7 @@ fn resolve_asset_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use xray_app_dispatcher::default::DispatcherContext;
+    use xray_app_router::balancing::SimpleSelector;
 
     use super::*;
 
@@ -1482,7 +1401,7 @@ mod tests {
 
     #[test]
     fn router_adapter_satisfies_routing_router() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         let adapter = RouterAdapter::new(r);
         let ctx = DispatcherContext::new().with_target_domain("test.com");
         let result = <RouterAdapter as RoutingRouter>::pick_route(&adapter, &ctx);
@@ -1492,7 +1411,7 @@ mod tests {
     #[test]
     fn router_adapter_satisfies_dispatch_router() {
         use xray_common::net::network::Network;
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         let adapter = RouterAdapter::new(r);
         let dest =
             Destination::new(Address::Domain("test".to_string()), Port::new(80), Network::TCP);
@@ -1501,7 +1420,7 @@ mod tests {
 
     #[test]
     fn router_adapter_debug_lists_rules() {
-        let r = Router::empty(Arc::new(NotImplementedSelector), None);
+        let r = Router::empty(Arc::new(SimpleSelector::default()), None);
         let adapter = RouterAdapter::new(r);
         let s = format!("{adapter:?}");
         assert!(s.contains("RouterAdapter"));
@@ -1510,7 +1429,9 @@ mod tests {
     #[test]
     fn build_adapter_from_json_domain_rule_routes() {
         let json = br#"{"rules":[{"outboundTag":"proxy","domain":["example.com"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         use xray_common::net::network::Network;
         let dest =
             Destination::new(Address::Domain("example.com".into()), Port::new(443), Network::TCP);
@@ -1521,7 +1442,8 @@ mod tests {
     fn parse_routing_json_missing_both_tags_errors() {
         // 对齐 Go router.go:170-171：双 tag 缺失报错拒启（此前静默丢规则）。
         let json = br#"{"rules":[{"domain":["x.com"]}]}"#;
-        let err = build_router_adapter_from_json(json).unwrap_err();
+        let err = build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+            .unwrap_err();
         assert!(
             err.to_string().contains("neither outboundTag nor balancerTag"),
             "unexpected error: {err}"
@@ -1574,7 +1496,9 @@ mod tests {
 
     #[test]
     fn build_adapter_invalid_json_errors() {
-        let err = build_router_adapter_from_json(b"not json").unwrap_err();
+        let err =
+            build_router_adapter_from_json_with_ohm(b"not json", Arc::new(SimpleOhm::new()), None)
+                .unwrap_err();
         assert!(matches!(err, WiringError::JsonParse(_)));
     }
 
@@ -1768,7 +1692,9 @@ mod tests {
     fn build_adapter_from_json_port_rule_routes() {
         use xray_common::net::network::Network;
         let json = br#"{"rules":[{"outboundTag":"proxy","port":"443"}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let hit =
             Destination::new(Address::Domain("anywhere.com".into()), Port::new(443), Network::TCP);
         assert_eq!(adapter.pick_outbound_tag(&hit).as_deref(), Some("proxy"));
@@ -1782,7 +1708,9 @@ mod tests {
     fn build_adapter_from_json_network_rule_routes() {
         use xray_common::net::network::Network;
         let json = br#"{"rules":[{"outboundTag":"udp-out","network":"udp"}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let udp_dest =
             Destination::new(Address::Domain("anywhere.com".into()), Port::new(53), Network::UDP);
         assert_eq!(adapter.pick_outbound_tag(&udp_dest).as_deref(), Some("udp-out"));
@@ -1828,7 +1756,9 @@ mod tests {
     #[tokio::test]
     async fn resolved_ip_on_demand_hits_ip_rule() {
         let json = br#"{"domainStrategy":"IPOnDemand","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let dns = std::sync::Arc::new(CountingDns::new());
         adapter.set_dns_client(dns.clone());
         let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
@@ -1839,7 +1769,9 @@ mod tests {
     #[tokio::test]
     async fn resolved_ip_if_non_match_resolves_after_miss() {
         let json = br#"{"domainStrategy":"IPIfNonMatch","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let dns = std::sync::Arc::new(CountingDns::new());
         adapter.set_dns_client(dns.clone());
         let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
@@ -1852,7 +1784,9 @@ mod tests {
     #[tokio::test]
     async fn resolved_skip_dns_resolve_suppresses_lookup() {
         let json = br#"{"domainStrategy":"IPIfNonMatch","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let dns = std::sync::Arc::new(CountingDns::new());
         adapter.set_dns_client(dns.clone());
 
@@ -1869,7 +1803,9 @@ mod tests {
     async fn resolved_asis_skips_dns() {
         let json =
             br#"{"domainStrategy":"AsIs","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         let dns = std::sync::Arc::new(CountingDns::new());
         adapter.set_dns_client(dns.clone());
         let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
@@ -1880,7 +1816,9 @@ mod tests {
     #[tokio::test]
     async fn resolved_without_dns_client_falls_back_to_domain_only() {
         let json = br#"{"domainStrategy":"IPOnDemand","rules":[{"outboundTag":"blocked","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
         // 未注入 DNS：IpOnDemand 退化为按域名匹配，IP 规则不命中
         let tag = adapter.pick_outbound_tag_resolved(&resolved_dest()).await;
         assert!(tag.is_none());
@@ -1897,7 +1835,7 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping","fallbackTag":"fb"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let err = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
+        let err = build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
             .map(|_| ())
             .expect_err("leastping without observatory must be rejected");
         assert!(
@@ -1913,7 +1851,7 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["a","b"],"strategy":"leastload"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let err = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), None)
+        let err = build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
             .map(|_| ())
             .expect_err("leastload without observatory must be rejected");
         assert!(
@@ -1930,11 +1868,11 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["proxy-"],"strategy":"random"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let ohm = SimpleOhm::new();
+        let ohm = Arc::new(SimpleOhm::new());
         ohm.add("proxy-a", test_handler("proxy-a"));
         ohm.add("proxy-b", test_handler("proxy-b"));
         ohm.add("direct", test_handler("direct"));
-        let adapter = build_router_adapter_from_json_with_ohm(json, &ohm, None)
+        let adapter = build_router_adapter_from_json_with_ohm(json, Arc::clone(&ohm), None)
             .expect("random balancer with ohm should build");
         let dest = Destination::new(
             Address::Domain("x.test".into()),
@@ -1993,8 +1931,9 @@ mod tests {
             "balancers":[{"tag":"bl","selector":["a","b","c"],"strategy":"leastping"}],
             "rules":[{"balancerTag":"bl","domain":["x.test"]}]
         }"#;
-        let adapter = build_router_adapter_from_json_with_ohm(json, &SimpleOhm::new(), Some(obs))
-            .expect("leastping + observer should build");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), Some(obs))
+                .expect("leastping + observer should build");
         let dest = Destination::new(
             Address::Domain("x.test".into()),
             Port::new(443),
@@ -2008,7 +1947,9 @@ mod tests {
     #[test]
     fn pick_route_prefers_route_target_over_target() {
         let json = br#"{"rules":[{"outboundTag":"routed","domain":["sniffed.example.com"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
 
         // routeOnly 形态：target 是 IP（无域名规则可命中），route_target 是嗅探域名。
         let mut ctx = DispatcherContext::new().with_target_port(Port::new(443));
@@ -2033,7 +1974,9 @@ mod tests {
     #[test]
     fn pick_route_source_and_local_rules_hit() {
         let json = br#"{"rules":[{"outboundTag":"lan","source":["198.51.100.0/24"],"localIP":["127.0.0.1"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
 
         let mut ctx = DispatcherContext::new().with_target_port(Port::new(80));
         ctx.source_ips = vec![std::net::IpAddr::from([198, 51, 100, 9])];
@@ -2053,7 +1996,9 @@ mod tests {
     #[test]
     fn pick_route_route_only_keeps_target_ips_for_ip_rules() {
         let json = br#"{"rules":[{"outboundTag":"direct-ip","ip":["1.2.3.0/24"]}]}"#;
-        let adapter = build_router_adapter_from_json(json).expect("build adapter");
+        let adapter =
+            build_router_adapter_from_json_with_ohm(json, Arc::new(SimpleOhm::new()), None)
+                .expect("build adapter");
 
         let mut ctx = DispatcherContext::new().with_target_port(Port::new(443));
         ctx.target_ips = vec![std::net::IpAddr::from([1, 2, 3, 4])];
@@ -2168,8 +2113,8 @@ mod tests {
 
         let json = br#"{"rules":[{"outboundTag":"routed","domain":["geosite:hot"]}]}"#;
         let cfg = parse_routing_json_to_proto_in(json, &dir).expect("parse routing json");
-        let adapter =
-            build_adapter_in(cfg, Arc::new(NotImplementedSelector), None, &dir).expect("adapter");
+        let adapter = build_adapter_in(cfg, Arc::new(SimpleSelector::default()), None, &dir)
+            .expect("adapter");
 
         let pick = |domain: &str| {
             let dest = Destination::new(
@@ -2209,8 +2154,8 @@ mod tests {
         let dir = temp_asset_dir("geodata-listener");
         let json = br#"{"rules":[{"outboundTag":"x","domain":["a.example"]}]}"#;
         let cfg = parse_routing_json_to_proto_in(json, &dir).expect("parse");
-        let adapter =
-            build_adapter_in(cfg, Arc::new(NotImplementedSelector), None, &dir).expect("adapter");
+        let adapter = build_adapter_in(cfg, Arc::new(SimpleSelector::default()), None, &dir)
+            .expect("adapter");
         // 同进程并行的其它装配测试也可能注册（全局表），故断言 ≥1 而非 ==1。
         assert!(xray_app_geodata::reload_listener_count() >= 1, "装配必须注册热更监听");
 
@@ -2500,9 +2445,12 @@ mod tests {
     /// 硬错路径对称。
     #[test]
     fn parse_routing_json_unknown_network_token_hard_error() {
-        let err =
-            build_router_adapter_from_json(br#"{"rules":[{"outboundTag":"b","network":"tpc"}]}"#)
-                .unwrap_err();
+        let err = build_router_adapter_from_json_with_ohm(
+            br#"{"rules":[{"outboundTag":"b","network":"tpc"}]}"#,
+            Arc::new(SimpleOhm::new()),
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown network token 'tpc'"), "unexpected error: {err}");
 
         // 正常 token（大小写混合、逗号串）不受影响。

@@ -61,7 +61,7 @@ pub use online_map::OnlineMap;
 // features 层 trait 透出
 pub use xray_features::stats::{
     Channel, ChannelError, ChannelMessage, ChannelSubscriber, Counter as CounterTrait,
-    Manager as ManagerTrait, ManagerError, NoopManager, OnlineMap as OnlineMapTrait,
-    get_or_register_channel, get_or_register_counter, get_or_register_online_map,
-    subscribe_runnable_channel, unsubscribe_closable_channel,
+    Manager as ManagerTrait, ManagerError, OnlineMap as OnlineMapTrait, get_or_register_channel,
+    get_or_register_counter, get_or_register_online_map, subscribe_runnable_channel,
+    unsubscribe_closable_channel,
 };

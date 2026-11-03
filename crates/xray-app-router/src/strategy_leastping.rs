@@ -81,7 +81,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::balancing::NotImplementedSelector;
 
     struct FixedObs(ObservationResult);
     impl ObservationProvider for FixedObs {
@@ -157,7 +156,6 @@ mod tests {
         assert!(matches!(s.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
 
-    // 让 NotImplementedSelector 不被 dead_code 警告（上述测试不使用）。
     #[test]
     fn test_candidates_filter_excludes_non_selected() {
         // ga1k：观测结果中包含候选集外的 tag（如 direct / 未注册 tag），
@@ -182,9 +180,5 @@ mod tests {
         let obs = ObservationResult { status: vec![status("a", true, 50), status("b", true, 100)] };
         let s = LeastPingStrategy::new(Arc::new(FixedObs(obs)), vec![]);
         assert_eq!(s.pick_outbound().unwrap(), "a");
-    }
-    #[test]
-    fn test_dummy_use_selector() {
-        let _ = NotImplementedSelector;
     }
 }

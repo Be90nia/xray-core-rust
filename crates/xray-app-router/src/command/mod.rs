@@ -149,8 +149,8 @@ mod tests {
 
     #[test]
     fn with_router_list_rule_returns_empty() {
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        use crate::balancing::{OutboundHandlerSelector, SimpleSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(SimpleSelector::default());
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         assert_eq!(s.list_rule().unwrap(), Vec::<(String, String)>::new());
@@ -158,8 +158,8 @@ mod tests {
 
     #[test]
     fn with_router_get_balancer_info_unknown_tag() {
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        use crate::balancing::{OutboundHandlerSelector, SimpleSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(SimpleSelector::default());
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         assert!(s.get_balancer_info("nonexistent").is_err());
@@ -168,10 +168,10 @@ mod tests {
     #[test]
     fn test_route_without_matching_rule_returns_no_clue() {
         use crate::{
-            balancing::{NotImplementedSelector, OutboundHandlerSelector},
+            balancing::{OutboundHandlerSelector, SimpleSelector},
             context::RoutingData,
         };
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(SimpleSelector::default());
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         let ctx = RoutingData::new();
@@ -187,8 +187,8 @@ mod tests {
             common::geodata::{Domain, DomainRule, domain::Type as DomainType},
         };
 
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        use crate::balancing::{OutboundHandlerSelector, SimpleSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(SimpleSelector::default());
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         let proto = RoutingRule {
@@ -217,8 +217,8 @@ mod tests {
     /// get_principle_target: unknown balancer → BalancerNotFound 错误。
     #[test]
     fn get_principle_target_unknown_balancer_errors() {
-        use crate::balancing::{NotImplementedSelector, OutboundHandlerSelector};
-        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(NotImplementedSelector);
+        use crate::balancing::{OutboundHandlerSelector, SimpleSelector};
+        let ohm: Arc<dyn OutboundHandlerSelector> = Arc::new(SimpleSelector::default());
         let router = Router::empty(ohm, None);
         let s = RoutingService::with_router(router);
         assert!(s.get_principle_target("missing").is_err());

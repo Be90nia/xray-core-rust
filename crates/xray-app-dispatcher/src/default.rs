@@ -9,11 +9,11 @@
 //! - [`should_override`] 函数 — sniff 域名是否覆盖原 IP 的判定逻辑
 //! - [`SniffingRequest`] — 嗅探请求配置
 //!
-//! IO 边界（trait + NotImplemented 占位）：
+//! IO 边界（trait + 真实实现）：
 //! - [`RoutingRouter`] / [`OutboundHandlerManager`] / [`DispatchHandler`] trait
-//! - [`DefaultDispatcher::dispatch`] / [`DefaultDispatcher::dispatch_link`] — 依赖 pipe/transport
-//!   全链路
-//! - [`CachedReader`] — 依赖 `pipe.Reader`，主体留 TODO
+//! - [`DefaultDispatcher::dispatch`] / [`DefaultDispatcher::dispatch_link`] — 已实装 （嗅探 + 路由
+//!   + 计数 + 兜底选择面），依赖 pipe/transport 全链路
+//! - [`CachedReader`] — 依赖 `pipe.Reader`，已实装（首包缓存回灌）
 
 use std::{
     borrow::Cow, collections::HashMap, fmt::Debug, future::Future, net::IpAddr, pin::Pin, sync::Arc,

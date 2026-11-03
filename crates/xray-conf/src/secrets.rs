@@ -6,10 +6,11 @@
 //! （坑约束 11「密钥必掩码」）。掩码只作用于日志输出，不改任何 settings 值
 //! （转发路径零影响）。
 //!
-//! 数据来源：既有 [`BuiltConfig`] + [`crate::protocols`] 的入/出站 settings 结构体
-//! （`dispatch_inbound_settings` / `dispatch_outbound_settings`）——**不另造协议解析**。
+//! 数据来源：既有 [`BuiltConfig`] 的入/出站 settings **原始 JSON**（`entry.data`）——
+//! **不另造协议解析**（conf 层强类型 settings 层已归零：生产解析真源在 `xray-core`
+//! 的 raw-JSON 解析器，conf 层那份是重复实现且无生产消费）。
 //!
-//! 覆盖族（T1.5 契约，强类型 settings 面）：
+//! 覆盖族（T1.5 契约，键位与协议解析真源逐键对齐）：
 //! - vmess：客户端 `id`（UUID）
 //! - vless：客户端 `id`（UUID）
 //! - trojan：客户端/服务端 `password`
@@ -22,12 +23,7 @@
 
 use serde_json::Value;
 
-use crate::{
-    BuiltConfig, BuiltEntry,
-    protocols::{
-        InboundSettings, OutboundSettings, dispatch_inbound_settings, dispatch_outbound_settings,
-    },
-};
+use crate::{BuiltConfig, BuiltEntry};
 
 /// 收集配置中的凭据字面量（去重、升序）。
 ///
@@ -50,52 +46,28 @@ pub fn collect_secrets(built: &BuiltConfig) -> Vec<String> {
 /// 入站凭据收集（`clients` / `users` 双读，Go 形 `users` 为旧名别名）。
 fn collect_inbound(entry: &BuiltEntry, out: &mut Vec<String>) {
     let Some(value) = parse_settings(entry) else { return };
-    // 七族先扫原始 JSON：anytls/tuic/naive/wireguard 无 conf 结构体（typed 分支
-    // 返回 None），socks/http/hysteria 的凭据键在嵌套数组里——都不能落到 `_ => {}`。
+    // 全部协议统一走原始 JSON 扫描：conf 层强类型 settings 层已归零（生产解析真源在
+    // xray-core 的 raw-JSON 解析器），凭据键位与各协议解析真源逐键对齐。
     collect_generic(&entry.kind, &value, out);
-    let settings = match dispatch_inbound_settings(&entry.kind, value) {
-        Ok(Some(settings)) => settings,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(protocol = %entry.kind, error = %e, "secrets collection: inbound settings unparsable, skipped");
-            return;
-        },
-    };
-    match settings {
-        InboundSettings::Vmess(s) => {
-            for client in &s.clients {
-                push_id(client, out);
-            }
-            for client in s.users.iter().flatten() {
-                push_id(client, out);
+    match entry.kind.as_str() {
+        "vmess" | "vless" => {
+            for key in ["clients", "users"] {
+                for_each(&value, key, |client| push_id(client, out));
             }
         },
-        InboundSettings::Vless(s) => {
-            for client in &s.clients {
-                push_id(client, out);
-            }
-            for client in s.users.iter().flatten() {
-                push_id(client, out);
+        "trojan" => {
+            for key in ["clients", "users"] {
+                for_each(&value, key, |user| push_key(user, "password", out));
             }
         },
-        InboundSettings::Trojan(s) => {
-            for user in s.clients.iter().flatten() {
-                push_str(&user.password, out);
-            }
-            for user in s.users.iter().flatten() {
-                push_str(&user.password, out);
-            }
-        },
-        InboundSettings::Shadowsocks(s) => {
-            push_str(&s.method, out);
-            push_opt(s.password.as_deref(), out);
-            for user in s.clients.iter().flatten() {
-                push_opt(user.method.as_deref(), out);
-                push_opt(user.password.as_deref(), out);
-            }
-            for user in s.users.iter().flatten() {
-                push_opt(user.method.as_deref(), out);
-                push_opt(user.password.as_deref(), out);
+        "shadowsocks" => {
+            push_key(&value, "method", out);
+            push_key(&value, "password", out);
+            for key in ["clients", "users"] {
+                for_each(&value, key, |user| {
+                    push_key(user, "method", out);
+                    push_key(user, "password", out);
+                });
             }
         },
         _ => {},
@@ -106,44 +78,24 @@ fn collect_inbound(entry: &BuiltEntry, out: &mut Vec<String>) {
 fn collect_outbound(entry: &BuiltEntry, out: &mut Vec<String>) {
     let Some(value) = parse_settings(entry) else { return };
     collect_generic(&entry.kind, &value, out);
-    let settings = match dispatch_outbound_settings(&entry.kind, value) {
-        Ok(Some(settings)) => settings,
-        Ok(None) => return,
-        Err(e) => {
-            tracing::warn!(protocol = %entry.kind, error = %e, "secrets collection: outbound settings unparsable, skipped");
-            return;
+    match entry.kind.as_str() {
+        "vmess" | "vless" => {
+            push_key(&value, "id", out);
+            for_each(&value, "vnext", |target| {
+                for_each(target, "users", |user| push_id(user, out));
+            });
         },
-    };
-    match settings {
-        OutboundSettings::Vmess(s) => {
-            push_opt(s.id.as_deref(), out);
-            for target in s.vnext.iter().flatten() {
-                for user in target.users.iter().flatten() {
-                    push_id(user, out);
-                }
-            }
+        "trojan" => {
+            push_key(&value, "password", out);
+            for_each(&value, "servers", |server| push_key(server, "password", out));
         },
-        OutboundSettings::Vless(s) => {
-            push_opt(s.id.as_deref(), out);
-            for target in s.vnext.iter().flatten() {
-                for user in target.users.iter().flatten() {
-                    push_id(user, out);
-                }
-            }
-        },
-        OutboundSettings::Trojan(s) => {
-            push_opt(s.password.as_deref(), out);
-            for server in s.servers.iter().flatten() {
-                push_str(&server.password, out);
-            }
-        },
-        OutboundSettings::Shadowsocks(s) => {
-            push_opt(s.method.as_deref(), out);
-            push_opt(s.password.as_deref(), out);
-            for server in s.servers.iter().flatten() {
-                push_opt(server.method.as_deref(), out);
-                push_opt(server.password.as_deref(), out);
-            }
+        "shadowsocks" => {
+            push_key(&value, "method", out);
+            push_key(&value, "password", out);
+            for_each(&value, "servers", |server| {
+                push_key(server, "method", out);
+                push_key(server, "password", out);
+            });
         },
         _ => {},
     }

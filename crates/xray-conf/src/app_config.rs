@@ -54,15 +54,18 @@ pub struct PolicyLevel {
     #[serde(skip_serializing_if = "Option::is_none", alias = "downlinkOnly")]
     pub downlink: Option<u32>,
     /// Per-connection 缓冲，KB 单位；负值（如 -1）= 无限制。
+    /// Go json `bufferSize`（Rust 方言 `buffer_size` 别名保留）。
     /// Go 语义见 infra/conf/policy.go:42-50（×1024 转字节，负值 → proto -1）。
     #[serde(alias = "buffer_size")]
     pub buffer_size: Option<i32>,
     /// Go json `statsUserUplink`（Rust 方言 `stats_user_uplink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_user_uplink")]
     pub stats_user_uplink: Option<bool>,
+    /// Go json `statsUserDownlink`（Rust 方言 `stats_user_downlink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_user_downlink")]
     pub stats_user_downlink: Option<bool>,
-    /// 是否启用 per-user 在线 IP 追踪。对应 Go json `statsUserOnline`。
+    /// Go json `statsUserOnline`（Rust 方言 `stats_user_online` 别名保留）。
+    /// 是否启用 per-user 在线 IP 追踪。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_user_online")]
     pub stats_user_online: Option<bool>,
 }
@@ -71,12 +74,16 @@ pub struct PolicyLevel {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PolicySystem {
+    /// Go json `statsInboundUplink`（Rust 方言 `stats_inbound_uplink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_inbound_uplink")]
     pub stats_inbound_uplink: Option<bool>,
+    /// Go json `statsInboundDownlink`（Rust 方言 `stats_inbound_downlink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_inbound_downlink")]
     pub stats_inbound_downlink: Option<bool>,
+    /// Go json `statsOutboundUplink`（Rust 方言 `stats_outbound_uplink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_outbound_uplink")]
     pub stats_outbound_uplink: Option<bool>,
+    /// Go json `statsOutboundDownlink`（Rust 方言 `stats_outbound_downlink` 别名保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "stats_outbound_downlink")]
     pub stats_outbound_downlink: Option<bool>,
 }
@@ -105,6 +112,9 @@ pub struct ObservatoryConfig {
     pub subject_selector: Option<Vec<String>>,
     /// Rust 单值方言（历史遗留）：单 tag 时 `subjectOutbound`/`subject_outbound`
     /// 与 Go 数组键并存，`subject_selector` 优先。
+    /// Go v26.10.17 `infra/conf/observatory.go` **只有 `subjectSelector []string`**，
+    /// 无单值键——本字段为本仓 Rust 自造方言（bd wzya8 #5 登记保留，见
+    /// `reports/audit-2026-11-02/deadcode-go-legacy.md` §1.3）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "subject_outbound")]
     pub subject_outbound: Option<String>,
     /// 并发探测（Go json `enableConcurrency`）。
@@ -131,7 +141,9 @@ pub struct BurstObservatoryConfig {
     /// 只有 SubjectSelector + pingConfig，无 enableConcurrency 字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject_selector: Option<Vec<String>>,
-    /// Rust 单值方言（历史遗留），`subject_selector` 优先。
+    /// Rust 单值方言（历史遗留），`subject_selector` 优先。Go v26.10.17
+    /// `infra/conf/observatory.go` 的 BurstObservatoryConfig 只有
+    /// `subjectSelector` + `pingConfig`，无单值键（bd wzya8 #5 登记保留）。
     #[serde(skip_serializing_if = "Option::is_none", alias = "subject_outbound")]
     pub subject_outbound: Option<String>,
     /// ping 探测配置。

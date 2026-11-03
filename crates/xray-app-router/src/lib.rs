@@ -23,17 +23,18 @@
 //! - `Rule::build_rule(proto, balancers, geo_loader)`：`GeoDataLoader` 接入后 `geosite`/`geoip`
 //!   rule 变体从 dat 文件加载
 //!
-//! **IO 边界（trait + 占位）**：
-//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：`select_outbounds` 返回
-//!   `NotImplemented`
-//! - `ObservationProvider`（Go `extension.Observatory`）：`get_observation` 返回 `NotImplemented`
-//! - `WebhookNotifier::post`：实际 HTTP POST 留 TODO，事件构造与去重逻辑可独立测试
-//! - `ProcessNameMatcher::find_process`：进程查找留 TODO（依赖 OS-specific sysinfo）
-//! - `command/`：gRPC RoutingService 留 stub（依赖 stats.Channel + grpc 框架）
+//! **IO 边界（trait + 真实实现）**：
+//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：生产由
+//!   `xray-core::wiring::OhmOutboundSelector` 实现（读真实出站表）
+//! - `ObservationProvider`（Go `extension.Observatory`）：生产由
+//!   `xray-core::wiring::ObservatoryProviderBridge` 桥接真实 observatory feature
+//! - `WebhookNotifier::post`：已实装手写 HTTP/1.1 + TLS + UDS POST
+//! - `ProcessNameMatcher::find_process`：已实装（Linux `/proc` + Windows iphelper； macOS/FreeBSD
+//!   与 Go 一致——不支持进程反查）
+//! - `command/`：gRPC RoutingService 已实装 7 个 RPC（`xray-core::functions` 注入 commander）
 //!
-//! **等接入**：等 xray-features 统一为手写 boxed future 风格后，再实现
-//! `xray_features::routing::Router` trait（当前 trait 用 `#[async_trait]`，
-//! 与新 crate 风格不一致）。
+//! **等接入**：`xray_features::routing::Router` trait 尚未实现（dispatcher 侧用本 crate
+//! 的 `Router` + `RoutingRouter` 适配面，见 `xray-core/src/wiring.rs`）。
 //! 对应 Go 源：`app/router/{router,condition,config,balancing,balancing_override,
 //! strategy_leastload,strategy_leastping,strategy_random,weight,webhook}.go`
 
@@ -45,7 +46,6 @@ pub mod context;
 pub mod error;
 pub mod router;
 pub mod rule;
-pub mod rule_set;
 pub mod strategy_leastload;
 pub mod strategy_leastping;
 pub mod strategy_random;
@@ -61,7 +61,6 @@ pub use context::{RoutingContext, RoutingData};
 pub use error::RouterError;
 pub use router::{Route, Router};
 pub use rule::Rule;
-pub use rule_set::{LoadedRuleSet, RuleSetConfig, RuleSetFormat, RuleSetRegistry, RuleSetType};
 pub use strategy_leastload::LeastLoadStrategy;
 pub use strategy_leastping::LeastPingStrategy;
 pub use strategy_random::RandomStrategy;

@@ -431,7 +431,6 @@ mod tests {
     use xray_proto::xray::core::app::observatory::OutboundStatus;
 
     use super::*;
-    use crate::balancing::NotImplementedSelector;
 
     struct FixedSelector(Vec<String>);
     impl OutboundHandlerSelector for FixedSelector {
@@ -818,8 +817,4 @@ mod tests {
     }
 
     // 防 dead_code 警告
-    #[test]
-    fn test_dummy_use_selector() {
-        let _ = NotImplementedSelector;
-    }
 }

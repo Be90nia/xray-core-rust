@@ -4,10 +4,10 @@
 //!
 //! # IO 边界 trait
 //!
-//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）
-//! - `ObservationProvider`（Go `extension.Observatory`）
-//! - 当前 stub 返回 `Err(NotHandlerSelector)` / `Err(ObservationUnavailable)`，
-//!   上层接入时提供真实实现。
+//! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）— 生产实现见
+//!   `xray-core::wiring::OhmOutboundSelector`（读真实出站表）
+//! - `ObservationProvider`（Go `extension.Observatory`）— 生产实现见
+//!   `xray-core::wiring::ObservatoryProviderBridge`（桥接真实 observatory feature）
 
 use std::sync::{
     Arc,
@@ -250,18 +250,6 @@ impl Balancer {
     }
 }
 
-// ── NotImplemented stubs ──────────────────────────────────────
-
-/// 未接入的 HandlerSelector。所有调用返回 `Err(NotHandlerSelector)`。
-#[derive(Debug, Default)]
-pub struct NotImplementedSelector;
-
-impl OutboundHandlerSelector for NotImplementedSelector {
-    fn select_outbounds(&self, _s: &[String]) -> Result<Vec<String>, RouterError> {
-        Err(RouterError::NotHandlerSelector)
-    }
-}
-
 // ── SimpleSelector / MemoryObservationProvider ──────────────
 
 /// 简单出站选择器：根据已知 tag 集过滤。
@@ -357,15 +345,6 @@ mod tests {
         assert!(o.get().is_empty());
     }
 
-    // ── NotImplementedSelector ──
-
-    #[test]
-    fn test_not_implemented_selector_returns_err() {
-        let s = NotImplementedSelector;
-        let r = s.select_outbounds(&["x".into()]);
-        assert!(matches!(r, Err(RouterError::NotHandlerSelector)));
-    }
-
     // ── SimpleSelector ──
 
     #[test]
@@ -424,7 +403,7 @@ mod tests {
         let b = Balancer::new(
             vec!["s".into()],
             Arc::new(FixedStrategy("out1".into())),
-            Arc::new(NotImplementedSelector),
+            Arc::new(SimpleSelector::default()),
             "",
         );
         assert_eq!(b.pick_outbound().unwrap(), "out1");
@@ -435,7 +414,7 @@ mod tests {
         let b = Balancer::new(
             vec!["s".into()],
             Arc::new(EmptyStrategy),
-            Arc::new(NotImplementedSelector),
+            Arc::new(SimpleSelector::default()),
             "fallback",
         );
         assert_eq!(b.pick_outbound().unwrap(), "fallback");
@@ -446,7 +425,7 @@ mod tests {
         let b = Balancer::new(
             vec![],
             Arc::new(EmptyStrategy),
-            Arc::new(NotImplementedSelector),
+            Arc::new(SimpleSelector::default()),
             "fallback",
         );
         b.set_override_target("override");
@@ -456,7 +435,7 @@ mod tests {
     #[test]
     fn test_balancer_empty_no_fallback_errors() {
         let b =
-            Balancer::new(vec![], Arc::new(EmptyStrategy), Arc::new(NotImplementedSelector), "");
+            Balancer::new(vec![], Arc::new(EmptyStrategy), Arc::new(SimpleSelector::default()), "");
         assert!(matches!(b.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
     }
 
@@ -466,7 +445,7 @@ mod tests {
         let b = Balancer::new(
             vec![],
             Arc::new(FixedStrategy("strategy-out".into())),
-            Arc::new(NotImplementedSelector),
+            Arc::new(SimpleSelector::default()),
             "fallback",
         );
         b.set_override_target("override-out");
@@ -484,7 +463,7 @@ mod tests {
         let b = Balancer::new(
             vec![],
             Arc::new(FixedStrategy("strategy-out".into())),
-            Arc::new(NotImplementedSelector),
+            Arc::new(SimpleSelector::default()),
             "",
         );
         b.override_handle().put("override-out");

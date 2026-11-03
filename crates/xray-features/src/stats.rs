@@ -3,7 +3,6 @@
 //! 对应 Go `features/stats/stats.go`：
 //! - [`Counter`] / [`OnlineMap`] / [`Channel`] 三大接口
 //! - [`Manager`] 注册表接口（含 `*OnlineMap*` / `*Channel*` 12 个方法）
-//! - [`NoopManager`] 空实现
 //! - [`get_or_register_counter`] / [`get_or_register_online_map`] / [`get_or_register_channel`]
 //!   工具函数
 //! - [`subscribe_runnable_channel`] / [`unsubscribe_closable_channel`] 工具函数
@@ -25,8 +24,6 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-
-use crate::Feature;
 
 /// Feature type identifier for Stats.
 ///
@@ -242,9 +239,13 @@ pub enum ManagerError {
     #[error("{kind} `{name}` already registered")]
     AlreadyRegistered { kind: &'static str, name: String },
 
-    /// 操作未实现。对应 Go NoopManager 的 `errors.New("not implemented")`。
-    #[error("not implemented")]
-    NotImplemented,
+    /// Channel 启动失败（Go `Channel.Start()` 错误）。
+    ///
+    /// Go 侧 `Channel.Start()` 返回 error，本仓此前把它误映射成「not implemented」
+    /// （Go `NoopManager` 的语义）——启动失败不是「未实现」，错误分类失真会让调用方
+    /// 误判为能力缺失。改为独立变体，携带底层原因。
+    #[error("channel start failed: {0}")]
+    ChannelStart(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -308,133 +309,6 @@ pub fn unsubscribe_closable_channel(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// NoopManager
-// ---------------------------------------------------------------------------
-
-/// Manager 空实现。对应 Go `NoopManager`。
-///
-/// 所有 `register_*` 返回 [`ManagerError::NotImplemented`]，
-/// 所有 `unregister_*` / `get_*` 返回空，所有 `visit_*` 空遍历。
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopManager;
-
-impl Manager for NoopManager {
-    fn register_counter(&self, _name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
-        Err(ManagerError::NotImplemented)
-    }
-
-    fn unregister_counter(&self, _name: &str) {}
-
-    fn get_counter(&self, _name: &str) -> Option<Arc<dyn Counter>> {
-        None
-    }
-
-    fn visit_counters(&self, _f: &mut dyn FnMut(&str, &dyn Counter) -> bool) {}
-
-    fn register_online_map(&self, _name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
-        Err(ManagerError::NotImplemented)
-    }
-
-    fn unregister_online_map(&self, _name: &str) {}
-
-    fn get_online_map(&self, _name: &str) -> Option<Arc<dyn OnlineMap>> {
-        None
-    }
-
-    fn visit_online_maps(&self, _f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) {}
-
-    fn register_channel(&self, _name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
-        Err(ManagerError::NotImplemented)
-    }
-
-    fn unregister_channel(&self, _name: &str) {}
-
-    fn get_channel(&self, _name: &str) -> Option<Arc<dyn Channel>> {
-        None
-    }
-
-    fn get_all_online_users(&self) -> Vec<String> {
-        Vec::new()
-    }
-}
-
-/// 默认 Stats Feature 实现（essentialFeatures fallback）。
-///
-/// 当配置中没有指定 stats app 时，Instance 使用此空实现占位。
-/// 内部委托 NoopManager，所有 register/get 操作返回空。
-pub struct DefaultStatsFeature {
-    manager: NoopManager,
-}
-
-impl Default for DefaultStatsFeature {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DefaultStatsFeature {
-    pub fn new() -> Self {
-        Self { manager: NoopManager }
-    }
-}
-
-impl Feature for DefaultStatsFeature {
-    fn feature_name(&self) -> &'static str {
-        "default_stats"
-    }
-}
-
-impl Manager for DefaultStatsFeature {
-    fn register_counter(&self, name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
-        self.manager.register_counter(name)
-    }
-
-    fn unregister_counter(&self, name: &str) {
-        self.manager.unregister_counter(name)
-    }
-
-    fn get_counter(&self, name: &str) -> Option<Arc<dyn Counter>> {
-        self.manager.get_counter(name)
-    }
-
-    fn visit_counters(&self, f: &mut dyn FnMut(&str, &dyn Counter) -> bool) {
-        self.manager.visit_counters(f)
-    }
-
-    fn register_online_map(&self, name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
-        self.manager.register_online_map(name)
-    }
-
-    fn unregister_online_map(&self, name: &str) {
-        self.manager.unregister_online_map(name)
-    }
-
-    fn get_online_map(&self, name: &str) -> Option<Arc<dyn OnlineMap>> {
-        self.manager.get_online_map(name)
-    }
-
-    fn visit_online_maps(&self, f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) {
-        self.manager.visit_online_maps(f)
-    }
-
-    fn register_channel(&self, name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
-        self.manager.register_channel(name)
-    }
-
-    fn unregister_channel(&self, name: &str) {
-        self.manager.unregister_channel(name)
-    }
-
-    fn get_channel(&self, name: &str) -> Option<Arc<dyn Channel>> {
-        self.manager.get_channel(name)
-    }
-
-    fn get_all_online_users(&self) -> Vec<String> {
-        self.manager.get_all_online_users()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,81 +318,49 @@ mod tests {
         assert_eq!(FEATURE_STATS, "stats");
     }
 
-    // ----- NoopManager -----
+    /// 仅测试用的 Manager 替身：`register_*` 一律报错，`get_*` 一律未命中。
+    /// 生产实现在 `xray-app-stats`（真实计数）；本仓此前的 `NoopManager` 生产零消费，
+    /// 已归零（bd wzya8）。
+    struct StubManager;
 
-    #[test]
-    fn noop_register_counter_returns_not_implemented() {
-        let m = NoopManager;
-        let err = match m.register_counter("x") {
-            Err(ManagerError::NotImplemented) => "ok",
-            Err(e) => panic!("expected NotImplemented, got {e:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
-        };
-        assert_eq!(err, "ok");
-    }
-
-    #[test]
-    fn noop_register_online_map_returns_not_implemented() {
-        let m = NoopManager;
-        match m.register_online_map("u") {
-            Err(ManagerError::NotImplemented) => (),
-            Err(e) => panic!("expected NotImplemented, got {e:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
+    impl Manager for StubManager {
+        fn register_counter(&self, _name: &str) -> Result<Arc<dyn Counter>, ManagerError> {
+            Err(ManagerError::AlreadyRegistered { kind: "Counter", name: "stub".into() })
         }
-    }
 
-    #[test]
-    fn noop_register_channel_returns_not_implemented() {
-        let m = NoopManager;
-        match m.register_channel("c") {
-            Err(ManagerError::NotImplemented) => (),
-            Err(e) => panic!("expected NotImplemented, got {e:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
+        fn unregister_counter(&self, _name: &str) {}
+
+        fn get_counter(&self, _name: &str) -> Option<Arc<dyn Counter>> {
+            None
         }
-    }
 
-    #[test]
-    fn noop_unregister_silent_no_op() {
-        let m = NoopManager;
-        m.unregister_counter("a");
-        m.unregister_online_map("b");
-        m.unregister_channel("c");
-    }
+        fn visit_counters(&self, _f: &mut dyn FnMut(&str, &dyn Counter) -> bool) {}
 
-    #[test]
-    fn noop_get_returns_none() {
-        let m = NoopManager;
-        assert!(m.get_counter("a").is_none());
-        assert!(m.get_online_map("b").is_none());
-        assert!(m.get_channel("c").is_none());
-    }
+        fn register_online_map(&self, _name: &str) -> Result<Arc<dyn OnlineMap>, ManagerError> {
+            Err(ManagerError::AlreadyRegistered { kind: "OnlineMap", name: "stub".into() })
+        }
 
-    #[test]
-    fn noop_visit_no_invocation() {
-        let m = NoopManager;
-        let mut counter_called = 0;
-        let mut online_called = 0;
-        m.visit_counters(&mut |_, _| {
-            counter_called += 1;
-            true
-        });
-        m.visit_online_maps(&mut |_, _| {
-            online_called += 1;
-            true
-        });
-        assert_eq!(counter_called, 0);
-        assert_eq!(online_called, 0);
-    }
+        fn unregister_online_map(&self, _name: &str) {}
 
-    #[test]
-    fn noop_get_all_online_users_empty() {
-        let m = NoopManager;
-        assert!(m.get_all_online_users().is_empty());
-    }
+        fn get_online_map(&self, _name: &str) -> Option<Arc<dyn OnlineMap>> {
+            None
+        }
 
-    #[test]
-    fn noop_default_constructible() {
-        let _m = NoopManager;
+        fn visit_online_maps(&self, _f: &mut dyn FnMut(&str, &dyn OnlineMap) -> bool) {}
+
+        fn register_channel(&self, _name: &str) -> Result<Arc<dyn Channel>, ManagerError> {
+            Err(ManagerError::AlreadyRegistered { kind: "Channel", name: "stub".into() })
+        }
+
+        fn unregister_channel(&self, _name: &str) {}
+
+        fn get_channel(&self, _name: &str) -> Option<Arc<dyn Channel>> {
+            None
+        }
+
+        fn get_all_online_users(&self) -> Vec<String> {
+            Vec::new()
+        }
     }
 
     // ----- Error display -----
@@ -539,31 +381,28 @@ mod tests {
     fn manager_error_display() {
         let e = ManagerError::AlreadyRegistered { kind: "Counter", name: "x".into() };
         assert_eq!(e.to_string(), "Counter `x` already registered");
-        let e = ManagerError::NotImplemented;
-        assert_eq!(e.to_string(), "not implemented");
+        let e = ManagerError::ChannelStart("channel closed".into());
+        assert_eq!(e.to_string(), "channel start failed: channel closed");
     }
 
-    // ----- get_or_register_* with NoopManager (validation only, real impl in app-stats) -----
+    // ----- get_or_register_* 走 register 路径（真实实现在 app-stats） -----
 
     #[test]
-    fn get_or_register_counter_returns_err_when_noop() {
-        let m = NoopManager;
-        // get 返回 None → 走 register 路径 → NotImplemented
-        let res = get_or_register_counter(&m, "c");
-        assert!(matches!(res, Err(ManagerError::NotImplemented)));
-    }
-
-    #[test]
-    fn get_or_register_online_map_returns_err_when_noop() {
-        let m = NoopManager;
-        let res = get_or_register_online_map(&m, "u");
-        assert!(matches!(res, Err(ManagerError::NotImplemented)));
+    fn get_or_register_counter_propagates_register_error() {
+        // get 返回 None → 走 register 路径 → 错误透传
+        let res = get_or_register_counter(&StubManager, "c");
+        assert!(matches!(res, Err(ManagerError::AlreadyRegistered { kind: "Counter", .. })));
     }
 
     #[test]
-    fn get_or_register_channel_returns_err_when_noop() {
-        let m = NoopManager;
-        let res = get_or_register_channel(&m, "ch");
-        assert!(matches!(res, Err(ManagerError::NotImplemented)));
+    fn get_or_register_online_map_propagates_register_error() {
+        let res = get_or_register_online_map(&StubManager, "u");
+        assert!(matches!(res, Err(ManagerError::AlreadyRegistered { kind: "OnlineMap", .. })));
+    }
+
+    #[test]
+    fn get_or_register_channel_propagates_register_error() {
+        let res = get_or_register_channel(&StubManager, "ch");
+        assert!(matches!(res, Err(ManagerError::AlreadyRegistered { kind: "Channel", .. })));
     }
 }

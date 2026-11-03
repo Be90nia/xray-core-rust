@@ -78,7 +78,7 @@ pub trait Feature: Any + Send + Sync + 'static {
 
     /// 启动 Feature。返回 `Err` 会导致 `Instance::start()` 中止并向上传播。
     ///
-    /// 默认空实现适用于无后台任务的纯状态型 feature（如 NoopManager）。
+    /// 默认空实现适用于无后台任务的纯状态型 feature（如仅持有配置值的 feature）。
     fn start(&self) -> Result<()> {
         Ok(())
     }

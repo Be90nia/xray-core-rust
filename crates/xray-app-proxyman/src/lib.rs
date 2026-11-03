@@ -19,7 +19,7 @@
 //! - gRPC 命令编排（[`command::InboundOperation`] / [`command::OutboundOperation`] /
 //!   [`command::HandlerService`]）
 //!
-//! IO 边界（trait + NotImplemented 占位）：
+//! IO 边界（trait + 真实实现）：
 //! - worker 创建（TCP/UDP/Unix listener）— 依赖 `xray_transport::Listener` + xray-mux
 //! - `outbound::OutboundHandlerEntry` 的 `dispatch`/`dial` — 依赖 `transport.Link` + 代理 + mux +
 //!   xudp + DNS
