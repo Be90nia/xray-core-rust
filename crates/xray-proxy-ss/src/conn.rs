@@ -44,6 +44,13 @@ const STAGE_SIZE: usize = 64 * 1024;
 /// 下行 wire 缓冲预留（与旧 pump 的 `pending.reserve` 同值）。
 const DOWN_RESERVE: usize = 16 * 1024;
 
+/// 下行读批窗口：桥层按此容量建读缓冲（[`Connection::tls_readbuf_size`] 钩子）。
+///
+/// 读半一次 `poll_read` 能交付**整 chunk 明文**（wire u16 长度域上限
+/// [`SSStream`] 的 65535B）；桥层缺省读缓冲是池化 8KiB，会把一个 64KiB chunk
+/// 劈成 8 批（8 次 memcpy + 8 次 mpsc 交接 + 8 次写 syscall）。
+const READ_BUF_CAP: usize = 64 * 1024;
+
 /// SS-2022 客户端请求头空闲兜底延时（与旧 pump 的 `hdr_timer` 同值）。
 const IDLE_HEADER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -461,6 +468,13 @@ impl<C: AsyncRead + AsyncWrite + Unpin + Send + Sync> Connection for SsStreamCon
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
         Ok(None)
     }
+
+    fn tls_readbuf_size(&self) -> usize {
+        // 读批窗口信号（F3 钩子的通用用法：钩子语义 = "调用方读缓冲该多大"，
+        // 名字里的 tls 只是首个采用方）：本连接一次 `poll_read` 能交付整 chunk
+        // 明文（≤65535B），缺省 8KiB 会把 64KiB chunk 劈成 8 批。
+        READ_BUF_CAP
+    }
 }
 
 /// 把直挂连接包成 link 写半：**每次写入后立刻 flush**。
@@ -653,6 +667,28 @@ mod tests {
         }
         writer.await.expect("writer task");
         assert_eq!(got, expect);
+    }
+
+    /// 读批窗口：桥层按 `tls_readbuf_size` 建 64KiB 读缓冲 ⇒ 一个 chunk 一批交付
+    /// （缺省 8KiB 要 7 次才读完 50KB，正是 cli 批粒度 8102B 的来源）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_batch_window_delivers_whole_chunk() {
+        let (mut conn, mut server) = pair().await;
+        assert_eq!(
+            conn.tls_readbuf_size(),
+            READ_BUF_CAP,
+            "桥层读窗口必须放大到整 chunk 档，否则批粒度退回 8KiB"
+        );
+        let payload = vec![0x7Au8; 50_000];
+        let writer = tokio::spawn(async move {
+            server.write_chunk(&payload).await.expect("写大 chunk");
+            server.flush().await.expect("flush");
+        });
+        let mut buf = vec![0u8; READ_BUF_CAP];
+        let n = conn.read(&mut buf).await.expect("read");
+        writer.await.expect("writer task");
+        assert_eq!(n, 50_000, "64KiB 读窗口下单 chunk 必须一次读完");
+        assert!(buf[..n].iter().all(|b| *b == 0x7A), "载荷内容错");
     }
 
     /// SS-2022 **入站**（服务端）专项：响应头必须在首写时随首段数据一起落线。
