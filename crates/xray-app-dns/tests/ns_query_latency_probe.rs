@@ -659,17 +659,18 @@ async fn b5_doq_ns_blackhole_upper_bound_is_one_timeout() {
     );
 }
 
-/// B-6：`cached.rs` singleflight 等待者超时上界（`SF_WAIT_TIMEOUT = 4s`）。
+/// B-6：`cached.rs` singleflight 等待者超时上界（bd 26v9t：等待上限 = 本 NS
+/// `query_timeout` + 1s；本用例 NS 走 trait 缺省 4s ⇒ 5s）。
 ///
-/// 语义（`nameserver/cached.rs:254-257`）：
+/// 语义（`nameserver/cached.rs`）：
 /// ```text
-/// match tokio::time::timeout(SF_WAIT_TIMEOUT, rx.recv()).await {
+/// match tokio::time::timeout(sf_wait_timeout(server), rx.recv()).await {
 ///     Ok(Ok(o)) => o,           // 领导者先完成 ⇒ 共享结果
 ///     _ => server.send_query(...).await,  // 超时 ⇒ 等待者自己再查一次
 /// }
 /// ```
-/// ⇒ 等待者最多等 4s（领导者挂死时），**之后自己发一次查询**（该查询自身还有
-/// 自己的 timeout）⇒ 单个等待者的总耗时上界 ≈ 4s + 自身查询 timeout。
+/// ⇒ 领导者挂死（永不返回）时等待者最多等 5s，**之后自己发一次查询**（该查询
+/// 自身还有自己的 timeout）⇒ 单个等待者的总耗时上界 ≈ 5s + 自身查询 timeout。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn b6_singleflight_waiter_timeout_upper_bound() {
     use xray_app_dns::nameserver::cached::QueryOutcome;
@@ -731,7 +732,7 @@ async fn b6_singleflight_waiter_timeout_upper_bound() {
     }
     assert_eq!(queries.load(Ordering::SeqCst), 1, "领导者应已进入 send_query");
 
-    // ② 第二个调用 = **等待者**：等 SF_WAIT_TIMEOUT（4s）后自查询。
+    // ② 第二个调用 = **等待者**：等派生上限（缺省 4s + 1s = 5s）后自查询。
     let t0 = Instant::now();
     let r = xray_app_dns::nameserver::cached::query_ip(
         server,
@@ -741,22 +742,22 @@ async fn b6_singleflight_waiter_timeout_upper_bound() {
     .await;
     let elapsed = t0.elapsed();
     probe(
-        "B-6 singleflight 等待者 4s 超时后自查询总耗时",
+        "B-6 singleflight 等待者 5s（派生）超时后自查询总耗时",
         format!(
             "{elapsed:?} err={:?} queries={}",
             r.as_ref().err().map(|e| e.to_string()),
             queries.load(Ordering::SeqCst)
         ),
     );
-    // 领导者挂死 ⇒ 等待者先等 4s（SF_WAIT_TIMEOUT）再自查询（+100ms）。
+    // 领导者挂死 ⇒ 等待者先等派生上限（缺省 4s + 1s）再自查询（+100ms）。
     assert!(
-        elapsed >= Duration::from_secs(4),
-        "等待者应至少等满 SF_WAIT_TIMEOUT=4s，实测 {elapsed:?}"
+        elapsed >= Duration::from_secs(5),
+        "等待者应至少等满派生上限 5s（query_timeout 4s + 1s），实测 {elapsed:?}"
     );
-    // 上界：4s + 自查询 100ms + 余量。
+    // 上界：5s + 自查询 100ms + 余量。
     assert!(
-        elapsed < Duration::from_millis(6000),
-        "等待者总耗时应 <6s（4s 等待 + 自身查询），实测 {elapsed:?}"
+        elapsed < Duration::from_millis(6500),
+        "等待者总耗时应 <6.5s（5s 等待 + 自身查询），实测 {elapsed:?}"
     );
     assert_eq!(queries.load(Ordering::SeqCst), 2, "领导者 1 次 + 等待者自查询 1 次");
     leader.abort();

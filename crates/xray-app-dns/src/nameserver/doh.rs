@@ -16,6 +16,9 @@
 //! 三条硬上限见常量注释。连接失效（对端关闭/半开/GOAWAY）→ 复用时探测到失败即
 //! 丢弃并回退新建；空闲 `DOH_IDLE_TIMEOUT` 由看门狗关闭，复用前另有懒判兜底。
 //!
+//! 会话在**查询期间留在槽里**（只克隆发送端），并发 A/AAAA 共享同一条连接
+//! ⇒ 双栈并发化不翻倍连接数；冷启动由建连门串行建档（同样只建一条）。
+//!
 //! deadline 语义（不变）：`query_timeout` 是**整条查询的绝对时刻**，dial/TLS/h2/
 //! response 与「复用失败→重建」全部共享它（Go `nameserver_doh.go:167-172`）——
 //! 复用只省时间，不新增预算。
@@ -110,12 +113,16 @@ struct DohSession {
 
 /// 单 NS 热会话槽（容量 1 条；加上在飞查询即「每 NS ≤2 条」上限）。
 struct SessionSlot {
+    /// 当前热会话（查询期间**留在槽里**：并发 A/AAAA 各克隆一个发送端，
+    /// 同一连接承载两条查询——h2 多路复用，连接数不翻倍）。
     current: Mutex<Option<DohSession>>,
+    /// 建连门（异步互斥）：冷启动/失效后并发多条查询只建一条连接。
+    connecting: tokio::sync::Mutex<()>,
 }
 
 impl SessionSlot {
     fn new() -> Self {
-        Self { current: Mutex::new(None) }
+        Self { current: Mutex::new(None), connecting: tokio::sync::Mutex::new(()) }
     }
 }
 
@@ -276,19 +283,48 @@ impl DohNameServer {
         )))
     }
 
-    /// 取出一条仍新鲜的热会话（空闲到期即丢弃关闭）。
-    fn take_session(&self) -> Option<DohSession> {
+    /// 取一条仍新鲜的热会话发送端（**会话留在槽里**：克隆即并发复用，h2 一条
+    /// 连接同时承载多条查询 ⇒ 并发化不翻倍连接数）。
+    ///
+    /// 空闲到期即丢弃关闭。
+    fn session_sender(&self) -> Option<SendRequest<Bytes>> {
         let mut guard = self.session.current.lock();
-        let session = guard.take()?;
-        let expired = session.idle.is_expired();
-        drop(guard);
-        if expired {
+        let session = guard.as_mut()?;
+        if session.idle.is_expired() {
             // 懒判兜底：看门狗被停机取消时同样带不出过期连接。
+            drop(guard.take());
             tracing::debug!(target: "xray.dns.doh", server = %self.name,
                 "doh: 热会话空闲到期，丢弃");
             return None;
         }
-        Some(session)
+        // 在用即非空闲：看门狗不得在查询中途把连接抽走。
+        session.idle.reset(DOH_IDLE_TIMEOUT);
+        Some(session.send.clone())
+    }
+
+    /// 丢弃当前热会话（对端关闭/半开/GOAWAY；连接驱动随之收尾）。
+    fn drop_session(&self) {
+        drop(self.session.current.lock().take());
+    }
+
+    /// 取一条可用会话的发送端（热会话优先；冷启动/失效后经建连门串行建档）。
+    async fn ensure_session(
+        &self,
+        fx: &FxScope,
+        deadline: &BudgetDeadline,
+    ) -> Result<SendRequest<Bytes>, DnsError> {
+        if let Some(send) = self.session_sender() {
+            return Ok(send);
+        }
+        // 建连门：并发 A/AAAA 同时冷启动时只建一条连接（门内复查）。
+        let _gate = self.session.connecting.lock().await;
+        if let Some(send) = self.session_sender() {
+            return Ok(send);
+        }
+        let session = self.open_session(fx, deadline).await?;
+        let send = session.send.clone();
+        self.store_session(session);
+        Ok(send)
     }
 
     /// 归还会话入槽（空闲计时重置；无名额 ⇒ 用完即关，不落槽）。
@@ -304,7 +340,7 @@ impl DohNameServer {
     /// 空闲会话看门狗（每 NS 一条生命周期任务，不随查询数增长）。
     ///
     /// 扫描粒度 = `DOH_IDLE_TIMEOUT`（到期后 ≤1 个周期关闭），精确关闭另有
-    /// 复用前懒判（[`Self::take_session`]）兜底。
+    /// 复用前懒判（[`Self::session_sender`]）兜底。
     fn start_session_watchdog(&self, fx: &FxScope) {
         if fx.is_closed() {
             return;
@@ -525,6 +561,19 @@ impl DohNameServer {
         Ok(parsed_to_ip_record(&parsed, now))
     }
 
+    /// 单族查询（族未启用返回 `None`，不建连）。
+    async fn query_once_if_enabled(
+        &self,
+        enabled: bool,
+        fqdn: &str,
+        record_type: RecordType,
+    ) -> Option<Result<IpRecord, DnsError>> {
+        if !enabled {
+            return None;
+        }
+        Some(self.query_once(fqdn, record_type).await)
+    }
+
     /// 发送单次 DNS 查询（DoH），等待响应。
     async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
         // P1-11：h2 conn 驱动的托管口先验——未注单（实例未 start）或已关
@@ -548,12 +597,9 @@ impl DohNameServer {
         let deadline = Budget::tokio().deadline(self.query_timeout);
 
         // bd yzhb4：热会话复用（同 NS 1 条 h2 承载全部查询），握手成本只在重建时付。
-        if let Some(session) = self.take_session() {
-            match self.exchange(&session.send, &payload, req_id, record_type, &deadline).await {
-                Ok(rec) => {
-                    self.store_session(session);
-                    return Ok(rec);
-                },
+        if let Some(send) = self.session_sender() {
+            match self.exchange(&send, &payload, req_id, record_type, &deadline).await {
+                Ok(rec) => return Ok(rec),
                 Err(e) => {
                     // 对端已关/半开/GOAWAY：丢弃会话，回退新建（同一 deadline 封顶）。
                     tracing::debug!(target: "xray.dns.doh", server = %self.name, error = %e,
@@ -562,14 +608,16 @@ impl DohNameServer {
                         // 预算已尽：原错误即结论（重建只会立即超时）。
                         return Err(e);
                     }
+                    self.drop_session();
                 },
             }
         }
 
-        let session = self.open_session(fx, &deadline).await?;
-        let result = self.exchange(&session.send, &payload, req_id, record_type, &deadline).await;
-        if result.is_ok() {
-            self.store_session(session);
+        // 冷启动或失效后重建：建连门内建档，并发 A/AAAA 只建一条连接。
+        let send = self.ensure_session(fx, &deadline).await?;
+        let result = self.exchange(&send, &payload, req_id, record_type, &deadline).await;
+        if result.is_err() {
+            self.drop_session();
         }
         result
     }
@@ -580,29 +628,38 @@ impl CachedNameserver for DohNameServer {
         &self.cache
     }
 
+    fn query_timeout(&self) -> Duration {
+        self.query_timeout
+    }
+
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
-        if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A).await {
-                Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => {
-                    // bd d881①：失败路径必须可观察（此前 body(()) Err `?` 静默早退）。
-                    tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
-                        family = "v4", error = %e, "doh: query failed");
-                    outcome.errors.push(e);
-                },
-            }
+        // A/AAAA 并发（Go `nameserver_doh.go` 每个 req 独立 goroutine）：串行 =
+        // 2×RTT，并发 = 1×RTT。两条查询共享同一条 h2 会话（`session_sender`
+        // 只克隆发送端，连接数不翻倍），冷启动时由建连门只建一条。
+        let (v4, v6) = tokio::join!(
+            self.query_once_if_enabled(option.ipv4_enable, fqdn, RecordType::A),
+            self.query_once_if_enabled(option.ipv6_enable, fqdn, RecordType::AAAA),
+        );
+        match v4 {
+            Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
+            Some(Err(e)) => {
+                // bd d881①：失败路径必须可观察（此前 body(()) Err `?` 静默早退）。
+                tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                    family = "v4", error = %e, "doh: query failed");
+                outcome.errors.push(e);
+            },
+            None => {},
         }
-        if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA).await {
-                Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => {
-                    tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
-                        family = "v6", error = %e, "doh: query failed");
-                    outcome.errors.push(e);
-                },
-            }
+        match v6 {
+            Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
+            Some(Err(e)) => {
+                tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                    family = "v6", error = %e, "doh: query failed");
+                outcome.errors.push(e);
+            },
+            None => {},
         }
 
         outcome

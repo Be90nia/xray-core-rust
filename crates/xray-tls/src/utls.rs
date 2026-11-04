@@ -329,45 +329,17 @@ impl<S: Connection + Unpin> Connection for ServerConn<S> {
 }
 
 // ============================================================
-// uTLS UConn（btls 指纹伪装 + rustls fallback）
+// uTLS UConn（btls 指纹伪装）
 // ============================================================
-
-/// UConn 内部连接（btls 或 rustls）。
-#[allow(clippy::large_enum_variant)] // btls SSL 与 rustls Conn 尺寸差固有，Box 化反增间接层
-enum UConnInner<S> {
-    /// 标准 rustls 连接（指纹不支持 btls 时的 fallback）。
-    Rustls(Conn<S>),
-    /// btls (BoringSSL) 连接（真实浏览器指纹）。
-    Btls(crate::btls_client::BtlsConn<S>),
-}
 
 /// uTLS 客户端连接包装。
 ///
-/// 对应 Go `utls.UConn`。根据 `Fingerprint` 选择 btls（真实指纹）或 rustls（fallback）。
+/// 对应 Go `utls.UConn`。rustls fallback 已随「清单外指纹硬错」裁决删除
+/// （票 bvvx0）：指纹要么被 btls 支持（真实 ClientHello），要么硬错。
 pub struct UConn<S> {
-    inner: UConnInner<S>,
+    inner: crate::btls_client::BtlsConn<S>,
     /// 用户期望的 uTLS 指纹。
     pub fingerprint: Fingerprint,
-}
-
-impl<S> UConn<S> {
-    /// 返回协商出的 ALPN 协议。未协商返回 `None`。
-    #[must_use]
-    pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.alpn_protocol(),
-            UConnInner::Btls(_) => None, // btls 通过 negotiated_protocol() 获取
-        }
-    }
-
-    /// 返回 ServerName（SNI）。
-    #[must_use]
-    pub fn server_name(&self) -> &str {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.server_name(),
-            UConnInner::Btls(_) => "", // btls 通过 handshake_server_name() 获取
-        }
-    }
 }
 
 impl<S: Connection + Unpin> AsyncRead for UConn<S> {
@@ -376,13 +348,8 @@ impl<S: Connection + Unpin> AsyncRead for UConn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // 站点归因（票 4y9ns）：u_client 指纹路径读面（Rustls 分支直通
-        // tokio_rustls，不经本 crate Conn 包装，须在此标记）。
-        let _site = alloc_site::enter(alloc_site::TLS_READ);
-        match &mut self.inner {
-            UConnInner::Rustls(c) => Pin::new(c).poll_read(cx, buf),
-            UConnInner::Btls(c) => Pin::new(c).poll_read(cx, buf),
-        }
+        // 站点归因由 BtlsConn::poll_read 标记（TLS_READ）。
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -392,93 +359,57 @@ impl<S: Connection + Unpin> AsyncWrite for UConn<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // 站点归因（z02z8）：Rustls 分支直通 tokio_rustls TlsStream（不经本 crate
-        // Conn 包装），须在此标记才能覆盖 u_client 指纹路径；Btls 分支内层已标记。
-        let _site = alloc_site::enter(alloc_site::TLS_WRITE);
-        match &mut self.inner {
-            UConnInner::Rustls(c) => Pin::new(c).poll_write(cx, buf),
-            UConnInner::Btls(c) => Pin::new(c).poll_write(cx, buf),
-        }
+        // 站点归因由 BtlsConn::poll_write 标记（TLS_WRITE）。
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.inner {
-            UConnInner::Rustls(c) => Pin::new(c).poll_flush(cx),
-            UConnInner::Btls(c) => Pin::new(c).poll_flush(cx),
-        }
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match &mut self.inner {
-            UConnInner::Rustls(c) => Pin::new(c).poll_shutdown(cx),
-            UConnInner::Btls(c) => Pin::new(c).poll_shutdown(cx),
-        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
 impl<S: Connection + Unpin> Connection for UConn<S> {
     fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.remote_addr(),
-            UConnInner::Btls(c) => c.remote_addr(),
-        }
+        self.inner.remote_addr()
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.local_addr(),
-            UConnInner::Btls(c) => c.local_addr(),
-        }
+        self.inner.local_addr()
     }
 
     fn raw_tcp_clone(&self) -> Option<tokio::net::TcpStream> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.raw_tcp_clone(),
-            UConnInner::Btls(c) => c.raw_tcp_clone(),
-        }
+        self.inner.raw_tcp_clone()
     }
 
     fn tls_readbuf_size(&self) -> usize {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.tls_readbuf_size(),
-            // btls SSL_read 单 record 语义：64KB 缓冲零收益，保持缺省 8KB。
-            UConnInner::Btls(_) => 0,
-        }
+        self.inner.tls_readbuf_size()
     }
 }
 
 impl<S: Connection + Unpin> ConnInterface for UConn<S> {
     fn handshake<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        match &mut self.inner {
-            UConnInner::Rustls(c) => c.handshake(),
-            UConnInner::Btls(c) => c.handshake(),
-        }
+        self.inner.handshake()
     }
 
     fn verify_hostname<'a>(
         &'a self,
         host: &'a str,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.verify_hostname(host),
-            UConnInner::Btls(c) => c.verify_hostname(host),
-        }
+        self.inner.verify_hostname(host)
     }
 
     fn handshake_server_name<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-        match &mut self.inner {
-            UConnInner::Rustls(c) => c.handshake_server_name(),
-            UConnInner::Btls(c) => c.handshake_server_name(),
-        }
+        self.inner.handshake_server_name()
     }
 
     fn negotiated_protocol<'a>(&'a self) -> Pin<Box<dyn Future<Output = String> + Send + 'a>> {
-        match &self.inner {
-            UConnInner::Rustls(c) => c.negotiated_protocol(),
-            UConnInner::Btls(c) => c.negotiated_protocol(),
-        }
+        self.inner.negotiated_protocol()
     }
 }
 
@@ -555,10 +486,13 @@ where
 /// 对应 Go `tls.UClient` + `UConn.WebsocketHandshakeContext`（websocket/
 /// httpupgrade dialer 共用，tls.go:98-133）：指纹模板的其余 ClientHello 形态
 /// 保持，仅把 ALPN 扩展重写为 `alpn`；`None` = 保持模板 ALPN。
+///
+/// `config` 已不被本函数使用（btls 只认指纹模板；rustls 回退随票 bvvx0 删除），
+/// 保留形参只为调用方签名稳定（`xray-transport-tcp/register.rs` 属红线文件）。
 pub async fn u_client_with_alpn<S>(
     stream: S,
     server_name: &str,
-    config: Arc<ClientConfig>,
+    _config: Arc<ClientConfig>,
     fingerprint: Fingerprint,
     ech_config_list: Option<&str>,
     // btls 回接验证（pz6c）：`tlsSettings` 原文，内部构建服务端证书验证器
@@ -570,77 +504,49 @@ where
     S: Connection + Unpin,
 {
     let alpn_wire = alpn.map(encode_alpn_wire);
-    // 尝试 btls（真实指纹）
-    if let Some(result) = crate::btls_client::connector_for_fingerprint(&fingerprint) {
-        match result {
-            Ok(_) => {
-                debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: 尝试 btls 指纹伪装");
-                // ECH DNS 形式（Go ech.go ApplyECH "://" 分支）：握手前真实查询
-                // （DoH，`ech_doh::query_ech_config`），结果 base64 回灌——resolve 的
-                // base64 分支原样解码，且 base64 不含 "://" 不会误入占位分支；
-                // 查询失败保持原串 → resolve 走 Full 语义落 INVALID_ECH_CONFIG
-                // （对齐 Go defer 失败语义：ECH 获取失败必须连接失败，不静默明文）。
-                let ech_resolved;
-                let ech_list: Option<&str> = match ech_config_list {
-                    Some(list) if list.contains("://") => {
-                        use base64::Engine as _;
-                        match crate::ech_doh::query_ech_config(list, server_name, None).await {
-                            Ok(bytes) => {
-                                ech_resolved =
-                                    base64::engine::general_purpose::STANDARD.encode(bytes);
-                                Some(ech_resolved.as_str())
-                            },
-                            Err(e) => {
-                                debug!(target: "xray_tls::utls", error = %e,
-                                    "ECH DoH query failed; falling back to invalid config (connection will fail)");
-                                Some(list)
-                            },
-                        }
-                    },
-                    other => other,
-                };
-                match crate::btls_client::BtlsConn::connect_with_alpn(
-                    stream,
-                    server_name,
-                    fingerprint,
-                    ech_list,
-                    // 回接证书验证（pz6c）：allowInsecure=true → None 跳过；
-                    // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
-                    crate::client_config::build_server_cert_verifier(security_json)?,
-                    alpn_wire.as_deref(),
-                    // 0-RTT 总闸（幂等首写协议 opt-in，缺省关）。
-                    crate::tls_session_cache::parse_allow_early_data(security_json),
-                )
-                .await
-                {
-                    Ok(btls_conn) => {
-                        return Ok(UConn { inner: UConnInner::Btls(btls_conn), fingerprint });
-                    },
-                    Err(e) => {
-                        debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败, fallback 到 rustls");
-                        // fallback: 重新建立 TCP 连接已不可能（stream 被 consume），返回错误
-                        return Err(e);
-                    },
-                }
-            },
-            Err(e) => {
-                // 清单外指纹（InvalidData）等 connector 构建失败：硬错。
-                // 配置了指纹却静默回退标准 rustls 等于伪装失效（批3 裁决）。
-                return Err(e);
-            },
-        }
-    }
-    // rustls fallback：无 ECH 能力（rustls 无该 feature），配置了 ECH 时 warn。
-    if let Some(list) = ech_config_list {
-        tracing::warn!(
-            target: "xray_tls::utls",
-            len = list.len(),
-            "ECH config list ignored on rustls fallback (btls fingerprint unavailable); connection proceeds without ECH"
-        );
-    }
-    debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: rustls fallback");
-    let inner = client(stream, server_name, config).await?;
-    Ok(UConn { inner: UConnInner::Rustls(inner), fingerprint })
+    debug!(target: "xray_tls::utls", ?fingerprint, server_name, "u_client: btls 指纹伪装");
+    // ECH DNS 形式（Go ech.go ApplyECH "://" 分支）：握手前真实查询
+    // （DoH，`ech_doh::query_ech_config`），结果 base64 回灌——resolve 的
+    // base64 分支原样解码，且 base64 不含 "://" 不会误入占位分支；
+    // 查询失败保持原串 → resolve 走 Full 语义落 INVALID_ECH_CONFIG
+    // （对齐 Go defer 失败语义：ECH 获取失败必须连接失败，不静默明文）。
+    let ech_resolved;
+    let ech_list: Option<&str> = match ech_config_list {
+        Some(list) if list.contains("://") => {
+            use base64::Engine as _;
+            match crate::ech_doh::query_ech_config(list, server_name, None).await {
+                Ok(bytes) => {
+                    ech_resolved = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    Some(ech_resolved.as_str())
+                },
+                Err(e) => {
+                    debug!(target: "xray_tls::utls", error = %e,
+                        "ECH DoH query failed; falling back to invalid config (connection will fail)");
+                    Some(list)
+                },
+            }
+        },
+        other => other,
+    };
+    // 清单外指纹在 `connect_with_alpn` 内硬错（InvalidData）——没有 rustls
+    // 回退：配置了指纹却静默回退标准 ClientHello 等于伪装失效（批3 裁决）。
+    let conn = crate::btls_client::BtlsConn::connect_with_alpn(
+        stream,
+        server_name,
+        fingerprint,
+        ech_list,
+        // 回接证书验证（pz6c）：allowInsecure=true → None 跳过；
+        // 否则 webpki/pinned verifier 对 btls peer 链做链+主机名验证。
+        crate::client_config::build_server_cert_verifier(security_json)?,
+        alpn_wire.as_deref(),
+        // 0-RTT 总闸（幂等首写协议 opt-in，缺省关）。
+        crate::tls_session_cache::parse_allow_early_data(security_json),
+    )
+    .await
+    .inspect_err(|e| {
+        debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败（无 rustls 回退）");
+    })?;
+    Ok(UConn { inner: conn, fingerprint })
 }
 
 /// ALPN 协议列表 → openssl wire 格式（每项前缀单字节长度）。
@@ -675,7 +581,8 @@ pub fn websocket_handshake_alpn(security_json: Option<&serde_json::Value>) -> Ve
 /// 默认 `ClientConfig`：使用 webpki-roots 系统 root + ring provider。
 ///
 /// 对应 Go `tls.Config{ RootCAs: nil }`（nil 时 Go 用系统 root pool）。
-/// 返回的 config 可在多次 `client()`/`u_client()` 调用间复用（`Arc` clone 廉价）。
+/// 返回的 config 可在多次 `client()` 调用间复用（`Arc` clone 廉价）。
+/// `u_client` 系列不再消费它（btls 走指纹模板，rustls 回退已删）。
 #[must_use]
 pub fn default_client_config() -> Arc<ClientConfig> {
     xray_common::ensure_default_crypto_provider();

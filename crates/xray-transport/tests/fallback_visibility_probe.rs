@@ -357,19 +357,20 @@ async fn c1b_fallback_to_dest_reachable_dest_replays_first_bytes() {
     probe("C-1b fallback_to_dest 返回值（客户端关闭后）", format!("is_err={}", r.is_err()));
 }
 
-/// C-5：fallback dest 是**域名** ⇒ 每次重试**重新解析**（×5）。
+/// C-5：fallback dest 是**域名** ⇒ 解析只做一次（重试环外），同一调用的重试复用该组地址。
 ///
-/// `fallback_to_dest` 用 `TcpStream::connect(dest)`（`&str` 形式）⇒ 每次调用
-/// 都触发一次系统解析（tokio `ToSocketAddrs`）。`exponential_backoff(5, 100)`
-/// ⇒ 最多 5 次尝试 ⇒ **最多 5 次解析**。
+/// 修复前：`lookup_host` 在重试闭包内 ⇒ 每次尝试重解析一次（5×DNS 延迟，因 `should_retry`
+/// 把 `NotFound` 当可重试）⇒ dest 是域名且解析失败时总耗时 = 5×解析 + 600ms 退避阶梯
+/// （实测 757.2 / 780.8ms）。
+/// 修复后（bd xwpt1）：解析移到环外、失败即终局 ⇒ 总耗时 = 1×解析、零退避（实测 ~32ms）。
 ///
 /// 实测方法：dest 用一个**每次解析都要走一次真实 DNS 查询**的域名
 /// （本机用 `localhost.` 不行——hosts 命中；改用 RFC 6761 保证 NXDOMAIN 的
 /// `.invalid` 顶级域 ⇒ 每次都真发一次 DNS 查询到上游）。
 /// 计数方式：用一个**自带 DNS 计数**的 mock 上游不可行（系统 resolver 不听我们的
-/// mock）⇒ 改用**耗时侧证**：5 次解析的耗时 ≈ 5× 单次解析耗时。
+/// mock）⇒ 改用**耗时侧证**：修复前 ≈ 5× 单次解析 + 阶梯，修复后 ≈ 1× 单次解析。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn c5_fallback_domain_dest_resolves_on_every_retry() {
+async fn c5_fallback_domain_dest_resolves_once_per_call() {
     // 单次系统解析耗时（`.invalid` ⇒ NXDOMAIN，每次真发查询）。
     let host = "fallback-probe-does-not-exist.invalid";
     let t0 = Instant::now();
@@ -396,20 +397,19 @@ async fn c5_fallback_domain_dest_resolves_on_every_retry() {
     .await;
     let elapsed = t0.elapsed();
     probe(
-        "C-5 fallback dest=域名 → 总耗时（含 5 次重解析）",
+        "C-5 fallback dest=域名 → 总耗时（1×解析、零退避）",
         format!("{elapsed:?} is_err={}", result.is_err()),
     );
     probe("C-5 错误 Debug（kind 判别）", format!("{:?}", result.as_ref().err()));
     assert!(result.is_err(), "域名不可解析 ⇒ 必须 Err");
 
-    // 判据：总耗时 ≥ 1× 单次解析（证明至少解析过一次），且**回退阶梯**
-    // （0+100+200+300=600ms）叠加在上面 ⇒ 总耗时 ≥ 600ms + 1×解析。
+    // 判据（bd xwpt1）：解析只在环外做一次且解析失败即终局 ⇒ 总耗时 = 1×解析，**不含**
+    // 退避阶梯（0+100+200+300=600ms）。上界 500ms 低于阶梯本身，故任何"回到环内重解析"
+    // 的回归都必红；下界不钉（NXDOMAIN 负缓存会让单次解析降到 ~0）。
     assert!(
-        elapsed >= Duration::from_millis(600) + single_elapsed,
-        "总耗时 {elapsed:?} 应 ≥ 退避阶梯 600ms + 单次解析 {single_elapsed:?}"
+        elapsed < Duration::from_millis(500),
+        "总耗时 {elapsed:?} 应 <500ms（1×解析 + 零退避），实测单次解析 {single_elapsed:?}"
     );
-    // 上界宽松（5 次解析 + 阶梯）。
-    assert!(elapsed < Duration::from_secs(30), "总耗时 {elapsed:?} 应 <30s（5 次解析上界）");
 }
 
 /// C-6：PROXY protocol 解析**无 timeout**（裸 `read_exact`）⇒ 只连不发 ⇒ 挂多久？
@@ -458,7 +458,8 @@ async fn c6_proxy_protocol_parse_has_no_timeout() {
 fn c0_probe_constants() {
     probe("fallback 重试参数", "exponential_backoff(5, 100) ⇒ 最多 5 次尝试，但…");
     probe("…确定性失败（refused/addr-unavailable）", "立即停：1 次尝试、零退避 sleep");
-    probe("…非确定性失败（timeout/unreachable/dns）", "保留重试，退避阶梯 0+100+200+300 = 600ms");
+    probe("…非确定性失败（timeout/unreachable）", "保留重试，退避阶梯 0+100+200+300 = 600ms");
+    probe("…dest=域名 的解析", "重试环外解析一次（同一调用复用该组地址）；解析失败即终局、零退避");
     probe("fallback 总预算", "FALLBACK_DIAL_BUDGET = 5s（黑洞封顶 <6s 判据）");
     probe("fallback 单次尝试上限", "FALLBACK_ATTEMPT_TIMEOUT = 2s（按剩余预算取 min）");
     probe("失败日志限频", "60s 窗 / 至多 5 条 warn，其余 debug + 窗滚动汇总 suppressed=N");

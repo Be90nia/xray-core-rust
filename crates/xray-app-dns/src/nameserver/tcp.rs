@@ -11,7 +11,8 @@
 //!
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket）
 //! - TLS 包装（DoT 见 follow-up 任务）
-//! - 长连接复用（每次查询都新连接；ponytail：简化代码，连接池可后续加）
+//! - 连接数：Go `nameserver_tcp.go` 每个 req 独立拨号；本实现留 ≤2 条空闲流复用 （并发 A/AAAA
+//!   各占一条，池空才付拨号成本）。
 
 use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
@@ -36,6 +37,9 @@ use crate::{
     },
 };
 
+/// 空闲查询流上限：双栈并发最多同时占用 2 条（A + AAAA），多留无复用价值。
+const TCP_MAX_IDLE_STREAMS: usize = 2;
+
 /// TCP DNS nameserver。对应 Go `TCPNameServer`。
 pub struct TcpNameServer {
     /// 服务名。
@@ -51,8 +55,9 @@ pub struct TcpNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
-    /// 连接池：复用查询流（直连 TcpConnection 或经路由 Link 流）。
-    conn: tokio::sync::Mutex<Option<crate::dial::DnsStream>>,
+    /// 空闲查询流池（并发 A/AAAA 各取一条——单条流上两个 DNS 事务不能并行；
+    /// 用完归还，池空才付拨号成本）。
+    conn: tokio::sync::Mutex<Vec<crate::dial::DnsStream>>,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
     /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
@@ -76,7 +81,7 @@ impl TcpNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
-            conn: tokio::sync::Mutex::new(None),
+            conn: tokio::sync::Mutex::new(Vec::new()),
             resolver,
             force_local: false,
         }
@@ -115,6 +120,19 @@ impl TcpNameServer {
             )
             .force_local(ns.force_local),
         )))
+    }
+
+    /// 取一条空闲查询流（并发查询各取一条，取走后互不排队）。
+    async fn take_stream(&self) -> Option<crate::dial::DnsStream> {
+        self.conn.lock().await.pop()
+    }
+
+    /// 归还仍可用的流（池满则弃用，随 drop 关闭）。
+    async fn put_stream(&self, stream: crate::dial::DnsStream) {
+        let mut pool = self.conn.lock().await;
+        if pool.len() < TCP_MAX_IDLE_STREAMS {
+            pool.push(stream);
+        }
     }
 
     /// 建立查询流：共享 dialer 在场经路由出站（Go nameserver_tcp.go:43-47
@@ -163,6 +181,20 @@ impl TcpNameServer {
         Ok(parsed_to_ip_record(&parsed, now))
     }
 
+    /// 单族查询（族未启用返回 `None`，不拨号）。
+    async fn query_if_enabled(
+        &self,
+        enabled: bool,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: BudgetDeadline,
+    ) -> Option<Result<IpRecord, DnsError>> {
+        if !enabled {
+            return None;
+        }
+        Some(self.query_once(fqdn, record_type, deadline).await)
+    }
+
     /// 发送单次 DNS 查询（TCP），等待响应。连接池复用连接，失败时重试一次
     /// （bd 2iauj：重试共享调用方传入的同一 `deadline`，不另起预算）。
     async fn query_once(
@@ -185,23 +217,19 @@ impl TcpNameServer {
                 .await;
         }
 
-        let mut conn_guard = self.conn.lock().await;
-        if conn_guard.is_none() {
-            *conn_guard = Some(self.connect(deadline.clone()).await?);
-        }
+        let mut stream = match self.take_stream().await {
+            Some(stream) => stream,
+            None => self.connect(deadline.clone()).await?,
+        };
 
         match self
-            .try_query(
-                conn_guard.as_mut().expect("conn established above when None"),
-                &len_be,
-                &payload,
-                req_id,
-                record_type,
-                deadline.clone(),
-            )
+            .try_query(&mut stream, &len_be, &payload, req_id, record_type, deadline.clone())
             .await
         {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                self.put_stream(stream).await;
+                Ok(result)
+            },
             Err(e) => {
                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
                 // 拨号错误掩盖真正的原因：直接返回首查错误（Go 本无重试）。
@@ -210,17 +238,21 @@ impl TcpNameServer {
                 }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DNS-over-TCP query on pooled connection failed, reconnecting");
-                *conn_guard = None;
-                *conn_guard = Some(self.connect(deadline.clone()).await?);
-                self.try_query(
-                    conn_guard.as_mut().expect("reconnected just above"),
-                    &len_be,
-                    &payload,
-                    req_id,
-                    record_type,
-                    deadline.clone(),
-                )
-                .await
+                let mut stream = self.connect(deadline.clone()).await?;
+                let result = self
+                    .try_query(
+                        &mut stream,
+                        &len_be,
+                        &payload,
+                        req_id,
+                        record_type,
+                        deadline.clone(),
+                    )
+                    .await;
+                if result.is_ok() {
+                    self.put_stream(stream).await;
+                }
+                result
             },
         }
     }
@@ -229,6 +261,10 @@ impl TcpNameServer {
 impl CachedNameserver for TcpNameServer {
     fn cache_controller(&self) -> &CacheController {
         &self.cache
+    }
+
+    fn query_timeout(&self) -> Duration {
+        self.query_timeout
     }
 
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
@@ -241,17 +277,21 @@ impl CachedNameserver for TcpNameServer {
         // pause/advance 语义不变）。
         let deadline = Budget::tokio().deadline(self.query_timeout);
 
-        if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        // A/AAAA 并发（Go `nameserver_tcp.go` 每个 req 独立 goroutine 拨号）：
+        // 串行 = 2×RTT，并发 = 1×RTT。两条事务各占一条流（池内空闲流优先）。
+        let (v4, v6) = tokio::join!(
+            self.query_if_enabled(option.ipv4_enable, fqdn, RecordType::A, deadline.clone()),
+            self.query_if_enabled(option.ipv6_enable, fqdn, RecordType::AAAA, deadline.clone()),
+        );
+        match v4 {
+            Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
-        if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        match v6 {
+            Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
 
         outcome

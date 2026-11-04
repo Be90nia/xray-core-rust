@@ -207,7 +207,8 @@ pub struct BtlsDial {
     pub port: u16,
     /// TLS SNI（tlsSettings.serverName，空回退 dest host）。
     pub sni: String,
-    /// 自建 config，清单外指纹由 u_client 回退此 config 走 rustls）。
+    /// rustls config，仅为 `u_client` 形参保留：`u_client` 已不使用它
+    /// （rustls 回退随票 bvvx0 删除，指纹要么 btls 要么硬错）。
     pub config: Arc<RustlsClientConfig>,
     pub fingerprint: Fingerprint,
     /// `tlsSettings` 原文（pz6c）：btls 指纹握手后回接证书验证用
@@ -224,6 +225,11 @@ pub struct BtlsDial {
 /// - Rustls 分支原生 `MaybeHttpsStream` 自带 rt traits（转发保留 `connected()` 的 ALPN/HttpInfo
 ///   元数据）。
 /// - Btls 分支 `UConn` 只实现 tokio traits，用 `TokioIo` 桥接。
+// 每连接一份（非每包）：`Btls` 变体 1080B 来自 `UConn` 内联 `BtlsConn`——删掉
+// `UConnInner` 的 rustls 死变体后最大/次大变体比值超过阈值才触发本 lint，绝对尺寸
+// 未变（无新增内存）、交付形态也未变。Box 化会让数据面每次 poll_read/write 多一次
+// 间接寻址，不划算（同 `transport.rs` 的 `XhSource`）。
+#[allow(clippy::large_enum_variant)]
 pub enum SplitStream {
     Rustls(MaybeHttpsStream<DestTcpStream>),
     Btls {
@@ -432,8 +438,8 @@ impl DefaultDialerClient {
                 tcpmask,
             })
         } else {
-            // clear 只在 rustls 分支：btls 分支的 config 原样传给 u_client
-            // （清单外指纹回退 rustls 时保留 alpn）。
+            // clear 只在 rustls 分支（btls 分支不读 config.alpn_protocols，
+            // 指纹 ALPN 走模板/显式覆盖）。
             tls_config.alpn_protocols.clear();
             let mut builder =
                 HttpsConnectorBuilder::new().with_tls_config(tls_config).https_or_http();

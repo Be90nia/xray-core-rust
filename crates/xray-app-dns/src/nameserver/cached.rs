@@ -27,9 +27,19 @@ use crate::{
     error::DnsError,
 };
 
-/// singleflight 等待者的兜底超时。领导者底层查询各自带 per-query timeout
-/// （默认 4s），此处取同量级值，防领导者异常挂起时等待者被无限拖住。
-const SF_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+/// singleflight 等待者相对领导者的兜底余量：等待上限 = 本 NS 的 `query_timeout`
+/// + 本余量（见 [`sf_wait_timeout`]）。
+///
+/// 领导者自身查询在 `query_timeout` 必定收场（各 NS 的整条查询绝对 deadline），
+/// 等待者必须**晚一步**收场才能共享到领导者的结论。固定值与缺省 `query_timeout`
+/// 相等（改前 4s == UDP/TCP/DoT/DoQ 缺省 4000ms）⇒ 等待者在领导者刚失败的同刻
+/// 超时并自起一轮上游查询，必然重复（bd 26v9t）。
+const SF_WAIT_MARGIN: Duration = Duration::from_secs(1);
+
+/// singleflight 等待者的等待上限：领导者查询超时 + [`SF_WAIT_MARGIN`]。
+fn sf_wait_timeout<S: CachedNameserver + ?Sized>(server: &S) -> Duration {
+    server.query_timeout() + SF_WAIT_MARGIN
+}
 
 /// 后台 pull 的兜底超时。对应 Go `pull` 的 `context.WithTimeout(..., 8s)`。
 const PULL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -69,6 +79,14 @@ enum SfSlot {
 pub trait CachedNameserver: Send + Sync {
     /// 取共享缓存控制器。
     fn cache_controller(&self) -> &CacheController;
+
+    /// 本 NS 单次查询的超时（整条查询的绝对预算，与 `send_query` 内一致）。
+    ///
+    /// singleflight 等待者的兜底超时按它派生（[`sf_wait_timeout`]）。各 NS 覆写
+    /// 为自身配置值；缺省 4s = UDP/TCP/DoT/DoQ 的缺省 `timeout_ms`。
+    fn query_timeout(&self) -> Duration {
+        Duration::from_secs(4)
+    }
 
     /// 发起底层 DNS 查询（UDP/TCP/DoH/...）。返回 `(rec_v4, rec_v6, err)`。
     ///
@@ -227,6 +245,8 @@ pub async fn fetch<S: CachedNameserver>(
     // 成为领导者。parking_lot guard 非 Send：锁内零 await，guard 不越过任何
     // await 点。领导者条目由 SfLeaderGuard 在 Drop 时移除——正常完成、错误、
     // 被上层 abort（如 parallel_query 的 abort_all）都保证不泄漏。
+    // 等待上限按领导者 NS 的查询超时派生（改前固定 4s = 缺省查询超时 ⇒ 必然重复）。
+    let sf_wait = sf_wait_timeout(server);
     let mut outcome = {
         let slot = {
             let mut sf = cache.single_flight.lock();
@@ -251,7 +271,7 @@ pub async fn fetch<S: CachedNameserver>(
                 // 等待者兜底超时：领导者异常挂起时不被无限拖住。
                 // 条目统一由领导者侧 guard 移除（等待者不清理，避免误删超时
                 // 期间新领导者的条目；Go singleflight 同为领导者单点删除）。
-                match tokio::time::timeout(SF_WAIT_TIMEOUT, rx.recv()).await {
+                match tokio::time::timeout(sf_wait, rx.recv()).await {
                     Ok(Ok(o)) => o,
                     _ => server.send_query(fqdn, option).await,
                 }
@@ -1030,5 +1050,131 @@ mod tests {
             "serveStale 关闭时不得返回过期旧值"
         );
         assert_eq!(ttl, 60, "应返回 fetch 新值的 TTL");
+    }
+
+    /// bd 26v9t：等待上限 = 本 NS 的 `query_timeout` + 1s（改前固定 4s，恰等于
+    /// UDP/TCP/DoT/DoQ 缺省 4000ms ⇒ 领导者刚失败的同刻等待者超时并自起一轮
+    /// 上游查询，必然重复）。五种 NS 各自按自身配置值派生。
+    #[test]
+    fn sf_wait_timeout_derives_from_ns_query_timeout() {
+        use xray_common::net::{address::Address, destination::Destination, port::Port};
+
+        use crate::nameserver::{
+            doh::DohNameServer, dot::DotNameServer, quic::DoqNameServer, tcp::TcpNameServer,
+            udp::UdpNameServer,
+        };
+
+        let dest = Destination::tcp(Address::from(Ipv4Addr::LOCALHOST), Port::new(53));
+        let udp_dest = Destination::udp(Address::from(Ipv4Addr::LOCALHOST), Port::new(53));
+        let resolver: Arc<dyn crate::dial::HostResolver> =
+            Arc::new(crate::dial::SystemHostResolver);
+        let tls = xray_tls::utls::default_client_config();
+        let cache = |tag: &str| Arc::new(CacheController::new(tag, true, false, 0, 0));
+        let default_qt = Duration::from_millis(4000);
+
+        let udp =
+            UdpNameServer::new(udp_dest, cache("t"), Vec::new(), default_qt, Arc::clone(&resolver));
+        let tcp = TcpNameServer::new(
+            dest.clone(),
+            cache("t"),
+            Vec::new(),
+            default_qt,
+            Arc::clone(&resolver),
+        );
+        let dot = DotNameServer::new(
+            dest.clone(),
+            "localhost".to_string(),
+            Arc::clone(&tls),
+            cache("t"),
+            Vec::new(),
+            default_qt,
+        );
+        let doq = DoqNameServer::new(
+            "127.0.0.1:853".parse().expect("addr"),
+            "localhost".to_string(),
+            Arc::clone(&tls),
+            cache("t"),
+            Vec::new(),
+            default_qt,
+        );
+        // DoH 缺省 5000ms ⇒ 派生 6s。
+        let doh = DohNameServer::new(
+            dest,
+            "localhost".to_string(),
+            tls,
+            cache("t"),
+            Vec::new(),
+            Duration::from_millis(5000),
+            true,
+        );
+
+        assert_eq!(sf_wait_timeout(&udp), Duration::from_secs(5));
+        assert_eq!(sf_wait_timeout(&tcp), Duration::from_secs(5));
+        assert_eq!(sf_wait_timeout(&dot), Duration::from_secs(5));
+        assert_eq!(sf_wait_timeout(&doq), Duration::from_secs(5));
+        assert_eq!(sf_wait_timeout(&doh), Duration::from_secs(6));
+    }
+
+    /// bd 26v9t：领导者跑得比等待上限更久时，等待者在上限处自查询——上限跟
+    /// `query_timeout` 走（100ms + 1s），不再被固定 4s 拖住。
+    #[tokio::test]
+    async fn sf_waiter_gives_up_at_derived_timeout() {
+        struct SlowServer {
+            cache: Arc<CacheController>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl CachedNameserver for SlowServer {
+            fn cache_controller(&self) -> &CacheController {
+                &self.cache
+            }
+
+            fn query_timeout(&self) -> Duration {
+                Duration::from_millis(100)
+            }
+
+            async fn send_query(&self, _fqdn: &str, _option: IpOption) -> QueryOutcome {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // 比派生上限（100ms + 1s）更久 ⇒ 等待者必在上限处自查询。
+                tokio::time::sleep(Duration::from_millis(1300)).await;
+                QueryOutcome { rec_v4: Some(v4_record(60)), rec_v6: None, errors: Vec::new() }
+            }
+        }
+
+        let server = Arc::new(SlowServer {
+            cache: Arc::new(CacheController::new("sf-derived", true, false, 0, 0)),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        // 领导者先起步（占住 singleflight 条目）。
+        let leader = xray_common::testing::spawn("sf-derived-leader", {
+            let server = Arc::clone(&server);
+            async move { fetch(&*server, "slow.com.", v4_only_option()).await }
+        });
+        loop {
+            if !server.cache.single_flight.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let started = Instant::now();
+        let waiter = fetch(&*server, "slow.com.", v4_only_option()).await;
+        let elapsed = started.elapsed();
+        assert!(waiter.is_ok());
+        assert!(
+            elapsed >= Duration::from_millis(1100),
+            "等待者至少要等满派生上限（100ms + 1s），实测 {elapsed:?}"
+        );
+        // 派生上限 1.1s + 自查询 1.3s ≈ 2.4s；改前固定 4s ⇒ 5.3s。
+        assert!(
+            elapsed < Duration::from_millis(3200),
+            "等待上限应跟 query_timeout 走（约 1.1s）而非固定 4s，实测 {elapsed:?}"
+        );
+        assert_eq!(
+            server.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "领导者 1 次 + 等待者自查询 1 次"
+        );
+        let _ = leader.await;
     }
 }

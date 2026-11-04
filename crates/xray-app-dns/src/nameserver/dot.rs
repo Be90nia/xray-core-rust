@@ -12,7 +12,8 @@
 //! ## 跳过范围
 //!
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket + xray_tls）
-//! - 长连接复用（每次查询都新连接；ponytail：连接池可后续加）
+//! - 连接数：Go 无独立 DoT NS（语义同 TCP，每 req 独立拨号）；本实现留 ≤2 条空闲 TLS 连接复用（并发
+//!   A/AAAA 各占一条，池空才付握手成本）。
 
 use std::{future::Future, io, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
 
@@ -41,6 +42,10 @@ use crate::{
 /// DoT 单次响应最大字节数（与 TCP 一致）。
 const DOT_RECV_MAX: usize = 65535;
 
+/// 空闲 TLS 连接上限：双栈并发最多同时占用 2 条（A + AAAA）——TLS 握手昂贵，
+/// 多留连接没有复用收益。
+const DOT_MAX_IDLE_CONNS: usize = 2;
+
 /// DoT DNS nameserver。
 ///
 /// 结构与 `TcpNameServer` 对称，区别：connect 后多一步 TLS 握手。
@@ -60,9 +65,10 @@ pub struct DotNameServer {
     query_timeout: Duration,
     /// 请求 ID 生成器。
     id_gen: AtomicReqIdGen,
-    /// 连接池：复用 TLS 连接（流形态：直连 TcpConnection 或经路由 Link 流）。
+    /// 空闲 TLS 连接池（并发 A/AAAA 各取一条——单条流上两个 DNS 事务不能并行；
+    /// 用完归还，池空才付握手成本）。
     conn: tokio::sync::Mutex<
-        Option<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>,
+        Vec<xray_tls::utls::Conn<Box<dyn xray_transport::connection::Connection>>>,
     >,
     /// 域名解析器（直连兜底路径）。
     resolver: Arc<dyn crate::dial::HostResolver>,
@@ -95,7 +101,7 @@ impl DotNameServer {
             client_ip,
             query_timeout,
             id_gen: AtomicReqIdGen::new(),
-            conn: tokio::sync::Mutex::new(None),
+            conn: tokio::sync::Mutex::new(Vec::new()),
             resolver: Arc::new(crate::dial::SystemHostResolver),
             force_local: false,
         }
@@ -168,6 +174,28 @@ impl DotNameServer {
             .map_err(|_| DnsError::WireFormat("dot tls handshake timeout".to_string()))?
             .map_err(|e| DnsError::WireFormat(format!("dot tls handshake: {e}")))?;
         Ok(tls)
+    }
+
+    /// 归还仍可用的 TLS 连接（池满则弃用，随 drop 关闭）。
+    async fn put_conn(&self, conn: xray_tls::utls::Conn<DotStream>) {
+        let mut pool = self.conn.lock().await;
+        if pool.len() < DOT_MAX_IDLE_CONNS {
+            pool.push(conn);
+        }
+    }
+
+    /// 单族查询（族未启用返回 `None`，不拨号）。
+    async fn query_if_enabled(
+        &self,
+        enabled: bool,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: BudgetDeadline,
+    ) -> Option<Result<IpRecord, DnsError>> {
+        if !enabled {
+            return None;
+        }
+        Some(self.query_once(fqdn, record_type, deadline).await)
     }
 
     /// 在已有连接上执行单次 DoT 查询（bd 2iauj：写/刷新/读全按整条查询的
@@ -248,24 +276,20 @@ impl DotNameServer {
             .map_err(|_| DnsError::WireFormat("query too large for DoT".to_string()))?
             .to_be_bytes();
 
-        let mut conn_guard = self.conn.lock().await;
-        if conn_guard.is_none() {
-            *conn_guard = Some(self.connect_tls(deadline.clone()).await?);
-        }
+        let mut conn = match self.conn.lock().await.pop() {
+            Some(conn) => conn,
+            None => self.connect_tls(deadline.clone()).await?,
+        };
 
         // 尝试在已有连接上查询，失败则丢弃重连。
         match self
-            .try_query(
-                conn_guard.as_mut().expect("conn established above when None"),
-                &len_be,
-                &payload,
-                req_id,
-                record_type,
-                deadline.clone(),
-            )
+            .try_query(&mut conn, &len_be, &payload, req_id, record_type, deadline.clone())
             .await
         {
-            Ok(result) => Ok(result),
+            Ok(result) => {
+                self.put_conn(conn).await;
+                Ok(result)
+            },
             Err(e) => {
                 // 整条查询 deadline 已耗尽（本段超时）→ 重连必然立即失败，且会用
                 // 拨号/握手错误掩盖真正原因：直接返回首查错误（Go 本无重试）。
@@ -274,17 +298,14 @@ impl DotNameServer {
                 }
                 // 首查失败静默重连不可观测（iq1o）：记录首查错误再重试。
                 tracing::debug!(error = %e, "DoT query on pooled connection failed, reconnecting");
-                *conn_guard = None;
-                *conn_guard = Some(self.connect_tls(deadline.clone()).await?);
-                self.try_query(
-                    conn_guard.as_mut().expect("reconnected just above"),
-                    &len_be,
-                    &payload,
-                    req_id,
-                    record_type,
-                    deadline.clone(),
-                )
-                .await
+                let mut conn = self.connect_tls(deadline.clone()).await?;
+                let result = self
+                    .try_query(&mut conn, &len_be, &payload, req_id, record_type, deadline.clone())
+                    .await;
+                if result.is_ok() {
+                    self.put_conn(conn).await;
+                }
+                result
             },
         }
     }
@@ -293,6 +314,10 @@ impl DotNameServer {
 impl CachedNameserver for DotNameServer {
     fn cache_controller(&self) -> &CacheController {
         &self.cache
+    }
+
+    fn query_timeout(&self) -> Duration {
+        self.query_timeout
     }
 
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
@@ -305,17 +330,21 @@ impl CachedNameserver for DotNameServer {
         // pause/advance 语义不变）。
         let deadline = Budget::tokio().deadline(self.query_timeout);
 
-        if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        // A/AAAA 并发（Go 每个 req 独立 goroutine 拨号）：串行 = 2×RTT，并发 =
+        // 1×RTT。两条事务各占一条连接（池内空闲连接优先）。
+        let (v4, v6) = tokio::join!(
+            self.query_if_enabled(option.ipv4_enable, fqdn, RecordType::A, deadline.clone()),
+            self.query_if_enabled(option.ipv6_enable, fqdn, RecordType::AAAA, deadline.clone()),
+        );
+        match v4 {
+            Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
-        if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        match v6 {
+            Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
 
         outcome

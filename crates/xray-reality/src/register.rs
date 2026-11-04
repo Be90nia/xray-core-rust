@@ -537,7 +537,7 @@ mod tests {
     /// 组合配置期拒启——堵 fail-open（Go 全指纹走 utls 均验签）。
     ///
     /// 注：`unsafe` 是唯一 get_fingerprint 认识但 btls 清单外的预设
-    /// （connector_for_fingerprint → Some(Err) → fingerprint_supported=false，
+    /// （connector_for_fingerprint → Err → fingerprint_supported=false，
     /// u_client 走 watfaq fallback）；randomizednoalpn 等现已被 btls 就近映射覆盖。
     #[test]
     fn parse_reality_config_rejects_mldsa65_with_fallback_fingerprint() {

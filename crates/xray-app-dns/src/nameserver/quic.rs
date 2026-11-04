@@ -143,6 +143,20 @@ impl DoqNameServer {
         Ok(endpoint)
     }
 
+    /// 单族查询（族未启用返回 `None`，不拨号）。
+    async fn query_once_if_enabled(
+        &self,
+        enabled: bool,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: BudgetDeadline,
+    ) -> Option<Result<IpRecord, DnsError>> {
+        if !enabled {
+            return None;
+        }
+        Some(self.query_once(fqdn, record_type, deadline).await)
+    }
+
     /// 发送单次 DNS 查询（DoQ），等待响应。
     ///
     /// bd 2iauj：连接/开流/写/读全部按调用方传入的整条查询绝对 `deadline` 收场
@@ -233,6 +247,10 @@ impl CachedNameserver for DoqNameServer {
         &self.cache
     }
 
+    fn query_timeout(&self) -> Duration {
+        self.query_timeout
+    }
+
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 
@@ -242,17 +260,26 @@ impl CachedNameserver for DoqNameServer {
         // pause/advance 语义不变）。
         let deadline = Budget::tokio().deadline(self.query_timeout);
 
-        if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        // A/AAAA 并发（Go `nameserver_quic.go` 每个 req 独立 goroutine 拨号）：
+        // 串行 = 2×RTT，并发 = 1×RTT。
+        let (v4, v6) = tokio::join!(
+            self.query_once_if_enabled(option.ipv4_enable, fqdn, RecordType::A, deadline.clone()),
+            self.query_once_if_enabled(
+                option.ipv6_enable,
+                fqdn,
+                RecordType::AAAA,
+                deadline.clone()
+            ),
+        );
+        match v4 {
+            Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
-        if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        match v6 {
+            Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
 
         outcome

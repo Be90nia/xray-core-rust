@@ -365,11 +365,7 @@ pub async fn connect_reality<S>(
 where
     S: Connection + Unpin,
 {
-    let fp_config = connector_for_fingerprint(&fingerprint)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "fingerprint not supported by btls")
-        })?
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let fp_config = connector_for_fingerprint(&fingerprint)?;
 
     let mut cfg = fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
     cfg.set_verify_hostname(false);

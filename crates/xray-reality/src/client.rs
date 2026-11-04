@@ -708,7 +708,7 @@ mod tests {
         let mk_state = |public_key: Vec<u8>, mldsa65_verify: Vec<u8>| {
             let mut cfg = make_valid_config();
             // `unsafe` 是唯一 get_fingerprint 认识但 btls 清单外的预设
-            // （connector_for_fingerprint → Some(Err)）→ u_client 走 fallback 分支
+            // （connector_for_fingerprint → Err）→ u_client 走 watfaq fallback
             cfg.fingerprint = "unsafe".into();
             cfg.public_key = public_key;
             cfg.mldsa65_verify = mldsa65_verify;

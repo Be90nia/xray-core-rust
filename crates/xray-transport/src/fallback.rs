@@ -27,7 +27,8 @@ const FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// `ConnectionRefused`：对方明确拒绝（无监听 / 防火墙 reject），5 次重试纯烧时间——
 /// 修复前正是它把「秒级连不上」放大成十几秒。`AddrNotAvailable`/`InvalidInput` 同理
 /// （本机无该地址族 / 目标地址非法）。**可重试**的保留：`TimedOut`/`Unreachable`
-/// （黑洞，值得再试，但受总预算约束）与 `NotFound`（DNS 可能是瞬时抖动）。
+/// （黑洞，值得再试，但受总预算约束）。解析失败不过此判定——解析在重试环外，失败即
+/// 终局（见 [`fallback_to_dest`]）。
 fn should_retry(e: &std::io::Error) -> bool {
     !matches!(
         e.kind(),
@@ -113,6 +114,20 @@ fn log_dial_failure(line: String) {
     }
 }
 
+/// 拨号/解析失败留痕的唯一出口（格式单源：端到端探针按此串 grep）。
+fn log_dial_error<E: std::fmt::Display>(
+    dest: &str,
+    src: SocketAddr,
+    started: std::time::Instant,
+    class: &str,
+    err: &E,
+) {
+    log_dial_failure(format!(
+        "fallback dest={dest} src={src} class={class} elapsed={:?} error={err}",
+        started.elapsed()
+    ));
+}
+
 /// PROXY protocol 版本（对应 Go `fb.Xver`）。
 ///
 /// - `0`：不发送 PROXY header。
@@ -196,6 +211,26 @@ where
     // 我们在其上加两条更优策略（见 `should_retry` / `FALLBACK_DIAL_BUDGET`）：
     // 确定性失败（refused 等）不再重试 5 次，且整次重试受 5s 总预算约束。
     let started = now();
+    // 解析在整个重试环**外**、只做一次：Go 是每次尝试都走完整系统拨号链（含重解析），
+    // 我们只复刻其可观测语义（同一调用内重试同一组地址），不复刻它的 DNS 放大——dest 是
+    // 域名且解析失败时，5 次重解析把 32ms 放大成 781ms（实测 bd xwpt1）。
+    // 解析顺序即拨号顺序（`dial_first_reachable` 内按序尝试 = Go `net.Dialer` 语义）。
+    //
+    // 解析失败即终局、不进退避环：拿不到地址就没有可重试的拨号，重解析 5 次的收益≈0
+    // （重试间隔 100/200/300ms 远小于解析器超时 1s+，瞬时抖动换不来结果）；真正的重试
+    // 路径是下一条连接重新解析（每次调用各解析一次）。与 `should_retry` 的「确定性失败
+    // 不重试」同族。
+    //
+    // 不按错误类别分流（NXDOMAIN 直返 / timeout 重试）：Windows 上 NXDOMAIN 的
+    // `io::ErrorKind` 是 `Uncategorized`（os error 11001），kind 映射跨平台不可靠，分流
+    // 只会变成静默误判。
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(dest).await {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => {
+            log_dial_error(dest, src, started, error_class(&e), &e);
+            return Err(e);
+        },
+    };
     let mut dest_conn = match crate::retry::exponential_backoff_if(
         FALLBACK_ATTEMPTS,
         FALLBACK_BACKOFF_MS,
@@ -209,7 +244,6 @@ where
                     "fallback dial budget exhausted",
                 ));
             }
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(dest).await?.collect();
             // 单次尝试独立封顶（`dial_first_reachable` 内部整次预算是 16s，黑洞地址会
             // 一口气吃满；这里按剩余预算/单次上限切短，让重试真实发生）。
             match tokio::time::timeout(

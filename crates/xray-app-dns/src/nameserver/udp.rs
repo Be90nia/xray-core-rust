@@ -516,6 +516,10 @@ impl CachedNameserver for UdpNameServer {
         &self.cache
     }
 
+    fn query_timeout(&self) -> Duration {
+        self.query_timeout
+    }
+
     async fn send_query(&self, fqdn: &str, option: IpOption) -> QueryOutcome {
         let mut outcome = QueryOutcome::default();
 

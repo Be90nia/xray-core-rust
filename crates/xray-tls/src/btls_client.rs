@@ -937,12 +937,43 @@ const NATIVE_TEMPLATE_LIST: &str = "chrome firefox safari ios edge 360 qq \
      hellochrome_120/131/133 hellofirefox_120/148 helloios_13/14 \
      helloedge_106 hellosafari_26_3 hello360_11_0 helloqq_11_1";
 
-/// 根据指纹选择 btls 连接器。
+/// 构造探针（票 bvvx0，仅测试面）：本线程 [`connector_for_fingerprint`] 的调用
+/// 次数与累计耗时。用线程局部而非全局计数——探针测试跑 `#[tokio::test]` 默认的
+/// current_thread 单线程运行时，一次拨号的构建全在本线程完成，因此计数精确且
+/// 不会被并行测试污染。
+#[cfg(test)]
+pub(crate) mod build_probe {
+    use std::cell::Cell;
+
+    use skeleton::clock::{Clock, SystemClock};
+
+    thread_local! {
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static NANOS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// 计时执行一次 connector 构建并计数。
+    pub(crate) fn timed<T>(f: impl FnOnce() -> T) -> T {
+        let t0 = SystemClock.now_instant();
+        let out = f();
+        let elapsed = SystemClock.now_instant().duration_since(t0);
+        NANOS.with(|n| n.set(n.get() + elapsed.as_nanos() as u64));
+        CALLS.with(|c| c.set(c.get() + 1));
+        out
+    }
+
+    /// 取出并清零本线程自上次调用以来的 (构建次数, 累计纳秒)。
+    pub(crate) fn take() -> (usize, u64) {
+        (CALLS.with(|c| c.replace(0)), NANOS.with(|n| n.replace(0)))
+    }
+}
+
+/// 根据指纹构建 btls 连接器（= 新建一个 `SSL_CTX`，实测 ~69µs）。
 ///
-/// 返回 `Some(Ok(config))` = btls 支持（Native 或已告警的显式降级）；
-/// `Some(Err(_))` = 清单外指纹（硬错 `InvalidData`，不再静默回退标准
-/// rustls）；函数不再返回 `None`。
-pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<FingerprintConfig>> {
+/// 清单外指纹硬错 `InvalidData`（不再静默回退标准 rustls）。只想判「指纹是否
+/// 被支持」时**不要**调本函数——用常数时间谓词 [`fingerprint_supported`]，
+/// 否则每次判断白建一个 `SSL_CTX`。
+pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> io::Result<FingerprintConfig> {
     let effective = match effective_fingerprint(fp) {
         FingerprintResolution::Native => *fp,
         FingerprintResolution::Degraded { effective } => {
@@ -959,15 +990,19 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> Option<io::Result<F
         FingerprintResolution::Unsupported => {
             // 清单外指纹：硬错 InvalidData。配置了指纹说明用户在意 ClientHello
             // 伪装，静默回退标准 rustls 等于伪装失效（批3 裁决：显式失败）。
-            return Some(Err(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "fingerprint {fp:?} not supported by btls; pick a supported fingerprint (silent rustls fallback removed)"
                 ),
-            )));
+            ));
         },
     };
-    Some(build_fingerprint_config(fp, &effective))
+    #[cfg(not(test))]
+    let built = build_fingerprint_config(fp, &effective);
+    #[cfg(test)]
+    let built = build_probe::timed(|| build_fingerprint_config(fp, &effective));
+    built
 }
 
 /// 按实际生效模板构建 connector 配置（分支与 [`effective_fingerprint`] 的
@@ -1263,17 +1298,8 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
-        let fp_config = match connector_for_fingerprint(&fingerprint) {
-            Some(Ok(c)) => c,
-            // 清单外指纹：透传 InvalidData 硬错（不静默降级）
-            Some(Err(e)) => return Err(e),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "fingerprint not supported by btls",
-                ));
-            },
-        };
+        // 清单外指纹：透传 InvalidData 硬错（不静默降级）
+        let fp_config = connector_for_fingerprint(&fingerprint)?;
 
         let mut cfg =
             fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
@@ -1453,13 +1479,13 @@ fn verify_peer_certs(
         .map(|_| ())
 }
 
-/// 指纹是否被 btls 支持（REALITY u_client 路径选择的预检）。
+/// 指纹是否被 btls 支持（REALITY u_client 路由与拨号前预检用）。
 ///
-/// 清单外指纹为 `false`（`Some(Err)` 不算支持）；调用方（如 REALITY）据此
-/// 走各自的平台降级路径，u_client 主路径则直接硬错。
+/// 常数时间谓词，**不构建 connector**（构建 = 新 `SSL_CTX`，~69µs）；清单外
+/// 指纹为 `false`，调用方据此走各自的降级路径，u_client 主路径则直接硬错。
 #[must_use]
 pub fn fingerprint_supported(fp: &Fingerprint) -> bool {
-    matches!(connector_for_fingerprint(fp), Some(Ok(_)))
+    !matches!(effective_fingerprint(fp), FingerprintResolution::Unsupported)
 }
 
 impl<S: Connection + Unpin> AsyncRead for BtlsConn<S> {
@@ -1672,7 +1698,6 @@ mod tests {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
             let cfg = connector_for_fingerprint(&Fingerprint::HelloChrome58)
-                .expect("Some")
                 .expect("degraded config builds");
             let _ = cfg;
         });
@@ -1698,7 +1723,6 @@ mod tests {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
             let cfg = connector_for_fingerprint(&Fingerprint::Random)
-                .expect("Some")
                 .expect("random degraded config builds");
             let _ = cfg;
         });
@@ -1718,7 +1742,6 @@ mod tests {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
             let cfg = connector_for_fingerprint(&Fingerprint::RandomizedNoAlpn)
-                .expect("Some")
                 .expect("no-alpn degraded config builds");
             assert!(cfg.alps.is_empty(), "no-ALPN variant must have empty ALPS");
         });
@@ -1736,8 +1759,8 @@ mod tests {
     fn native_fingerprint_emits_no_warning() {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let _ = connector_for_fingerprint(&Fingerprint::Chrome).expect("Some").expect("ok");
-            let _ = connector_for_fingerprint(&Fingerprint::HelloIos13).expect("Some").expect("ok");
+            let _ = connector_for_fingerprint(&Fingerprint::Chrome).expect("ok");
+            let _ = connector_for_fingerprint(&Fingerprint::HelloIos13).expect("ok");
         });
         assert!(capture.0.lock().unwrap().is_empty(), "native fingerprints must not warn");
     }
@@ -1747,16 +1770,15 @@ mod tests {
     fn unsupported_fingerprint_hard_errors() {
         // FingerprintConfig 无 Debug（SslConnector 无 derive），用 match 解构。
         let err = match connector_for_fingerprint(&Fingerprint::Unsafe) {
-            Some(Ok(_)) => panic!("out-of-list fingerprint must hard-error"),
-            Some(Err(e)) => e,
-            None => panic!("connector_for_fingerprint never returns None"),
+            Ok(_) => panic!("out-of-list fingerprint must hard-error"),
+            Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("not supported by btls"), "got: {err}");
     }
 
     /// ModernFingerprints 全池 + 补齐清单（android/randomized 家族/
-    /// uniformrandom）必须 btls 可用（Some(Ok)），且 fingerprint_supported 同步。
+    /// uniformrandom）必须 btls 可用，且 fingerprint_supported 同步。
     #[test]
     fn fingerprint_list_fully_supported_by_btls() {
         let mut names = vec![
@@ -1786,21 +1808,18 @@ mod tests {
         ];
         for name in names.drain(..) {
             let fp = get_fingerprint(name).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let r =
-                connector_for_fingerprint(&fp).unwrap_or_else(|| panic!("{name}: no connector"));
+            let r = connector_for_fingerprint(&fp);
             assert!(r.is_ok(), "{name} ({fp:?}) must build a connector: {:?}", r.err());
             assert!(super::fingerprint_supported(&fp), "{name} must be supported");
         }
     }
 
     /// 清单外指纹（unsafe/hellochrome_58 等旧变体之外的占位）——这里以
-    /// `Unsafe` 为样本——必须 Some(Err) 且错误类别为 InvalidData（硬错，
-    /// 不再静默回退标准 rustls）。
+    /// `Unsafe` 为样本——必须 InvalidData 硬错（不再静默回退标准 rustls）。
     #[test]
     fn unsupported_fingerprint_fails_hard_with_invalid_data() {
         let fp = get_fingerprint("unsafe").expect("unsafe must resolve");
-        let r = connector_for_fingerprint(&fp).expect("returns Some(Err), never None");
-        let err = match r {
+        let err = match connector_for_fingerprint(&fp) {
             Ok(_) => panic!("out-of-list fingerprint must fail"),
             Err(e) => e,
         };
@@ -1812,10 +1831,10 @@ mod tests {
     #[test]
     fn randomized_no_alpn_skips_alps() {
         let fp = Fingerprint::RandomizedNoAlpn;
-        let cfg = connector_for_fingerprint(&fp).expect("Some").expect("Ok");
+        let cfg = connector_for_fingerprint(&fp).expect("Ok");
         assert!(cfg.alps.is_empty());
         // 有 ALPN 变体对照：Chrome 133 携带 h2 ALPS
-        let with = connector_for_fingerprint(&Fingerprint::Chrome).expect("Some").expect("Ok");
+        let with = connector_for_fingerprint(&Fingerprint::Chrome).expect("Ok");
         assert!(!with.alps.is_empty());
     }
 
@@ -1982,9 +2001,7 @@ mod tests {
     fn probe_connector_reuse_cost() {
         use skeleton::clock::{Clock, SystemClock};
 
-        let cfg = connector_for_fingerprint(&Fingerprint::Chrome)
-            .expect("chrome entry")
-            .expect("build chrome connector");
+        let cfg = connector_for_fingerprint(&Fingerprint::Chrome).expect("build chrome connector");
         let n = 25;
         for _ in 0..5 {
             drop(cfg.connector.configure()); // warmup
@@ -2055,6 +2072,103 @@ mod tests {
             "[PROBE] u_client_with_alpn(Chrome, 含完整握手) median={:?} p90={:?} (n={n})",
             samples[n / 2],
             samples[(n * 9) / 10],
+        );
+    }
+
+    /// 票 bvvx0 验收：一次拨号内 `SSL_CTX` 构建**恰好 1 次**（改前 = 2：`u_client`
+    /// 预检构造一个 connector 只为判 `Ok` 就丢弃 + `connect_with_alpn` 内再建一个）。
+    /// 「改前」口径用同一探针在同一线程复现旧序列（预检 + 拨号），同时给出两侧耗时。
+    /// 复现：`cargo test --release -p xray-tls --lib dial_builds_connector -- --nocapture`。
+    #[tokio::test]
+    #[allow(clippy::disallowed_macros, reason = "测量探针：输出耗时中位数供人工判读")]
+    async fn dial_builds_connector_exactly_once() {
+        use xray_transport::connection::Connection;
+
+        use crate::btls_server::accept as btls_accept;
+
+        /// 一次真实拨号（自签 server + allowInsecure），返回本线程拨号窗口内的
+        /// (SSL_CTX 构建次数, 累计构建耗时)。`legacy_precheck` 复现已删除的预检。
+        async fn dial(
+            cert_der: &[u8],
+            key_der: &[u8],
+            config: &Arc<tokio_rustls::rustls::ClientConfig>,
+            legacy_precheck: bool,
+        ) -> (usize, std::time::Duration) {
+            let _ = build_probe::take(); // 清零：本拨号窗口起点
+            if legacy_precheck {
+                // 旧 utls.rs:574 的预检：构造 connector 只为判 Ok，立即丢弃。
+                drop(connector_for_fingerprint(&Fingerprint::Chrome));
+            }
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+            let server_fut = btls_accept(server_io, cert_der, key_der);
+            tokio::pin!(server_fut);
+            let round = async {
+                crate::utls::u_client_with_alpn(
+                    Box::new(xray_transport::connection::DuplexConnection::new(client_io))
+                        as Box<dyn Connection>,
+                    "localhost",
+                    Arc::clone(config),
+                    Fingerprint::Chrome,
+                    None,
+                    Some(&serde_json::json!({"allowInsecure": true})),
+                    None,
+                )
+                .await
+                .expect("u_client_with_alpn");
+            };
+            tokio::join!(round, async {
+                let _ = server_fut.await;
+            });
+            let (calls, nanos) = build_probe::take();
+            (calls, std::time::Duration::from_nanos(nanos))
+        }
+
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        let config = Arc::new(crate::utls::default_client_config());
+
+        let n = 25;
+        let warmup = 5;
+        let mut now_counts = Vec::with_capacity(n);
+        let mut now_costs = Vec::with_capacity(n);
+        let mut legacy_counts = Vec::with_capacity(n);
+        let mut legacy_costs = Vec::with_capacity(n);
+        for i in 0..n + warmup {
+            let (calls, cost) = dial(&cert_der, &key_der, &config, false).await;
+            if i >= warmup {
+                now_counts.push(calls);
+                now_costs.push(cost);
+            }
+        }
+        for i in 0..n + warmup {
+            let (calls, cost) = dial(&cert_der, &key_der, &config, true).await;
+            if i >= warmup {
+                legacy_counts.push(calls);
+                legacy_costs.push(cost);
+            }
+        }
+
+        assert!(
+            now_counts.iter().all(|&c| c == 1),
+            "一次拨号必须恰好构建 1 个 SSL_CTX，实测 {now_counts:?}"
+        );
+        assert!(
+            legacy_counts.iter().all(|&c| c == 2),
+            "旧序列（预检 + 拨号）应为 2 次，实测 {legacy_counts:?}"
+        );
+        now_costs.sort_unstable();
+        legacy_costs.sort_unstable();
+        println!(
+            "[PROBE] 每拨号 SSL_CTX 构建：改后 {} 次 median={:?} p90={:?} / 改前 {} 次 median={:?} p90={:?} (n={n})",
+            now_counts[0],
+            now_costs[n / 2],
+            now_costs[(n * 9) / 10],
+            legacy_counts[0],
+            legacy_costs[n / 2],
+            legacy_costs[(n * 9) / 10],
         );
     }
 }
