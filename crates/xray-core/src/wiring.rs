@@ -10,7 +10,7 @@
 //! 两者方法几乎一致，唯一差异：dispatcher 端 `get_vless_route() -> &str`，
 //! router 端 `get_vless_route() -> Port`。适配时把字符串解析为 Port（空串 → 0）。
 
-use std::{future::Future, net::IpAddr, path::Path, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, net::IpAddr, path::Path, pin::Pin, sync::Arc};
 
 use xray_app_dispatcher::{
     DispatchHandler, DispatcherError,
@@ -24,10 +24,10 @@ use xray_app_dispatcher::{
 use xray_app_router::{
     Router,
     balancing::{ObservationProvider, OutboundHandlerSelector},
-    context::RoutingData as RouterRoutingData,
+    context::{RoutingContext as RouterRoutingContext, RoutingData as RouterRoutingData},
     error::RouterError,
 };
-use xray_common::net::{address::Address, destination::Destination, port::Port};
+use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_geodata::{
     loader::GeoDataLoader,
     matcher::{
@@ -68,45 +68,104 @@ impl std::fmt::Debug for RouterAdapter {
     }
 }
 
-/// 把 dispatcher 的 `RoutingContext` 字段拷贝到 router 的 `RoutingData`。
+/// dispatcher `RoutingContext` → router `RoutingContext` 的**零拷贝**借用桥。
 ///
-/// Go `routing.Context.GetTarget` 语义：`RouteTarget` 有效时优先（routeOnly：
-/// 路由用嗅探域名，拨号保持原 dest）。
-fn bridge_context(ctx: &dyn DispRoutingContext) -> RouterRoutingData {
-    let mut data = RouterRoutingData {
-        target_ips: ctx.get_target_ips().to_vec(),
-        target_domain: ctx.get_target_domain().to_string(),
-        target_port: ctx.get_target_port(),
-        source_ips: ctx.get_source_ips().to_vec(),
-        source_port: ctx.get_source_port(),
-        local_ips: ctx.get_local_ips().to_vec(),
-        local_port: ctx.get_local_port(),
-        // dispatcher 端 vless_route 是 &str（Go `net.Port` 的字符串形态），router 端是 Port。
-        // 未填充（空串）时解析失败回落 0，等价 Go Port 零值。
-        vless_route: ctx.get_vless_route().parse::<u16>().map_or(Port::new(0), Port::new),
-        network: ctx.get_network(),
-        user: ctx.get_user().to_string(),
-        attributes: ctx.get_attributes().clone(),
-        inbound_tag: ctx.get_inbound_tag().to_string(),
-        protocol: ctx.get_protocol().to_string(),
-        skip_dns_resolve: ctx.get_skip_dns_resolve(),
-    };
-    if let Some(rt) = ctx.get_route_target() {
-        match rt.address().ip() {
-            Some(ip) => {
-                data.target_ips = vec![ip];
-                data.target_domain.clear();
-            },
-            None => {
-                // routeOnly（Go default.go:311-315）：RouteTarget 只覆盖域名侧；
-                // GetTargetIPs 仍读原 Target（features/routing/session/context.go:47-57），
-                // 故保留原目标 IP，IP/geoip 规则在 routeOnly 下照常命中。
-                data.target_domain = rt.address().as_domain().unwrap_or("").to_string();
-            },
-        }
-        data.target_port = rt.port();
+/// 旧 `bridge_context` 每次路由把上下文深拷贝进 owned `RoutingData`（3×to_vec +
+/// 4×to_string + attributes.clone，每连接 4-8 次堆分配）；本视图只持有
+/// `&dyn DispRoutingContext`，getter 纯转发——router matcher 消费面本就是
+/// `&dyn RoutingContext` 对象安全借用接口，无需 owned 数据。
+///
+/// RouteTarget 覆盖（Go `routing.Context.GetTarget`：`RouteTarget` 有效时优先，
+/// routeOnly 路由用嗅探域名、拨号保持原 dest）在 getter 内即时生效，逐字段等价旧拷贝：
+/// - `rt` 带 IP：`target_ips` 单元素覆盖、`target_domain` 清空；
+/// - `rt` 无 IP（routeOnly，Go default.go:311-315）：`target_domain` 用 rt 域名， `GetTargetIPs`
+///   仍读原 Target（features/routing/session/context.go:47-57）， IP/geoip 规则照常命中；
+/// - 两态 `target_port` 均取 `rt.port()`。
+struct BridgeCtx<'a> {
+    ctx: &'a dyn DispRoutingContext,
+    rt: Option<&'a Destination>,
+    /// `rt.address().ip()` 预取：`get_target_ips` 返回借用切片，临时值不能落在栈上。
+    rt_ip: Option<IpAddr>,
+}
+
+impl<'a> BridgeCtx<'a> {
+    fn new(ctx: &'a dyn DispRoutingContext) -> Self {
+        let rt = ctx.get_route_target();
+        let rt_ip = rt.and_then(|d| d.address().ip());
+        Self { ctx, rt, rt_ip }
     }
-    data
+}
+
+impl RouterRoutingContext for BridgeCtx<'_> {
+    fn get_target_ips(&self) -> &[IpAddr] {
+        match &self.rt_ip {
+            Some(ip) => std::slice::from_ref(ip),
+            None => self.ctx.get_target_ips(),
+        }
+    }
+
+    fn get_target_domain(&self) -> &str {
+        match self.rt {
+            Some(rt) => match rt.address().ip() {
+                Some(_) => "",
+                None => rt.address().as_domain().unwrap_or(""),
+            },
+            None => self.ctx.get_target_domain(),
+        }
+    }
+
+    fn get_target_port(&self) -> Port {
+        match self.rt {
+            Some(rt) => rt.port(),
+            None => self.ctx.get_target_port(),
+        }
+    }
+
+    fn get_source_ips(&self) -> &[IpAddr] {
+        self.ctx.get_source_ips()
+    }
+
+    fn get_source_port(&self) -> Port {
+        self.ctx.get_source_port()
+    }
+
+    fn get_local_ips(&self) -> &[IpAddr] {
+        self.ctx.get_local_ips()
+    }
+
+    fn get_local_port(&self) -> Port {
+        self.ctx.get_local_port()
+    }
+
+    /// dispatcher 端 vless_route 是 &str（Go `net.Port` 的字符串形态），router 端是
+    /// Port。未填充（空串）时解析失败回落 0，等价 Go Port 零值。
+    fn get_vless_route(&self) -> Port {
+        self.ctx.get_vless_route().parse::<u16>().map_or(Port::new(0), Port::new)
+    }
+
+    fn get_network(&self) -> Network {
+        self.ctx.get_network()
+    }
+
+    fn get_user(&self) -> &str {
+        self.ctx.get_user()
+    }
+
+    fn get_attributes(&self) -> &HashMap<String, String> {
+        self.ctx.get_attributes()
+    }
+
+    fn get_inbound_tag(&self) -> &str {
+        self.ctx.get_inbound_tag()
+    }
+
+    fn get_protocol(&self) -> &str {
+        self.ctx.get_protocol()
+    }
+
+    fn get_skip_dns_resolve(&self) -> bool {
+        self.ctx.get_skip_dns_resolve()
+    }
 }
 
 /// 把 router 的 `RouterError` 映射为 dispatcher 的 `DispatcherError`。
@@ -121,7 +180,7 @@ fn map_router_err(e: RouterError) -> DispatcherError {
 }
 impl RoutingRouter for RouterAdapter {
     fn pick_route(&self, ctx: &dyn DispRoutingContext) -> Result<DispRoute, DispatcherError> {
-        let data = bridge_context(ctx);
+        let data = BridgeCtx::new(ctx);
         match self.router.pick_route(&data) {
             Ok(route) => {
                 Ok(DispRoute { outbound_tag: route.outbound_tag, rule_tag: route.rule_tag })
@@ -139,8 +198,8 @@ impl RoutingRouter for RouterAdapter {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<DispRoute, DispatcherError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let mut data = bridge_context(ctx);
-            match self.router.pick_route_resolved(&mut data).await {
+            let data = BridgeCtx::new(ctx);
+            match self.router.pick_route_resolved(&data).await {
                 Ok(route) => {
                     Ok(DispRoute { outbound_tag: route.outbound_tag, rule_tag: route.rule_tag })
                 },
@@ -170,8 +229,8 @@ impl RouterAdapter {
         dest: &'a Destination,
     ) -> std::pin::Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>> {
         Box::pin(async move {
-            let mut data = dest_to_routing_data(dest);
-            match self.router.pick_route_resolved(&mut data).await {
+            let data = dest_to_routing_data(dest);
+            match self.router.pick_route_resolved(&data).await {
                 Ok(route) => Some(route.outbound_tag),
                 Err(_) => None,
             }
@@ -1942,7 +2001,7 @@ mod tests {
         assert_eq!(adapter.pick_outbound_tag(&dest).as_deref(), Some("b"));
     }
 
-    /// bridge_context 消费 route_target（Go `routing.Context.GetTarget`：
+    /// BridgeCtx 消费 route_target（Go `routing.Context.GetTarget`：
     /// RouteTarget 有效时优先于 Target——routeOnly 路由用嗅探域名）。
     #[test]
     fn pick_route_prefers_route_target_over_target() {

@@ -16,9 +16,10 @@
 //!   `xray-core::wiring::ObservatoryProviderBridge`）。
 //! - DNS 解析路径：经 `set_dns_client` 注入后由 `pick_route_resolved` 执行。
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use parking_lot::RwLock;
+use xray_common::net::{network::Network, port::Port};
 use xray_geodata::loader::GeoDataLoader;
 use xray_proto::xray::app::router::{BalancingRule, Config, RoutingRule};
 
@@ -38,6 +39,73 @@ pub struct Route {
     pub outbound_tag: String,
     /// 命中的 ruleTag。
     pub rule_tag: String,
+}
+
+/// 解析结果覆盖视图：仅 `target_ips` 换成解析结果，其余字段借用透传 `base`。
+///
+/// [`Router::pick_route_resolved`] 的解析注入点——matcher 只经 getter 读，
+/// 注入一份 IP 向量即足，无需整份 owned 上下文。
+struct ResolvedCtx<'a> {
+    base: &'a dyn RoutingContext,
+    ips: Vec<IpAddr>,
+}
+
+impl RoutingContext for ResolvedCtx<'_> {
+    fn get_target_ips(&self) -> &[IpAddr] {
+        &self.ips
+    }
+
+    fn get_target_domain(&self) -> &str {
+        self.base.get_target_domain()
+    }
+
+    fn get_target_port(&self) -> Port {
+        self.base.get_target_port()
+    }
+
+    fn get_source_ips(&self) -> &[IpAddr] {
+        self.base.get_source_ips()
+    }
+
+    fn get_source_port(&self) -> Port {
+        self.base.get_source_port()
+    }
+
+    fn get_local_ips(&self) -> &[IpAddr] {
+        self.base.get_local_ips()
+    }
+
+    fn get_local_port(&self) -> Port {
+        self.base.get_local_port()
+    }
+
+    fn get_vless_route(&self) -> Port {
+        self.base.get_vless_route()
+    }
+
+    fn get_network(&self) -> Network {
+        self.base.get_network()
+    }
+
+    fn get_user(&self) -> &str {
+        self.base.get_user()
+    }
+
+    fn get_attributes(&self) -> &HashMap<String, String> {
+        self.base.get_attributes()
+    }
+
+    fn get_inbound_tag(&self) -> &str {
+        self.base.get_inbound_tag()
+    }
+
+    fn get_protocol(&self) -> &str {
+        self.base.get_protocol()
+    }
+
+    fn get_skip_dns_resolve(&self) -> bool {
+        self.base.get_skip_dns_resolve()
+    }
 }
 
 /// 路由器。对应 Go `router.Router`。
@@ -181,9 +249,14 @@ impl Router {
     ///   eager——结果等价，多解析由 DnsService 缓存兜住）。
     /// - `IpIfNonMatch`：第一轮全不中且目标为域名时，解析后重跑一轮。
     /// - `AsIs` / 无 dns / skip_dns_resolve：退化为 [`Router::pick_route`]。
+    ///
+    /// `ctx` 只读借用；解析结果经 [`ResolvedCtx`] 覆盖视图注入（旧签名
+    /// `&mut RoutingData` 要求调用方整份深拷贝成 owned 数据，是为一次 IP 注入
+    /// 付出的无谓拷贝），且不再写回调用方数据——生产调用点（wiring.rs）本就
+    /// 不复用调用后的 ctx。
     pub async fn pick_route_resolved(
         &self,
-        ctx: &mut crate::context::RoutingData,
+        ctx: &dyn RoutingContext,
     ) -> Result<Route, RouterError> {
         let can_resolve = !ctx.get_skip_dns_resolve()
             && self.domain_strategy != DomainStrategy::AsIs
@@ -191,16 +264,20 @@ impl Router {
             && ctx.get_target_ips().is_empty();
         match self.domain_strategy {
             DomainStrategy::IpOnDemand if can_resolve => {
-                self.resolve_into(ctx).await;
-                self.pick_route(ctx)
+                if let Some(ips) = self.resolve_domain(ctx).await {
+                    self.pick_route(&ResolvedCtx { base: ctx, ips })
+                } else {
+                    self.pick_route(ctx)
+                }
             },
             DomainStrategy::IpIfNonMatch => {
                 if let Ok(r) = self.pick_route(ctx) {
                     return Ok(r);
                 }
                 if can_resolve {
-                    self.resolve_into(ctx).await;
-                    return self.pick_route(ctx);
+                    if let Some(ips) = self.resolve_domain(ctx).await {
+                        return self.pick_route(&ResolvedCtx { base: ctx, ips });
+                    }
                 }
                 Err(RouterError::NoClue)
             },
@@ -208,23 +285,20 @@ impl Router {
         }
     }
 
-    /// 解析 ctx.target_domain 注入 target_ips（失败保持原状，规则照域名匹配）。
-    async fn resolve_into(&self, ctx: &mut crate::context::RoutingData) {
+    /// 解析 `ctx` 的目标域名；失败 / 无 dns / 空结果返回 `None`
+    /// （保持原状，规则照域名匹配——旧 `resolve_into` 的等价返回化）。
+    async fn resolve_domain(&self, ctx: &dyn RoutingContext) -> Option<Vec<IpAddr>> {
         use xray_features::dns::IpOption;
-        let Some(dns) = self.dns.read().clone() else {
-            return;
-        };
+        let dns = self.dns.read().clone()?;
         // Go ResolvableContext：IPOption{IPv4+IPv6, FakeDisable}
         // （app/router/router_test.go:176-179 同参数）。
         let option = IpOption { ipv4_enable: true, ipv6_enable: true, fake_enable: false };
         match dns.lookup_ip(ctx.get_target_domain(), option).await {
-            Ok((ips, _ttl)) => {
-                if !ips.is_empty() {
-                    ctx.target_ips = ips;
-                }
-            },
+            Ok((ips, _ttl)) if !ips.is_empty() => Some(ips),
+            Ok(_) => None,
             Err(e) => {
                 tracing::debug!(error = %e, "router dns resolve failed, rules match by domain only");
+                None
             },
         }
     }
