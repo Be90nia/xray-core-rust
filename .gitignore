@@ -107,3 +107,9 @@ tools/bin/
 # 2026-11-01 卫生审计：reports 下未跟踪 scratch 曾累积 1.5GB
 reports/**/tmp/
 dist/tmp_*/
+
+# 社区标配文档不进仓（用户口供 2026-11-04：私有仓不塞，本地文件保留照常维护）
+/SECURITY.md
+/CONTRIBUTING.md
+/CODE_OF_CONDUCT.md
+/CHANGELOG.md
