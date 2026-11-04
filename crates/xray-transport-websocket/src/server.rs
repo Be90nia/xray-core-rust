@@ -249,7 +249,7 @@ impl WsListener {
     /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
     ///
     /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
-    /// 生产 accept 循环不走本方法（见 [`accept_raw`](Self::accept_raw)）。
+    /// 生产 accept 循环不走本方法（见 `accept_raw`）。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept(&self) -> Result<AcceptedConn> {
         let raw = self.accept_raw().await?;
@@ -260,7 +260,7 @@ impl WsListener {
     ///
     /// 流程：TCP accept → PROXY protocol（可选）→ TLS accept → WS handshake。
     /// 对应 Go `tls.NewListener(l, tlsConfig)` 包装 TCP listener。
-    /// 生产 accept 循环不走本方法（见 [`accept_raw`](Self::accept_raw)）。
+    /// 生产 accept 循环不走本方法（见 `accept_raw`）。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept_tls(
         &self,

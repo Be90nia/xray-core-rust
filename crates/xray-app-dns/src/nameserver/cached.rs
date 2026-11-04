@@ -82,7 +82,7 @@ pub trait CachedNameserver: Send + Sync {
 
     /// 本 NS 单次查询的超时（整条查询的绝对预算，与 `send_query` 内一致）。
     ///
-    /// singleflight 等待者的兜底超时按它派生（[`sf_wait_timeout`]）。各 NS 覆写
+    /// singleflight 等待者的兜底超时按它派生（`sf_wait_timeout`）。各 NS 覆写
     /// 为自身配置值；缺省 4s = UDP/TCP/DoT/DoQ 的缺省 `timeout_ms`。
     fn query_timeout(&self) -> Duration {
         Duration::from_secs(4)
