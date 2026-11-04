@@ -250,7 +250,7 @@ impl Router {
     /// - `IpIfNonMatch`：第一轮全不中且目标为域名时，解析后重跑一轮。
     /// - `AsIs` / 无 dns / skip_dns_resolve：退化为 [`Router::pick_route`]。
     ///
-    /// `ctx` 只读借用；解析结果经 [`ResolvedCtx`] 覆盖视图注入（旧签名
+    /// `ctx` 只读借用；解析结果经私有 `ResolvedCtx` 覆盖视图注入（旧签名
     /// `&mut RoutingData` 要求调用方整份深拷贝成 owned 数据，是为一次 IP 注入
     /// 付出的无谓拷贝），且不再写回调用方数据——生产调用点（wiring.rs）本就
     /// 不复用调用后的 ctx。
