@@ -173,8 +173,10 @@ where
             // 16B 随机数，以其为 context 建立（恰好 16B，不属于任何 record）。
             if this.peer_aead.is_none() {
                 while this.raw_buf.len() - this.raw_pos < 16 {
-                    let mut tmp = [0u8; 4096];
-                    let mut rb = ReadBuf::new(&mut tmp);
+                    // 直读 raw_buf 余量（0-RTT 阶段 raw_buf 仅数 KiB，余量恒非空），
+                    // 免 4KB 栈清零与 extend 回拼拷贝
+                    let spare = this.raw_buf.spare_capacity_mut();
+                    let mut rb = ReadBuf::uninit(spare);
                     match Pin::new(&mut this.conn).poll_read(cx, &mut rb) {
                         Poll::Ready(Ok(())) => {
                             let n = rb.filled().len();
@@ -184,7 +186,8 @@ where
                                     "EOF before 0-RTT server random",
                                 )));
                             }
-                            this.raw_buf.extend_from_slice(&tmp[..n]);
+                            // SAFETY: poll_read 契约保证 filled 前缀已被底层实现写入（初始化）
+                            unsafe { this.raw_buf.set_len(this.raw_buf.len() + n) };
                         },
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Pending => return Poll::Pending,
@@ -285,9 +288,14 @@ where
                     continue; // 回到步骤 1 返回明文
                 }
             }
-            // 3. raw_buf 不足，从底层读
-            let mut tmp = [0u8; 16_384];
-            let mut rb = ReadBuf::new(&mut tmp);
+            // 3. raw_buf 不足，从底层读——直读 raw_buf 余量（免 16KB 栈 memset 与
+            // extend 回拼）；余量为空时按单 record 上限扩容（total 可达
+            // 5 + TLS_PAYLOAD_MAX = 16645 > 16KiB 初始容量）
+            if this.raw_buf.spare_capacity_mut().is_empty() {
+                this.raw_buf.reserve(TLS_RECORD_HEADER_LEN + TLS_PAYLOAD_MAX as usize);
+            }
+            let spare = this.raw_buf.spare_capacity_mut();
+            let mut rb = ReadBuf::uninit(spare);
             match Pin::new(&mut this.conn).poll_read(cx, &mut rb) {
                 Poll::Ready(Ok(())) => {
                     let n = rb.filled().len();
@@ -301,7 +309,8 @@ where
                             "truncated record at EOF",
                         )));
                     }
-                    this.raw_buf.extend_from_slice(&tmp[..n]);
+                    // SAFETY: poll_read 契约保证 filled 前缀已被底层实现写入（初始化）
+                    unsafe { this.raw_buf.set_len(this.raw_buf.len() + n) };
                 },
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,

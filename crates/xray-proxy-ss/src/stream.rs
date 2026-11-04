@@ -74,6 +74,10 @@ pub struct SSStream<C> {
     /// 原地 seal 路径（[`Self::write_chunk_in_place`]）下只放 sealed size 段
     /// （2B + tag），载荷密文留在调用方缓冲里。
     write_buf: Vec<u8>,
+    /// 读路径跨帧复用 wire 缓冲（size + payload chunk 共用）：read_exact 恒整段
+    /// 覆写且 error 路径不消费内容，resize 幂等复用 = 稳态每帧 0 分配 0 清零；
+    /// 明文按 [`Self::read_chunk`] 契约仍每次交出独立 `Vec`。
+    read_scratch: Vec<u8>,
 }
 
 /// SS-2022 响应头分阶段解析（读侧 lazy rekey，缓冲版）。
@@ -159,6 +163,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             response_rekey: None,
             response_rekey_2022: None,
             write_buf: Vec::new(),
+            read_scratch: Vec::new(),
             pending_payload: None,
             pending_server_2022: None,
             pending_client_2022: None,
@@ -219,6 +224,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             pending_client_2022: None,
             plain_prefix: Vec::new(),
             write_buf: Vec::new(),
+            read_scratch: Vec::new(),
         }
     }
 
@@ -642,6 +648,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             pending_client_2022: None,
             plain_prefix: Vec::new(),
             write_buf: Vec::new(),
+            read_scratch: Vec::new(),
         }
     }
 
@@ -672,10 +679,12 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
             self.rekey_for_response(&account).await?;
         }
 
-        // 读 size chunk（2 + tag_size = 18B for AES-GCM/ChaCha20）
+        // 读 size chunk（2 + tag_size = 18B for AES-GCM/ChaCha20）——wire 进
+        // 跨帧复用 scratch：read_exact 恒整段覆写、error 路径不消费内容，
+        // 免每帧分配与清零
         let size_wire_len = 2 + self.tag_size;
-        let mut size_buf = vec![0u8; size_wire_len];
-        match self.inner.read_exact(&mut size_buf).await {
+        self.read_scratch.resize(size_wire_len, 0);
+        match self.inner.read_exact(&mut self.read_scratch).await {
             Ok(_) => {},
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(SsError::from(e)),
@@ -685,7 +694,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         increment_nonce_bytes(&mut self.read_nonce);
         let size_plain = self
             .read_aead
-            .open_in_place(&self.read_nonce, &[], &mut size_buf)
+            .open_in_place(&self.read_nonce, &[], &mut self.read_scratch)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?;
         if size_plain.len() < 2 {
             return Err(SsError::InsufficientData(size_plain.len()));
@@ -698,20 +707,23 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         }
 
         // 读 payload chunk：wire = payload_len (ciphertext) + tag_size
+        //（同一 scratch：resize 幂等——稳态等长零写入，增长仅清零增量）
         let wire_len = payload_len + self.tag_size;
-        let mut payload_buf = vec![0u8; wire_len];
-        self.inner.read_exact(&mut payload_buf).await?;
+        self.read_scratch.resize(wire_len, 0);
+        self.inner.read_exact(&mut self.read_scratch).await?;
 
-        // open payload（原地解密：明文 = wire 缓冲前缀，truncate 后整缓冲移交）
+        // open payload（原地解密：明文 = scratch 前缀；read_chunk 契约每次交出
+        // 独立 Vec，拷出——稳态每帧 1 次分配（无清零）替代旧 2 分配 + 2 全量清零）
         increment_nonce_bytes(&mut self.read_nonce);
         let plaintext_len = self
             .read_aead
-            .open_in_place(&self.read_nonce, &[], &mut payload_buf)
+            .open_in_place(&self.read_nonce, &[], &mut self.read_scratch)
             .map_err(|e| SsError::AeadOpen(e.to_string()))?
             .len();
-        payload_buf.truncate(plaintext_len);
+        let mut payload = Vec::with_capacity(plaintext_len);
+        payload.extend_from_slice(&self.read_scratch[..plaintext_len]);
 
-        Ok(Some(payload_buf))
+        Ok(Some(payload))
     }
 
     /// 从应用层缓冲 `pending` 解出一个完整 SS chunk（`try_open_chunk` 返回态）。
