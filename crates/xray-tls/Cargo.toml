@@ -39,6 +39,9 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 # 时钟唯一源 = udf skeleton::clock（L3-5；bd 39hko W3a 底层接线）
 udf-skeleton = { path = "../udf-frame/skeleton" }
+# TLS session cache 宿主 = udf std_ext::cache::SyncTtlCache（容量 + TTL 双界，
+# bd nzli4/nzli6）。path 形态同其它消费方（udf-frame 仓内工作副本即改即用）。
+udf-std-ext = { path = "../udf-frame/std-ext" }
 time = { version = "0.3", default-features = false, features = ["std"] }
 rcgen = "0.13"
 x509-parser = "0.18"

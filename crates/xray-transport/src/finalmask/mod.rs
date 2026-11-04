@@ -15,10 +15,11 @@
 //! `slices.Backward`）。
 
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -371,6 +372,56 @@ pub fn maybe_mask_server<C: AsyncIo + 'static>(
     Ok(MaybeTcpMaskConn::Masked(apply_tcpmasks(&mgr.tcpmasks, raw, false)?))
 }
 
+/// 已构建 manager 缓存上界（键 = 配置内容；每条约 <2KiB ⇒ <128KiB）。
+///
+/// 真实配置只有 1~5 段 finalmask；溢出（多 outbound 各配不同 mask）整体清空
+/// ——配置变更路径，不在连接热路径上。
+const MANAGER_CACHE_CAP: usize = 64;
+
+/// finalmask 配置内容 → 已构建 manager（进程级，跨拨号复用）。
+static MANAGER_CACHE: LazyLock<Mutex<HashMap<String, Arc<TcpmaskManager>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 按配置内容复用 [`TcpmaskManager`]：首次解析构建，后续返回同一 `Arc`。
+///
+/// Go 侧 `streamSettings.TcpmaskManager` 在 conf 期只建一次；本仓
+/// `TransportDialFn` 只拿得到 `&StreamSettings`（无装配期钩子）⇒ 等价落点是
+/// 「首次拨号构建 + 按配置内容复用」。xmc 的 `derive_rsa_key(password)` 实测
+/// 67ms/次（bd nzli6）⇒ 命中即抹掉该成本。
+///
+/// 缓存键 = **整段** `finalmask` JSON：masks 是纯配置对象（`wrap_conn_*` 收
+/// `&self`，per-conn 状态在返回的包装器里），跨连接共享安全；但私钥由 password
+/// 派生 ⇒ 键必须含 password/type/全部 settings，不得跨 password 复用。
+pub fn shared_tcpmask_manager_from_json(
+    json: Option<&serde_json::Value>,
+) -> io::Result<Arc<TcpmaskManager>> {
+    let empty = || Arc::new(TcpmaskManager::new(Vec::new()));
+    let Some(v) = json else { return Ok(empty()) };
+    if v.get("tcp").and_then(|x| x.as_array()).is_none_or(|arr| arr.is_empty()) {
+        // 未配 mask（生产现状）：空 manager 零成本，不必进缓存（省序列化）。
+        return Ok(empty());
+    }
+    let Ok(key) = serde_json::to_string(v) else {
+        // `Value` 序列化不可失败（map 键恒为 String）；万一发生则降级直构，
+        // 不静默返回空 manager（错 manager = 协议失配）。
+        return Ok(Arc::new(build_tcpmask_manager_from_json(Some(v))?));
+    };
+    {
+        let cache = MANAGER_CACHE.lock();
+        if let Some(hit) = cache.get(&key) {
+            return Ok(Arc::clone(hit));
+        }
+    }
+    // 构建在锁外（xmc 67ms 不许持锁）；并发首发各自构建一次、后写覆盖，无害。
+    let built = Arc::new(build_tcpmask_manager_from_json(Some(v))?);
+    let mut cache = MANAGER_CACHE.lock();
+    if cache.len() >= MANAGER_CACHE_CAP {
+        cache.clear();
+    }
+    let entry = cache.entry(key).or_insert_with(|| Arc::clone(&built));
+    Ok(Arc::clone(entry))
+}
+
 /// 便捷入口（TCP 系 transport dial 路径用）：从 `StreamSettings.finalmask_json`
 /// 构建 [`TcpmaskManager`] 并 client 侧包装 conn。
 ///
@@ -382,7 +433,7 @@ pub fn wrap_conn_client_from_settings(
     settings: &crate::dialer::StreamSettings,
     conn: Box<dyn crate::connection::Connection>,
 ) -> io::Result<Box<dyn crate::connection::Connection>> {
-    let mgr = build_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
+    let mgr = shared_tcpmask_manager_from_json(settings.finalmask_json.as_ref())?;
     if mgr.tcpmasks.is_empty() {
         return Ok(conn);
     }
@@ -925,6 +976,9 @@ fn build_mkcp_legacy_udpmask(settings: &serde_json::Value) -> io::Result<Box<dyn
 /// - `header-custom` —— `custom::Config`（自定义 TCP 序列 clients/servers/errors）
 ///
 /// 未知 mask 类型返回 `InvalidInput`。`None` / 缺失 `tcp` 键 / 空数组 → 空 manager。
+///
+/// ⚠️ 连接拨号路径请用 [`shared_tcpmask_manager_from_json`]（按配置内容复用同一
+/// `Arc`，xmc 的 RSA 派生 67ms 只付一次）；本函数每次调用都重建（bd nzli6）。
 pub fn build_tcpmask_manager_from_json(
     json: Option<&serde_json::Value>,
 ) -> io::Result<TcpmaskManager> {
@@ -2112,6 +2166,31 @@ mod tests {
     fn empty_managers_construct() {
         let _tcp = TcpmaskManager::new(vec![]);
         let _udp = UdpmaskManager::new(vec![]);
+    }
+
+    /// bd nzli6：(c) 同配置复用同一 manager（`Arc::ptr_eq`）——拨号路径不再
+    /// 每次重建（xmc 时每次 67ms）；配置内容不同必须各建（私钥由 password
+    /// 派生，跨 password 复用 = 鉴权绕过）。
+    #[test]
+    fn shared_manager_reused_per_config_content() {
+        let cfg = serde_json::json!({"tcp": [{"type": "fragment", "settings": {
+            "packets_from": 1, "packets_to": 2,
+            "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+        }}]});
+        let first = shared_tcpmask_manager_from_json(Some(&cfg)).unwrap();
+        let second = shared_tcpmask_manager_from_json(Some(&cfg)).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "同配置必须复用同一 manager");
+
+        let other_cfg = serde_json::json!({"tcp": [{"type": "fragment", "settings": {
+            "packets_from": 1, "packets_to": 3,
+            "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+        }}]});
+        let other = shared_tcpmask_manager_from_json(Some(&other_cfg)).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other), "配置内容不同不得复用");
+
+        // 未配 mask（生产现状）：空 manager，不进缓存也不需序列化。
+        let unset = shared_tcpmask_manager_from_json(None).unwrap();
+        assert!(unset.tcpmasks.is_empty());
     }
 
     #[test]

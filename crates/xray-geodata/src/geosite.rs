@@ -126,6 +126,17 @@ mod tests {
 
     // ── Domain tests ──────────────────────────────────────────
 
+    /// 钉住 **protobuf** 编号：构造器产出的必须是 pb `Domain.Type`
+    /// （`Substr=0/Regex=1/Domain=2/Full=3`），不是 matcher `DomainType`
+    /// （`Full=0/Domain=1/Substr=2/Regex=3`）。改错成 matcher 编号即红。
+    #[test]
+    fn domain_constructors_use_proto_numbering() {
+        assert_eq!(Domain::full("x").r#type, 3);
+        assert_eq!(Domain::domain("x").r#type, 2);
+        assert_eq!(Domain::regex("x").r#type, 1);
+        assert_eq!(Domain::substr("x").r#type, 0);
+    }
+
     #[test]
     fn domain_full() {
         let d = Domain::full("example.com");

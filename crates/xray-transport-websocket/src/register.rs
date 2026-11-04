@@ -19,10 +19,12 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
+use xray_frame::compat::ManagedScope;
 use xray_transport::{
     accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -195,23 +197,71 @@ fn spawn_ws_accept_loop(
     let close_notify = Arc::new(tokio::sync::Notify::new());
     let close_notify_clone = close_notify.clone();
     let log_ident = ident.clone();
+    // 每连接握手模板（配置/信任名单/finalmask/TLS）一次取出，spawn 出的任务
+    // clone 自持；listener 本体留在循环内 ⇒ close 后端口立即释放。
+    let template = ws_listener.handshake_template(tls_config);
+    // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）。生产 256MB 小机场，
+    // 上界核算见 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
+    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    // 握手任务托管口（CLAUDE.md §3.5.6 ①「接管类必须托管」）：`ManagedScope` 组合
+    // 包装 udf `FxScope`。listener 关闭/丢弃 ⇒ scope 最后一份引用归零 ⇒ 在途握手
+    // 任务被 abort（不残留 4s 尾巴）。
+    let scope = ManagedScope::new(format!("ws-accept:{ident}"));
+    let loop_scope = scope.clone();
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面连接任务（ws accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_loop_handle = tokio::spawn(async move {
-        let ident = log_ident;
+        // Arc<str>：每连接任务都要日志标识，克隆不分配。
+        let ident: Arc<str> = Arc::from(log_ident);
         loop {
             tokio::select! {
-                result = async {
-                    if let Some(tls_cfg) = &tls_config {
-                        ws_listener.accept_tls(tls_cfg.clone()).await
-                    } else {
-                        ws_listener.accept().await
-                    }
-                } => {
+                // 只 accept 裸连接：握手（PROXY/TLS/WS upgrade）全部在 spawn 出的
+                // 任务里（Go `http.Server.Serve` per-conn goroutine）。bd 0wvne：
+                // 此前握手在循环内 await，单条「连了不握手」的探测连接独占循环
+                // 4~7s（生产 75 次/分钟 ⇒ 循环 100% 被占住）。
+                result = ws_listener.accept_raw() => {
                     match result {
-                        Ok(accepted) => handler(accepted.conn),
+                        Ok(raw) => {
+                            // 握手闸满 ⇒ fail-fast 丢弃（drop = 对端见 FIN/RST），
+                            // 不排队（排队 = 内存与请求数同涨）。
+                            let Some(permit) = gate.try_admit() else {
+                                gate.record_reject(tag);
+                                drop(raw);
+                                continue;
+                            };
+                            let template = template.clone();
+                            let handler = handler.clone();
+                            let ident = Arc::clone(&ident);
+                            let task_gate = Arc::clone(&gate);
+                            if loop_scope
+                                .spawn(async move {
+                                    // permit 随任务结束释放（并发上界的作用域）。
+                                    let _permit = permit;
+                                    match template.handshake(raw).await {
+                                        Ok(accepted) => handler(accepted.conn),
+                                        // 握手错误 = 单连接级（原 accept_conn 内握手错误的
+                                        // 同口径分级）；退避只对 accept 错误有意义。
+                                        Err(e) => {
+                                            task_gate.record_failure(tag, &e);
+                                            match accept_kind(&e) {
+                                                AcceptErrorKind::Connection => crate::LOG.debug(format!(
+                                                    "tag={tag} error={e} ws inbound: 单连接级握手错误，继续监听"
+                                                )),
+                                                kind => crate::LOG.warn(format!(
+                                                    "tag={tag} local={ident} error={e} ws inbound: 握手错误（{kind:?}），继续监听"
+                                                )),
+                                            }
+                                        },
+                                    }
+                                })
+                                .is_err()
+                            {
+                                // scope 已关（停机中）：托管口自身已 warn 留痕，连接随 raw 释放。
+                                gate.record_reject(tag);
+                            }
+                        }
                         // 错误永不退出（accept_policy 铁律）：退出唯一来源是
                         // close_notify 分支。生产杀手链：TLS 握手成功后客户端断开 →
                         // rustls PeerClosed（"peer closed connection without sending
@@ -248,13 +298,16 @@ fn spawn_ws_accept_loop(
     )]
     tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 
-    Box::new(WsTransportListener { local_addr, close_notify })
+    Box::new(WsTransportListener { local_addr, close_notify, scope })
 }
 
-/// WebSocket `TransportListener` wrapper。只持有 local_addr + close 通知。
+/// WebSocket `TransportListener` wrapper。持有 local_addr + close 通知 + 握手任务托管口。
 struct WsTransportListener {
     local_addr: SocketAddr,
     close_notify: Arc<tokio::sync::Notify>,
+    /// 在途握手任务的托管口：`close()` 关闸（拒新 spawn），listener 丢弃时
+    /// scope 归零 ⇒ 在途握手任务 abort。
+    scope: ManagedScope,
 }
 
 impl TransportListener for WsTransportListener {
@@ -263,6 +316,8 @@ impl TransportListener for WsTransportListener {
         // 也不丢失（notify_waiters 只唤醒已注册 waiter，会留下永久 accept 的僵尸）。
         // 底层 TcpListener 在 WsListener drop 时关闭。
         self.close_notify.notify_one();
+        // 握手托管口关闸：停机后拒新握手任务（在途任务随 listener 丢弃被 abort）。
+        self.scope.close();
         Ok(())
     }
 
@@ -306,9 +361,10 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
 
     // finalmask（bd dppv）：manager 随 DialParams 进 dial()，在 TLS/WS 握手前套上
     // （Go dialer.go:49-62 NetDial 层序，首字节 = mask 头）；空 manager = 恒等。
-    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+    // 按配置内容复用（bd nzli6）：xmc 派生 67ms 只在首次构建付一次。
+    let tcpmask = xray_transport::finalmask::shared_tcpmask_manager_from_json(
         settings.finalmask_json.as_ref(),
-    )?);
+    )?;
 
     // Go dialer.go:24-33 + 168-221 delayDialConn：Ed > 0 时拨号推迟到首次
     // Write，首包 ≤ Ed 以 early data 进握手头（0-RTT），Read 阻塞至拨号完成。

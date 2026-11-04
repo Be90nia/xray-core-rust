@@ -1944,4 +1944,117 @@ mod tests {
         .await
         .expect("early-data roundtrip timed out");
     }
+
+    /// C-05 实测（2026-11-04 PM 追加）：`connector_for_fingerprint` = 新 `SSL_CTX`
+    /// 的单次构建成本。只测量不改产品代码（是否缓存由 PM 按数据裁决）。
+    /// 复现：`cargo test --release -p xray-tls --lib probe_connector -- --nocapture`。
+    #[allow(clippy::disallowed_macros, reason = "测量探针：输出耗时中位数供人工判读")]
+    fn probe_connector_percentiles(fp: Fingerprint, name: &str, n: usize) {
+        use skeleton::clock::{Clock, SystemClock};
+
+        for _ in 0..5 {
+            drop(connector_for_fingerprint(&fp)); // warmup（含惰性初始化）
+        }
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = SystemClock.now_instant();
+            drop(connector_for_fingerprint(&fp));
+            samples.push(SystemClock.now_instant().duration_since(t0));
+        }
+        samples.sort_unstable();
+        println!(
+            "[PROBE] connector_for_fingerprint({name}) median={:?} p90={:?} (n={n})",
+            samples[n / 2],
+            samples[(n * 9) / 10],
+        );
+    }
+
+    #[test]
+    fn probe_connector_for_fingerprint_cost() {
+        probe_connector_percentiles(Fingerprint::Chrome, "Chrome", 25);
+        probe_connector_percentiles(Fingerprint::Firefox, "Firefox", 25);
+    }
+
+    /// 缓存形态下的每拨号成本对照：同一 connector 只 `configure()`（不重建
+    /// SSL_CTX）——「缓存能省的量」= 构建中位数 − 本行中位数。
+    #[test]
+    #[allow(clippy::disallowed_macros, reason = "测量探针：输出耗时中位数供人工判读")]
+    fn probe_connector_reuse_cost() {
+        use skeleton::clock::{Clock, SystemClock};
+
+        let cfg = connector_for_fingerprint(&Fingerprint::Chrome)
+            .expect("chrome entry")
+            .expect("build chrome connector");
+        let n = 25;
+        for _ in 0..5 {
+            drop(cfg.connector.configure()); // warmup
+        }
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t0 = SystemClock.now_instant();
+            drop(cfg.connector.configure());
+            samples.push(SystemClock.now_instant().duration_since(t0));
+        }
+        samples.sort_unstable();
+        println!(
+            "[PROBE] 复用已构造 connector（仅 configure()） median={:?} (n={n})",
+            samples[n / 2]
+        );
+    }
+
+    /// 拨号实际入口端到端：`u_client_with_alpn`（含 connector 构建 + SSL set +
+    /// 完整握手 + ALPN 设置）。对照上面两行可拆出「握手」占比。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::disallowed_macros, reason = "测量探针：输出耗时中位数供人工判读")]
+    async fn probe_u_client_with_alpn_cost() {
+        use skeleton::clock::{Clock, SystemClock};
+        use xray_transport::connection::Connection;
+
+        use crate::btls_server::accept as btls_accept;
+
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        let config = Arc::new(crate::utls::default_client_config());
+
+        let n = 20;
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+            let server_fut = btls_accept(server_io, &cert_der, &key_der);
+            tokio::pin!(server_fut);
+            let round = async {
+                let t0 = SystemClock.now_instant();
+                let conn = crate::utls::u_client_with_alpn(
+                    Box::new(xray_transport::connection::DuplexConnection::new(client_io))
+                        as Box<dyn Connection>,
+                    "localhost",
+                    Arc::clone(&config),
+                    Fingerprint::Chrome,
+                    None,
+                    // 自签证书：allowInsecure=true ⇒ 回接验证器 = None（生产默认是
+                    // webpki 全验，此处只为测 connector+握手成本）。
+                    Some(&serde_json::json!({"allowInsecure": true})),
+                    None,
+                )
+                .await
+                .expect("u_client_with_alpn");
+                let elapsed = SystemClock.now_instant().duration_since(t0);
+                drop(conn); // 释放连接 ⇒ 服务端 EOF 退出
+                elapsed
+            };
+            let (elapsed, ()) = tokio::join!(round, async {
+                let _ = server_fut.await;
+            });
+            samples.push(elapsed);
+        }
+        samples.sort_unstable();
+        println!(
+            "[PROBE] u_client_with_alpn(Chrome, 含完整握手) median={:?} p90={:?} (n={n})",
+            samples[n / 2],
+            samples[(n * 9) / 10],
+        );
+    }
 }

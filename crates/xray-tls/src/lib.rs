@@ -1,7 +1,11 @@
 #![deny(warnings)]
 // 治理红线（bd 75rv ②）：任何 rustc warning 即构建失败；豁免一律显式 allow + 理由
-#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))] // 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
+// ⚠️ 顺序敏感（2026-11-04 PM 修）：`warn` 必须在 `allow` **之前**，否则同级的后置 `warn`
+// 会把 `cfg_attr(test, allow(..))` 盖掉 —— 该 crate 的「测试目标豁免」曾因此从未生效，
+// 导致测试里的 `println!` 被 `deny(warnings)` 升级成错误。
 #![warn(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(test, allow(clippy::disallowed_macros, clippy::print_stdout, clippy::print_stderr))]
+// 测试目标统一豁免（print 宏断言便利），生产禁令不受影响
 // 库代码禁直写控制台（诊断走 tracing）；豁免面见各文件 allow 与 clippy.toml 注释
 //! # xray-tls
 //!

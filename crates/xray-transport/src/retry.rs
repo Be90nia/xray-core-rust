@@ -61,12 +61,44 @@ impl AsyncSleeper for GoSleeper {
 pub async fn exponential_backoff<T, E, F, Fut>(
     attempts: u32,
     base_delay_ms: u64,
-    mut f: F,
+    f: F,
 ) -> Result<T, RetryError<E>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
     E: std::fmt::Display,
+{
+    exponential_backoff_if(attempts, base_delay_ms, Duration::MAX, f, |_: &E| true).await
+}
+
+/// 带**停止判定**与**整次预算**的指数退避（[`exponential_backoff`] 的判定器变体）。
+///
+/// 两处差异，其余（首试零延迟、线性退避阶梯、相邻同文本错误去重、末次失败不再睡）
+/// 逐字相同：
+///
+/// - `retryable(&err) == false` ⇒ **立即停**（零睡眠、零额外尝试）——用于「确定性失败」 （如
+///   `ConnectionRefused`：对方已明确拒绝，重试只是烧时间）；
+/// - `budget` ⇒ 整次重试的墙钟总上限（udf `RetryPolicy::with_budget`），用尽即停。
+///   注意预算只在**失败后**裁决，故实际上界 = `budget` + 一层退避（≤ `base * attempts`）。
+///
+/// 停止信号经 `stopped` 标志传给 udf 判定器：udf 的 `retryable` 只拿到 op 的错误类型
+/// （此处为 `()`），而分类需要 `&E`，故由 op 侧判定并置位，判定器只读标志。单次尝试
+/// 串行，无竞态面。
+///
+/// # Errors
+/// 全部尝试失败（次数/判定/预算任一先到）时返回 [`RetryError`]，含去重后的错误列表。
+pub async fn exponential_backoff_if<T, E, F, Fut, P>(
+    attempts: u32,
+    base_delay_ms: u64,
+    budget: Duration,
+    mut f: F,
+    retryable: P,
+) -> Result<T, RetryError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+    P: FnMut(&E) -> bool,
 {
     if attempts == 0 {
         return Err(RetryError { errors: Vec::new() });
@@ -80,12 +112,19 @@ where
         RetryPolicy::new(attempts, base, Duration::MAX)
     }
     // 恒等抖动源=关 jitter：Go 退避确定性，时序须与改前逐次相等。
-    .with_jitter(|d| d);
+    .with_jitter(|d| d)
+    .with_budget(budget);
 
     // op 闭包侧边收集去重列表（&Mutex 是 Copy，可随每次调用的 future 借出，
     // 无需 Arc/分配）。udf 侧错误类型取 `()`——末次错误已进列表，不再回灌。
     let errors: parking_lot::Mutex<Vec<E>> = parking_lot::Mutex::new(Vec::new());
     let sink = &errors;
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let stop_ref = &stopped;
+    // 判定器锁进 Mutex：`&Mutex` 是 Copy 可随每次调用的 future 借出；直接借 `&mut P`
+    // 会被 `FnMut` 闭包的 return-position 拒绝（引用逃出闭包体）。判定调用不含 await。
+    let retryable = parking_lot::Mutex::new(retryable);
+    let retryable_ref = &retryable;
     let outcome = retry_if_async(
         &policy,
         |_attempt| {
@@ -94,18 +133,25 @@ where
                 match fut.await {
                     Ok(v) => Ok(v),
                     Err(e) => {
-                        let mut acc = sink.lock();
-                        let dup = acc.last().is_some_and(|last| last.to_string() == e.to_string());
-                        if !dup {
-                            acc.push(e);
+                        let mut decide = retryable_ref.lock();
+                        let again = decide(&e);
+                        drop(decide);
+                        {
+                            let mut acc = sink.lock();
+                            let dup =
+                                acc.last().is_some_and(|last| last.to_string() == e.to_string());
+                            if !dup {
+                                acc.push(e);
+                            }
                         }
+                        stop_ref.store(!again, std::sync::atomic::Ordering::Relaxed);
                         Err(())
                     },
                 }
             }
         },
         GoSleeper { base },
-        |_| true,
+        |_| !stopped.load(std::sync::atomic::Ordering::Relaxed),
     )
     .await;
 

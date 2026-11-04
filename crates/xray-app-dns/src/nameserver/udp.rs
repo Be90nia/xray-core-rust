@@ -23,16 +23,24 @@
 //! - 请求去重 singleflight（CacheController 层面已部分缓解）
 
 use std::{
+    collections::HashMap,
     future::Future,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use hickory_proto::rr::RecordType;
+use parking_lot::Mutex;
 use skeleton_infra::fx::FxScope;
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, oneshot},
+};
 use xray_common::net::{destination::Destination, port::Port};
 use xray_frame::deadline::{Budget, BudgetDeadline};
 
@@ -55,6 +63,130 @@ mod tcp_fallback;
 /// UDP DNS 查询缓冲区大小（Go 默认 4096；hickory 推荐 1232 + EDNS0）。
 const UDP_RECV_BUF: usize = 4096;
 
+/// pending map 硬顶（Go `s.requests` 无界；本仓按 256MB 口径设上界）。
+///
+/// 条目 = req_id u16(2) + token u64(8) + `oneshot::Sender<Vec<u8>>`(≈40) +
+/// HashMap 装载开销 ≈ 80B ⇒ 512 × 80B ≈ **41KB**（远低于 0.5MB 上限）。
+/// 到顶直接拒发（禁排队：排队时内存随并发查询数线性上涨）。
+const MAX_PENDING_QUERIES: usize = 512;
+
+/// 单 socket + pending map 通道（一 NS 一族一个，惰性建立）。
+///
+/// 对应 Go `ClassicNameServer` 的 `udpServer` + `requests`（`nameserver_udp.go:161-195`）：
+/// 一个长活 socket 承担全部查询，回包按 req ID 唤醒对应 waiter，而非每查询新 bind。
+struct UdpChannel {
+    /// 长期 socket（复用；免每查询 55.1µs `UdpSocket::bind`）。
+    sock: Arc<UdpSocket>,
+    /// 待回包表（req_id → 唤醒器），上界见 [`MAX_PENDING_QUERIES`]。
+    pending: Arc<Mutex<PendingMap>>,
+    /// 通道释放时唤醒收包循环退出（否则任务与 fd 滞留到进程结束）。
+    close: Arc<Notify>,
+    /// socket 地址族（与目标族不符时重建通道）。
+    is_ipv6: bool,
+}
+
+impl Drop for UdpChannel {
+    fn drop(&mut self) {
+        self.close.notify_one();
+    }
+}
+
+/// 待回包表。对应 Go `ClassicNameServer.requests map[uint16]*udpDnsRequest`。
+#[derive(Default)]
+struct PendingMap {
+    entries: HashMap<u16, PendingEntry>,
+    /// 条目序号：guard 释放时按它比对，防 req ID 回绕后误删后登记的条目。
+    next_token: u64,
+}
+
+struct PendingEntry {
+    token: u64,
+    tx: oneshot::Sender<Vec<u8>>,
+}
+
+/// 待回包槽的 RAII 归属：超时/取消/解析失败任一路径都摘表，防泄漏。
+struct PendingSlot {
+    pending: Arc<Mutex<PendingMap>>,
+    id: u16,
+    token: u64,
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        let mut pending = self.pending.lock();
+        if pending.entries.get(&self.id).is_some_and(|entry| entry.token == self.token) {
+            pending.entries.remove(&self.id);
+        }
+    }
+}
+
+impl UdpChannel {
+    /// 绑定长期 socket 并启动唯一收包循环。
+    async fn bind(is_ipv6: bool) -> Result<Self, DnsError> {
+        let local = if is_ipv6 { "[::]:0" } else { "0.0.0.0:0" };
+        let sock = Arc::new(
+            UdpSocket::bind(local)
+                .await
+                .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?,
+        );
+        let pending = Arc::new(Mutex::new(PendingMap::default()));
+        let close = Arc::new(Notify::new());
+        // 坑约束 ⑤：spawn 走托管口（无 ctx 站点 = 进程级 compat scope）。
+        xray_frame::compat::spawn(recv_loop(
+            Arc::clone(&sock),
+            Arc::clone(&pending),
+            Arc::clone(&close),
+        ))
+        .map_err(|_| DnsError::WireFormat("udp recv loop spawn failed".to_string()))?;
+        Ok(Self { sock, pending, close, is_ipv6 })
+    }
+
+    /// 登记待回包槽（到顶 fail-fast）。
+    fn register(&self, id: u16) -> Result<(PendingSlot, oneshot::Receiver<Vec<u8>>), DnsError> {
+        let (tx, rx) = oneshot::channel();
+        let mut pending = self.pending.lock();
+        if pending.entries.len() >= MAX_PENDING_QUERIES {
+            return Err(DnsError::WireFormat(format!(
+                "udp pending queries exceeded {MAX_PENDING_QUERIES}"
+            )));
+        }
+        pending.next_token += 1;
+        let token = pending.next_token;
+        pending.entries.insert(id, PendingEntry { token, tx });
+        drop(pending);
+        Ok((PendingSlot { pending: Arc::clone(&self.pending), id, token }, rx))
+    }
+}
+
+/// 唯一收包点：按 req ID 唤醒对应 waiter（Go `nameserver_udp.go` `HandleResponse`）。
+///
+/// 收发缓冲是**一个** 4KiB 栈上数组（全 NS 共享），取代旧的每查询一份。
+/// 退出条件 = socket 出错 / 通道 Drop 的 `notify_one`。
+async fn recv_loop(sock: Arc<UdpSocket>, pending: Arc<Mutex<PendingMap>>, close: Arc<Notify>) {
+    let mut buf = [0u8; UDP_RECV_BUF];
+    loop {
+        let n = tokio::select! {
+            r = sock.recv(&mut buf) => match r {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!(target: "xray.dns.udp", error = %e, "udp recv loop exit");
+                    return;
+                },
+            },
+            () = close.notified() => return,
+        };
+        if n < 2 {
+            continue;
+        }
+        let id = u16::from_be_bytes([buf[0], buf[1]]);
+        // 锁内只摘槽，投递在锁外。未登记的包（重复应答/迟到包）直接丢弃，同 Go。
+        let entry = pending.lock().entries.remove(&id);
+        if let Some(entry) = entry {
+            let _ = entry.tx.send(buf[..n].to_vec());
+        }
+    }
+}
+
 /// UDP DNS nameserver。对应 Go `ClassicNameServer`。
 pub struct UdpNameServer {
     /// 服务名（含地址，用于日志）。
@@ -73,6 +205,10 @@ pub struct UdpNameServer {
     resolver: Arc<dyn crate::dial::HostResolver>,
     /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
     force_local: bool,
+    /// 单 socket 通道（惰性建立；直连兜底路径专用）。
+    channel: tokio::sync::Mutex<Option<Arc<UdpChannel>>>,
+    /// 本 NS 的 `UdpSocket::bind` 次数（单 socket 复用观测面，验收探针读它）。
+    bind_count: AtomicU64,
 }
 
 impl UdpNameServer {
@@ -97,6 +233,8 @@ impl UdpNameServer {
             id_gen: AtomicReqIdGen::new(),
             resolver,
             force_local: false,
+            channel: tokio::sync::Mutex::new(None),
+            bind_count: AtomicU64::new(0),
         }
     }
 
@@ -105,6 +243,54 @@ impl UdpNameServer {
     pub fn force_local(mut self, v: bool) -> Self {
         self.force_local = v;
         self
+    }
+
+    /// 本 NS 累计 `UdpSocket::bind` 次数（单 socket 复用的观测面）。
+    #[must_use]
+    pub fn socket_bind_count(&self) -> u64 {
+        self.bind_count.load(Ordering::Relaxed)
+    }
+
+    /// 取本 NS 的 UDP 通道；地址族不符才重建（域名 NS 换族属病态配置——
+    /// 旧通道在途查询各自持 `Arc<UdpChannel>`，收完才会真正释放）。
+    async fn channel_for(&self, addr: SocketAddr) -> Result<Arc<UdpChannel>, DnsError> {
+        let mut slot = self.channel.lock().await;
+        if let Some(ch) = slot.as_ref() {
+            if ch.is_ipv6 == addr.is_ipv6() {
+                return Ok(Arc::clone(ch));
+            }
+        }
+        let ch = Arc::new(UdpChannel::bind(addr.is_ipv6()).await?);
+        self.bind_count.fetch_add(1, Ordering::Relaxed);
+        *slot = Some(Arc::clone(&ch));
+        Ok(ch)
+    }
+
+    /// 在通道上发一包并等匹配 `req_id` 的应答（单 socket + pending map）。
+    ///
+    /// `stage` 是既有错误文本前缀（`udp` / `udp retry`），端到端测试按文本 grep。
+    async fn channel_roundtrip(
+        &self,
+        channel: &UdpChannel,
+        wire: &[u8],
+        req_id: u16,
+        sock_addr: SocketAddr,
+        deadline: &BudgetDeadline,
+        stage: &str,
+    ) -> Result<Vec<u8>, DnsError> {
+        let (_slot, rx) = channel.register(req_id)?;
+        deadline
+            .timeout(channel.sock.send_to(wire, sock_addr))
+            .await
+            .map_err(|_| DnsError::WireFormat(format!("{stage} send timeout")))?
+            .map_err(|e| DnsError::WireFormat(format!("{stage} send: {e}")))?;
+        deadline
+            .timeout(rx)
+            .await
+            .map_err(|_| {
+                DnsError::WireFormat(format!("{stage} recv timeout after {:?}", self.query_timeout))
+            })?
+            .map_err(|_| DnsError::WireFormat(format!("{stage} recv: channel closed")))
     }
 
     /// 从 `NameServerConfig` 构造（`Box<dyn Server>` 形态）。
@@ -141,6 +327,20 @@ impl UdpNameServer {
             Arc::new(crate::dial::SystemHostResolver),
         )
         .force_local(ns.force_local))
+    }
+
+    /// 单族查询（族未启用返回 `None`，不发包）。
+    async fn query_if_enabled(
+        &self,
+        enabled: bool,
+        fqdn: &str,
+        record_type: RecordType,
+        deadline: BudgetDeadline,
+    ) -> Option<Result<IpRecord, DnsError>> {
+        if !enabled {
+            return None;
+        }
+        Some(self.query_once(fqdn, record_type, deadline).await)
     }
 
     /// 发送单次 DNS 查询并等待响应。
@@ -236,51 +436,26 @@ impl UdpNameServer {
             return Err(DnsError::SkipDnsServer(sock_addr.to_string()));
         }
 
-        // 绑定任意本地端口。失败多为系统 fd 限制。
-        let sock = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?;
-        deadline
-            .timeout(sock.send_to(&wire, sock_addr))
-            .await
-            .map_err(|_| DnsError::WireFormat("udp send timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("udp send: {e}")))?;
+        // 单 socket 复用（Go `nameserver_udp.go:161-195`）：一 NS 一族一个长活
+        // socket + pending map，回包按 req ID 唤醒 waiter；A/AAAA 并发才可能
+        // 在同一 socket 上同时有两个在途查询。
+        let channel = self.channel_for(sock_addr).await?;
 
-        // 栈上收包缓冲（4 KiB）：免每查询堆分配（NF-7）。
-        let mut buf = [0u8; UDP_RECV_BUF];
-        let n = deadline
-            .timeout(sock.recv(&mut buf))
-            .await
-            .map_err(|_| {
-                DnsError::WireFormat(format!("udp recv timeout after {:?}", self.query_timeout))
-            })?
-            .map_err(|e| DnsError::WireFormat(format!("udp recv: {e}")))?;
-
+        let resp =
+            self.channel_roundtrip(&channel, &wire, req_id, sock_addr, &deadline, "udp").await?;
         // 713x6：解析时刻取自注入时钟（CacheController P1-12 单钟语义）。
         let now = self.cache.clock().now_instant();
-        let parsed = parse_dns_response(&buf[..n], req_id, record_type, now)?;
+        let parsed = parse_dns_response(&resp, req_id, record_type, now)?;
         if !self.should_retry_with_edns0(parsed.truncated) {
             return self.finish_udp_response(&parsed, now, fqdn, record_type, &deadline).await;
         }
         // Go nameserver_udp.go:118-137：同一 UDP 通道追加 EDNS0 OPT + 新 ID 重发一次。
         let (retry_id, retry_wire) = self.edns0_retry_wire(fqdn, record_type)?;
-        deadline
-            .timeout(sock.send_to(&retry_wire, sock_addr))
-            .await
-            .map_err(|_| DnsError::WireFormat("udp retry send timeout".to_string()))?
-            .map_err(|e| DnsError::WireFormat(format!("udp retry send: {e}")))?;
-        let n = deadline
-            .timeout(sock.recv(&mut buf))
-            .await
-            .map_err(|_| {
-                DnsError::WireFormat(format!(
-                    "udp retry recv timeout after {:?}",
-                    self.query_timeout
-                ))
-            })?
-            .map_err(|e| DnsError::WireFormat(format!("udp retry recv: {e}")))?;
+        let resp = self
+            .channel_roundtrip(&channel, &retry_wire, retry_id, sock_addr, &deadline, "udp retry")
+            .await?;
         let now = self.cache.clock().now_instant();
-        let parsed = parse_dns_response(&buf[..n], retry_id, record_type, now)?;
+        let parsed = parse_dns_response(&resp, retry_id, record_type, now)?;
         self.finish_udp_response(&parsed, now, fqdn, record_type, &deadline).await
     }
 
@@ -351,20 +526,21 @@ impl CachedNameserver for UdpNameServer {
         // pause/advance 语义不变）。
         let deadline = Budget::tokio().deadline(self.query_timeout);
 
-        // 顺序发起 A/AAAA。
-        // ponytail: 串行 await。真正并行需 tokio::join! 或 JoinSet，业务上串行也能完成
-        // （多 1 个 RTT 的延迟换简化代码）。高并发场景可在 query_once 外层 spawn。
-        if option.ipv4_enable {
-            match self.query_once(fqdn, RecordType::A, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v4 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        // A/AAAA 并发（Go `dnscommon.go:130 buildReqMsgs` 一次建两条 + 连续
+        // dispatch）：串行 = 2×RTT，并发 = 1×RTT（200ms 网络下 421ms → ~206ms）。
+        let (v4, v6) = tokio::join!(
+            self.query_if_enabled(option.ipv4_enable, fqdn, RecordType::A, deadline.clone()),
+            self.query_if_enabled(option.ipv6_enable, fqdn, RecordType::AAAA, deadline.clone()),
+        );
+        match v4 {
+            Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
-        if option.ipv6_enable {
-            match self.query_once(fqdn, RecordType::AAAA, deadline.clone()).await {
-                Ok(rec) => outcome.rec_v6 = Some(rec),
-                Err(e) => outcome.errors.push(e),
-            }
+        match v6 {
+            Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
+            Some(Err(e)) => outcome.errors.push(e),
+            None => {},
         }
 
         outcome

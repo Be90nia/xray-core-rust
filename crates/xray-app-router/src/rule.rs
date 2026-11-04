@@ -275,16 +275,10 @@ fn proto_network_to_native(v: i32) -> Option<Network> {
 
 /// proto Domain.Type (i32) → matcher DomainType。
 ///
-/// Proto: Substr=0, Regex=1, Domain=2, Full=3。
-/// Matcher: Full=0, Domain=1, Substr=2, Regex=3。
+/// 单一来源：转调 [`xray_geodata::matcher::domain::from_proto_type`]
+/// （pb `Substr=0/Regex=1/Domain=2/Full=3` → matcher `Full=0/Domain=1/Substr=2/Regex=3`）。
 fn proto_domain_type_to_matcher(v: i32) -> Option<DomainType> {
-    match v {
-        0 => Some(DomainType::Substr),
-        1 => Some(DomainType::Regex),
-        2 => Some(DomainType::Domain),
-        3 => Some(DomainType::Full),
-        _ => None,
-    }
+    xray_geodata::matcher::domain::from_proto_type(v)
 }
 
 /// 将 proto DomainRule 列表解析为 matcher DomainRule 列表。

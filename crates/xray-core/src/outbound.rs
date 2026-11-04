@@ -1368,11 +1368,17 @@ async fn lookup_for_ip(
 /// IP 改写目标（handler.go:202 `ips[dice.Roll(len(ips))]`）；解析失败时
 /// Force* 断链报错（handler.go:192-197）、Use* 回退域名直连（handler.go:190-191）。
 ///
-/// ## 与 Go 的差异（`DialFn` 签名无 session 上下文）
+/// ## `skip_dns_resolve` 门控（Go handler.go:182）
 ///
-/// - `content.SkipDNSResolve` 门控未实现（Go handler.go:184）
-/// - UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）； UDP
-///   域名目标按原策略解析
+/// DNS 上游查询自身（`AccessContext.skip_dns_resolve`）不得再解析目标域名，否则
+/// 「NS 地址是域名 → 解析 → 再 dispatch → 再解析」成递归。该标记随 dispatch
+/// future 经 `xray_app_dispatcher::default::current_skip_dns_resolve` 抵达此处
+/// （`DialFn` 签名不带 session 上下文）。
+///
+/// ## 与 Go 的差异
+///
+/// UDP `GetDynamicStrategy(origTargetAddr)` 动态策略未实现（Go handler.go:186-188）；
+/// UDP 域名目标按原策略解析
 pub(crate) fn wrap_dial_with_target_strategy(
     inner: xray_app_dispatcher::default::DialFn,
     strategy: DomainStrategy,
@@ -1385,6 +1391,12 @@ pub(crate) fn wrap_dial_with_target_strategy(
         let dns = dns.clone();
         let dest = dest.clone();
         Box::pin(async move {
+            // Go handler.go:182：DNS 上游查询自身不解析（否则递归）。放在最前的原因
+            // 与 Go 同序——`HasStrategy && IsDomain && !SkipDNSResolve` 里 skip 是最廉
+            // 的短路项，且 Force* 策略下也不得因「解析失败」断链。
+            if xray_app_dispatcher::default::current_skip_dns_resolve() {
+                return inner(&dest).await;
+            }
             // Go handler.go:184：仅域名目标走解析（`Family().IsDomain()` 门控）
             let Address::Domain(domain) = dest.address() else {
                 return inner(&dest).await;
@@ -5317,6 +5329,168 @@ mod tests {
         };
         assert!(err.contains("resolve-test.invalid"), "error mentions domain: {err}");
         assert!(recorded.lock().is_empty(), "inner dial must not run");
+    }
+
+    // ========== P1-4：skip_dns_resolve 门控（DNS 回环防护）==========
+
+    /// 递归上限：门控缺失时链会一直展开，截断以便断言「有界」而不是挂死。
+    const LOOP_RECURSION_CAP: usize = 8;
+
+    /// DNS nameserver 桩：查询一律经 dispatcher 再出站。
+    ///
+    /// 等价 Go `nameserver_{tcp,doh,quic}.go` 把查询交给 dispatcher 的形态，
+    /// 且必带 `skip_dns_resolve=true`。
+    struct LoopNameServer {
+        dispatcher: Arc<std::sync::OnceLock<Arc<xray_app_dispatcher::default::DefaultDispatcher>>>,
+        queries: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl xray_app_dns::nameserver::Server for LoopNameServer {
+        fn name(&self) -> &str {
+            "loop-ns"
+        }
+
+        fn is_disable_cache(&self) -> bool {
+            true
+        }
+
+        fn query_ip<'a>(
+            &'a self,
+            domain: &'a str,
+            _option: xray_app_dns::config::IpOption,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (Vec<std::net::IpAddr>, u32),
+                            xray_app_dns::error::DnsError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let n = self.queries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n >= LOOP_RECURSION_CAP {
+                    // 门控失效时到此截断（生产是单飞去重 + 超时后逐层重发，同样无界）。
+                    return Err(xray_app_dns::error::DnsError::EmptyResponse);
+                }
+                let dispatcher = self.dispatcher.get().expect("dispatcher installed before query");
+                let access = xray_app_dispatcher::default::AccessContext {
+                    skip_dns_resolve: true,
+                    ..xray_app_dispatcher::default::AccessContext::default()
+                };
+                dispatcher
+                    .dispatch_with_access(
+                        &domain_dest(domain),
+                        &xray_app_dispatcher::default::SniffingRequest::default(),
+                        None,
+                        None,
+                        Some(access),
+                    )
+                    .map_err(|_| xray_app_dns::error::DnsError::EmptyResponse)?;
+                Ok((vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)], 60))
+            })
+        }
+    }
+
+    /// 等被 spawn 的 dispatch future 走到 dial（有界轮询：不拿固定 sleep 当断言）。
+    // nn8os 2b 残余豁免：测试超时上限读数（墙钟差），非生产时钟取用。
+    #[allow(clippy::disallowed_methods, reason = "测试超时上限读数，非生产时钟取用")]
+    async fn wait_for_dial(recorded: &Arc<Mutex<Vec<Destination>>>, want: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while recorded.lock().len() < want {
+            assert!(std::time::Instant::now() < deadline, "dial did not run within 10s");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// 门控阻断「目标域名 → DNS server → 该 server 地址也是域名 → 再解析」递归。
+    ///
+    /// 反向自检锚点：删掉 `wrap_dial_with_target_strategy` 里的
+    /// `current_skip_dns_resolve()` 早退 ⇒ 第二段的 `queries` 会涨到
+    /// `LOOP_RECURSION_CAP`，两条断言必红。
+    #[tokio::test]
+    async fn target_strategy_gate_breaks_dns_dispatch_recursion() {
+        use std::sync::{
+            Arc as SharedArc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use xray_app_dispatcher::default::{
+            AccessContext, DefaultDispatcher, DialBridge, SimpleOhm, SniffingRequest,
+        };
+
+        let slot: SharedArc<std::sync::OnceLock<SharedArc<DefaultDispatcher>>> =
+            SharedArc::new(std::sync::OnceLock::new());
+        let queries = SharedArc::new(AtomicUsize::new(0));
+
+        // 生产 DnsService：配置照常 build，仅把 nameserver 换成「经 dispatcher」的桩。
+        let raw: xray_app_dns::DnsAppConfig =
+            serde_json::from_str(r#"{"servers":["8.8.8.8"],"disableCache":true}"#)
+                .expect("dns config json");
+        let mut svc_cfg = raw.build().expect("dns config build");
+        svc_cfg.clients = vec![SharedArc::new(
+            xray_app_dns::nameserver::Client::new(
+                xray_app_dns::nameserver::NameServerConfig::default(),
+                xray_app_dns::config::IpOption {
+                    ipv4_enable: true,
+                    ipv6_enable: true,
+                    fake_enable: false,
+                },
+                Box::new(LoopNameServer {
+                    dispatcher: SharedArc::clone(&slot),
+                    queries: SharedArc::clone(&queries),
+                }),
+            )
+            .expect("loop nameserver client"),
+        )];
+        svc_cfg.domain_matcher = None;
+        svc_cfg.matcher_infos.clear();
+        let dns = SharedArc::new(xray_app_dns::DnsService::new(svc_cfg));
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let dial = wrap_dial_with_target_strategy(
+            recording_dial(Arc::clone(&recorded)),
+            xray_proxy_freedom::DomainStrategy::UseIP,
+            Some(SharedArc::clone(&dns)),
+        );
+        let ohm = SimpleOhm::new();
+        ohm.set_default(SharedArc::new(DialBridge::new("freedom", dial)));
+        let mut dispatcher = DefaultDispatcher::new();
+        dispatcher.ohm = Some(SharedArc::new(ohm));
+        let dispatcher = SharedArc::new(dispatcher);
+        slot.set(SharedArc::clone(&dispatcher)).expect("install dispatcher");
+
+        let dest = domain_dest("ns.test");
+
+        // ① 对照组：普通出站（skip=false）必须解析 ⇒ dial 收到 IP。
+        let inbound = dispatcher
+            .dispatch_with_access(&dest, &SniffingRequest::default(), None, None, None)
+            .expect("control dispatch");
+        drop(inbound);
+        wait_for_dial(&recorded, 1).await;
+        assert_eq!(queries.load(Ordering::SeqCst), 1, "对照组：普通出站必须解析域名");
+        assert_eq!(
+            recorded.lock()[0].address(),
+            &Address::from(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "对照组：域名被改写成解析后的 IP"
+        );
+
+        // ② 门控组：DNS 上游查询自身的 dispatch 不再解析 ⇒ 递归有界。
+        recorded.lock().clear();
+        let access = AccessContext { skip_dns_resolve: true, ..AccessContext::default() };
+        let inbound = dispatcher
+            .dispatch_with_access(&dest, &SniffingRequest::default(), None, None, Some(access))
+            .expect("gated dispatch");
+        drop(inbound);
+        wait_for_dial(&recorded, 1).await;
+        assert_eq!(
+            recorded.lock()[0].address(),
+            &Address::Domain("ns.test".into()),
+            "skip 时 dial 必须收到原域名（未解析）"
+        );
+        assert_eq!(queries.load(Ordering::SeqCst), 1, "skip 时不得再查 DNS（递归被门控阻断）");
     }
 
     /// e2e：JSON `targetStrategy: "UseIP"` → BuiltConfig → register_outbounds →

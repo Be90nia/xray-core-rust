@@ -51,7 +51,8 @@ fn borrow_100_return_100_zeroes_borrowed_and_overflow() {
     let m = pool.metrics();
     assert_eq!(m.borrowed, 0, "借还后 borrowed=0");
     assert_eq!(m.dropped_overflow, 0, "无溢出丢弃");
-    assert_eq!(m.idle, 100, "keep 裁决全部留存（idle_cap=128 未触顶）");
+    // 接缝不持闲槽：归还恒回 xray-buf，接缝账本 idle 恒 0（审计 A-03）。
+    assert_eq!(m.idle, 0, "接缝不持闲槽 ⇒ idle 恒 0（旧实现此处 = 100）");
 }
 
 // ── 红线隔离③：审计 seq 单调 + resize 拒绝不改状态 ─────────────────────

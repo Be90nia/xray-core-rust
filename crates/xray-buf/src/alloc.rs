@@ -11,7 +11,7 @@
 //! - Tier 4: 128KB (131072 bytes)
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
@@ -32,10 +32,38 @@ const SHARD_COUNT: usize = 8;
 
 /// 全局池每分片每层上限：超出直接丢弃，防高水位无限堆积。
 /// 8 分片 × 64 块：tier0 上限 1MB、tier3 上限 32MB、tier4 上限 64MB。
+/// **总字节仍由 [`POOL_BYTE_BUDGET`] 统收**（跨层跨分片的合计上界，8 MB）。
 const SHARD_MAX_PER_TIER: usize = 64;
 
 /// 惰性收缩间隔（近似 Go sync.Pool 被 GC 周期性清池的节奏）。
 const SWEEP_INTERVAL_MS: u64 = 60_000;
+
+/// 池**常驻总字节**预算（bd f516k）：按件上限（[`SHARD_MAX_PER_TIER`] × 8 分片，
+/// 再叠加各线程 TLS 缓存）理论可达 ~116 MB，与 256 MB 小机场的 96 MB xray 预算
+/// 无关（`reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md` §1）。本常量把 TLS 缓存
+/// 与全部分片的字节总和钉死，**超限归还即丢弃**（块归还系统，不累积）。
+/// 实测稳态 0.3–0.7 MB，远低于本上界 ⇒ 热路径复用率不受影响。
+const POOL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// 每分片字节预算 = [`POOL_BYTE_BUDGET`] / [`SHARD_COUNT`]（静态均分，8 MiB / 8 = 1 MiB）。
+///
+/// **为什么记账放在分片内、不在全局**（别改回全局原子——审计裁定过的形态，bd f516k）：
+/// 全局单一原子会让所有线程的借还打同一条 cache line ⇒ 跨核乒乓；且 CAS 形态的
+/// `fetch_update` 是重试循环，不是单条指令。分片计数住在 `Shard` 里，借还本来就取
+/// 该分片的锁 ⇒ 记账是**锁内一拍普通加减**，零共享写、零 CAS、零额外同步。
+/// 上界仍硬：各分片 ≤ 1 MiB ⇒ 合计 ≤ [`POOL_BYTE_BUDGET`]（静态均分只会更保守）。
+/// 代价：单分片偏热时可能先撞自己的 1 MiB 而别的分片有空余（轻微利用率损失），
+/// 稳态总量 0.3–0.7 MB ⇒ 远达不到。全局合计只按需读侧求和（不进热路径）。
+const SHARD_BYTE_BUDGET: usize = POOL_BYTE_BUDGET / SHARD_COUNT;
+
+/// TLS 缓存单线程字节预算（thread_local 计数，无原子）：128 KiB/线程。超限的归还
+/// 不进 TLS（还会继续试分片）；全局影响 = 每线程至多占 [`TLS_BYTE_BUDGET`]。
+const TLS_BYTE_BUDGET: usize = 128 * 1024;
+
+/// 因字节上界而丢弃的归还款（可观测：上界拒绝不得静默）。**只挂在丢弃分支**
+/// （罕见路径），成功路径零触碰；`clear()` 不归零（单向事实计数，归零会让并行
+/// 测试里别的线程读数凭空消失）。
+static DROPPED_OVER_BUDGET: AtomicU64 = AtomicU64::new(0);
 
 /// 上次惰性收缩时间（unix ms）。`fetch_max` 天然去重并发清扫。
 static LAST_SWEEP_MS: AtomicU64 = AtomicU64::new(0);
@@ -53,14 +81,17 @@ fn now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
-/// 全局池分片：每个分片包含 5 个层的 Vec<BytesMut>
+/// 全局池分片：每个分片包含 5 个层的 Vec<BytesMut>，外加本分片**常驻字节记账**
+/// （借还都在本分片锁内 ⇒ 普通加减，见 [`SHARD_BYTE_BUDGET`] 的 why 注释）。
 struct Shard {
     tiers: [Vec<BytesMut>; 5],
+    /// 本分片池内块的字节合计（只统计经 `release` 入池的标准容量块）。
+    bytes: usize,
 }
 
 impl Shard {
     const fn new() -> Self {
-        Self { tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()] }
+        Self { tiers: [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()], bytes: 0 }
     }
 }
 
@@ -74,8 +105,12 @@ impl Shard {
         if now.saturating_sub(last) < SWEEP_INTERVAL_MS {
             return;
         }
-        for tier in &mut self.tiers {
+        for (i, tier) in self.tiers.iter_mut().enumerate() {
             let keep = tier.len() / 2;
+            // 收缩回系统：销掉被裁掉块的字节额度（分片记账必须跟真实驻留同步，
+            // 否则上界会被幽灵字节永久占满）。饱和不减穿：`maybe_sweep` 的单元测试
+            // 直接往分片塞块（绕过记账），少记只会「少留几块」，不 wrap（否则永久拒收）。
+            self.bytes = self.bytes.saturating_sub((tier.len() - keep) * TIER_SIZES[i]);
             tier.truncate(keep);
         }
     }
@@ -101,6 +136,9 @@ thread_local! {
     static TLS_CACHE: RefCell<[Vec<BytesMut>; 5]> = const {
         RefCell::new([Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()])
     };
+    /// 本线程 TLS 缓存的字节合计（配额见 [`TLS_BYTE_BUDGET`]）：thread_local 计数
+    /// ⇒ 读写都是线程私有，无原子、无共享。
+    static TLS_CACHE_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// 根据请求大小选择合适的分层索引。
@@ -136,6 +174,7 @@ pub fn alloc(size: usize) -> BytesMut {
             if !cache[tier].is_empty() {
                 let mut buf = cache[tier].pop().expect("已检查 len > 0");
                 buf.clear();
+                TLS_CACHE_BYTES.set(TLS_CACHE_BYTES.get().saturating_sub(tier_size));
                 tracing::trace!(tier, tier_size, "缓冲池 TLS 命中");
                 Some(buf)
             } else {
@@ -152,6 +191,8 @@ pub fn alloc(size: usize) -> BytesMut {
         if !shard.tiers[tier].is_empty() {
             let mut buf = shard.tiers[tier].pop().expect("已检查 len > 0");
             buf.clear();
+            // 命中销账：本分片锁内一拍普通减法（零跨线程原子，见 SHARD_BYTE_BUDGET）。
+            shard.bytes = shard.bytes.saturating_sub(tier_size);
             tracing::trace!(tier, tier_size, shard = shard_idx, "缓冲池分片命中");
             return buf;
         }
@@ -176,6 +217,10 @@ pub fn alloc(size: usize) -> BytesMut {
 /// 只经 `MaybeUninit` 只写视图（`writable_bytes` / `seal_window` tag /
 /// `ReadBuf::uninit` 系统调用写）暴露。全仓调用点核查与 A7/A0 回归锁定见
 /// `tests/pooled_logical_len.rs`。
+///
+/// 确需清零的池（如 udf `ObjectPool` 的明文块）**只许清「已写入区」**（`[..len]`），
+/// 禁整块清零：64 KiB 整块清零审计实测 190.8µs/次（bd hdugl，debug 档；release 2.1µs），
+/// 而只清 16 KiB 已写区仅 300ns —— 清零成本必须与写入量同阶，不能被借还开销（~100-300ns）反超。
 pub fn release(mut buf: BytesMut) {
     let capacity = buf.capacity();
     if let Some(tier) = select_tier(capacity) {
@@ -190,11 +235,14 @@ pub fn release(mut buf: BytesMut) {
         }
         buf.clear();
 
-        // 1. 尝试 TLS 缓存
+        // 1. 尝试 TLS 缓存（单线程字节配额，thread_local 计数 ⇒ 无原子）
         let mut buf = Some(buf);
         TLS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache[tier].len() < TLS_MAX_PER_TIER {
+            if cache[tier].len() < TLS_MAX_PER_TIER
+                && TLS_CACHE_BYTES.get() + capacity <= TLS_BYTE_BUDGET
+            {
+                TLS_CACHE_BYTES.set(TLS_CACHE_BYTES.get() + capacity);
                 cache[tier].push(buf.take().expect("buf 只被 take 一次"));
             }
         });
@@ -203,14 +251,22 @@ pub fn release(mut buf: BytesMut) {
         }
         let buf = buf.expect("is_none 已处理");
 
-        // 2. 尝试全局分片（每分片每层上限 [`SHARD_MAX_PER_TIER`]，超出丢弃；
-        // 拿锁顺带机会式惰性收缩，近似 Go sync.Pool 的 GC 清池）
+        // 2. 尝试全局分片（每分片每层上限 [`SHARD_MAX_PER_TIER`] + 每分片字节预算
+        // [`SHARD_BYTE_BUDGET`]，超出丢弃；拿锁顺带机会式惰性收缩，近似 Go
+        // sync.Pool 的 GC 清池）
         let shard_idx = next_shard();
         let mut shard = SHARDS[shard_idx].lock();
         shard.maybe_sweep(now_ms());
-        if shard.tiers[tier].len() < SHARD_MAX_PER_TIER {
+        // 字节裁决 = 本分片锁内一拍加法 + 比较（零跨线程原子，见 SHARD_BYTE_BUDGET）；
+        // 拒收只发生在丢弃分支（罕见路径），成功路径零全局触碰。
+        if shard.tiers[tier].len() < SHARD_MAX_PER_TIER
+            && shard.bytes + capacity <= SHARD_BYTE_BUDGET
+        {
             shard.tiers[tier].push(buf);
+            shard.bytes += capacity;
             tracing::trace!(tier, shard = shard_idx, "缓冲池归还到分片");
+        } else {
+            DROPPED_OVER_BUDGET.fetch_add(1, Ordering::Relaxed);
         }
         // 超上限：buf drop 归还系统——高水位由 sweep 周期回落
     }
@@ -236,6 +292,15 @@ pub fn clear() {
             tier.clear();
         }
     }
+
+    // 记账归零：分片与本线程 TLS 缓存已空。他线程 TLS 缓存不在此清理 ⇒ 这是
+    // 测试/收尾口径（生产不调 clear）。
+    // `DROPPED_OVER_BUDGET` **不归零**：它是单向观测面（丢了多少块是事实），且并行
+    // 测试会各调 `clear()`——归零会让别的线程的读数凭空消失（实测踩过：断言偶发 0）。
+    for shard_mutex in &SHARDS {
+        shard_mutex.lock().bytes = 0;
+    }
+    TLS_CACHE_BYTES.with(|b| b.set(0));
 }
 
 #[cfg(test)]
@@ -432,5 +497,79 @@ mod tests {
         shard.maybe_sweep(SWEEP_INTERVAL_MS * 2 - 1);
         assert_eq!(shard.tiers[2].len(), 10, "间隔未到不得收缩");
         LAST_SWEEP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 总字节上界（bd f516k，分片记账形态）：每分片常驻 ≤ [`SHARD_BYTE_BUDGET`]
+    /// （合计 ⇒ [`POOL_BYTE_BUDGET`]），超限归还**被丢弃且计数可见**（禁静默累积）。
+    /// **反向自检锚点**：删掉 `release` 里的 `shard.bytes + capacity <= SHARD_BYTE_BUDGET`
+    /// 闸，本断言必红（驻留会越过每分片 1 MB）。
+    ///
+    /// 并发纪律：本 crate 的 `buffer` 模块测试也碰全局池（各自 `clear()`，不持本锁），
+    /// 故断言只用「只会被外部行为**减小**」的读数 + `DROPPED_OVER_BUDGET` 的**增量**
+    /// （该计数在 `clear()` 后不归零）——避免外部 `clear()` 把读数抹成 0 的偶发红。
+    #[test]
+    fn release_over_byte_budget_drops_and_counts() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        // 冻结 sweep（真实墙钟可能在塞池中途把驻留减半，破坏上界读数）
+        LAST_SWEEP_MS.store(u64::MAX - 1, Ordering::Relaxed);
+        let dropped_before = DROPPED_OVER_BUDGET.load(Ordering::Relaxed);
+
+        // 64 KiB × 200 = 12.8 MB > 预算（按件上限 8 分片 × 64 块 = 32 MB 装得下，
+        // 故只有字节上界能拒收 ⇒ 本用例钉的是字节面）。
+        let bufs: Vec<_> = (0..200).map(|_| alloc(TIER_SIZES[3])).collect();
+        for b in bufs {
+            release(b);
+        }
+
+        let mut shard_bytes_total = 0usize;
+        for (i, shard_mutex) in SHARDS.iter().enumerate() {
+            let bytes = shard_mutex.lock().bytes;
+            assert!(
+                bytes <= SHARD_BYTE_BUDGET,
+                "分片 {i} 常驻 {bytes} 字节超每分片预算 {SHARD_BYTE_BUDGET}"
+            );
+            shard_bytes_total += bytes;
+        }
+        assert!(
+            shard_bytes_total <= POOL_BYTE_BUDGET,
+            "分片合计 {shard_bytes_total} 字节超总预算 {POOL_BYTE_BUDGET}"
+        );
+        assert!(
+            DROPPED_OVER_BUDGET.load(Ordering::Relaxed) > dropped_before,
+            "超上界的归还必须留痕（禁静默丢弃）"
+        );
+
+        // 上界生效后热路径照常复用（不因拒收打崩）。
+        let again = alloc(TIER_SIZES[3]);
+        assert_eq!(again.capacity(), TIER_SIZES[3], "上界生效后仍须拿到足额块");
+        release(again);
+    }
+
+    /// TLS 缓存的**单线程字节配额**（bd f516k）：TLS 层最多留住
+    /// `TLS_BYTE_BUDGET / 层大小` 块，超限归还跳过 TLS 直进分片（不丢弃）。
+    /// **反向自检锚点**：删掉 `release` TLS 臂的 `TLS_CACHE_BYTES + capacity <=
+    /// TLS_BYTE_BUDGET` 条件，本断言必红（TLS 会留满 TLS_MAX_PER_TIER 块）。
+    #[test]
+    fn release_tls_byte_quota_skips_tls_over_budget() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        let dropped_before = DROPPED_OVER_BUDGET.load(Ordering::Relaxed);
+        // 128 KiB 预算 / 64 KiB 层 = 至多 2 块进 TLS（件上限 8 不再是有效边界）。
+        for _ in 0..TLS_MAX_PER_TIER {
+            release(alloc(TIER_SIZES[3]));
+        }
+        let tls_bytes = TLS_CACHE_BYTES.get();
+        assert!(
+            tls_bytes <= TLS_BYTE_BUDGET,
+            "TLS 常驻 {tls_bytes} 字节超单线程预算 {TLS_BYTE_BUDGET}"
+        );
+        // 超配额的块不得静默消失：分片预算未满 ⇒ 全部收下，丢弃计数必须为零
+        // （单向计数不受并行 clear() 影响，读增量口径）。
+        assert_eq!(
+            DROPPED_OVER_BUDGET.load(Ordering::Relaxed),
+            dropped_before,
+            "TLS 拒收的块必须落到分片，不得丢弃"
+        );
     }
 }

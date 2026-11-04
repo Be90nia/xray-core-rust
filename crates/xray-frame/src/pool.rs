@@ -134,9 +134,14 @@ pub trait BufferPool: Send + Sync {
 /// xray-buf 适配器：把 udf [`PoolBase`] 管理面挂在 xray-buf 分配路径**外侧**。
 ///
 /// **分配路径一行不动**（坑约束 12）：`xray_buf::alloc`/`xray_buf::release`
-/// 原样调用，本类型只在其外侧记账。keep=false（槽满：缩容窗/超闲上限）时
-/// 缓冲就地 drop——`dropped_overflow` 已计数 + `OverflowDropped` 审计已发射，
-/// fail-visible 非静默。
+/// 原样调用，本类型只在其外侧记账。
+///
+/// **记账口径（审计 A-03）**：接缝**不持有闲槽**（物理存储归 xray-buf 分层池）⇒
+/// 只记 `borrowed` / `watermark` 两个读数；`idle` 恒 `0`、`dropped_overflow` 恒 `0`，
+/// 物理去留 100% 委托 `xray_buf::release`。⚠️ 不能用 `PoolBase::note_return()` 的
+/// keep 裁决当去留闸：它把归还计入 `idle`（为「自持闲槽」的实现方设计），接缝借出
+/// 侧无闲槽可减 ⇒ `idle` 变「累计归还数」，撞 `idle_cap` 后永久 keep=false，
+/// 缓冲再也回不到池（修复前实测 `idle==64`/`dropped_overflow==36`）。
 pub struct XrayBufPool {
     base: Arc<PoolBase>,
 }
@@ -184,10 +189,16 @@ impl BufferPool for XrayBufPool {
         Ok(PooledBuffer::new(
             bytes,
             Box::new(move |bytes| {
-                // note_return 的 keep 裁决：true = 留存（回 xray-buf 闲存
-                // TLS/分片）；false = 槽满丢弃（计数 + 审计留痕，非静默）。
+                // 物理去留 100% 委托 xray-buf：接缝不持闲槽 ⇒ 没有「槽满」可言，
+                // 归还恒回池（不设 keep 闸，审计 A-03）。
+                xray_buf::alloc::release(bytes);
+                // 借出数 -1。`note_return` 的 keep 判决是给自持闲槽的实现方用的，
+                // 它把归还计入 idle ⇒ 接缝的 idle 立即消账（恒 0）。
+                // keep=false 只在并发窗内 borrowed 曾超 max 时出现（acquire 的
+                // check-then-act 窗口，见 trait 文档），此时缓冲并未丢弃——物理
+                // 释放已先行，`dropped_overflow` 在那条路径上表达的是「超上界归还」。
                 if base.note_return() {
-                    xray_buf::alloc::release(bytes);
+                    base.note_idle_delta(-1);
                 }
             }),
         ))
@@ -200,8 +211,10 @@ impl BufferPool for XrayBufPool {
 
 /// 管理面继承壳：接缝（`B`）+ [`PoolBase`] 管理面 = 池管理的白拿组合。
 ///
-/// 记账分层：外壳与内层各自独立记账（嵌套时双层账本各自配平）；外壳的
-/// keep 裁决只动外壳账本，物理留存/丢弃由最内层存储裁决。
+/// 记账口径同 [`XrayBufPool`]：外壳**不持闲槽** ⇒ 只记 `borrowed`/`watermark`，
+/// `idle` 恒 `0`、`dropped_overflow` 恒 `0`；物理去留由**最内层**存储裁决
+/// （`inner_release` 恒被调用，外壳不做 keep 闸——旧实现丢掉了内层 keep 结果，
+/// 同时自己把归还计成闲槽，两层账本都在说假话，审计 A-03/A-04）。
 ///
 /// 调参面走 [`PoolManaged`]（`Tuning = (usize, usize)`）——不设 inherent
 /// `resize(max, idle_cap)`：双参形与 tuple 形并存会互相遮蔽（ThreadPool
@@ -250,8 +263,11 @@ impl<B: BufferPool> BufferPool for ManagedBufferPool<B> {
         Ok(PooledBuffer::new(
             bytes,
             Box::new(move |bytes| {
-                base.note_return();
-                // 内层独立记账与存储裁决（双层账本各自配平）。
+                // 外壳只做借出数/水位线记账（idle 恒 0，理由同 XrayBufPool）。
+                if base.note_return() {
+                    base.note_idle_delta(-1);
+                }
+                // 物理去留归最内层（恒调用，不设 keep 闸）。
                 inner_release(bytes);
             }),
         ))
@@ -283,7 +299,13 @@ impl<B: BufferPool> PoolManaged for ManagedBufferPool<B> {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Borrow;
+    use std::{
+        borrow::Borrow,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use skeleton::pool::PoolAuditKind;
 
@@ -339,7 +361,8 @@ mod tests {
 
         drop(bufs); // Drop 路径归还
         let m = pool.metrics();
-        assert_eq!((m.borrowed, m.idle, m.dropped_overflow), (0, 4, 0));
+        // 接缝不持闲槽 ⇒ idle 恒 0（「已归还次数」不是「闲槽数」，审计 A-03）。
+        assert_eq!((m.borrowed, m.idle, m.dropped_overflow), (0, 0, 0));
         assert_eq!(m.watermark, 0.0);
     }
 
@@ -355,19 +378,74 @@ mod tests {
         assert!(pool.acquire(64).is_ok(), "归还即恢复（不阻塞不等待）");
     }
 
-    // ── 溢出丢弃计数（禁静默：dropped_overflow + OverflowDropped）───────
+    // ── 归还恒达底层池（接缝不做去留裁决，审计 A-03 主锚）─────────────────
+    //
+    // 底层池 = 真持有 `BytesMut` 的实现（计数 + 物理存储）：证明「越过 idle_cap 的
+    // 归还仍进底层」且「归还的块能再次取出」。旧实现在第 idle_cap 笔之后把归还
+    // 挡在接缝里（缓冲就地 drop），本单测当场红。
+
+    #[derive(Default)]
+    struct InnerStore {
+        released: AtomicUsize,
+        stored: Mutex<Vec<BytesMut>>,
+    }
+
+    struct RecordingPool {
+        store: Arc<InnerStore>,
+    }
+
+    impl BufferPool for RecordingPool {
+        fn acquire(&self, size: usize) -> Result<PooledBuffer, PoolError> {
+            let bytes = self
+                .store
+                .stored
+                .lock()
+                .expect("test lock")
+                .pop()
+                .unwrap_or_else(|| BytesMut::with_capacity(size));
+            let store = Arc::clone(&self.store);
+            Ok(PooledBuffer::new(
+                bytes,
+                Box::new(move |bytes| {
+                    store.released.fetch_add(1, Ordering::Relaxed);
+                    store.stored.lock().expect("test lock").push(bytes);
+                }),
+            ))
+        }
+
+        fn release(&self, buf: PooledBuffer) {
+            buf.release();
+        }
+    }
 
     #[test]
-    fn pool_overflow_drops_counted_not_silent() {
-        let pool = XrayBufPool::new(4, 2);
-        let bufs: Vec<_> = (0..4).map(|_| pool.acquire(64).expect("within max")).collect();
-        for b in bufs {
-            b.release(); // 显式提前归还 = 与 Drop 等价路径
+    fn pool_routes_every_return_to_inner_storage_past_idle_cap() {
+        const IDLE_CAP: usize = 64;
+        let store = Arc::new(InnerStore::default());
+        let pool =
+            ManagedBufferPool::new(RecordingPool { store: Arc::clone(&store) }, 1024, IDLE_CAP);
+
+        let mut addr = 0;
+        for i in 0..200 {
+            let buf = pool.acquire(4096).expect("within max");
+            addr = buf.payload().as_ptr() as usize;
+            buf.release();
+            assert_eq!(
+                store.released.load(Ordering::Relaxed),
+                i + 1,
+                "第 {i} 次归还必须到达底层池（idle_cap={IDLE_CAP} 不封顶、不去留裁决）"
+            );
+            assert_eq!(store.stored.lock().expect("test lock").len(), 1, "底层物理留存 1 块");
         }
         let m = pool.metrics();
-        // idle_cap=2：前 2 笔留存，后 2 笔槽满丢弃。
-        assert_eq!((m.borrowed, m.idle), (0, 2));
-        assert_eq!(m.dropped_overflow, 2);
+        assert_eq!((m.borrowed, m.idle, m.dropped_overflow), (0, 0, 0), "外层只记借出/水位线");
+
+        let again = pool.acquire(4096).expect("within max");
+        assert_eq!(
+            again.payload().as_ptr() as usize,
+            addr,
+            "归还的块必须能再次取出（底层物理存储 LIFO）"
+        );
     }
 
     // ── 审计 seq 单调 + 票据纪律 ────────────────────────────────────────
@@ -414,7 +492,7 @@ mod tests {
             b.release();
         }
         let m = shell.metrics();
-        assert_eq!((m.borrowed, m.idle, m.dropped_overflow), (0, 8, 0), "双层账本各自配平");
+        assert_eq!((m.borrowed, m.idle, m.dropped_overflow), (0, 0, 0), "外壳只记借出/水位线");
 
         // 内层先爆时外壳透传 Err：内层 max=2，第 3 次借出被内层拒绝，
         // 被拒借出外壳零记账（外壳停在 2，不是 3）。

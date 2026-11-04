@@ -11,6 +11,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use skeleton_infra::{ObjectPool, Owned, ResetPhase};
 use tokio::sync::mpsc;
+use xray_frame::compat::ManagedScope;
 
 use crate::error::{HysteriaError, Result};
 
@@ -26,6 +27,21 @@ pub const MIN_HOP_INTERVAL: Duration = Duration::from_secs(5);
 /// 接收 channel 缓冲（对应 Go `packetQueueSize = 1024`）。
 pub const PACKET_QUEUE_SIZE: usize = 1024;
 
+/// 池**空闲**块额度（每连接常驻上界）：128 × [`UDP_BUFFER_SIZE`] = **192 KB/连接**。
+///
+/// 旧值 = `PACKET_QUEUE_SIZE` ⇒ 1500 B × 1024 = 1.5 MB/连接（20 条连接 30 MB，撞
+/// 256 MB 小机场的 96 MB xray 预算，见 `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md`）。
+/// `max` 仍取 `PACKET_QUEUE_SIZE * 2`：它只按值认领宇宙配额、**不预分配**，管的是
+/// 「在飞 + idle」总量，突发照收（超 max 走降级直构，不进 idle 常驻）。
+const POOL_IDLE_CAP: usize = 128;
+
+/// 池老化窗：idle 块距上次使用超此值即释放。Go 的 `sync.Pool` 靠 GC 回收，Rust 无
+/// GC ⇒ 不修剪就永久常驻（本池的 idle 额度即上界，故必须有显式老化）。
+const POOL_IDLE_AGE: Duration = Duration::from_secs(30);
+
+/// 老化节拍（低频：修剪是 O(分片) 扫 idle 槽，30s 一次对数据面无感）。
+const POOL_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 单个 UDP 数据包（对应 Go `udpPacket`）。
 #[derive(Debug)]
 struct UdpPacket {
@@ -39,6 +55,30 @@ struct UdpPacket {
     err: Option<std::io::Error>,
 }
 
+/// 池化块的归还复位：**容量归一 + 清零「已写入区」**（bd hdugl 契约，独立成函数使
+/// 「还池后是否清零」在 `with_reset(..)` 调用点一眼可见）。
+///
+/// # 清零边界（≥ 读取边界）
+/// - 写入边界：块借出时 `as_mut_slice()` 恒为 `[..len]`，`recv_from` 只能从 0 写、写入量 ≤ len。
+/// - 读取边界：消费端 `read_from` 只按 `[..n]`（n = recv 返回的字节数）拷贝，n ≤ 借出长度。
+/// - 清零边界 = `[..len]`（= 借出的可写区间）⇒ **恒 ⊇ 写入边界 ⊇ 读取边界**。
+/// - 工厂块容量 == len == [`UDP_BUFFER_SIZE`] ⇒ 无「容量未用区」，清 `[..len]` 即清全部有效数据；
+///   改前 len 恰好合规就什么都不做 ⇒ 上一包明文跟着块进池（跨包/跨用户可见）。
+/// - 异形块（容量 != 定长）：容量外字节从无判读/清零 ⇒ 整块换定长零块，不把未知内存留在池里。
+///
+/// # 为什么不清容量
+/// 清零量必须与写入量同阶：全量清零 64 KiB 大块实测 190.8µs/次（debug；release 2.1µs），
+/// 而池借还仅 ~100-300ns ⇒ 全量清零把池化收益吃光（只清 16 KiB 已写区 = 300ns）。
+fn reset_returned_block(buf: &mut Vec<u8>) {
+    if buf.capacity() != UDP_BUFFER_SIZE {
+        *buf = vec![0u8; UDP_BUFFER_SIZE];
+        return;
+    }
+    buf.fill(0);
+    // len 归一到定长（`fill` 不改 len；短块补齐的尾部同为 0）。
+    buf.resize(UDP_BUFFER_SIZE, 0);
+}
+
 /// 池化 buf 复用（对应 Go `udphop` 包级 `sync.Pool`）。
 ///
 /// recv_loop 与 read_from 消费端共享：buf 随 [`UdpPacket`] 零拷贝流转，
@@ -50,7 +90,8 @@ struct UdpPacket {
 ///   即归还（不遗留脱离池的野块）；
 /// - 归还走 `insert`（按值入池）：`Some(buf)` = 池已满，裸块就地释放； `dropped_overflow` +
 ///   审计事件由池留痕（原实现的静默丢弃变成可观测）；
-/// - reset 钩子做容量归一（红线：池化对象等重，防池毒化）。
+/// - reset 钩子做**容量归一 + 已写区清零**（红线：池化对象等重，防池毒化；安全：明文不随
+///   块进池）。清零范围与成本见钩子内注。
 struct BufPool {
     inner: Arc<ObjectPool<Vec<u8>>>,
 }
@@ -62,17 +103,12 @@ impl BufPool {
                 // max = idle 额度 + 在途额度：插入件按值认领宇宙配额，留一倍余量，
                 // 使「容量因拒收」只发生在 idle 面（= 原 `put` 的 `PACKET_QUEUE_SIZE` 门）。
                 PACKET_QUEUE_SIZE * 2,
-                PACKET_QUEUE_SIZE,
+                // idle 面按字节预算收窄（192 KB/连接）：`max` 不预分配，只限总量。
+                POOL_IDLE_CAP,
                 // 工厂 = 原 `get` 的 miss 分支（池空才分配）。
                 || vec![0u8; UDP_BUFFER_SIZE],
-                |buf: &mut Vec<u8>| {
-                    // 容量归一：合规块只付一次 len 比较；异形块（超长/短块）就地归一到
-                    // 定长，免得把脏块投给下一个借出方。
-                    if buf.len() != UDP_BUFFER_SIZE {
-                        buf.clear();
-                        buf.resize(UDP_BUFFER_SIZE, 0);
-                    }
-                },
+                // 归还即清零已写入区（契约见函数本体）。
+                reset_returned_block,
                 ResetPhase::OnReturn,
             )),
         }
@@ -155,6 +191,9 @@ pub struct UdpHopPacketConn {
     /// recv 任务句柄（每 hop 启动一个）。
     #[allow(dead_code)] // 句柄随 conn 保活统一回收，本体无需读取
     recv_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// 池老化任务的托管口（`xray_frame::compat::ManagedScope`）：寿命 = 本连接，
+    /// Drop/close 即 abort 老化任务（禁裸 spawn，见 CLAUDE.md §3.5.6 ①）。
+    prune_scope: ManagedScope,
 }
 
 struct UdpHopInner {
@@ -264,6 +303,26 @@ impl UdpHopPacketConn {
             hop_loop(hop_inner, hop_recv_tx, pool_for_hop).await;
         });
 
+        // 池老化（Go 的 `sync.Pool` 靠 GC 回收，Rust 无 GC ⇒ 必须显式修剪）：低频
+        // 任务走托管口，禁裸 spawn、禁新建线程。scope 随本连接存活，`close`/Drop
+        // 即 abort（`FxScope` 的 Drop=abort 语义）。
+        let prune_scope = ManagedScope::new("xray_frame::transport::hysteria::udphop");
+        let prune_pool = Arc::clone(&pool);
+        // 时钟走端口（L3-5：裸 `Instant::now` 在 clippy.toml 里已是禁令），
+        // 装配根未安装能力集时兜底 = `SystemClock`（迁移前行为不变）。
+        let prune_clock = xray_frame::compat::clock();
+        if prune_scope
+            .spawn(async move {
+                loop {
+                    tokio::time::sleep(POOL_PRUNE_INTERVAL).await;
+                    prune_pool.inner.prune_idle(POOL_IDLE_AGE, prune_clock.now_instant());
+                }
+            })
+            .is_err()
+        {
+            // 拒发只发生在 scope 已关（构造期不可达）；托管口自身已 warn 留痕。
+        }
+
         Ok(Arc::new(Self {
             inner,
             recv_rx: tokio::sync::Mutex::new(recv_rx),
@@ -271,6 +330,7 @@ impl UdpHopPacketConn {
             pool,
             hop_handle: tokio::sync::Mutex::new(Some(hop_handle)),
             recv_handles: tokio::sync::Mutex::new(vec![recv_handle]),
+            prune_scope,
         }))
     }
 
@@ -327,6 +387,10 @@ impl UdpHopPacketConn {
         for h in handles.drain(..) {
             h.abort();
         }
+        drop(handles);
+        // 池老化任务收口（托管口 udf 三段：close 闸 → abort 在途 → 等净；任务是
+        // sleep 态 ⇒ 立即 abort，不付满超时）。报告由托管口自行落日志，此处无断言面。
+        let _ = self.prune_scope.shutdown_timeout(Duration::from_millis(100)).await;
 
         #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
         let mut inner = self.inner.lock();
@@ -500,7 +564,10 @@ pub fn to_addrs(ip: std::net::IpAddr, ports: &[u32]) -> Vec<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        time::Instant,
+    };
 
     use super::*;
 
@@ -655,7 +722,8 @@ mod tests {
         assert_eq!(pool.inner.metrics().core.idle, 1);
     }
 
-    /// 红线：reset 钩子负责容量归一——异形块插入后必须归一到定长才可能被借出。
+    /// 红线：reset 钩子负责容量归一——异形块（容量偏离定长）插回后必须换成定长零块才
+    /// 可能被借出，不把未知内存投给下一个借出方。
     /// **反向自检锚点**：把钩子改成 no-op，本断言必红（迁移报告有实测记录）。
     #[test]
     fn buf_pool_reset_normalizes_poisoned_block() {
@@ -664,9 +732,31 @@ mod tests {
         assert_eq!(pool.inner.metrics().core.idle, 1, "归一到定长的块才入池");
         let reused = pool.get();
         assert_eq!(reused.len(), UDP_BUFFER_SIZE, "reset 必须把块归一到定长");
+        assert_eq!(reused.capacity(), UDP_BUFFER_SIZE, "异形块的超长容量不得留在池里");
         assert!(
             reused.iter().all(|&b| b == 0),
             "归一后必须清零：禁把上一轮的脏数据发给下一个借出方"
+        );
+    }
+
+    /// 串味防护（bd hdugl · P0）：**合规块**（`len == 容量 == UDP_BUFFER_SIZE`，即
+    /// `recv_from` 真正写过的块）归还时必须清零——改前该分支「只做 len 比较、什么都不做」，
+    /// 上一包的明文 payload 跟着块进池，下一个借出方直接拿到。
+    /// **反向自检锚点**：把钩子改回「仅当 `len != 定长` 才归一」，本断言必红。
+    #[test]
+    fn buf_pool_zeroes_compliant_block_on_return() {
+        let pool = BufPool::new();
+        let mut written = pool.get().detach();
+        assert_eq!(written.len(), UDP_BUFFER_SIZE);
+        // 模拟一个真实 UDP 包：明文落在 [0..64)。
+        written[..64].fill(0xAA);
+        pool.put(written);
+
+        let reused = pool.get();
+        assert_eq!(reused.len(), UDP_BUFFER_SIZE, "定长不变");
+        assert!(
+            reused.iter().all(|&b| b == 0),
+            "合规块归还必须清零：禁把上一包的明文发给下一个借出方"
         );
     }
 
@@ -675,16 +765,52 @@ mod tests {
     #[test]
     fn buf_pool_insert_overflow_returns_object_and_counts() {
         let pool = BufPool::new();
-        for _ in 0..PACKET_QUEUE_SIZE {
+        for _ in 0..POOL_IDLE_CAP {
             pool.put(vec![0u8; UDP_BUFFER_SIZE]);
         }
-        assert_eq!(pool.inner.metrics().core.idle, PACKET_QUEUE_SIZE, "idle 额度内全收");
+        assert_eq!(pool.inner.metrics().core.idle, POOL_IDLE_CAP, "idle 额度内全收");
         assert_eq!(pool.inner.metrics().core.dropped_overflow, 0);
 
         // 第 N+1 块：idle 额度已满 ⇒ 交回，本模块就地释放并计数。
         pool.put(vec![0u8; UDP_BUFFER_SIZE]);
         let m = pool.inner.metrics();
         assert_eq!(m.core.dropped_overflow, 1, "超量归还必须计数，不得静默");
-        assert_eq!(m.core.idle, PACKET_QUEUE_SIZE, "idle 不得越过额度");
+        assert_eq!(m.core.idle, POOL_IDLE_CAP, "idle 不得越过额度");
+    }
+
+    /// 每连接池常驻上界（96 MB 预算口径）：idle 额度按 1500 B/块计 ≤ 192 KB。
+    /// **反向自检锚点**：把 `idle_cap` 改回 `PACKET_QUEUE_SIZE`（1.5 MB/连接），
+    /// 下面两条 `const` 断言直接编译不过。
+    #[test]
+    fn idle_cap_is_byte_bounded() {
+        const { assert!(POOL_IDLE_CAP * UDP_BUFFER_SIZE <= 192 * 1024, "idle 常驻超 192 KB/连接") };
+        // `max` 只是宇宙配额（不预分配）⇒ 保留突发容量，不随 idle 额度同缩。
+        const { assert!(PACKET_QUEUE_SIZE * 2 >= POOL_IDLE_CAP, "max 必须容纳 idle 额度") };
+    }
+
+    /// 老化（Go 的 `sync.Pool` 靠 GC 回收，Rust 无 GC ⇒ 必须显式修剪）：idle 块
+    /// 超老化窗后被释放，池不永久常驻。`prune_idle` 的 `now` 由宿主给 ⇒ 用「未来
+    /// now」模拟窗过期（生产侧 = 托管任务每 `POOL_PRUNE_INTERVAL` 调一次）。
+    /// **反向自检锚点**：不接老化任务，本断言必红（idle 恒 8）。
+    #[test]
+    fn prune_idle_releases_aged_blocks() {
+        let pool = BufPool::new();
+        for _ in 0..8 {
+            pool.put(vec![0u8; UDP_BUFFER_SIZE]);
+        }
+        assert_eq!(pool.inner.metrics().core.idle, 8, "前置：8 块在 idle");
+
+        let aged_now = Instant::now() + POOL_IDLE_AGE + Duration::from_secs(1);
+        assert_eq!(pool.inner.prune_idle(POOL_IDLE_AGE, aged_now), 8, "超窗块必须全部释放");
+        let m = pool.inner.metrics();
+        assert_eq!(m.core.idle, 0, "老化后 idle 归零");
+        assert_eq!(m.pruned, 8, "释放数必须留痕");
+
+        // 释放后取块 ⇒ 重新构造（不得再复用已释放的块）。
+        let b = pool.get().detach();
+        assert_eq!(b.len(), UDP_BUFFER_SIZE);
+        let m = pool.inner.metrics();
+        assert_eq!(m.constructed, 1, "prune 后取块必须重新构造");
+        assert_eq!(m.reused, 0, "已释放的块不得被复用");
     }
 }

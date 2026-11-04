@@ -158,9 +158,10 @@ async fn dial_splithttp(
     // finalmask（bd dppv）：Go splithttp/dialer.go:127-134——h1/h2 路径在
     // dialContext 内 TCP 后、TLS 前 WrapConnClient（首字节 = mask 头）；h3/QUIC
     // 无 Tcpmask（Go hub.go:546-549 同款排除）。空 manager = 恒等。
-    let tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+    // 按配置内容复用（bd nzli6）：xmc 派生 67ms 只在首次构建付一次。
+    let tcpmask = xray_transport::finalmask::shared_tcpmask_manager_from_json(
         settings.finalmask_json.as_ref(),
-    )?);
+    )?;
     // 下载侧通道（Go `dialer.go:355-404`）：配了 `downloadSettings` 就**另建**一个下载侧
     // HTTP 客户端（独立 dest/tls/host/path/ALPN）——上行仍走主客户端。
     //
@@ -466,9 +467,10 @@ async fn build_download_side(
         } else {
             None
         };
-        let dl_tcpmask = Arc::new(xray_transport::finalmask::build_tcpmask_manager_from_json(
+        // 按配置内容复用（bd nzli6）：下载侧配置同样可能含 xmc（67ms/次）。
+        let dl_tcpmask = xray_transport::finalmask::shared_tcpmask_manager_from_json(
             stream.finalmask_json.as_ref(),
-        )?);
+        )?;
         let dial_target = DialTarget {
             host: ds.destination.address().to_string(),
             port: ds.destination.port().value(),

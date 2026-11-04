@@ -233,7 +233,7 @@ impl DnsAppConfig {
         // `make_groups` 仅按 id 相等分组。
         let mut policy_map: HashMap<String, u32> = HashMap::new();
         let mut next_policy_id: u32 = 1;
-        for ns in &self.servers {
+        for (i, ns) in self.servers.iter().enumerate() {
             // JSON `policyID` 非零为手动覆盖（4ah3 钦定扩展，Go 无此字段）；
             // 否则用派生值。
             let policy_id = match ns.policy_id.filter(|&v| v != 0) {
@@ -282,6 +282,16 @@ impl DnsAppConfig {
                     )))
                 })?;
                 for (dt, v) in entries {
+                    // 正则规则在此先编译一次：末尾全局 matcher 构建失败只剩裸原因，
+                    // 无位置信息（bd P1-5 要求错误可定位到配置项）。
+                    if dt == xray_geodata::matcher::domain::DomainType::Regex {
+                        xray_geodata::matcher::RegexMatcher::new(&v).map_err(|e| {
+                            DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                                "dns servers[{i}] (address={:?}) domains {s:?}: {e}",
+                                ns.address
+                            )))
+                        })?;
+                    }
                     matcher_infos.push(DomainMatcherInfo { client_idx, domain_rule: s.clone() });
                     all_rules.push(MatcherDomainRule::new(dt, v, all_rules.len() as u32));
                 }
@@ -308,13 +318,16 @@ impl DnsAppConfig {
         let domain_matcher = if all_rules.is_empty() {
             None
         } else {
-            match MphDomainMatcher::build(&all_rules) {
-                Ok(m) => Some(Box::new(m) as Box<dyn xray_geodata::matcher::domain::DomainMatcher>),
-                Err(e) => {
-                    tracing::warn!(error = %e, "dns: domain matcher build failed, fallback only");
-                    None
-                },
-            }
+            // Go dns.go:162-165：`BuildDomainMatcher` 失败 → `New` 返回错误 → 实例启动
+            // 失败。此前 warn + None ⇒ 整个 DNS 域限定失效（后续所有域名都允许解析），
+            // 用户配了 white/black 白名单却写错一个就静默变「全域放行」（bd P1-5）。
+            let matcher = MphDomainMatcher::build(&all_rules).map_err(|e| {
+                DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                    "dns: domain matcher build failed ({} rule(s) from per-nameserver \"domains\"): {e}",
+                    all_rules.len()
+                )))
+            })?;
+            Some(Box::new(matcher) as Box<dyn xray_geodata::matcher::domain::DomainMatcher>)
         };
 
         let mut mappings = parse_hosts(&self.hosts, &datadir, &loader)?;
@@ -609,13 +622,18 @@ fn parse_domain_rule_entries(
     let Some(value) = pb_rule.value else {
         return Ok(Vec::new());
     };
-    let to_matcher_type = |t: i32| {
-        DomainType::from_i32(t).ok_or_else(|| {
+    // pb `Domain.Type` 与 matcher `DomainType` 编号不同（见 protos/common/geodata/geodat.proto）：
+    // pb = Substr0/Regex1/Domain2/Full3，matcher = Full0/Domain1/Substr2/Regex3。
+    // 直接透传 `from_i32` 会把每类规则错位一格（Substr→Full、Regex→Domain…）：
+    // `domains:["google.com"]` 只精确匹配、`regexp:` 永不编译。
+    // 单一来源见 `xray_geodata::matcher::domain::from_proto_type`。
+    fn to_matcher_type(t: i32) -> Result<DomainType, DnsError> {
+        xray_geodata::matcher::domain::from_proto_type(t).ok_or_else(|| {
             DnsError::Features(xray_features::dns::DnsError::Other(format!(
                 "unknown domain type: {t}"
             )))
         })
-    };
+    }
     match value {
         DV::Custom(d) => Ok(vec![(to_matcher_type(d.r#type)?, d.value)]),
         DV::Geosite(g) => {
@@ -868,6 +886,72 @@ mod tests {
         }"#;
         let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.build().is_err(), "bad hosts key must fail the build");
+    }
+
+    /// P1-5：matcher 构建失败 ⇒ 启动硬错（Go dns.go:162-165）。此前 warn + None
+    /// 会让整个域名限定失效——用户写坏一个 `domains` 就静默变「全域放行」。
+    ///
+    /// 反向自检锚点：把 `MphDomainMatcher::build` 的 `?` 换回 warn + None ⇒
+    /// `expect_err` 必红。
+    #[test]
+    fn build_hard_fails_on_bad_regexp_domain_rule() {
+        let json = r#"{
+            "servers": [
+                {"address": "8.8.8.8", "domains": ["regexp:([unclosed"]},
+                {"address": "1.1.1.1"}
+            ]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let err = cfg.build().map(|_| ()).expect_err("bad regexp rule must fail the build");
+        let msg = err.to_string();
+        assert!(msg.contains("servers[0]"), "error must locate the offending server: {msg}");
+        assert!(
+            msg.contains("regexp:([unclosed"),
+            "error must quote the offending domains entry: {msg}"
+        );
+        assert!(msg.contains("正则表达式编译失败"), "error must carry the reason: {msg}");
+    }
+
+    /// 对照：合法 `regexp:` 规则照常构建（fail-visible 不得误伤正常配置）。
+    #[test]
+    fn build_accepts_valid_regexp_domain_rule() {
+        let json = r#"{
+            "servers": [{"address": "8.8.8.8", "domains": ["regexp:^ads\\..*$"]}]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("valid regexp rule must build");
+        assert!(built.domain_matcher.is_some(), "matcher must be present");
+        assert_eq!(built.matcher_infos.len(), 1);
+    }
+
+    /// pb `Domain.Type`（Substr0/Regex1/Domain2/Full3）→ matcher `DomainType`
+    /// （Full0/Domain1/Substr2/Regex3）必须换表，不能透传 `from_i32`。
+    ///
+    /// 未加前缀的 `domains` 条目走 Go `ParseDomainRule(s, Domain_Substr)` ⇒ **子串**匹配；
+    /// `full:` 才是精确匹配；`regexp:` 才真的编译正则。
+    #[test]
+    fn ns_domain_rule_types_map_from_pb_numbering() {
+        let json = r#"{
+            "servers": [{
+                "address": "8.8.8.8",
+                "domains": [
+                    "substr-marker.test",
+                    "full:full-marker.test",
+                    "regexp:^ads\\..*\\.regexp$"
+                ]
+            }]
+        }"#;
+        let cfg: DnsAppConfig = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("build");
+        let matcher = built.domain_matcher.expect("matcher");
+        // 未加前缀 ⇒ Substr：任意包含即命中
+        assert!(!matcher.match_domain("a.substr-marker.test").is_empty(), "substr rule must match");
+        // full: ⇒ Full：子域不命中
+        assert!(!matcher.match_domain("full-marker.test").is_empty(), "full rule must match");
+        assert!(matcher.match_domain("x.full-marker.test").is_empty(), "full rule must be exact");
+        // regexp: ⇒ 真的编译并按正则匹配
+        assert!(!matcher.match_domain("ads.x.regexp").is_empty(), "regexp rule must match");
+        assert!(matcher.match_domain("x.ads.x.regexp").is_empty(), "regexp rule is anchored");
     }
 
     #[test]

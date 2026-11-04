@@ -32,7 +32,7 @@ pub struct FallbackPolicy {
 /// 一条 fallback 目标：`dest`（"host:port"）+ PROXY protocol `xver`（0/1/2）。
 #[derive(Debug, Clone)]
 pub struct FallbackDest {
-    /// 目标地址字符串（直接 `TcpStream::connect`）。
+    /// 目标地址字符串（`xray_transport::fallback::fallback_to_dest` 拨，可含域名）。
     pub dest: String,
     /// PROXY protocol 版本（0=无，1=v1 文本，2=v2 二进制）。
     pub xver: u8,

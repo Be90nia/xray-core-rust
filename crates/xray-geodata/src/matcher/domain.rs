@@ -14,6 +14,22 @@
 //! # 工厂模式
 //!
 //! - [`DomainMatcherFactory`] - 域名匹配器工厂 trait
+//!
+//! # ⚠️ 同名异型警告（两个 `DomainType`）
+//!
+//! 仓里有**两个**都叫 `DomainType` 的枚举，编号**不同序**，混用即静默错位：
+//!
+//! |枚举|路径|编号|
+//! |---|---|---|
+//! |protobuf `Domain.Type`|`xray_proto::xray::common::geodata::domain::Type`<br>`xray_geodata::pb::domain::Type`（`geosite::DomainType` 亦是它）|`Substr=0 / Regex=1 / Domain=2 / Full=3`|
+//! |matcher [`DomainType`]|`xray_geodata::matcher::domain::DomainType`（本模块）|`Full=0 / Domain=1 / Substr=2 / Regex=3`|
+//!
+//! 规则：
+//! - 读配置 / `.dat` 里的 `Domain.type`（pb 值）→ [`from_proto_type`]；写回 pb →
+//!   [`to_proto_type`]。
+//! - [`DomainType::from_i32`] 是**matcher 自编号**解析器，**不要**喂 pb 值。
+//! - 禁在两套编号间 `as i32` 互转；pb 枚举的 `as i32`（如 `Type::Full as i32` = 3）是 pb 编号，
+//!   只用于构造 pb 消息。
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -27,8 +43,9 @@ use crate::weak_cache::WeakCacheMap;
 
 /// 域名规则类型。
 ///
-/// 区别于 protobuf 的 `DomainType`，这是匹配器层面的类型枚举，
-/// 直接对应 Go 版本 `Domain.Type` 枚举值。
+/// 这是**匹配器层面**的类型枚举，编号 `Full=0/Domain=1/Substr=2/Regex=3`，
+/// 与 protobuf `Domain.Type`（`Substr=0/Regex=1/Domain=2/Full=3`）**不同序**。
+/// 从 pb 值转换一律走 [`from_proto_type`]，禁 `as i32` 互转。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum DomainType {
@@ -43,9 +60,11 @@ pub enum DomainType {
 }
 
 impl DomainType {
-    /// 从 i32 值转换为 DomainType。
+    /// 从 **matcher 自编号** 解析：`Full=0/Domain=1/Substr=2/Regex=3`。
     ///
-    /// 对应 protobuf `Domain.Type` 的整数值。
+    /// ⚠️ 这**不是** protobuf `Domain.Type` 的编号（pb 是
+    /// `Substr=0/Regex=1/Domain=2/Full=3`）。拿 pb 值调本函数会整体错位，
+    /// 想解析配置里的 `Domain.Type` 请用 [`from_proto_type`]。
     /// 未知值返回 `None`。
     #[must_use]
     pub fn from_i32(value: i32) -> Option<Self> {
@@ -67,6 +86,37 @@ impl DomainType {
             Self::Substr => MatcherType::Substr,
             Self::Regex => MatcherType::Regex,
         }
+    }
+}
+
+/// protobuf `Domain.Type` 编号 → matcher [`DomainType`]。
+///
+/// pb: `Substr=0 / Regex=1 / Domain=2 / Full=3`
+/// （`protos/common/geodata/geodat.proto`）；matcher:
+/// `Full=0 / Domain=1 / Substr=2 / Regex=3`——两套编号**不同序**，
+/// `as i32` 互转必然错位。
+///
+/// 这是全仓唯一的 pb→matcher 映射来源；各 crate 的本地映射表一律转调此处。
+/// 未知值返回 `None`。
+#[must_use]
+pub fn from_proto_type(value: i32) -> Option<DomainType> {
+    match value {
+        0 => Some(DomainType::Substr),
+        1 => Some(DomainType::Regex),
+        2 => Some(DomainType::Domain),
+        3 => Some(DomainType::Full),
+        _ => None,
+    }
+}
+
+/// matcher [`DomainType`] → protobuf `Domain.Type` 编号（[`from_proto_type`] 的逆）。
+#[must_use]
+pub fn to_proto_type(t: DomainType) -> i32 {
+    match t {
+        DomainType::Substr => 0,
+        DomainType::Regex => 1,
+        DomainType::Domain => 2,
+        DomainType::Full => 3,
     }
 }
 
@@ -670,12 +720,30 @@ mod tests {
 
     #[test]
     fn test_domain_type_from_i32() {
+        // matcher 自编号（非 pb）
         assert_eq!(DomainType::from_i32(0), Some(DomainType::Full));
         assert_eq!(DomainType::from_i32(1), Some(DomainType::Domain));
         assert_eq!(DomainType::from_i32(2), Some(DomainType::Substr));
         assert_eq!(DomainType::from_i32(3), Some(DomainType::Regex));
         assert_eq!(DomainType::from_i32(4), None);
         assert_eq!(DomainType::from_i32(-1), None);
+    }
+
+    #[test]
+    fn test_from_proto_type_mapping_table() {
+        // pb: Substr=0/Regex=1/Domain=2/Full=3
+        let table = [
+            (0, DomainType::Substr),
+            (1, DomainType::Regex),
+            (2, DomainType::Domain),
+            (3, DomainType::Full),
+        ];
+        for (pb, dt) in table {
+            assert_eq!(from_proto_type(pb), Some(dt));
+            assert_eq!(to_proto_type(dt), pb);
+        }
+        assert_eq!(from_proto_type(4), None);
+        assert_eq!(from_proto_type(-1), None);
     }
 
     #[test]

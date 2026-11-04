@@ -8,8 +8,10 @@
 //! # 流程
 //!
 //! 1. `WsListener::bind` 绑 TcpListener
-//! 2. `accept()` 收一条 TCP 连接（+ 可选 TLS 包装）
-//! 3. `accept_hdr_async` 触发握手，callback 内：
+//! 2. accept 循环只 `accept_raw()` 取裸连接（不握手，毫秒级），随后 spawn 每连接握手任务（对齐 Go
+//!    `http.Server.Serve` 的 per-conn goroutine）
+//! 3. 握手任务内：PROXY protocol（4s 窗）→ finalmask → TLS（4s 窗）→ `accept_hdr_async`（4s
+//!    窗），callback 内：
 //!    - 校验 `Sec-WebSocket-Key` → 自动由 tungstenite 处理
 //!    - 校验 Host / Path → 不匹配返回 `404` 拒绝
 //!    - 提取 `Sec-WebSocket-Protocol` base64 → early data
@@ -199,135 +201,73 @@ impl WsListener {
         }
     }
 
-    /// 接受一条底层连接并完成传输层包装（PROXY protocol + finalmask，仅 TCP 分支）。
-    /// 返回 `(流, remote, local)`；unix 分支直接给出 `Box<dyn Connection>`
-    /// （`UnixConnection`，无 PROXY protocol/finalmask——对齐 Go system_listener
-    /// UnixAddr 分支），remote/local 为全零占位。
+    /// accept 循环专用：只取裸连接，**零握手**（毫秒级返回）。
+    ///
+    /// PROXY protocol / finalmask / TLS / WS 升级全部推迟到
+    /// [`HandshakeTemplate::handshake`]——对应 Go `http.Server.Serve` 每连接一个
+    /// goroutine（握手不在 accept 循环内）。bd 0wvne：此前握手在循环内 await，
+    /// 单条「连了不握手」的探测连接独占循环 4~7s（生产 75 次/分钟探测 ⇒ 循环
+    /// 100% 被占住）。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
-    async fn accept_conn(&self) -> Result<(Box<dyn Connection>, SocketAddr, Option<SocketAddr>)> {
+    pub(crate) async fn accept_raw(&self) -> Result<RawConn> {
         match &self.source {
             ListenerSource::Tcp(l) => {
-                let (mut tcp, remote) = l.accept().await.map_err(WsError::Io)?;
+                let (tcp, remote) = l.accept().await.map_err(WsError::Io)?;
                 let local = tcp.local_addr().ok();
-                let remote = self.parse_proxy_protocol(&mut tcp, remote).await?;
-                // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 在 WS 握手
-                // 前包住裸 TCP——读到的首字节必须是 mask 头而非 GET。空 manager = 恒等。
-                let stream: Box<dyn Connection> = match self.tcpmask.as_ref() {
-                    Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(
-                        m,
-                        Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-                    )
-                    .map_err(WsError::Io)?,
-                    None => Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-                };
-                Ok((stream, remote, local))
+                Ok(RawConn { source: RawSource::Tcp(tcp), remote, local })
             },
             #[cfg(unix)]
             ListenerSource::Unix(l) => {
                 use xray_transport::system_listener::SystemListener as _;
                 let conn = l.accept().await.map_err(WsError::Io)?;
-                Ok((conn, SocketAddr::from(([0, 0, 0, 0], 0)), None))
+                Ok(RawConn {
+                    source: RawSource::Unix(conn),
+                    remote: SocketAddr::from(([0, 0, 0, 0], 0)),
+                    local: None,
+                })
             },
+        }
+    }
+
+    /// 每连接握手模板：配置 / 信任名单 / finalmask / TLS 一次取出。
+    ///
+    /// accept 循环取一次再 `clone()` 给每个 spawn 出的握手任务（全是 Arc 克隆，
+    /// 零分配）。listener 本体留在循环内 ⇒ `close()` 后端口立即释放，不被在途
+    /// 握手任务拖住（Go `Listener.Close()` 同语义）。
+    pub(crate) fn handshake_template(
+        &self,
+        tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    ) -> HandshakeTemplate {
+        HandshakeTemplate {
+            configs: Arc::from(self.configs.clone()),
+            trusted: Arc::from(self.trusted_x_forwarded_for.clone()),
+            tcpmask: self.tcpmask.clone(),
+            tls_config,
         }
     }
 
     /// 接受一条新连接，完成 WS 握手 + 校验 host/path + 提取 early data。
     ///
     /// **不支持 TLS**：明文 ws:// only。TLS 场景请用 [`accept_tls`](Self::accept_tls)。
+    /// 生产 accept 循环不走本方法（见 [`accept_raw`](Self::accept_raw)）。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept(&self) -> Result<AcceptedConn> {
-        let (stream, remote, local) = self.accept_conn().await?;
-        Self::ws_handshake(stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
-            .await
+        let raw = self.accept_raw().await?;
+        self.handshake_template(None).handshake(raw).await
     }
 
     /// 接受一条新连接，先做 TLS 握手再 WS 握手。
     ///
     /// 流程：TCP accept → PROXY protocol（可选）→ TLS accept → WS handshake。
     /// 对应 Go `tls.NewListener(l, tlsConfig)` 包装 TCP listener。
+    /// 生产 accept 循环不走本方法（见 [`accept_raw`](Self::accept_raw)）。
     #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
     pub async fn accept_tls(
         &self,
         tls_config: Arc<tokio_rustls::rustls::ServerConfig>,
     ) -> Result<AcceptedConn> {
-        // 0-RTT 排空开关：allowEarlyData=true 时 rustls ServerConfig 的
-        // max_early_data_size>0（build_server_config 设置），此位即配置透传。
-        let ed_enabled = tls_config.max_early_data_size > 0;
-        // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
-        // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
-        // ClientHello 的连接超时丢弃，accept 循环永不被单个连接堵死（串行 accept 下
-        // 无超时的 rustls accept 即瘫痪全 inbound，httpupgrade P0 同族：半个
-        // ClientHello 挂死 5 小时）。WS 升级握手另有自身 4s 超时（H14，
-        // HandshakeTimeout），h2 拒绝服务另有 30s 兜底，均在本窗之外不变。
-        let (remote, tls_stream, local) =
-            match tokio::time::timeout(Duration::from_secs(4), async {
-                let (stream, remote, local) = self.accept_conn().await?;
-                let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-                let tls_stream = acceptor
-                    .accept(stream)
-                    .await
-                    .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
-                Ok::<_, WsError>((remote, tls_stream, local))
-            })
-            .await
-            {
-                Ok(Ok((remote, tls_stream, local))) => (remote, tls_stream, local),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    crate::LOG.debug("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
-                    return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
-                },
-            };
-        // TLS 0-RTT：rustls 把收到的 early data 缓在 ServerConnection 里，标准
-        // 读路径不排空（tokio-rustls accept 直连 ServerConnection、不经 Acceptor
-        // 的 Accepting::early_data()）——不在此取出，客户端随 0-RTT 发来的 ws
-        // upgrade GET 会永远滞留缓冲、握手悬挂。仅在 max_early_data_size>0
-        // （allowEarlyData=true）时走此路径，缺省配置零行为变化。
-        let mut tls_stream = tls_stream;
-        let mut early_bytes = Vec::new();
-        if ed_enabled {
-            if let Some(mut ed) = tls_stream.get_mut().1.early_data() {
-                use std::io::Read as _;
-                let _ = ed.read_to_end(&mut early_bytes);
-            }
-        }
-        if !early_bytes.is_empty() {
-            crate::LOG.info(format!(
-                "bytes={} TLS 0-RTT early data accepted (prefixed to ws handshake)",
-                early_bytes.len()
-            ));
-        }
-        // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
-        // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
-        // 协商 h2 后 CDN 族全挂）。Go hub.go:158 `http.Server.Serve(tls.NewListener)`
-        // 由 net/http 对 TLS listener 自动装配 h2 层，gorilla upgrader 对 h2 请求
-        // 回 400——此处对齐该行为。h2 服务随连接终结，Err 让 accept loop 继续。
-        if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
-            // spawn 而非内联 await：扫描器 h2 探测常 hard-close，hyper h2 serve
-            // 对此最长挂 30s——内联会钉死串行 accept loop（backlog 满转 521，
-            // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
-            )]
-            tokio::spawn(Self::serve_h2_reject(tls_stream, self.configs.clone()));
-            return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
-        }
-        // 0-RTT 前缀流：有 early data 时先吐缓存字节再接 TLS 流；无 early data
-        // 且开关关闭时保持裸流（缺省配置零变化、零包装）。
-        if ed_enabled || !early_bytes.is_empty() {
-            let stream = EarlyDataPrefixed { prefix: early_bytes, offset: 0, inner: tls_stream };
-            return Self::ws_handshake(
-                stream,
-                remote,
-                local,
-                &self.configs,
-                &self.trusted_x_forwarded_for,
-            )
-            .await;
-        }
-        Self::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted_x_forwarded_for)
-            .await
+        let raw = self.accept_raw().await?;
+        self.handshake_template(Some(tls_config)).handshake(raw).await
     }
 
     /// ALPN=h2 时的 h2 拒绝服务（wsh2 修复）。
@@ -338,7 +278,7 @@ impl WsListener {
     /// （hub.go:41-52）的校验顺序：host 404 → path 404 → upgrader 400。
     /// h2 上 host 在 `:authority` 伪头（`uri().host()`），Host header 回落——
     /// 同 splithttp dispatch_request 语义（对齐 Go `r.Host`）。
-    async fn serve_h2_reject<S>(stream: S, configs: Vec<Arc<Config>>)
+    async fn serve_h2_reject<S>(stream: S, configs: Arc<[Arc<Config>]>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -381,20 +321,6 @@ impl WsListener {
         // 完成，30s 仅覆盖慢链路重传窗口。hyper 侧根因修复后可移除。
         let serve = builder.serve_connection(TokioIo::new(stream), svc);
         let _ = tokio::time::timeout(Duration::from_secs(30), serve).await;
-    }
-
-    /// 解析 PROXY protocol（如果启用），返回真实客户端地址。
-    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
-    async fn parse_proxy_protocol(
-        &self,
-        tcp: &mut tokio::net::TcpStream,
-        original: SocketAddr,
-    ) -> Result<SocketAddr> {
-        if self.configs.iter().any(|c| c.accept_proxy_protocol) {
-            Ok(read_proxy_protocol(tcp).await?.unwrap_or(original))
-        } else {
-            Ok(original)
-        }
     }
 
     /// 在已建立的流上做 WS 握手 + 多 path 路由 + early data + XFF + 心跳 ping。
@@ -497,6 +423,200 @@ impl WsListener {
         })
     }
 }
+
+/// 裸 accept 出的连接源（未做任何握手）。
+enum RawSource {
+    Tcp(tokio::net::TcpStream),
+    /// unix 连接（`UnixConnection`，无 PROXY protocol/finalmask——对齐 Go
+    /// system_listener UnixAddr 分支）。
+    #[cfg(unix)]
+    Unix(Box<dyn Connection>),
+}
+
+/// accept 循环取到的裸连接：PROXY protocol / finalmask / TLS / WS 升级全部未做。
+///
+/// 对应 Go `net.Listener.Accept()` 的返回值——accept 循环只做这一步，握手进
+/// [`HandshakeTemplate::handshake`]（对齐 Go `http.Server.Serve` 每连接一个 goroutine）。
+pub(crate) struct RawConn {
+    source: RawSource,
+    remote: SocketAddr,
+    local: Option<SocketAddr>,
+}
+
+impl RawConn {
+    /// 首字节窗：TCP 建连后首字节必须在 [`xray_transport::handshake_gate::FIRST_BYTE_TIMEOUT`]
+    /// 内到达（`peek` 不消费字节，后续 PROXY/TLS/GET 仍从第 1 字节读）。
+    ///
+    /// 探测连接（连了不发一个字节）在此被快速清掉，不必等 4s 的 TLS/WS 窗；
+    /// unix 连接无对应形态，直接放行。
+    async fn wait_first_byte(&mut self) -> Result<()> {
+        match &mut self.source {
+            RawSource::Tcp(tcp) => xray_transport::handshake_gate::wait_first_byte(
+                tcp,
+                xray_transport::handshake_gate::FIRST_BYTE_TIMEOUT,
+            )
+            .await
+            .map_err(|e| WsError::HandshakeFailed(format!("first byte wait: {e}"))),
+            #[cfg(unix)]
+            RawSource::Unix(_) => Ok(()),
+        }
+    }
+
+    /// PROXY protocol（可选）+ finalmask 包装，返回 `(流, remote, local)`。
+    ///
+    /// PROXY 头是裸 `read_exact`（无自带超时），**必须**由调用方包限时窗——见
+    /// [`HandshakeTemplate::handshake`] 的 4s。
+    async fn into_transport(
+        self,
+        accept_proxy: bool,
+        tcpmask: Option<&Arc<xray_transport::finalmask::TcpmaskManager>>,
+    ) -> Result<(Box<dyn Connection>, SocketAddr, Option<SocketAddr>)> {
+        match self.source {
+            RawSource::Tcp(mut tcp) => {
+                let mut remote = self.remote;
+                if accept_proxy {
+                    remote = read_proxy_protocol(&mut tcp).await?.unwrap_or(remote);
+                }
+                // finalmask（bd dppv）：Go hub.go:107 `FinalMask.Listen` 在 WS 握手
+                // 前包住裸 TCP——读到的首字节必须是 mask 头而非 GET。空 manager = 恒等。
+                let tcp: Box<dyn Connection> =
+                    Box::new(xray_transport::connection::TcpConnection::new(tcp));
+                let stream: Box<dyn Connection> = match tcpmask {
+                    Some(m) => xray_transport::finalmask::wrap_conn_server_into_connection(m, tcp)
+                        .map_err(WsError::Io)?,
+                    None => tcp,
+                };
+                Ok((stream, remote, self.local))
+            },
+            #[cfg(unix)]
+            RawSource::Unix(conn) => Ok((conn, self.remote, self.local)),
+        }
+    }
+}
+
+/// accept 循环的每连接握手模板：[`WsListener::handshake_template`] 取一次，
+/// spawn 出的握手任务 `clone()` 自持（全是 Arc 克隆，零分配）。
+///
+/// listener 本体不进来 ⇒ `close()` 后端口立即释放，不被在途握手任务拖住
+/// （Go `Listener.Close()` 同语义）。
+#[derive(Clone)]
+pub(crate) struct HandshakeTemplate {
+    configs: Arc<[Arc<Config>]>,
+    trusted: Arc<[String]>,
+    tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+    tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+}
+
+impl HandshakeTemplate {
+    /// 单连接完整握手：PROXY protocol（4s 窗）→ finalmask → TLS → WS upgrade。
+    ///
+    /// 对应 Go `http.Server.Serve` 的每连接 goroutine——4s `ReadHeaderTimeout`
+    /// 只作用在那一个连接内，accept 循环继续取新连接。时间窗放这里而不是循环里
+    /// 是本票核心（bd 0wvne 实测：单条「连了不握手」的探测连接曾让好连接等
+    /// 3706ms，TLS 档 3708ms，慢 TLS 两窗串行 7013ms，PROXY 档无界）。
+    #[allow(clippy::result_large_err)] // WsError::Tungstenite 136B；Box 化属类型变更，超出行为零变更契约
+    pub(crate) async fn handshake(self, mut raw: RawConn) -> Result<AcceptedConn> {
+        let accept_proxy = self.configs.iter().any(|c| c.accept_proxy_protocol);
+        // 两段式超时（bd 0wvne 判据 4）：先要求首字节在 2s 内到达——探测连接一个
+        // 字节都不发，命中即清，不必等 4s；真实客户端（PROXY 头 / TLS ClientHello /
+        // GET）首字节与 SYN 同批到达，不受影响。其后各协议的 4s 窗保持不变（慢网
+        // 客户端不误伤）。
+        raw.wait_first_byte().await?;
+        // 明文档：PROXY 头读取同样要护栏（裸 read_exact 无界，曾让单连接永久占住
+        // accept 循环）。WS 升级握手另有自身 4s 超时（H14，HandshakeTimeout）。
+        let Some(tls_config) = self.tls_config else {
+            let (stream, remote, local) = match tokio::time::timeout(
+                Duration::from_secs(4),
+                raw.into_transport(accept_proxy, self.tcpmask.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    crate::LOG.debug("ws PROXY protocol read timeout (4s)");
+                    return Err(WsError::HandshakeFailed(
+                        "proxy protocol read timeout (4s)".into(),
+                    ));
+                },
+            };
+            return WsListener::ws_handshake(stream, remote, local, &self.configs, &self.trusted)
+                .await;
+        };
+        // 0-RTT 排空开关：allowEarlyData=true 时 rustls ServerConfig 的
+        // max_early_data_size>0（build_server_config 设置），此位即配置透传。
+        let ed_enabled = tls_config.max_early_data_size > 0;
+        // Go hub.go:143 http.Server{ReadHeaderTimeout: 4s}——deadline 在 TLS wrap 前
+        // 生效，4s 覆盖 PROXY protocol 解析 + TLS 惰性握手全程。整段限时：半开/分片
+        // ClientHello 的连接超时丢弃（串行 accept 下无超时的 rustls accept 即瘫痪全
+        // inbound，httpupgrade P0 同族：半个 ClientHello 挂死 5 小时）。h2 拒绝服务
+        // 另有 30s 兜底，在本窗之外不变。
+        let (remote, tls_stream, local) =
+            match tokio::time::timeout(Duration::from_secs(4), async {
+                let (stream, remote, local) =
+                    raw.into_transport(accept_proxy, self.tcpmask.as_ref()).await?;
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| WsError::HandshakeFailed(format!("tls accept: {e}")))?;
+                Ok::<_, WsError>((remote, tls_stream, local))
+            })
+            .await
+            {
+                Ok(Ok((remote, tls_stream, local))) => (remote, tls_stream, local),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    crate::LOG.debug("ws TLS accept timeout (4s, Go ReadHeaderTimeout)");
+                    return Err(WsError::HandshakeFailed("tls accept timeout (4s)".into()));
+                },
+            };
+        // TLS 0-RTT：rustls 把收到的 early data 缓在 ServerConnection 里，标准
+        // 读路径不排空（tokio-rustls accept 直连 ServerConnection、不经 Acceptor
+        // 的 Accepting::early_data()）——不在此取出，客户端随 0-RTT 发来的 ws
+        // upgrade GET 会永远滞留缓冲、握手悬挂。仅在 max_early_data_size>0
+        // （allowEarlyData=true）时走此路径，缺省配置零行为变化。
+        let mut tls_stream = tls_stream;
+        let mut early_bytes = Vec::new();
+        if ed_enabled {
+            if let Some(mut ed) = tls_stream.get_mut().1.early_data() {
+                use std::io::Read as _;
+                let _ = ed.read_to_end(&mut early_bytes);
+            }
+        }
+        if !early_bytes.is_empty() {
+            crate::LOG.info(format!(
+                "bytes={} TLS 0-RTT early data accepted (prefixed to ws handshake)",
+                early_bytes.len()
+            ));
+        }
+        // wsh2 修复：ALPN 协商出 h2 时进 h2 拒绝服务，而非把 HTTP/2 帧喂给
+        // http/1.1-only 的 ws_handshake（裸断根因：curl --http2 = 000，CF 回源
+        // 协商 h2 后 CDN 族全挂）。Go hub.go:158 `http.Server.Serve(tls.NewListener)`
+        // 由 net/http 对 TLS listener 自动装配 h2 层，gorilla upgrader 对 h2 请求
+        // 回 400——此处对齐该行为。h2 服务随连接终结，Err 让 accept loop 继续。
+        if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
+            // spawn 而非内联 await：扫描器 h2 探测常 hard-close，hyper h2 serve
+            // 对此最长挂 30s——内联会钉死 accept loop（backlog 满转 521，
+            // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            )]
+            tokio::spawn(WsListener::serve_h2_reject(tls_stream, self.configs.clone()));
+            return Err(WsError::HandshakeFailed("http/2 request rejected".into()));
+        }
+        // 0-RTT 前缀流：有 early data 时先吐缓存字节再接 TLS 流；无 early data
+        // 且开关关闭时保持裸流（缺省配置零变化、零包装）。
+        if ed_enabled || !early_bytes.is_empty() {
+            let stream = EarlyDataPrefixed { prefix: early_bytes, offset: 0, inner: tls_stream };
+            return WsListener::ws_handshake(stream, remote, local, &self.configs, &self.trusted)
+                .await;
+        }
+        WsListener::ws_handshake(tls_stream, remote, local, &self.configs, &self.trusted).await
+    }
+}
+
 /// 解析出的 early data（原始 header 字符串 + 解码后字节）。
 struct EarlyDataHeader {
     raw: String,

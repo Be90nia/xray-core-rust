@@ -162,7 +162,8 @@ pub async fn dial(
     // Go 侧 policy 属全局配置层），取 DefaultDialTimeout；接线后此处应优先取 policy 值。
     // finalmask（bd dppv）：Go grpc/dial.go:129-135 WrapConnClient——TCP 建立
     // 后、TLS/h2 之前套上（首字节 = mask 头而非 HTTP/2 preface）。空 manager = 恒等。
-    let tcpmask = xray_transport::finalmask::build_tcpmask_manager_from_json(
+    // 按配置内容复用（bd nzli6）：xmc 派生 67ms 只在首次构建付一次。
+    let tcpmask = xray_transport::finalmask::shared_tcpmask_manager_from_json(
         settings.finalmask_json.as_ref(),
     )?;
     let attempt_budget = xray_transport::system_dialer::DEFAULT_DIAL_TIMEOUT;

@@ -100,7 +100,9 @@ fn load_geosite_and_match_domain_end_to_end() {
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let dt = DomainType::from_i32(d.r#type).unwrap_or(DomainType::Full);
+            // pb `Domain.Type` 值 → matcher 类型（两套编号不同序，走单一来源）
+            let dt = xray_geodata::matcher::domain::from_proto_type(d.r#type)
+                .unwrap_or(DomainType::Full);
             DomainRule::new(dt, d.value.clone(), (i + 1) as u32)
         })
         .collect();

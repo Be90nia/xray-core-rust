@@ -334,19 +334,6 @@ fn normalize_dest_override(protocols: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// proto `Domain.Type`（Substr=0/Regex=1/Domain=2/Full=3）→ matcher 层
-/// `DomainType`（Full=0/Domain=1/Substr=2/Regex=3）。两套编号不同序
-/// （对照 xray-app-router `proto_domain_type_to_matcher`）。
-fn proto_domain_type_to_matcher(t: i32) -> Option<geodata_domain::DomainType> {
-    match t {
-        0 => Some(geodata_domain::DomainType::Substr),
-        1 => Some(geodata_domain::DomainType::Regex),
-        2 => Some(geodata_domain::DomainType::Domain),
-        3 => Some(geodata_domain::DomainType::Full),
-        _ => None,
-    }
-}
-
 /// 把 proto `Domain` 编译进 matcher（Full/Domain/Substr 值小写化、Regex 原样
 /// —— Go `parseDomain` 同语义）。
 fn add_proto_domain(
@@ -354,7 +341,7 @@ fn add_proto_domain(
     rule_id: u32,
     d: &xray_geodata::Domain,
 ) -> Result<(), String> {
-    let Some(dt) = proto_domain_type_to_matcher(d.r#type) else {
+    let Some(dt) = geodata_domain::from_proto_type(d.r#type) else {
         return Err(format!("unknown domain type {}", d.r#type));
     };
     let m = parse_geodata_domain(&geodata_domain::DomainRule::new(dt, d.value.clone(), rule_id))
@@ -2155,7 +2142,7 @@ mod tests {
             use xray_proto::xray::common::geodata::{Domain, GeoSite, GeoSiteList};
             let hot = GeoSite {
                 code: "HOT".into(),
-                // r#type 3 = Full（`proto_domain_type_to_matcher`）
+                // r#type 3 = Full（`DomainType::from_proto_type`）
                 domain: domains
                     .iter()
                     .map(|d| Domain { r#type: 3, value: (*d).into(), attribute: vec![] })

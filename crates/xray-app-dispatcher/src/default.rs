@@ -1125,9 +1125,9 @@ impl DefaultDispatcher {
     /// 后走 `dispatcher.Dispatch` 完整链，消费点在 routedDispatch（default.go:443-454）：
     /// tag 无效即丢弃链路、不落默认出站。返回 Link 等价 Go `cnc.NewConnection` 包装。
     ///
-    /// `SkipDNSResolve` 无需传递：forced 分支不经过路由（其路由侧消费点天然跳过）；
-    /// handler 侧 TargetStrategy 的 per-request skip 在 Rust dial_fn 链无 ctx 可传
-    /// （gap 见 outbound.rs `wrap_dial_with_target_strategy` 注记）。
+    /// `SkipDNSResolve` 未在此置位（Go taggedimpl/impl.go:20 置 true）：入参只有
+    /// dest 与 tag，无 access 上下文，且本入口的目标通常是 IP（geodata/探测）。
+    /// 出站解析面的门控见 `default::current_skip_dns_resolve`。
     ///
     /// Go 消费方：geodata 下载（download.go:76）/ observatory（observer.go:146）/
     /// burst ping（ping.go:42）。
@@ -1254,6 +1254,9 @@ impl DefaultDispatcher {
             "dispatch_link: per-level policy bound to connection"
         );
         let conn_policy = policy.clone();
+        // DNS 上游查询自身不再解析目标（Go `Content.SkipDNSResolve`）：`DialFn` 无
+        // ctx 参数，与 `CONN_POLICY` 同款 task-local 是跨进 outbound 的唯一通道。
+        let skip_dns_resolve = access.as_ref().is_some_and(|a| a.skip_dns_resolve);
         let outbound_reader = outbound.reader;
         let outbound_writer = outbound.writer;
         let fut = CONN_POLICY.scope(conn_policy, async move {
@@ -1501,6 +1504,7 @@ impl DefaultDispatcher {
                 handler.dispatch_with_access(&final_dest, final_link, access.unwrap_or_default());
             let _ = fut.await;
         });
+        let fut = SKIP_DNS_RESOLVE.scope(skip_dns_resolve, fut);
 
         // 停机窗内 scope 已关：拒发必须回错（否则连接静默挂住等对端超时）。
         // ManagedScope 内部已记 warn，此处只负责把失败交给调用方。
@@ -1747,10 +1751,31 @@ tokio::task_local! {
     static CONN_POLICY: xray_features::policy::Policy;
 }
 
+tokio::task_local! {
+    /// 本次 dispatch 是否为「DNS 上游查询自身」（Go `Content.SkipDNSResolve`，
+    /// proxyman/outbound/handler.go:182）。
+    ///
+    /// 设置点 = [`DefaultDispatcher::dispatch_link`]（取 `access.skip_dns_resolve`）；
+    /// 消费点 = 出站解析面（`xray-core` targetStrategy、freedom finalRules 预检）——
+    /// 那两处都拿不到 `AccessContext`（`DialFn` 签名只带 dest），`CONN_POLICY`
+    /// 同款 task-local 是唯一不新增中间层的通道。
+    static SKIP_DNS_RESOLVE: bool;
+}
+
 /// 当前连接的 per-level 策略；不在 dispatch 内（直连调用/测试）时 `None`。
 #[must_use]
 fn current_conn_policy() -> Option<xray_features::policy::Policy> {
     CONN_POLICY.try_with(Clone::clone).ok()
+}
+
+/// 本次 dispatch 是否要求跳过出站域名解析；不在 dispatch 内（直连调用/测试）时
+/// `false`（= 正常解析）。
+///
+/// 出站解析点据此跳过 targetStrategy / finalRules 预检解析，防「NS 地址是域名 →
+/// 解析 → 再 dispatch → 再解析」递归（Go proxyman/outbound/handler.go:182）。
+#[must_use]
+pub fn current_skip_dns_resolve() -> bool {
+    SKIP_DNS_RESOLVE.try_with(|v| *v).unwrap_or(false)
 }
 
 /// splice 准入激活累计（txno-splice 生产观测：零拷贝下行快路径接管连接数）。

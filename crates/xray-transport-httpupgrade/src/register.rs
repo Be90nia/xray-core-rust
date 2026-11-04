@@ -18,9 +18,11 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
+use xray_frame::compat::ManagedScope;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -112,66 +114,153 @@ async fn log_accept_err(e: &io::Error, tag: &str, log_ident: &str) {
     }
 }
 
-/// 连接获取 + 传输层包装（PROXY protocol + finalmask，仅 TCP 分支）。
-///
-/// 返回 `None` = 该连接丢弃/accept 瞬时错误已分类退避，循环继续（错误永不
-/// 退出——退出唯一来源是 close() 的 abort 句柄）。
-async fn accept_upgrade_conn(
-    source: &UpgradeSource,
-    accept_proxy: bool,
-    tcpmask: &Arc<xray_transport::finalmask::TcpmaskManager>,
-    tag: &str,
-    log_ident: &str,
-) -> Option<(Box<dyn Connection>, SocketAddr)> {
-    match source {
-        UpgradeSource::Tcp(listener) => {
-            let (mut tcp, mut remote) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    log_accept_err(&e, tag, log_ident).await;
-                    return None;
-                },
-            };
+/// 裸 accept 出的连接源（未做任何握手）。
+enum RawUpgradeSource {
+    Tcp(tokio::net::TcpStream),
+    /// unix 连接（无 PROXY protocol/finalmask——对齐 Go system_listener UnixAddr 分支）。
+    #[cfg(unix)]
+    Unix(Box<dyn Connection>),
+}
 
-            // PROXY protocol（可选）
-            if accept_proxy {
-                match xray_transport::read_proxy_protocol(&mut tcp).await {
-                    Ok(Some(real_addr)) => remote = real_addr,
-                    Ok(None) => {},
-                    Err(e) => {
-                        crate::LOG.debug(format!("HTTPUpgrade PROXY protocol parse error: {e}"));
-                        return None;
-                    },
+/// accept 循环取到的裸连接（PROXY protocol / finalmask / TLS / HTTP upgrade 全未做）。
+struct RawUpgradeConn {
+    source: RawUpgradeSource,
+    remote: SocketAddr,
+}
+
+impl RawUpgradeConn {
+    /// 首字节窗：TCP 建连后首字节必须在
+    /// [`xray_transport::handshake_gate::FIRST_BYTE_TIMEOUT`] 内到达（`peek` 不消费
+    /// 字节，后续 PROXY 头 / TLS ClientHello / GET 仍从第 1 字节读）。
+    ///
+    /// 探测连接（连了不发一个字节）在此被快速清掉，不必等 4s 握手窗；unix 连接
+    /// 无对应形态，直接放行。
+    async fn wait_first_byte(&mut self) -> io::Result<()> {
+        match &mut self.source {
+            RawUpgradeSource::Tcp(tcp) => {
+                xray_transport::handshake_gate::wait_first_byte(
+                    tcp,
+                    xray_transport::handshake_gate::FIRST_BYTE_TIMEOUT,
+                )
+                .await
+            },
+            #[cfg(unix)]
+            RawUpgradeSource::Unix(_) => Ok(()),
+        }
+    }
+
+    /// PROXY protocol（可选）+ finalmask 包装。
+    ///
+    /// PROXY 头是裸 `read_exact`（无自带超时），**必须**由调用方包限时窗——见
+    /// accept 循环里 spawn 出的 4s 握手窗。
+    async fn into_transport(
+        self,
+        accept_proxy: bool,
+        tcpmask: &Arc<xray_transport::finalmask::TcpmaskManager>,
+    ) -> io::Result<(Box<dyn Connection>, SocketAddr)> {
+        match self.source {
+            RawUpgradeSource::Tcp(mut tcp) => {
+                let mut remote = self.remote;
+                if accept_proxy {
+                    if let Some(real_addr) = xray_transport::read_proxy_protocol(&mut tcp).await? {
+                        remote = real_addr;
+                    }
                 }
-            }
-
-            // finalmask（bd dppv）：Go httpupgrade/hub.go:145-147 WrapListener——
-            // mask 在 TLS/HTTP upgrade 之下、最贴近 wire（首字节 = mask 头而非
-            // GET）；wrap 失败丢弃该 conn 继续 accept。空 manager = 恒等。
-            let conn: Box<dyn Connection> =
-                match xray_transport::finalmask::wrap_conn_server_into_connection(
+                // finalmask（bd dppv）：Go httpupgrade/hub.go:145-147 WrapListener——
+                // mask 在 TLS/HTTP upgrade 之下、最贴近 wire（首字节 = mask 头而非
+                // GET）。空 manager = 恒等。
+                let conn = xray_transport::finalmask::wrap_conn_server_into_connection(
                     tcpmask,
                     Box::new(xray_transport::connection::TcpConnection::new(tcp)),
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        crate::LOG.debug(format!("HTTPUpgrade tcpmask wrap error: {e}"));
-                        return None;
-                    },
-                };
-            Some((conn, remote))
+                )?;
+                Ok((conn, remote))
+            },
+            #[cfg(unix)]
+            RawUpgradeSource::Unix(conn) => Ok((conn, self.remote)),
+        }
+    }
+}
+
+/// accept 循环专用：只取裸连接，**零握手**（毫秒级返回）。
+///
+/// PROXY protocol / finalmask / TLS / HTTP upgrade 全部推迟到 accept 循环 spawn
+/// 出的握手任务——对应 Go `keepAccepting` 的 `go s.Handle(conn)`
+/// （httpupgrade/hub.go:105-121）。bd 0wvne：此前握手在循环内 await，单条
+/// 「连了不握手」的探测连接独占循环 4s，PROXY 档无界。
+async fn accept_raw_upgrade_conn(
+    source: &UpgradeSource,
+    tag: &str,
+    log_ident: &str,
+) -> Option<RawUpgradeConn> {
+    match source {
+        UpgradeSource::Tcp(listener) => match listener.accept().await {
+            Ok((tcp, remote)) => {
+                Some(RawUpgradeConn { source: RawUpgradeSource::Tcp(tcp), remote })
+            },
+            Err(e) => {
+                log_accept_err(&e, tag, log_ident).await;
+                None
+            },
         },
         #[cfg(unix)]
         UpgradeSource::Unix(listener) => {
             use xray_transport::system_listener::SystemListener as _;
-            let conn = match listener.accept().await {
-                Ok(c) => c,
+            match listener.accept().await {
+                Ok(conn) => Some(RawUpgradeConn {
+                    source: RawUpgradeSource::Unix(conn),
+                    remote: SocketAddr::from(([0, 0, 0, 0], 0)),
+                }),
                 Err(e) => {
                     log_accept_err(&e, tag, log_ident).await;
-                    return None;
+                    None
                 },
-            };
-            Some((conn, SocketAddr::from(([0, 0, 0, 0], 0))))
+            }
+        },
+    }
+}
+
+/// 单监听的握手上下文（accept 循环建一次，`Arc` 克隆进每连接任务——避免每连接
+/// 重复克隆 7 个字段，也避免 `too_many_arguments`）。
+struct HandshakeCtx {
+    accept_proxy: bool,
+    tcpmask: Arc<xray_transport::finalmask::TcpmaskManager>,
+    server: HttpUpgradeServer,
+    tls_config: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
+    gate: Arc<HandshakeGate>,
+    tag: &'static str,
+    handler: ConnHandler,
+}
+
+/// 单连接握手任务（accept 循环 spawn 出来，TCP 与 unix 共用）：
+/// 首字节窗 → 4s 合并窗（PROXY 头 + TLS + HTTP upgrade）。
+///
+/// 失败/超时逐条 `debug` + 经 [`HandshakeGate::record_failure`] 节流 `warn`
+/// （生产探测 75 次/分钟，不能刷屏，但**不许静默吞**）。
+async fn run_handshake_task(mut raw: RawUpgradeConn, ctx: Arc<HandshakeCtx>) {
+    // 两段式超时（bd 0wvne 判据 4）：首字节 1s 内必须到达 ⇒ 探测连接快速清掉；
+    // 真实客户端（PROXY 头 / ClientHello / GET）首字节与 SYN 同批到达，不受影响。
+    if let Err(e) = raw.wait_first_byte().await {
+        ctx.gate.record_failure(ctx.tag, &e);
+        crate::LOG.debug(format!("HTTPUpgrade first byte wait failed: {e}"));
+        return;
+    }
+    // Go hub.go:39-41：SetReadDeadline(+4s) 在 TLS wrap 前设置——4s 覆盖 PROXY 头
+    // + TLS 握手 + GET 读取全程（升级完成 defer 清零）。整段限时：半开/分片
+    // ClientHello 的连接超时丢弃（串行 accept 下一次无超时的 rustls accept 即瘫痪
+    // 全 inbound，生产 P0 实锤：半个 ClientHello 挂死 5 小时）。
+    let handshake = async {
+        let (conn, remote) = raw.into_transport(ctx.accept_proxy, &ctx.tcpmask).await?;
+        do_handshake(conn, &ctx.server, ctx.tls_config.clone(), remote).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(4), handshake).await {
+        Ok(Ok(conn)) => (ctx.handler)(conn),
+        Ok(Err(e)) => {
+            ctx.gate.record_failure(ctx.tag, &e);
+            crate::LOG.debug(format!("HTTPUpgrade handshake error: {e}"));
+        },
+        Err(_) => {
+            ctx.gate.record_failure(ctx.tag, &"handshake timeout (4s, Go SetReadDeadline)");
+            crate::LOG.debug("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
         },
     }
 }
@@ -181,7 +270,8 @@ async fn accept_upgrade_conn(
 /// 对应 Go `hub.go::ListenHTTPUpgrade`：
 /// 1. 解析 httpupgrade 配置
 /// 2. TCP bind (`internet.ListenSystem`)
-/// 3. accept loop：每条连接 → PROXY protocol → TLS → HTTP upgrade 握手 → ConnHandler
+/// 3. accept loop：只 accept 裸连接 → spawn 每连接任务（PROXY protocol → TLS → HTTP upgrade 握手 →
+///    ConnHandler，对齐 Go `go s.Handle(conn)`）
 async fn listen_httpupgrade(
     addr: SocketAddr,
     settings: &StreamSettings,
@@ -215,45 +305,48 @@ async fn listen_httpupgrade(
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for.clone();
     // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
+    // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）；上界核算见
+    // `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
+    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    // 握手任务托管口（CLAUDE.md §3.5.6 ①）：listener 丢弃/关闭 ⇒ scope 归零 ⇒
+    // 在途握手任务 abort（不残留 4s 尾巴）。
+    let scope = ManagedScope::new(format!("httpupgrade-accept:{local}"));
+    let loop_scope = scope.clone();
+    let ctx = Arc::new(HandshakeCtx {
+        accept_proxy,
+        tcpmask,
+        server,
+        tls_config,
+        gate,
+        tag: "httpupgrade",
+        handler,
+    });
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面连接任务（httpupgrade accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
-            // 连接获取 + 传输层包装（PROXY protocol + finalmask，仅 TCP 分支）；
-            // None = 丢弃继续（accept 瞬时错误已分类退避）。
-            let Some((conn, remote)) = accept_upgrade_conn(
-                &source,
-                accept_proxy,
-                &tcpmask,
-                "httpupgrade",
-                &local.to_string(),
-            )
-            .await
+            // 只 accept 裸连接（零握手）；None = accept 瞬时错误已分类退避。
+            let Some(raw) =
+                accept_raw_upgrade_conn(&source, "httpupgrade", &local.to_string()).await
             else {
                 continue;
             };
 
-            // Go hub.go:39-41：SetReadDeadline(+4s) 在 TLS wrap 前设置——4s 覆盖
-            // TLS 惰性握手 + GET 读取全程（升级完成 defer 清零）。整段限时：
-            // 半开/分片 ClientHello 的连接超时丢弃，accept 循环永不被单个连接
-            // 堵死（串行 accept 下一次无超时的 rustls accept 即瘫痪全 inbound，
-            // 生产 P0 实锤：半个 ClientHello 挂死 5 小时）。
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                do_handshake(conn, &server, tls_config.clone(), remote),
-            )
-            .await
-            {
-                Ok(Ok(conn)) => handler(conn),
-                Ok(Err(e)) => {
-                    crate::LOG.debug(format!("HTTPUpgrade handshake error: {e}"));
-                },
-                Err(_) => {
-                    crate::LOG.debug("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
-                },
-            }
+            // 握手移出 accept 循环（Go `keepAccepting` 的 `go s.Handle(conn)`）：
+            // 单条只连不握手的探测连接不再独占循环（bd 0wvne：好连接曾等 3696ms，
+            // PROXY 档无界）。闸满 ⇒ fail-fast 丢弃（drop = 对端见 FIN/RST）。
+            let Some(permit) = ctx.gate.try_admit() else {
+                ctx.gate.record_reject("httpupgrade");
+                continue;
+            };
+            let ctx = Arc::clone(&ctx);
+            // scope 已关（停机中）：托管口自身已 warn 留痕，连接随 raw 释放。
+            let _ = loop_scope.spawn(async move {
+                let _permit = permit;
+                run_handshake_task(raw, ctx).await;
+            });
         }
     });
 
@@ -269,7 +362,7 @@ async fn listen_httpupgrade(
         accept_task,
     ));
 
-    Ok(Box::new(HttpUpgradeListener { local, abort }) as Box<dyn TransportListener>)
+    Ok(Box::new(HttpUpgradeListener { local, abort, scope }) as Box<dyn TransportListener>)
 }
 
 /// unix 路径 HTTPUpgrade 监听（对应 Go hub.go:134-139 `port == net.Port(0)`
@@ -305,31 +398,38 @@ async fn listen_unix_httpupgrade(
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for;
     // 日志标识进块（supervise_accept_loop 另需 path 所有权）。
     let log_ident = path.clone();
+    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    let scope = ManagedScope::new(format!("httpupgrade-unix-accept:{log_ident}"));
+    let loop_scope = scope.clone();
+    let ctx = Arc::new(HandshakeCtx {
+        accept_proxy: false,
+        tcpmask,
+        server,
+        tls_config,
+        gate,
+        tag: "httpupgrade-unix",
+        handler,
+    });
     #[allow(
         clippy::disallowed_methods,
         reason = "unix accept 泵（httpupgrade）；显式脱管：托管无收益（ctx 不可达），寿命随 listener close（句柄存 abort 由 listener 终结），cfg(unix) 本机不可编译故无逐点复核（bd hj3jf 裁定）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
-            let Some((conn, remote)) =
-                accept_upgrade_conn(&source, false, &tcpmask, "httpupgrade-unix", &log_ident).await
+            let Some(raw) = accept_raw_upgrade_conn(&source, "httpupgrade-unix", &log_ident).await
             else {
                 continue;
             };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                do_handshake(conn, &server, tls_config.clone(), remote),
-            )
-            .await
-            {
-                Ok(Ok(conn)) => handler(conn),
-                Ok(Err(e)) => {
-                    crate::LOG.debug(format!("HTTPUpgrade handshake error: {e}"));
-                },
-                Err(_) => {
-                    crate::LOG.debug("HTTPUpgrade handshake timeout (4s, Go SetReadDeadline)");
-                },
-            }
+            // 握手移出 accept 循环（Go `go s.Handle(conn)`）；闸满 fail-fast 丢弃。
+            let Some(permit) = ctx.gate.try_admit() else {
+                ctx.gate.record_reject("httpupgrade-unix");
+                continue;
+            };
+            let ctx = Arc::clone(&ctx);
+            let _ = loop_scope.spawn(async move {
+                let _permit = permit;
+                run_handshake_task(raw, ctx).await;
+            });
         }
     });
 
@@ -344,7 +444,7 @@ async fn listen_unix_httpupgrade(
         accept_task,
     ));
 
-    Ok(Box::new(HttpUpgradeListener { local, abort }) as Box<dyn TransportListener>)
+    Ok(Box::new(HttpUpgradeListener { local, abort, scope }) as Box<dyn TransportListener>)
 }
 
 /// unix 监听无 finalmask（入口已拒绝非空配置）：恒等空 manager 占位。
@@ -393,12 +493,17 @@ fn build_tls_server_config(
 struct HttpUpgradeListener {
     local: SocketAddr,
     abort: tokio::task::AbortHandle,
+    /// 在途握手任务的托管口：`close()` 关闸，listener 丢弃时 scope 归零 ⇒ 在途
+    /// 握手任务 abort（不残留 4s 尾巴）。
+    scope: ManagedScope,
 }
 
 impl TransportListener for HttpUpgradeListener {
     fn close(&self) -> io::Result<()> {
         // 取消 accept task：正在 accept()/握手 await 中的循环被打断，端口释放。
         self.abort.abort();
+        // 握手托管口关闸：停机后拒新握手任务（在途任务随 listener 丢弃被 abort）。
+        self.scope.close();
         Ok(())
     }
 

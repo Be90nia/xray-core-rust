@@ -378,6 +378,16 @@ pub struct DefaultDialerClient {
     closed: Arc<AtomicBool>,
 }
 
+/// 每 host 空闲连接上界（bd cgmcj）。hyper-util legacy client 缺省
+/// `max_idle_per_host = usize::MAX`（`client.rs:1045`）⇒ 只受 idle timeout 约束，
+/// 每个 host 的空闲 fd 数无上界；CDN 出站是「大量不同域名」形态（每个 xmux
+/// manager key 一个 host）⇒ 90s 窗口内高并发即 fd 积压点。
+///
+/// 256MB 机器口径：单条空闲 h2/h1 连接 RSS < 100KiB（TLS 状态 + h2 帧缓冲，
+/// 流控窗是信用不是预分配）⇒ 4 × 100KiB = 400KiB/host。取 4：packet-up 的
+/// GET(下)/POST(上) 各一条 + 一条 xmux 并发余量，池满即直接关连接（不排队）。
+pub const MAX_IDLE_PER_HOST: usize = 4;
+
 impl DefaultDialerClient {
     /// 创建新客户端。`tls_config` 由调用方（[`crate::dialer`]）从 `stream_settings`
     /// 构造；`dial` 指定 Go 语义：TCP 恒拨出站 `dest`，URL authority 仅作 Host 头；
@@ -450,6 +460,8 @@ impl DefaultDialerClient {
         let client = Client::builder(TokioExecutor::new())
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
+            // 每 host 空闲连接硬上界（bd cgmcj）：缺省 usize::MAX = 无界 fd 积压。
+            .pool_max_idle_per_host(MAX_IDLE_PER_HOST)
             .http2_initial_stream_window_size(win.stream_window)
             .http2_initial_connection_window_size(win.connection_window)
             .http2_max_send_buf_size(win.max_send_buf)

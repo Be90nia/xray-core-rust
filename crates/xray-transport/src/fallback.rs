@@ -7,6 +7,112 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// fallback 拨号尝试次数与退避基数（Go `retry.ExponentialBackoff(5, 100)` 同参数）。
+const FALLBACK_ATTEMPTS: u32 = 5;
+const FALLBACK_BACKOFF_MS: u64 = 100;
+
+/// 整次 fallback 拨号的总预算（判据：黑洞 dest 总耗时 < 6s）。
+///
+/// 修复前用裸 `TcpStream::connect` 无任何预算：再叠加 5 次重试，每个尝试的上界等于
+/// OS 的 SYN 重传超时（Windows ~21s），最坏 ~105s；环回「端口无人监听」实测也要
+/// 2.04s × 5 + 600ms 退避 = 10.816s。
+const FALLBACK_DIAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 单次尝试上限：把总预算切成多份，保证「重试」真实发生（首尝试不再一口气吃满）。
+/// 2s 对弱网仍宽松（TCP 握手 RTT 到 2s 已属极端），且留出 2-3 次重试机会。
+const FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 是否**值得重试**。确定性失败（重试不可能改变结果）一律不重试，一次尝试即收场。
+///
+/// `ConnectionRefused`：对方明确拒绝（无监听 / 防火墙 reject），5 次重试纯烧时间——
+/// 修复前正是它把「秒级连不上」放大成十几秒。`AddrNotAvailable`/`InvalidInput` 同理
+/// （本机无该地址族 / 目标地址非法）。**可重试**的保留：`TimedOut`/`Unreachable`
+/// （黑洞，值得再试，但受总预算约束）与 `NotFound`（DNS 可能是瞬时抖动）。
+fn should_retry(e: &std::io::Error) -> bool {
+    !matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::InvalidInput
+    )
+}
+
+/// 错误分类标签（日志/上报口径；`xray_common` 侧沿用 std `ErrorKind` 分类）。
+fn error_class(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => "refused",
+        std::io::ErrorKind::TimedOut => "timeout",
+        std::io::ErrorKind::NotFound => "dns-fail",
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable => {
+            "unreachable"
+        },
+        std::io::ErrorKind::AddrNotAvailable => "addr-unavailable",
+        _ => "other",
+    }
+}
+
+/// 失败日志限频窗：每 [`FAIL_LOG_WINDOW`] 最多 [`FAIL_LOG_BURST`] 条 warn，其余降级
+/// debug（默认不输出、`RUST_LOG` 打开可见 ⇒ 不静默），窗口滚动时补一条**汇总**
+/// （上一轮被限频掉的条数，丢不掉）。
+///
+/// 为什么是**全局**窗口而不是 per-dest 表：256MB 常驻约束下，per-dest key 表会随
+/// 攻击者控制的 dest 增长（无界 HashMap = 内存泄漏面）。固定 3 字段状态（24B）在
+/// 「可见」与「不刷屏」之间取平衡；按类别聚合的额外区分对排障价值不足。
+///
+/// 为什么不用 udf `std_ext::ratelimit::TokenBucket`：它要 `Arc<dyn Sleeper>` 实例，
+/// 而 `Sleeper` 的实现 `SystemClock` 在 `skeleton` crate——xray-transport 不依赖它，
+/// 为一个日志闸新增依赖不划算（§3.5.2 反例）。此处用已注入的 `compat::clock()`。
+const FAIL_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const FAIL_LOG_BURST: u32 = 5;
+
+/// 限频状态（固定大小，无分配、无表）。
+struct FailLogGate {
+    window_start: std::time::Instant,
+    sent: u32,
+    suppressed: u64,
+}
+
+static FAIL_LOG_GATE: std::sync::LazyLock<parking_lot::Mutex<FailLogGate>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(FailLogGate { window_start: now(), sent: 0, suppressed: 0 })
+    });
+
+/// 单调钟取时（走能力句柄，不用裸 `Instant::now`）。
+fn now() -> std::time::Instant {
+    xray_frame::compat::clock().now_instant()
+}
+
+/// 输出一条 fallback 失败留痕：窗口内前 [`FAIL_LOG_BURST`] 条 warn，其余 debug 并计数。
+fn log_dial_failure(line: String) {
+    let (as_warn, summary) = {
+        let mut gate = FAIL_LOG_GATE.lock();
+        let now = now();
+        let mut summary = 0u64;
+        if now.saturating_duration_since(gate.window_start) >= FAIL_LOG_WINDOW {
+            summary = std::mem::take(&mut gate.suppressed);
+            *gate = FailLogGate { window_start: now, sent: 0, suppressed: 0 };
+        }
+        if gate.sent < FAIL_LOG_BURST {
+            gate.sent += 1;
+            (true, summary)
+        } else {
+            gate.suppressed += 1;
+            (false, summary)
+        }
+    };
+    if summary > 0 {
+        crate::LOG.warn(format!(
+            "fallback dial failures suppressed={summary} in last {:?}",
+            FAIL_LOG_WINDOW
+        ));
+    }
+    if as_warn {
+        crate::LOG.warn(line);
+    } else {
+        crate::LOG.debug(line);
+    }
+}
+
 /// PROXY protocol 版本（对应 Go `fb.Xver`）。
 ///
 /// - `0`：不发送 PROXY header。
@@ -83,16 +189,65 @@ pub async fn fallback_to_dest<RW>(
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    use tokio::{
-        io::{AsyncWriteExt, copy_bidirectional},
-        net::TcpStream,
-    };
+    use tokio::io::{AsyncWriteExt, copy_bidirectional};
 
-    // Go trojan server.go:455 / vless inbound.go:420 — fallback 拨号 retry.ExponentialBackoff(5,
-    // 100)
-    let mut dest_conn = crate::retry::exponential_backoff(5, 100, || TcpStream::connect(dest))
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Go trojan server.go:455 / vless inbound.go:420 用 `retry.ExponentialBackoff(5, 100)` +
+    // `net.Dialer`（每次尝试都走系统拨号链：域名重解析、Windows 环回打 `SIO_TCP_INITIAL_RTO`）。
+    // 我们在其上加两条更优策略（见 `should_retry` / `FALLBACK_DIAL_BUDGET`）：
+    // 确定性失败（refused 等）不再重试 5 次，且整次重试受 5s 总预算约束。
+    let started = now();
+    let mut dest_conn = match crate::retry::exponential_backoff_if(
+        FALLBACK_ATTEMPTS,
+        FALLBACK_BACKOFF_MS,
+        FALLBACK_DIAL_BUDGET,
+        || async {
+            let remaining = FALLBACK_DIAL_BUDGET.saturating_sub(started.elapsed());
+            let attempt_budget = remaining.min(FALLBACK_ATTEMPT_TIMEOUT);
+            if attempt_budget.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fallback dial budget exhausted",
+                ));
+            }
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(dest).await?.collect();
+            // 单次尝试独立封顶（`dial_first_reachable` 内部整次预算是 16s，黑洞地址会
+            // 一口气吃满；这里按剩余预算/单次上限切短，让重试真实发生）。
+            match tokio::time::timeout(
+                attempt_budget,
+                crate::system_dialer::dial_first_reachable(
+                    None,
+                    &addrs,
+                    &crate::sockopt::SocketOptions::default(),
+                ),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fallback dial attempt timeout",
+                )),
+            }
+        },
+        should_retry,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // 四路调用方中三处 `let _ =` 吞错 ⇒ 客户端只看到 EOF。拨号失败一律在此留痕
+            // （含 dest / 分类 / 耗时 / 失败明细），并按窗限频（不许静默、不许刷屏）。
+            let class = e.errors.first().map_or("other", error_class);
+            log_dial_failure(format!(
+                "fallback dest={dest} src={src} class={class} elapsed={:?} error={e}",
+                started.elapsed()
+            ));
+            return Err(std::io::Error::new(
+                e.errors.first().map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+                e.to_string(),
+            ));
+        },
+    };
 
     // 1. 写 PROXY protocol header（xver 0 则跳过）
     let proxy_header = encode_proxy_header(xver, src, dst);

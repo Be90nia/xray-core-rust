@@ -207,7 +207,7 @@ impl SystemDialer for DefaultSystemDialer {
     clippy::disallowed_methods,
     reason = "整次拨号预算锚点必须是 tokio::time::Instant（下游 dial_serial/dial_parallel 的 timeout 面与 tokio 虚拟钟对齐）；本 crate 无 ctx.clock() 注入面，compat::clock 只出 std Instant 面 → 待 Dialer 接 Clock 端口后迁"
 )]
-async fn dial_first_reachable(
+pub(crate) async fn dial_first_reachable(
     src: Option<SocketAddr>,
     addrs: &[SocketAddr],
     sockopt: &SocketOptions,

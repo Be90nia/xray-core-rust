@@ -87,6 +87,7 @@ pub mod system_listener;
 pub mod config;
 pub mod filelocker;
 pub mod finalmask;
+pub mod handshake_gate;
 pub mod happy_eyeballs;
 pub mod headers;
 pub mod memory_settings;

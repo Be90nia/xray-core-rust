@@ -10,21 +10,40 @@
 //! - 默认端口 443。
 //! - 自动接入 cache（实现 `CachedNameserver`）。
 //!
+//! ## 会话复用（bd yzhb4）
+//!
+//! 同一 NS 复用一条 h2 连接（h2 多路复用，1 条承载全部查询）：`DOH_SESSIONS_*`
+//! 三条硬上限见常量注释。连接失效（对端关闭/半开/GOAWAY）→ 复用时探测到失败即
+//! 丢弃并回退新建；空闲 `DOH_IDLE_TIMEOUT` 由看门狗关闭，复用前另有懒判兜底。
+//!
+//! deadline 语义（不变）：`query_timeout` 是**整条查询的绝对时刻**，dial/TLS/h2/
+//! response 与「复用失败→重建」全部共享它（Go `nameserver_doh.go:167-172`）——
+//! 复用只省时间，不新增预算。
+//!
 //! ## 跳过范围
 //!
 //! - 走 Xray routing/dispatcher 出口（直接用 tokio socket + xray_tls + h2）
-//! - 长连接复用（每次查询都新 h2 连接；ponytail：连接池可后续加）
 
-use std::{future::Future, net::IpAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
-use h2::client;
+use h2::client::{self, SendRequest};
 use hickory_proto::rr::RecordType;
 use http::{Method, Request, StatusCode, header::CONTENT_TYPE};
+use parking_lot::Mutex;
 use skeleton_infra::fx::{FxScope, ScopeClosed};
 use tokio_rustls::rustls::ClientConfig;
 use xray_common::net::{destination::Destination, port::Port};
-use xray_frame::deadline::Budget;
+use xray_frame::deadline::{Budget, BudgetDeadline, BudgetTimer};
 use xray_tls::utls::client as tls_client;
 
 use crate::{
@@ -46,6 +65,59 @@ const DOH_RECV_MAX: usize = 65535;
 
 /// DoH 默认 URL 路径（RFC 8484）。
 const DEFAULT_DOH_PATH: &str = "/dns-query";
+
+/// DoH 热会话全局上限（显式常量，非内存推导）：8 条 h2 连接。
+///
+/// 内存核算（256MB 机 xray 预算 ~96MB）：单条空闲 h2 连接 ≈ 50KB（h2 连接态 +
+/// TLS 读写缓冲，流级缓冲随请求释放）⇒ 8 × 50KB ≈ 400KB ≤ 1MB 上限。
+const DOH_MAX_SESSIONS: usize = 8;
+
+/// 热会话空闲上限（显式常量）：到点关闭，不常驻。
+const DOH_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 全局在用热会话数（[`SessionLease`] 记账）。
+static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// 全局会话名额租约：Drop 归还；取不到名额 ⇒ 本次查询照常但不落槽（用完即关）。
+struct SessionLease;
+
+impl SessionLease {
+    fn try_acquire() -> Option<Self> {
+        LIVE_SESSIONS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < DOH_MAX_SESSIONS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        LIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 一条可复用的 DoH 会话（`ready()` 后的 h2 发送端 + 空闲计时 + 全局名额）。
+struct DohSession {
+    /// h2 发送端（克隆即并发复用；h2 多路复用无需多条连接）。
+    send: SendRequest<Bytes>,
+    /// 空闲计时（存入时重置；复用前 `is_expired` 懒判到期）。
+    idle: BudgetTimer,
+    /// 全局名额（`None` = 满额，仅本次查询用，不落槽）。
+    lease: Option<SessionLease>,
+}
+
+/// 单 NS 热会话槽（容量 1 条；加上在飞查询即「每 NS ≤2 条」上限）。
+struct SessionSlot {
+    current: Mutex<Option<DohSession>>,
+}
+
+impl SessionSlot {
+    fn new() -> Self {
+        Self { current: Mutex::new(None) }
+    }
+}
 
 /// DoH DNS nameserver。
 ///
@@ -73,6 +145,8 @@ pub struct DohNameServer {
     resolver: Arc<dyn crate::dial::HostResolver>,
     /// `+local`：强制直连（绕过共享 dialer，Go Local mode nil dispatcher）。
     force_local: bool,
+    /// 热会话槽（bd yzhb4：同 NS 复用一条 h2 连接）。
+    session: Arc<SessionSlot>,
 }
 
 /// h2c authority 取目的地址字符串（bd d881①：空 `server_name` →
@@ -131,6 +205,7 @@ impl DohNameServer {
             id_gen: AtomicReqIdGen::new(),
             resolver: Arc::new(crate::dial::SystemHostResolver),
             force_local: false,
+            session: Arc::new(SessionSlot::new()),
         }
     }
 
@@ -201,27 +276,73 @@ impl DohNameServer {
         )))
     }
 
-    /// 发送单次 DNS 查询（DoH），等待响应。
-    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
-        // P1-11：h2 conn 驱动的托管口先验——未注单（实例未 start）或已关
-        // （停机中）快速失败，不发起新上游连接，不裸 spawn（坑约束 5）。
-        let fx = self.cache.fx_scope().ok_or_else(|| {
-            DnsError::WireFormat(
-                "doh: fx scope not attached (dns instance not started)".to_string(),
-            )
-        })?;
-        if fx.is_closed() {
-            return Err(DnsError::WireFormat("doh: fx scope closed (shutting down)".to_string()));
+    /// 取出一条仍新鲜的热会话（空闲到期即丢弃关闭）。
+    fn take_session(&self) -> Option<DohSession> {
+        let mut guard = self.session.current.lock();
+        let session = guard.take()?;
+        let expired = session.idle.is_expired();
+        drop(guard);
+        if expired {
+            // 懒判兜底：看门狗被停机取消时同样带不出过期连接。
+            tracing::debug!(target: "xray.dns.doh", server = %self.name,
+                "doh: 热会话空闲到期，丢弃");
+            return None;
         }
+        Some(session)
+    }
 
-        let req_id = self.id_gen.next_id();
-        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+    /// 归还会话入槽（空闲计时重置；无名额 ⇒ 用完即关，不落槽）。
+    fn store_session(&self, mut session: DohSession) {
+        if session.lease.is_none() {
+            return;
+        }
+        session.idle.reset(DOH_IDLE_TIMEOUT);
+        let replaced = self.session.current.lock().replace(session);
+        drop(replaced); // 同 NS 竞态顶替的旧会话随 drop 关闭
+    }
 
-        // bd ezrg4：兜底 deadline 在查询入口算一次（Go nameserver_doh.go:167-172
-        // 绝对时刻），dial/TLS/h2/response 共享，慢握手不推出新预算。
-        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
-        // pause/advance 语义不变）。
-        let deadline = Budget::tokio().deadline(self.query_timeout);
+    /// 空闲会话看门狗（每 NS 一条生命周期任务，不随查询数增长）。
+    ///
+    /// 扫描粒度 = `DOH_IDLE_TIMEOUT`（到期后 ≤1 个周期关闭），精确关闭另有
+    /// 复用前懒判（[`Self::take_session`]）兜底。
+    fn start_session_watchdog(&self, fx: &FxScope) {
+        if fx.is_closed() {
+            return;
+        }
+        let slot = Arc::clone(&self.session);
+        let watchdog = async move {
+            let mut tick = Budget::tokio().arm_timer(DOH_IDLE_TIMEOUT);
+            loop {
+                tick.expired().await;
+                let mut guard = slot.current.lock();
+                if guard.as_ref().is_some_and(|s| s.idle.is_expired()) {
+                    drop(guard.take()); // drop 即关闭（连接驱动随之收尾）
+                }
+                drop(guard);
+                tick.reset(DOH_IDLE_TIMEOUT);
+            }
+        };
+        if xray_frame::compat::spawn_reaping(
+            fx,
+            &xray_frame::compat::log(),
+            "dns doh session idle",
+            watchdog,
+        )
+        .is_err()
+        {
+            tracing::debug!(target: "xray.dns.doh", server = %self.name,
+                "doh: 停机中，空闲看门狗不启动");
+        }
+    }
+
+    /// 建立一条新 h2 会话（dial → TLS → h2 → ready），全部等待点共用查询 deadline。
+    async fn open_session(
+        &self,
+        fx: &FxScope,
+        deadline: &BudgetDeadline,
+    ) -> Result<DohSession, DnsError> {
+        // 名额先占：满额则本次查询照常进行，但会话不落槽（用完即关）。
+        let lease = SessionLease::try_acquire();
 
         // 经路由出站或直连兜底（域名每查询现解析）——Go dohnameserver.go:68
         // dispatcher.Dispatch 语义。connect_stream 内部仍按单次拨号计预算，
@@ -242,7 +363,7 @@ impl DohNameServer {
 
         // TLS 握手（h2c 明文跳过）+ HTTP/2 handshake。
         tracing::debug!(target: "xray.dns.doh", "doh: stream connected");
-        let (mut h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
+        let (h2, h2_conn): (_, Pin<Box<dyn Future<Output = ()> + Send>>) = if self.plain_h2c {
             let (h2, conn) = deadline
                 .timeout(client::handshake(stream))
                 .await
@@ -294,7 +415,7 @@ impl DohNameServer {
         .map_err(|_: ScopeClosed| DnsError::WireFormat("doh: fx scope closed".to_string()))?;
 
         // 等待 h2 连接 ready（ready 消费 self 后返回 ready 态的 SendRequest）。
-        h2 = deadline
+        let h2 = deadline
             .timeout(h2.ready())
             .await
             .map_err(|_| {
@@ -303,6 +424,30 @@ impl DohNameServer {
             })?
             .map_err(|e| DnsError::WireFormat(format!("doh h2 ready: {e}")))?;
         tracing::debug!(target: "xray.dns.doh", "doh: h2 ready");
+
+        Ok(DohSession { send: h2, idle: Budget::tokio().arm_timer(DOH_IDLE_TIMEOUT), lease })
+    }
+
+    /// 在给定会话上完成一次 RFC 8484 POST（复用与新建共用同一实现）。
+    ///
+    /// 复用失败（对端关闭/半开/GOAWAY）由调用方丢弃会话并回退新建，不在此重试。
+    async fn exchange(
+        &self,
+        send: &SendRequest<Bytes>,
+        payload: &[u8],
+        req_id: u16,
+        record_type: RecordType,
+        deadline: &BudgetDeadline,
+    ) -> Result<IpRecord, DnsError> {
+        // 复用：从槽里取出的发送端每次请求前重新 ready（连接已死则此处报错）。
+        let mut h2 = deadline
+            .timeout(send.clone().ready())
+            .await
+            .map_err(|_| {
+                tracing::debug!(target: "xray.dns.doh", "doh: h2 ready TIMEOUT");
+                DnsError::WireFormat("doh h2 ready timeout".to_string())
+            })?
+            .map_err(|e| DnsError::WireFormat(format!("doh h2 ready: {e}")))?;
 
         // POST /dns-query + Content-Type: application/dns-message
         // bd ypsl：h2 HEADERS 必须带 :authority——相对形式 uri("/dns-query") 发出的
@@ -326,7 +471,7 @@ impl DohNameServer {
 
         // 发送 DNS query body + end_of_stream。
         send_stream
-            .send_data(Bytes::from(payload), true)
+            .send_data(Bytes::copy_from_slice(payload), true)
             .map_err(|e| DnsError::WireFormat(format!("doh send_data: {e}")))?;
         tracing::debug!(target: "xray.dns.doh", "doh: body sent");
 
@@ -379,6 +524,55 @@ impl DohNameServer {
         let parsed = parse_dns_response(&buf, req_id, record_type, now)?;
         Ok(parsed_to_ip_record(&parsed, now))
     }
+
+    /// 发送单次 DNS 查询（DoH），等待响应。
+    async fn query_once(&self, fqdn: &str, record_type: RecordType) -> Result<IpRecord, DnsError> {
+        // P1-11：h2 conn 驱动的托管口先验——未注单（实例未 start）或已关
+        // （停机中）快速失败，不发起新上游连接，不裸 spawn（坑约束 5）。
+        let fx = self.cache.fx_scope().ok_or_else(|| {
+            DnsError::WireFormat(
+                "doh: fx scope not attached (dns instance not started)".to_string(),
+            )
+        })?;
+        if fx.is_closed() {
+            return Err(DnsError::WireFormat("doh: fx scope closed (shutting down)".to_string()));
+        }
+
+        let req_id = self.id_gen.next_id();
+        let payload = build_dns_query(fqdn, record_type, req_id, &self.client_ip)?;
+
+        // bd ezrg4：兜底 deadline 在查询入口算一次（Go nameserver_doh.go:167-172
+        // 绝对时刻），dial/TLS/h2/response 共享，慢握手不推出新预算。
+        // W4 面 3：取时统一走 Budget::tokio()（Tokio 源内部 = tokio Instant，
+        // pause/advance 语义不变）。
+        let deadline = Budget::tokio().deadline(self.query_timeout);
+
+        // bd yzhb4：热会话复用（同 NS 1 条 h2 承载全部查询），握手成本只在重建时付。
+        if let Some(session) = self.take_session() {
+            match self.exchange(&session.send, &payload, req_id, record_type, &deadline).await {
+                Ok(rec) => {
+                    self.store_session(session);
+                    return Ok(rec);
+                },
+                Err(e) => {
+                    // 对端已关/半开/GOAWAY：丢弃会话，回退新建（同一 deadline 封顶）。
+                    tracing::debug!(target: "xray.dns.doh", server = %self.name, error = %e,
+                        "doh: 热会话失效，重建连接");
+                    if deadline.is_expired() {
+                        // 预算已尽：原错误即结论（重建只会立即超时）。
+                        return Err(e);
+                    }
+                },
+            }
+        }
+
+        let session = self.open_session(fx, &deadline).await?;
+        let result = self.exchange(&session.send, &payload, req_id, record_type, &deadline).await;
+        if result.is_ok() {
+            self.store_session(session);
+        }
+        result
+    }
 }
 
 impl CachedNameserver for DohNameServer {
@@ -430,6 +624,7 @@ impl Server for Arc<DohNameServer> {
 
     fn start_managed_tasks(&self, fx: &Arc<FxScope>) {
         self.cache.start_managed(fx, crate::cache_controller::CLEANUP_INTERVAL);
+        self.start_session_watchdog(fx);
     }
 
     fn query_ip<'a>(
@@ -579,6 +774,86 @@ mod tests {
         );
 
         (addr, client_config, handle)
+    }
+
+    /// 计数版 mock DoH server：逐连接独立任务、连接内可多请求（bd yzhb4 会话复用）。
+    ///
+    /// `close_after_first_response`：每条连接回完第一个响应后，等客户端复用（第二个
+    /// 请求到达）即断开——模拟对端关连接（测「会话失效 → 重建」）。
+    async fn spawn_counting_doh_server(
+        fqdn: &str,
+        ips: Vec<Ipv4Addr>,
+        ttl: u32,
+        close_after_first_response: bool,
+    ) -> (SocketAddr, Arc<ClientConfig>, Arc<AtomicUsize>) {
+        ensure_crypto_provider();
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = key_pair.serialize_der();
+        let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(key_der).unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der.clone())],
+                key,
+            )
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_c = Arc::clone(&accepts);
+        let fqdn = fqdn.to_string();
+
+        xray_common::testing::spawn("counting-doh-server-accept", async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                accepts_c.fetch_add(1, Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                let fqdn = fqdn.clone();
+                let ips = ips.clone();
+                xray_common::testing::spawn("counting-doh-server-conn", async move {
+                    let Ok(tls) = acceptor.accept(TcpConnection::new(sock)).await else { return };
+                    let Ok(mut h2_conn) = server::handshake(tls).await else { return };
+                    let mut served = 0usize;
+                    while let Some(req_result) = h2_conn.accept().await {
+                        let Ok((req, mut respond)) = req_result else { break };
+                        if close_after_first_response && served > 0 {
+                            return; // 复用的第二个请求：断开连接（对端关闭语义）
+                        }
+                        let mut body = req.into_body();
+                        let mut query_buf = Vec::new();
+                        while let Some(chunk) = body.data().await {
+                            let Ok(chunk) = chunk else { return };
+                            query_buf.extend_from_slice(&chunk);
+                        }
+                        let Ok(query_msg) = Message::from_vec(&query_buf) else { return };
+                        let resp_payload =
+                            make_a_response(query_msg.metadata.id, &fqdn, ips.clone(), ttl);
+                        let resp = Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/dns-message")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut send) = respond.send_response(resp, false) else { return };
+                        if send.send_data(Bytes::from(resp_payload), true).is_err() {
+                            return;
+                        }
+                        served += 1;
+                    }
+                });
+            }
+        });
+
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        root_store.add(tokio_rustls::rustls::pki_types::CertificateDer::from(cert_der)).unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth(),
+        );
+        (addr, client_config, accepts)
     }
 
     /// bd d881① 回归：h2c 的 server_name 取目的地址——空串会构造
@@ -1008,5 +1283,87 @@ mod tests {
         assert_eq!(effective_query_timeout(0), Duration::from_secs(5));
         assert_eq!(effective_query_timeout(4000), Duration::from_millis(4000));
         assert_eq!(effective_query_timeout(12345), Duration::from_millis(12345));
+    }
+
+    /// 构造带托管 scope 的 DoH nameserver（生产等价 = 实例 start）。
+    fn counting_ns(addr: SocketAddr, tls_config: Arc<ClientConfig>) -> Arc<DohNameServer> {
+        let cache = Arc::new(CacheController::new("test", true, false, 0, 0));
+        Arc::new(DohNameServer::new(
+            ip_dest(addr),
+            "localhost".to_string(),
+            tls_config,
+            cache,
+            Vec::new(),
+            Duration::from_secs(5),
+            false,
+        ))
+    }
+
+    /// bd yzhb4：同一 NS 连续查询复用同一条 h2 连接（上游 accept 只发生一次）。
+    #[tokio::test]
+    async fn doh_reuses_h2_session_across_queries() {
+        let (addr, tls_config, accepts) =
+            spawn_counting_doh_server("reuse.com.", vec![Ipv4Addr::new(10, 9, 9, 9)], 60, false)
+                .await;
+        let ns = counting_ns(addr, tls_config);
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        ns.cache.attach_scope(&fx);
+
+        for i in 0..3 {
+            let rec = ns
+                .query_once(&format!("q{i}.reuse.com."), RecordType::A)
+                .await
+                .unwrap_or_else(|e| panic!("第 {i} 次查询失败: {e}"));
+            assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))]);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "3 次查询必须复用同一条连接");
+        let _ = fx.shutdown().await;
+    }
+
+    /// bd yzhb4：热会话被对端关闭后，下一次查询自动重建（不把错误抛给调用方）。
+    #[tokio::test]
+    async fn doh_rebuilds_session_after_peer_close() {
+        let (addr, tls_config, accepts) =
+            spawn_counting_doh_server("rebuild.com.", vec![Ipv4Addr::new(10, 8, 8, 8)], 60, true)
+                .await;
+        let ns = counting_ns(addr, tls_config);
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        ns.cache.attach_scope(&fx);
+
+        for i in 0..2 {
+            let rec = ns
+                .query_once(&format!("q{i}.rebuild.com."), RecordType::A)
+                .await
+                .unwrap_or_else(|e| panic!("第 {i} 次查询失败（会话销毁后必须重建）: {e}"));
+            assert_eq!(rec.ips, vec![IpAddr::V4(Ipv4Addr::new(10, 8, 8, 8))]);
+        }
+        assert_eq!(accepts.load(Ordering::SeqCst), 2, "对端关连接后必须重建一条新连接");
+        let _ = fx.shutdown().await;
+    }
+
+    /// bd yzhb4：空闲 `DOH_IDLE_TIMEOUT` 后看门狗关闭热会话（不常驻）。
+    #[tokio::test]
+    async fn doh_idle_session_is_closed_by_watchdog() {
+        let (addr, tls_config, _accepts) =
+            spawn_counting_doh_server("idle.com.", vec![Ipv4Addr::new(10, 7, 7, 7)], 60, false)
+                .await;
+        let ns = counting_ns(addr, tls_config);
+        let fx = Arc::new(skeleton_infra::fx::FxScope::new());
+        ns.cache.attach_scope(&fx);
+        ns.start_managed_tasks(&fx); // 生产等价：DNS 实例 start（看门狗由此启动）
+
+        ns.query_once("idle.com.", RecordType::A).await.unwrap();
+        assert!(ns.session.current.lock().is_some(), "查询后应留下一条热会话");
+
+        tokio::time::pause();
+        tokio::time::advance(DOH_IDLE_TIMEOUT * 2).await;
+        for _ in 0..50 {
+            if ns.session.current.lock().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(ns.session.current.lock().is_none(), "空闲到期后热会话必须关闭");
+        let _ = fx.shutdown().await;
     }
 }

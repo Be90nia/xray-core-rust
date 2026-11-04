@@ -1147,3 +1147,86 @@ async fn stream_upload_tls_h2_request_has_no_connection_header() {
 
     server.abort();
 }
+
+/// bd cgmcj：每 host 空闲连接上界。hyper-util legacy client 缺省
+/// `max_idle_per_host = usize::MAX` ⇒ 并发请求完成后全部留池（fd 积压）；
+/// 显式设 [`MAX_IDLE_PER_HOST`] 后超额连接在归还时被关闭，服务端
+/// `serve_connection` 返回 ⇒ `accepted - finished ≤ 上界`。
+#[tokio::test]
+async fn idle_connections_bounded_by_max_idle_per_host() {
+    use xray_transport_splithttp::client::MAX_IDLE_PER_HOST;
+
+    ensure_crypto_provider();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let finished = Arc::new(AtomicUsize::new(0));
+    let server_task = {
+        let accepted = Arc::clone(&accepted);
+        let finished = Arc::clone(&finished);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                accepted.fetch_add(1, Ordering::Relaxed);
+                let finished = Arc::clone(&finished);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let body = if req.method() == Method::GET {
+                            Full::new(Bytes::from_static(b"dl"))
+                        } else {
+                            Full::new(Bytes::new())
+                        };
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder().status(StatusCode::OK).body(body).unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    // serve_connection 返回 = 对端关闭该 TCP（连接未被池保留）。
+                    finished.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        })
+    };
+
+    let client = Arc::new(DefaultDialerClient::new(
+        Arc::new(Config::default()),
+        make_tls_config(),
+        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        None,
+        None,
+        None,
+    ));
+    let base_uri = format!("http://127.0.0.1:{}/", addr.port());
+
+    // 2×上界条并发 h1 POST：h1 连接独占 ⇒ 池空时逐请求各建一条。
+    let mut set = tokio::task::JoinSet::new();
+    for seq in 0..(MAX_IDLE_PER_HOST * 2) {
+        let client = Arc::clone(&client);
+        let base_uri = base_uri.clone();
+        set.spawn(async move {
+            client
+                .post_packet(&base_uri, "idle-cap-sess", &seq.to_string(), Bytes::from_static(b"p"))
+                .await
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        joined.unwrap().expect("post_packet 必须成功");
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let accepted_n = accepted.load(Ordering::Relaxed);
+    let finished_n = finished.load(Ordering::Relaxed);
+    assert!(
+        accepted_n > MAX_IDLE_PER_HOST,
+        "须建出多于上界的连接才有判定力（accepted={accepted_n}）"
+    );
+    assert!(
+        accepted_n.saturating_sub(finished_n) <= MAX_IDLE_PER_HOST,
+        "空闲连接数必须 ≤ max_idle_per_host（accepted={accepted_n}, finished={finished_n}, cap={MAX_IDLE_PER_HOST}）"
+    );
+
+    drop(client);
+    server_task.abort();
+}

@@ -344,11 +344,15 @@ impl DispatchHandler for FreedomDispatchBridge {
             let domain_strategy =
                 xray_transport::sockopt::DomainStrategy::from_i32(self.domain_strategy);
             let has_precheck_rules = default_rule.is_some() || !final_rules.is_empty();
+            // DNS 上游查询自身不做 finalRules 预检解析：预检只为 Block 判定，而解析
+            // 会再走 dispatcher → 再次进本出站 → 再解析，成无界递归（Go handler.go:182
+            // 在 targetStrategy 面门控；Go freedom 自身未门控，同链在 Go 侧同样递归）。
+            let skip_dns_resolve = access.skip_dns_resolve;
             let src = access.from.parse::<SocketAddr>().ok();
             let tcp = Arc::clone(&self.tcp);
             Box::pin(async move {
                 let blocked = if check_dest.address().is_domain() {
-                    if has_precheck_rules {
+                    if has_precheck_rules && !skip_dns_resolve {
                         // Go :294-329：解析全部候选 IP，任一命中 Block → 黑洞
                         let domain =
                             check_dest.address().as_domain().unwrap_or_default().to_string();
@@ -1101,6 +1105,88 @@ mod tests {
         assert_eq!(conn_count.load(Ordering::SeqCst), 0, "blocked target must not be dialed");
         accept_task.abort();
         let _ = task.await;
+        uninstall();
+    }
+
+    /// P1-4：DNS 上游查询自身（`skip_dns_resolve`）不做 finalRules 预检解析——
+    /// 否则「解析 → dispatcher → 本出站 → 再解析」成无界递归。
+    ///
+    /// 反向自检锚点：删掉 `has_precheck_rules && !skip_dns_resolve` 里的
+    /// `!skip_dns_resolve` ⇒ 第一段 `fake.seen()` 非空，断言必红。
+    #[tokio::test]
+    async fn precheck_resolve_skipped_for_dns_query_dispatch() {
+        use crate::test_support::{FAKE_DNS_LOCK, FakeDns, install, uninstall};
+
+        let _g = FAKE_DNS_LOCK.lock();
+        let fake = FakeDns::ips(vec![vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]]);
+        install(&fake);
+
+        let rule = crate::config::FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block",
+            "ip": ["10.0.0.0/8"],
+            "blockDelay": {"from": 0, "to": 0},
+        }))
+        .unwrap();
+        // 拨号即刻失败：本测试只关心预检解析是否发生，不建立真实连接。
+        let stub_dial: xray_app_dispatcher::default::DialFn =
+            Arc::new(|_: &Destination| Box::pin(async { Err("stub dial".to_string()) }));
+        let bridge = FreedomDispatchBridge::from_bridge(
+            test_ctx(),
+            Arc::new(DialBridge::new("direct", stub_dial)),
+        )
+        .with_domain_strategy(crate::config::DomainStrategy::UseIPv4 as i32)
+        .with_final_rules(vec![crate::config::FinalRule::build(&rule).unwrap()]);
+
+        let dest = Destination::new(
+            Address::Domain("ns-domain.test".into()),
+            Port::new(443),
+            Network::TCP,
+        );
+        let link = || {
+            let pipe_opt = xray_buf::pipe::PipeOption::default();
+            let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            // 对端不进 link（拨号/黑屏判定只读本端），显式丢弃以免误以为还在用。
+            drop((up_w, dn_r));
+            xray_transport::link::Link::new(
+                Box::new(up_r) as Box<dyn Reader>,
+                Box::new(dn_w) as Box<dyn Writer>,
+            )
+        };
+
+        // ① DNS 上游查询自身：不解析
+        let access = xray_app_dispatcher::AccessContext {
+            skip_dns_resolve: true,
+            ..xray_app_dispatcher::AccessContext::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bridge.dispatch_with_access(&dest, link(), access),
+        )
+        .await
+        .expect("skip dispatch must finish");
+        assert!(
+            fake.seen().is_empty(),
+            "skip_dns_resolve must not run the finalRule pre-check resolve"
+        );
+
+        // ② 对照组（普通出站）：必须解析
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bridge.dispatch_with_access(
+                &dest,
+                link(),
+                xray_app_dispatcher::AccessContext::default(),
+            ),
+        )
+        .await
+        .expect("control dispatch must finish");
+        assert_eq!(
+            fake.seen(),
+            vec![("ns-domain.test".to_string(), true, false)],
+            "对照组：域名目标必须经预检解析（Go freedom.go:294-295）"
+        );
+
         uninstall();
     }
 
