@@ -200,13 +200,23 @@ async fn zero_buffer_still_carries_one_mb() {
     // 写读并发（避免双端写缓冲互塞的回环死锁）；into_split 供写半部进独立 task。
     let (mut rh, mut wh) = stream.into_split();
     let to_send = payload.clone();
-    let writer = tokio::spawn(async move { wh.write_all(&to_send).await });
+    // 写完**不得** drop 写半部：drop 会发 FIN，echo 侧 `read` 立刻得 Ok(0) 收场并关
+    // socket，把还在飞的 1MB 回显截断 ⇒ `read_exact` 提前 UnexpectedEof（bd 56xmi 的
+    // 「跨优化档两红一绿」即此竞态，慢 runner 必撞）。写完后挂起，由外层 abort 收尾。
+    let writer = tokio::spawn(async move {
+        wh.write_all(&to_send).await?;
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
+    });
     let mut got = vec![0u8; size];
     tokio::time::timeout(Duration::from_secs(30), rh.read_exact(&mut got))
         .await
         .expect("1MB 往返超时")
         .unwrap();
-    writer.await.unwrap().unwrap();
+    // 写半部到此才收尾（abort ⇒ drop ⇒ FIN）；写失败会体现为 got 少字节，由上方
+    // assert_eq 兜住，故不再单独 unwrap writer 结果。
+    writer.abort();
     assert_eq!(got, payload, "零缓冲（bufferSize:0）下 1MB 流量必须完整往返");
     for h in handles {
         h.abort();

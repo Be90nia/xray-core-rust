@@ -78,7 +78,7 @@ impl HandshakeGate {
 
     /// 记录一次因饱和被丢弃的连接（调用方随即 drop 连接 = 对端见 RST/FIN）。
     ///
-    /// 首条与随后每 [`LOG_EVERY`] 条打 warn：既留可见证据，又不随探测流量刷屏。
+    /// 首条与随后每 `LOG_EVERY` 条打 warn：既留可见证据，又不随探测流量刷屏。
     pub fn record_reject(&self, tag: &str) {
         let n = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
         if n % LOG_EVERY == 1 {
