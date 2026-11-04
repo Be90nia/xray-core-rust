@@ -3,7 +3,7 @@
 //! Implements AuthenticationReader from Go's common/crypto/auth.go,
 //! providing AEAD-based authenticated decryption reading.
 
-use xray_buf::{buffer::Buffer, io, multi::MultiBuffer, reader::BufferedReader};
+use xray_buf::{alloc, buffer::Buffer, io, multi::MultiBuffer, reader::BufferedReader};
 use xray_common::protocol::TransferType;
 
 use crate::{
@@ -107,13 +107,35 @@ impl<'a> AuthenticationReader<'a> {
         size: usize,
         padding: usize,
     ) -> Result<Buffer, ReadInternalError> {
-        self.fill_scratch_exact(size, "insufficient bytes for chunk data").await?;
+        // 密文直写池化块 + 块内原地解密：省 scratch→Vec 一次全量拷贝与每读的
+        // 堆分配；输出块随 Buffer 归还池（from_vec 的 Frozen 永不回池）。
+        let mut chunk = alloc::alloc(size);
+        chunk.resize(size, 0);
+        let mut filled = 0;
+        if !self.pending_data.is_empty() {
+            // 不变量：非 soft 路径 pending 恒空（soft 全量 drain）；防御保持。
+            let take = self.pending_data.len().min(size);
+            chunk[..take].copy_from_slice(&self.pending_data[..take]);
+            self.pending_data.drain(..take);
+            filled = take;
+        }
+        while filled < size {
+            let n = self.reader.read(&mut chunk[filled..]).await;
+            if n == 0 {
+                return Err(ReadInternalError::Io(io::Error::ReadError(
+                    "insufficient bytes for chunk data".into(),
+                )));
+            }
+            filled += n;
+        }
         let ciphertext_len = size - padding;
-        let decrypted = self
+        let plaintext = self
             .auth
-            .open(&mut [], &self.scratch[..ciphertext_len])
+            .open_in_place(&mut chunk[..ciphertext_len])
             .map_err(ReadInternalError::Crypto)?;
-        Ok(Buffer::from_vec(decrypted))
+        let pt_len = plaintext.len();
+        chunk.truncate(pt_len);
+        Ok(Buffer::from_bytes(chunk))
     }
 
     async fn read_exact_into(&mut self, size: usize) -> Result<(), ReadInternalError> {
@@ -177,26 +199,35 @@ impl<'a> AuthenticationReader<'a> {
                         return Err(ReadInternalError::Soft);
                     }
                     let ciphertext_len = size_usize - padding_usize;
-                    // AEAD 需连续字节：单 buffer 零拷贝直借；跨 buffer 用 conn 级
-                    // scratch 拼连续（78c613cc out-param 范式，容量跨 chunk 流转）
-                    let decrypted = if chunk_mb.buffer_count() == 1 {
+                    // AEAD 需连续字节：单 buffer 零拷贝直借 open（bytes 视图不可变，
+                    // 无法原地）；跨 buffer 用 conn 级 scratch 拼连续（78c613cc
+                    // out-param 范式，容量跨 chunk 流转），拼好后原地解密，明文
+                    // 直接取 scratch 前缀（省中间 Vec 分配+拷贝）。
+                    if chunk_mb.buffer_count() == 1 {
                         let bytes = chunk_mb.iter().next().map(|b| b.bytes()).unwrap_or(&[]);
-                        self.auth
+                        let decrypted = self
+                            .auth
                             .open(&mut [], &bytes[..ciphertext_len])
-                            .map_err(ReadInternalError::Crypto)?
-                    } else {
-                        self.scratch.clear();
-                        for b in chunk_mb.iter() {
-                            self.scratch.extend_from_slice(b.bytes());
+                            .map_err(ReadInternalError::Crypto)?;
+                        if size_usize <= DEFAULT_SIZE {
+                            mb.push(Buffer::from_vec(decrypted));
+                        } else {
+                            mb.merge_bytes(&decrypted);
                         }
-                        self.auth
-                            .open(&mut [], &self.scratch[..ciphertext_len])
-                            .map_err(ReadInternalError::Crypto)?
-                    };
+                        return Ok(());
+                    }
+                    self.scratch.clear();
+                    for b in chunk_mb.iter() {
+                        self.scratch.extend_from_slice(b.bytes());
+                    }
+                    let plaintext = self
+                        .auth
+                        .open_in_place(&mut self.scratch[..ciphertext_len])
+                        .map_err(ReadInternalError::Crypto)?;
                     if size_usize <= DEFAULT_SIZE {
-                        mb.push(Buffer::from_vec(decrypted));
+                        mb.push(Buffer::from_vec(plaintext.to_vec()));
                     } else {
-                        mb.merge_bytes(&decrypted);
+                        mb.merge_bytes(plaintext);
                     }
                     return Ok(());
                 },
@@ -217,11 +248,11 @@ impl<'a> AuthenticationReader<'a> {
         } else {
             self.read_exact_into(size_usize).await?;
             let ciphertext_len = size_usize - padding_usize;
-            let decrypted = self
+            let plaintext = self
                 .auth
-                .open(&mut [], &self.scratch[..ciphertext_len])
+                .open_in_place(&mut self.scratch[..ciphertext_len])
                 .map_err(ReadInternalError::Crypto)?;
-            mb.merge_bytes(&decrypted);
+            mb.merge_bytes(plaintext);
         }
         Ok(())
     }

@@ -57,9 +57,7 @@ pub struct CacheController {
     high_watermark: RwLock<usize>,
     /// 广播通道发送端（响应到达时发 `CacheEvent`）。
     pub tx: broadcast::Sender<CacheEvent>,
-    pub single_flight: tokio::sync::Mutex<
-        HashMap<(String, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>,
-    >,
+    pub single_flight: SfMap,
     /// 时间源契约（P1-12）：TTL/stale 判定与清理节奏统一走 `skeleton::clock::Clock`。
     /// 生产 `SystemClock`；测试注入 `MockClock` 得确定性时间线（零真等）。
     clock: Arc<dyn Clock>,
@@ -73,6 +71,12 @@ pub struct CacheController {
     /// serveStale 后台刷新闸（派生件 1）：同 fqdn 同时至多一个 pull 在飞。
     stale_gate: RefreshGate<String>,
 }
+
+/// singleflight 表：`Mutex` 换 `parking_lot` 短临界（guard 非 Send，锁内零 await），
+/// key 用 `Arc<str>` 让领导者路径的 key 复制退化为引用计数。
+pub type SfMap = parking_lot::Mutex<
+    HashMap<(Arc<str>, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>,
+>;
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
 #[derive(Debug, Clone)]
@@ -141,7 +145,7 @@ impl CacheController {
             ips: RwLock::new(HashMap::new()),
             high_watermark: RwLock::new(0),
             tx,
-            single_flight: tokio::sync::Mutex::new(HashMap::new()),
+            single_flight: parking_lot::Mutex::new(HashMap::new()),
             clock,
             fx: OnceLock::new(),
             // Go `serveExpiredTTL == 0` ⇒ 不设上限；`serveStale == false` ⇒ 零宽限。

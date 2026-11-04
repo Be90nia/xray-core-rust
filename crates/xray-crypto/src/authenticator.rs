@@ -89,6 +89,22 @@ pub trait Authenticator: Send + Sync {
         dst.extend_from_slice(&self.seal(&mut [], plaintext)?);
         Ok(())
     }
+
+    /// 把 `buf` 前缀的密文（含 tag）原地解密，返回明文子切片（`seal_into` 的读侧对称）。
+    ///
+    /// 默认实现 = [`Self::open`] + 拷回；AEAD 后端覆盖走 [`AeadCipher::open_in_place`]
+    /// 真原地（解密读路径省中间 `Vec` 分配 + 全量拷贝）。解密失败时 `buf` 内容
+    /// 保持调用前原样（tag 校验先于任何写入）。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::open`]：nonce 长度不符或 tag 验证失败。
+    fn open_in_place<'a>(&self, buf: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
+        let plaintext = self.open(&mut [], buf)?;
+        let pt_len = plaintext.len();
+        buf[..pt_len].copy_from_slice(&plaintext);
+        Ok(&mut buf[..pt_len])
+    }
 }
 
 // ========== AEADAuthenticator ==========
@@ -157,6 +173,18 @@ impl<A: AeadCipher + Send + Sync> Authenticator for AEADAuthenticator<A> {
         let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal_into(&iv, &aad, plaintext, dst)
     }
+
+    fn open_in_place<'a>(&self, ciphertext: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
+        let iv = (self.nonce_generator)();
+        if iv.len() != self.cipher.nonce_size() {
+            return Err(CryptoError::InvalidNonceLength {
+                expected: self.cipher.nonce_size(),
+                actual: iv.len(),
+            });
+        }
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
+        self.cipher.open_in_place(&iv, &aad, ciphertext)
+    }
 }
 
 // ========== DynamicAEADAuthenticator ==========
@@ -216,6 +244,16 @@ impl Authenticator for DynamicAEADAuthenticator {
         }
         let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
         self.cipher.seal_into(&iv, &aad, plaintext, dst)
+    }
+
+    fn open_in_place<'a>(&self, ciphertext: &'a mut [u8]) -> Result<&'a mut [u8], CryptoError> {
+        let iv = (self.nonce_generator)();
+        let expected = self.cipher.nonce_size();
+        if iv.len() != expected {
+            return Err(CryptoError::InvalidNonceLength { expected, actual: iv.len() });
+        }
+        let aad = self.additional_data_generator.as_ref().map(|g| g()).unwrap_or_default();
+        self.cipher.open_in_place(&iv, &aad, ciphertext)
     }
 }
 

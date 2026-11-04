@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use xray_frame::cache::RefreshPermit;
 
 use crate::{
-    cache_controller::CacheController,
+    cache_controller::{CacheController, SfMap},
     config::IpOption,
     dnscommon::{IpRecord, merge_records},
     error::DnsError,
@@ -34,13 +34,9 @@ const SF_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
 /// 后台 pull 的兜底超时。对应 Go `pull` 的 `context.WithTimeout(..., 8s)`。
 const PULL_TIMEOUT: Duration = Duration::from_secs(8);
 
-type SfMap = tokio::sync::Mutex<
-    std::collections::HashMap<(String, bool, bool), broadcast::Sender<QueryOutcome>>,
->;
-
 /// 按 key 移除 singleflight 条目；`same_channel` 校验防止误删后来领导者的新条目。
-fn remove_sf_entry(sf: &SfMap, key: &(String, bool, bool), tx: &broadcast::Sender<QueryOutcome>) {
-    if let Ok(mut sf) = sf.try_lock() {
+fn remove_sf_entry(sf: &SfMap, key: &(Arc<str>, bool, bool), tx: &broadcast::Sender<QueryOutcome>) {
+    if let Some(mut sf) = sf.try_lock() {
         if sf.get(key).is_some_and(|t| t.same_channel(tx)) {
             sf.remove(key);
         }
@@ -52,7 +48,7 @@ fn remove_sf_entry(sf: &SfMap, key: &(String, bool, bool), tx: &broadcast::Sende
 /// 条目泄漏会让后续同 key 查询永远走「等待者」路径。
 struct SfLeaderGuard<'a> {
     sf: &'a SfMap,
-    key: (String, bool, bool),
+    key: (Arc<str>, bool, bool),
     tx: broadcast::Sender<QueryOutcome>,
 }
 
@@ -61,6 +57,12 @@ impl Drop for SfLeaderGuard<'_> {
         // Drop 不能 await；try_lock 失败时条目由等待者的 remove_sf_entry 兜底清除。
         remove_sf_entry(self.sf, &self.key, &self.tx);
     }
+}
+
+/// singleflight 临界区结果：等待者拿接收端，领导者拿条目 sender。
+enum SfSlot {
+    Waiter(broadcast::Receiver<QueryOutcome>),
+    Leader(broadcast::Sender<QueryOutcome>),
 }
 
 /// 缓存型 nameserver 接口。对应 Go `CachedNameserver` interface。
@@ -218,39 +220,52 @@ pub async fn fetch<S: CachedNameserver>(
 ) -> Result<(Vec<IpAddr>, u32), DnsError> {
     let cache = server.cache_controller();
     let started = cache.clock().now_instant();
-    let sf_key = (fqdn.to_string(), option.ipv4_enable, option.ipv6_enable);
+    // Arc<str> 让 leader 路径的 key 复制退化为引用计数（String clone 是全量拷贝）。
+    let sf_key = (Arc::from(fqdn), option.ipv4_enable, option.ipv6_enable);
 
-    // singleflight：如果已有同名查询在进行，等待其结果；否则成为领导者。
-    // 领导者条目由 SfLeaderGuard 在 Drop 时移除——正常完成、错误、被上层
-    // abort（如 parallel_query 的 abort_all）都保证不泄漏。
+    // singleflight：同步临界区内定身份——已有条目则订阅为等待者，否则注册条目
+    // 成为领导者。parking_lot guard 非 Send：锁内零 await，guard 不越过任何
+    // await 点。领导者条目由 SfLeaderGuard 在 Drop 时移除——正常完成、错误、
+    // 被上层 abort（如 parallel_query 的 abort_all）都保证不泄漏。
     let mut outcome = {
-        let mut sf = cache.single_flight.lock().await;
-        if let Some(tx) = sf.get(&sf_key).cloned() {
-            drop(sf);
-            let mut rx = tx.subscribe();
-            // 丢弃自己的 sender 克隆：channel 关闭只取决于 map 内（领导者侧）
-            // 的 sender——领导者被 abort 时 guard Drop 移除它，等待者的 recv
-            // 才能立即得到 Closed 而非空等。
-            drop(tx);
-            // 等待者兜底超时：领导者异常挂起时不被无限拖住。
-            // 条目统一由领导者侧 guard 移除（等待者不清理，避免误删超时
-            // 期间新领导者的条目；Go singleflight 同为领导者单点删除）。
-            match tokio::time::timeout(SF_WAIT_TIMEOUT, rx.recv()).await {
-                Ok(Ok(o)) => o,
-                _ => server.send_query(fqdn, option).await,
+        let slot = {
+            let mut sf = cache.single_flight.lock();
+            match sf.get(&sf_key).cloned() {
+                Some(tx) => {
+                    let rx = tx.subscribe();
+                    // 丢弃自己的 sender 克隆：channel 关闭只取决于 map 内（领导者
+                    // 侧）的 sender——领导者被 abort 时 guard Drop 移除它，等待者
+                    // 的 recv 才能立即得到 Closed 而非空等。
+                    drop(tx);
+                    SfSlot::Waiter(rx)
+                },
+                None => {
+                    let (tx, _) = broadcast::channel(1);
+                    sf.insert(sf_key.clone(), tx.clone());
+                    SfSlot::Leader(tx)
+                },
             }
-        } else {
-            let (tx, _) = broadcast::channel(1);
-            sf.insert(sf_key.clone(), tx.clone());
-            drop(sf);
-            let _guard =
-                SfLeaderGuard { sf: &cache.single_flight, key: sf_key.clone(), tx: tx.clone() };
+        };
+        match slot {
+            SfSlot::Waiter(mut rx) => {
+                // 等待者兜底超时：领导者异常挂起时不被无限拖住。
+                // 条目统一由领导者侧 guard 移除（等待者不清理，避免误删超时
+                // 期间新领导者的条目；Go singleflight 同为领导者单点删除）。
+                match tokio::time::timeout(SF_WAIT_TIMEOUT, rx.recv()).await {
+                    Ok(Ok(o)) => o,
+                    _ => server.send_query(fqdn, option).await,
+                }
+            },
+            SfSlot::Leader(tx) => {
+                let _guard =
+                    SfLeaderGuard { sf: &cache.single_flight, key: sf_key, tx: tx.clone() };
 
-            let outcome = server.send_query(fqdn, option).await;
+                let outcome = server.send_query(fqdn, option).await;
 
-            // 广播给等待者（条目移除由 guard Drop 完成）。
-            let _ = tx.send(outcome.clone());
-            outcome
+                // 广播给等待者（条目移除由 guard Drop 完成）。
+                let _ = tx.send(outcome.clone());
+                outcome
+            },
         }
     };
     let now = cache.clock().now_instant();
@@ -855,7 +870,7 @@ mod tests {
             });
         // 等领导者注册条目。
         loop {
-            if server.cache.single_flight.lock().await.len() == 1 {
+            if server.cache.single_flight.lock().len() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -883,7 +898,7 @@ mod tests {
         let (ips, _) = fetch(&*server, "a.com.", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert!(
-            server.cache.single_flight.lock().await.is_empty(),
+            server.cache.single_flight.lock().is_empty(),
             "singleflight entry must be cleaned up"
         );
     }
@@ -926,7 +941,7 @@ mod tests {
             1,
             "same-key concurrent queries must hit send_query once"
         );
-        assert!(server.cache.single_flight.lock().await.is_empty());
+        assert!(server.cache.single_flight.lock().is_empty());
     }
 
     /// serveStale 刷新失败：上游失败不写缓存（不覆盖旧值），过期记录保留，
