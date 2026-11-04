@@ -32,7 +32,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use xray_buf::{
     buffer::Buffer,
     io::{Reader, Writer, new_reader, new_writer},
@@ -73,9 +73,10 @@ struct Inner {
     resp: DuplexStream,
     /// 响应方向半帧累积缓冲。
     accum: Vec<u8>,
-    /// 响应读缓冲（会话期常驻：栈数组会把本 future 撑到 64KiB，构造期在调用方
-    /// poll 栈上留同尺寸临时量 → 击穿 2MiB 线程栈；常驻还省掉每包一次分配）。
-    buf: Vec<u8>,
+    /// 响应读缓冲（会话期常驻池化块：栈数组会把本 future 撑到 64KiB，构造期在调用方
+    /// poll 栈上留同尺寸临时量 → 击穿 2MiB 线程栈；常驻省掉每包一次分配，池化再省掉
+    /// 每会话一次 `vec![0u8; RECV_BUF]` 分配+清零，会话结束 `Drop` 回池复用）。
+    buf: Buffer,
     /// 请求帧序列化 scratch（清空复用容量，免每包一次 `Vec` 分配）。
     frame: Vec<u8>,
     /// 首帧 GlobalID（随机 8 字节，对应 Go xudp）。
@@ -224,11 +225,12 @@ impl UdpDispatchSession {
                     return Ok(Some((source, data)));
                 }
             }
-            let n = inner.resp.read(&mut inner.buf[..]).await?;
+            inner.buf.clear();
+            let n = inner.buf.read_from(&mut inner.resp, RECV_BUF).await?;
             if n == 0 {
                 return Ok(None); // outbound 关闭
             }
-            inner.accum.extend_from_slice(&inner.buf[..n]);
+            inner.accum.extend_from_slice(inner.buf.bytes());
         }
     }
 
@@ -268,7 +270,7 @@ impl UdpDispatchSession {
             req: req_local,
             resp: resp_local,
             accum: Vec::new(),
-            buf: vec![0u8; RECV_BUF],
+            buf: Buffer::new_pooled(RECV_BUF),
             frame: Vec::with_capacity(666),
             global_id: rand::random(),
             new_sent: false,

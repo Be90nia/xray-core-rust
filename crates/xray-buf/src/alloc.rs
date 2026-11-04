@@ -170,7 +170,12 @@ pub fn alloc(size: usize) -> BytesMut {
 /// 将 `BytesMut` 归还到池中。
 ///
 /// 归还优先级：TLS 缓存 → 全局分片 → 丢弃。
-/// 缓冲区在归还前会被清零（清除数据并重置长度）。
+/// 归还前仅重置逻辑长度（[`BytesMut::clear`] 置 `len = 0`），**不清除字节内容**——
+/// 旧数据留在块内，直到被下一持有者覆写。跨持有者不泄漏的保证不在清零，而在
+/// `Buffer` 的视图纪律：读视图恒限 `[start, end)` 游标区间；`[end, cap)` 未提交区
+/// 只经 `MaybeUninit` 只写视图（`writable_bytes` / `seal_window` tag /
+/// `ReadBuf::uninit` 系统调用写）暴露。全仓调用点核查与 A7/A0 回归锁定见
+/// `tests/pooled_logical_len.rs`。
 pub fn release(mut buf: BytesMut) {
     let capacity = buf.capacity();
     if let Some(tier) = select_tier(capacity) {
