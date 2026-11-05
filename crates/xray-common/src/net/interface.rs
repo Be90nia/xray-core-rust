@@ -7,7 +7,7 @@
 //! 底层数据来自 `if-addrs` crate（POSIX getifaddrs / Windows GetAdaptersAddresses）。
 //! 数据源不提供的信息（MTU、MAC、Broadcast/Multicast 标志）以哨兵值呈现：
 //! [`Interface::mtu`] 恒 `0`、[`Interface::hardware_addr`] 恒 `None`、
-//! [`InterfaceFlags::BROADCAST`] / [`InterfaceFlags::MULTICAST`] 恒不置位；
+//! `InterfaceFlags` 的 `BROADCAST` / `MULTICAST` 恒不置位；
 //! 接线方（TUN 自动路由/系统 DNS）若需真实值须另扩数据源，不得消费哨兵值。
 
 use std::{
