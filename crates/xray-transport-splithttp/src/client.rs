@@ -115,8 +115,8 @@ impl TowerService<Uri> for DestTcpConnector {
         Box::pin(async move {
             let tcp = xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
-            // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复，
-            // TCP_RCVBUF_DEFAULT）。
+            // bd r5j96 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune；
+            // 显式 setsockopt 在两平台都是「关掉 autotune 并把窗钉在请求值」）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
             // finalmask（bd dppv）：TCP 后、TLS 前——首字节 = mask 头。
             let conn: Box<dyn Connection> = match tcpmask.as_ref() {
@@ -268,8 +268,8 @@ impl TowerService<Uri> for SplitConnector {
                     ))
                     .await?;
                     tcp.set_nodelay(true).ok();
-                    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 4MB（窗钉修复，
-                    // TCP_RCVBUF_DEFAULT）。
+                    // bd r5j96 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune；
+                    // 显式 setsockopt 在两平台都是「关掉 autotune 并把窗钉在请求值」）。
                     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
                     // finalmask（bd dppv）：TCP 后、指纹 TLS 前——首字节 = mask 头。
                     let conn: Box<dyn Connection> = match dial.tcpmask.as_ref() {
@@ -940,12 +940,20 @@ mod tests {
         assert_eq!(crate::flow_window::client_windows(), crate::flow_window::CLIENT_FALLBACK);
     }
 
-    /// 1f43481b 防回档：完整 TCP connector（[`DestTcpConnector`] =
-    /// dial_client_tcp + apply_client_dial_rcvbuf）走完后，底层 socket
-    /// SO_RCVBUF 回读 >= 4MB（TCP_RCVBUF_DEFAULT，bd 88m0 客户端侧窗钉修复）。
-    /// 摘除接线 = 本测试红。
+    /// bd r5j96：完整 TCP connector（[`DestTcpConnector`] = dial_client_tcp +
+    /// apply_client_dial_rcvbuf）走完后，底层 socket 的 SO_RCVBUF 必须是**内核缺省
+    /// 量级**——缺省两平台均**不设置** SO_RCVBUF（显式 setsockopt 在两平台都是
+    /// 「关掉接收窗 autotune 并把窗钉在请求值」：Windows 关 Winsock autotune；
+    /// Linux 会被 rmem_max 钳到 208KB 并锁 autotune）。
+    ///
+    /// 判据用**对照差值**而非绝对阈值：单看「< 4MB」在 Linux 上恒真（显式 4MB
+    /// 被 rmem_max 钳到 425984，仍 < 4MB），区分不出「没设」与「设了但被钳制」。
+    /// 故与「同平台显式设 4MB」的对照 socket 比——两者必须不同。
+    ///
+    /// ⚠️ 原 1f43481b 防回档锁（>= 4MB）已由 bd r5j96 推翻：4MB 缺省自身即锁窗源
+    /// （Linux 比不设更差）。该锁的治本方案（读循环排水模式）另立 bd cna1g。
     #[tokio::test]
-    async fn dest_connector_dials_with_4mb_recvbuf() {
+    async fn dest_connector_does_not_pin_recvbuf() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accept = tokio::spawn(async move {
@@ -962,9 +970,18 @@ mod tests {
         drop(conn);
         accept.await.unwrap();
         let got = socket2::SockRef::from(&tcp).recv_buffer_size().unwrap();
-        assert!(
-            got >= 4 * 1024 * 1024,
-            "bd 88m0/1f43481b 防回档：完整 connector 后 SO_RCVBUF 应 >= 4MB: got={got}"
+        // 对照：同平台显式设 4MB 后的回读（Windows 4194304 / Linux 425984）。
+        let ctrl = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        ctrl.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+        let explicit_4mb = ctrl.recv_buffer_size().unwrap();
+        assert_ne!(
+            got, explicit_4mb,
+            "bd r5j96：缺省不得钉 SO_RCVBUF（须保留 OS autotune）: got={got} explicit_4mb={explicit_4mb}"
         );
     }
     #[test]
