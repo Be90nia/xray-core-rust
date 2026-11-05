@@ -51,9 +51,6 @@ const DOWN_RESERVE: usize = 16 * 1024;
 /// 劈成 8 批（8 次 memcpy + 8 次 mpsc 交接 + 8 次写 syscall）。
 const READ_BUF_CAP: usize = 64 * 1024;
 
-/// SS-2022 客户端请求头空闲兜底延时（与旧 pump 的 `hdr_timer` 同值）。
-const IDLE_HEADER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
-
 /// 待落线的密文输出态。
 #[derive(Debug, Clone, Copy)]
 enum Out {
@@ -95,21 +92,17 @@ pub struct SsStreamConn<C> {
     head: Vec<u8>,
     /// 上行：待落线状态。
     out: Out,
-    /// SS-2022 客户端请求头空闲兜底定时器（仅首写待发时存在）。
-    idle: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<C: AsyncRead + AsyncWrite + Unpin> SsStreamConn<C> {
     /// 从已写完首帧（addr+port）的 `SSStream` 构造。
     ///
-    /// SS-2022 客户端的请求头在此登记为**首写待发**（与旧泵一致）：首段明文与
-    /// 请求头合并单次写出；上游 200ms 内无数据时兜底发 padding-only 请求头
-    /// （server-speaks-first 目标否则双向等死锁）。
+    /// SS-2022 客户端的请求头在此登记为**首写待发**：首次 `poll_write` 就把头与首段
+    /// 明文合封成一次写出；首次 `poll_flush`（无明文时）或首次 `poll_read` 立刻发
+    /// padding-only 请求头（Go `requestDone` 起始即写头，server-speaks-first 目标
+    /// 否则双向等死锁）。`poll_shutdown` 保留兜底。
     #[must_use]
     pub fn new(stream: SSStream<C>) -> Self {
-        let idle = stream
-            .has_pending_client_2022()
-            .then(|| Box::pin(tokio::time::sleep(IDLE_HEADER_DELAY)));
         Self {
             ss: stream,
             plain: Bytes::new(),
@@ -118,7 +111,6 @@ impl<C: AsyncRead + AsyncWrite + Unpin> SsStreamConn<C> {
             staged: 0,
             head: Vec::new(),
             out: Out::Idle,
-            idle,
         }
     }
 
@@ -295,27 +287,20 @@ impl<C: AsyncRead + AsyncWrite + Unpin> SsStreamConn<C> {
         Pin::new(self.ss.get_mut()).poll_flush(cx)
     }
 
-    /// SS-2022 请求头空闲兜底：上游 200ms 无数据也必须发出（padding-only 请求，
-    /// 否则 server-speaks-first 目标（FTP/SMTP banner）双向等死锁）。
-    fn poll_idle_header(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(timer) = self.idle.as_mut() else {
-            return Poll::Ready(Ok(()));
-        };
-        if timer.as_mut().poll(cx).is_pending() {
-            return Poll::Ready(Ok(()));
+    /// SS-2022 客户端请求头「请求开始即发」（Go `requestDone` 起始写头，payload 可为空）。
+    ///
+    /// 暂存区有明文时不动——留给 [`Self::seal_stage`] 把请求头与首段 payload 合封成
+    /// **一次**写出。无明文则立刻登记 padding-only 请求头待发：不等 `poll_shutdown`
+    /// （server-speaks-first 目标否则双向等死锁）。
+    ///
+    /// 幂等：待发状态由 `build_client_2022_header` 一次性 `take`，重复调用即 no-op。
+    fn arm_client_header(&mut self) -> Result<(), SsError> {
+        if !matches!(self.out, Out::Idle) || self.staged > 0 || !self.ss.has_pending_client_2022() {
+            return Ok(());
         }
-        self.idle = None;
-        if !self.ss.has_pending_client_2022() {
-            return Poll::Ready(Ok(()));
-        }
-        let (wire, _used) = self
-            .ss
-            .build_client_2022_header(&[])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        self.head.clear();
-        self.head.extend_from_slice(&wire);
-        self.out = Out::Header { done: 0 };
-        Poll::Ready(Ok(()))
+        let (wire, _used) = self.ss.build_client_2022_header(&[])?;
+        self.take_header(&wire, 0);
+        Ok(())
     }
 }
 
@@ -334,11 +319,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsStreamConn<C> {
                 me.plain.advance(n);
                 return Poll::Ready(Ok(()));
             }
-            // ② SS-2022 请求头空闲兜底 + 推进待落线内容（写半由下行任务顺带驱动）。
-            match me.poll_idle_header(cx) {
-                Poll::Ready(Ok(())) => {},
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+            // ② SS-2022 请求头「请求开始即发」+ 推进待落线内容（写半由下行任务顺带驱动）。
+            if let Err(e) = me.arm_client_header() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
             }
             match me.poll_out(cx) {
                 Poll::Ready(Ok(())) => {},
@@ -410,8 +393,9 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
             me.stage.write_from(&buf[..n]);
             me.staged += n;
         }
-        // ③ 满块 → 原地 seal（落线由后续 poll 推进）。
-        if me.staged >= me.up_cap() {
+        // ③ 满块 / SS-2022 请求头待发 → 原地 seal：头与首段 payload 合封成**一次**
+        //    写出（Go `WriteTCPRequest(initialPayload)`），头不留在缓冲区里等 flush。
+        if me.staged >= me.up_cap() || me.ss.has_pending_client_2022() {
             if let Err(e) = me.seal_stage() {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
             }
@@ -427,18 +411,18 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
             Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             Poll::Pending => return Poll::Pending,
         }
-        // ② 暂存明文封块并落线（尾块 = 应用侧批次边界，与旧泵「读到多少封多少」同）。
-        if me.staged > 0 {
-            if let Err(e) = me.seal_stage() {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
-            }
-            match me.poll_out(cx) {
-                Poll::Ready(Ok(())) => {},
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        // ② 暂存明文封块落线（尾块 = 应用侧批次边界，与旧泵「读到多少封多少」同）；
+        //    暂存为空时 SS-2022 请求头**请求开始即发**（不等 shutdown）。
+        let step = if me.staged > 0 { me.seal_stage() } else { me.arm_client_header() };
+        if let Err(e) = step {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
         }
-        // ③ flush 底层。
+        // ③ 冲刷待落线内容 + flush 底层。
+        match me.poll_out(cx) {
+            Poll::Ready(Ok(())) => {},
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
         me.poll_flush_inner(cx)
     }
 
@@ -537,10 +521,17 @@ impl<W: AsyncWrite + Unpin + Send> xray_buf::io::Writer for FlushWriter<W> {
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use xray_common::net::address::Address;
     use xray_proto::xray::proxy::shadowsocks::Account as ProtoAccount;
 
     use super::*;
-    use crate::config::{CipherType, MemoryAccount};
+    use crate::{
+        config::{CipherType, MemoryAccount},
+        ss2022::{
+            CipherKind2022, Client2022, Ss2022Inbound, derive_psk, derive_session_subkey,
+            psk_from_base64,
+        },
+    };
 
     /// 测试用底层连接（duplex 半）。
     struct TestConn(DuplexStream);
@@ -794,5 +785,177 @@ mod tests {
         }
         writer.await.expect("writer task");
         assert_eq!(got, expect, "批量写向下帧边界/序号必须自洽");
+    }
+
+    // ===== bd wxaim：SS-2022 客户端请求头「请求开始即发」=====
+
+    /// SS-2022 客户端 PSK（256-bit / aes-256-gcm，与 `client_new_aes256` 同源）。
+    const PSK_2022_B64: &str = "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=";
+
+    /// 2022 客户端直挂连接（dispatcher 生产形态）：`dial_target_on` 只登记待发请求头，
+    /// 一个 wire 字节都还没落线。
+    async fn conn_2022<C>(inner: C) -> SsStreamConn<C>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &[PSK_2022_B64.to_string()],
+            "127.0.0.1",
+            8388,
+        )
+        .expect("2022 client");
+        let stream =
+            client.dial_target_on(inner, "example.com", 443).await.expect("dial_target_on");
+        SsStreamConn::new(stream)
+    }
+
+    /// 写侧捕获连接：记录底层每一次 `poll_write` 的字节段（断言「头 + 首段单次写出」）。
+    struct CaptureConn {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncRead for CaptureConn {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for CaptureConn {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.lock().expect("writes lock").push(buf.to_vec());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Connection for CaptureConn {
+        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+    }
+
+    /// 上行**无业务数据**时，请求头必须在首个 `poll` 就落线（Go `requestDone`
+    /// 起始写头，payload 可为空）：对齐前只在 `poll_shutdown` / 空闲 200ms 兜底发，
+    /// 服务端首包被拖住。
+    ///
+    /// 反向自检：把头退回「只在 shutdown / flush 发」⇒ 服务端握手拿不到任何字节 ⇒
+    /// 本用例超时红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_2022_header_emitted_on_first_poll_without_uplink_data() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut conn = conn_2022(TestConn(client_io)).await;
+
+        // 下行任务的第一个 poll：服务端无数据 ⇒ 读必须 Pending（只驱动一次 poll，
+        // 不依赖任何定时器，故「头已落线」与「等待时间」无关）。
+        let mut buf = [0u8; 64];
+        let mut rb = ReadBuf::new(&mut buf);
+        let first =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll_read(cx, &mut rb)))
+                .await;
+        assert!(first.is_pending(), "服务端未回数据，首个 poll_read 应 Pending");
+        assert_eq!(rb.filled().len(), 0, "不应凭空交付明文");
+
+        // 服务端此刻必须已能解出完整请求头（走真实 2022 入站解码）。
+        let inbound = Ss2022Inbound::new("2022-blake3-aes-256-gcm", PSK_2022_B64, "u@x.com")
+            .expect("inbound");
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            inbound.handle_conn(TestConn(server_io)),
+        )
+        .await
+        .expect("请求头必须首 poll 落线，否则服务端握手挂死到超时")
+        .expect("请求头解码");
+        assert_eq!(res.port, 443, "目标端口须原样送达");
+        assert_eq!(res.address, Address::Domain("example.com".to_string()), "目标地址须原样送达");
+    }
+
+    /// 首段业务数据与请求头**合封一次**落线，且请求头只发一次。
+    ///
+    /// 计数断言：底层 `poll_write` 只被调用一次（头 + 首段 payload 单次写出）；
+    /// 解出的 wire = `salt || sealed fixed || sealed var(addr+port+pad+payload)`，
+    /// var 尾部即首写内容，且头后无多余字节——重复发头会让 nonce 错位，解密直接失败。
+    ///
+    /// 关键：**不 flush** 也要落线（`poll_write` 即封块，头不在暂存区里等 flush）——
+    /// 反向自检：去掉 `poll_write` 的「头待发即封块」条件 ⇒ 单次 `poll_read` 后
+    /// wire 上仍无字节 ⇒ 本用例红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_2022_header_merged_into_first_write_once() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut conn = conn_2022(CaptureConn { writes: std::sync::Arc::clone(&writes) }).await;
+
+        let payload = b"hello-2022-header";
+        conn.write_all(payload).await.expect("write");
+        // 只驱动一次读（下行任务的首个 poll），不 flush：请求头必须在这次 poll 前
+        // 就已随首段合封并落线。
+        let mut buf = [0u8; 64];
+        let mut rb = ReadBuf::new(&mut buf);
+        let first =
+            std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll_read(cx, &mut rb)))
+                .await;
+        assert!(first.is_pending(), "服务端未回数据，读应 Pending");
+        // 未 flush 时头 + 首段就必须已经在 wire 上（一次写出，不在暂存区里等 flush）。
+        assert_eq!(
+            writes.lock().expect("writes lock").len(),
+            1,
+            "首写后未 flush 也必须已落线（头不留缓冲区）"
+        );
+        conn.flush().await.expect("flush");
+
+        let captured = writes.lock().expect("writes lock").clone();
+        assert_eq!(captured.len(), 1, "请求头 + 首段必须一次写出，实际 {} 次", captured.len());
+        let wire = &captured[0];
+
+        let kind = CipherKind2022::Aes256Gcm;
+        let psk =
+            derive_psk(&psk_from_base64(PSK_2022_B64).expect("psk b64"), kind).expect("derive psk");
+        let salt = &wire[..kind.salt_size()];
+        let aead = crate::ss2022::key::build_aead(kind, &derive_session_subkey(&psk, salt, kind))
+            .expect("session aead");
+        let tag = aead.tag_size();
+        let mut nonce = vec![0u8; aead.nonce_size()];
+
+        let mut off = kind.salt_size();
+        let fixed = aead.open(&nonce, &[], &wire[off..off + 11 + tag]).expect("fixed header");
+        off += 11 + tag;
+        let var_len = u16::from_be_bytes([fixed[9], fixed[10]]) as usize;
+        nonce[0] = 1;
+        let var = aead.open(&nonce, &[], &wire[off..off + var_len + tag]).expect("var header");
+        off += var_len + tag;
+        assert_eq!(off, wire.len(), "请求头之后不得有重复头或多余字节");
+
+        // var 明文 = ATYP + len + domain + port + padLen + padding + 首段 payload
+        assert_eq!(var[0], 0x03, "ATYP=domain");
+        assert_eq!(&var[2..13], b"example.com", "目标域名");
+        assert_eq!(&var[13..15], &443u16.to_be_bytes(), "目标端口");
+        assert!(var.ends_with(payload), "首段 payload 必须合并在请求头同一次写出里");
+
+        // 再次 flush / shutdown 不得补发请求头（幂等）。
+        conn.flush().await.expect("second flush");
+        conn.shutdown().await.expect("shutdown");
+        assert_eq!(
+            writes.lock().expect("writes lock").len(),
+            1,
+            "重复 flush/shutdown 不得补发请求头"
+        );
     }
 }

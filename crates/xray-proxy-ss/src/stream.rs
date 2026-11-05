@@ -508,7 +508,7 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         self.pending_client_2022 = Some(PendingClient2022 { prefix, fixed_plain, addr_port });
     }
 
-    /// 是否存在未发客户端请求头（pump 据此决定空闲兜底 flush / 定时 flush）。
+    /// 是否存在未发客户端请求头（直挂连接据此在首写/首个 poll 立刻发出）。
     #[must_use]
     pub fn has_pending_client_2022(&self) -> bool {
         self.pending_client_2022.is_some()
