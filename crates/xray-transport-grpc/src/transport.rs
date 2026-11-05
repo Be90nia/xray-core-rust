@@ -46,6 +46,11 @@ use crate::config::Config;
 /// （grpc-go / Rust h2 client）按 SETTINGS 排队，互通语义不受影响。
 const H2_MAX_CONCURRENT_STREAMS: u32 = 250;
 
+/// h2 单向泵的读 scratch 尺寸（32 KiB，两侧共用）。走 `xray_buf` 分层池
+/// （bd 0ux3t C19）：`alloc(32KiB)` 命中 tier2 精确档、容量恒等 tier ⇒ 流结束时
+/// `release` 可回收，稳态零新鲜分配。
+const SH2_SCRATCH: usize = 32 * 1024;
+
 /// gRPC :authority 判定（Go dial.go:147-153，票 0tnw）。
 ///
 /// 三级回退：一级 `grpcSettings.Authority`；二级只看 tlsConfig 的 serverName
@@ -409,21 +414,29 @@ where
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(server);
         let up = async {
-            let mut buf = vec![0u8; 32 * 1024];
-            loop {
-                let n = rd.read(&mut buf).await?;
-                if n == 0 {
-                    let _ = send_stream.send_data(Bytes::new(), true);
-                    break;
+            // 池化读 scratch（bd 0ux3t C19）：帧由 `encode_*_hunk_frame` 自拷成新
+            // Vec，scratch 不逃逸 ⇒ 流结束时 `release` 回池（归零点在本块末）。
+            let mut buf = xray_buf::alloc::alloc(SH2_SCRATCH);
+            buf.resize(SH2_SCRATCH, 0);
+            let res = async {
+                loop {
+                    let n = rd.read(&mut buf).await?;
+                    if n == 0 {
+                        let _ = send_stream.send_data(Bytes::new(), true);
+                        break;
+                    }
+                    let frame = if multi_mode {
+                        crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
+                    } else {
+                        crate::encoding::encode_hunk_frame(&buf[..n])
+                    };
+                    send_stream.send_data(Bytes::from(frame), false).map_err(io_err)?;
                 }
-                let frame = if multi_mode {
-                    crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
-                } else {
-                    crate::encoding::encode_hunk_frame(&buf[..n])
-                };
-                send_stream.send_data(Bytes::from(frame), false).map_err(io_err)?;
+                Ok::<_, io::Error>(())
             }
-            Ok::<_, io::Error>(())
+            .await;
+            xray_buf::alloc::release(buf);
+            res
         };
         let down = async {
             // 9d7a：响应头校验。Go grpc-go client 行为：非 200 → errMalformedHeader；
@@ -915,21 +928,29 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
             // 返回 Result<(), Error> 而非 Future；慢接收端下库内部自动挂起 task
             // 等 WINDOW_UPDATE。无需 Rust 端加 .await。
             let s = async {
-                let mut buf = vec![0u8; 32 * 1024];
-                loop {
-                    let n = rd.read(&mut buf).await?;
-                    if n == 0 {
-                        let _ = send_resp.send_data(Bytes::new(), true);
-                        break;
+                // 池化读 scratch（bd 0ux3t C19）：帧自拷成新 Vec，scratch 不逃逸
+                // ⇒ 流结束时 `release` 回池（归零点在本块末）。
+                let mut buf = xray_buf::alloc::alloc(SH2_SCRATCH);
+                buf.resize(SH2_SCRATCH, 0);
+                let res = async {
+                    loop {
+                        let n = rd.read(&mut buf).await?;
+                        if n == 0 {
+                            let _ = send_resp.send_data(Bytes::new(), true);
+                            break;
+                        }
+                        let frame = if multi_mode {
+                            crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
+                        } else {
+                            crate::encoding::encode_hunk_frame(&buf[..n])
+                        };
+                        send_resp.send_data(Bytes::from(frame), false).map_err(io_err)?;
                     }
-                    let frame = if multi_mode {
-                        crate::encoding::encode_multi_hunk_frame(&[&buf[..n]])
-                    } else {
-                        crate::encoding::encode_hunk_frame(&buf[..n])
-                    };
-                    send_resp.send_data(Bytes::from(frame), false).map_err(io_err)?;
+                    Ok::<_, io::Error>(())
                 }
-                Ok::<_, io::Error>(())
+                .await;
+                xray_buf::alloc::release(buf);
+                res
             };
             let r = async {
                 let mut acc: Vec<u8> = Vec::new();

@@ -223,6 +223,9 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
                 // owned Bytes move 给 quinn——原 `vec![0u8; 32K] + copy_from_slice`
                 // 的第二次 32KB memcpy 消除。reserve 保证每轮读预算（spare 为 0 时
                 // read_buf 返回 Ok(0) 会被误判 EOF）。
+                // 不走 xray_buf 池（bd 0ux3t C19 判定）：`write_chunk` 把块所有权交给
+                // quinn（重传要持有），池无 hook 收回；池化 = 每 chunk 多一次 32KB
+                // memcpy 换一次更便宜的 malloc，负优化。
                 let mut buf = BytesMut::with_capacity(32 * 1024);
                 loop {
                     buf.reserve(32 * 1024);
@@ -237,15 +240,23 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
             };
             // r: 读 quinn recv → 写到 duplex-read 半边
             let r = async {
-                let mut buf = vec![0u8; 32 * 1024];
-                loop {
-                    match recv.read(&mut buf).await {
-                        Ok(Some(n)) => wr.write_all(&buf[..n]).await?,
-                        Ok(None) => break,
-                        Err(e) => return Err(io_err(e)),
+                // 池化读 scratch（bd 0ux3t C19）：下行 `write_all` 拷贝，scratch 不
+                // 逃逸 ⇒ 泵结束时 `release` 回池（归零点在本块末）。
+                let mut buf = xray_buf::alloc::alloc(32 * 1024);
+                buf.resize(32 * 1024, 0);
+                let res = async {
+                    loop {
+                        match recv.read(&mut buf).await {
+                            Ok(Some(n)) => wr.write_all(&buf[..n]).await?,
+                            Ok(None) => break,
+                            Err(e) => return Err(io_err(e)),
+                        }
                     }
+                    Ok::<_, io::Error>(())
                 }
-                Ok::<_, io::Error>(())
+                .await;
+                xray_buf::alloc::release(buf);
+                res
             };
             let _ = tokio::try_join!(s, r);
         });

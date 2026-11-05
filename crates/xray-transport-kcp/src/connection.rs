@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::BytesMut;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -736,7 +737,10 @@ pub struct KcpConn {
     write_state: parking_lot::Mutex<Option<CachedWait>>,
     /// poll_read 持久 scratch（vision read_tmp 同型）：虚假唤醒重 poll 不再
     /// 逐次堆分配（原 `vec![0u8; remaining]` 每 poll 一次，P1 F7）。
-    read_scratch: Vec<u8>,
+    ///
+    /// 存储走 `xray_buf` 分层池（bd 0ux3t C18）：`alloc(need)` 取层块、容量恒等
+    /// tier ⇒ 连接销毁时 `release` 可回收（归零点 = [`Drop`]）。
+    read_scratch: BytesMut,
 }
 
 impl KcpConn {
@@ -747,7 +751,7 @@ impl KcpConn {
             inner,
             read_state: parking_lot::Mutex::new(None),
             write_state: parking_lot::Mutex::new(None),
-            read_scratch: Vec::new(),
+            read_scratch: BytesMut::new(),
         }
     }
 
@@ -755,6 +759,13 @@ impl KcpConn {
     #[must_use]
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner
+    }
+}
+
+impl Drop for KcpConn {
+    fn drop(&mut self) {
+        // 归零点：连接销毁时 scratch 回分层池（容量恒等 tier 才回收，见 alloc::release）
+        xray_buf::alloc::release(std::mem::take(&mut self.read_scratch));
     }
 }
 
@@ -779,9 +790,12 @@ impl tokio::io::AsyncRead for KcpConn {
         // 调用参数），唤醒后用本次 poll 的 buf 重读。
         let this = self.get_mut();
         let need = buf.remaining();
-        if this.read_scratch.len() < need {
-            this.read_scratch.resize(need, 0);
+        if this.read_scratch.capacity() < need {
+            // 换层块（旧块可能因 caller 缩小 buf 而闲置；换掉才不让小块占着大请求）
+            xray_buf::alloc::release(std::mem::take(&mut this.read_scratch));
+            this.read_scratch = xray_buf::alloc::alloc(need);
         }
+        this.read_scratch.resize(need, 0);
         loop {
             match this.inner.read(&mut this.read_scratch[..need]) {
                 Ok(0) => {},

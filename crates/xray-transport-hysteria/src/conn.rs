@@ -387,23 +387,34 @@ impl InterStreamConn {
 }
 
 /// 在途 read future：完成时交出 `(scratch, n)`——scratch 归还槽内复用（T17）。
-type ReadFuture = Pin<Box<dyn Future<Output = std::io::Result<(Vec<u8>, usize)>> + Send>>;
+type ReadFuture = Pin<Box<dyn Future<Output = std::io::Result<(BytesMut, usize)>> + Send>>;
 
 /// 读侧槽：在途 read future + 可复用读缓冲。
 ///
 /// T17（同 `KcpConn::read_scratch` 手法）：原实现每次起新读都
 /// `vec![0u8; remaining]` 新分配，读进 tmp 再拷给调用方；scratch 现在常驻此槽，
 /// 在途期由 future 持有（读出后随 `(scratch, n)` 归还），稳态零分配。
+///
+/// 存储走 `xray_buf` 分层池（bd 0ux3t C17）：块容量恒等 tier ⇒ 槽销毁时
+/// `release` 可回收（归零点 = `Drop` 实现）。
 struct ReadSlot {
     /// 在途 future（`None` = 无读在飞）。
     reading: Option<ReadFuture>,
-    /// 复用读缓冲；在途期间被 future 借走（槽内留空 Vec）。
-    scratch: Vec<u8>,
+    /// 复用读缓冲；在途期间被 future 借走（槽内留空）。
+    scratch: BytesMut,
 }
 
 impl ReadSlot {
     fn new() -> Self {
-        Self { reading: None, scratch: Vec::new() }
+        Self { reading: None, scratch: BytesMut::new() }
+    }
+}
+
+impl Drop for ReadSlot {
+    fn drop(&mut self) {
+        // 归零点：连接销毁时 scratch 回分层池（容量恒等 tier 才回收，见 alloc::release）。
+        // 在途 future 持有的那块拿不回来 —— 随 future 一起交还系统分配器。
+        xray_buf::alloc::release(std::mem::take(&mut self.scratch));
     }
 }
 
@@ -471,9 +482,12 @@ impl tokio::io::AsyncRead for HysteriaConn {
             // 创建新 read future（读入常驻 scratch，不借用 caller 的 buf）
             let inner = Arc::clone(&self.inner);
             let mut scratch = std::mem::take(&mut state.scratch);
-            if scratch.len() < remaining {
-                scratch.resize(remaining, 0);
+            if scratch.capacity() < remaining {
+                // 换更大的层块（旧块回池）：容量恒等 tier 才可回收
+                xray_buf::alloc::release(scratch);
+                scratch = xray_buf::alloc::alloc(remaining);
             }
+            scratch.resize(remaining, 0);
             state.reading = Some(Box::pin(async move {
                 let n = inner.read(&mut scratch[..remaining]).await?;
                 Ok((scratch, n))
