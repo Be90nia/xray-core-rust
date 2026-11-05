@@ -461,7 +461,7 @@ pub const SO_RCVBUF_FREE_TIER_MAX: usize = 4 * 1024 * 1024;
 pub const SO_RCVBUF_HARD_MAX: usize = 64 * 1024 * 1024;
 
 /// 大档显式接收缓冲的**确认开关名**（env，进程级语义；**单一真值源**——全仓只
-/// 此一处定义与读取，见 [`large_rcvbuf_confirmed`]）。
+/// 此一处定义与读取，见 `large_rcvbuf_confirmed`）。
 ///
 /// 语义：`XRAY_ALLOW_LARGE_RCVBUF=1` ⇒ 允许 (4 MiB, 64 MiB] 档。缺省 = 未确认。
 /// 依据指南 §96-98 的 2× 记账与并发账面公式 `并发 × 2 × 值`——大档是**显式运维
@@ -1024,7 +1024,7 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) -> std::io::Res
 /// 96 MB 整机预算里 pipe 与 socket 不重复计账。
 ///
 /// **只约束显式值**（用户显式配置的 `receiveBufferSize`/`sendBufferSize`）；
-/// 缺省 8 MB 是 Go quic-go `wrapConn` parity 下限（[`QUIC_UDP_MIN_BUFFER`]），
+/// 缺省 8 MB 是 Go quic-go `wrapConn` parity 下限（`QUIC_UDP_MIN_BUFFER`），
 /// PM 裁决保留、不受本闸约束。
 pub const MAX_EXPLICIT_UDP_BUFFER_SIZE: usize = SO_RCVBUF_HARD_MAX;
 

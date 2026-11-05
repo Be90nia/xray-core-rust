@@ -292,6 +292,10 @@ serena-cli undo                                                        # 改坏�
 - **禁派** scout / fullstack-engineer 做审计
 - **Ponytail 模式**：只出报告不修代码（红线外可建议改，**不实施**）
 - **红线条目**（§4）= 触动一次 = 派回原 agent + 全报告重审
+- **PM 推送前必过 docs 门（用户裁决 2026-11-05）**：每次推 GitHub 前本地跑 `cargo doc --workspace --no-deps`（btls 四件套环境变量同 §1）⇒ **本地绿才推**；子代理每交一件产出，PM 先跑该门再推。**理由**：CI 的 Docs 门（`cargo doc --workspace --no-deps` + `#![deny(warnings)]` ⇒ rustdoc 告警即失败）已三次替 PM 抓出悬空内链/私有内链/已删常量内链（`dial_system`、`Self::pool`、`InterfaceFlags::BROADCAST`）—— **别让 CI 当 PM 的 docs 门**。
+  - 改完文档/删除符号/改公开 API 后**必跑**（内链悬空与私有项链接是 `deny(warnings)` 下的**硬错**）。
+  - 排查口径：CI Docs job 失败 ⇒ `gh run view <id> --log-failed` 取 `unresolved link to ...` / `links to private item` 行号 ⇒ 定位改；本地复跑同一命令确认绿再推。
+
 
 ---
 
