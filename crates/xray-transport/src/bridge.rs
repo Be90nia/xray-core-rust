@@ -342,6 +342,47 @@ async fn wait_abort(rx: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = rx.wait_for(|closed| *closed).await;
 }
 
+/// 桥腿终态（诊断面 bd myppb）。
+///
+/// 改造前每条腿的读循环把「`Ok(空块)`/`Error::Eof`」与「真实 IO 错误」并进
+/// 同一个 `_ => break`，且腿恒返 `Ok(())` ⇒ dispatcher 的
+/// `bridge ended: {e}` 是死代码，中继侧零痕迹。此处只区分**记什么**与
+/// **返回什么**，break 点、shutdown、半窗、budget 记账一行未动。
+enum LegExit {
+    /// 正常收尾：流 EOF、对向级联退出、读侧超时判定断连。
+    Eof,
+    /// 真实 IO 错误（字节数已由 [`leg_read_err`] 记入 warn）。
+    Err { err: io::Error },
+}
+
+/// 读腿错误 → 终态：`xray_buf::Error::Eof` 是正常收尾（pipe 关闭/流结束，
+/// 不是错误），其余保 `kind` 上浮并记 warn。
+fn leg_read_err(leg: &'static str, bytes_done: u64, err: xray_buf::io::Error) -> LegExit {
+    if matches!(err, xray_buf::io::Error::Eof) {
+        return LegExit::Eof;
+    }
+    let err = io::Error::from(err);
+    tracing::warn!(
+        target: "xray_frame::bridge",
+        leg,
+        bytes_done,
+        err = %err,
+        "bridge leg error"
+    );
+    LegExit::Err { err }
+}
+
+/// 聚合腿终态：取**首个** IO 错误上浮（顺序固定 = 决定性），全 EOF 则
+/// `Ok(())`——与改造前「正常收尾一律 Ok」的返回值一致。
+fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
+    legs.into_iter()
+        .find_map(|leg| match leg {
+            LegExit::Err { err } => Some(err),
+            LegExit::Eof => None,
+        })
+        .map_or(Ok(()), Err)
+}
+
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -453,7 +494,8 @@ where
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
-            loop {
+            let mut bytes_done: u64 = 0;
+            let exit = loop {
                 // 读 future 每轮重建是 cancel-safe 的：select!/timeout 丢弃的 future
                 // 只可能处于 Pending（poll 到 Ready 的分支必被采用），无数据丢失。
                 let mb = match window {
@@ -463,7 +505,7 @@ where
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break;
+                                break LegExit::Eof;
                             },
                         },
                         _ = down_done.changed() => {
@@ -476,7 +518,7 @@ where
                         Err(_) => {
                             // uplink_only 窗口内无数据
                             let _ = abort_tx.send(true);
-                            break;
+                            break LegExit::Eof;
                         },
                     },
                 };
@@ -485,22 +527,24 @@ where
                         if p7lm_trace {
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
                         }
+                        bytes_done += mb.len() as u64;
                         // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
                         // send 立即 Err → 本向级联退出，绝不静默吞数据。关闸时
                         // 放弃在飞批次（收尾态，连接已被判死）。
                         let sent = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
                             r = up_tx.send(mb) => r,
                         };
                         if sent.is_err() {
-                            break;
+                            break LegExit::Eof;
                         }
                     },
-                    _ => break,
+                    Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
+                    Err(e) => break leg_read_err("up_read", bytes_done, e),
                 }
-            }
+            };
             let _ = up_done_tx.send(Some(downlink_only));
-            io::Result::Ok(())
+            exit
         }
     };
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
@@ -543,7 +587,8 @@ where
         async move {
             let mut up_done = up_done_rx;
             let mut window: Option<std::time::Duration> = None;
-            loop {
+            let mut bytes_done: u64 = 0;
+            let exit = loop {
                 let mb = match window {
                     None => tokio::select! {
                         // 空闲 deadline（Go ConnectionIdle / CancelAfterInactivity）
@@ -551,7 +596,7 @@ where
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break;
+                                break LegExit::Eof;
                             },
                         },
                         _ = up_done.changed() => {
@@ -564,7 +609,7 @@ where
                         Err(_) => {
                             // downlink_only 窗口内无数据
                             let _ = abort_tx.send(true);
-                            break;
+                            break LegExit::Eof;
                         },
                     },
                 };
@@ -573,19 +618,21 @@ where
                         if p7lm_trace {
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
                         }
+                        bytes_done += mb.len() as u64;
                         let sent = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
                             r = down_tx.send(mb) => r,
                         };
                         if sent.is_err() {
-                            break;
+                            break LegExit::Eof;
                         }
                     },
-                    _ => break, // EOF / 读错误
+                    Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
+                    Err(e) => break leg_read_err("down_read", bytes_done, e),
                 }
-            }
+            };
             let _ = down_done_tx.send(Some(uplink_only));
-            io::Result::Ok(())
+            exit
         }
     };
 
@@ -651,7 +698,11 @@ where
 
     // join! 语义：四块被并发轮询（读等待不阻塞写推进），全部完成后返回。
     let (up_r, up_w, down_r, down_w) = tokio::join!(up_reader, up_writer, down_reader, down_writer);
-    up_r.and(up_w).and(down_r).and(down_w)
+    // 写腿恒 Ok（写错误按 50074b2 语义只收敛本向，见 `bridge_stream_full_
+    // up_write_err_keeps_downlink` 回归门）；读腿错误上浮给 dispatcher。
+    up_w?;
+    down_w?;
+    first_leg_error([up_r, down_r])
 }
 
 /// 默认策略的便捷包装（保留旧 API 兼容调用方）。
@@ -844,7 +895,8 @@ pub async fn bridge_link_with_link(
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
-            loop {
+            let mut bytes_done: u64 = 0;
+            let exit = loop {
                 let mb = match window {
                     None => {
                         let idle_dl = Budget::tokio().deadline(conn_idle);
@@ -854,7 +906,7 @@ pub async fn bridge_link_with_link(
                                 Ok(r) => r,
                                 Err(_) => {
                                     let _ = abort_tx.send(true);
-                                    break;
+                                    break LegExit::Eof;
                                 },
                             },
                             _ = down_done.changed() => {
@@ -872,31 +924,34 @@ pub async fn bridge_link_with_link(
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break;
+                                break LegExit::Eof;
                             },
                         }
                     },
                 };
                 match mb {
                     Ok(mb) if !mb.is_empty() => {
+                        bytes_done += mb.len() as u64;
                         let wrote = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
                             r = b_writer.write_multi_buffer(mb) => r,
                         };
+                        // 写错只收敛本向（pipe 关闭是正常收尾，同 stream 桥 50074b2 语义）。
                         if wrote.is_err() {
-                            break;
+                            break LegExit::Eof;
                         }
                     },
-                    _ => break,
+                    Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
+                    Err(e) => break leg_read_err("chain_up_read", bytes_done, e),
                 }
-            }
+            };
             // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
             let _ = Budget::tokio()
                 .deadline(std::time::Duration::from_secs(3))
                 .timeout(b_writer.shutdown_flush())
                 .await;
             let _ = up_done_tx.send(Some(downlink_only));
-            io::Result::Ok(())
+            exit
         }
     };
 
@@ -907,7 +962,8 @@ pub async fn bridge_link_with_link(
         async move {
             let mut up_done = up_done_rx;
             let mut window: Option<std::time::Duration> = None;
-            loop {
+            let mut bytes_done: u64 = 0;
+            let exit = loop {
                 let mb = match window {
                     None => {
                         let idle_dl = Budget::tokio().deadline(conn_idle);
@@ -917,7 +973,7 @@ pub async fn bridge_link_with_link(
                                 Ok(r) => r,
                                 Err(_) => {
                                     let _ = abort_tx.send(true);
-                                    break;
+                                    break LegExit::Eof;
                                 },
                             },
                             _ = up_done.changed() => {
@@ -935,35 +991,38 @@ pub async fn bridge_link_with_link(
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break;
+                                break LegExit::Eof;
                             },
                         }
                     },
                 };
                 match mb {
                     Ok(mb) if !mb.is_empty() => {
+                        bytes_done += mb.len() as u64;
                         let wrote = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
                             r = a_writer.write_multi_buffer(mb) => r,
                         };
+                        // 写错只收敛本向（pipe 关闭是正常收尾，同 stream 桥 50074b2 语义）。
                         if wrote.is_err() {
-                            break;
+                            break LegExit::Eof;
                         }
                     },
-                    _ => break,
+                    Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
+                    Err(e) => break leg_read_err("chain_down_read", bytes_done, e),
                 }
-            }
+            };
             let _ = Budget::tokio()
                 .deadline(std::time::Duration::from_secs(3))
                 .timeout(a_writer.shutdown_flush())
                 .await;
             let _ = down_done_tx.send(Some(uplink_only));
-            io::Result::Ok(())
+            exit
         }
     };
 
     let (up_res, down_res) = tokio::join!(up, down);
-    up_res.and(down_res)
+    first_leg_error([up_res, down_res])
 }
 
 /// 默认策略的便捷包装（保留旧 API 兼容调用方）。
@@ -2078,6 +2137,77 @@ mod tests {
             .expect("bridge must finish after window expiry")
             .expect("bridge join");
         assert!(res.is_ok());
+    }
+
+    /// 诊断面回归门（bd myppb）：读腿真实 IO 错误必须上浮——整体返回 `Err`
+    /// 且**保留原始 kind**，另一腿的正常 EOF 不得掩盖它（改造前 `_ => break`
+    /// 把两者并成一类，腿恒返 `Ok(())` ⇒ dispatcher 的 warn 是死代码）。
+    #[tokio::test]
+    async fn bridge_stream_full_read_err_surfaces_with_kind() {
+        use std::future::Future;
+
+        use xray_buf::{
+            io::{Error as BufError, Reader, Result as BufResult},
+            multi::MultiBuffer,
+        };
+
+        use crate::link::Link;
+
+        /// 读恒报 ConnectionReset 的 mock link.reader。
+        struct ResetReader;
+        impl Reader for ResetReader {
+            fn read_multi_buffer(
+                &mut self,
+            ) -> Pin<Box<dyn Future<Output = BufResult<MultiBuffer>> + Send + '_>> {
+                Box::pin(std::future::ready(Err(BufError::ReadIo(std::io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "reset by peer",
+                )))))
+            }
+        }
+
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(ResetReader), Box::new(dn_w));
+        // 下行（另一腿）正常 EOF：对端 drop。
+        let (stream_peer, stream) = tokio::io::duplex(8192);
+        drop(stream_peer);
+
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        let err = res.expect_err("read-leg error must surface, not be swallowed like EOF");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "kind must survive the leg");
+        let _ = dn_r;
+    }
+
+    /// 诊断面回归门（bd myppb）：全腿正常收尾仍是 `Ok(())`。上行 pipe 关闭时
+    /// 读腿拿到的是 `Error::Eof`（**不是**错误），下行对端 EOF —— 两者都必须
+    /// 只算收尾，否则每条正常结束的连接都会变成 error 日志。
+    #[tokio::test]
+    async fn bridge_stream_full_all_legs_eof_returns_ok() {
+        use xray_buf::io::Writer;
+
+        use crate::link::Link;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (stream_peer, stream) = tokio::io::duplex(8192);
+
+        drop(stream_peer); // 下行 EOF
+        up_w.shutdown(); // 上行 pipe close → 读腿报 Error::Eof（正常收尾）
+
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        assert!(res.is_ok(), "normal EOF ends must stay Ok, got {res:?}");
+        let _ = dn_r;
     }
 
     /// 对称回归门：下行 writer 写 link.writer 恒错时仅下行收敛，上行数据

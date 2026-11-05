@@ -308,8 +308,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> SsStreamConn<C> {
         if !self.ss.has_pending_client_2022() {
             return Poll::Ready(Ok(()));
         }
-        let (wire, _used) =
-            self.ss.build_client_2022_header(&[]).map_err(|e| io::Error::other(e.to_string()))?;
+        let (wire, _used) = self
+            .ss
+            .build_client_2022_header(&[])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.head.clear();
         self.head.extend_from_slice(&wire);
         self.out = Out::Header { done: 0 };
@@ -376,7 +378,13 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncRead for SsStreamConn<C> {
                     let _ = Pin::new(me.ss.get_mut()).poll_shutdown(cx);
                     return Poll::Ready(Ok(()));
                 },
-                Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+                // 协议/AEAD 解帧错：保 kind（InvalidData），文案不改。
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )));
+                },
             }
         }
     }
@@ -405,7 +413,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
         // ③ 满块 → 原地 seal（落线由后续 poll 推进）。
         if me.staged >= me.up_cap() {
             if let Err(e) = me.seal_stage() {
-                return Poll::Ready(Err(io::Error::other(e.to_string())));
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
             }
         }
         Poll::Ready(Ok(n))
@@ -422,7 +430,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
         // ② 暂存明文封块并落线（尾块 = 应用侧批次边界，与旧泵「读到多少封多少」同）。
         if me.staged > 0 {
             if let Err(e) = me.seal_stage() {
-                return Poll::Ready(Err(io::Error::other(e.to_string())));
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
             }
             match me.poll_out(cx) {
                 Poll::Ready(Ok(())) => {},
@@ -438,8 +446,10 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
         let me = self.get_mut();
         // ① 未发客户端请求头时兜底发出（Go requestDone 恒写请求头，payload 可为空）。
         if me.ss.has_pending_client_2022() {
-            let (wire, _used) =
-                me.ss.build_client_2022_header(&[]).map_err(|e| io::Error::other(e.to_string()))?;
+            let (wire, _used) = me
+                .ss
+                .build_client_2022_header(&[])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             me.head.clear();
             me.head.extend_from_slice(&wire);
             me.out = Out::Header { done: 0 };
@@ -447,7 +457,7 @@ impl<C: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SsStreamConn<C> {
         // ② 暂存明文封块落线。
         if me.staged > 0 {
             if let Err(e) = me.seal_stage() {
-                return Poll::Ready(Err(io::Error::other(e.to_string())));
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())));
             }
         }
         // ③ 冲刷待落线内容 + 关底层写向（FIN）。

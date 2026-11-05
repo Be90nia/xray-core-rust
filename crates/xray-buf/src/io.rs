@@ -29,6 +29,15 @@ pub enum Error {
     #[error("write error: {0}")]
     WriteError(String),
 
+    /// 读取失败的底层 std 错误：保留 `kind`（`ReadError` 只剩 string，
+    /// 诊断面无法区分 ConnectionReset / UnexpectedEof / BrokenPipe）。
+    #[error("read error: {0}")]
+    ReadIo(std::io::Error),
+
+    /// 写入失败的底层 std 错误：同 [`Error::ReadIo`] 保留 `kind`。
+    #[error("write error: {0}")]
+    WriteIo(std::io::Error),
+
     /// 超时
     #[error("timeout")]
     TimeoutError,
@@ -45,16 +54,19 @@ pub enum Error {
 /// 判断是否为读取错误
 #[inline]
 pub fn is_read_error(err: &Error) -> bool {
-    matches!(err, Error::ReadError(_))
+    matches!(err, Error::ReadError(_) | Error::ReadIo(_))
 }
 
 /// 判断是否为写入错误
 #[inline]
 pub fn is_write_error(err: &Error) -> bool {
-    matches!(err, Error::WriteError(_))
+    matches!(err, Error::WriteError(_) | Error::WriteIo(_))
 }
 
 /// 将 std::io::Error 转换为本模块的 Error，自动分类读写
+///
+/// 保留底层 `err`（`ReadIo`/`WriteIo`）而不降级成 string——`kind` 是诊断面
+/// 上区分「对端 Reset」与「正常 EOF」的唯一信息。
 pub fn classify_io_error(err: std::io::Error, is_read: bool) -> Error {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return Error::TimeoutError;
@@ -62,7 +74,20 @@ pub fn classify_io_error(err: std::io::Error, is_read: bool) -> Error {
     if err.kind() == std::io::ErrorKind::Interrupted {
         return Error::Interrupted;
     }
-    if is_read { Error::ReadError(err.to_string()) } else { Error::WriteError(err.to_string()) }
+    if is_read { Error::ReadIo(err) } else { Error::WriteIo(err) }
+}
+
+/// 保 `kind` 转回 std 错误（[`Error::ReadIo`]/[`Error::WriteIo`] 原样归还）。
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        match err {
+            Error::ReadIo(e) | Error::WriteIo(e) => e,
+            Error::TimeoutError => std::io::ErrorKind::TimedOut.into(),
+            Error::Interrupted => std::io::ErrorKind::Interrupted.into(),
+            Error::Eof => std::io::ErrorKind::UnexpectedEof.into(),
+            Error::ReadError(_) | Error::WriteError(_) => std::io::Error::other(err.to_string()),
+        }
+    }
 }
 
 // ========== Result 类型 ==========
@@ -297,6 +322,27 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe");
         let err = classify_io_error(io_err, false);
         assert!(is_write_error(&err));
+    }
+
+    /// 诊断面回归门：分类后的错误必须仍能还出原始 `io::ErrorKind`，
+    /// 否则 bridge 侧只能看到字符串「read error: …」，无法区分 Reset 与 EOF。
+    #[test]
+    fn test_classify_io_error_preserves_kind() {
+        let read = classify_io_error(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer"),
+            true,
+        );
+        assert!(is_read_error(&read));
+        let read: std::io::Error = read.into();
+        assert_eq!(read.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(read.to_string(), "reset by peer");
+
+        let write = classify_io_error(
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"),
+            false,
+        );
+        assert!(is_write_error(&write));
+        assert_eq!(std::io::Error::from(write).kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
