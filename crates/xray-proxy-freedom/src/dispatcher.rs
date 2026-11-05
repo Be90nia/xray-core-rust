@@ -1,9 +1,10 @@
 //! Freedom outbound → DialBridge 适配器（阶段 1 切片 1e）。
 //!
 //! Freedom 是直连代理——直接拨号到目标，无中间服务器。所以 DialFn 闭包不需要
-//! 捕获任何 client 配置，直接调 [`dial_system`] 返回 [`Connection`]。
+//! 捕获任何 client 配置，直接调 [`dial_system_with_retry_budget`] 返回 [`Connection`]。
 //!
-//! `dial_system` 已返回 `Box<dyn Connection>`，无需 wrapper。
+//! `dial_system_with_retry_budget` 已返回 `Box<dyn Connection>`（deadline 锚一次、
+//! 整链共享重试预算），无需 wrapper。
 //!
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
