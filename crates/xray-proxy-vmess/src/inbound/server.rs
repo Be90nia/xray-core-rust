@@ -811,6 +811,127 @@ mod tests {
         run_vmess_e2e(SecurityType::Chacha20Poly1305).await;
     }
 
+    /// e2e（bd degg3）：VMess **请求方向提前 EOF、响应续传**。
+    ///
+    /// 客户端写完整请求后立刻 EOF（一次性请求，Go `requestDone` 返回），响应
+    /// 方向必须继续收满。客户端侧走生产桥 `bridge_link_with_stream_full`：上行
+    /// EOF 只写**终止 chunk**（Go `outbound.go:180`）、不向 VMess conn 发 FIN
+    /// （`requestDone` 完成后不碰 conn，freedom.go:372/386-455）。
+    /// 注：目标端不等请求 EOF 才回应——Go freedom 同样不向目标转发半关闭
+    /// （freedom.go:386-455 只 `buf.Copy`，`conn.Close()` 在 Process 尾部），
+    /// 故「读满请求才回」的目标在 Go 侧同样会挂，不是本桥的语义。
+    #[tokio::test]
+    async fn vmess_outbound_request_eof_response_continues_e2e() {
+        use std::time::Duration;
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            time::timeout,
+        };
+        use xray_buf::io::Writer;
+
+        use crate::dispatcher::{VmessOutboundConfig, make_vmess_dial_fn};
+
+        // 1. 目标服务器：收到完整 5 字节请求即回 128KiB 响应（不等请求 EOF—— Go freedom 的
+        //    requestDone 同样不向目标转发半关闭，freedom.go:386-455）
+        let resp: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener.local_addr().unwrap().port();
+        let resp_for_task = resp.clone();
+        xray_common::testing::spawn("vmess-up-eof-target", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut got = Vec::new();
+            while got.len() < b"hello".len() {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                }
+            }
+            let out: &[u8] = if got == b"hello" { &resp_for_task } else { b"BAD" };
+            let _ = sock.write_all(out).await;
+            let _ = sock.shutdown().await;
+        });
+
+        // 2. serve_vmess + freedom（与生产 wiring 一致）
+        let ohm = make_ohm_with_freedom();
+        let (validator, _cmd_key) = make_validator_with_user();
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vmess_addr = vmess_listener.local_addr().unwrap();
+        xray_common::testing::spawn("vmess-up-eof-serve", async move {
+            let _ = serve_vmess(
+                test_ctx(),
+                vmess_listener,
+                ohm,
+                validator,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // 3. 出站 VMess conn（真实 dial：请求头 + chunk AEAD 全部走生产代码）
+        let uuid = UUID::parse(SAMPLE_UUID_STR).expect("uuid");
+        let cfg = Arc::new(
+            VmessOutboundConfig::new(
+                uuid,
+                Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+                Port::new(vmess_addr.port()),
+            )
+            .with_security(SecurityType::Aes128Gcm),
+        );
+        let dial = make_vmess_dial_fn(cfg, test_ctx());
+        let dest =
+            Destination::tcp(Address::ipv4(std::net::Ipv4Addr::LOCALHOST), Port::new(target_port));
+        let conn = timeout(Duration::from_secs(10), dial(&dest))
+            .await
+            .expect("dial timeout")
+            .expect("tcp dial");
+
+        // 4. 生产桥：link ↔ VMess conn
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (mut dn_r, dn_w) = xray_buf::pipe::new();
+        let link = xray_transport::link::Link::new(Box::new(up_r), Box::new(dn_w));
+        let policy = xray_features::policy::TimeoutPolicy {
+            handshake: Duration::from_secs(5),
+            connection_idle: Duration::from_secs(30),
+            uplink_only: Duration::from_secs(5),
+            downlink_only: Duration::from_secs(5),
+        };
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
+        let bridge = tokio::spawn(async move {
+            xray_transport::bridge::bridge_link_with_stream_full(link, conn, &policy).await
+        });
+
+        // 5. 请求写完后立刻 EOF（请求方向提前结束）
+        let mut mb = xray_buf::multi::MultiBuffer::new();
+        mb.merge_bytes(b"hello");
+        up_w.write_multi_buffer(mb).await.expect("write request");
+        up_w.shutdown();
+
+        // 6. 响应必须完整送达（仅靠半窗超时收摊 = 失败）
+        let mut got: Vec<u8> = Vec::new();
+        let read_all = async {
+            loop {
+                match dn_r.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => got.extend_from_slice(&mb.to_vec()),
+                    Ok(_) | Err(xray_buf::io::Error::Eof) => break,
+                    Err(e) => panic!("down read: {e}"),
+                }
+            }
+        };
+        timeout(Duration::from_secs(20), read_all)
+            .await
+            .expect("response must arrive after request EOF");
+        assert_eq!(got, resp, "response must come through complete after request EOF");
+        let _ = timeout(Duration::from_secs(10), bridge).await.expect("bridge must finish");
+    }
+
     /// 回归（生产 30 分钟 199 次 `vmess mux command not yet supported`）：Mux
     /// command 不再被拒。Go 语义（encoding/server.go:207-211）：Mux 头无地址字段，
     /// dest 恒 `v1.mux.cool:0`；carrier 拦截在上层 dispatcher 装饰器

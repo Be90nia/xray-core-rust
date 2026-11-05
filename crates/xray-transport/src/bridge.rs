@@ -347,7 +347,8 @@ async fn wait_abort(rx: &mut tokio::sync::watch::Receiver<bool>) {
 /// 改造前每条腿的读循环把「`Ok(空块)`/`Error::Eof`」与「真实 IO 错误」并进
 /// 同一个 `_ => break`，且腿恒返 `Ok(())` ⇒ dispatcher 的
 /// `bridge ended: {e}` 是死代码，中继侧零痕迹。此处只区分**记什么**与
-/// **返回什么**，break 点、shutdown、半窗、budget 记账一行未动。
+/// **返回什么**，break 点、半窗、budget 记账一行未动（收尾 shutdown 的口径
+/// 另由 bd degg3 改：上行正常 EOF 不再拆对端写向，见 `up_writer` 尾）。
 enum LegExit {
     /// 正常收尾：流 EOF、对向级联退出、读侧超时判定断连。
     Eof,
@@ -399,6 +400,14 @@ fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
 /// 传给对向腿，无静默半断；写错误只关本向写半部，绝不 shutdown 对向
 /// （50074b2 教训：瞬时写错 shutdown link.writer = 下行永久断）。
 ///
+/// **上行正常 EOF 不拆对端写向（bd degg3）**：Go `requestDone` 完成后只设
+/// 半关闭 timer、不碰 conn（freedom.go:386-455），`conn.Close()` 统一在
+/// Process 尾部（:372）——即「请求发完」不等于「向服务端发 FIN」。桥层因此
+/// 只在**中止/读错误**时 `shutdown()` 本向写半部；正常 EOF 仅把协议层结束
+/// 标记推上线（`Connection::request_end_signal`，如 vmess 终止 chunk）后
+/// flush，底层写向留到连接 drop。旧语义「上行 EOF 即 FIN」会让服务端把 FIN
+/// 判成请求结束而停发，curl 先见 EOF（cna1g 形态）。
+///
 /// 接收 `&TimeoutPolicy` 把 connIdle / uplinkOnly / downlinkOnly 三个超时下放到
 /// 桥接层（Go `policy.Timeout` 语义，bd 4-6 修复：之前硬编码 DEFAULT_* 常量，
 /// dispatcher 取出的 per-user Policy 不生效）。
@@ -444,6 +453,9 @@ where
     // 缺省 0 = 池化 8KB 不变；btls SSL_read 单 record 零收益，vision/reality
     // 包装层不转发即保持批边界语义）。
     let tls_readbuf = stream.tls_readbuf_size();
+    // 协议层请求结束标记句柄（bd degg3）：必须在 split 前取——拆半后拿不到
+    // `&S`。上行正常 EOF 时由 up_writer 置位 + flush 触发（vmess 终止 chunk）。
+    let request_end = stream.request_end_signal();
     let (s_read_half, mut s_write) = tokio::io::split(stream);
     let mut s_read: Box<dyn Reader> = match (frozen, s_read_dup, tls_readbuf) {
         (Some(r), _, _) => r,
@@ -486,11 +498,18 @@ where
     // 零额外拷贝：缓冲区仍按原路 move，select 只多 poll 一个 watch。
     let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
+    // 上行读腿是否**正常 EOF**（请求方向自然结束，含 Ok(空块) 与
+    // `xray_buf::Error::Eof`）。up_writer 收尾据此决定是否拆对端写向（bd degg3）：
+    // 本 flag 在 up_reader 里于 drop up_tx 之前置位，up_writer 观察到
+    // `up_rx.recv() == None` 时必然可见。
+    let up_graceful = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // 上行 reader：link.reader → up_tx。超时语义与串行版逐行等价：
     // conn_idle 双向存活空闲断开；对向读侧结束后本向仅剩 half_window 宽限。
     let up_reader = {
         let abort_tx = abort_tx.clone();
         let mut abort_rx = abort_rx.clone();
+        let up_graceful = std::sync::Arc::clone(&up_graceful);
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
@@ -539,8 +558,17 @@ where
                             break LegExit::Eof;
                         }
                     },
-                    Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
-                    Err(e) => break leg_read_err("up_read", bytes_done, e),
+                    Ok(_) => {
+                        up_graceful.store(true, std::sync::atomic::Ordering::Release);
+                        break LegExit::Eof; // 正常 EOF（空块）
+                    },
+                    Err(e) => {
+                        let exit = leg_read_err("up_read", bytes_done, e);
+                        if matches!(exit, LegExit::Eof) {
+                            up_graceful.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        break exit;
+                    },
                 }
             };
             let _ = up_done_tx.send(Some(downlink_only));
@@ -571,11 +599,23 @@ where
                     break;
                 }
             }
-            // 无条件 shutdown（EOF 排空收尾与写错误收尾同路径），只关本向写半部。
-            // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
-            // 传播 half_window，对向不静默半断。3s 界：对端不读时 shutdown 自身
-            // 也会挂（对称下方 shutdown_flush 的既有界）。
-            let _ = timeout(std::time::Duration::from_secs(3), s_write.shutdown()).await;
+            // 收尾：**正常 EOF 不拆对端写向**（bd degg3 / Go freedom requestDone
+            // 完成后只设 timer、不碰 conn，`conn.Close()` 在 Process 尾部：
+            // freedom.go:372/386-455）。旧语义无条件 shutdown 会让服务端把
+            // 「我方 FIN」判成请求结束而停发，curl 先见 EOF（cna1g 形态）。
+            // 正常 EOF 只把**协议层**结束标记推上线（vmess 终止 chunk，见
+            // `Connection::request_end_signal`），无标记协议纯 flush；底层写向
+            // 留到 conn drop（两半都放掉 = Go 的 Process 尾部 Close）。
+            // 超时/错误/显式中止仍 shutdown 本向写半部（3s 界：对端不读时
+            // shutdown 自身也会挂，对称下方 shutdown_flush 的既有界）。
+            if up_graceful.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(signal) = &request_end {
+                    signal.store(true, std::sync::atomic::Ordering::Release);
+                }
+                let _ = timeout(std::time::Duration::from_secs(3), s_write.flush()).await;
+            } else {
+                let _ = timeout(std::time::Duration::from_secs(3), s_write.shutdown()).await;
+            }
             io::Result::Ok(())
         }
     };
@@ -946,6 +986,16 @@ pub async fn bridge_link_with_link(
                 }
             };
             // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
+            //
+            // bd degg3 判定：此处 close **保留**（与 stream 桥的上行 EOF 不同）。
+            // 本函数的对端是 `xray_buf::pipe::Writer`（生产唯一调用方
+            // dispatcher `dispatch_via_chain` 用两对 pipe 建 client/chained link），
+            // 而 pipe 的 EOF 只能由 `close()` 给出——`Writer` 是 `Arc<PipeShared>`
+            // 的克隆句柄且无 `Drop` 关闸（pipe.rs `close` 注释「读端读完 buffered
+            // 后返回 EOF；多次调用幂等」），drop 写端不会关 pipe。跳过 close 会让
+            // 链式 handler 的读端永远等不到 EOF，挂到 conn_idle 才收摊。
+            // 即：这里关的是**进程内 pipe 的 EOF 信号**，不是向远端发 FIN，
+            // cna1g 形态（上行 EOF 向服务端 shutdown）不在此处。
             let _ = Budget::tokio()
                 .deadline(std::time::Duration::from_secs(3))
                 .timeout(b_writer.shutdown_flush())
@@ -2181,6 +2231,212 @@ mod tests {
         let err = res.expect_err("read-leg error must surface, not be swallowed like EOF");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset, "kind must survive the leg");
         let _ = dn_r;
+    }
+
+    /// 记录 `poll_shutdown` 调用次数的 stream 包装（bd degg3 回归门）。
+    struct ShutdownProbe<S> {
+        inner: S,
+        shutdowns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownProbe<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownProbe<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.shutdowns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl<S: AsyncRead + AsyncWrite + Send + Sync + Unpin> Connection for ShutdownProbe<S> {
+        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+    }
+
+    /// bd degg3 核心回归门：**上行正常 EOF 不拆对端写向**，且下行数据完整送达。
+    ///
+    /// Go 锚点：freedom.go `requestDone` 完成后只 `SetTimeout(DownlinkOnly)`、
+    /// 从不碰 conn（`defer conn.Close()` 在 Process 尾部 :372）。旧语义在上行
+    /// EOF 即 `s_write.shutdown()`（对服务端 FIN），服务端判请求结束停发 ⇒
+    /// curl 先见 EOF（cna1g 形态）。
+    #[tokio::test]
+    async fn bridge_stream_full_up_eof_does_not_shutdown_stream_write() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+
+        use xray_buf::io::Writer;
+
+        use crate::link::Link;
+
+        let (up_r, mut up_w) = xray_buf::pipe::new();
+        let (mut dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (mut peer, stream) = tokio::io::duplex(8192);
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let probe_count = Arc::clone(&shutdowns);
+        let policy = xray_features::policy::TimeoutPolicy {
+            handshake: Duration::from_secs(5),
+            connection_idle: Duration::from_secs(10),
+            uplink_only: Duration::from_secs(5),
+            downlink_only: Duration::from_secs(5),
+        };
+
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务")]
+        let bridge = tokio::spawn(async move {
+            bridge_link_with_stream_full(
+                link,
+                Box::new(ShutdownProbe { inner: stream, shutdowns: probe_count })
+                    as Box<dyn Connection>,
+                &policy,
+            )
+            .await
+        });
+
+        // 请求方向：一段请求后 EOF（= 请求发完，Go requestDone 返回）
+        let mut req = xray_buf::multi::MultiBuffer::new();
+        req.merge_bytes(b"GET / HTTP/1.1\r\n\r\n");
+        up_w.write_multi_buffer(req).await.unwrap();
+        up_w.shutdown();
+
+        // 对端收到请求，且**没有**收到我方半关闭 → 响应照常回
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("peer must receive request")
+            .unwrap();
+        assert_eq!(&buf[..n], b"GET / HTTP/1.1\r\n\r\n");
+
+        let resp: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        peer.write_all(&resp).await.unwrap();
+        peer.shutdown().await.unwrap(); // 响应发完 → 下行 EOF
+
+        // 下行数据必须完整送达（旧语义的 FIN 会让服务端停发）
+        let mut got: Vec<u8> = Vec::new();
+        while let Ok(mb) = dn_r.read_multi_buffer().await {
+            if mb.is_empty() {
+                break;
+            }
+            got.extend_from_slice(&mb.to_vec());
+        }
+        assert_eq!(got, resp, "downlink must arrive complete after up EOF");
+
+        let res = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must finish")
+            .expect("bridge join");
+        assert!(res.is_ok());
+        assert_eq!(
+            shutdowns.load(Ordering::Relaxed),
+            0,
+            "graceful up EOF must NOT shutdown the peer write direction (bd degg3)"
+        );
+    }
+
+    /// bd degg3 反向门：**上行读错误**（非 EOF）仍按 50074b2 语义收敛本向——
+    /// shutdown 保留给 abort（超时/错误/显式关闭），错误 kind 照常上浮。
+    #[tokio::test]
+    async fn bridge_stream_full_up_read_err_still_shuts_down() {
+        use std::{
+            future::Future,
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+
+        use xray_buf::{
+            io::{Error as BufError, Reader, Result as BufResult},
+            multi::MultiBuffer,
+        };
+
+        use crate::link::Link;
+
+        /// 先给一批数据，再报 ConnectionReset。
+        struct DataThenReset {
+            sent: bool,
+        }
+        impl Reader for DataThenReset {
+            fn read_multi_buffer(
+                &mut self,
+            ) -> Pin<Box<dyn Future<Output = BufResult<MultiBuffer>> + Send + '_>> {
+                if self.sent {
+                    return Box::pin(std::future::ready(Err(BufError::ReadIo(
+                        std::io::Error::new(io::ErrorKind::ConnectionReset, "reset by peer"),
+                    ))));
+                }
+                self.sent = true;
+                Box::pin(async {
+                    let mut mb = MultiBuffer::new();
+                    mb.merge_bytes(b"req");
+                    Ok(mb)
+                })
+            }
+        }
+
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(DataThenReset { sent: false }), Box::new(dn_w));
+        let (peer, stream) = tokio::io::duplex(8192);
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let policy = xray_features::policy::TimeoutPolicy {
+            handshake: Duration::from_secs(5),
+            connection_idle: Duration::from_secs(5),
+            uplink_only: Duration::from_millis(200),
+            downlink_only: Duration::from_millis(200),
+        };
+
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(ShutdownProbe { inner: stream, shutdowns: Arc::clone(&shutdowns) })
+                as Box<dyn Connection>,
+            &policy,
+        )
+        .await;
+
+        let err = res.expect_err("up read error must surface");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            shutdowns.load(Ordering::Relaxed),
+            1,
+            "read error is an abort path — the write half must still be shut down"
+        );
+        let _ = (dn_r, peer);
     }
 
     /// 诊断面回归门（bd myppb）：全腿正常收尾仍是 `Ok(())`。上行 pipe 关闭时

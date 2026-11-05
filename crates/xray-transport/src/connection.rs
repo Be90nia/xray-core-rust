@@ -98,6 +98,20 @@ pub trait Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin {
         0
     }
 
+    /// 上行请求方向正常结束的信号句柄（bd degg3）。
+    ///
+    /// 桥层在 up 读腿**正常 EOF** 时置位并 flush 输出方向；协议 conn 在自己的
+    /// `poll_flush` 里看到置位即写**协议层**结束标记（vmess 终止 chunk，对齐 Go
+    /// `outbound.go:180` 的 `bodyWriter2.WriteMultiBuffer(empty)`），但**不**拆底层
+    /// 写向——Go `requestDone` 完成后只设半关闭 timer、不碰 conn
+    /// （freedom.go:386-455），`conn.Close()` 统一在 Process 尾部（:372）。
+    ///
+    /// 缺省 `None` = 本协议线路上没有请求结束标记（vless/ss/trojan：Go 同样不写），
+    /// 桥层正常 EOF 时只 flush、不 shutdown 对端写向。
+    fn request_end_signal(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+
     /// 下行零拷贝读腿钩子（bd oarfu）：连接能直接把收到的 `Bytes` 块作为
     /// 只读缓冲交出时返回 `Some`（h2/h3 等"数据到达即 `Bytes` 所有权"的传输）。
     ///
