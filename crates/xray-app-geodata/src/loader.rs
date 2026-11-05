@@ -137,7 +137,7 @@ pub struct GeodataLoadPool {
 }
 
 impl GeodataLoadPool {
-    /// 组装互喂池（**不建线程**：worker 首次 submit 时才拉起，见 [`Self::pool`]）。
+    /// 组装互喂池（**不建线程**：worker 首次 submit 时才拉起，见 `Self::pool`）。
     ///
     /// 非法参数（0 值 / `core > max` / `queue_cap == 0`）构造期 fail-fast
     /// panic（恒不合法 = 调用方 bug，同 udf 纪律）：udf 的同源校验在
@@ -195,7 +195,7 @@ impl GeodataLoadPool {
 
     /// 线程池管理面（resize / metrics / shutdown+join / 审计订阅）。
     ///
-    /// `None` = 池尚未建（无消费方 ⇒ 零线程，见 [`Self::pool`]）。
+    /// `None` = 池尚未建（无消费方 ⇒ 零线程，见 `Self::pool`）。
     #[must_use]
     pub fn threads(&self) -> Option<&ThreadPool> {
         self.pool.get().map(|p| p.threads())
