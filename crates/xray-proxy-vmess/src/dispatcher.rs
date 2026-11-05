@@ -431,10 +431,6 @@ pub struct VmessConn {
     frame_pos: usize,
     /// 终止 chunk 已构帧（重入 `poll_shutdown` 不再重复取 nonce）。
     up_done: bool,
-    /// 桥层置位的「请求方向正常结束」信号（bd degg3）：置位后下一次
-    /// `poll_flush` 写终止 chunk，但**不**拆底层写向。见
-    /// `xray_transport::connection::Connection::request_end_signal`。
-    request_end: std::sync::Arc<std::sync::atomic::AtomicBool>,
     // ---- 下行 ----
     resp_cipher: BodyCipher,
     resp_nonce: ChunkNonceGenerator,
@@ -488,7 +484,6 @@ impl VmessConn {
             frame: Vec::with_capacity(up_cap + 96),
             frame_pos: 0,
             up_done: false,
-            request_end: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resp_cipher,
             resp_nonce: ChunkNonceGenerator::new(&resp_iv, 12),
             resp_size_parser: parking_lot::Mutex::new(resp_size_parser),
@@ -516,25 +511,6 @@ impl VmessConn {
         )?;
         self.frame_pos = 0;
         self.stage.clear();
-        Ok(())
-    }
-
-    /// 请求方向收尾：写**终止 chunk**（`seal([])`，服务端 decode 见空明文即
-    /// 请求 body 结束）；`NoTerminationSignal` 实验时省略，靠连接关闭让服务端
-    /// 识别流结束（Go outbound.go:180 同形）。幂等。
-    ///
-    /// 两条触发路径共用：`poll_shutdown`（中止/显式关闭，之后拆底层写向）与
-    /// 桥层置位的 `request_end` 信号（**请求正常 EOF**，只落线不拆写向，
-    /// bd degg3）。
-    fn seal_termination(&mut self) -> std::io::Result<()> {
-        if self.up_done {
-            return Ok(());
-        }
-        self.up_done = true;
-        if self.termination_signal {
-            self.seal_frame(true)
-                .map_err(|e| std::io::Error::other(format!("vmess termination: {e}")))?;
-        }
         Ok(())
     }
 
@@ -703,18 +679,21 @@ impl AsyncWrite for VmessConn {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
-        // 桥层置位「请求方向正常结束」（bd degg3）：写终止 chunk 后落线，
-        // 但**不**拆底层写向——Go requestDone 完成后不碰 conn（freedom.go:372）。
-        if me.request_end.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            me.seal_termination()?;
-        }
         std::task::ready!(me.poll_out(cx))?;
         Pin::new(&mut me.wire).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let me = self.get_mut();
-        me.seal_termination()?;
+        // 终止 chunk（seal([])）：服务端 decode 看到空明文即请求 body 结束；
+        // `NoTerminationSignal` 实验时省略，靠连接关闭让服务端识别流结束。
+        if !me.up_done {
+            me.up_done = true;
+            if me.termination_signal {
+                me.seal_frame(true)
+                    .map_err(|e| std::io::Error::other(format!("vmess termination: {e}")))?;
+            }
+        }
         std::task::ready!(me.poll_out(cx))?;
         std::task::ready!(Pin::new(&mut me.wire).poll_flush(cx))?;
         Pin::new(&mut me.wire).poll_shutdown(cx)
@@ -728,10 +707,6 @@ impl Connection for VmessConn {
 
     fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
         Ok(None)
-    }
-
-    fn request_end_signal(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        Some(std::sync::Arc::clone(&self.request_end))
     }
 }
 
@@ -2123,46 +2098,9 @@ mod tests {
         assert_eq!(wire_len(false).await, 23, "NoTerminationSignal 只留数据帧");
     }
 
-    /// bd degg3：桥层置位的 `request_end` 信号必须让上行写**终止 chunk** 后落线
-    /// （Go outbound.go:180 的 `bodyWriter2.WriteMultiBuffer(empty)`），且不依赖
-    /// `poll_shutdown`——请求正常 EOF 时桥层不再 shutdown 对端写向
-    /// （freedom.go:372：`conn.Close()` 在 Process 尾部），终止 chunk 只能由
-    /// flush 触发。
-    #[tokio::test]
-    async fn request_end_signal_writes_termination_chunk_on_flush() {
-        let data_cipher = || BodyCipher::Aes(Aes128Gcm::new(&[0x42u8; 16]).expect("cipher"));
-        let wire = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut conn = VmessConn::from_conn(
-            Box::new(SinkConn(Arc::clone(&wire))),
-            ClientSession::new(),
-            data_cipher(),
-            [0xAAu8; 16],
-            Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>,
-            false,
-            data_cipher(),
-            [0x11u8; 16],
-            Box::new(PlainSizeParser) as Box<dyn SizeParser + Send>,
-            false,
-            true,
-        );
-        conn.write_all(b"hello").await.expect("write body");
-        conn.flush().await.expect("flush");
-        let after_data = wire.lock().len();
-        assert_eq!(after_data, 23, "数据帧 = 2 size + 5 明文 + 16 tag");
-
-        let signal =
-            Connection::request_end_signal(&conn).expect("vmess 必须暴露 request_end 信号");
-        signal.store(true, std::sync::atomic::Ordering::Release);
-        conn.flush().await.expect("flush");
-        assert_eq!(wire.lock().len(), after_data + 18, "终止帧 = 2 size + 16 tag");
-
-        // 幂等：重复 flush 不重复写终止 chunk
-        conn.flush().await.expect("flush");
-        assert_eq!(wire.lock().len(), after_data + 18, "终止 chunk 只写一次");
-    }
-
     /// 只吞不吐的连接桩（量上行 wire 字节；读侧恒 EOF）。
     struct SinkConn(Arc<parking_lot::Mutex<Vec<u8>>>);
+
     impl AsyncRead for SinkConn {
         fn poll_read(
             self: Pin<&mut Self>,
