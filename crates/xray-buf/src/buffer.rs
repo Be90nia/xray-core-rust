@@ -720,13 +720,20 @@ impl std::fmt::Display for Buffer {
 mod tests {
     use super::*;
 
-    fn init() {
+    /// 取池串行锁并清池，返回守卫（测试期间独占全局池）。
+    ///
+    /// `buffer` 与 `alloc` 测试都碰**进程级**全局池：并发的 `clear()` 会把分片常驻
+    /// 抹零，让 `alloc` 侧「超预算必须丢弃」的断言凭空失效（workspace 全量并行下
+    /// 实测偶发红）。同一把锁 = 两模块测试互斥。
+    fn init() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = alloc::test_serial_guard();
         alloc::clear();
+        guard
     }
 
     #[test]
     fn test_new_buffer() {
-        init();
+        let _g = init();
         let buf = Buffer::new();
         assert!(buf.is_empty());
         assert_eq!(buf.len(), 0);
@@ -737,7 +744,7 @@ mod tests {
     /// （读路径稳态零新鲜分配的直接证据）。
     #[test]
     fn test_pooled_buffer_is_reused_after_drop() {
-        init();
+        let _g = init();
         let mut first = Buffer::new_pooled(64 * 1024);
         assert_eq!(
             first.capacity(),
@@ -757,7 +764,7 @@ mod tests {
 
     #[test]
     fn test_with_capacity() {
-        init();
+        let _g = init();
         let buf = Buffer::with_capacity(1024);
         assert!(buf.is_empty());
         assert!(buf.capacity() >= 1024);
@@ -793,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_write_read() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         let written = buf.write_from(b"hello world");
         assert_eq!(written, 11);
@@ -809,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_write_byte() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         assert!(buf.write_byte(0x41));
         assert!(buf.write_byte(0x42));
@@ -844,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_free_space() {
-        init();
+        let _g = init();
         let buf = Buffer::new();
         let cap = buf.capacity();
         assert_eq!(buf.free(), cap);
@@ -853,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_writable_bytes_and_advance_write() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         let writable = buf.writable_bytes();
         assert!(writable.len() >= alloc::DEFAULT_SIZE);
@@ -873,7 +880,7 @@ mod tests {
     /// 分配地址/容量恒定即证明改造没有引入新的分配或扩容（重分配必然漂移起点）。
     #[test]
     fn writable_view_cycle_does_not_realloc() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new_pooled(alloc::DEFAULT_SIZE);
         let addr = buf.writable_bytes().as_ptr() as usize;
         let cap = buf.capacity();
@@ -899,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_put() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         buf.put(Bytes::from("hello"));
         assert_eq!(buf.len(), 5);
@@ -963,7 +970,7 @@ mod tests {
 
     #[test]
     fn test_resize_grow() {
-        init();
+        let _g = init();
         let mut buf = Buffer::with_capacity(64);
         buf.write_from(b"hi");
         buf.resize(10);
@@ -975,7 +982,7 @@ mod tests {
 
     #[test]
     fn test_release() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         buf.write_from(b"data");
         buf.release();
@@ -985,7 +992,7 @@ mod tests {
 
     #[test]
     fn test_drop_auto_release() {
-        init();
+        let _g = init();
         {
             let mut buf = Buffer::new();
             buf.write_from(b"temporary");
@@ -1022,14 +1029,14 @@ mod tests {
 
     #[test]
     fn test_default() {
-        init();
+        let _g = init();
         let buf = Buffer::default();
         assert!(buf.is_empty());
     }
 
     #[test]
     fn test_large_write() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         let data = vec![0xABu8; 7000];
         let written = buf.write_from(&data);
@@ -1039,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_write_full_buffer() {
-        init();
+        let _g = init();
         let mut buf = Buffer::with_capacity(8);
         let written = buf.write_from(b"12345678");
         assert_eq!(written, 8);
@@ -1050,7 +1057,7 @@ mod tests {
 
     #[test]
     fn test_write_byte_full() {
-        init();
+        let _g = init();
         let mut buf = Buffer::with_capacity(2);
         assert!(buf.write_byte(1));
         assert!(buf.write_byte(2));
@@ -1100,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_udp_cleared_on_release() {
-        init();
+        let _g = init();
         let mut buf = Buffer::new();
         buf.set_udp(Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9090))));
         buf.release();
@@ -1179,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_frozen_release_not_pooled() {
-        init();
+        let _g = init();
         let mut buf = Buffer::from_bytes_frozen(Bytes::from_static(b"temp"));
         assert!(!buf.is_released());
         buf.release();
@@ -1241,7 +1248,7 @@ mod tests {
 
     #[test]
     fn test_frozen_clear_transitions_to_pooled() {
-        init();
+        let _g = init();
         let mut buf = Buffer::from_bytes_frozen(Bytes::from_static(b"gone"));
         buf.clear();
         assert!(buf.is_empty());

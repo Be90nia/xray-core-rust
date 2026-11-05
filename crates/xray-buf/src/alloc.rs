@@ -339,12 +339,23 @@ pub fn stats() -> PoolStats {
     }
 }
 
+/// 串行化触碰全局池 static 的测试（`clear`/`release`/`alloc` 均是进程级共享状态）。
+///
+/// `clear()` 会把分片常驻字节抹零——若与「超预算丢弃」类断言并发，断言会凭空失效
+/// （workspace 全量并行下实测偶发红）。`buffer` 模块测试也走本锁（见
+/// [`test_serial_guard`]）：它同样调 `clear()`。
+#[cfg(test)]
+static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// 取池测试串行锁（跨模块共用；守卫存活期间独占全局池）。
+#[cfg(test)]
+pub(crate) fn test_serial_guard() -> parking_lot::MutexGuard<'static, ()> {
+    POOL_TEST_LOCK.lock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 串行化触碰全局池 static 的测试（clear/release 均是进程级共享状态）。
-    static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_select_tier() {
