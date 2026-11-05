@@ -950,6 +950,75 @@ pub async fn dial_system(
     dialer.dial(src, &dest, sockopt).await
 }
 
+// ===== dial + 重试共享一份墙钟预算（bd n8abk）=====
+
+/// dial + 重试共享一份墙钟预算。
+///
+/// 背景（bd n8abk）：调用方用 [`crate::retry::exponential_backoff`] 包住
+/// [`dial_system`] 时，[`DEFAULT_DIAL_TIMEOUT`]（16s）每次尝试各自生效，重试链
+/// 最坏 `attempts × 16s + Σ退避`（Go `retry.ExponentialBackoff(5,100)` 同款共有
+/// 形状，5 次 ≈ 80.6s）。CF 橘云 + IP 优选部署里「优选 IP 不通」= 黑洞超时，
+/// 每次连接最坏等 80s。本入口把预算提到重试链外层：整条链（含退避）共享
+/// `budget` 一份墙钟——每次尝试只拿**剩余**预算（前序尝试烧掉的墙钟直接压缩
+/// 后续窗口），预算耗尽后重试环停止，不再烧空尝试。最坏总墙钟 ≈ `budget` +
+/// 一层调度余量（预算只在失败后裁决，见 [`crate::retry::exponential_backoff_if`]）。
+///
+/// 并发正确性：无共享状态，每次调用持有独立预算；多任务并发拨号互不干扰
+/// （测试 `concurrent_dials_have_independent_budgets` 钉住）。
+///
+/// # Errors
+/// 全部尝试失败（次数/预算任一先到）时返回 [`crate::retry::RetryError`]。
+pub async fn dial_system_with_retry_budget(
+    destination: &Destination,
+    sockopt: &SocketOptions,
+    attempts: u32,
+    base_delay_ms: u64,
+    budget: std::time::Duration,
+) -> Result<Box<dyn Connection>, crate::retry::RetryError<io::Error>> {
+    retry_dial_shared_budget(attempts, base_delay_ms, budget, || dial_system(destination, sockopt))
+        .await
+}
+
+/// [`dial_system_with_retry_budget`] 的拨号接缝（模式同 [`dial_addr_list`] 的
+/// `attempt`：生产传 [`dial_system`]，测试传可控假拨号钉预算分布）。
+#[allow(
+    clippy::disallowed_methods,
+    reason = "共享预算的剩余窗口取时必须是 tokio::time::Instant（与截断尝试的 tokio timeout 面对齐，start_paused 测试才跟随虚拟钟）；本 crate 无 ctx.clock() 注入面 → 待 Dialer 接 Clock 端口后迁"
+)]
+async fn retry_dial_shared_budget<T, F, Fut>(
+    attempts: u32,
+    base_delay_ms: u64,
+    budget: std::time::Duration,
+    mut f: F,
+) -> Result<T, crate::retry::RetryError<io::Error>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = io::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    crate::retry::exponential_backoff_if(
+        attempts,
+        base_delay_ms,
+        budget,
+        || {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let attempt = f();
+            async move {
+                match tokio::time::timeout(remaining, attempt).await {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "shared dial retry budget exhausted",
+                    )),
+                }
+            }
+        },
+        |_: &io::Error| true,
+    )
+    .await
+}
+
 // ===== 辅助函数 =====
 
 /// 把 `Destination` 转为 `SocketAddr`。切片1 仅处理 IP 地址。
@@ -1120,6 +1189,85 @@ mod tests {
 
     fn localhost_dest(port: u16) -> Destination {
         Destination::tcp(Address::IPv4(Ipv4Addr::LOCALHOST), Port::new(port))
+    }
+
+    /// n8abk：重试链共享一份预算（非每次重置）。假拨号前 2 次立即拒绝（消耗退避
+    /// 0+100ms），第 3 次挂起吃掉剩余预算。共享形态 = 3 次尝试后预算耗尽停止
+    /// （总墙钟 ≈ budget）；每次重置形态 = 后续尝试各拿满 budget（总墙钟
+    /// ≥ 3×budget），次数与耗时断言均可证伪。
+    #[tokio::test]
+    async fn retry_chain_shares_single_budget() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::{Duration, Instant},
+        };
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let budget = Duration::from_millis(900);
+        let calls_c = std::sync::Arc::clone(&calls);
+        let started = Instant::now();
+        let err = match retry_dial_shared_budget(5, 100, budget, move || {
+            let calls = std::sync::Arc::clone(&calls_c);
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+                } else {
+                    // 第 3 次起挂起：吃满剩余预算（真实黑洞拨号的确定性替身，
+                    // 不依赖本机路由/防火墙行为）。
+                    std::future::pending::<io::Result<Box<dyn Connection>>>().await
+                }
+            }
+        })
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("budget must exhaust while fake dial hangs"),
+        };
+        let elapsed = started.elapsed();
+
+        // 次数断言是本测试的证伪核心：预算耗尽后环必须停止（退化为「每次重置」
+        // 形态会烧满 5 次尝试）。
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "预算耗尽后必须停止重试（每次重置形态会烧满 5 次）"
+        );
+        assert_eq!(err.errors.len(), 2, "refused 相邻去重一条 + 超时一条");
+        assert_eq!(err.errors[0].kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(err.errors[1].kind(), io::ErrorKind::TimedOut);
+        // 共享形态 ≈ budget + 调度余量；每次重置形态下界 ≈ budget×3 + 退避 ≥ 2.7s。
+        assert!(elapsed >= budget, "预算未生效: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(2500), "预算未共享（每次重置形态）: {elapsed:?}");
+    }
+
+    /// n8abk：并发拨号各持独立预算池——一个任务的预算消耗不干扰另一个，两者都在
+    /// 各自 budget 附近完成。串行化/共池形态（两任务分摊一份预算 → 各 ~300ms，
+    /// 或排队 → ~1.2s）都会落进红区。
+    #[tokio::test]
+    async fn concurrent_dials_have_independent_budgets() {
+        use std::time::{Duration, Instant};
+
+        let budget = Duration::from_millis(600);
+        let hang = || std::future::pending::<io::Result<Box<dyn Connection>>>();
+        let started = Instant::now();
+        let (r1, r2) = tokio::join!(
+            retry_dial_shared_budget(3, 10, budget, hang),
+            retry_dial_shared_budget(3, 10, budget, hang),
+        );
+        let elapsed = started.elapsed();
+
+        assert!(r1.is_err() && r2.is_err(), "预算内未完成即须失败");
+        // 共池分摊形态会提前于 budget 结束。
+        assert!(elapsed >= budget, "预算未生效（被并发任务分摊）: {elapsed:?}");
+        // 排队/串行形态会在 budget×2 附近结束。
+        assert!(elapsed < Duration::from_millis(1000), "并发互相拖长: {elapsed:?}");
+        let (e1, e2) = match (r1, r2) {
+            (Err(e1), Err(e2)) => (e1, e2),
+            _ => panic!("both dials must fail on budget exhaustion"),
+        };
+        assert_eq!(e1.errors.len(), 1);
+        assert_eq!(e2.errors.len(), 1);
     }
 
     /// nd006：环回「端口无人监听」必须快速失败，且错误是真实拒绝而非拨号超时。

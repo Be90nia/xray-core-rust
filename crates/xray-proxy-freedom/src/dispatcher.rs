@@ -13,12 +13,42 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
-use xray_transport::{connection::Connection, sockopt::SocketOptions, system_dialer::dial_system};
+use xray_transport::{
+    connection::Connection, sockopt::SocketOptions, system_dialer::dial_system_with_retry_budget,
+};
 
 use crate::config::Config;
 
-/// bd 7p1m：TCP 出站默认接收缓冲（字节）。见 make_dial_fn_with_sockopt 内注释。
-const OUTBOUND_TCP_RCVBUF: i32 = 4 * 1024 * 1024;
+/// bd r5j96：TCP 出站**不设置** SO_RCVBUF（字节，0 = 不设置）。见
+/// make_dial_fn_with_sockopt 内注释。
+///
+/// 显式 `setsockopt(SO_RCVBUF)` 在两平台都是「关掉接收窗 autotune 并把窗钉在
+/// 请求值」而非「抬上限」：Windows 关掉 Winsock autotune（吞吐=窗/RTT）；Linux
+/// 受 `net.core.rmem_max` 静默钳制（stock 208KB）+ 锁 autotune → 窗钉 208KB
+/// （WSL netem RTT 300ms 实测 ours 0.80 vs Go/sing-box 7.43MB/s，9 倍差）。
+/// Go xray / sing-box 均从不设此项 → 本缺省与之对齐。
+const OUTBOUND_TCP_RCVBUF: i32 = 0;
+
+/// freedom 出站 sockopt 构造（bd r5j96）。
+///
+/// 独立成 fn 是为了**可测**：`receive_buffer_size` 的 TCP / UDP 取值差异只能从
+/// 实际流向 socket 的产出值上断言（常量改了但接线没改、或反之，都要抓得到）。
+///
+/// `receive_buffer_size` 分两支的原因：TCP 缺省 = 0（不设置，交 OS autotune）；
+/// UDP 必须恒为 0——QUIC 端点走 Go quic-go `wrapConn` 的 8MB floor 语义
+/// （见 `xray_transport::sockopt::bind_udp_endpoint`），非 0 会顶掉那个下限。
+fn outbound_sockopt(
+    domain_strategy: xray_transport::sockopt::DomainStrategy,
+    dialer_proxy: String,
+    network: Network,
+) -> SocketOptions {
+    SocketOptions {
+        domain_strategy,
+        dialer_proxy,
+        receive_buffer_size: if network == Network::TCP { OUTBOUND_TCP_RCVBUF } else { 0 },
+        ..SocketOptions::default()
+    }
+}
 
 /// 构造 Freedom 的 DialFn 闭包（默认配置）。
 ///
@@ -63,32 +93,29 @@ pub fn make_dial_fn_with_sockopt(config: Config, dialer_proxy: String) -> DialFn
             // destinationOverride 改写（Go :269-279；isValidAddress 排除 AnyIP）
             let dial_dest =
                 crate::config::apply_destination_override(&dest, destination_override.as_ref());
-            // bd 7p1m：TCP 出站默认 SO_RCVBUF 4MB。内核 DRS（tcp_moderate_rcvbuf）
-            // 对「快排空 relay」结构性自稳定：收端即时排空 → 接收队列恒空 →
-            // rcv_rtt=真实 RTT、space=窗字节数 → rcvbuf 目标恒等于当前值，
-            // autotune 永不逃逸 → 接收窗钉死 64KB、高 RTT 吞吐=窗/RTT
-            // （netem 150ms 实测 0.31MB/s，Go 对照 11.6MB/s；Go 靠运行时调度
-            // 偶然逃逸，tokio 朴素泵不可复制，socat 同病 54KB/s）。显式缓冲
-            // 解锁接收窗（内核翻倍记账→窗约 4MB→150ms 约 26MB/s 上限）；
-            // rcvbuf 是记账上限非预分配，空闲连接零内存代价。显式设置会锁定
-            // DRS，更高 BDP 场景需抬此常量。
-            let sockopt = SocketOptions {
-                domain_strategy,
-                dialer_proxy,
-                receive_buffer_size: if dial_dest.network() == Network::TCP {
-                    OUTBOUND_TCP_RCVBUF
-                } else {
-                    0
-                },
-                ..SocketOptions::default()
-            };
-            // Go :281 retry.ExponentialBackoff(5, 100)：dial 瞬时失败指数退避重试
-            let conn: Box<dyn Connection> =
-                xray_transport::retry::exponential_backoff(5, 100, || {
-                    dial_system(&dial_dest, &sockopt)
-                })
-                .await
-                .map_err(|e| format!("freedom dial: {e}"))?;
+            // bd r5j96：TCP 出站**不设置** SO_RCVBUF（0 = 不设置），接收窗交 OS
+            // autotune——显式 setsockopt 在两平台都是「关掉 autotune 并把窗钉在
+            // 请求值」：Windows 关 Winsock autotune（吞吐=窗/RTT，4MB → 24.8MB/s
+            // 天花板 vs sing-box autotune 57MB/s）；Linux 受 net.core.rmem_max
+            // 静默钳制（stock 208KB）+ 锁 autotune → 窗钉 208KB（WSL netem
+            // RTT 300ms 实测 ours 0.80 vs Go/sing-box 7.43MB/s，9 倍差）。
+            // 先前的 4MB 缺省（bd 7p1m/88m0）是为治内核 DRS 钉死 64KB 接收窗，
+            // 但它自身即锁窗源、比不设更差；该症状根因是读循环排水模式，
+            // 另立 bd cna1g 处理，不在本票解决。0 时下游 `dial_system` 同样
+            // 退回平台缺省，两平台语义一致。
+            let sockopt = outbound_sockopt(domain_strategy, dialer_proxy, dial_dest.network());
+            // Go :281 retry.ExponentialBackoff(5, 100)：dial 瞬时失败指数退避重试。
+            // bd n8abk：整条重试链共享一份 16s 拨号预算——每次尝试只拿剩余预算，
+            // 消除旧形态（每次尝试各自 16s）最坏 5×16s≈80.6s 的墙钟叠加。
+            let conn: Box<dyn Connection> = dial_system_with_retry_budget(
+                &dial_dest,
+                &sockopt,
+                5,
+                100,
+                std::time::Duration::from_secs(16),
+            )
+            .await
+            .map_err(|e| format!("freedom dial: {e}"))?;
             // PROXY protocol 头（Go :367-376）：拨号后、任何业务数据前写
             let conn = write_proxy_protocol_header(conn, proxy_protocol).await?;
             // fragment 配置存在时 dial 后包 writer（对齐 Go :410-418）
@@ -1319,5 +1346,28 @@ mod tests {
         drop(g);
         uninstall();
         drop((up_w, dn_r));
+    }
+
+    /// bd r5j96：freedom 出站的 `receive_buffer_size` 必须是 **0**（= 不设置）——
+    /// 非 0 会让 `apply_outbound_socket_options` 下发 `setsockopt(SO_RCVBUF)`，
+    /// 把接收窗钉死在请求值（Windows 关 autotune → 吞吐 = 窗/RTT）。
+    ///
+    /// 断言**实际流向 socket 的产出值**（[`outbound_sockopt`]）而非常量字面量：
+    /// 常量改了但接线没改（或反之）都要被抓到。
+    #[test]
+    fn outbound_sockopt_does_not_request_so_rcvbuf() {
+        let strategy = xray_transport::sockopt::DomainStrategy::AsIs;
+        let tcp = outbound_sockopt(strategy, String::new(), Network::TCP);
+        assert_eq!(
+            tcp.receive_buffer_size, 0,
+            "bd r5j96：TCP 出站不得请求 SO_RCVBUF（0 = 不设置，交 OS autotune）"
+        );
+        // UDP 必须恒 0：QUIC 端点走 Go quic-go wrapConn 的 8MB floor 语义
+        // （bind_udp_endpoint），非 0 会顶掉那个下限。
+        let udp = outbound_sockopt(strategy, String::new(), Network::UDP);
+        assert_eq!(
+            udp.receive_buffer_size, 0,
+            "bd r5j96：UDP 出站 receive_buffer_size 必须恒 0（保留 QUIC 8MB floor 语义）"
+        );
     }
 }

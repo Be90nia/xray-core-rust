@@ -653,8 +653,16 @@ async fn serve_grpc_conn(
     keepalive_enabled: bool,
 ) {
     if let Some(tc) = tls {
+        // bd xmv43：eager 握手套显式超时窗（同 splithttp transport）——半开连接
+        // 「连了不发 ClientHello」在窗尾被清，不再无限期占任务 + fd。
         let acc = tokio_rustls::TlsAcceptor::from(tc);
-        if let Ok(c) = acc.accept(stream).await {
+        if let Ok(c) = xray_transport::tls_handshake_gate::accept_tls_with_timeout(
+            &acc,
+            stream,
+            xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        {
             accept_h2(c, h, ep, mm, peer, &tr, ka_time, ka_timeout, keepalive_enabled).await
         }
     } else {

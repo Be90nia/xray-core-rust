@@ -156,6 +156,14 @@ pub trait SystemListener: Send + Sync {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 
+/// PROXY 头读取超时累计（tfq5x 节流 warn 分母；进程级，跨连接累计）。
+static PROXY_HEADER_TIMEOUT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// PROXY 头超时 warn 节流间隔（对齐 `handshake_gate` 节流纪律：逐条 debug +
+/// 每 256 条一条 warn 汇总——生产探测流量不能刷屏，但必须有可见失败证据）。
+const PROXY_TIMEOUT_LOG_EVERY: u64 = 256;
+
 /// 默认系统监听器。对应 Go `DefaultListener`。
 ///
 /// 持有 TCP listener + sockopt 配置 + 注册的 fd 控制器列表。
@@ -403,18 +411,48 @@ impl SystemListener for DefaultListener {
             // PROXY protocol：启用时先读取 PROXY header 提取真实源地址。
             let conn: Box<dyn Connection> = if self.accept_proxy_protocol {
                 let mut stream = tcp_stream;
-                match crate::proxy_protocol::read_proxy_protocol(&mut stream).await {
-                    Ok(Some(real_peer)) => {
+                // tfq5x：解析器是裸 read_exact（无自带超时），accept 循环内 await
+                // 时「连了不发头」的连接可无限期堵住 accept（Go proxyproto.Listener
+                // 同款共有 DoS 面，非 Rust↔Go 差异）。套首字节窗同级限时：超时丢弃
+                // 该连接并返回单连接级 TimedOut（hub `classify` = Connection →
+                // debug + 继续监听，accept 循环不退出，对齐 443 铁律）。
+                match tokio::time::timeout(
+                    crate::handshake_gate::FIRST_BYTE_TIMEOUT,
+                    crate::proxy_protocol::read_proxy_protocol(&mut stream),
+                )
+                .await
+                {
+                    Ok(Ok(Some(real_peer))) => {
                         crate::LOG.debug(format!(
                             "proxy_peer={real_peer} tcp_peer={peer} PROXY protocol resolved"
                         ));
                         Box::new(ProxiedConnection::new(TcpConnection::new(stream), real_peer))
                     },
-                    Ok(None) => {
+                    Ok(Ok(None)) => {
                         crate::LOG.debug(format!("tcp_peer={peer} PROXY protocol UNKNOWN"));
                         Box::new(TcpConnection::new(stream))
                     },
-                    Err(e) => return Err(e),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        let n = PROXY_HEADER_TIMEOUT_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        crate::LOG.debug(format!(
+                            "tcp_peer={peer} PROXY protocol header timeout ({}s window), connection dropped",
+                            crate::handshake_gate::FIRST_BYTE_TIMEOUT.as_secs()
+                        ));
+                        if n % PROXY_TIMEOUT_LOG_EVERY == 1 {
+                            crate::LOG.warn(format!(
+                                "tag=tcp PROXY protocol: 累计 {n} 条连接未在 {}s 内发送 PROXY 头，已超时丢弃（单连接级，监听继续）",
+                                crate::handshake_gate::FIRST_BYTE_TIMEOUT.as_secs()
+                            ));
+                        }
+                        // 连接随 stream drop 关闭（对端见 FIN/RST），不再交付。
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "proxy protocol header timeout",
+                        ));
+                    },
                 }
             } else {
                 let _ = peer;
@@ -1175,9 +1213,62 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// tfq5x：开 acceptProxyProtocol 后「连了不发头」不堵 accept——静默连接以
+    /// 单连接级 TimedOut 被丢弃（hub `classify`=Connection → 监听继续），后续
+    /// 连接立即被 accept 且 PROXY 源正常解析。无修复形态 = 第一次 accept 无界
+    /// 挂起（10s 保险伞把「修复失效」转成红而非挂死）。
+    #[tokio::test]
+    async fn accept_proxy_silent_conn_does_not_block_accept_loop() {
+        use std::time::{Duration, Instant};
+
+        use crate::proxy_protocol::build_proxy_header;
+
+        let fake_src: SocketAddr = "198.51.100.17:47213".parse().unwrap();
+        let sockopt = SocketOptions { accept_proxy_protocol: true, ..SocketOptions::default() };
+        let listener =
+            DefaultListener::bind("127.0.0.1:0".parse().unwrap(), sockopt).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 坏连接 A：连上不发任何字节，且保持打开（forget = 不发 FIN——EOF 会立即
+        // 解除读阻塞，测不出「无界等头」）。
+        let silent = TcpStream::connect(addr).await.unwrap();
+        std::mem::forget(silent);
+
+        // 好连接 B：完整 PROXY v2 头（A 之后排队）。
+        let mut good = TcpStream::connect(addr).await.unwrap();
+        good.write_all(&build_proxy_header(2, fake_src, addr)).await.unwrap();
+
+        // 第一次 accept = A：必须在首字节窗内以 TimedOut 被丢弃。
+        let started = Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await;
+        let elapsed = started.elapsed();
+        assert!(first.is_ok(), "accept 被静默连接无限期堵住（PROXY 头读无超时，10s 保险伞触发）");
+        let err = match first.unwrap() {
+            Err(e) => e,
+            Ok(_) => panic!("静默连接必须以错误被丢弃"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= crate::handshake_gate::FIRST_BYTE_TIMEOUT,
+            "超时窗未生效即返回: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(5), "超时窗过长: {elapsed:?}");
+
+        // 第二次 accept = B：循环未被堵，立即返回且 PROXY 源生效。
+        let started2 = Instant::now();
+        let conn = listener.accept().await.expect("后续连接必须被正常 accept");
+        assert!(
+            started2.elapsed() < Duration::from_secs(1),
+            "accept 循环被堵: {:?}",
+            started2.elapsed()
+        );
+        assert_eq!(conn.remote_addr().unwrap().unwrap(), fake_src);
+    }
+
     /// sockopt.acceptProxyProtocol → DefaultListener 开关端到端（Go
     /// system_listener.go:169-172）：开启时 accept 读掉 PROXY v1 header，
     /// remote_addr 覆盖为声明源地址，应用流从 header 之后开始。
+    /// tfq5x 验收对照：正常 PROXY 头仍被正确解析（保持绿）。
     #[tokio::test]
     async fn sockopt_accept_proxy_protocol_switch_on() {
         use crate::proxy_protocol::build_proxy_header;

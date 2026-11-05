@@ -419,7 +419,16 @@ async fn handle_accepted_stream<S>(
         serve_reality_conn(stream, peer, local, rc, probe, ctx).await;
     } else if let Some(tc) = tls {
         // Go hub.go:553-556 `gotls.NewListener`
-        if let Ok(tls_stream) = tokio_rustls::TlsAcceptor::from(tc).accept(stream).await {
+        // bd xmv43：eager 握手套显式超时窗——「连了不发 ClientHello」的半开连接
+        // 在窗尾被清（stream 随 future drop 释放），不再无限期占任务 + fd。
+        let acceptor = tokio_rustls::TlsAcceptor::from(tc);
+        if let Ok(tls_stream) = xray_transport::tls_handshake_gate::accept_tls_with_timeout(
+            &acceptor,
+            stream,
+            xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT,
+        )
+        .await
+        {
             serve_http_conn(tls_stream, peer, ctx).await;
         }
     } else {

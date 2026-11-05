@@ -182,13 +182,20 @@ impl InboundHandler for NaiveInboundHandler {
                             reason = "数据面连接任务（每连接 TLS/处理）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
                         )]
                         tokio::spawn(async move {
-                            let tls = match acceptor.accept(tcp).await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    crate::LOG.debug(format!("error={e} tls accept failed"));
-                                    return;
-                                },
-                            };
+                            let tls =
+                                match xray_transport::tls_handshake_gate::accept_tls_with_timeout(
+                                    &acceptor,
+                                    tcp,
+                                    xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT,
+                                )
+                                .await
+                                {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        crate::LOG.debug(format!("error={e} tls accept failed"));
+                                        return;
+                                    },
+                                };
                             let service = service_fn(move |req| {
                                 handle_request(req, dispatch.clone(), Arc::clone(&auth))
                             });

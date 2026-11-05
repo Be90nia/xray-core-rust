@@ -1381,4 +1381,80 @@ mod tests {
             }
         }
     }
+
+    /// x8ozl：accept_proxy 开启后「只连不发 PROXY 头」的连接不堵 accept 循环。
+    /// 两段式机制（bd 0wvne 已落地，本票钉行为）：accept 循环只取裸连接（零
+    /// 握手），PROXY 解析在 spawn 出的握手任务里受首字节窗（1s）+ 合并窗（4s）
+    /// 约束——静默连接被清，正常客户端（PROXY 头 + GET upgrade）仍被立即服务。
+    /// 缺陷形态（解析回 accept 循环内裸 read_exact）= A 占死循环，B 永不被
+    /// accept → 8s 保险伞触发红。
+    #[tokio::test]
+    async fn accept_proxy_silent_conn_does_not_block_upgrade_loop() {
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering},
+            time::{Duration, Instant},
+        };
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let settings = StreamSettings {
+            protocol: "httpupgrade".to_string(),
+            transport_json: Some(serde_json::json!({
+                "acceptProxyProtocol": true,
+                "path": "/ws"
+            })),
+            ..StreamSettings::tcp()
+        };
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let served_c = std::sync::Arc::clone(&served);
+        let handler: ConnHandler = Arc::new(move |_| {
+            served_c.fetch_add(1, Ordering::SeqCst);
+        });
+        let listener = listen_httpupgrade(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen_httpupgrade");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // 坏连接 A：连上不发任何字节，且保持打开（forget = 不发 FIN——EOF 会立即
+        // 解除读阻塞，测不出「无界等头」）。
+        let silent = tokio::net::TcpStream::connect(addr).await.expect("connect A");
+        std::mem::forget(silent);
+
+        // 好连接 B：完整 PROXY v2 头 + GET upgrade。
+        let fake_src: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+        let mut good = tokio::net::TcpStream::connect(addr).await.expect("connect B");
+        good.write_all(&xray_transport::build_proxy_header(2, fake_src, addr)).await.unwrap();
+        good.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        // B 必须被立即服务（101 响应）；缺陷形态下 B 永不被 accept → 伞触发红。
+        let started = Instant::now();
+        let mut buf = vec![0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(8), good.read(&mut buf))
+            .await
+            .expect("B 未被静默连接堵住（accept 循环被 PROXY 解析占死，8s 保险伞触发）")
+            .expect("server closed early");
+        let elapsed = started.elapsed();
+        let resp = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 101"), "非 101 响应: {resp:?}");
+        assert!(elapsed < Duration::from_secs(4), "B 被拖慢: {elapsed:?}");
+
+        // 等 A 的首字节窗（1s）走完：A 不进 handler，恰好 B 一条被服务。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "只有 B 进 handler（A 被首字节窗清掉，未被误服务）"
+        );
+
+        listener.close().expect("close");
+    }
 }

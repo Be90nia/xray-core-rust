@@ -76,6 +76,8 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# tls_handshake_gate 测试：自签证书（workspace 既有同版本惯例，如 xray-transport-splithttp）
+rcgen = "0.13"
 [features]
 default = []
 browser-dialer = []
