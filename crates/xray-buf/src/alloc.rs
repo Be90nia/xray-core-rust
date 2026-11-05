@@ -22,18 +22,18 @@ use parking_lot::Mutex;
 pub const DEFAULT_SIZE: usize = 8192;
 
 /// 缓冲区分层大小
-const TIER_SIZES: [usize; 5] = [2048, 8192, 32768, 65536, 131072];
+pub const TIER_SIZES: [usize; 5] = [2048, 8192, 32768, 65536, 131072];
 
 /// TLS 每层最大缓存数量
-const TLS_MAX_PER_TIER: usize = 8;
+pub const TLS_MAX_PER_TIER: usize = 8;
 
 /// 全局池分片数量
-const SHARD_COUNT: usize = 8;
+pub const SHARD_COUNT: usize = 8;
 
 /// 全局池每分片每层上限：超出直接丢弃，防高水位无限堆积。
 /// 8 分片 × 64 块：tier0 上限 1MB、tier3 上限 32MB、tier4 上限 64MB。
 /// **总字节仍由 [`POOL_BYTE_BUDGET`] 统收**（跨层跨分片的合计上界，8 MB）。
-const SHARD_MAX_PER_TIER: usize = 64;
+pub const SHARD_MAX_PER_TIER: usize = 64;
 
 /// 惰性收缩间隔（近似 Go sync.Pool 被 GC 周期性清池的节奏）。
 const SWEEP_INTERVAL_MS: u64 = 60_000;
@@ -43,7 +43,7 @@ const SWEEP_INTERVAL_MS: u64 = 60_000;
 /// 无关（`reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md` §1）。本常量把 TLS 缓存
 /// 与全部分片的字节总和钉死，**超限归还即丢弃**（块归还系统，不累积）。
 /// 实测稳态 0.3–0.7 MB，远低于本上界 ⇒ 热路径复用率不受影响。
-const POOL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+pub const POOL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
 /// 每分片字节预算 = [`POOL_BYTE_BUDGET`] / [`SHARD_COUNT`]（静态均分，8 MiB / 8 = 1 MiB）。
 ///
@@ -54,11 +54,11 @@ const POOL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 /// 上界仍硬：各分片 ≤ 1 MiB ⇒ 合计 ≤ [`POOL_BYTE_BUDGET`]（静态均分只会更保守）。
 /// 代价：单分片偏热时可能先撞自己的 1 MiB 而别的分片有空余（轻微利用率损失），
 /// 稳态总量 0.3–0.7 MB ⇒ 远达不到。全局合计只按需读侧求和（不进热路径）。
-const SHARD_BYTE_BUDGET: usize = POOL_BYTE_BUDGET / SHARD_COUNT;
+pub const SHARD_BYTE_BUDGET: usize = POOL_BYTE_BUDGET / SHARD_COUNT;
 
 /// TLS 缓存单线程字节预算（thread_local 计数，无原子）：128 KiB/线程。超限的归还
 /// 不进 TLS（还会继续试分片）；全局影响 = 每线程至多占 [`TLS_BYTE_BUDGET`]。
-const TLS_BYTE_BUDGET: usize = 128 * 1024;
+pub const TLS_BYTE_BUDGET: usize = 128 * 1024;
 
 /// 因字节上界而丢弃的归还款（可观测：上界拒绝不得静默）。**只挂在丢弃分支**
 /// （罕见路径），成功路径零触碰；`clear()` 不归零（单向事实计数，归零会让并行
@@ -301,6 +301,42 @@ pub fn clear() {
         shard_mutex.lock().bytes = 0;
     }
     TLS_CACHE_BYTES.with(|b| b.set(0));
+}
+
+/// 池状态快照（bd a7snv 池可观测性：上界够不够在生产可读）。
+///
+/// **读侧逐分片求和**（8 分片 ≤ O(8) 逐片取锁，非热路径、零分配）——诊断/巡检
+/// 面专用，**禁进借还热路径**（热路径的分片字节记账见 [`SHARD_BYTE_BUDGET`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStats {
+    /// 全局分片常驻字节合计（`Σ shard.bytes`——只统计经 `release` 入池的标准
+    /// 容量块；TLS 缓存不计入，见 [`PoolStats::tls_bytes`]）。
+    pub resident_bytes: u64,
+    /// 全局分片常驻块数合计。
+    pub resident_blocks: u64,
+    /// **本线程** TLS 缓存字节（thread_local 各线程私有；其他线程的 TLS 不在
+    /// 本读数——进程级 TLS 合计 = 各线程自报求和，无全局账本）。
+    pub tls_bytes: u64,
+    /// 因字节/块数上界被丢弃的归还款（进程累计，单向事实计数，`clear()` 不
+    /// 归零——增量对账请取两次快照做差）。
+    pub dropped_over_budget: u64,
+}
+
+/// 池状态快照（诊断读口）：调用即取各分片锁求和 + 读本线程 TLS 计数。
+pub fn stats() -> PoolStats {
+    let mut resident_bytes = 0u64;
+    let mut resident_blocks = 0u64;
+    for shard_mutex in &SHARDS {
+        let shard = shard_mutex.lock();
+        resident_bytes += shard.bytes as u64;
+        resident_blocks += shard.tiers.iter().map(Vec::len).sum::<usize>() as u64;
+    }
+    PoolStats {
+        resident_bytes,
+        resident_blocks,
+        tls_bytes: TLS_CACHE_BYTES.get() as u64,
+        dropped_over_budget: DROPPED_OVER_BUDGET.load(Ordering::Relaxed),
+    }
 }
 
 #[cfg(test)]
@@ -571,5 +607,45 @@ mod tests {
             dropped_before,
             "TLS 拒收的块必须落到分片，不得丢弃"
         );
+    }
+
+    // ── 池可观测性（bd a7snv）：stats() 读数与归还状态配平 ────────────────
+
+    /// TLS 收满预算后余量落分片：`stats()` 的 `tls_bytes`（本线程精确）与
+    /// `resident_bytes`（全局下界——分片会被并行测试归还污染，只断言增量下界）
+    /// 各归其位；`dropped_over_budget` 走增量口径（`clear()` 不归零）。
+    #[test]
+    fn stats_reports_tls_and_resident_ledger() {
+        let _g = POOL_TEST_LOCK.lock();
+        clear();
+        // 冻结 sweep（同 `test_shard_release_cap`：真实墙钟中途减半会破坏读数）
+        LAST_SWEEP_MS.store(u64::MAX - 1, Ordering::Relaxed);
+        let resident_before = stats().resident_bytes;
+
+        // 3 块 64 KiB：TLS 预算 128 KiB 收前 2 块，第 3 块落分片（远低于分片
+        // 字节预算 ⇒ 零丢弃）。
+        let bufs: Vec<_> = (0..3).map(|_| alloc(TIER_SIZES[3])).collect();
+        for b in bufs {
+            release(b);
+        }
+
+        let s = stats();
+        assert_eq!(s.tls_bytes, 2 * TIER_SIZES[3] as u64, "本线程 TLS 收 2 块（128 KiB 预算内）");
+        assert!(
+            s.resident_bytes >= resident_before + TIER_SIZES[3] as u64,
+            "第 3 块必须落分片（resident {} ≥ {} + 64 KiB）",
+            s.resident_bytes,
+            resident_before
+        );
+        assert!(s.resident_blocks >= 1, "分片常驻块数随归还增长");
+        assert_eq!(
+            s.dropped_over_budget,
+            DROPPED_OVER_BUDGET.load(Ordering::Relaxed),
+            "stats 的 dropped 读数与丢弃计数同源"
+        );
+
+        clear();
+        assert_eq!(stats().resident_bytes, 0, "clear 后分片常驻归零");
+        assert_eq!(stats().resident_blocks, 0, "clear 后分片块数归零");
     }
 }

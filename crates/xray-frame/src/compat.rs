@@ -331,6 +331,14 @@ impl ManagedScope {
         reap_into(&self.scope, &self.log, &self.label)
     }
 
+    /// 暴露底层 [`FxScope`] 句柄：供「拿不到 PluginContext 但持有 ManagedScope」
+    /// 的宿主把托管任务喂给统一托管口（如 `crate::pool::spawn_idle_pruner`）；
+    /// 本门面语义（spawn 排程 / reap / 停机报告）不变（bd jovl4 接线授权）。
+    #[must_use]
+    pub fn fx_scope(&self) -> &FxScope {
+        &self.scope
+    }
+
     /// 关 accepting 闸（拒新 spawn，放行在途——udf `FxScope::close` 语义）。
     pub fn close(&self) {
         self.scope.close();

@@ -18,11 +18,18 @@
 //! `borrowed == 0` fail-fast 断言兜底；**L5/坑约束 12** 管理面挂在分配路径
 //! 外侧，xray-buf 分配路径字节级不动（红线隔离测试：`tests/pool_isolation.rs`）。
 
-use std::{fmt, sync::Arc};
+use std::{fmt, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
-use skeleton::pool::{PoolAuditEvent, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError};
-use skeleton_infra::pool::{AUDIT_RING_DEFAULT_CAP, PoolBase};
+use skeleton::{
+    clock::Clock,
+    pool::{PoolAuditEvent, PoolAuditTicket, PoolManaged, PoolMetrics, PoolResizeError},
+};
+use skeleton_infra::{
+    fx::{FxScope, ScopeClosed, Spawned},
+    objpool::ObjectPool,
+    pool::{AUDIT_RING_DEFAULT_CAP, PoolBase},
+};
 
 /// RAII 归还闭包：池在借出时把「还回去要做什么」封进 [`PooledBuffer`]。
 type Release = Box<dyn FnOnce(BytesMut) + Send>;
@@ -297,6 +304,46 @@ impl<B: BufferPool> PoolManaged for ManagedBufferPool<B> {
     }
 }
 
+/// 低频老化任务托管口（bd vi2h5 缺陷 2 / bd jovl4 缺口 3）：宿主用既有托管口
+/// [`FxScope`] 起周期 `prune_idle` 任务——**池不起后台线程**（udf 纪律）纪律
+/// 不变，老化由**托管任务**承担：任务生命周期随 scope（scope drop / shutdown
+/// ⇒ 任务随 JoinSet abort，无孤儿循环）。
+///
+/// **双时钟注入**：`clock` 驱动龄判定（`prune_idle_with_clock`——测试注入
+/// `MockClock` 确定性推进，无需真实等待）；tokio 虚拟时间（`start_paused`）驱动
+/// tick 节奏。两钟正交：宿主可只造一次 pruner，测试与生产共用同一构造路。
+///
+/// 语义边界：本口面向**真实持槽的池**（udf `ObjectPool` 系——idle 槽驻留即
+/// 内存驻留）；接缝 [`XrayBufPool`]/[`ManagedBufferPool`] **不持闲槽**（物理
+/// 存储归 xray-buf 分层池，其自身带惰性收缩 `maybe_sweep`），无需本口。
+/// 现役两池（hysteria udphop / splithttp pool_stream）宿主接线时以本口为
+/// 唯一托管入口（禁在协议 crate 自起裸 spawn——坑约束 5）。
+pub fn spawn_idle_pruner<T: Send + 'static>(
+    scope: &FxScope,
+    pool: Arc<ObjectPool<T>>,
+    clock: Arc<dyn Clock>,
+    period: Duration,
+    max_idle_age: Duration,
+) -> Result<Spawned<()>, ScopeClosed> {
+    scope.spawn_tracked(async move {
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval 首 tick 立即完成——首轮老化无需等一个周期。
+        loop {
+            ticker.tick().await;
+            let pruned = pool.prune_idle_with_clock(max_idle_age, clock.as_ref());
+            if pruned > 0 {
+                tracing::debug!(
+                    target: "xray_frame::pool",
+                    pruned,
+                    max_idle_age_secs = max_idle_age.as_secs(),
+                    "idle objects pruned"
+                );
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -512,5 +559,47 @@ mod tests {
         assert_send_sync::<ManagedBufferPool<XrayBufPool>>();
         fn assert_send<T: Send>() {}
         assert_send::<PooledBuffer>();
+    }
+
+    // ── 低频老化托管口（vi2h5 缺陷 2 / jovl4 缺口 3）────────────────────
+
+    /// 双时钟注入的确定性推进：tokio 虚拟时间驱动 tick（`start_paused`），
+    /// `MockClock` 驱动龄判定——无需真实等待即可断言「周期到 ⇒ 超龄 idle 被
+    /// 释放」。
+    #[tokio::test(start_paused = true)]
+    async fn idle_pruner_releases_aged_idle_on_tick() {
+        use skeleton::clock::MockClock;
+
+        let clock = Arc::new(MockClock::new());
+        let scope = FxScope::new();
+        let pool = Arc::new(ObjectPool::new(4, 4, Vec::<u8>::new));
+        {
+            let mut b = pool.acquire();
+            b.push(1u8);
+        } // 归还 1 件入 idle（last_used = 构造期附近）
+        assert_eq!(pool.metrics().core.idle, 1, "前置：1 件常驻 idle");
+
+        let spawned = spawn_idle_pruner(
+            &scope,
+            Arc::clone(&pool),
+            clock.clone(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        )
+        .expect("scope 初始 accepting，spawn 必成");
+
+        // 推进虚拟时钟使对象超龄（60s 窗）+ 推进 tokio 时间跨过一个 tick。
+        clock.advance(Duration::from_secs(120));
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // 让出调度：pruner 任务在 tick 唤醒后完成本轮 prune。
+        tokio::task::yield_now().await;
+
+        let m = pool.metrics();
+        assert_eq!(m.core.idle, 0, "tick 后超龄 idle 必须被释放");
+        assert_eq!(m.pruned, 1, "prune 计数留痕");
+
+        // 托管语义：scope 关闸 + 排空 ⇒ pruner 随 JoinSet 收割，无孤儿循环。
+        drop(spawned);
+        let _ = scope.shutdown().await;
     }
 }
