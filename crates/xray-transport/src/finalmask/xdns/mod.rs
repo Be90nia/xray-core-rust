@@ -12,17 +12,21 @@
 //! - `resp`：响应编解码 + SendManager（Go `resp.go`）
 //! - `client`：`XdnsConnClient` 实现 [`super::UdpIo`]（Go `client.go`）
 //! - `server`：`XdnsConnServer` 实现 [`super::UdpIo`]（Go `server.go`）
+//! - `doh`：DoH resolver（RFC 8484，对应 Go `resolver_doh.go`）
 //! - `base32`：RFC4648 base32（无 padding）
 //!
 //! 配置形态对齐 Go v26.10.17 `XDNS`（`infra/conf/transport_finalmask.go:815-911`）：
 //! `resolvers[]` 为 `{addrs[], worker, tlsConfig, quicConfig}`，`type` 由每个
-//! `addrs` 项的 URL scheme 决定（见 `build_resolver_configs`）。Rust finalmask
-//! 栈为 UDP-only：TCP/DOH resolver 配置期显式报错（Go 侧按 `ResolverProto.type`
-//! 分派 tcp/udp/https，见 `resolver.go NewResolver`）。
+//! `addrs` 项的 URL scheme 决定（见 `build_resolver_configs`）：`udp` / `tcp` /
+//! `https`（DoH）。Rust finalmask 隧道为 UDP-only ⇒ `tcp` resolver 运行期拒绝
+//! （Go `resolver_tcp.go` 经 finalmask 拨号，本栈无 TCP 拨号句柄）；DoH 走独立
+//! TLS+h2 直连（差异见 `doh` 模块头）；DoH-over-QUIC（`quicConfig` / ALPN h3）
+//! 本轮未实现，配置期硬错点路。
 
 pub(crate) mod base32;
 mod client;
 mod dns;
+mod doh;
 mod domain;
 mod frag;
 mod resp;
@@ -54,14 +58,17 @@ pub struct DomainConfig {
 pub enum ResolverKind {
     Udp,
     Tcp,
+    /// `https://`：DoH（Go `NewDOHResolver`）。
+    Doh,
 }
 
 /// resolver 配置（对应 Go `ResolverProto`：type/addr/worker/tls_config/quic_config）。
 ///
 /// `worker`/`tls_config`/`quic_config` 对 udp/tcp 在 Go 运行时同样不读
 /// （`resolver_udp.go`/`resolver_tcp.go` 只取 Addr，仅 DOH 读 worker/tls/quic），
-/// 此处无损承载以对齐 wire；真正做不到的形态（DOH）在 [`ResolverConfig::from_proto`]
-/// 配置期显式报错。JSON 层由 `build_resolver_configs` 供给。
+/// 此处无损承载以对齐 wire；`tcp` 在本栈运行期拒绝（UDP-only 隧道），`https`
+/// 的 TLS 参数在配置期校验后落 `doh::DohParams`。JSON 层由
+/// `build_resolver_configs` 供给。
 #[derive(Clone)]
 pub struct ResolverConfig {
     pub kind: ResolverKind,
@@ -69,6 +76,8 @@ pub struct ResolverConfig {
     pub worker: i32,
     pub tls_config: Option<TlsConfig>,
     pub quic_config: Option<QuicParams>,
+    /// `kind == Doh` 专用：配置期校验通过的 URL/SNI/信任根。
+    pub doh: Option<doh::DohParams>,
 }
 
 impl std::fmt::Debug for ResolverConfig {
@@ -80,24 +89,20 @@ impl std::fmt::Debug for ResolverConfig {
             .field("worker", &self.worker)
             .field("tls_config", &self.tls_config.is_some())
             .field("quic_config", &self.quic_config.is_some())
+            .field("doh", &self.doh)
             .finish()
     }
 }
 
 impl ResolverConfig {
-    /// Go `NewResolver`（resolver.go:17-27）的 `type` 分派：udp/tcp 照常构造；
-    /// https（DOH）Rust 栈未实现 → 配置期显式报错；未知 type 同 Go 报
+    /// Go `NewResolver`（resolver.go:17-27）的 `type` 分派：udp/tcp 照常构造，
+    /// https（DOH）配置期校验并产出 `doh::DohParams`；未知 type 同 Go 报
     /// "unknown type"。
     pub fn from_proto(p: &ResolverProto) -> io::Result<Self> {
         let kind = match p.r#type.as_str() {
             "udp" => ResolverKind::Udp,
             "tcp" => ResolverKind::Tcp,
-            "https" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "xdns: DOH (https) resolver not supported (UDP-only stack)",
-                ));
-            },
+            "https" => ResolverKind::Doh,
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -105,12 +110,18 @@ impl ResolverConfig {
                 ));
             },
         };
+        let doh = (kind == ResolverKind::Doh)
+            .then(|| {
+                doh::DohParams::from_proto(&p.addr, p.tls_config.as_ref(), p.quic_config.as_ref())
+            })
+            .transpose()?;
         Ok(Self {
             kind,
             addr: p.addr.clone(),
             worker: p.worker,
             tls_config: p.tls_config.clone(),
             quic_config: p.quic_config.clone(),
+            doh,
         })
     }
 }
@@ -232,10 +243,11 @@ pub(crate) fn build_domain_config(v: &serde_json::Value) -> io::Result<Vec<Domai
 /// `XDNSResolver{addrs[], worker, tlsConfig, quicConfig}`（`:820-825`）：每个 `addrs`
 /// 项按 URL scheme 展开成一条 resolver。
 ///
-/// - `worker`：Go `:860-862` 缺省 32（udp/tcp 下 Go 不读，仍转出）
-/// - `tlsConfig`/`quicConfig`：只被 `NewDOHResolver` 读 （`resolver_doh.go:46-53`）；而 `https`
-///   在本栈配置期即拒 （见 [`resolve_addr`]）⇒ udp/tcp 上恒 inert，故不 materialize， 也不在此另造
-///   TLS/QUIC 解析器（xray-tls / hysteria 已有同源实现）
+/// - `worker`：Go `:860-862` 缺省 32（udp/tcp 下 Go 不读，仍转出；`https` 即 DoH 并发数，`< 1`
+///   配置期硬错，同 Go `NewDOHResolver` "invalid worker"）
+/// - `tlsConfig`/`quicConfig`：只被 `NewDOHResolver` 读（`resolver_doh.go:46-53`）⇒ 仅在 `https`
+///   项上校验并 materialize 成 [`doh::DohParams`]（udp/tcp 上恒 inert， 与 Go
+///   运行时等价）；未支持键/`quicConfig` 配置期硬错（禁静默忽略）
 /// - `type`/`settings`：Rust 旧方言，Go 无此键 ⇒ 硬错指路
 pub(crate) fn build_resolver_configs(v: &serde_json::Value) -> io::Result<Vec<ResolverConfig>> {
     let mut out = Vec::new();
@@ -266,14 +278,29 @@ pub(crate) fn build_resolver_configs(v: &serde_json::Value) -> io::Result<Vec<Re
         for a in addrs {
             let raw = a.as_str().ok_or_else(|| mask_err("xdns: resolver addr must be a string"))?;
             let (kind, addr) = resolve_addr(raw)?;
-            out.push(ResolverConfig { kind, addr, worker, tls_config: None, quic_config: None });
+            let doh = if kind == ResolverKind::Doh {
+                if worker < 1 {
+                    return Err(mask_err("xdns: invalid worker"));
+                }
+                Some(doh::DohParams::from_json(&addr, obj.get("tlsConfig"), obj.get("quicConfig"))?)
+            } else {
+                None
+            };
+            out.push(ResolverConfig {
+                kind,
+                addr,
+                worker,
+                tls_config: None,
+                quic_config: None,
+                doh,
+            });
         }
     }
     Ok(out)
 }
 
 /// Go `:879-905`：无 `://` 前缀按 `udp://` 解析；`tcp`/`udp` 归一为 `host:port`
-/// （端口缺省 53），`https` 保留全 URL，其余 scheme 硬错（Go："invalid protocol"）。
+/// （端口缺省 53），`https` 保留全 URL（DoH），其余 scheme 硬错。
 fn resolve_addr(raw: &str) -> io::Result<(ResolverKind, String)> {
     let prefixed;
     let url = if raw.contains("://") {
@@ -286,9 +313,11 @@ fn resolve_addr(raw: &str) -> io::Result<(ResolverKind, String)> {
     let kind = match scheme {
         "udp" => ResolverKind::Udp,
         "tcp" => ResolverKind::Tcp,
-        "https" => {
-            return Err(mask_err("xdns: DOH (https) resolver not supported (UDP-only stack)"));
-        },
+        // Go 保留 `url.String()`（含 path/query）——DoH 的 POST 目标就是它
+        "https" => return Ok((ResolverKind::Doh, url.to_string())),
+        // DoH-over-QUIC 本轮未实现：点名指路，不做静默降级（Go 侧走 ALPN h3 的
+        // http3.Transport，见 resolver_doh.go:47-60）
+        "quic" | "http3" => return Err(doh::doh_over_quic()),
         other => return Err(mask_err(format!("xdns: invalid protocol {other:?}"))),
     };
     // Go url.URL：userinfo / path / query 不参与 Hostname()/Port()
@@ -420,17 +449,28 @@ mod tests {
         assert!(build_resolver_configs(&serde_json::json!({})).unwrap().is_empty());
     }
 
-    /// scheme 分派对齐 Go `:883-905`：`https` Go 支持而本栈未实现 → 点名报错
-    /// （禁静默降级成 udp）；其余未知 scheme 同 Go "invalid protocol"。
+    /// scheme 分派对齐 Go `:883-905`：`https` = DoH（全 URL 保留），`quic`/`http3`
+    /// 本轮未实现 → 点名指路，其余未知 scheme 同 Go "invalid protocol"。
     ///
     /// 期望值由 Go 26.10.17 源码逐行复刻的探针实跑得出（`url.Parse` +
     /// `Hostname()`/`Port()` + `JoinHostPort`），不是推导。
     #[test]
     fn resolver_addr_scheme_dispatch_and_rejections() {
-        let Err(e) = resolve_addr("https://dns.google/dns-query") else {
-            panic!("DOH must reject");
+        // https：Go `addr = u.String()`（含 path/query）
+        assert_eq!(
+            resolve_addr("https://dns.google/dns-query").unwrap(),
+            (ResolverKind::Doh, "https://dns.google/dns-query".to_string())
+        );
+        assert_eq!(
+            resolve_addr("https://1.1.1.1:8443/q?x=1").unwrap(),
+            (ResolverKind::Doh, "https://1.1.1.1:8443/q?x=1".to_string())
+        );
+        let Err(e) = resolve_addr("quic://dns.google/dns-query") else {
+            panic!("DoH-over-QUIC 必须硬错");
         };
-        assert!(e.to_string().contains("DOH"), "{e}");
+        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
+        assert!(e.to_string().contains("https://"), "错误须指路 https：{e}");
+        assert!(resolve_addr("http3://dns.google").is_err());
         let Err(e) = resolve_addr("tls://dns.google") else {
             panic!("tls scheme must reject");
         };
@@ -448,6 +488,54 @@ mod tests {
             build_resolver_configs(&serde_json::json!({"resolvers": [{"addrs": [1]}]})).is_err()
         );
         assert!(build_resolver_configs(&serde_json::json!({"resolvers": ["x"]})).is_err());
+    }
+
+    /// `https://` 项：`tlsConfig` 配置期校验后落 `doh`（缺省 SNI/webpki 根），
+    /// 未支持键与 `quicConfig` 硬错点名。
+    #[test]
+    fn resolver_configs_https_materializes_doh() {
+        let rs = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["https://dns.google/dns-query"],
+            "worker": 8,
+            "tlsConfig": {"serverName": "dns.google", "minVersion": "1.3"}
+        }]}))
+        .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].kind, ResolverKind::Doh);
+        assert_eq!(rs[0].addr, "https://dns.google/dns-query");
+        assert_eq!(rs[0].worker, 8);
+        let doh = rs[0].doh.as_ref().expect("https 必须产出 DoH 参数");
+        assert_eq!(doh.sni.as_deref(), Some("dns.google"));
+        assert_eq!(doh.tls.alpn, vec!["h2".to_string()]);
+
+        // worker < 1 = Go `NewDOHResolver` 的 "invalid worker"（配置期提前）
+        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["https://dns.google/dns-query"], "worker": -1
+        }]})) else {
+            panic!("DoH worker<1 必须硬错");
+        };
+        assert!(e.to_string().contains("invalid worker"), "{e}");
+
+        // udp 项上的 tlsConfig/quicConfig 仍 inert（Go udp/tcp resolver 不读）
+        let rs = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["1.1.1.1"], "tlsConfig": {"serverName": "x"}, "quicConfig": {"congestion": "bbr"}
+        }]}))
+        .unwrap();
+        assert!(rs[0].doh.is_none() && rs[0].tls_config.is_none());
+
+        // quicConfig / h3 → DoH-over-QUIC 硬错
+        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["https://dns.google/dns-query"], "quicConfig": {"congestion": "bbr"}
+        }]})) else {
+            panic!("quicConfig 必须硬错");
+        };
+        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
+        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["https://dns.google/dns-query"], "tlsConfig": {"alpn": ["h3"]}
+        }]})) else {
+            panic!("alpn h3 必须硬错");
+        };
+        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
     }
 
     /// Go 侧 fixture（Go xray-core config.pb.go proto.Marshal 真实输出，
@@ -484,17 +572,29 @@ mod tests {
         assert_eq!(rc.worker, 2);
     }
 
-    /// `from_proto` 按 Go `resolver.go NewResolver` 分派：udp/tcp 构造，
-    /// https 显式报错（Rust 栈未实现），未知 type 报 "unknown"。
+    /// `from_proto` 按 Go `resolver.go NewResolver` 分派：udp/tcp/https 均构造
+    /// （https 走 DoH 参数校验），未知 type 报 "unknown"。
     #[test]
     fn from_proto_dispatches_and_rejects() {
-        let p = |t: &str| ResolverProto {
+        use xray_proto::xray::transport::internet::finalmask::xdns as proto_xdns;
+
+        let p = |t: &str| proto_xdns::ResolverProto {
             r#type: t.into(),
             addr: "1.1.1.1:53".into(),
             ..Default::default()
         };
         assert_eq!(ResolverConfig::from_proto(&p("udp")).unwrap().kind, ResolverKind::Udp);
         assert_eq!(ResolverConfig::from_proto(&p("tcp")).unwrap().kind, ResolverKind::Tcp);
+        let https = ResolverConfig::from_proto(&proto_xdns::ResolverProto {
+            r#type: "https".into(),
+            addr: "https://dns.google/dns-query".into(),
+            worker: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(https.kind, ResolverKind::Doh);
+        assert!(https.doh.is_some());
+        // 非 https 的 addr 形态（Go 从 JSON 层拿到的就是 URL）
         assert!(ResolverConfig::from_proto(&p("https")).is_err());
         assert!(ResolverConfig::from_proto(&p("quic")).is_err());
     }
@@ -566,6 +666,7 @@ mod tests {
                 worker: 0,
                 tls_config: None,
                 quic_config: None,
+                doh: None,
             }],
             extra_poll: 0,
         }
@@ -695,5 +796,136 @@ mod tests {
             assert!(n >= 12, "round {round}: 响应至少 12 字节 DNS 头，实际 {n}");
             assert_eq!(buf[2] & 0x80, 0x80, "round {round}: QR 位必须置位");
         }
+    }
+
+    /// DoH 端到端（bd lf69h 验收）：`https://` resolver + 自签证书经
+    /// `tlsConfig.certificates` 信任，走真实 TLS + h2 的 DoH 假服务器，与
+    /// `XdnsConnServer` 全链路互通。
+    ///
+    /// 同时锁住三件事：①配置期 `https://` 不再被拒；②`tlsConfig.serverName` 真实
+    /// 生效（连接 127.0.0.1、SNI/校验名 localhost）；③请求符合 RFC 8484
+    /// （POST + `application/dns-message`）。
+    #[tokio::test]
+    async fn doh_resolver_loopback_end_to_end() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::{
+            TlsAcceptor,
+            rustls::{
+                ServerConfig,
+                pki_types::{CertificateDer, PrivateKeyDer},
+            },
+        };
+
+        xray_common::ensure_default_crypto_provider();
+
+        // 自签证书（SAN: localhost）+ 服务端 rustls 配置（ALPN h2：DoH 客户端只发 h2）
+        let cert_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = cert_params.self_signed(&key_pair).unwrap();
+        let cert_pem = cert.pem();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = listener.local_addr().unwrap();
+
+        // 内存管道：DoH 服务器侧 ↔ XdnsConnServer 的 raw conn
+        let (q_tx, q_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let (r_tx, r_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+        let server_pipe: Arc<dyn UdpIo> =
+            Arc::new(PipeEnd { peer: r_tx, inbox: tokio::sync::Mutex::new(q_rx) });
+        let http_pipe: Arc<dyn UdpIo> =
+            Arc::new(PipeEnd { peer: q_tx, inbox: tokio::sync::Mutex::new(r_rx) });
+
+        let cfg = Config {
+            domains: build_domain_config(&serde_json::json!({"names": ["t.example.com"]})).unwrap(),
+            resolvers: build_resolver_configs(&serde_json::json!({"resolvers": [{
+                "addrs": [format!("https://127.0.0.1:{}/dns-query", doh_addr.port())],
+                "worker": 2,
+                // 连接目标是 127.0.0.1，校验名必须是 localhost ⇒ serverName 必须生效
+                "tlsConfig": {
+                    "serverName": "localhost",
+                    "certificates": [{"certificate": cert_pem}]
+                }
+            }]}))
+            .unwrap(),
+            extra_poll: 0,
+        };
+        assert_eq!(cfg.resolvers[0].kind, ResolverKind::Doh);
+        let server = server::XdnsConnServer::new(server_pipe, &cfg).unwrap();
+
+        // DoH 假服务器：POST 体 = DNS 查询 → XdnsConnServer → 响应体回投
+        #[allow(clippy::disallowed_methods, reason = "测试用 DoH 假服务器：accept 环")]
+        let doh_server = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                let acceptor = acceptor.clone();
+                let http_pipe = http_pipe.clone();
+                #[allow(clippy::disallowed_methods, reason = "测试用 DoH 假服务器：每连接一任务")]
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(sock).await else { return };
+                    let Ok(mut conn) = h2::server::handshake(tls).await else { return };
+                    while let Some(accepted) = conn.accept().await {
+                        let Ok((req, mut respond)) = accepted else { return };
+                        // RFC 8484 形态断言
+                        assert_eq!(req.method(), http::Method::POST);
+                        assert_eq!(
+                            req.headers().get(http::header::CONTENT_TYPE).unwrap(),
+                            "application/dns-message"
+                        );
+                        assert_eq!(
+                            req.headers().get(http::header::ACCEPT).unwrap(),
+                            "application/dns-message"
+                        );
+                        let mut body = req.into_body();
+                        let mut query = Vec::new();
+                        while let Some(chunk) = body.data().await {
+                            query.extend_from_slice(&chunk.unwrap());
+                        }
+                        // 源地址对 server 无语义（clientID 从 payload 解出）
+                        http_pipe.send_to(&query, doh_addr).await.unwrap();
+                        let mut buf = [0u8; 4096];
+                        let (n, _) = http_pipe.recv_from(&mut buf).await.unwrap();
+                        let resp = http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "application/dns-message")
+                            .body(())
+                            .unwrap();
+                        let mut send = respond.send_response(resp, false).unwrap();
+                        send.send_data(bytes::Bytes::copy_from_slice(&buf[..n]), true).unwrap();
+                    }
+                });
+            }
+        });
+
+        // 客户端：inner 隧道 conn 在纯 DoH 配置下不被使用（DoH 走独立 TLS+h2）
+        let (dummy_tx, dummy_rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(1);
+        let unused_pipe: Arc<dyn UdpIo> =
+            Arc::new(PipeEnd { peer: dummy_tx, inbox: tokio::sync::Mutex::new(dummy_rx) });
+        let client = client::XdnsConnClient::new(unused_pipe, &cfg).unwrap();
+
+        client.send_to(b"hello doh", "127.0.0.1:53".parse().unwrap()).await.unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, up_addr) =
+            tokio::time::timeout(Duration::from_secs(10), server.recv_from(&mut buf))
+                .await
+                .expect("DoH uplink timeout")
+                .unwrap();
+        assert_eq!(&buf[..n], b"hello doh");
+
+        server.send_to(b"doh pong", up_addr).await.unwrap();
+        let mut cbuf = [0u8; 4096];
+        let (cn, _) = tokio::time::timeout(Duration::from_secs(10), client.recv_from(&mut cbuf))
+            .await
+            .expect("DoH downlink timeout")
+            .unwrap();
+        assert_eq!(&cbuf[..cn], b"doh pong");
+
+        doh_server.abort();
     }
 }

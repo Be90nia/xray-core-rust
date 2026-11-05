@@ -7,8 +7,9 @@
 //!
 //! 响应按 [len2|0xC0][bytes] 帧拆包投递上层。
 //!
-//! bd 2ktp ④：对齐 Xray-core fc8f8a45；resolver 仅 UDP 形态（Rust finalmask
-//! 栈为 UDP-only，TCP resolver 配置期报错，见 mod.rs）。
+//! bd 2ktp ④：对齐 Xray-core fc8f8a45；resolver 形态见 [`Resolver`]：`udp://` 走
+//! wrap 期拿到的隧道 conn，`https://`（DoH）走独立 TLS+h2 请求（[`super::doh`]）。
+//! `tcp://` 在本栈运行期拒绝（隧道为 UDP-only，无 TCP 拨号句柄）。
 
 use std::{
     io,
@@ -27,6 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 use super::{
     Config, ResolverKind, UdpIo,
     dns::{CLASS_IN, Message, Question, RR, RR_TYPE_OPT, message_from_wire_format},
+    doh,
     domain::{DEFAULT_CLIENT_TYPES, Domain, type_map},
     resp::Resp,
 };
@@ -48,7 +50,7 @@ struct Packet {
 struct ClientState {
     client_id: [u8; 8],
     domains: Vec<Domain>,
-    resolvers: Vec<SocketAddr>,
+    resolvers: Vec<Resolver>,
     /// 各 resolver 连续未命中计数（Go `resolverSends`）。
     sends: Vec<AtomicU32>,
     /// 轮转游标（Go `resolverIndex`）。
@@ -56,6 +58,14 @@ struct ClientState {
     /// 分片 ID 计数（Go `fragID`）。
     frag_id: AtomicU32,
     extra_poll: i32,
+}
+
+/// resolver 运行形态（Go `Resolver` 接口的两种实现，`resolver.go:17-27`）。
+enum Resolver {
+    /// `udp://`：经 wrap 期隧道 conn 发往解析器地址（Go `UDPResolver`）。
+    Udp(SocketAddr),
+    /// `https://`：DoH worker 组（Go `DOHResolver`）。
+    Doh(doh::DohResolver),
 }
 
 /// xdns 客户端：包装底层 UDP conn，按 DNS-over-UDP 隧道协议转发。
@@ -91,18 +101,43 @@ impl XdnsConnClient {
             )?);
         }
         let mut resolvers = Vec::with_capacity(config.resolvers.len());
-        for r in &config.resolvers {
-            if r.kind != ResolverKind::Udp {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "xdns: TCP resolver not supported (UDP-only stack)",
-                ));
+        // DoH worker → 解码环（无 DoH resolver 时 channel 无人使用，随 state 落空）。
+        let (doh_tx, doh_rx) = mpsc::channel::<(usize, Vec<u8>)>(SEND_QUEUE_CAP);
+        for (idx, r) in config.resolvers.iter().enumerate() {
+            match r.kind {
+                ResolverKind::Udp => {
+                    let addr: SocketAddr = r.addr.parse().map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("invalid resolver addr: {e}"),
+                        )
+                    })?;
+                    resolvers.push(Resolver::Udp(addr));
+                },
+                ResolverKind::Tcp => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "xdns: TCP resolver not supported (UDP-only stack)",
+                    ));
+                },
+                ResolverKind::Doh => {
+                    let params = r.doh.as_ref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "xdns: DoH resolver missing validated tls params",
+                        )
+                    })?;
+                    resolvers.push(Resolver::Doh(doh::DohResolver::new(
+                        params,
+                        r.worker,
+                        idx,
+                        doh_tx.clone(),
+                    )?));
+                },
             }
-            let addr: SocketAddr = r.addr.parse().map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("invalid resolver addr: {e}"))
-            })?;
-            resolvers.push(addr);
         }
+        // 所有 DoH worker 的发送端都在 resolvers 里；这里只留读端。
+        drop(doh_tx);
 
         let mut client_id = [0u8; 8];
         rand::rng().fill_bytes(&mut client_id);
@@ -129,7 +164,18 @@ impl XdnsConnClient {
             clippy::disallowed_methods,
             reason = "数据面泵任务（xdns client recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
-        tokio::spawn(recv_loop(state.clone(), inner.clone(), closed.clone(), read_tx, poll_tx));
+        tokio::spawn(recv_loop(
+            state.clone(),
+            inner.clone(),
+            closed.clone(),
+            read_tx.clone(),
+            poll_tx.clone(),
+        ));
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "数据面泵任务（xdns client DoH 响应解码环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        )]
+        tokio::spawn(doh_recv_loop(state.clone(), doh_rx, read_tx, poll_tx, closed.clone()));
         #[allow(
             clippy::disallowed_methods,
             reason = "数据面泵任务（xdns client send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
@@ -218,7 +264,9 @@ async fn recv_loop(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(idx) = state.resolvers.iter().position(|a| *a == addr) else {
+        let Some(idx) =
+            state.resolvers.iter().position(|r| matches!(r, Resolver::Udp(a) if *a == addr))
+        else {
             continue;
         };
         if client_read(&state, &buf[..n], addr, &read_tx).await {
@@ -272,7 +320,35 @@ async fn send_msg(
         }
     }
     state.index.store(i as u32, Ordering::Relaxed);
-    inner.send_to(&pack, state.resolvers[index]).await.map(|_| ())
+    match &state.resolvers[index] {
+        Resolver::Udp(addr) => inner.send_to(&pack, *addr).await.map(|_| ()),
+        Resolver::Doh(doh) => doh.send(&pack).await,
+    }
+}
+
+/// DoH 响应解码环：worker 取回的原始 DNS 响应 → 与 UDP 路径同一套解码/拆包
+/// （Go `DOHResolver.Read` → `xdnsClient.recv`）。
+async fn doh_recv_loop(
+    state: Arc<ClientState>,
+    mut resp_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    read_tx: mpsc::Sender<Packet>,
+    poll_tx: mpsc::Sender<()>,
+    closed: Arc<AtomicBool>,
+) {
+    while let Some((idx, body)) = resp_rx.recv().await {
+        if closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let addr = match state.resolvers.get(idx) {
+            Some(Resolver::Doh(doh)) => doh.remote_addr(),
+            // 下标不变量：worker 只回投本 client 的 resolver 下标
+            _ => continue,
+        };
+        if client_read(&state, &body, addr, &read_tx).await {
+            state.sends[idx].store(0, Ordering::Relaxed);
+            let _ = poll_tx.try_send(());
+        }
+    }
 }
 
 /// 单次 send：随机 domain/qtype，按 poll/small/frag 三形态编码，对应 Go `send`。

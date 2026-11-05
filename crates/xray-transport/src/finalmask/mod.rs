@@ -2633,17 +2633,19 @@ mod tests {
         assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
         // extraPoll 越界报错（对齐 Go Build 校验）
         assert!(build_xdns_config(&fm(r#"{"extraPoll":4}"#)).is_err());
-        // 未知 scheme 报错（Go Build :903-904 default → "invalid protocol"）
-        assert!(
-            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["quic://1.1.1.1:53"]}]}"#)).is_err()
-        );
-        // https（DOH）Go 支持但本栈未实现 → 配置期点名报错（不静默改成 udp）
-        let Err(e) =
-            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["https://dns.google/dns-query"]}]}"#))
+        // quic:// = DoH-over-QUIC：本轮未实现 → 配置期点名指路 https://（不是静默降级）
+        let Err(e) = build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["quic://1.1.1.1:53"]}]}"#))
         else {
-            panic!("https must reject");
+            panic!("DoH-over-QUIC must reject");
         };
-        assert!(e.to_string().contains("DOH"), "{e}");
+        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
+        // https（DOH）本栈已实现（bd lf69h）→ 配置期可读入，kind = Doh
+        let cfg =
+            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["https://dns.google/dns-query"]}]}"#))
+                .unwrap();
+        assert_eq!(cfg.resolvers[0].kind, xdns::ResolverKind::Doh);
+        assert_eq!(cfg.resolvers[0].addr, "https://dns.google/dns-query");
+        assert!(cfg.resolvers[0].doh.is_some());
         // Rust 旧方言（type/settings）硬错指路，禁静默失效
         let Err(e) = build_xdns_config(&fm(
             r#"{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}"#,

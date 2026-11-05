@@ -283,7 +283,10 @@ fn parse_pinned_hashes(
 }
 
 /// PEM 字符串 → 全部 CERTIFICATE 块的 DER。
-fn pem_certificates_to_der(pem: &str) -> io::Result<Vec<Vec<u8>>> {
+///
+/// `pub(crate)`：xdns DoH resolver（`finalmask/xdns/doh.rs`）复用同一 PEM→DER 解析
+/// （Go `getCertPool` 语义同源），避免第二份实现。
+pub(crate) fn pem_certificates_to_der(pem: &str) -> io::Result<Vec<Vec<u8>>> {
     let mut out = Vec::new();
     let mut body = String::new();
     let mut in_block = false;

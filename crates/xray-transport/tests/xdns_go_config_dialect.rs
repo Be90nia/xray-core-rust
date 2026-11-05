@@ -7,7 +7,8 @@
 //!    extraPoll}` 能被读入（此前强制 `type`+`settings` 键，Go 写的配置整段读不进）；
 //! 2. Rust 旧方言（`type`/`settings`）硬错指路——它 Go 侧是未知键（静默忽略 → xdns
 //!    实际失效），禁再产；
-//! 3. `https`（DOH）Go 支持但本栈未实现 → 配置期点名报错，不静默降级成 udp。
+//! 3. `https`（DoH）Go 支持且本栈已实现（bd lf69h）→ 配置期读入；DoH-over-QUIC （`quic://` / `quicConfig`
+//!    / ALPN h3）本轮未实现 → 配置期点名指路 `https://`， 不静默降级成 udp。
 //!
 //! 字段级断言（type/addr/worker/tls/quic 逐项）在 `src/finalmask/xdns/mod.rs` 单测。
 
@@ -57,23 +58,33 @@ fn legacy_rust_dialect_rejected() {
     assert!(e.to_string().contains("addrs"), "错误须指路 addrs：{e}");
 }
 
-/// https(DOH)：Go 支持、本栈未实现 → 配置期点名（禁静默改成 udp）。
+/// https(DoH)：配置期可读入（Go 形态 + 合法 tlsConfig）；连接期的 DoH 端到端见
+/// `src/finalmask/xdns/mod.rs::doh_resolver_loopback_end_to_end`。
 #[test]
-fn doh_resolver_rejected_loudly() {
+fn doh_resolver_loads() {
     let json = udpmask(serde_json::json!({
+        "domains": [{ "names": ["t.example.com"] }],
         "resolvers": [{ "addrs": ["https://dns.google/dns-query"], "worker": 8,
-                        "tlsConfig": { "serverName": "dns.google" } }]
+                        "tlsConfig": { "serverName": "dns.google", "alpn": ["h2"] } }]
     }));
+    build_udpmask_manager_from_json(Some(&json)).expect("https resolver 必须可读入");
+}
+
+/// DoH-over-QUIC（本轮未实现）：`quic://` 错误文案点名并指路 `https://`。
+#[test]
+fn doh_over_quic_rejected_loudly() {
+    let json = udpmask(serde_json::json!({ "resolvers": [{ "addrs": ["quic://8.8.8.8:53"] }] }));
     let Err(e) = build_udpmask_manager_from_json(Some(&json)) else {
-        panic!("DOH 必须硬错");
+        panic!("DoH-over-QUIC 必须硬错");
     };
-    assert!(e.to_string().contains("DOH"), "错误须点明 DOH：{e}");
+    assert!(e.to_string().contains("DoH-over-QUIC"), "错误须点明 DoH-over-QUIC：{e}");
+    assert!(e.to_string().contains("https://"), "错误须指路 https：{e}");
 }
 
 /// 未知 scheme（Go `:903-904` → "invalid protocol"）同样配置期硬错。
 #[test]
 fn unknown_scheme_rejected() {
-    let json = udpmask(serde_json::json!({ "resolvers": [{ "addrs": ["quic://8.8.8.8:53"] }] }));
+    let json = udpmask(serde_json::json!({ "resolvers": [{ "addrs": ["tls://8.8.8.8:853"] }] }));
     let Err(e) = build_udpmask_manager_from_json(Some(&json)) else {
         panic!("未知 scheme 必须硬错");
     };
