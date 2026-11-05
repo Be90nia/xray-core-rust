@@ -27,7 +27,7 @@
 //!
 //! # 与现状关系
 //!
-//! [`crate::outbound::handler::OutboundHandlerEntry::get_uo_t_connection`] 当前仅返回
+//! `OutboundHandlerEntry` 的 Go `getUoTConnection` 对接当前仅返回
 //! `(UdpSocket, UotVersion)`（20% 实现）；本模块提供完整的 ServerConn/ClientConn 包装，
 //! 上层 UoT 拨号链路可在本模块就绪后接入。
 //!

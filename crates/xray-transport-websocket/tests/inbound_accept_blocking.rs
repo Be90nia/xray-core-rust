@@ -455,12 +455,21 @@ async fn ws_accept_loop_survives_256_bad_connections() {
         handshake_extra / 1024
     );
 
-    // ② 内存红线：握手路径可归因堆增量 <4MB（`MEMORY-BUDGET-256MB.md` 本轮新增池
-    // 硬顶；64 × 实测 55KiB/conn ≈ 3.4MiB，PM 复核后取 64 以容纳真实 burst，
-    // 3MB 曾是压测阈值而非预算上限）。
+    // ② 内存红线：握手路径可归因堆增量分平台封顶（分配计数环境敏感——CI Linux
+    // 的分配器/tungstenite 构建路径与 Windows 不同，实测斜率本身约 2.6×，不是
+    // tungstenite 结构性差异；参照 udf CI flake 战役「期望值按机制推导 + 双平台
+    // 实测校准」口径）。
+    // - Windows：本机 debug 实测 3289KiB（2026-11-05 改前基线）/ 2652KiB（改后）， ≈64 × 51KiB/conn
+    //   ⇒ <4MB（≈1.25× 余量，MEMORY-BUDGET-256MB.md 口径沿用）。
+    // - Linux：CI 实测 8.6MB（2026-11-05 通报）⇒ <16MB（≈1.9× 余量，抓 2× 级 暴涨：per-conn
+    //   成本翻倍或闸泄漏必红）。
+    #[cfg(target_os = "windows")]
+    const HANDSHAKE_HEAP_BUDGET: usize = 4 * 1024 * 1024;
+    #[cfg(not(target_os = "windows"))]
+    const HANDSHAKE_HEAP_BUDGET: usize = 16 * 1024 * 1024;
     assert!(
-        handshake_extra < 4 * 1024 * 1024,
-        "256 并发坏连接的握手路径堆增量应 <4MB，实测 {handshake_extra} 字节（总 {total_delta}，裸 socket 基线 {bare}）"
+        handshake_extra < HANDSHAKE_HEAP_BUDGET,
+        "256 并发坏连接的握手路径堆增量应 <{HANDSHAKE_HEAP_BUDGET} 字节，实测 {handshake_extra} 字节（总 {total_delta}，裸 socket 基线 {bare}）"
     );
     // ③ fail-fast 证据：超出闸上界的连接被立即丢弃（不等 1s 首字节窗）。
     assert!(
@@ -624,10 +633,20 @@ async fn tungstenite_silent_handshake_window_heap_cost() {
              (ReadBuffer 4KiB Vec + 4KiB Box + handshake structs; upstream const, not tunable)"
         );
     }
-    // 宽上界：若上游把沉默窗分配做大（如 >32 KiB），本断言红 = 版本升级引入
-    // 每连接握手期内存回归，需重估 0wvne 口径。
+    // 分平台封顶（分配计数环境敏感——CI Linux 的分配器/tungstenite 构建路径与
+    // Windows 不同，实测约 3-4×，非 tungstenite 结构性差异：源码定位沉默窗结构
+    // 仅 ReadBuffer 4KiB+4KiB + 状态机；参照 udf CI flake 战役「期望值按机制推导
+    // + 双平台实测校准」口径）。
+    // - Windows：本机 debug 双轮实测 13728B / 19471B（2026-11-05，i37bz 报告） ⇒ <32KiB（≈1.6×
+    //   余量）。
+    // - Linux：CI 实测 60620B（2026-11-05 通报）⇒ <96KiB（≈1.6× 余量，对称 Windows 档——抓 1.6×
+    //   以上暴涨：上游升级放大沉默窗分配或握手泄漏必红， 需重估 0wvne 口径）。
+    #[cfg(target_os = "windows")]
+    const SILENT_WINDOW_BUDGET: usize = 32 * 1024;
+    #[cfg(not(target_os = "windows"))]
+    const SILENT_WINDOW_BUDGET: usize = 96 * 1024;
     assert!(
-        holding < 32 * 1024,
-        "tungstenite 沉默握手窗分配应 <32 KiB（2026-11-05 实测 13728B），实测 {holding}B"
+        holding < SILENT_WINDOW_BUDGET,
+        "tungstenite 沉默握手窗分配应 <{SILENT_WINDOW_BUDGET} 字节（Windows 实测 13728B/19471B，Linux CI 实测 60620B，均为 2026-11-05），实测 {holding}B"
     );
 }

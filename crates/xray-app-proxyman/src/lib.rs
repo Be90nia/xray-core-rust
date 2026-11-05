@@ -23,7 +23,7 @@
 //! - worker 创建（TCP/UDP/Unix listener）— 依赖 `xray_transport::Listener` + xray-mux
 //! - `outbound::OutboundHandlerEntry` 的 `dispatch`/`dial` — 依赖 `transport.Link` + 代理 + mux +
 //!   xudp + DNS
-//! - UoT ([`outbound::OutboundHandlerEntry::get_uo_t_connection`]) — UDP over TCP 桥接
+//! - UoT — UDP over TCP 桥接（Go `getUoTConnection` 对接，待 `uot` 模块就绪后接入）
 //! - gRPC server 注册 — 依赖 tonic + xray-app-commander
 //! - TypedMessage 操作解码 — 由上层注入 [`command::OperationDecoder`] 实现
 

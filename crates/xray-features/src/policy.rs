@@ -382,9 +382,14 @@ mod tests {
         #[cfg(any(target_arch = "arm", target_arch = "mips"))]
         assert_eq!(size, 0, "arm/mips GOARCH branch expects 0");
         // rustc target_arch 无 "arm64"/"mips64el"（对应 aarch64/mips64），恒假值已删。
-        #[cfg(target_arch = "mips64")]
-        assert_eq!(size, 4096, "mips64 GOARCH branch expects 4 KiB");
-        #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "mips64"))]
+        assert_eq!(size, 4096, "aarch64/mips64 GOARCH 分支期望 4 KiB（9utc3③）");
+        #[cfg(not(any(
+            target_arch = "arm",
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "aarch64"
+        )))]
         assert_eq!(size, 512 * 1024, "其他 GOARCH 分支（x86_64 等）期望 512 KiB");
     }
 
@@ -393,17 +398,11 @@ mod tests {
     /// buffer 字段时 `system_stats_from_proto` 仍回落到 `BufferPolicy::default()`。
     #[test]
     fn test_system_stats_buffer_default_roundtrip_via_default_policy() {
-        // 对应 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
-        // 与 policy.go:108-112 defaultBufferPolicy() = Buffer{PerConnection: 512*1024}
-        // 已由现有 test_system_stats_buffer_default_aligns_go_default 覆盖；这里补一个
-        // 走 `default_buffer_connection_from_env` 路径的反向验证：env 缺省下的 512 KiB
-        // 应等于 SystemStats::default().buffer.connection（GOARCH 「其他」分支）。
-        #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
-        {
-            let sys = SystemStats::default();
-            assert_eq!(sys.buffer.connection, default_buffer_connection_from_env(None));
-            assert_eq!(sys.buffer.connection, 512 * 1024);
-        }
+        // 对应 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}。
+        // 走 `default_buffer_connection_from_env` 路径的反向验证：env 缺省下该值必须
+        // 等于 SystemStats::default().buffer.connection（架构无关断言，9utc3③）。
+        let sys = SystemStats::default();
+        assert_eq!(sys.buffer.connection, default_buffer_connection_from_env(None));
     }
 
     /// XRAY_BUFSIZE 原始串解析：有效整数/空白容忍/非数字与缺失回退 None
