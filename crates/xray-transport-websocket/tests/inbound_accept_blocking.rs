@@ -87,6 +87,19 @@ fn heap_in_use() -> usize {
     ALLOCATED.load(Ordering::Relaxed).saturating_sub(FREED.load(Ordering::Relaxed))
 }
 
+/// 本文件内的测试**串行**锁。
+///
+/// 本二进制装了进程级 [`CountingAlloc`]，`heap_in_use()` 读数含**同二进制其他
+/// 测试**的并行分配——并发跑时「沉默握手窗」的增量会被邻居抬高而误红
+/// （2026-11-05 run 42023127702 release 档同族、本地 debug 档实测复现）。
+/// 每个测试开头拿它：heap 探针串行 ⇒ 读数只反映自己。
+static PROBE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 取串行锁（中毒也继续：泄漏的 panic 信息不影响下一用例的读数口径）。
+fn probe_serial() -> std::sync::MutexGuard<'static, ()> {
+    PROBE_SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 判据 2（好连接端到端上界）。
 const FAST_LIMIT: Duration = Duration::from_millis(500);
 /// 判据 1（accept 循环零阻塞：坏连接在场时新连接必须在 50ms 内能被 accept）。
@@ -251,8 +264,13 @@ fn judge(baseline: Duration, good: Duration) -> String {
 ///
 /// 命中面：argo 明文 ws 39007/39009/39011/39016。
 /// 修复前实测：好连接 3706ms（独占一个 WS 4s 窗）。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_plaintext_bad_connection_does_not_block_accept_loop() {
+    let _serial = probe_serial();
     let addr = start_ws_listener("none", Some(serde_json::json!({"path": "/"}))).await;
 
     // 基线：好连接单独跑。
@@ -300,8 +318,13 @@ async fn ws_plaintext_bad_connection_does_not_block_accept_loop() {
 ///
 /// 命中面：443/2083/2096/39003/39004。
 /// 修复前实测：好连接 3708ms（独占 TLS 4s 窗）；生产 4528 次/60min accept timeout。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_tls_bad_connection_does_not_block_accept_loop() {
+    let _serial = probe_serial();
     let addr = start_ws_listener("tls", Some(serde_json::json!({"path": "/"}))).await;
 
     let baseline = ws_handshake(addr, true, false).await.expect("baseline handshake");
@@ -347,8 +370,13 @@ async fn ws_tls_bad_connection_does_not_block_accept_loop() {
 ///
 /// 修复前实测：同类「慢」连接（3s 后完成 TLS、不发升级）让好连接等 7013ms
 /// （TLS 4s 窗 + WS 4s 窗在 accept 循环内串行）。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_slow_first_byte_cleared_by_first_byte_window() {
+    let _serial = probe_serial();
     let addr = start_ws_listener("none", Some(serde_json::json!({"path": "/"}))).await;
 
     let baseline = ws_handshake(addr, false, false).await.expect("baseline handshake");
@@ -420,8 +448,13 @@ async fn measure_bare_256() -> usize {
 /// 内存证据 = 进程内堆增量（本文件自带计数 allocator）。注意本用例客户端与服务端
 /// 同进程，故先对「哑监听（只 accept 不握手）」量一遍 256 连接的**客户端侧成本**，
 /// 再从总量里扣除 ⇒ 得到**服务端握手**的可归因增量（生产上只有这一侧）。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_accept_loop_survives_256_bad_connections() {
+    let _serial = probe_serial();
     // ① 裸 socket 双方基线（无握手态）——用于扣除 256 连接的 socket 固有成本。
     let bare = measure_bare_256().await;
 
@@ -507,8 +540,13 @@ async fn ws_accept_loop_survives_256_bad_connections() {
 /// 命中面：`wsSettings.acceptProxyProtocol=true` 的明文 ws 入站。
 /// 修复前实测：**无界**——好连接 6s 观察上限内永不被 accept，坏连接永不被释放
 /// （裸 `read_exact` 无超时）。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_plaintext_proxy_protocol_does_not_block_accept_loop() {
+    let _serial = probe_serial();
     let addr = start_ws_listener(
         "none",
         Some(serde_json::json!({"path": "/", "acceptProxyProtocol": true})),
@@ -548,8 +586,13 @@ async fn ws_plaintext_proxy_protocol_does_not_block_accept_loop() {
 }
 
 /// ws TLS + PROXY protocol：坏连接不发 PROXY 头 ⇒ 好连接仍须 <500ms 完成。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ws_tls_proxy_protocol_does_not_block_accept_loop() {
+    let _serial = probe_serial();
     let addr = start_ws_listener(
         "tls",
         Some(serde_json::json!({"path": "/", "acceptProxyProtocol": true})),
@@ -600,8 +643,13 @@ async fn ws_tls_proxy_protocol_does_not_block_accept_loop() {
 /// - 稳态（握手完成后）大头是 `FrameCodec::in_buffer` =
 ///   `BytesMut::with_capacity(read_buffer_size)`（默认 128 KiB 立即分配）， 由
 ///   [`crate::config::ws_config`] 收窄到 32 KiB（源码定位见 config.rs 注）。
+#[allow(
+    clippy::await_holding_lock,
+    reason = "测试全局串行锁刻意跨 await 持有：各测试独立 runtime，用 tokio Mutex 无法跨 runtime 互斥；无争用场景"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tungstenite_silent_handshake_window_heap_cost() {
+    let _serial = probe_serial();
     use std::task::Poll;
 
     use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -637,16 +685,21 @@ async fn tungstenite_silent_handshake_window_heap_cost() {
     // Windows 不同，实测约 3-4×，非 tungstenite 结构性差异：源码定位沉默窗结构
     // 仅 ReadBuffer 4KiB+4KiB + 状态机；参照 udf CI flake 战役「期望值按机制推导
     // + 双平台实测校准」口径）。
-    // - Windows：本机 debug 双轮实测 13728B / 19471B（2026-11-05，i37bz 报告） ⇒ <32KiB（≈1.6×
+    // - Windows debug：本机双轮实测 13728B / 19471B（2026-11-05，i37bz 报告） ⇒ <32KiB（≈1.6×
     //   余量）。
-    // - Linux：CI 实测 60620B（2026-11-05 通报）⇒ <96KiB（≈1.6× 余量，对称 Windows 档——抓 1.6×
-    //   以上暴涨：上游升级放大沉默窗分配或握手泄漏必红， 需重估 0wvne 口径）。
-    #[cfg(target_os = "windows")]
+    // - Windows release：本机实测 66928B（2026-11-06，gate2-rel）——与 Linux CI 同量级：
+    //   优化档下计数口径不同（`realloc` 缺省实现 = alloc+copy+dealloc，增长期双计），
+    //   结构未变。故按「平台 × 优化档」分档封顶，仍在 ~1.4× 内可抓结构性暴涨。
+    // - Linux：CI 实测 60620B（2026-11-05 通报）⇒ <96KiB（≈1.6× 余量）。
+    #[cfg(all(target_os = "windows", debug_assertions))]
     const SILENT_WINDOW_BUDGET: usize = 32 * 1024;
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    const SILENT_WINDOW_BUDGET: usize = 96 * 1024;
     #[cfg(not(target_os = "windows"))]
     const SILENT_WINDOW_BUDGET: usize = 96 * 1024;
     assert!(
         holding < SILENT_WINDOW_BUDGET,
-        "tungstenite 沉默握手窗分配应 <{SILENT_WINDOW_BUDGET} 字节（Windows 实测 13728B/19471B，Linux CI 实测 60620B，均为 2026-11-05），实测 {holding}B"
+        "tungstenite 沉默握手窗分配应 <{SILENT_WINDOW_BUDGET} 字节（Windows debug 实测 13728B/19471B，\
+         Windows release 实测 66928B，Linux CI 实测 60620B），实测 {holding}B"
     );
 }

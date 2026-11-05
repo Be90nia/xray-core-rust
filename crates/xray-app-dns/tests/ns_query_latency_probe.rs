@@ -557,6 +557,10 @@ async fn b4_doh_ns_blackhole_upper_bound_is_one_timeout() {
 /// 改前：`query_once` 每查询都 `connect_stream` + TLS + `client::handshake`
 /// ⇒ N 次查询 = N 次 accept。改后热会话入槽复用（h2 多路复用 1 条承载全部
 /// 查询）⇒ 3 次查询 accepts ≤2。
+///
+/// 超时用 [`DEFAULT_QUERY_TIMEOUT_MS`] 而非探针的 400ms：本用例考的是
+/// **会话复用**，不是延迟预算；release 档 2 核 CI 上 h2c 首握手 + 首查询实测会
+/// 撞 400ms（2026-11-05 run 42023127702 `b4c_*` 首发查询超时实证）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn b4b_doh_ns_reuses_session_across_queries() {
     let (addr, accepts) =
@@ -565,7 +569,7 @@ async fn b4b_doh_ns_reuses_session_across_queries() {
     let ns = h2c_doh_ns(addr, "probe-doh-reuse");
     let fx = std::sync::Arc::new(skeleton_infra::fx::FxScope::new());
     ns.start_managed_tasks(&fx);
-    let client = client_for(Box::new(ns) as Box<dyn Server>, PROBE_TIMEOUT_MS);
+    let client = client_for(Box::new(ns) as Box<dyn Server>, DEFAULT_QUERY_TIMEOUT_MS);
 
     const N: usize = 3;
     let mut ok = 0usize;
@@ -591,6 +595,9 @@ async fn b4b_doh_ns_reuses_session_across_queries() {
 }
 
 /// B-4c：会话失效可重建——对端关连接后，下一次查询自动新建连接并成功（bd yzhb4）。
+///
+/// 同 B-4b：考的是**重建**而非延迟，超时取 [`DEFAULT_QUERY_TIMEOUT_MS`]
+/// （release 档 CI 上 400ms 会误杀首查询，见 2026-11-05 run 42023127702）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn b4c_doh_session_rebuilds_after_peer_close() {
     let (addr, accepts) =
@@ -599,7 +606,7 @@ async fn b4c_doh_session_rebuilds_after_peer_close() {
     let ns = h2c_doh_ns(addr, "probe-doh-rebuild");
     let fx = std::sync::Arc::new(skeleton_infra::fx::FxScope::new());
     ns.start_managed_tasks(&fx);
-    let client = client_for(Box::new(ns) as Box<dyn Server>, PROBE_TIMEOUT_MS);
+    let client = client_for(Box::new(ns) as Box<dyn Server>, DEFAULT_QUERY_TIMEOUT_MS);
 
     let opt = || IpOption { ipv4_enable: true, ipv6_enable: false, fake_enable: false };
     let r1 = client.query_ip("a.rebuild.test", opt()).await;
