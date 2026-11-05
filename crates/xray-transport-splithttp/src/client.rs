@@ -78,6 +78,23 @@ pub struct DialTarget {
     pub port: u16,
     /// TLS SNI。空 = 回退 hyper 默认（URI authority host）。
     pub sni: String,
+    /// `socketSettings`（bd w5jhf：显式 `receiveBufferSize` 随拨号下发；缺省
+    /// 0 = 不设置，r5j96 缺省语义不变）。
+    pub sockopt: xray_transport::sockopt::SocketOptions,
+}
+
+/// bd w5jhf：用户显式 `receiveBufferSize`（JSON `sockopt.receiveBufferSize`）
+/// 照旧下发——opt-in「锁窗 + 大缓冲」语义；**缺省 0 = 不设置**（r5j96 缺省
+/// 语义不变，交 OS autotune）。失败即拨号失败（对齐 bd 88m0 口径）。
+/// 返回 `sockopt.receive_buffer_size` 原值供注入点观测（>0 = 已调 setsockopt）。
+fn apply_explicit_receive_buffer_size(
+    tcp: &tokio::net::TcpStream,
+    sockopt: &xray_transport::sockopt::SocketOptions,
+) -> std::io::Result<i32> {
+    if sockopt.receive_buffer_size > 0 {
+        socket2::SockRef::from(tcp).set_recv_buffer_size(sockopt.receive_buffer_size as usize)?;
+    }
+    Ok(sockopt.receive_buffer_size)
 }
 
 /// 忽略 URI host、恒拨 `DialTarget` 的 TCP connector（hyper-util Service 语义）。
@@ -97,6 +114,8 @@ pub struct DestTcpConnector {
     /// finalmask TCP 伪装（bd dppv；None/空 manager = 恒等）——TCP 后、TLS 前
     /// 套上（Go splithttp/dialer.go:127-134 dialContext 内 WrapConnClient）。
     tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+    /// `socketSettings`（bd w5jhf：显式 `receiveBufferSize` 随拨号下发）。
+    sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 impl TowerService<Uri> for DestTcpConnector {
@@ -112,12 +131,14 @@ impl TowerService<Uri> for DestTcpConnector {
         let host = std::sync::Arc::clone(&self.host);
         let port = self.port;
         let tcpmask = self.tcpmask.clone();
+        let sockopt = self.sockopt.clone();
         Box::pin(async move {
             let tcp = xray_transport::sockopt::dial_client_tcp((host.as_ref(), port)).await?;
             tcp.set_nodelay(true).ok();
             // bd r5j96 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune；
             // 显式 setsockopt 在两平台都是「关掉 autotune 并把窗钉在请求值」）。
             xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+            apply_explicit_receive_buffer_size(&tcp, &sockopt)?;
             // finalmask（bd dppv）：TCP 后、TLS 前——首字节 = mask 头。
             let conn: Box<dyn Connection> = match tcpmask.as_ref() {
                 Some(m) => xray_transport::finalmask::wrap_conn_client_into_connection(
@@ -217,6 +238,8 @@ pub struct BtlsDial {
     pub security_json: Option<serde_json::Value>,
     /// finalmask TCP 伪装（bd dppv；None/空 manager = 恒等）——TCP 后、TLS 前。
     pub tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+    /// `socketSettings`（bd w5jhf：显式 `receiveBufferSize` 随拨号下发）。
+    pub sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 /// [`SplitConnector`] 的统一 response 流。满足 hyper-util legacy Client 的
@@ -271,6 +294,7 @@ impl TowerService<Uri> for SplitConnector {
                     // bd r5j96 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune；
                     // 显式 setsockopt 在两平台都是「关掉 autotune 并把窗钉在请求值」）。
                     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+                    apply_explicit_receive_buffer_size(&tcp, &dial.sockopt)?;
                     // finalmask（bd dppv）：TCP 后、指纹 TLS 前——首字节 = mask 头。
                     let conn: Box<dyn Connection> = match dial.tcpmask.as_ref() {
                         Some(m) => xray_transport::finalmask::wrap_conn_client_into_connection(
@@ -436,6 +460,7 @@ impl DefaultDialerClient {
                 fingerprint: fp,
                 security_json,
                 tcpmask,
+                sockopt: dial.sockopt,
             })
         } else {
             // clear 只在 rustls 分支（btls 分支不读 config.alpn_protocols，
@@ -452,6 +477,7 @@ impl DefaultDialerClient {
                 host: std::sync::Arc::from(dial.host.as_str()),
                 port: dial.port,
                 tcpmask,
+                sockopt: dial.sockopt,
             });
             SplitConnector::Rustls(https)
         };
@@ -959,8 +985,12 @@ mod tests {
         let accept = tokio::spawn(async move {
             let _ = listener.accept().await;
         });
-        let mut connector =
-            DestTcpConnector { host: std::sync::Arc::from("127.0.0.1"), port, tcpmask: None };
+        let mut connector = DestTcpConnector {
+            host: std::sync::Arc::from("127.0.0.1"),
+            port,
+            tcpmask: None,
+            sockopt: Default::default(),
+        };
         let uri: Uri = "http://127.0.0.1/xh/".parse().unwrap();
         let stream = connector.call(uri).await.unwrap();
         // DestTcpStream(TokioIo<Box<dyn Connection>>)：取内层连接克隆裸 socket 回读
@@ -1130,7 +1160,12 @@ mod tests {
         let _c = DefaultDialerClient::new(
             Arc::new(Config::default()),
             tls,
-            DialTarget { host: "127.0.0.1".into(), port: 0, sni: String::new() },
+            DialTarget {
+                host: "127.0.0.1".into(),
+                port: 0,
+                sni: String::new(),
+                sockopt: Default::default(),
+            },
             None,
             None,
             None,
@@ -1163,7 +1198,12 @@ mod tests {
         let c = std::sync::Arc::new(DefaultDialerClient::new(
             config,
             client_tls(cert),
-            DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            DialTarget {
+                host: "127.0.0.1".into(),
+                port,
+                sni: "127.0.0.1".into(),
+                sockopt: Default::default(),
+            },
             None,
             None,
             None,
@@ -1215,7 +1255,12 @@ mod tests {
         let c = DefaultDialerClient::new(
             config,
             client_tls(cert),
-            DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            DialTarget {
+                host: "127.0.0.1".into(),
+                port,
+                sni: "127.0.0.1".into(),
+                sockopt: Default::default(),
+            },
             None,
             None,
             None,
@@ -1225,5 +1270,46 @@ mod tests {
         let err = c.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"x")).await;
         assert!(matches!(err, Err(SplitHttpError::BadStatus(503))), "{err:?}");
         server.await.expect("mock server");
+    }
+
+    /// bd w5jhf：显式 `receiveBufferSize` 注入点观测（真实 socket 同进程对照）。
+    /// 显式 1MiB 连接的 SO_RCVBUF 回读必须高于缺省连接：Windows set/get 原样
+    /// （1MiB > 内核缺省 ~64KiB）；Linux 即使被 `net.core.rmem_max` 钳制
+    /// （stock 208KiB），min(1MiB, 208KiB)×2 = 416KiB 仍高于 autotune 初始回读
+    /// 262144B。缺省 sockopt（0）不得触碰 socket（r5j96：不设，交 OS autotune）。
+    #[tokio::test]
+    async fn explicit_receive_buffer_size_reaches_dial_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 缺省形态：apply_client_dial_rcvbuf + 显式 fn（0）都不触碰 socket。
+        let base_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        xray_transport::sockopt::apply_client_dial_rcvbuf(&base_sock).unwrap();
+        let base = socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap();
+        let applied_none = apply_explicit_receive_buffer_size(
+            &base_sock,
+            &xray_transport::sockopt::SocketOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(applied_none, 0, "缺省 sockopt 不得触发 setsockopt");
+        assert_eq!(
+            socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap(),
+            base,
+            "缺省路径不得改变 SO_RCVBUF（r5j96：缺省不设）"
+        );
+
+        // 显式形态：1MiB 下发后回读必须高于缺省对照。
+        let explicit_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let opts = xray_transport::sockopt::SocketOptions {
+            receive_buffer_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let applied = apply_explicit_receive_buffer_size(&explicit_sock, &opts).unwrap();
+        assert_eq!(applied, 1024 * 1024, "返回值 = 配置值（下发已发生的注入点观测）");
+        let explicit = socket2::SockRef::from(&explicit_sock).recv_buffer_size().unwrap();
+        assert!(
+            explicit > base,
+            "显式 receiveBufferSize 必须抬高 SO_RCVBUF 回读：explicit={explicit} 须高于缺省 {base}"
+        );
     }
 }

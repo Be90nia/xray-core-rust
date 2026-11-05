@@ -83,6 +83,7 @@ fn grpc_authority(cfg_authority: &str, settings: &StreamSettings, dest: &Destina
 
 pub async fn dial(
     dest: &Destination,
+    sockopt: &xray_transport::sockopt::SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let addr = format!("{}:{}", dest.address(), dest.port().value());
@@ -178,6 +179,7 @@ pub async fn dial(
                 tls.as_ref(),
                 security_json,
                 &tcpmask,
+                sockopt,
             )
             .await
             {
@@ -210,9 +212,24 @@ struct TlsDialReady {
     fingerprint: Option<xray_tls::fingerprint::Fingerprint>,
 }
 
+/// bd w5jhf：用户显式 `receiveBufferSize`（JSON `sockopt.receiveBufferSize`）
+/// 照旧下发——opt-in「锁窗 + 大缓冲」语义；**缺省 0 = 不设置**（r5j96 缺省
+/// 语义不变，交 OS autotune）。失败即拨号失败（对齐 bd 88m0 口径）。
+/// 返回 `sockopt.receive_buffer_size` 原值供注入点观测（>0 = 已调 setsockopt）。
+fn apply_explicit_receive_buffer_size(
+    tcp: &tokio::net::TcpStream,
+    sockopt: &xray_transport::sockopt::SocketOptions,
+) -> std::io::Result<i32> {
+    if sockopt.receive_buffer_size > 0 {
+        socket2::SockRef::from(tcp).set_recv_buffer_size(sockopt.receive_buffer_size as usize)?;
+    }
+    Ok(sockopt.receive_buffer_size)
+}
+
 /// 单次拨号尝试（TCP → [TLS] → h2）。Err 一律视为暂时性、由 `dial` 退避循环
 /// 决定重试；永久性错误（配置/指纹/TLS 构建非法/URI 非法）已在 `dial` 进入
 /// 循环前直接返回。
+#[allow(clippy::too_many_arguments)] // 同 accept_h2：Go dial.go 参数面直译；bd w5jhf 增 sockopt 一参
 async fn connect_once(
     addr: &str,
     uri: &http::Uri,
@@ -221,6 +238,7 @@ async fn connect_once(
     tls: Option<&TlsDialReady>,
     security_json: Option<&serde_json::Value>,
     tcpmask: &xray_transport::finalmask::TcpmaskManager,
+    sockopt: &xray_transport::sockopt::SocketOptions,
 ) -> io::Result<Box<dyn Connection>> {
     // r7a9：拨号外层 timeout 包装。Go xray-core system_dialer 用 DefaultSystemDialer
     // 16s 超时；这里与 system_dialer::DEFAULT_DIAL_TIMEOUT 对齐（与 hysteria/quic 拨号同源）。
@@ -232,9 +250,9 @@ async fn connect_once(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "grpc dial timeout"))??;
     tcp.set_nodelay(true).ok();
-    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
-    // 对齐 dial_system sockopt 语义）。
+    // bd 88m0/0kqj 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+    apply_explicit_receive_buffer_size(&tcp, sockopt)?;
     // finalmask（bd dppv）：TCP 建立后、TLS/h2 之前（Go dial.go:129-135 层序，
     // 首字节 = mask 头而非 HTTP/2 preface）。空 manager = 恒等。
     let conn: Box<dyn Connection> = xray_transport::finalmask::wrap_conn_client_into_connection(
@@ -1653,7 +1671,7 @@ mod tests {
             ..StreamSettings::tcp()
         };
         let dial_task = tokio::spawn(async move {
-            let _ = dial(&dest, &settings).await;
+            let _ = dial(&dest, &Default::default(), &settings).await;
         });
 
         // 首次连接：真实 loopback IO；虚拟时间 1ms 小步推进（advance 的内部
@@ -1721,7 +1739,8 @@ mod tests {
             transport_json: Some(serde_json::json!({"serviceName": "GunService"})),
             ..StreamSettings::tcp()
         };
-        let dial_task = tokio::spawn(async move { dial(&dest, &settings).await });
+        let dial_task =
+            tokio::spawn(async move { dial(&dest, &Default::default(), &settings).await });
 
         // 1s 步进推进跨过 16s deadline：dial 必须终结并返回 TimedOut
         let mut turns = 0u32;
@@ -1886,5 +1905,42 @@ mod tests {
 
         drop(s);
         let _ = tokio::time::timeout(Duration::from_secs(5), serve).await;
+    }
+
+    /// bd w5jhf：显式 `receiveBufferSize` 注入点观测（真实 socket 同进程对照）。
+    /// 显式 1MiB 连接的 SO_RCVBUF 回读必须高于缺省连接：Windows set/get 原样
+    /// （1MiB > 内核缺省 ~64KiB）；Linux 即使被 `net.core.rmem_max` 钳制
+    /// （stock 208KiB），min(1MiB, 208KiB)×2 = 416KiB 仍高于 autotune 初始回读
+    /// 262144B。缺省 sockopt（0）不得触碰 socket（r5j96：不设，交 OS autotune）。
+    #[tokio::test]
+    async fn explicit_receive_buffer_size_reaches_dial_socket() {
+        use xray_transport::sockopt::SocketOptions;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 缺省形态：apply_client_dial_rcvbuf + 显式 fn（0）都不触碰 socket。
+        let base_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        xray_transport::sockopt::apply_client_dial_rcvbuf(&base_sock).unwrap();
+        let base = socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap();
+        let applied_none =
+            apply_explicit_receive_buffer_size(&base_sock, &SocketOptions::default()).unwrap();
+        assert_eq!(applied_none, 0, "缺省 sockopt 不得触发 setsockopt");
+        assert_eq!(
+            socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap(),
+            base,
+            "缺省路径不得改变 SO_RCVBUF（r5j96：缺省不设）"
+        );
+
+        // 显式形态：1MiB 下发后回读必须高于缺省对照。
+        let explicit_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let opts = SocketOptions { receive_buffer_size: 1024 * 1024, ..Default::default() };
+        let applied = apply_explicit_receive_buffer_size(&explicit_sock, &opts).unwrap();
+        assert_eq!(applied, 1024 * 1024, "返回值 = 配置值（下发已发生的注入点观测）");
+        let explicit = socket2::SockRef::from(&explicit_sock).recv_buffer_size().unwrap();
+        assert!(
+            explicit > base,
+            "显式 receiveBufferSize 必须抬高 SO_RCVBUF 回读：explicit={explicit} 须高于缺省 {base}"
+        );
     }
 }

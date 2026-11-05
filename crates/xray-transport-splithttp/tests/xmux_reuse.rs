@@ -360,7 +360,12 @@ async fn h2_bypass_pool_control() {
                 ..Default::default()
             }),
             tls.clone(),
-            DialTarget { host: "127.0.0.1".into(), port, sni: "127.0.0.1".into() },
+            DialTarget {
+                host: "127.0.0.1".into(),
+                port,
+                sni: "127.0.0.1".into(),
+                sockopt: Default::default(),
+            },
             None,
             None,
             None,

@@ -41,11 +41,13 @@ use xray_transport::{
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`（对齐 Go `init()` 在测试中多次执行的容错）。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, _sockopt, settings| {
+    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         // TransportDialFn 返回 'static future，必须在进入 async block 前拥有数据。
         let dest = dest.clone();
+        let sockopt = sockopt.clone();
         let settings = settings.clone();
-        Box::pin(async move { dial_grpc(&dest, &settings).await })
+        // bd w5jhf：socketSettings（含显式 receiveBufferSize）随拨号下发。
+        Box::pin(async move { dial_grpc(&dest, &sockopt, &settings).await })
     });
     // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
     let _ = register_transport_dialer("grpc", dialer.clone());
@@ -120,9 +122,10 @@ async fn listen_grpc(
 /// 配置解析与 TLS 构建已执行，确保错误前的路径可测。
 async fn dial_grpc(
     dest: &Destination,
+    sockopt: &xray_transport::sockopt::SocketOptions,
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
-    crate::transport::dial(dest, settings).await
+    crate::transport::dial(dest, sockopt, settings).await
 }
 
 #[cfg(test)]
@@ -243,7 +246,8 @@ mod tests {
             ..StreamSettings::tcp()
         };
         #[allow(clippy::disallowed_methods, reason = "测试：dial 重试观测任务")]
-        let dial_task = tokio::spawn(async move { dial_grpc(&dest, &settings).await });
+        let dial_task =
+            tokio::spawn(async move { dial_grpc(&dest, &Default::default(), &settings).await });
         // 跨过 ≥2 个首退避周期（500ms×1.2=600ms 上界；1600ms 足够第 2 轮尝试开始）：
         // dial 必须仍在重试，不得返回终态错误。
         tokio::time::advance(std::time::Duration::from_millis(1600)).await;
@@ -499,7 +503,7 @@ mod tests {
             Port::new(addr.port()),
             Network::TCP,
         );
-        let mut conn = dial_grpc(&dest, &settings).await.expect("dial_grpc");
+        let mut conn = dial_grpc(&dest, &Default::default(), &settings).await.expect("dial_grpc");
 
         conn.write_all(b"hello-grpc-tcpmask").await.expect("write");
         let mut buf = vec![0u8; 64];

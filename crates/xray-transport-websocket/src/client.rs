@@ -49,6 +49,20 @@ use crate::{
 /// `HandshakeTimeout: time.Second * 8`）。
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// bd w5jhf：用户显式 `receiveBufferSize`（JSON `sockopt.receiveBufferSize`）
+/// 照旧下发——opt-in「锁窗 + 大缓冲」语义；**缺省 0 = 不设置**（r5j96 缺省
+/// 语义不变，交 OS autotune）。失败即拨号失败（对齐 bd 88m0 口径）。
+/// 返回 `sockopt.receive_buffer_size` 原值供注入点观测（>0 = 已调 setsockopt）。
+fn apply_explicit_receive_buffer_size(
+    tcp: &tokio::net::TcpStream,
+    sockopt: &xray_transport::sockopt::SocketOptions,
+) -> std::io::Result<i32> {
+    if sockopt.receive_buffer_size > 0 {
+        socket2::SockRef::from(tcp).set_recv_buffer_size(sockopt.receive_buffer_size as usize)?;
+    }
+    Ok(sockopt.receive_buffer_size)
+}
+
 /// 拨号参数（与 Go `dialWebSocket` 入参对齐）。
 pub struct DialOptions<'a> {
     /// WS 配置（host/path/header/heartbeat）。
@@ -72,6 +86,9 @@ pub struct DialOptions<'a> {
     /// dialer.go:49-62：`NetDial`/`NetDialTLSContext` 里 `FinalMask.DialTCP` 包
     /// 裸 TCP，TLS/WS 握手跑在 mask 内——首字节是 mask 头而非 GET。
     pub tcpmask: Option<&'a xray_transport::finalmask::TcpmaskManager>,
+    /// `socketSettings`（bd w5jhf：显式 `receiveBufferSize` 随拨号下发；缺省
+    /// 0 = 不设置，r5j96 缺省语义不变）。
+    pub sockopt: &'a xray_transport::sockopt::SocketOptions,
 }
 
 /// 完成 WS 握手并返回字节流包装。
@@ -106,9 +123,9 @@ pub async fn dial(
     let port = opts.destination.port().value();
     let tcp = xray_transport::sockopt::dial_client_tcp((host.as_str(), port)).await?;
     tcp.set_nodelay(true).ok();
-    // bd 88m0/0kqj 客户端侧：下行 SO_RCVBUF 缺省 16MB（窗钉修复；失败即拨号失败，
-    // 对齐 dial_system sockopt 语义）。
+    // bd 88m0/0kqj 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
+    apply_explicit_receive_buffer_size(&tcp, opts.sockopt)?;
     // Bug-B（bd cqyj）：ws 拨号此前绕过 sockopt（裸 connect 无 keepalive）——
     // NAT/CDN 静默切断后成半开死链。45s 对齐 SocketOptions::default。
     {
@@ -202,6 +219,9 @@ pub struct DialParams {
     /// finalmask TCP 伪装（bd dppv；`None`/空 manager = 恒等）——随拨号进
     /// [`dial`]，在 TLS/WS 握手前套上（Go dialer.go:49-62 层序）。
     pub tcpmask: Option<Arc<xray_transport::finalmask::TcpmaskManager>>,
+    /// `socketSettings`（bd w5jhf：显式 `receiveBufferSize` 随拨号下发；缺省
+    /// 0 = 不设置，r5j96 缺省语义不变）。
+    pub sockopt: xray_transport::sockopt::SocketOptions,
 }
 
 /// 用 owned 参数拨号（内部组 [`DialOptions`] 调 [`dial`]）。
@@ -218,6 +238,7 @@ pub async fn dial_with_params(
         fingerprint,
         security_json,
         tcpmask,
+        sockopt,
     } = params;
     dial(DialOptions {
         config: &config,
@@ -228,6 +249,7 @@ pub async fn dial_with_params(
         fingerprint,
         security_json,
         tcpmask: tcpmask.as_deref(),
+        sockopt: &sockopt,
     })
     .await
 }
@@ -535,6 +557,7 @@ mod tests {
             fingerprint: None,
             security_json: None,
             tcpmask: None,
+            sockopt: Default::default(),
         };
         #[allow(clippy::disallowed_methods, reason = "测试：dial 任务")]
         let dial_task = tokio::spawn(dial_with_params(params, None));
@@ -723,6 +746,7 @@ mod tests {
             fingerprint: None,
             security_json: None,
             tcpmask: None,
+            sockopt: &Default::default(),
         })
         .await
         .unwrap();
@@ -739,6 +763,7 @@ mod tests {
             fingerprint: None,
             security_json: None,
             tcpmask: None,
+            sockopt: &Default::default(),
         })
         .await
         .unwrap();
@@ -803,6 +828,7 @@ mod tests {
             fingerprint: fingerprint.map(String::from),
             security_json: Some(sec),
             tcpmask: None,
+            sockopt: &Default::default(),
         })
         .await;
         assert!(result.is_err(), "capture server drops conn → dial must fail");
@@ -1000,5 +1026,46 @@ mod tests {
         assert!(recorded(&record).is_empty(), "shutdown must not dial");
         let err = conn.write(b"x".as_slice()).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    /// bd w5jhf：显式 `receiveBufferSize` 注入点观测（真实 socket 同进程对照）。
+    /// 显式 1MiB 连接的 SO_RCVBUF 回读必须高于缺省连接：Windows set/get 原样
+    /// （1MiB > 内核缺省 ~64KiB）；Linux 即使被 `net.core.rmem_max` 钳制
+    /// （stock 208KiB），min(1MiB, 208KiB)×2 = 416KiB 仍高于 autotune 初始回读
+    /// 262144B。缺省 sockopt（0）不得触碰 socket（r5j96：不设，交 OS autotune）。
+    #[tokio::test]
+    async fn explicit_receive_buffer_size_reaches_dial_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 缺省形态：apply_client_dial_rcvbuf + 显式 fn（0）都不触碰 socket。
+        let base_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        xray_transport::sockopt::apply_client_dial_rcvbuf(&base_sock).unwrap();
+        let base = socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap();
+        let applied_none = apply_explicit_receive_buffer_size(
+            &base_sock,
+            &xray_transport::sockopt::SocketOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(applied_none, 0, "缺省 sockopt 不得触发 setsockopt");
+        assert_eq!(
+            socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap(),
+            base,
+            "缺省路径不得改变 SO_RCVBUF（r5j96：缺省不设）"
+        );
+
+        // 显式形态：1MiB 下发后回读必须高于缺省对照。
+        let explicit_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let opts = xray_transport::sockopt::SocketOptions {
+            receive_buffer_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let applied = apply_explicit_receive_buffer_size(&explicit_sock, &opts).unwrap();
+        assert_eq!(applied, 1024 * 1024, "返回值 = 配置值（下发已发生的注入点观测）");
+        let explicit = socket2::SockRef::from(&explicit_sock).recv_buffer_size().unwrap();
+        assert!(
+            explicit > base,
+            "显式 receiveBufferSize 必须抬高 SO_RCVBUF 回读：explicit={explicit} 须高于缺省 {base}"
+        );
     }
 }

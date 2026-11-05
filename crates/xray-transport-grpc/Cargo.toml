@@ -24,6 +24,9 @@ http = "1"
 bytes = "1"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
+# bd w5jhf：显式 receiveBufferSize 下发的 set/getsockopt 唯一口（sockopt 机制件
+# 同款依赖；workspace 版本对齐 ws/splithttp）。
+socket2 = { workspace = true }
 
 [features]
 default = ["register"]

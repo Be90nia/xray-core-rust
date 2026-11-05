@@ -44,11 +44,13 @@ use crate::{
 ///
 /// 幂等：重复调用忽略 `AlreadyExists`（对齐 Go `init()` 在测试中多次执行的容错）。
 pub fn register_dialer() -> io::Result<()> {
-    let dialer: TransportDialFn = Arc::new(move |dest, _sockopt, settings| {
+    let dialer: TransportDialFn = Arc::new(move |dest, sockopt, settings| {
         // TransportDialFn 返回 'static future，必须在进入 async block 前拥有数据。
         let dest = dest.clone();
+        let sockopt = sockopt.clone();
         let settings = settings.clone();
-        Box::pin(async move { dial_ws(&dest, &settings).await })
+        // bd w5jhf：socketSettings（含显式 receiveBufferSize）随拨号下发。
+        Box::pin(async move { dial_ws(&dest, &sockopt, &settings).await })
     });
     // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
     let _ = register_transport_dialer("ws", dialer.clone());
@@ -337,7 +339,11 @@ impl Drop for WsTransportListener {
 }
 
 /// 实际拨号：解析 wsSettings → tls config → 池查询/拨号 → 包装为 Connection。
-async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Box<dyn Connection>> {
+async fn dial_ws(
+    dest: &Destination,
+    sockopt: &xray_transport::sockopt::SocketOptions,
+    settings: &StreamSettings,
+) -> io::Result<Box<dyn Connection>> {
     let config = parse_ws_config(settings.transport_json.as_ref())?;
 
     // 默认 SNI 用 dest 地址（与 Go `serverName = dest address` 一致）。
@@ -378,6 +384,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
             fingerprint,
             security_json: settings.security_json.clone(),
             tcpmask: Some(Arc::clone(&tcpmask)),
+            sockopt: sockopt.clone(),
         };
         let factory: DialFactory = Arc::new(move |ed_bytes| {
             let params = params.clone();
@@ -419,6 +426,7 @@ async fn dial_ws(dest: &Destination, settings: &StreamSettings) -> io::Result<Bo
         fingerprint,
         security_json: settings.security_json.clone(),
         tcpmask: Some(Arc::clone(&tcpmask)),
+        sockopt: sockopt.clone(),
     };
 
     if pool_enabled {
@@ -1032,7 +1040,9 @@ mod tests {
             ..Default::default()
         };
         let dest = Destination::new(Address::new_domain("127.0.0.1"), Port::new(1), Network::TCP);
-        let conn = dial_ws(&dest, &settings).await.expect("delayDial must return without dialing");
+        let conn = dial_ws(&dest, &Default::default(), &settings)
+            .await
+            .expect("delayDial must return without dialing");
         drop(conn);
     }
     /// Tcpmask round-trip（o54c，Go websocket/dialer.go:56-63 + hub.go:132-134）：
@@ -1082,7 +1092,7 @@ mod tests {
             Port::new(addr.port()),
             Network::TCP,
         );
-        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws");
+        let mut conn = dial_ws(&dest, &Default::default(), &settings).await.expect("dial_ws");
 
         conn.write_all(b"hello-ws-tcpmask").await.expect("write");
         // tcpmask 分片 + echo 按 chunk 回写：单次 read 可能只拿到一个分片
@@ -1372,7 +1382,7 @@ mod tests {
         }
 
         // 会话 #1：池空 → 现拨 → 承载会话数据（服务端序号 0）。
-        let mut session = dial_ws(&dest, &settings).await.expect("dial #1");
+        let mut session = dial_ws(&dest, &Default::default(), &settings).await.expect("dial #1");
         let id0 = roundtrip(&mut session, b"one").await;
         assert_eq!(id0, 0, "first dial must land on server connection #0");
         drop(session); // used 连接：结构性不回池（交付侧无归还路径）。
@@ -1388,13 +1398,13 @@ mod tests {
 
         // 顺序两连发（生产 caller 路径）：#2 命中预连接（补拨来得及）或退化为
         // 现拨——两条路径都必须拿到 virgin 连接。
-        let mut session2 = dial_ws(&dest, &settings).await.expect("dial #2");
+        let mut session2 = dial_ws(&dest, &Default::default(), &settings).await.expect("dial #2");
         let id2 = roundtrip(&mut session2, b"three").await;
         assert_ne!(id2, id0, "second session must never see the first session's connection");
         assert_ne!(id2, id1, "second session must get a distinct virgin connection");
         drop(session2);
 
-        let mut session3 = dial_ws(&dest, &settings).await.expect("dial #3");
+        let mut session3 = dial_ws(&dest, &Default::default(), &settings).await.expect("dial #3");
         let id3 = roundtrip(&mut session3, b"four").await;
         assert_ne!(id3, id0, "third session must never see any earlier connection");
         assert_ne!(id3, id1);
@@ -1446,7 +1456,8 @@ mod tests {
         let dest =
             Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
 
-        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws with finalmask");
+        let mut conn =
+            dial_ws(&dest, &Default::default(), &settings).await.expect("dial_ws with finalmask");
         conn.write_all(b"fm-roundtrip").await.expect("write");
         // tcpmask 分片 + echo 按 chunk 回写：循环读满，总预算 5s。
         let payload = b"fm-roundtrip";
@@ -1540,7 +1551,8 @@ mod tests {
         let dest =
             Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
 
-        let mut conn = dial_ws(&dest, &settings).await.expect("dial_ws with finalmask");
+        let mut conn =
+            dial_ws(&dest, &Default::default(), &settings).await.expect("dial_ws with finalmask");
         let len: usize =
             std::env::var("REPRO_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(131072);
         let chunk: usize =

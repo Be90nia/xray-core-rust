@@ -51,12 +51,13 @@ tokio-util = "0.7"
 tokio-stream = "0.1"
 base64 = "0.22"
 hex = "0.4"
+# bd w5jhf：显式 receiveBufferSize 下发的 setsockopt 口（原为 dev-dep（88m0 防回档
+# 测试回读口），生产拨号点消费后上移——workspace 版本对齐 ws/grpc）。
+socket2 = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"
 xray-features = { path = "../xray-features" }
-# bd 88m0 防回档测试：完整 connector 后回读 SO_RCVBUF（socket2 是唯一回读口）
-socket2 = { workspace = true }
 
 # bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

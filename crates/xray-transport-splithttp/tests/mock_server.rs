@@ -116,7 +116,12 @@ async fn dial_packet_up_end_to_end_via_mock_http1_server() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: server_addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -232,7 +237,12 @@ async fn packet_up_posts_run_concurrently_and_keep_seq_order() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -311,7 +321,12 @@ async fn post_packet_returns_bad_status_on_500() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -357,7 +372,12 @@ async fn open_stream_get_non_200_yields_eof() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -470,7 +490,12 @@ async fn fingerprint_btls_end_to_end_http1() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port,
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
         None,
@@ -508,7 +533,12 @@ async fn fingerprint_btls_end_to_end_http2() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port, sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port,
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         Some(Fingerprint::Chrome),
         Some(serde_json::json!({"allowInsecure": true})),
         None,
@@ -587,7 +617,12 @@ async fn conn_drop_terminates_all_http_connections() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: server_addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -719,7 +754,12 @@ async fn bridge_eof_propagates_without_conn_idle() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: server_addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -878,7 +918,12 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: server_addr.port(), sni: "127.0.0.1".into() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: server_addr.port(),
+            sni: "127.0.0.1".into(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -972,7 +1017,12 @@ async fn stream_up_dial_returns_while_upload_response_body_open() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -1034,7 +1084,12 @@ async fn stream_up_plain_h1_request_carries_connection_close() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -1125,7 +1180,12 @@ async fn stream_upload_tls_h2_request_has_no_connection_header() {
     let client = Arc::new(DefaultDialerClient::new(
         config,
         tls_config,
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: "127.0.0.1".into() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: "127.0.0.1".into(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,
@@ -1193,7 +1253,12 @@ async fn idle_connections_bounded_by_max_idle_per_host() {
     let client = Arc::new(DefaultDialerClient::new(
         Arc::new(Config::default()),
         make_tls_config(),
-        DialTarget { host: "127.0.0.1".into(), port: addr.port(), sni: String::new() },
+        DialTarget {
+            host: "127.0.0.1".into(),
+            port: addr.port(),
+            sni: String::new(),
+            sockopt: Default::default(),
+        },
         None,
         None,
         None,

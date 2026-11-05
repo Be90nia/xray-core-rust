@@ -302,6 +302,7 @@ async fn dial_splithttp(
                     .and_then(|j| j.get("serverName").and_then(|v| v.as_str()))
                     .unwrap_or("")
                     .to_string(),
+                sockopt: sockopt.clone(),
             };
             // bd vkirx①（lf51l 已清）：此前的握手前 RTT 探针（`resolve_rtt` 一次性
             // TCP）就是抓包看到的「stream-one 每会话多 1 条零字节 TCP」（Rust 2 条 vs
@@ -475,6 +476,7 @@ async fn build_download_side(
             host: ds.destination.address().to_string(),
             port: ds.destination.port().value(),
             sni: sni.clone(),
+            sockopt: sockopt.clone(),
         };
         dialer::DownloadClient::H2(Arc::new(DefaultDialerClient::new(
             dl_config.clone(),

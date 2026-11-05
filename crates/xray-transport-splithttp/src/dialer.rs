@@ -959,7 +959,12 @@ mod tests {
             config.clone(),
             #[allow(clippy::useless_conversion)] // 存量清零批次
             tls.into(),
-            DialTarget { host: "h".into(), port: 0, sni: String::new() },
+            DialTarget {
+                host: "h".into(),
+                port: 0,
+                sni: String::new(),
+                sockopt: Default::default(),
+            },
             None,
             None,
             None,
