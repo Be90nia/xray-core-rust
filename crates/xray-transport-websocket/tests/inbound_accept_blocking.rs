@@ -578,3 +578,56 @@ async fn ws_tls_proxy_protocol_does_not_block_accept_loop() {
         bad_hold
     );
 }
+
+/// bd i37bz：tungstenite「沉默握手窗」分配**隔离**探针。
+///
+/// 用 in-memory duplex 流绕开本仓 accept 链（握手闸/任务壳/PROXY peek 全部不在
+/// 场），把 `accept_hdr_async` 起手 + 首轮 poll 到 Pending（等首字节）的堆增量
+/// 单独量出来——bd 0wvne E1 的 ws−hu 差值（≈45 KiB/conn）中「tungstenite 结构
+/// 自身」份额的源码级对账：
+/// - `ServerHandshake` + `HandshakeMachine::start_read` 的 `ReadBuffer`：
+///   `Vec::with_capacity(4096)` + `Box<[u8; 4096]>`（上游 `const READ_BUFFER_CHUNK_SIZE =
+///   4096`，不可配）≈ 8 KiB；
+/// - 稳态（握手完成后）大头是 `FrameCodec::in_buffer` =
+///   `BytesMut::with_capacity(read_buffer_size)`（默认 128 KiB 立即分配）， 由
+///   [`crate::config::ws_config`] 收窄到 32 KiB（源码定位见 config.rs 注）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tungstenite_silent_handshake_window_heap_cost() {
+    use std::task::Poll;
+
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    // duplex 先建好（其分配不计入被测窗）。
+    let (_client, server) = tokio::io::duplex(8 * 1024);
+
+    let h0 = heap_in_use();
+    // tungstenite `ErrorResponse` 136 B（同 server.rs 的 result_large_err 口径）。
+    #[allow(clippy::result_large_err)]
+    let mut fut =
+        Box::pin(tokio_tungstenite::accept_hdr_async(server, |_req: &Request, resp: Response| {
+            Ok(resp)
+        }));
+    // 驱动一轮：ServerHandshake 构造 + start_read（读阻塞在空 duplex 上）。
+    std::future::poll_fn(|cx| {
+        let _ = fut.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+    let holding = heap_in_use().saturating_sub(h0);
+    drop(fut);
+
+    // 取证输出（--nocapture 回读）。残留释放经 tokio 资源异步回收，不做同窗断言。
+    #[allow(clippy::print_stdout)]
+    {
+        println!(
+            "[i37bz] tungstenite silent-handshake window: holding={holding}B \
+             (ReadBuffer 4KiB Vec + 4KiB Box + handshake structs; upstream const, not tunable)"
+        );
+    }
+    // 宽上界：若上游把沉默窗分配做大（如 >32 KiB），本断言红 = 版本升级引入
+    // 每连接握手期内存回归，需重估 0wvne 口径。
+    assert!(
+        holding < 32 * 1024,
+        "tungstenite 沉默握手窗分配应 <32 KiB（2026-11-05 实测 13728B），实测 {holding}B"
+    );
+}

@@ -10,35 +10,43 @@
 //! 调用方指定（下行 = duplex 缓冲 64 KiB，上行同值）。块池实体是 udf `ObjectPool`
 //! （2026-11-03 迁移，见 [`PoolStream`] 文档）。
 //!
+//! **进程级共享池（bd kw2si）**：同 chunk 全进程唯一一份 `ObjectPool`（上行
+//! `UPLINK_CHUNK` 与下行 `DUPLEX_BUF` 同为 64 KiB ⇒ 上行/下行全部流共享同一份），
+//! 预算 [`POOL_BYTE_BUDGET`] 从「每流一份」的乘积面（N 流 = N × 2 MiB）收敛为
+//! 进程级常量上界。并发借还线程安全由池自身保证（分片 + 片锁），测试用
+//! [`PoolStream::with_pool`] 注入独立池隔离读数。
+//!
 //! 留主仓（方向件：依赖 `bytes::Bytes::from_owner`）——池化读流只服务 h2 body
 //! 这一网络方向，`bytes` 属方向件非 udf 依赖纪律，不上浮。
 
 use std::{
+    collections::HashMap,
     io,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex},
     task::{Context, Poll},
 };
 
 use bytes::Bytes;
 use futures_util::Stream;
-use skeleton_infra::{ObjectPool, ObjectPoolTuning, Owned, ResetPhase};
+use skeleton_infra::{ObjectPool, Owned, ResetPhase};
 use tokio::io::{AsyncRead, ReadBuf};
 
 /// 上行（客户端 POST body）读块大小 = 下行 [`crate::hub::handler::DUPLEX_BUF`] 同值。
 /// 4 KiB（tokio-util 缺省）在 h2 下把 DATA 帧粒度钉死，帧数/唤醒数放大 16×。
 pub(crate) const UPLINK_CHUNK: usize = 64 * 1024;
 
-/// 本流块池的**常驻字节预算**：256 MB 小机场口径下 xray 只有 ~96 MB，本池独占
-/// ≤2 MB（`reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md` §1「全部池/缓存合计
-/// ≤4 MB」）。
+/// 进程级共享块池的**常驻字节预算**（每 chunk 一池、同池全进程共享）：256 MB
+/// 小机场口径下 xray 只有 ~96 MB，本池独占 ≤2 MB（
+/// `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md` §1「全部池/缓存合计 ≤4 MB」）。
 ///
 /// 旧口径按 hyper 16 MB send_buf 推导块数（64 KiB chunk ⇒ 258 块 ≈ 16.5 MB/流），
 /// 且 `idle_cap` 随在飞峰值涨到该上限 ⇒ 高负载后空闲常驻可逼近 16.5 MB。
 /// hyper 的 send_buf 属另一份账（连接缓冲面），**不是**本池可以跟着涨的理由。
+///
+/// 生产只存在 64 KiB 一种 chunk（上行 [`UPLINK_CHUNK`] = 下行
+/// [`crate::hub::handler::DUPLEX_BUF`]）⇒ 进程级合计 ≤ [`POOL_BYTE_BUDGET`]；
+/// 测试面的小 chunk 各自成池，不进生产预算口径。
 pub(super) const POOL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 
 /// 块数下限：chunk 偏大时预算算出的块数可能小于窗口必要量，保底 4 块——
@@ -47,9 +55,9 @@ pub(super) const POOL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 /// 下限换的是「窗口小包不逐帧走直构」。
 const POOL_MIN_BLOCKS: usize = 4;
 
-/// 池容量硬上限 = 本流**空闲块数**上界（按 [`POOL_BYTE_BUDGET`] 推导）：64 KiB
-/// chunk ⇒ 32 块 = 2 MB。在飞块数不受此限——超上限时 `acquire_owned` 降级直构，
-/// 只是不进 idle 常驻（`ObjectPool` 语义，见 `take_block` 的峰值抬升）。
+/// 池容量硬上限 = 共享池**空闲块数**上界（按 [`POOL_BYTE_BUDGET`] 推导）：64 KiB
+/// chunk ⇒ 32 块 = 2 MB（进程级）。在飞块数不受此限——超上限时 `acquire_owned`
+/// 降级直构，只是不进 idle 常驻（`ObjectPool` 语义）。
 fn pool_max_blocks(chunk: usize) -> usize {
     (POOL_BYTE_BUDGET / chunk.max(1)).max(POOL_MIN_BLOCKS)
 }
@@ -85,34 +93,47 @@ impl AsRef<[u8]> for PooledBuf {
 /// EOF 时释放内层（下行场景下会话 guard 随之触发）。
 ///
 /// 块池由 udf [`ObjectPool`] 承担（2026-11-03 迁移，依据见
-/// `reports/audit-2026-11-03/bufpool-migration.md`）：
+/// `reports/audit-2026-11-03/bufpool-migration.md`）；2026-11-05 起为**进程级共享**
+/// （bd kw2si）——同 chunk 全进程唯一一份：
 /// - 在飞块数 = `metrics().core.borrowed`：块以 `'static` 句柄（`acquire_owned`） 随 [`PooledBuf`]
 ///   存续到 `Bytes` 最后一个引用释放，句柄 Drop 即归还——
 ///   「最后一个引用释放才归还」由引用计数天然保证，不需要第二套借还账本；
-/// - 空闲额度按本流观测的在飞峰值 `resize` 抬升（封顶 [`pool_max_blocks`]）： `idle_cap`
-///   是固定值，`resize` 是旧自适应策略最接近的等价物（峰值单调 ⇒ 只增长、不触缩容裁剪）；
+/// - `idle_cap` 恒等于池上界（[`pool_max_blocks`]）：共享池的 2 MiB 是进程级预算
+///   承诺，恒定上界可审计；`idle_cap` 不预分配内存（块只有借过才占 idle 槽）， 低负载下常驻 =
+///   历史峰值在飞数 × chunk，与旧自适应抬升的稳态一致；
 /// - reset 钩子只做容量归一（红线：池化对象等重，防池毒化）；明文清零**不在钩子里**： 钩子跑在整块
 ///   64 KiB 上（memset 实测 190.8µs/次，直接吃掉池化收益），改由持有方在 [`PooledBuf::drop`]
 ///   里按实际写入量 `[..len]` 清零（见该 Drop 的契约注）。
 pub(crate) struct PoolStream<R> {
     inner: R,
     pool: Arc<ObjectPool<Vec<u8>>>,
-    /// 本流观测的在飞峰值（空闲额度的输入量，**不是**借还账本：在飞数读数走
-    /// `metrics().core.borrowed`，此处只留单调峰值供 `resize` 用）。
-    peak: AtomicUsize,
 }
 
-impl<R> PoolStream<R> {
-    pub(crate) fn new(inner: R, chunk: usize) -> Self {
-        Self {
-            inner,
-            pool: Arc::new(ObjectPool::with_reset(
+/// 进程级共享池表类型（clippy `type_complexity` 收敛别名）。
+type SharedPools = LazyLock<Mutex<HashMap<usize, Arc<ObjectPool<Vec<u8>>>>>>;
+
+/// 进程级共享池表（每 chunk 一份）：生产路径 [`PoolStream::new`] 取池的唯一入口。
+///
+/// - 线程安全：udf `ObjectPool` 内部分片 + 片锁（64 KiB chunk ⇒ `idle_cap` 32 经 `clamp(1, 8)` 定 8
+///   分片，借还争用摊薄），`acquire_owned` 句柄归还点是 任意线程的引用计数归零——共享不新增锁成本；
+/// - 借出**永不阻塞、永不失败**（池空即 factory 新造，宇宙满即降级直构交付），
+///   共享不引入单流独占饿死；N 流并发 > 池宇宙时的代价是降级直构的性能差异 （实测 3.7–4.1 µs/次 vs
+///   池借还 ~100–300 ns），不是饥饿；
+/// - 表锁只在 `PoolStream::new`（每流一次）走，借还热路径只碰 `Arc` 克隆结果；
+/// - `Mutex` 中毒恢复（`into_inner`）：表操作本身不 panic，真毒化（构造池 validate
+///   panic）后恢复表继续服务，不放大故障。
+fn shared_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
+    static POOLS: SharedPools = LazyLock::new(|| Mutex::new(HashMap::new()));
+    let mut pools = POOLS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pools
+        .entry(chunk)
+        .or_insert_with(|| {
+            Arc::new(ObjectPool::with_reset(
                 pool_max_blocks(chunk),
-                // 初始空闲额度 1（首次借出后观测到的峰值）：容量随在飞峰值增长。
-                // 分片数 = 构造期 `idle_cap.clamp(1, 8)` ⇒ 单分片，与旧单锁形态一致，
-                // 且额度不会被 8 片均分压成「小块峰值下份额 0、块留不住」。
-                1,
-                move || vec![0; chunk],
+                // idle_cap = max = 池上界：归还即留池（不预分配）；分片数 =
+                // 构造期 `idle_cap.clamp(1, 8)` ⇒ 8 分片摊薄并发借还争用。
+                pool_max_blocks(chunk),
+                move || vec![0u8; chunk],
                 move |buf: &mut Vec<u8>| {
                     // 容量归一：合规块只付一次 len 比较（`ReadBuf` 不改 Vec 的 len）。
                     if buf.len() != chunk {
@@ -121,29 +142,26 @@ impl<R> PoolStream<R> {
                     }
                 },
                 ResetPhase::OnReturn,
-            )),
-            peak: AtomicUsize::new(0),
-        }
+            ))
+        })
+        .clone()
+}
+
+impl<R> PoolStream<R> {
+    pub(crate) fn new(inner: R, chunk: usize) -> Self {
+        Self::with_pool(inner, shared_pool(chunk))
     }
 
-    /// 借一块（`'static` 句柄：归还点是任意 worker 线程的引用计数归零），顺带按
-    /// 观测在飞峰值抬高空闲额度。
+    /// 注入缝：测试面隔离（独立池的 metrics 读数不被并行测试污染）；生产一律走
+    /// [`Self::new`] 的进程级共享池。`pool` 的 chunk 与读流 chunk 必须一致
+    /// （reset 钩子按构造期 chunk 归一）。
+    pub(crate) fn with_pool(inner: R, pool: Arc<ObjectPool<Vec<u8>>>) -> Self {
+        Self { inner, pool }
+    }
+
+    /// 借一块（`'static` 句柄：归还点是任意 worker 线程的引用计数归零）。
     fn take_block(&self) -> Owned<Vec<u8>> {
-        let handle = self.pool.acquire_owned();
-        let core = self.pool.metrics().core;
-        if core.borrowed > self.peak.load(Ordering::Relaxed) {
-            self.peak.store(core.borrowed, Ordering::Relaxed);
-            // 峰值单调 ⇒ 只增长（不触缩容裁剪）；形状恒合法（1 ≤ idle_cap ≤ max）。
-            let idle_cap = core.borrowed.min(core.max);
-            if let Err(err) = self.pool.resize(ObjectPoolTuning { max: core.max, idle_cap }) {
-                // 钳位后不可达；真出现说明上面的上界算错，别静默吞掉。
-                crate::LOG.warn(format_args!(
-                    "pool resize rejected (idle_cap={idle_cap}, max={}): {err}",
-                    core.max
-                ));
-            }
-        }
-        handle
+        self.pool.acquire_owned()
     }
 
     /// 池内空闲块数（测试观测用）。
@@ -195,6 +213,23 @@ mod tests {
 
     use super::*;
 
+    /// 独立池（测试隔离）：形状与 [`shared_pool`] 构造完全一致——断言读数不被
+    /// 共享池上其他并行测试的借还污染。
+    fn isolated_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
+        Arc::new(ObjectPool::with_reset(
+            pool_max_blocks(chunk),
+            pool_max_blocks(chunk),
+            move || vec![0u8; chunk],
+            move |buf: &mut Vec<u8>| {
+                if buf.len() != chunk {
+                    buf.clear();
+                    buf.resize(chunk, 0);
+                }
+            },
+            ResetPhase::OnReturn,
+        ))
+    }
+
     #[tokio::test]
     async fn frames_carry_all_bytes_in_order_and_blocks_return_to_pool() {
         let chunk = 8 * 1024;
@@ -206,7 +241,7 @@ mod tests {
             tx.shutdown().await.expect("duplex 关闭不失败");
         });
 
-        let mut stream = PoolStream::new(rx, chunk);
+        let mut stream = PoolStream::with_pool(rx, isolated_pool(chunk));
         let mut got = Vec::new();
         while let Some(item) = stream.next().await {
             got.extend_from_slice(&item.expect("读不失败"));
@@ -226,7 +261,7 @@ mod tests {
             tx.write_all(&vec![7u8; chunk * 4]).await.expect("duplex 写不失败");
             tx.shutdown().await.expect("duplex 关闭不失败");
         });
-        let mut stream = PoolStream::new(rx, chunk);
+        let mut stream = PoolStream::with_pool(rx, isolated_pool(chunk));
         while let Some(item) = stream.next().await {
             drop(item.expect("读不失败"));
         }
@@ -234,23 +269,22 @@ mod tests {
         assert!(stream.idle_blocks() > 0, "块必须归还池（否则逐帧重分配）");
     }
 
-    /// 在飞块数 = `metrics().core.borrowed`；峰值抬高空闲额度后块整批留池复用
-    /// （改前 `live`/`peak` 两个本地计数器的等价读数）。
+    /// 在飞块数 = `metrics().core.borrowed`；归还后整批留池复用（共享池改造后
+    /// `idle_cap` 恒等于池上界，原「每流峰值抬升」逻辑随之删除）。
     #[test]
-    fn live_blocks_map_to_borrowed_and_peak_raises_idle_cap() {
+    fn live_blocks_map_to_borrowed_and_idle_retains_on_return() {
         let chunk = 4 * 1024;
-        let stream = PoolStream::new(tokio::io::empty(), chunk);
+        let stream = PoolStream::with_pool(tokio::io::empty(), isolated_pool(chunk));
 
         let b1 = stream.take_block();
         let b2 = stream.take_block();
         let m = stream.pool.metrics();
         assert_eq!(m.core.borrowed, 2, "在外块数 = borrowed");
-        assert_eq!(stream.peak.load(Ordering::Relaxed), 2, "峰值随在飞数抬升");
         assert_eq!(m.constructed, 2, "两块都是新造");
         drop(b1);
         drop(b2);
         let m = stream.pool.metrics();
-        assert_eq!(m.core.idle, 2, "空闲额度 = 峰值 ⇒ 两块都留池");
+        assert_eq!(m.core.idle, 2, "idle_cap = 池上界 ⇒ 归还即留池");
         assert_eq!(m.reset_panicked, 0, "归一路径只有赋值，不得 panic");
 
         let _b3 = stream.take_block();
@@ -274,7 +308,7 @@ mod tests {
             tx.shutdown().await.expect("duplex 关闭不失败");
         });
 
-        let mut stream = PoolStream::new(rx, chunk);
+        let mut stream = PoolStream::with_pool(rx, isolated_pool(chunk));
         let frame = stream.next().await.expect("一帧").expect("读不失败");
         assert_eq!(frame.len(), PAYLOAD);
         assert!(frame.iter().all(|&b| b == 0x5A), "帧内容原样交付");
@@ -298,7 +332,7 @@ mod tests {
     fn returning_64k_block_costs_only_written_region() {
         const CHUNK: usize = 64 * 1024;
         const WRITTEN: usize = 16 * 1024; // 一帧 h2 DATA 的量级
-        let stream = PoolStream::new(tokio::io::empty(), CHUNK);
+        let stream = PoolStream::with_pool(tokio::io::empty(), isolated_pool(CHUNK));
 
         let mut worst = std::time::Duration::ZERO;
         for _ in 0..8 {
@@ -344,6 +378,46 @@ mod tests {
         assert_eq!(pool_max_blocks(POOL_BYTE_BUDGET), POOL_MIN_BLOCKS);
     }
 
+    /// **内存审计锚点（2026-11-04 audit4-memory）**：`POOL_BYTE_BUDGET` 是
+    /// 池级预算。锚点登记时预算是**单实例**口径（每个 `PoolStream` 一份
+    /// `Arc::new(ObjectPool::…)`，N 流 = N × 2 MiB 乘积面，见
+    /// `reports/audit-2026-11-04/audit4-memory.md`）；**bd kw2si 落地进程级共享池
+    /// 后，本锚点的上界即进程级上界**——同 chunk 全进程唯一一份池，在飞峰值
+    /// 32 × 64 KiB = 2 MiB 全部留池仍可达（hyper send_buf 侧积压形态），但不再
+    /// 随流数相乘。
+    #[test]
+    fn idle_cap_reaches_single_instance_budget_ceiling() {
+        let stream = PoolStream::with_pool(tokio::io::empty(), isolated_pool(UPLINK_CHUNK));
+        let cap = pool_max_blocks(UPLINK_CHUNK);
+        assert_eq!(cap, 32, "前置：64 KiB chunk ⇒ 32 块");
+
+        // 模拟突发：在飞峰值打到 max（hyper send_buf 侧积压时的真实形态）。
+        let held: Vec<_> = (0..cap).map(|_| stream.take_block()).collect();
+        let m = stream.pool.metrics();
+        assert_eq!(m.core.borrowed, cap, "在飞 = 池宇宙上限");
+        assert_eq!(m.core.idle, 0, "全部在外");
+
+        drop(held); // 突发收回：块按池上界全留
+        let m = stream.pool.metrics();
+        assert_eq!(m.core.idle, cap, "idle_cap 恒 = 池上界 ⇒ 全量留池");
+        assert!(
+            m.core.idle * UPLINK_CHUNK <= POOL_BYTE_BUDGET,
+            "单实例留池 {} 字节须 ≤ 预算 {POOL_BYTE_BUDGET}",
+            m.core.idle * UPLINK_CHUNK
+        );
+        // 实测锚（审计取证）：2 MiB / 单流 —— `cargo test -p xray-transport-splithttp
+        // idle_cap_reaches_single_instance_budget_ceiling -- --nocapture` 回读。
+        #[allow(clippy::print_stdout)]
+        {
+            println!(
+                "per-PoolStream idle resident = {} bytes ({} blocks × {} B)",
+                m.core.idle * UPLINK_CHUNK,
+                m.core.idle,
+                UPLINK_CHUNK
+            );
+        }
+    }
+
     /// 复用率不回退（64 KiB = 生产 `UPLINK_CHUNK` / 下行 `DUPLEX_BUF`）：预算把 idle
     /// 上限从 258 块砍到 32 块后，逐帧消费（每帧释放后才取下一块）仍零重分配，且
     /// 稳态不走降级直构（走降级 = 逐帧 3.7 µs 直构，即"上界换来吞吐塌"）。
@@ -358,7 +432,7 @@ mod tests {
             tx.shutdown().await.expect("duplex 关闭不失败");
         });
 
-        let mut stream = PoolStream::new(rx, UPLINK_CHUNK);
+        let mut stream = PoolStream::with_pool(rx, isolated_pool(UPLINK_CHUNK));
         let mut frames = 0usize;
         while let Some(item) = stream.next().await {
             drop(item.expect("读不失败"));
@@ -382,9 +456,9 @@ mod tests {
     #[test]
     fn pool_reset_normalizes_poisoned_block() {
         let chunk = 4 * 1024;
-        let stream = PoolStream::new(tokio::io::empty(), chunk);
+        let stream = PoolStream::with_pool(tokio::io::empty(), isolated_pool(chunk));
 
-        // peak=0 时空闲额度是构造初值 1，足够收下这一块。
+        // idle_cap 恒 = 池上界，足够收下这一块。
         drop(stream.pool.insert(vec![0xCD; chunk * 3]));
         assert_eq!(stream.pool.metrics().core.idle, 1, "归一到定长的块才入池");
 
@@ -394,5 +468,64 @@ mod tests {
             reused.iter().all(|&b| b == 0),
             "归一后必须清零：禁把上一轮的脏数据发给下一个借出方"
         );
+    }
+
+    /// 契约测试（bd kw2si 验收）：进程级共享池 = 同 chunk 全进程唯一；并发借还
+    /// 线程安全且账面配平。8 任务 × 256 轮借还并发打满后：
+    /// - 全局唯一性：两条 `PoolStream::new`（生产路径）拿到同一个 `Arc` 池；
+    /// - `borrowed == 0`：所有句柄归还，无泄漏；
+    /// - 构造数守恒：`constructed == idle`（无降级/丢弃时，每件构造的块要么在
+    ///   池里要么在飞，全部归还后必然全在池里）；
+    /// - `degraded == 0`：8 并发在飞 < 32 池宇宙，不降级；
+    /// - 每个任务每一轮都拿到块——借出永不阻塞（池空即造、宇宙满即降级交付），
+    ///   共享池不引入单流独占饿死（本测试任务全部跑完即证）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_pool_is_unique_and_balances_under_concurrent_borrow_return() {
+        // 生产路径（new）全局唯一性：Arc::ptr_eq。
+        let a = PoolStream::new(tokio::io::empty(), UPLINK_CHUNK);
+        let b = PoolStream::new(tokio::io::empty(), UPLINK_CHUNK);
+        assert!(Arc::ptr_eq(&a.pool, &b.pool), "同 chunk 的 PoolStream 必须共享同一份进程级池");
+
+        let chunk = UPLINK_CHUNK;
+        let cap = pool_max_blocks(chunk);
+        let pool = isolated_pool(chunk);
+        let tasks = 8usize;
+        let rounds = 256u32;
+        let mut joins = Vec::with_capacity(tasks);
+        for _ in 0..tasks {
+            let pool = Arc::clone(&pool);
+            joins.push(tokio::spawn(async move {
+                for i in 0..rounds {
+                    let mut block = pool.acquire_owned();
+                    assert_eq!(block.len(), chunk, "池块定长");
+                    block[0] = (i % 251) as u8; // 摸一下内存，防止借还被优化掉
+                    drop(block); // 归还
+                }
+            }));
+        }
+        for joined in joins {
+            joined.await.expect("并发借还任务不 panic");
+        }
+
+        let m = pool.metrics();
+        assert_eq!(m.core.borrowed, 0, "配平：所有句柄已归还");
+        assert!(m.core.idle <= cap, "空闲 ≤ 池上界（{cap} 块）");
+        assert_eq!(m.constructed as usize, m.core.idle, "构造数守恒：constructed = 留池数");
+        assert_eq!(m.degraded, 0, "{tasks} 并发在飞 < {cap} 池宇宙，不得降级");
+        assert_eq!(m.core.dropped_overflow, 0, "idle_cap = 池上界 ⇒ 归还不得溢出丢弃");
+        // 配平断言输出（bd kw2si 验收取证）：`-- --nocapture` 回读。
+        #[allow(clippy::print_stdout)]
+        {
+            println!(
+                "shared-pool balance: constructed={} reused={} idle={} borrowed={} \
+                 degraded={} dropped_overflow={}",
+                m.constructed,
+                m.reused,
+                m.core.idle,
+                m.core.borrowed,
+                m.degraded,
+                m.core.dropped_overflow
+            );
+        }
     }
 }

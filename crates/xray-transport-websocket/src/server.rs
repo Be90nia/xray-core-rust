@@ -33,7 +33,7 @@ use tokio::{
     net::TcpListener as TokioTcpListener,
 };
 use tokio_tungstenite::{
-    accept_hdr_async,
+    accept_hdr_async_with_config,
     tungstenite::{
         handshake::server::{Request, Response},
         http::{HeaderMap, StatusCode},
@@ -391,11 +391,20 @@ impl WsListener {
 
         // H14：握手全程 4s 超时（Go hub.go:27-33 Upgrader HandshakeTimeout: 4s；
         // 慢速/半开连接不再无限占用 accept 并发）。
-        let ws_stream =
-            tokio::time::timeout(Duration::from_secs(4), accept_hdr_async(stream, callback))
-                .await
-                .map_err(|_| WsError::HandshakeFailed("websocket handshake timeout (4s)".into()))?
-                .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
+        // bd i37bz：缓冲统一走 [`crate::config::ws_config`]（read/write 32 KiB，
+        // 默认 128 KiB 的 in_buffer 是每连接常驻大头——64 在线 × 256 KiB ≈ 16 MiB）。
+        let ws_stream = tokio::time::timeout(
+            Duration::from_secs(4),
+            accept_hdr_async_with_config(stream, callback, Some(crate::config::ws_config())),
+        )
+        .await
+        .map_err(|_| WsError::HandshakeFailed("websocket handshake timeout (4s)".into()))?
+        .map_err(|e| WsError::HandshakeFailed(format!("accept_hdr_async: {e}")))?;
+        crate::LOG.debug(format!(
+            "remote={remote} ws handshake done; per-conn tungstenite buffers: read={}B + write={}B (bd i37bz)",
+            crate::config::ws_config().read_buffer_size,
+            crate::config::ws_config().write_buffer_size,
+        ));
 
         let early_data = early_data_slot.lock().clone();
         let xff_ip = xff_slot.lock().take();

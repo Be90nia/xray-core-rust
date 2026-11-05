@@ -116,6 +116,31 @@ impl Config {
     }
 }
 
+/// tungstenite 帧编解码缓冲统一口径（bd i37bz）：上游 `WebSocketConfig` 可调项收敛。
+///
+/// 源码定位（tungstenite 0.26.2）与实测（bd 0wvne E1 探针，64 闸内沉默握手连接
+/// ≈51 KiB/conn 可归因增量）：
+///
+/// - **握手期**（沉默连接挂在首字节窗）：固定分配 ≈8 KiB——`HandshakeMachine` 的
+///   `ReadBuffer`（`Vec::with_capacity(4096)` + `Box<[u8; 4096]>`）， chunk 4096 是上游 `const
+///   READ_BUFFER_CHUNK_SIZE`，**不可配**；
+/// - **握手完成后**：每连接稳态大头 = `FrameCodec` 的 `in_buffer`
+///   （`BytesMut::with_capacity(read_buffer_size)`，默认 128 KiB **立即分配**）+ 写侧
+///   `out_buffer`（按目标 `write_buffer_size` 在写时扩容，默认 128 KiB）； 64 在线连接 × 256 KiB ≈
+///   16 MiB —— 收窄到 32 KiB 后 ≈ 4 MiB。
+///
+/// 32 KiB 的选取：Xray ws 载荷消息粒度 = 内层写块（≤64 KiB），32 KiB 只是把
+/// 64 KiB 消息拆成两次读循环，wire 语义零变化；Go gorilla/websocket 默认读缓冲
+/// 4 KiB，32 KiB = 8× Go 默认，安全余量充足。`max_message_size`（64 MiB）/
+/// `max_frame_size`（16 MiB）是协议 OOM 防线，与每连接常驻内存无关（只有实际
+/// 收到大帧才占），不动；`WebSocketConfig` 是 `#[non_exhaustive]`，走 builder。
+#[must_use]
+pub(crate) fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(32 * 1024)
+        .write_buffer_size(32 * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

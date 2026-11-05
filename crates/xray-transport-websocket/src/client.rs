@@ -34,7 +34,6 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, client_async_tls_with_config,
     tungstenite::{
         client::IntoClientRequest, handshake::client::Request as WsRequest, http::HeaderValue,
-        protocol::WebSocketConfig,
     },
 };
 use xray_common::{browser::try_default_headers_with, net::destination::Destination};
@@ -94,8 +93,10 @@ pub async fn dial(
         opts.early_data,
     )?;
 
-    // ponytail: WebSocketConfig 默认 64 MiB max_message_size 足够代理流量。
-    let ws_cfg = WebSocketConfig::default();
+    // bd i37bz：缓冲统一走 [`crate::config::ws_config`]（read/write 32 KiB；
+    // 旧默认 128 KiB 是每连接常驻大头，64 在线 × 256 KiB ≈ 16 MiB。
+    // max_message_size 默认 64 MiB 保持——代理流量协议 OOM 防线不动）。
+    let ws_cfg = crate::config::ws_config();
 
     // 自管 TCP + TLS：tokio-tungstenite 的 connect_async_tls_with_config 用
     // URI authority 做 SNI，而 CDN/argo 场景 URI authority（拨号目标）与
