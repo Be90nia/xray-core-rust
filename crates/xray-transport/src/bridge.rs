@@ -349,8 +349,9 @@ async fn wait_abort(rx: &mut tokio::sync::watch::Receiver<bool>) {
 /// 终止符）但响应方向仍需续传的场景。
 ///
 /// **8sum 解耦（方案 A）**：每方向 reader（只读）与 writer（只写）拆为独立
-/// async block，经 bounded mpsc（64 条 MultiBuffer ≈ 512KiB，对齐 Go
-/// `defaultBufferSize`）解耦背压——writer 写背压时 reader 继续排空接收侧
+/// async block，经 bounded mpsc（**按条目计**：每方向 64 条 MultiBuffer，
+/// 单方向在途上界 = 64 条 × 单条 512KiB = 32MiB；条目/字节口径见
+/// `PIPE_BUF_CAP` 处注释）解耦背压——writer 写背压时 reader 继续排空接收侧
 /// （串行泵「读 8KB→写→循环」两腿锁步曾致服务端 TCP 接收窗不增长、全链
 /// 1 窗/RTT 步进，up 3.1 vs Go 19.8 Mbps）。级联退出：任一 writer 死 →
 /// mpsc rx drop → 对应 reader `send` 失败退出 → done watch 把 half_window
@@ -410,8 +411,17 @@ where
         (None, None, cap) => xray_buf::io::new_reader_with_capacity(s_read_half, cap),
     };
 
-    // 512KiB bounded mpsc ×2：容量按条目计（Go pipe 按字节软限，这里
-    // 64 条 × 1-8 buffer × 8KiB，常态 ≥512KiB，只影响内存上限不影响正确性）。
+    // 背压闸按**条目**计（mpsc 容量 = 条目数，不是字节数）：每方向 64 条。
+    // 单条字节上限由**生产侧**决定，不是本闸决定：
+    //   下行 readv 腿 = 8 块 × 64KiB 块（xray_buf::readv 升窗后）= 512KiB；
+    //   下行 TLS 腿   = 1 块 × tls_readbuf_size（≤64KiB）；
+    //   上行腿 = dispatcher pipe 读端整块交付（≈ policy.buffer.connection，
+    //   缺省 512KiB；pipe 判满在 merge 前 ⇒ 可再多出一次写入批量）。
+    // ⇒ 单方向在途上界 = 64 条 × 512KiB = 32MiB（**不是** 512KiB——512KiB 是
+    //   Go 每连接 pipe 的字节软限，与本闸的条目闸不同量纲）。
+    // ⚠️ 冻结腿（h2/h3 body，Bytes 直交）单条 = 一个传输分片，由传输层定，
+    //   不受 512KiB 约束 ⇒ 该路径的实际上界更高。
+    // 只影响内存上限、不影响正确性；改容量属行为面变更（bd n580i：只修口径）。
     const PIPE_BUF_CAP: usize = 64;
     let (up_tx, mut up_rx) =
         tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
@@ -1934,7 +1944,8 @@ mod tests {
 
     /// 解耦回归门（HANDOFF `bridge_stream_full_uplink_survives_slow_remote` 重建）：
     /// stream 对端永不读（duplex 8192 缓冲即背压），上游写 64KB + shutdown。
-    /// 解耦版 up reader 把数据吸进 512KiB mpsc 后照常读到 EOF → up_done →
+    /// 解耦版 up reader 把数据吸进 mpsc（**按条目计**，见 `PIPE_BUF_CAP`）后
+    /// 照常读到 EOF → up_done →
     /// down 腿 uplink_only 窗口耗尽收尾 → dn_r 读到关闭；串行泵会卡在
     /// 写 duplex 的锁步里永远读不到上游 EOF，dn_r 5s 内等不到关闭。
     #[tokio::test]
@@ -1954,7 +1965,7 @@ mod tests {
             Box::new(DuplexConnection::new(stream)) as Box<dyn Connection>,
         ));
 
-        // 64KB = 8 × duplex 缓冲：解耦后被 mpsc（64×8KiB）全量吸收
+        // 64KB = 8 × duplex 缓冲：解耦后被 mpsc（按条目计）全量吸收
         for _ in 0..8 {
             let mut mb = MultiBuffer::new();
             mb.merge_bytes(&vec![0x5Au8; 8 * 1024]);
