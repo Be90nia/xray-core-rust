@@ -162,6 +162,27 @@ mod tests {
         }
     }
 
+    /// caih2：生产装配（`GeodataFeature::new`）**不得起 OS 线程**——互喂池
+    /// 改为首次 submit 才建（见 [`crate::loader::GeodataLoadPool`]）。修复前
+    /// 每次装配即 spawn 2 个空转 worker 线程（无消费方）。
+    #[test]
+    fn feature_construction_spawns_no_pool_threads() {
+        let scheduler: Arc<CallbackCapturingScheduler> = CallbackCapturingScheduler::new();
+        let downloader: Arc<dyn AssetDownloader> = Arc::new(DummyDownloader);
+        let reloader: Arc<dyn GeodataReloader> =
+            Arc::new(CountingReloader(Arc::new(AtomicUsize::new(0))));
+        let feature = GeodataFeature::new(
+            GeodataConfig::default(),
+            scheduler as Arc<dyn Scheduler>,
+            downloader,
+            reloader,
+        );
+        assert!(
+            feature.load_pool().threads().is_none(),
+            "生产装配不得起池线程（无消费方 ⇒ 零线程）"
+        );
+    }
+
     #[test]
     fn feature_name_is_geodata() {
         let scheduler: Arc<CallbackCapturingScheduler> = CallbackCapturingScheduler::new();

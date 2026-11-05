@@ -166,6 +166,10 @@ pub struct Balancer {
     ohm: Arc<dyn OutboundHandlerSelector>,
     fallback_tag: String,
     override_target: Override,
+    /// 降级计数（实际落到 fallback 的次数）——运维可见「这条规则多常降级」。
+    fallback_count: AtomicU32,
+    /// 最近一次降级/失败的原因（与 warn/error 日志同源；排障与断言用）。
+    last_reason: RwLock<Option<String>>,
 }
 
 impl Balancer {
@@ -182,6 +186,8 @@ impl Balancer {
             ohm,
             fallback_tag: fallback_tag.into(),
             override_target: Override::new(),
+            fallback_count: AtomicU32::new(0),
+            last_reason: RwLock::new(None),
         }
     }
 
@@ -195,6 +201,21 @@ impl Balancer {
     #[must_use]
     pub fn fallback_tag(&self) -> &str {
         &self.fallback_tag
+    }
+
+    /// 降级次数（实际落到 fallback 的次数）。
+    #[must_use]
+    pub fn fallback_count(&self) -> u32 {
+        self.fallback_count.load(Ordering::Relaxed)
+    }
+
+    /// 最近一次降级（或「fallback 未配置」硬失败）的原因。
+    ///
+    /// epyge：fallback 日志必须带原因，否则运维只知道「回退」不知「为何」。
+    /// 此处留一份可编程读取的同源副本（日志之外的可观测面）。
+    #[must_use]
+    pub fn last_fallback_reason(&self) -> Option<String> {
+        self.last_reason.read().clone()
     }
 
     /// 返回 override 句柄（供 Router.OverrideBalancer 使用）。
@@ -224,16 +245,40 @@ impl Balancer {
             Ok(tag) if !tag.is_empty() => Ok(tag),
             err => {
                 // selector/策略出错（Err）或返回空 tag 均走 fallback（Go balancing.go:96-119
-                // 的两个 fallback 分支），并记 warn 便于观测。
+                // 的两个 fallback 分支）。
+                //
+                // epyge：fallback 日志必须带**原因**——原先只记 `fallback=<tag>`，
+                // 运维只知道「回退」不知「为何」（哪个候选 dead / 策略报了什么）。
+                // 三类可区分原因：
+                // ① 策略执行失败（Err，非 EmptyBalancerResult）→ 带策略错误文本；
+                // ② 候选全部不可用/被拒（EmptyBalancerResult 或空 tag）→ 带候选数；
+                // ③ fallback 未配置 → 不是降级而是硬失败（错误上抛 + error 日志）。
+                let reason = match &err {
+                    Err(RouterError::EmptyBalancerResult) | Ok(_) => {
+                        format!("no candidate available (candidates={})", self.selectors.len())
+                    },
+                    Err(e) => format!("strategy failed: {e}"),
+                };
                 if self.fallback_tag.is_empty() {
-                    Err(match err {
+                    // fallback 未配置 ⇒ 无降级可言，本次是硬失败：原因写进日志并
+                    // 留存（错误值保持原样上抛，不改既有错误契约）。
+                    let reason = format!("fallback tag not configured: {reason}");
+                    *self.last_reason.write() = Some(reason.clone());
+                    tracing::error!(reason = %reason, "balancer fallback unavailable");
+                    return Err(match err {
                         Ok(_) => RouterError::EmptyBalancerResult,
                         Err(e) => e,
-                    })
-                } else {
-                    tracing::warn!(fallback = %self.fallback_tag, "balancer fallback");
-                    Ok(self.fallback_tag.clone())
+                    });
                 }
+                self.fallback_count.fetch_add(1, Ordering::Relaxed);
+                *self.last_reason.write() = Some(reason.clone());
+                // 降级 = warn（不是错误，但必须可见：流量走了非预期路径）。
+                tracing::warn!(
+                    fallback = %self.fallback_tag,
+                    reason = %reason,
+                    "balancer fallback"
+                );
+                Ok(self.fallback_tag.clone())
             },
         }
     }
@@ -396,6 +441,65 @@ mod tests {
         fn pick_outbound(&self) -> Result<String, RouterError> {
             Ok(self.0.clone())
         }
+    }
+
+    /// 策略执行失败的 stub（模拟 selector/上游观测失败）。
+    struct FailingStrategy;
+    impl BalancingStrategy for FailingStrategy {
+        fn pick_outbound(&self) -> Result<String, RouterError> {
+            Err(RouterError::ObservationUnavailable("no alive outbound".into()))
+        }
+    }
+
+    /// epyge：策略失败而落 fallback 时，原因必须带策略错误文本（原先只记
+    /// `fallback=<tag>`，运维看不到「为何回退」）。
+    #[test]
+    fn test_balancer_fallback_reason_carries_strategy_error() {
+        let b = Balancer::new(
+            vec!["a".into(), "b".into()],
+            Arc::new(FailingStrategy),
+            Arc::new(SimpleSelector::default()),
+            "fallback",
+        );
+        assert_eq!(b.pick_outbound().unwrap(), "fallback");
+        assert_eq!(b.fallback_count(), 1, "降级必须可计数");
+        let reason = b.last_fallback_reason().expect("fallback 必须留原因");
+        assert!(reason.contains("strategy failed"), "原因须标明策略失败：{reason}");
+        assert!(reason.contains("no alive outbound"), "原因须含策略错误文本：{reason}");
+    }
+
+    /// epyge：候选不可用（策略挑不出可用 outbound）时，原因须带候选数。
+    #[test]
+    fn test_balancer_fallback_reason_reports_candidate_count() {
+        let b = Balancer::new(
+            vec!["a".into(), "b".into(), "c".into()],
+            Arc::new(EmptyStrategy),
+            Arc::new(SimpleSelector::default()),
+            "fallback",
+        );
+        assert_eq!(b.pick_outbound().unwrap(), "fallback");
+        assert_eq!(b.fallback_count(), 1, "降级必须可计数");
+        let reason = b.last_fallback_reason().expect("fallback 必须留原因");
+        assert!(reason.contains("no candidate available"), "原因须表明候选不可用：{reason}");
+        assert!(reason.contains("candidates=3"), "原因须带候选数：{reason}");
+    }
+
+    /// epyge：fallback 未配置 = 硬失败（不是降级）——原因须明确，且不计降级数。
+    #[test]
+    fn test_balancer_no_fallback_configured_reports_reason() {
+        let b = Balancer::new(
+            vec!["a".into()],
+            Arc::new(EmptyStrategy),
+            Arc::new(SimpleSelector::default()),
+            "",
+        );
+        assert!(matches!(b.pick_outbound(), Err(RouterError::EmptyBalancerResult)));
+        let reason = b.last_fallback_reason().expect("未配置 fallback 也须留原因");
+        assert!(
+            reason.contains("fallback tag not configured"),
+            "原因须表明未配置 fallback：{reason}"
+        );
+        assert_eq!(b.fallback_count(), 0, "未发生降级 ⇒ 计数不得增");
     }
 
     #[test]

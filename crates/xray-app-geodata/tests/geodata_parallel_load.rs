@@ -160,7 +160,7 @@ fn pooled_startup_load_is_not_slower_than_serial() {
 
     pool.shutdown_join();
     assert_eq!(pool.borrow_rejected(), 0);
-    let m = pool.mem_pool().metrics();
+    let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
     assert_eq!(m.core.borrowed, 0);
     // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
     assert_eq!(m.core.dropped_overflow, 0);
@@ -218,7 +218,7 @@ fn parallel_load_end_to_end_balance_and_panic_isolation() {
 
     pool.shutdown_join();
     assert_eq!(pool.borrow_rejected(), 0);
-    let m = pool.mem_pool().metrics();
+    let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
     assert_eq!(m.core.borrowed, 0, "panic task must not leak its buffer");
     // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
     assert_eq!(m.core.dropped_overflow, 0);

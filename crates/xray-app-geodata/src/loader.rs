@@ -21,7 +21,7 @@
 use std::{
     io::Read,
     path::Path,
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock, mpsc},
     time::Duration,
 };
 
@@ -105,7 +105,19 @@ fn parse_overrides(get: impl Fn(&str) -> Option<String>) -> (PoolParams, Vec<Str
     (params, warnings)
 }
 
+/// 池内缓冲类型（worker 借还的字节缓冲）。
+type PoolBuf = Vec<u8>;
+/// 池内缓冲的构造工厂（udf `MemoryPool<T, F>` 的 `F`：空缓冲）。
+type PoolBufFactory = fn() -> PoolBuf;
+/// 组合池类型（udf `MemoryPool` × `ThreadPool` 互喂）。
+type LoadPool = PooledThreadPool<PoolBuf, PoolBufFactory>;
+
 /// 互喂池：worker 内借缓冲 → 跑 → RAII 还。
+///
+/// **惰性建池**（bd caih2）：udf `ThreadPool::new` 在**构造期**即 spawn `core`
+/// 个 OS 线程。本池的生产消费方为零 ⇒ 构造即空转 2 个线程（线程栈 + 调度
+/// 开销，256MB 小机器上不值）。故改为**首次 submit 才建池**：无人用 ⇒ 零
+/// 线程、零常驻资源；有人用 ⇒ worker 按需拉起，语义不变。
 ///
 /// 构造参数逐项对应 udf 真实签名：
 /// - `PooledThreadPool::new(mem, threads, borrow_timeout)`
@@ -113,19 +125,47 @@ fn parse_overrides(get: impl Fn(&str) -> Option<String>) -> (PoolParams, Vec<Str
 /// - `ThreadPool::new(ThreadPoolTuning)`（同目录 `pool.rs`）
 /// - `ThreadPoolTuning::new(core, max, queue_cap)`（同上）
 pub struct GeodataLoadPool {
-    pool: PooledThreadPool<Vec<u8>, fn() -> Vec<u8>>,
+    /// 池体：`None` = 尚未建池（⇒ 零 OS 线程）。
+    ///
+    /// 用 [`OnceLock`] 而非 [`std::sync::LazyLock`]：LazyLock 只有 `force()`
+    /// （一调即初始化），**无法观测「尚未建池」**——而「未建池」正是本件的
+    /// 关键状态（零线程判据 + `threads()/mem_pool()` 返回 `None`）。初始化器
+    /// 依赖运行期参数（`params`），非声明期常量。
+    pool: OnceLock<LoadPool>,
+    /// 建池参数（首次建池时读）。
+    params: PoolParams,
 }
 
 impl GeodataLoadPool {
-    /// 组装互喂池。非法参数（0 值 / `core > max`）由 udf 构造期 fail-fast
-    /// panic（恒不合法 = 调用方 bug，同 udf 纪律）。
+    /// 组装互喂池（**不建线程**：worker 首次 submit 时才拉起，见 [`Self::pool`]）。
+    ///
+    /// 非法参数（0 值 / `core > max` / `queue_cap == 0`）构造期 fail-fast
+    /// panic（恒不合法 = 调用方 bug，同 udf 纪律）：udf 的同源校验在
+    /// `ThreadPool::new` 内部（私有），惰性化后校验点前移至此，保持
+    /// 「构造期即报错」语义不变。
     ///
     /// 内存池上限 = `max`：每 worker 至多持 1 块缓冲，恒不借空
     /// （`borrow_rejected` 只在误用时才可能非零）。
     pub fn new(core: usize, max: usize, queue_cap: usize, borrow_timeout: Duration) -> Self {
-        let mem = Arc::new(MemoryPool::<Vec<u8>>::new(max, max, Vec::new));
-        let threads = ThreadPool::new(ThreadPoolTuning::new(core, max, queue_cap));
-        Self { pool: PooledThreadPool::new(mem, threads, borrow_timeout) }
+        assert!(core > 0, "GeodataLoadPool::new: core == 0 (no worker is a bug)");
+        assert!(max > 0, "GeodataLoadPool::new: max == 0 (a pool that cannot run is a bug)");
+        assert!(core <= max, "GeodataLoadPool::new: core > max (illegal tuning)");
+        assert!(queue_cap > 0, "GeodataLoadPool::new: queue_cap == 0 (queue must have room)");
+        Self { pool: OnceLock::new(), params: PoolParams { core, max, queue_cap, borrow_timeout } }
+    }
+
+    /// 取池体（首次调用才组装 ⇒ 首次组装才 spawn worker 线程）。
+    fn pool(&self) -> &LoadPool {
+        self.pool.get_or_init(|| {
+            let mem =
+                Arc::new(MemoryPool::<Vec<u8>>::new(self.params.max, self.params.max, Vec::new));
+            let threads = ThreadPool::new(ThreadPoolTuning::new(
+                self.params.core,
+                self.params.max,
+                self.params.queue_cap,
+            ));
+            PooledThreadPool::new(mem, threads, self.params.borrow_timeout)
+        })
     }
 
     /// 固定默认值 + env 覆盖装配（PM 拍板 §2 P1-2.1）。非法 env 值记
@@ -145,29 +185,35 @@ impl GeodataLoadPool {
         &self,
         f: impl FnOnce(&mut Vec<u8>) + Send + 'static,
     ) -> Result<(), RejectedTask> {
-        self.pool.submit(f)
+        self.pool().submit(f)
     }
 
-    /// 借空拒绝计数（读侧；与提交侧 rejected 独立）。
+    /// 借空拒绝计数（读侧；与提交侧 rejected 独立）。未建池 ⇒ 0。
     pub fn borrow_rejected(&self) -> u64 {
-        self.pool.borrow_rejected()
+        self.pool.get().map_or(0, |p| p.borrow_rejected())
     }
 
     /// 线程池管理面（resize / metrics / shutdown+join / 审计订阅）。
-    pub fn threads(&self) -> &ThreadPool {
-        self.pool.threads()
+    ///
+    /// `None` = 池尚未建（无消费方 ⇒ 零线程，见 [`Self::pool`]）。
+    #[must_use]
+    pub fn threads(&self) -> Option<&ThreadPool> {
+        self.pool.get().map(|p| p.threads())
     }
 
-    /// 内存池管理面（metrics / 直接借还）。
-    pub fn mem_pool(&self) -> &MemoryPool<Vec<u8>, fn() -> Vec<u8>> {
-        self.pool.mem_pool()
+    /// 内存池管理面（metrics / 直接借还）。`None` = 池尚未建。
+    #[must_use]
+    pub fn mem_pool(&self) -> Option<&MemoryPool<PoolBuf, PoolBufFactory>> {
+        self.pool.get().map(|p| p.mem_pool())
     }
 
     /// 停机面：停止接收新任务 → 排空已入队任务 → 等 worker 退役
-    /// （契约坑约束 5：后台任务必托管）。幂等。
+    /// （契约坑约束 5：后台任务必托管）。幂等。未建池 ⇒ 空操作（零线程）。
     pub fn shutdown_join(&self) {
-        self.pool.threads().shutdown();
-        self.pool.threads().join();
+        if let Some(p) = self.pool.get() {
+            p.threads().shutdown();
+            p.threads().join();
+        }
     }
 
     /// 并行加载一批 (kind, file, code) 请求：全部提交（worker 内读 dat 文件
@@ -405,6 +451,27 @@ mod tests {
             .collect()
     }
 
+    /// caih2：`GeodataLoadPool` 构造期**不得起线程**——udf `ThreadPool::new`
+    /// 在构造期即 spawn `core` 个 OS 线程，而本池的生产消费方为零 ⇒ 那 2 个
+    /// 线程纯空转（线程栈 + 调度开销）。修复后：首次 submit 才建池。
+    #[test]
+    fn pool_spawns_no_threads_until_first_submit() {
+        let pool = GeodataLoadPool::new(2, 2, 8, Duration::from_secs(10));
+        // 未提交 ⇒ 池未建 ⇒ 零线程、零内存池。
+        assert!(pool.threads().is_none(), "构造池不得起线程（未提交即未建池）");
+        assert!(pool.mem_pool().is_none(), "构造池不得分配内存池");
+        assert_eq!(pool.borrow_rejected(), 0);
+        // 停机面在未建池时为空操作（不得 panic，也不得顺带把池建起来）。
+        pool.shutdown_join();
+        assert!(pool.threads().is_none(), "shutdown_join 不得建池");
+
+        // 首次提交 ⇒ 建池 ⇒ worker 按需拉起（消费方真用时才付线程代价）。
+        pool.submit(|_buf| {}).expect("首次提交必须被受理");
+        let threads = pool.threads().expect("首次提交后池必须已建");
+        assert!(threads.metrics().workers >= 1, "首次提交后必须有 worker 在跑");
+        pool.shutdown_join();
+    }
+
     #[test]
     fn parse_overrides_defaults_and_invalid_fallback() {
         let (p, warnings) = parse_overrides(|_| None);
@@ -475,7 +542,7 @@ mod tests {
         // 断言不放松。
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let m = pool.mem_pool().metrics();
+            let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
             if m.core.borrowed == 0 && m.core.dropped_overflow == 0 && m.core.idle >= 1 {
                 break;
             }
@@ -530,7 +597,7 @@ mod tests {
         .expect("pool must stay usable after a task panic");
         pool.shutdown_join();
         assert_eq!(pool.borrow_rejected(), 0);
-        let m = pool.mem_pool().metrics();
+        let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
         assert_eq!(m.core.borrowed, 0, "panic task must still return its buffer");
         assert_eq!(m.core.idle, m.core.max);
         assert!(rx2.recv().is_ok());
@@ -572,7 +639,7 @@ mod tests {
         assert_eq!(pool.borrow_rejected(), 0);
         recovered(); // 退还任务由调用方处置：内联执行仍有效
         assert_eq!(done_rx.recv(), Ok("refunded-inline"));
-        let m = pool.mem_pool().metrics();
+        let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
         assert_eq!(m.core.borrowed, 0);
         assert_eq!(m.core.idle, m.core.max);
     }

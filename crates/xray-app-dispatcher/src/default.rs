@@ -1701,6 +1701,12 @@ pub struct DialBridge {
     /// chained dispatch task 收口（bd 4a1zy）：bridge 自持托管 scope，bridge drop
     /// ⇒ scope 随之 abort 在途 chained task（杜绝 fire-and-forget 孤儿）。
     scope: ManagedScope,
+    /// 代理链失败累计（chain handler 缺失 / 无 outbound manager 两种）。
+    ///
+    /// epyge：这两处原先只记 error 日志后**静默 return**——下行永不关闭，
+    /// 客户端侧表现为「挂起」（伪装成慢）。改为显式失败后，此计数 = 断链
+    /// 次数（可观测面，配合 error 日志定位「哪条链、哪个 tag」）。
+    proxy_chain_failures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// 入站 splice 元数据的 dispatch 作用域通道（txno-splice）。
@@ -1809,6 +1815,7 @@ impl DialBridge {
             policy: parking_lot::RwLock::new(None),
             splice_outbound: std::sync::atomic::AtomicBool::new(false),
             splice_admitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            proxy_chain_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1817,6 +1824,15 @@ impl DialBridge {
     #[must_use]
     pub fn splice_admitted(&self) -> bool {
         self.splice_admitted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 代理链失败累计（chain handler 缺失 / 无 outbound manager）。
+    ///
+    /// epyge 的可观测面：这两类失败原先静默 return（连接挂起），现改为显式
+    /// 失败并断下行 ⇒ 计数 = 断链次数。
+    #[must_use]
+    pub fn proxy_chain_failures(&self) -> u64 {
+        self.proxy_chain_failures.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 标记本桥为 splice 出站（Go `ob.CanSpliceCopy = 1`，freedom.go:260）。
@@ -2006,18 +2022,34 @@ impl DialBridge {
         let pipe_limit = self.current_pipe_limit();
         // 提前克隆 scope：chained task 收进 bridge 的托管 scope（bd 4a1zy）
         let scope = self.scope.clone();
+        // 提前克隆失败计数句柄：async move 块不能借用 &self（epyge 可观测面）。
+        let chain_failures = Arc::clone(&self.proxy_chain_failures);
 
         Box::pin(async move {
+            // epyge：代理链入口的两个失败分支原先只记日志后**静默 return**——
+            // 下行永不关闭 ⇒ 客户端侧表现为「挂起」（伪装成慢），运维看不到
+            // 流量被丢弃。改为**显式失败**：断下行（客户端立刻见连接关闭）
+            // + 计数 + 带原因的 error 日志。
             let Some(ohm) = ohm else {
-                tracing::error!(tag = %tag, "proxy chain tag '{chain_tag}' set but no outbound manager");
-                return;
-            };
-            let Some(chained_handler) = ohm.get_handler(&chain_tag) else {
+                chain_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::error!(
                     tag = %tag,
                     chain_tag = %chain_tag,
-                    "proxy chain handler not found"
+                    reason = "no outbound manager for proxy chain",
+                    "proxy chain failed"
                 );
+                link.writer.shutdown();
+                return;
+            };
+            let Some(chained_handler) = ohm.get_handler(&chain_tag) else {
+                chain_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    tag = %tag,
+                    chain_tag = %chain_tag,
+                    reason = "proxy chain handler not found",
+                    "proxy chain failed"
+                );
+                link.writer.shutdown();
                 return;
             };
 
@@ -2832,6 +2864,45 @@ mod tests {
         assert!(
             !done.load(Ordering::SeqCst),
             "chained task must not survive bridge drop (orphan task)"
+        );
+    }
+
+    /// epyge：代理链 handler 缺失必须**显式失败**，不得静默 return。
+    ///
+    /// 修复前：`dispatch_via_chain` 只记 error 日志后 return，下行 pipe 永不
+    /// 关闭 ⇒ 客户端读端永久阻塞（用户侧表现为「挂起」，伪装成慢），且失败
+    /// 不可计数。修复后：失败计数 +1 且下行被关闭（客户端立刻见 EOF）。
+    #[tokio::test]
+    async fn chain_handler_missing_fails_visibly_and_closes_downlink() {
+        use std::time::Duration;
+
+        let ohm = SimpleOhm::new(); // 空表：chain tag 必然查不到
+        let dial: DialFn = Arc::new(|_dest: &Destination| {
+            Box::pin(async { Err("unused: chain never dials".to_string()) })
+        });
+        let bridge = Arc::new(DialBridge::new("bridge-missing-chain", dial));
+        bridge.set_proxy_chain("no-such-chain", Arc::new(ohm));
+
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
+        let (up_r, _up_w) = xray_buf::pipe::new();
+        let (mut dn_r, dn_w) = xray_buf::pipe::new();
+        let link = xray_transport::link::Link::new(
+            Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+            Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+        );
+
+        bridge.dispatch(&dest, link).await;
+
+        // ① 失败可见且可计数（不再是「静默成功」）。
+        assert_eq!(bridge.proxy_chain_failures(), 1, "chain handler 缺失必须计数");
+
+        // ② 下行已关闭：客户端读到 EOF（修复前此处永久阻塞 = 伪装成慢）。
+        let read = tokio::time::timeout(Duration::from_secs(2), dn_r.read_multi_buffer()).await;
+        assert!(read.is_ok(), "chain 失败必须断下行（客户端不得挂起）");
+        assert!(
+            matches!(read, Ok(Err(xray_buf::io::Error::Eof))),
+            "下行关闭后必须读到 EOF，实际：{read:?}"
         );
     }
 
