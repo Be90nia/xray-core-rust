@@ -342,17 +342,131 @@ async fn wait_abort(rx: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = rx.wait_for(|closed| *closed).await;
 }
 
-/// 桥腿终态（诊断面 bd myppb）。
+/// 收尾策略（bd degg3 设计 §4）：把「凭什么理由收尾」与「怎么收尾」分开。
+///
+/// 改造前写腿收尾唯一动作是 `shutdown()`，上行腿的四种终态（正常 EOF / 读错 /
+/// 空闲超时 / 中止闸）被折叠成同一个动作 ⇒ 中继内部错误在 wire 上伪装成
+/// 「请求正常完成」，服务端因此提前停止响应（bd myppb/cna1g）。反向的一刀切
+/// （异常也不发结束信号）已被真机证伪：A 臂 32/32 vs B 臂 30/32（bd degg3）。
+/// ⇒ 只能按**理由**分流，不能按方向分流。
+mod end_policy {
+    /// 腿终态原因（平台无关）。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub(super) enum LegEnd {
+        /// 正常 EOF：源端确实不再发数据（空块 / `Error::Eof`）。
+        CleanEof = 0,
+        /// 级联退出：本向的 send/write 目标先亡（不是本向的语义结束）。
+        PeerEnded = 1,
+        /// 读错误（AEAD / 帧 / 传输错误）。
+        ReadError = 2,
+        /// 写错误（对端连接已坏，FIN 无意义）。
+        WriteError = 3,
+        /// connIdle 或半窗（uplinkOnly / downlinkOnly）到期：是判定，不是对端说
+        /// 「我发完了」。
+        IdleExpired = 4,
+        /// 中止闸被其它腿置位（bd rjt2o：闸只搬运既有判定）。
+        Aborted = 5,
+    }
+
+    impl LegEnd {
+        /// 原因槽编码（跨腿投递用 `AtomicU8` 无载荷，冷路径各一次）。
+        pub(super) const fn code(self) -> u8 {
+            self as u8
+        }
+
+        /// 原因槽解码。越界按 `CleanEof`（= 改造前 `SignalEnd`）：槽必在读腿
+        /// store 之后才被写腿读到（见 `bridge_link_with_stream_full` store 处
+        /// 注释），越界不可达。
+        pub(super) const fn from_code(code: u8) -> Self {
+            match code {
+                1 => Self::PeerEnded,
+                2 => Self::ReadError,
+                3 => Self::WriteError,
+                4 => Self::IdleExpired,
+                5 => Self::Aborted,
+                _ => Self::CleanEof,
+            }
+        }
+
+        /// warn 字段 `kind`。
+        pub(super) const fn as_str(self) -> &'static str {
+            match self {
+                Self::CleanEof => "clean_eof",
+                Self::PeerEnded => "peer_ended",
+                Self::ReadError => "read_error",
+                Self::WriteError => "write_error",
+                Self::IdleExpired => "idle_expired",
+                Self::Aborted => "aborted",
+            }
+        }
+    }
+
+    /// 收尾动作。
+    ///
+    /// ⚠️ 设计 §4.2 的第三档 `FlushOnly`（只 flush 不发结束信号）随 **Step 3**
+    /// （能力维度：WS 全双工 + `CleanEof`）一起引入——本仓 `#![deny(warnings)]`
+    /// 对「从不构造的变体」是硬错，先声明后使用只能靠 lint 抑制，故此刻不声明。
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum EndAction {
+        /// flush + 结束发送方向（各 conn `poll_shutdown` 语义：FIN / END_STREAM /
+        /// 终止 chunk / WS Close）。
+        SignalEnd,
+        /// 不发有序结束，直接全关（协议层无标记；有未读数据时按 RFC 9293
+        /// SHLD-3 出 RST）。
+        FullClose,
+    }
+
+    /// **唯一**决策点：纯函数，无 IO、无平台分支、无 `cfg`（splice 承载与
+    /// stream 承载同源，故 Windows 可全量单测）。
+    ///
+    /// `CleanEof` / `PeerEnded` → `SignalEnd`：**与改造前字节级一致**（真机 32
+    /// 节点 A 臂就是这条路径，禁改）。异常四档 → `FullClose`：不发有序结束。
+    pub(super) const fn end_action(end: LegEnd) -> EndAction {
+        match end {
+            LegEnd::CleanEof | LegEnd::PeerEnded => EndAction::SignalEnd,
+            LegEnd::ReadError | LegEnd::WriteError | LegEnd::IdleExpired | LegEnd::Aborted => {
+                EndAction::FullClose
+            },
+        }
+    }
+}
+
+/// 桥腿终态（诊断面 bd myppb + 收尾分流 bd degg3）。
 ///
 /// 改造前每条腿的读循环把「`Ok(空块)`/`Error::Eof`」与「真实 IO 错误」并进
 /// 同一个 `_ => break`，且腿恒返 `Ok(())` ⇒ dispatcher 的
-/// `bridge ended: {e}` 是死代码，中继侧零痕迹。此处只区分**记什么**与
-/// **返回什么**，break 点、shutdown、半窗、budget 记账一行未动。
+/// `bridge ended: {e}` 是死代码，中继侧零痕迹。degg3 起每个 break 点还必须
+/// 说清**理由**（超时/中止/级联不再记 `Eof`）——写腿据此选收尾动作。
+///
+/// 与 [`end_policy::LegEnd`] 1:1 对应，多带 `Err` 的 io 错误载荷（供聚合上浮）。
 enum LegExit {
-    /// 正常收尾：流 EOF、对向级联退出、读侧超时判定断连。
+    /// 正常收尾：流 EOF（空块 / `Error::Eof`）。
     Eof,
+    /// 级联退出：本向 send/write 目标先亡。
+    PeerEnded,
+    /// 写错误：只收敛本向（50074b2 语义），不上浮为错误。
+    WriteErr,
+    /// 空闲或半窗到期（connIdle / uplinkOnly / downlinkOnly）。
+    IdleExpired,
+    /// 中止闸被其它腿置位（bd rjt2o）。
+    Aborted,
     /// 真实 IO 错误（字节数已由 [`leg_read_err`] 记入 warn）。
     Err { err: io::Error },
+}
+
+impl LegExit {
+    /// 收尾策略输入。
+    fn end(&self) -> end_policy::LegEnd {
+        match self {
+            Self::Eof => end_policy::LegEnd::CleanEof,
+            Self::PeerEnded => end_policy::LegEnd::PeerEnded,
+            Self::WriteErr => end_policy::LegEnd::WriteError,
+            Self::IdleExpired => end_policy::LegEnd::IdleExpired,
+            Self::Aborted => end_policy::LegEnd::Aborted,
+            Self::Err { .. } => end_policy::LegEnd::ReadError,
+        }
+    }
 }
 
 /// 读腿错误 → 终态：`xray_buf::Error::Eof` 是正常收尾（pipe 关闭/流结束，
@@ -372,13 +486,17 @@ fn leg_read_err(leg: &'static str, bytes_done: u64, err: xray_buf::io::Error) ->
     LegExit::Err { err }
 }
 
-/// 聚合腿终态：取**首个** IO 错误上浮（顺序固定 = 决定性），全 EOF 则
-/// `Ok(())`——与改造前「正常收尾一律 Ok」的返回值一致。
+/// 聚合腿终态：取**首个** IO 错误上浮（顺序固定 = 决定性），其余终态（含
+/// 超时/中止/级联）一律 `Ok(())`——与改造前「正常收尾一律 Ok」的返回值一致。
 fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
     legs.into_iter()
         .find_map(|leg| match leg {
             LegExit::Err { err } => Some(err),
-            LegExit::Eof => None,
+            LegExit::Eof
+            | LegExit::PeerEnded
+            | LegExit::WriteErr
+            | LegExit::IdleExpired
+            | LegExit::Aborted => None,
         })
         .map_or(Ok(()), Err)
 }
@@ -486,11 +604,18 @@ where
     // 零额外拷贝：缓冲区仍按原路 move，select 只多 poll 一个 watch。
     let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
 
+    // 收尾原因槽（degg3 设计 §4.3，每向一个）：读腿退出前 store，写腿
+    // `recv()==None` 后 load。热路径零成本——冷路径每连接各一次原子操作。
+    // 写腿本地可判定的两种原因（`WriteError` / `Aborted`）不读槽。
+    let up_end =
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(end_policy::LegEnd::CleanEof.code()));
+
     // 上行 reader：link.reader → up_tx。超时语义与串行版逐行等价：
     // conn_idle 双向存活空闲断开；对向读侧结束后本向仅剩 half_window 宽限。
     let up_reader = {
         let abort_tx = abort_tx.clone();
         let mut abort_rx = abort_rx.clone();
+        let up_end = up_end.clone();
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
@@ -505,7 +630,7 @@ where
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break LegExit::Eof;
+                                break LegExit::IdleExpired;
                             },
                         },
                         _ = down_done.changed() => {
@@ -518,7 +643,7 @@ where
                         Err(_) => {
                             // uplink_only 窗口内无数据
                             let _ = abort_tx.send(true);
-                            break LegExit::Eof;
+                            break LegExit::IdleExpired;
                         },
                     },
                 };
@@ -532,17 +657,21 @@ where
                         // send 立即 Err → 本向级联退出，绝不静默吞数据。关闸时
                         // 放弃在飞批次（收尾态，连接已被判死）。
                         let sent = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
                             r = up_tx.send(mb) => r,
                         };
                         if sent.is_err() {
-                            break LegExit::Eof;
+                            break LegExit::PeerEnded;
                         }
                     },
                     Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
                     Err(e) => break leg_read_err("up_read", bytes_done, e),
                 }
             };
+            // ⚠️ store 必须早于本块结束（本块结束时 up_tx 才 drop → 写腿可能
+            // 立刻 `recv()==None` 醒来）：顺序反了写腿会读初始值 0（= CleanEof），
+            // 异常被当正常收尾（设计 §10 风险项）。
+            up_end.store(exit.end().code(), std::sync::atomic::Ordering::Release);
             let _ = up_done_tx.send(Some(downlink_only));
             exit
         }
@@ -550,32 +679,54 @@ where
     // 上行 writer：up_rx → stream 写半部聚合写（vectored 批写，y1yx）。只写不读。
     let up_writer = {
         let mut abort_rx = abort_rx.clone();
+        let up_end = up_end.clone();
         async move {
-            loop {
+            let mut up_bytes: u64 = 0;
+            let end = loop {
                 let mb = tokio::select! {
-                    _ = wait_abort(&mut abort_rx) => break,
+                    _ = wait_abort(&mut abort_rx) => break end_policy::LegEnd::Aborted,
                     r = up_rx.recv() => match r {
                         Some(mb) => mb,
-                        None => break,
+                        // 读腿已退出：原因由它 store（store 早于 up_tx drop）。
+                        None => break end_policy::LegEnd::from_code(
+                            up_end.load(std::sync::atomic::Ordering::Acquire),
+                        ),
                     },
                 };
                 if p7lm_trace {
                     tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_write", "");
                 }
+                up_bytes += mb.len() as u64;
                 // 关闸时丢弃在飞批次：对端不读 + 连接已被判死，半截写无意义。
                 let wrote = tokio::select! {
-                    _ = wait_abort(&mut abort_rx) => break,
+                    _ = wait_abort(&mut abort_rx) => break end_policy::LegEnd::Aborted,
                     r = write_all_mb(&mut s_write, &mb) => r,
                 };
                 if wrote.is_err() {
-                    break;
+                    break end_policy::LegEnd::WriteError;
                 }
-            }
-            // 无条件 shutdown（EOF 排空收尾与写错误收尾同路径），只关本向写半部。
+            };
+            // 收尾按**原因**分流（唯一决策点）：只关本向写半部。
             // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
             // 传播 half_window，对向不静默半断。3s 界：对端不读时 shutdown 自身
             // 也会挂（对称下方 shutdown_flush 的既有界）。
-            let _ = timeout(std::time::Duration::from_secs(3), s_write.shutdown()).await;
+            match end_policy::end_action(end) {
+                end_policy::EndAction::SignalEnd => {
+                    let _ = timeout(std::time::Duration::from_secs(3), s_write.shutdown()).await;
+                },
+                // 异常收尾：不发有序结束（协议层无标记），靠 drop 全关——不让对端
+                // 把中继内部错误读成「请求已完成」。
+                end_policy::EndAction::FullClose => {
+                    tracing::warn!(
+                        target: "xray_frame::bridge",
+                        leg = "up_write",
+                        kind = end.as_str(),
+                        bytes_done = up_bytes,
+                        action = "full_close",
+                        "bridge leg end without ordered shutdown"
+                    );
+                },
+            }
             io::Result::Ok(())
         }
     };
@@ -596,7 +747,7 @@ where
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break LegExit::Eof;
+                                break LegExit::IdleExpired;
                             },
                         },
                         _ = up_done.changed() => {
@@ -609,7 +760,7 @@ where
                         Err(_) => {
                             // downlink_only 窗口内无数据
                             let _ = abort_tx.send(true);
-                            break LegExit::Eof;
+                            break LegExit::IdleExpired;
                         },
                     },
                 };
@@ -620,11 +771,11 @@ where
                         }
                         bytes_done += mb.len() as u64;
                         let sent = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
                             r = down_tx.send(mb) => r,
                         };
                         if sent.is_err() {
-                            break LegExit::Eof;
+                            break LegExit::PeerEnded;
                         }
                     },
                     Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
@@ -770,7 +921,8 @@ where
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
-            loop {
+            let mut bytes_done: u64 = 0;
+            let exit = loop {
                 let mb = match window {
                     None => {
                         // 预算先绑定具名局部：`Budget::tokio()` 是临时值，
@@ -782,7 +934,7 @@ where
                                     Ok(r) => r,
                                     Err(_) => {
                                         let _ = abort_tx.send(true);
-                                        break;
+                                        break LegExit::IdleExpired;
                                     },
                                 }
                             }
@@ -798,29 +950,47 @@ where
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break;
+                                break LegExit::IdleExpired;
                             },
                         }
                     },
                 };
                 match mb {
                     Ok(mb) if !mb.is_empty() => {
+                        bytes_done += mb.len() as u64;
                         let wrote = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
                             r = write_all_mb(&mut s_write, &mb) => r,
                         };
                         if wrote.is_err() {
-                            break;
+                            break LegExit::WriteErr;
                         }
                     },
-                    _ => break,
+                    Ok(_) => break LegExit::Eof,
+                    Err(e) => break leg_read_err("up_read", bytes_done, e),
                 }
+            };
+            // 收尾按原因分流（与 stream 承载同源，唯一决策点）；3s 界：对端不读时
+            // shutdown 自身也会挂（同 full 变体的 shutdown_flush）。
+            match end_policy::end_action(exit.end()) {
+                end_policy::EndAction::SignalEnd => {
+                    let _ = Budget::tokio()
+                        .deadline(std::time::Duration::from_secs(3))
+                        .timeout(s_write.shutdown())
+                        .await;
+                },
+                // 异常收尾：不发有序结束，靠 drop 全关（同 stream 承载）。
+                end_policy::EndAction::FullClose => {
+                    tracing::warn!(
+                        target: "xray_frame::bridge",
+                        leg = "up_write",
+                        kind = exit.end().as_str(),
+                        bytes_done,
+                        action = "full_close",
+                        "bridge leg end without ordered shutdown"
+                    );
+                },
             }
-            // 3s 界：对端不读时 shutdown 自身也会挂（同 full 变体的 shutdown_flush）。
-            let _ = Budget::tokio()
-                .deadline(std::time::Duration::from_secs(3))
-                .timeout(s_write.shutdown())
-                .await;
             let _ = up_done_tx.send(Some(downlink_only));
             io::Result::Ok(())
         }
@@ -906,7 +1076,7 @@ pub async fn bridge_link_with_link(
                                 Ok(r) => r,
                                 Err(_) => {
                                     let _ = abort_tx.send(true);
-                                    break LegExit::Eof;
+                                    break LegExit::IdleExpired;
                                 },
                             },
                             _ = down_done.changed() => {
@@ -924,7 +1094,7 @@ pub async fn bridge_link_with_link(
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break LegExit::Eof;
+                                break LegExit::IdleExpired;
                             },
                         }
                     },
@@ -933,12 +1103,12 @@ pub async fn bridge_link_with_link(
                     Ok(mb) if !mb.is_empty() => {
                         bytes_done += mb.len() as u64;
                         let wrote = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
                             r = b_writer.write_multi_buffer(mb) => r,
                         };
                         // 写错只收敛本向（pipe 关闭是正常收尾，同 stream 桥 50074b2 语义）。
                         if wrote.is_err() {
-                            break LegExit::Eof;
+                            break LegExit::WriteErr;
                         }
                     },
                     Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
@@ -946,10 +1116,27 @@ pub async fn bridge_link_with_link(
                 }
             };
             // bd VISIONMAC：TLS 链路场景须 flush+shutdown 排空滞留尾巴。
-            let _ = Budget::tokio()
-                .deadline(std::time::Duration::from_secs(3))
-                .timeout(b_writer.shutdown_flush())
-                .await;
+            // degg3：收尾按原因分流（唯一决策点）；pipe 的 `close()` 只让本 pipe
+            // 读端见 EOF ⇒ 天然方向性，`SignalEnd` 分支原样保留。
+            match end_policy::end_action(exit.end()) {
+                end_policy::EndAction::SignalEnd => {
+                    let _ = Budget::tokio()
+                        .deadline(std::time::Duration::from_secs(3))
+                        .timeout(b_writer.shutdown_flush())
+                        .await;
+                },
+                // 异常收尾：不发有序结束，靠 drop 全关（同 stream 承载）。
+                end_policy::EndAction::FullClose => {
+                    tracing::warn!(
+                        target: "xray_frame::bridge",
+                        leg = "up_write",
+                        kind = exit.end().as_str(),
+                        bytes_done,
+                        action = "full_close",
+                        "bridge leg end without ordered shutdown"
+                    );
+                },
+            }
             let _ = up_done_tx.send(Some(downlink_only));
             exit
         }
@@ -973,7 +1160,7 @@ pub async fn bridge_link_with_link(
                                 Ok(r) => r,
                                 Err(_) => {
                                     let _ = abort_tx.send(true);
-                                    break LegExit::Eof;
+                                    break LegExit::IdleExpired;
                                 },
                             },
                             _ = up_done.changed() => {
@@ -991,7 +1178,7 @@ pub async fn bridge_link_with_link(
                             Ok(r) => r,
                             Err(_) => {
                                 let _ = abort_tx.send(true);
-                                break LegExit::Eof;
+                                break LegExit::IdleExpired;
                             },
                         }
                     },
@@ -1000,12 +1187,12 @@ pub async fn bridge_link_with_link(
                     Ok(mb) if !mb.is_empty() => {
                         bytes_done += mb.len() as u64;
                         let wrote = tokio::select! {
-                            _ = wait_abort(&mut abort_rx) => break LegExit::Eof,
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
                             r = a_writer.write_multi_buffer(mb) => r,
                         };
                         // 写错只收敛本向（pipe 关闭是正常收尾，同 stream 桥 50074b2 语义）。
                         if wrote.is_err() {
-                            break LegExit::Eof;
+                            break LegExit::WriteErr;
                         }
                     },
                     Ok(_) => break LegExit::Eof, // 正常 EOF（空块）
@@ -1064,6 +1251,43 @@ mod tests {
             p7lm_trace(),
             p7lm_trace_enabled(std::env::var("XRAY_P7LM_TRACE").ok().as_deref())
         );
+    }
+
+    /// degg3 收尾策略表（6×1）：决策点唯一且平台无关，故表驱动钉死。
+    #[test]
+    fn end_action_table() {
+        use end_policy::{EndAction, LegEnd, end_action};
+
+        // 唯一决策点：正常两档保持现状（A 臂字节级不变），异常四档全关。
+        let want = [
+            (LegEnd::CleanEof, EndAction::SignalEnd),
+            (LegEnd::PeerEnded, EndAction::SignalEnd),
+            (LegEnd::ReadError, EndAction::FullClose),
+            (LegEnd::WriteError, EndAction::FullClose),
+            (LegEnd::IdleExpired, EndAction::FullClose),
+            (LegEnd::Aborted, EndAction::FullClose),
+        ];
+        for (end, action) in want {
+            assert_eq!(end_action(end), action, "{end:?} 的收尾动作");
+        }
+    }
+
+    /// 原因槽编解码必须双射（写腿靠它跨腿取原因）；越界只允许落到 `CleanEof`。
+    #[test]
+    fn leg_end_codec_roundtrip() {
+        use end_policy::LegEnd;
+
+        for end in [
+            LegEnd::CleanEof,
+            LegEnd::PeerEnded,
+            LegEnd::ReadError,
+            LegEnd::WriteError,
+            LegEnd::IdleExpired,
+            LegEnd::Aborted,
+        ] {
+            assert_eq!(LegEnd::from_code(end.code()), end, "{end:?} 编解码");
+        }
+        assert_eq!(LegEnd::from_code(u8::MAX), LegEnd::CleanEof, "越界必须是现状兜底");
     }
 
     /// 创建两对 loopback TCP 连接：(client_a ↔ server_a) 和 (client_b ↔ server_b)。
@@ -2207,6 +2431,215 @@ mod tests {
         )
         .await;
         assert!(res.is_ok(), "normal EOF ends must stay Ok, got {res:?}");
+        let _ = dn_r;
+    }
+
+    // ---- degg3 收尾分流门（Step 2）：有序结束信号只在正常收尾发 ----
+
+    /// 收尾门探针：转发 duplex（数据面照常），只把 `poll_shutdown` 计数。
+    /// 计数 == 1 ⇒ 发了有序结束信号；== 0 ⇒ 异常收尾（靠 drop 全关）。
+    struct CountShutdownConn {
+        io: tokio::io::DuplexStream,
+        shuts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountShutdownConn {
+        fn new(
+            io: tokio::io::DuplexStream,
+        ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let shuts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (Self { io, shuts: shuts.clone() }, shuts)
+        }
+    }
+
+    impl tokio::io::AsyncRead for CountShutdownConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountShutdownConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.io).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.shuts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    impl Connection for CountShutdownConn {
+        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+
+        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+            Ok(None)
+        }
+    }
+
+    /// A 臂不回归（QAS-2）：正常 EOF 仍然发有序结束信号，且只发一次。
+    #[tokio::test]
+    async fn bridge_stream_full_clean_eof_still_signals_end() {
+        use xray_buf::io::Writer;
+
+        use crate::link::Link;
+
+        let (up_r, up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (stream_peer, stream) = tokio::io::duplex(8192);
+        let (conn, shuts) = CountShutdownConn::new(stream);
+
+        drop(stream_peer); // 下行 EOF
+        up_w.shutdown(); // 上行 pipe close → 读腿报 Error::Eof（正常收尾）
+
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(conn) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        assert!(res.is_ok(), "normal EOF ends must stay Ok, got {res:?}");
+        assert_eq!(
+            shuts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "clean EOF 必须发结束信号（A 臂字节级不变）"
+        );
+        let _ = dn_r;
+    }
+
+    /// QAS-1（异常可辨性）：读错误不得再伪装成「请求完成」——不调 `poll_shutdown`。
+    #[tokio::test]
+    async fn bridge_stream_full_read_err_skips_ordered_shutdown() {
+        use xray_buf::{
+            io::{Error as BufError, Reader, Result as BufResult},
+            multi::MultiBuffer,
+        };
+
+        use crate::link::Link;
+
+        struct ResetReader;
+        impl Reader for ResetReader {
+            fn read_multi_buffer(
+                &mut self,
+            ) -> Pin<Box<dyn Future<Output = BufResult<MultiBuffer>> + Send + '_>> {
+                Box::pin(std::future::ready(Err(BufError::ReadIo(std::io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "reset by peer",
+                )))))
+            }
+        }
+
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(ResetReader), Box::new(dn_w));
+        let (stream_peer, stream) = tokio::io::duplex(8192);
+        let (conn, shuts) = CountShutdownConn::new(stream);
+        drop(stream_peer); // 下行正常 EOF
+
+        let res = bridge_link_with_stream_full(
+            link,
+            Box::new(conn) as Box<dyn Connection>,
+            &asym_halfclose_policy(),
+        )
+        .await;
+        assert_eq!(
+            res.expect_err("read-leg error must surface").kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            shuts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "读错误收尾不得发有序结束信号"
+        );
+        let _ = dn_r;
+    }
+
+    /// 空闲超时（`connIdle`）是判定，不是对端说「我发完了」⇒ 不发有序结束信号。
+    #[tokio::test]
+    async fn bridge_stream_full_idle_expired_skips_ordered_shutdown() {
+        use std::time::Duration;
+
+        use xray_features::policy::TimeoutPolicy;
+
+        use crate::link::Link;
+
+        let (up_r, _up_w) = xray_buf::pipe::new();
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        let link = Link::new(Box::new(up_r), Box::new(dn_w));
+        let (_peer, stream) = tokio::io::duplex(8192);
+        let (conn, shuts) = CountShutdownConn::new(stream);
+        let policy = TimeoutPolicy {
+            connection_idle: Duration::from_millis(200),
+            ..TimeoutPolicy::default()
+        };
+
+        let res =
+            bridge_link_with_stream_full(link, Box::new(conn) as Box<dyn Connection>, &policy)
+                .await;
+        assert!(res.is_ok(), "idle break must stay Ok, got {res:?}");
+        assert_eq!(
+            shuts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "空闲超时收尾不得发有序结束信号"
+        );
+        let _ = dn_r;
+    }
+
+    /// 中止闸收尾（写腿被堵、判定由对向读侧给出）同样不发有序结束信号。
+    #[tokio::test]
+    async fn bridge_stream_full_abort_skips_ordered_shutdown() {
+        use std::time::Duration;
+
+        use xray_features::policy::TimeoutPolicy;
+
+        use crate::link::Link;
+
+        let (dn_r, dn_w) = xray_buf::pipe::new();
+        // 上行源 4MB 顺序读：写腿背压卡住（peer 活着但不读），收尾只能由中止闸给出。
+        let up_src = xray_buf::io::new_reader(std::io::Cursor::new(vec![0u8; 4 * 1024 * 1024]));
+        let link = Link::new(up_src, Box::new(dn_w));
+        let (_peer, stream) = tokio::io::duplex(8192);
+        let (conn, shuts) = CountShutdownConn::new(stream);
+        let policy = TimeoutPolicy {
+            connection_idle: Duration::from_millis(200),
+            ..TimeoutPolicy::default()
+        };
+
+        let start = xray_frame::compat::clock().now_instant();
+        let res =
+            bridge_link_with_stream_full(link, Box::new(conn) as Box<dyn Connection>, &policy)
+                .await;
+        assert!(res.is_ok(), "abort break must stay Ok, got {res:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "abort 收尾不得再等 3s shutdown 界，got {:?}",
+            start.elapsed()
+        );
+        assert_eq!(
+            shuts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "中止收尾不得发有序结束信号"
+        );
         let _ = dn_r;
     }
 
