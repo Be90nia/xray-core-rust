@@ -273,7 +273,11 @@ mod tests {
         assert!(!policy.stats.user_uplink);
         assert!(!policy.stats.user_downlink);
         assert!(!policy.stats.user_online, "user_online must default false");
-        assert_eq!(policy.buffer.connection, DEFAULT_BUFFER_CONNECTION);
+        assert_eq!(
+            policy.buffer.connection,
+            BufferPolicy::default().connection,
+            "Policy::default 必须内嵌 BufferPolicy::default（arch 对齐 Go，9utc3③）"
+        );
     }
 
     #[test]
@@ -316,13 +320,13 @@ mod tests {
 
     #[test]
     fn test_system_stats_buffer_default_aligns_go_default() {
-        // 对齐 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
-        // 及 defaultBufferPolicy() = Buffer{PerConnection: 512 * 1024}（policy.go:108-112）。
-        // Rust proto 当前 SystemPolicy 未暴露 buffer 字段，所以 SystemStats.buffer 走
-        // BufferPolicy::default()=512 KiB。
+        // 对齐 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}。
+        // Rust BufferPolicy::default() 走 env 桥 + 按 arch 对齐 Go（aarch64/mips64=4KiB，
+        // 其余=512KiB，9utc3③）——SystemPolicy proto 未暴露 buffer 字段 ⇒
+        // SystemStats.buffer 直接回落 BufferPolicy::default()。
         let s = SystemStats::default();
-        assert_eq!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
-        assert_eq!(s.buffer.connection, 512 * 1024);
+        assert_eq!(s.buffer.connection, BufferPolicy::default().connection);
+        assert_eq!(s.buffer.connection, default_buffer_connection_from_env(None));
         assert_eq!(s.buffer.write, DEFAULT_BUFFER_WRITE);
         // 同时验证 stats 子结构仍是 default（与原行为兼容）
         assert!(!s.inbound_uplink);
@@ -384,9 +388,9 @@ mod tests {
         assert_eq!(size, 512 * 1024, "其他 GOARCH 分支（x86_64 等）期望 512 KiB");
     }
 
-    /// SystemStats.buffer 默认 512 KiB（policy.go:108-112 `defaultBufferPolicy()`），验证
-    /// SystemPolicy proto 未暴露 buffer 字段时 `system_stats_from_proto` 仍回落到
-    /// `BufferPolicy::default()`=512 KiB。
+    /// SystemStats.buffer 默认随 arch 对齐 Go（aarch64/mips64=4 KiB，其余=512 KiB，
+    /// policy.go:108-112 `defaultBufferPolicy()`），验证 SystemPolicy proto 未暴露
+    /// buffer 字段时 `system_stats_from_proto` 仍回落到 `BufferPolicy::default()`。
     #[test]
     fn test_system_stats_buffer_default_roundtrip_via_default_policy() {
         // 对应 Go features/policy/policy.go:52-56 System{Buffer: defaultBufferPolicy()}
@@ -496,11 +500,12 @@ mod tests {
 
     // ====== 改（Batch10 P3 无限支持）======
 
-    /// 默认 connection 与 Go defaultBufferSize 512 KiB 对齐。
+    /// 默认 connection 与 Go defaultBufferSize 对齐（arch 分支：aarch64/mips64=4 KiB，
+    /// 其余=512 KiB；env 桥 sm80⑤）。
     #[test]
     fn test_default_buffer_connection_is_positive_default() {
         let buf = BufferPolicy::default();
-        assert_eq!(buf.connection, DEFAULT_BUFFER_CONNECTION);
+        assert_eq!(buf.connection, default_buffer_connection_from_env(None));
         assert!(buf.connection > 0, "default must not be unlimited");
     }
 

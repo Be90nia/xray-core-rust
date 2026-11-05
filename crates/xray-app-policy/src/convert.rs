@@ -127,7 +127,11 @@ mod tests {
         assert_eq!(p.timeout.handshake, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT);
         assert_eq!(p.timeout.connection_idle, xray_features::policy::DEFAULT_CONN_IDLE_TIMEOUT);
         assert!(!p.stats.user_uplink);
-        assert_eq!(p.buffer.connection, xray_features::policy::DEFAULT_BUFFER_CONNECTION);
+        assert_eq!(
+            p.buffer.connection,
+            BufferPolicy::default().connection,
+            "空 proto 回落 BufferPolicy::default（arch 对齐 Go：aarch64/mips64=4KiB，其余=512KiB，9utc3③）"
+        );
     }
 
     #[test]
@@ -212,8 +216,9 @@ mod tests {
         assert!(!s.inbound_downlink);
         assert!(!s.outbound_uplink);
         assert!(!s.outbound_downlink);
-        // SystemPolicy proto 无 buffer 子消息 → 走 BufferPolicy::default()=512 KiB
-        assert_eq!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
+        // SystemPolicy proto 无 buffer 子消息 → 走 BufferPolicy::default()
+        //（arch 对齐 Go：aarch64/mips64=4KiB，其余=512KiB，9utc3③）
+        assert_eq!(s.buffer.connection, BufferPolicy::default().connection);
     }
 
     #[test]
