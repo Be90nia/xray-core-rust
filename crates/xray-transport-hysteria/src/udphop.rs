@@ -823,6 +823,19 @@ mod tests {
         const { assert!(PACKET_QUEUE_SIZE * 2 >= POOL_IDLE_CAP, "max 必须容纳 idle 额度") };
     }
 
+    /// 固定时刻时钟：`prune_idle_with_clock` 只用单调面（`now_instant`）。
+    /// udf #22 已弃用 `Instant` 版入口（bd ki2vo），测试改走时钟注入口径。
+    struct FixedClock(Instant);
+    impl skeleton::clock::Clock for FixedClock {
+        fn now_instant(&self) -> Instant {
+            self.0
+        }
+
+        fn now_system(&self) -> std::time::SystemTime {
+            std::time::SystemTime::UNIX_EPOCH
+        }
+    }
+
     /// 老化（Go 的 `sync.Pool` 靠 GC 回收，Rust 无 GC ⇒ 必须显式修剪）：idle 块
     /// 超老化窗后被释放，池不永久常驻。`prune_idle` 的 `now` 由宿主给 ⇒ 用「未来
     /// now」模拟窗过期（生产侧 = 托管任务每 `POOL_PRUNE_INTERVAL` 调一次）。
@@ -836,7 +849,11 @@ mod tests {
         assert_eq!(pool.inner.metrics().core.idle, 8, "前置：8 块在 idle");
 
         let aged_now = Instant::now() + POOL_IDLE_AGE + Duration::from_secs(1);
-        assert_eq!(pool.inner.prune_idle(POOL_IDLE_AGE, aged_now), 8, "超窗块必须全部释放");
+        assert_eq!(
+            pool.inner.prune_idle_with_clock(POOL_IDLE_AGE, &FixedClock(aged_now)),
+            8,
+            "超窗块必须全部释放"
+        );
         let m = pool.inner.metrics();
         assert_eq!(m.core.idle, 0, "老化后 idle 归零");
         assert_eq!(m.pruned, 8, "释放数必须留痕");

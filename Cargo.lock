@@ -6861,6 +6861,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "udf-skeleton",
  "udf-skeleton-infra",
  "webpki-roots 1.0.11",
  "xray-buf",

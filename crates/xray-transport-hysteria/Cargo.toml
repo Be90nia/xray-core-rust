@@ -42,6 +42,9 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# udf 契约层：测试用固定时刻 `Clock` 注入 `prune_idle_with_clock`（bd ki2vo：
+# udf #22 弃用 Instant 版；测试仍须可确定性推进，不能等真实 30s）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
 rcgen = "0.13"
 rustls = { workspace = true, default-features = false, features = ["ring"] }
 

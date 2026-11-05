@@ -318,6 +318,13 @@ impl<B: BufferPool> PoolManaged for ManagedBufferPool<B> {
 /// 存储归 xray-buf 分层池，其自身带惰性收缩 `maybe_sweep`），无需本口。
 /// 现役两池（hysteria udphop / splithttp pool_stream）宿主接线时以本口为
 /// 唯一托管入口（禁在协议 crate 自起裸 spawn——坑约束 5）。
+///
+/// **归属（ADR-1 派生件，bd ki2vo）**：udf issue #23「skeleton-infra 提供 FxScope
+/// 托管的池老化任务」已判 `NOT_PLANNED`——上游要求由消费方派生，理由是该任务
+/// 需要同时握 `ObjectPool` 与 `FxScope` 两件，属装配层关注点。故本口按派生纪律
+/// 留 `xray-frame`（组合包装 udf `ObjectPool::prune_idle_with_clock` +
+/// `FxScope::spawn_tracked`，不复制任何 udf 机制）。若上游日后落同一件，删本口、
+/// 消费点换 udf 版即可（调用面已按此形状设计：pool/clock/period/max_idle_age）。
 pub fn spawn_idle_pruner<T: Send + 'static>(
     scope: &FxScope,
     pool: Arc<ObjectPool<T>>,
