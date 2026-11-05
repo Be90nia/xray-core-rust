@@ -253,6 +253,16 @@ serena-cli undo                                                        # 改坏�
 ### tcping window 钉窗（88m0 战役）
 - **症状**：吞吐 = 64KB / RTT
 - **修复**：TCP SO_RCVBUF 4MB 缺省（已落地 bd 88m0 + 3e755458）
+- **⚠️ 2026-11-05 更正（bd r5j96）**：4MB 缺省**已撤销**——Linux `net.core.rmem_max` 缺省 208KB 会把它钳死且锁死内核 autotune（WSL netem 150ms 实测 ours 0.80 vs go 7.43 vs sing-box 7.43 MB/s，9 倍差）；现缺省 = **不设置**（`TCP_RCVBUF_DEFAULT = 0`，两平台交 OS autotune）。修复后 ours 7.09-7.67 MB/s 追平 go/sing-box（TTFB/出生窗/复用行为三方同档，见 `reports/audit-2026-11-05/ttfb-birth-window.md`）⇒ **窗不是当前杠杆，若再现窗/RTT 塌轮查桥泵/消费节律**（bd cna1g / myppb），不先动 sockopt。
+- **显式值仍可用**（Go 无此字段，本仓 opt-in 运维工具，bd o93t 终裁保留）：≤4 MiB 直通 / 4-64 MiB 需 `XRAY_ALLOW_LARGE_RCVBUF=1` / >64 MiB 恒拒（bd u91se），运维指南 `docs/guide-highrtt-sockopt.md` §3.5。
+
+### 性能改动的 A/B 门（用户裁决 2026-11-05，强制）
+- **规则**：任何性能/内存类改动**必须**带「改动前基线 + 改动后 A/B 对比」——**测试全绿不算数**，不允许「发现回退了再说」。
+- **基线**：取自**改动前**的同一台机器/同一拓扑/同一二进制族（**禁用历史报告旧数字**当基线）。
+- **A/B 交错多轮**：`python tools/loopback_alloc_bench.py --ab A --ab-runs N --ab-tol`（逐轮反相成对 + 比值中位）；**离散度 >15% 判 CONTAMINATED（exit 3）重跑**、**单轮判 INDETERMINATE（exit 2）**（同二进制自测已证单轮会给出符号相反的 -6.8%/+11.5%）。
+- **判定口径**：TTFB median + 每连接构造数 + 构造成本 + 吞吐（**不用分配次数当主指标**）；内存类另给常驻/账面字节。
+- **自证不回归**：任一指标劣化超门限（建议 吞吐 -5% / TTFB +5% / 账面 +10%）⇒ 该改动**自证回退**，不保留（PM 复核后再定）。
+- **无法 A/B 时**：写「未验证 + 原因 + 风险」，**禁推理代数字**。
 
 ### h2 窗钉（enc8x 战役）
 - **症状**：hyper 默认 send_buf 400KB → min(4MB, 4MB)/0.45s ≈ 8.8 Mbps
