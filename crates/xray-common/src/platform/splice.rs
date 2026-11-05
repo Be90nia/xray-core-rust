@@ -13,11 +13,8 @@
 
 use super::env::use_splice;
 
-/// Go `session.CanSpliceCopy`（session.go:75-77）：1=可 splice。
+/// Go `session.CanSpliceCopy`：1=可 splice。
 pub const CAN_SPLICE_COPY_YES: i32 = 1;
-/// Go `session.CanSpliceCopy`：2=处理后可行（vless 用；本实现不等待翻转，
-/// 直接回退既有泵，见 [`signals_allow_splice`] 注释）。
-pub const CAN_SPLICE_COPY_AFTER_PROCESS: i32 = 2;
 /// Go `session.CanSpliceCopy`：3=不可。
 pub const CAN_SPLICE_COPY_NEVER: i32 = 3;
 

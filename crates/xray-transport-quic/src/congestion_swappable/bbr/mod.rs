@@ -3,9 +3,6 @@
 //! 模块构成：
 //! - [`bandwidth`]：`Bandwidth` 类型 + 单位转换
 //! - [`clock`]：`Clock` trait + `DefaultClock`
-//! - [`windowed_filter`]：`WindowedFilter` 三槽滑窗（Nichols 算法）
-//! - [`ringbuffer`]：`RingBuffer` 环形队列
-//! - [`packet_queue`]：`PacketNumberIndexedQueue` 按包序号索引的队列
 //! - [`bandwidth_sampler`]：`BandwidthSampler` 带宽采样器
 //! - [`bbr_sender`]：`BbrSender` BBR 主算法
 
@@ -13,9 +10,6 @@ pub mod bandwidth;
 pub mod bandwidth_sampler;
 pub mod bbr_sender;
 pub mod clock;
-pub mod packet_queue;
-pub mod ringbuffer;
-pub mod windowed_filter;
 
 pub use bandwidth::Bandwidth;
 pub use bbr_sender::BbrSender;

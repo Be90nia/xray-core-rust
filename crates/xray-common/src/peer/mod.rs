@@ -12,16 +12,6 @@ pub trait Latency: Send + Sync {
     fn value(&self) -> u64;
 }
 
-/// 具有连接延迟和握手延迟的对端。
-///
-/// 对应 Go `peer.HasLatency` 接口。
-pub trait HasLatency: Send + Sync {
-    /// 连接延迟。
-    fn connection_latency(&self) -> &dyn Latency;
-    /// 握手延迟。
-    fn handshake_latency(&self) -> &dyn Latency;
-}
-
 /// 加权移动平均延迟。
 ///
 /// 对应 Go `peer.AverageLatency`。

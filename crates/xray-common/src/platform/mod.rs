@@ -29,9 +29,6 @@ static ASSET_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.l
 #[cfg(test)]
 pub(crate) static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Go `platform.CertLocation`。
-static CERT_LOCATION: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.location.cert"));
-
 /// Go `getExecutableDir`：可执行文件所在目录，取不到时空串。
 fn executable_dir() -> PathBuf {
     std::env::current_exe()
@@ -58,12 +55,6 @@ pub fn get_confdir_path() -> Option<PathBuf> {
 /// 未设置时回退可执行文件同目录。
 pub fn get_resource_path() -> PathBuf {
     ASSET_LOCATION.get_value().map_or_else(executable_dir, PathBuf::from)
-}
-
-/// 证书目录（Go `GetCertLocation` 的目录部分）：`xray.location.cert`
-/// 未设置时回退可执行文件同目录。
-pub fn get_cert_path() -> PathBuf {
-    CERT_LOCATION.get_value().map_or_else(executable_dir, PathBuf::from)
 }
 
 /// 资源文件完整路径（Go `GetAssetLocation(file)`，windows.go:13）：资源目录 + `file`。

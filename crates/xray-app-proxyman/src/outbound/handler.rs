@@ -19,7 +19,6 @@ use std::{io, net::IpAddr, sync::Arc};
 use async_trait::async_trait;
 use ipnet::IpNet;
 use rand::Rng;
-use tokio::net::UdpSocket;
 use xray_common::{net::destination::Destination, session::Session};
 use xray_proto::xray::app::proxyman::{MultiplexingConfig, SenderConfig};
 use xray_transport::{
@@ -40,12 +39,6 @@ use crate::{
 };
 
 // ── UoT 常量 ──────────────────────────────────────────────────
-
-/// UoT v1 魔术域名（对应 Go `uot.MagicAddress`）。
-const UOT_MAGIC_ADDRESS: &str = "UoT";
-
-/// UoT Legacy 魔术域名（对应 Go `uot.LegacyMagicAddress`）。
-const UOT_LEGACY_MAGIC_ADDRESS: &str = "UoTL";
 
 /// UoT 版本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,52 +265,9 @@ impl OutboundHandlerEntry {
         self.stream_settings = settings;
     }
 
-    /// 设置 socket 选项
-    pub fn set_socket_options(&mut self, opts: SocketOptions) {
-        self.socket_options = opts;
-    }
-
     /// 设置代理链目标 tag
     pub fn set_proxy_chain_tag(&mut self, tag: Option<String>) {
         self.proxy_chain_tag = tag;
-    }
-
-    /// 获取 UoT (UDP over TCP) 连接。
-    ///
-    /// 对应 Go `Handler.getUoTConnection(ctx, dest)`。
-    /// 当目标地址是 UoT 魔术域名时，创建 UDP socket 并包装为 UoT 连接。
-    ///
-    /// # Errors
-    /// - [`ProxymanError::NilDestination`]：目标地址为空
-    /// - [`ProxymanError::NotUoTDestination`]：目标地址不是 UoT 魔术域名
-    /// - [`ProxymanError::ListenSocketFailed`]：UDP socket 绑定失败
-    pub async fn get_uo_t_connection(
-        &self,
-        dest_domain: Option<&str>,
-    ) -> Result<(UdpSocket, UotVersion), ProxymanError> {
-        let domain = dest_domain.ok_or(ProxymanError::NilDestination)?;
-        if domain.is_empty() {
-            return Err(ProxymanError::NilDestination);
-        }
-
-        // 判断 UoT 版本
-        let version = if domain == UOT_MAGIC_ADDRESS {
-            UotVersion::Current
-        } else if domain == UOT_LEGACY_MAGIC_ADDRESS {
-            UotVersion::Legacy
-        } else {
-            return Err(ProxymanError::NotUoTDestination);
-        };
-
-        // 绑定 UDP socket（对应 Go internet.ListenSystemPacket）
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| ProxymanError::ListenSocketFailed(e.to_string()))?;
-
-        // ponytail: Go 用 uot.NewServerConn(packetConn, uotVersion) 包装。
-        // Rust 端无 sing uot crate，直接返回 (socket, version)，由上层桥接。
-        // 升级路径：实现 UoT ServerConn 包装层。
-        Ok((socket, version))
     }
 }
 

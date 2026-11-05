@@ -319,12 +319,6 @@ pub struct UserMatcherCondition {
     patterns: Vec<UserPattern>,
 }
 
-/// 旧 API 别名：保留历史子串匹配语义以兼容未迁移调用方。
-///
-/// ⚠ 语义与 Go `UserMatcher` 不一致。仅用于兼容历史配置，正式路由请用 `UserMatcherCondition`。
-#[deprecated(note = "substring semantics differ from Go UserMatcher; use UserMatcherCondition")]
-pub type UserMatcherLenient = UserMatcherCondition;
-
 #[derive(Debug)]
 enum UserPattern {
     /// 字面严格等值（`u == s`，对应 Go `u == user`）。
@@ -1131,13 +1125,6 @@ mod tests {
         let m = UserMatcherCondition::new(vec!["x".into()]);
         let empty = RoutingData::new();
         assert!(!m.apply(&empty));
-    }
-
-    #[test]
-    fn test_user_matcher_lenient_alias_still_compiles() {
-        // 历史 API 别名仍可用——编译期兜底（不验证 substring 行为，因为该类型已弃用）。
-        #[allow(deprecated)] // 历史 API 别名编译期兜底用例，刻意触达弃用项
-        let _m: UserMatcherLenient = UserMatcherCondition::new(vec!["x@example.com".into()]);
     }
 
     #[test]

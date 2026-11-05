@@ -5,7 +5,6 @@
 pub mod account;
 pub mod address_parser;
 pub mod http;
-pub mod server_spec;
 pub mod time;
 pub mod user;
 
@@ -375,13 +374,6 @@ impl ResponseHeader {
     #[must_use]
     pub fn with_option(mut self, option: Bitmask) -> Self {
         self.option = option;
-        self
-    }
-
-    /// 设置响应命令，返回新的 ResponseHeader。
-    #[must_use]
-    pub fn with_response_command(mut self, cmd: ResponseCommand) -> Self {
-        self.response_command = cmd;
         self
     }
 }

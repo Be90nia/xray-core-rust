@@ -1143,8 +1143,6 @@ mod udp_assoc_tests {
         buf.put_u8(VERSION);
         buf.put_u8(type_code::PACKET);
         pkt.write_payload(&mut buf).expect("encode packet");
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::AsyncWriteExt as _;
         send.write_all(&buf.freeze()).await.expect("write bi packet");
         let _ = send.finish();
         let r = tokio::time::timeout(

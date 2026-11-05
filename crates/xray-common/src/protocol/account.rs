@@ -3,11 +3,9 @@
 //! 对应 Go 版本 `common/protocol/account.go`。
 //! Go 消费方：vless/vmess/trojan/shadowsocks/shadowsocks_2022/socks/http/hysteria
 //! 各自的 Account/MemoryAccount 实现本 trait（见 `proxy/*/config.go` 的
-//! `Equals`/`AsAccount` 方法）。
+//! `Equals` 方法）。
 
-use std::sync::Arc;
-
-use crate::{errors::Error, serial::TypedMessage};
+use crate::serial::TypedMessage;
 
 /// 用户身份，用于认证。
 ///
@@ -37,20 +35,11 @@ pub trait Account: std::fmt::Debug + Send + Sync {
     /// `equals` 实现需要经由本方法取 `dyn Any` 后下转比较。
     fn as_any(&self) -> &dyn std::any::Any;
 }
-/// 可转换为 [`Account`] 的对象。
-///
-/// 对应 Go 版本的 `AsAccount` 接口。Go 中 proto 生成的原始 Account
-/// （如 `vless.Account`）实现它，转换为运行时 MemoryAccount
-/// （如 `vless.MemoryAccount`，含解析后的 UUID/cmd_key）。
-pub trait AsAccount {
-    /// 转换为运行时账户。
-    ///
-    /// Go 语义：解析失败（如 UUID 非法）返回 error。
-    fn as_account(&self) -> Result<Arc<dyn Account>, Error>;
-}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     /// 测试用账户：按 (kind, id) 判等，镜像 Go proxy Account 的典型实现。
@@ -77,22 +66,6 @@ mod tests {
 
         fn as_any(&self) -> &dyn std::any::Any {
             self
-        }
-    }
-
-    /// proto 原始账户，实现 AsAccount，镜像 Go vless/trojan 的转换模式。
-    #[derive(Debug)]
-    struct ProtoAccount {
-        raw_id: u32,
-    }
-
-    impl AsAccount for ProtoAccount {
-        fn as_account(&self) -> Result<Arc<dyn Account>, Error> {
-            if self.raw_id == 0 {
-                // 镜像 Go：vless.Account.AsAccount 对非法 ID 返回 error
-                return Err(Error::new("failed to parse account"));
-            }
-            Ok(Arc::new(TestAccount { kind: "test", id: self.raw_id }))
         }
     }
 
@@ -143,22 +116,6 @@ mod tests {
         let msg = a.to_proto();
         assert_eq!(msg.type_url(), "type.googleapis.com/test.test");
         assert_eq!(msg.value(), 7u32.to_be_bytes());
-    }
-
-    #[test]
-    fn test_as_account_success() {
-        let proto = ProtoAccount { raw_id: 5 };
-        let account = proto.as_account().expect("valid account");
-        let same = TestAccount { kind: "test", id: 5 };
-        assert!(account.equals(&same));
-    }
-
-    #[test]
-    fn test_as_account_parse_error() {
-        // 镜像 Go vless.Account.AsAccount 的 UUID 解析失败路径
-        let proto = ProtoAccount { raw_id: 0 };
-        let err = proto.as_account().expect_err("zero id must fail");
-        assert!(err.to_string().contains("failed to parse account"));
     }
 
     #[test]

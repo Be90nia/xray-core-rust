@@ -207,12 +207,6 @@ impl ActivityTimer {
     pub fn timeout(&self) -> std::time::Duration {
         *self.timeout.lock()
     }
-
-    /// 兼容别名：保留旧 `done()` 调用方（`xray-app-proxyman` worker 等）。
-    #[deprecated(note = "use done_signal for clarity; kept for backward compat")]
-    pub fn done(&self) -> Done {
-        self.done.clone()
-    }
 }
 
 // ========== PubSub (Go: signal/pubsub) ==========

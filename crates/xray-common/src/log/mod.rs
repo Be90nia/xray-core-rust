@@ -8,7 +8,6 @@
 //! 未注册通道 emit 首次告警一行后静默，写失败计数可观测）。便捷入口（[`debug`]/[`info`]/
 //! [`warning`]/[`error`]）只走 general 通道一路，不再直发 tracing。
 //! Go 级别别名（[`Severity::as_str`]）与消息语义留仓不动。
-//! 带通道缓冲的通用 Logger 见 [`general_logger`]。
 
 use std::{fmt, sync::Arc};
 
@@ -48,7 +47,7 @@ impl Severity {
         match self {
             Self::Debug => log::Level::Debug,
             Self::Info => log::Level::Info,
-            // log 门面无 "warning"，Go 别名文案由 sink 侧还原（见 general_logger）。
+            // log 门面无 "warning"，Go 别名文案由 sink 侧还原。
             Self::Warning => log::Level::Warn,
             Self::Error => log::Level::Error,
         }
@@ -194,9 +193,6 @@ pub fn warning(content: impl Into<String>) {
 pub fn error(content: impl Into<String>) {
     log(Message::new(Severity::Error, content));
 }
-
-/// 带通道缓冲的通用 Logger，对应 Go `common/log/logger.go::generalLogger`。
-pub mod general_logger;
 
 #[cfg(test)]
 mod tests {

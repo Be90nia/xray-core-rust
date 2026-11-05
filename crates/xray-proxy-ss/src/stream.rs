@@ -918,21 +918,6 @@ impl<C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> SSStream<C> {
         Ok(ChunkOut::Message(payload_buf.freeze()))
     }
 
-    /// 读一个 raw chunk（直接 open，无 size prefix），指定 wire 长度。
-    ///
-    /// 用于 SS-2022 响应的 header chunk（fixed + variable），
-    /// 对应 Go `shadowaead.Reader.ReadWithLength`。
-    pub async fn read_raw_chunk(&mut self, wire_len: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; wire_len];
-        self.inner.read_exact(&mut buf).await?;
-        increment_nonce_bytes(&mut self.read_nonce);
-        let plaintext = self
-            .read_aead
-            .open(&self.read_nonce, &[], &buf)
-            .map_err(|e| SsError::AeadOpen(e.to_string()))?;
-        Ok(plaintext)
-    }
-
     /// 获取底层连接的不可变引用。
     #[must_use]
     pub fn get_ref(&self) -> &C {

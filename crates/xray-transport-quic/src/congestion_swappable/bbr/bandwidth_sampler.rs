@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::{
     super::types::{AckedPacketInfo, ByteCount, LostPacketInfo, MonoTime, PacketNumber},
-    bandwidth::{Bandwidth, INF_BANDWIDTH},
+    bandwidth::Bandwidth,
 };
 
 /// 发送时刻状态（对应 Go `sendTimeState`）。
@@ -40,32 +40,6 @@ impl SendTimeState {
             bytes_in_flight,
         }
     }
-}
-
-/// 一次带宽采样结果（对应 Go `bandwidthSample`）。
-#[derive(Copy, Clone, Debug, Default)]
-pub struct BandwidthSample {
-    pub bandwidth: Bandwidth,
-    pub rtt: Duration,
-    pub send_rate: Bandwidth,
-    pub state_at_send: SendTimeState,
-}
-
-impl BandwidthSample {
-    /// 默认值（send_rate = INF，对应 Go `newBandwidthSample`）。
-    #[must_use]
-    pub fn new() -> Self {
-        Self { send_rate: INF_BANDWIDTH, ..Self::default() }
-    }
-}
-
-/// Extra ACK 事件（对应 Go `extraAckedEvent`）。
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct ExtraAckedEvent {
-    pub extra_acked: ByteCount,
-    pub bytes_acked: ByteCount,
-    pub time_delta: Duration,
-    pub round: u64,
 }
 
 /// 拥塞事件整体采样结果（对应 Go `BandwidthSampler.OnCongestionEvent` 返回）。
@@ -227,7 +201,7 @@ impl BandwidthSampler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::bandwidth::INF_BANDWIDTH, *};
 
     #[test]
     fn new_sampler_initial_state() {

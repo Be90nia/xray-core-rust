@@ -310,19 +310,6 @@ impl BurstObserver {
         g.retain(|tag, _| keep.contains(tag));
     }
 
-    /// do_check 接受 duration 参数版本（兼容 Go `doCheck(ctx, tags, duration, rounds)`）。
-    ///
-    /// 当前实装未使用 duration 做随机延迟分布——保留为兼容性方法。
-    #[doc(hidden)]
-    pub fn do_check_with_duration(
-        &self,
-        tags: &[String],
-        executor: &dyn ProbeExecutor,
-        _duration: Duration,
-    ) {
-        self.do_check(tags, executor);
-    }
-
     // ===========================================================================
     // 观测快照：对应 Go `Observer.createResult` / `Observer.GetObservation`
     // ===========================================================================

@@ -127,11 +127,6 @@ impl ID {
     pub fn as_uuid(&self) -> &UUID {
         &self.0
     }
-
-    /// 消费自身，返回内部 UUID。
-    pub fn into_uuid(self) -> UUID {
-        self.0
-    }
 }
 
 impl Default for ID {
@@ -280,12 +275,6 @@ impl Inbound {
         self
     }
 
-    /// 设置网关地址（builder 模式）。
-    pub fn with_gateway(mut self, dest: Destination) -> Self {
-        self.gateway = Some(dest);
-        self
-    }
-
     /// 设置 VLESS 路由字节（builder 模式）。
     pub fn with_vless_route(mut self, port: Port) -> Self {
         self.vless_route = Some(port);
@@ -403,21 +392,9 @@ impl Outbound {
         self
     }
 
-    /// 设置网关地址（builder 模式）。
-    pub fn with_gateway(mut self, gateway: Destination) -> Self {
-        self.gateway = Some(gateway);
-        self
-    }
-
     /// 设置最终目标地址（builder 模式）。
     pub fn with_target(mut self, target: Destination) -> Self {
         self.target = Some(target);
-        self
-    }
-
-    /// 设置原始目标地址（builder 模式）。
-    pub fn with_original_target(mut self, target: Destination) -> Self {
-        self.original_target = Some(target);
         self
     }
 

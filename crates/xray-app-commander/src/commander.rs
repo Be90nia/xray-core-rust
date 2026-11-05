@@ -1069,10 +1069,7 @@ mod tests {
     async fn outbound_mode_serves_grpc_via_dispatch() {
         use std::sync::Arc;
 
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dispatcher::{
-            DispatchHandler as _, OutboundHandlerManager as _, default::SimpleOhm,
-        };
+        use xray_app_dispatcher::{OutboundHandlerManager as _, default::SimpleOhm};
         use xray_common::net::{
             address::Address, destination::Destination, network::Network, port::Port,
         };
@@ -1151,8 +1148,6 @@ mod tests {
     async fn dispatch_handler_delivers_conn_to_listener() {
         use std::sync::Arc;
 
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dispatcher::DispatchHandler as _;
         use xray_common::net::{
             address::Address, destination::Destination, network::Network, port::Port,
         };

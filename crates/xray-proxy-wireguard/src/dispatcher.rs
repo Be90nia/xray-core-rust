@@ -289,8 +289,6 @@ pub(crate) async fn pump_client_to_udp(
     default_dest: &Destination,
     acc: &mut Vec<u8>,
 ) {
-    #[allow(unused_imports)] // 存量清零批次
-    use std::io::Read as _;
     if bytes.is_empty() {
         return;
     }
@@ -1293,8 +1291,6 @@ mod tests {
         // 客户端写一帧 XUDP（target 8.8.4.4:53，payload "dns-query"）
         let mut frame = Vec::new();
         {
-            #[allow(unused_imports)] // 存量清零批次
-            use std::io::Write;
             let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, udp_dest(53), [0x42; 8]);
             pw.write_packet(b"dns-query").expect("write frame");
         }

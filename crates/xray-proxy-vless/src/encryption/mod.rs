@@ -2045,8 +2045,7 @@ mod tests {
         let first_flight = build_zero_rtt_first_flight(&client_pkeys[0], &cached_ticket);
 
         let (mut fake_c, fake_s) = tokio::io::duplex(64 * 1024);
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
         fake_c.write_all(&first_flight).await.unwrap();
         let err = match fresh_server.handshake(fake_s).await {
             Err(e) => e,
@@ -2060,8 +2059,6 @@ mod tests {
 
         // 发起方读到 1279..2279B 噪声（非 TLS header，长度匹配 1-RTT server hello），
         // 对应 Go client 侧触发重新握手语义。
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::AsyncReadExt as _;
         let mut noise = Vec::new();
         fake_c.read_to_end(&mut noise).await.unwrap();
         assert!(

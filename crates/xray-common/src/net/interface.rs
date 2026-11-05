@@ -82,18 +82,12 @@ impl InterfaceAddr {
 }
 
 /// 接口标志，位定义对齐 Go `net.Flags`。
-///
-/// 数据源限制：`BROADCAST` / `MULTICAST` 无来源，恒不置位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct InterfaceFlags(u16);
 
 impl InterfaceFlags {
-    /// 支持广播（对应 Go `FlagBroadcast`；数据源不提供，恒不置位）。
-    pub const BROADCAST: Self = Self(1 << 1);
     /// 回环接口（对应 Go `FlagLoopback`，来自回环地址判定）。
     pub const LOOPBACK: Self = Self(1 << 2);
-    /// 支持组播（对应 Go `FlagMulticast`；数据源不提供，恒不置位）。
-    pub const MULTICAST: Self = Self(1 << 4);
     /// 点对点接口（对应 Go `FlagPointToPoint`）。
     pub const POINT_TO_POINT: Self = Self(1 << 3);
     /// 接口在运行（对应 Go `FlagUp`，来自 oper_status=Up）。
