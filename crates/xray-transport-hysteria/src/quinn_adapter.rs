@@ -1484,8 +1484,6 @@ mod tests {
         drop(h3);
         #[allow(unused_mut, unused_variables)] // 存量清零批次
         let (mut send, mut recv) = client.inner().open_bi().await.unwrap();
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::AsyncWriteExt;
         send.write_all(b"hello").await.unwrap();
         send.finish().unwrap();
         let (_s, mut r) =
@@ -1493,8 +1491,6 @@ mod tests {
                 .await
                 .expect("wrapped h3 server drop must NOT close the QUIC conn")
                 .unwrap();
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::AsyncReadExt;
         let mut buf = vec![0u8; 5];
         r.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"hello");
@@ -1600,9 +1596,6 @@ mod tests {
     #[tokio::test]
     async fn listener_factory_full_auth_and_stream_roundtrip() {
         use std::sync::Arc;
-
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::sync::Notify;
 
         use crate::{
             dialer::{DialDestination, HysteriaTransport},
