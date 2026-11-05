@@ -49,20 +49,6 @@ use crate::{
 /// `HandshakeTimeout: time.Second * 8`）。
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// bd w5jhf：用户显式 `receiveBufferSize`（JSON `sockopt.receiveBufferSize`）
-/// 照旧下发——opt-in「锁窗 + 大缓冲」语义；**缺省 0 = 不设置**（r5j96 缺省
-/// 语义不变，交 OS autotune）。失败即拨号失败（对齐 bd 88m0 口径）。
-/// 返回 `sockopt.receive_buffer_size` 原值供注入点观测（>0 = 已调 setsockopt）。
-fn apply_explicit_receive_buffer_size(
-    tcp: &tokio::net::TcpStream,
-    sockopt: &xray_transport::sockopt::SocketOptions,
-) -> std::io::Result<i32> {
-    if sockopt.receive_buffer_size > 0 {
-        socket2::SockRef::from(tcp).set_recv_buffer_size(sockopt.receive_buffer_size as usize)?;
-    }
-    Ok(sockopt.receive_buffer_size)
-}
-
 /// 拨号参数（与 Go `dialWebSocket` 入参对齐）。
 pub struct DialOptions<'a> {
     /// WS 配置（host/path/header/heartbeat）。
@@ -99,6 +85,10 @@ pub struct DialOptions<'a> {
 pub async fn dial(
     opts: DialOptions<'_>,
 ) -> Result<WsConnection<MaybeTlsStream<Box<dyn xray_transport::connection::Connection>>>> {
+    // bd w5jhf：显式 `receiveBufferSize` 预算闸**先于拨号**判定（超限 ⇒ 终态失败，
+    // 不进重试/不建 socket）——统一口在 sockopt 机制面（三 transport 共用）。
+    xray_transport::sockopt::check_explicit_receive_buffer_size(opts.sockopt)
+        .map_err(WsError::Io)?;
     // TLS 自管时 URI 也必须用 ws://：tungstenite 的 uri_mode 按 scheme 判断，
     // wss + Connector::Plain 会报 "TLS support not compiled in"。
     let uri = build_request_uri(opts.config, opts.destination, false);
@@ -125,7 +115,7 @@ pub async fn dial(
     tcp.set_nodelay(true).ok();
     // bd 88m0/0kqj 客户端侧：缺省**不设置**下行 SO_RCVBUF（交 OS autotune）。
     xray_transport::sockopt::apply_client_dial_rcvbuf(&tcp)?;
-    apply_explicit_receive_buffer_size(&tcp, opts.sockopt)?;
+    xray_transport::sockopt::apply_explicit_receive_buffer_size(&tcp, opts.sockopt)?;
     // Bug-B（bd cqyj）：ws 拨号此前绕过 sockopt（裸 connect 无 keepalive）——
     // NAT/CDN 静默切断后成半开死链。45s 对齐 SocketOptions::default。
     {
@@ -1028,44 +1018,48 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
-    /// bd w5jhf：显式 `receiveBufferSize` 注入点观测（真实 socket 同进程对照）。
-    /// 显式 1MiB 连接的 SO_RCVBUF 回读必须高于缺省连接：Windows set/get 原样
-    /// （1MiB > 内核缺省 ~64KiB）；Linux 即使被 `net.core.rmem_max` 钳制
-    /// （stock 208KiB），min(1MiB, 208KiB)×2 = 416KiB 仍高于 autotune 初始回读
-    /// 262144B。缺省 sockopt（0）不得触碰 socket（r5j96：不设，交 OS autotune）。
+    /// bd w5jhf 预算闸（统一口在 sockopt 机制面）：显式 `receiveBufferSize`
+    /// ≤ 1 MiB 生效；**超限 ⇒ 拨号失败且错误点名上限值**（fail-visible，禁静默
+    /// 钳制）。超限判定发生在拨号**之前**（dial 入口），故无需对端服务。
     #[tokio::test]
-    async fn explicit_receive_buffer_size_reaches_dial_socket() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn explicit_receive_buffer_budget_gate_blocks_dial() {
+        let d = dest("127.0.0.1", 1);
+        let cfg = Config::default();
 
-        // 缺省形态：apply_client_dial_rcvbuf + 显式 fn（0）都不触碰 socket。
-        let base_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        xray_transport::sockopt::apply_client_dial_rcvbuf(&base_sock).unwrap();
-        let base = socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap();
-        let applied_none = apply_explicit_receive_buffer_size(
-            &base_sock,
-            &xray_transport::sockopt::SocketOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(applied_none, 0, "缺省 sockopt 不得触发 setsockopt");
-        assert_eq!(
-            socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap(),
-            base,
-            "缺省路径不得改变 SO_RCVBUF（r5j96：缺省不设）"
-        );
-
-        // 显式形态：1MiB 下发后回读必须高于缺省对照。
-        let explicit_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let opts = xray_transport::sockopt::SocketOptions {
-            receive_buffer_size: 1024 * 1024,
+        // 显式 4 MiB（免确认档）：判定通过（真实生效由机制面契约测试覆盖）。
+        let ok_opts = xray_transport::sockopt::SocketOptions {
+            receive_buffer_size: xray_transport::sockopt::SO_RCVBUF_FREE_TIER_MAX as i32,
             ..Default::default()
         };
-        let applied = apply_explicit_receive_buffer_size(&explicit_sock, &opts).unwrap();
-        assert_eq!(applied, 1024 * 1024, "返回值 = 配置值（下发已发生的注入点观测）");
-        let explicit = socket2::SockRef::from(&explicit_sock).recv_buffer_size().unwrap();
+        xray_transport::sockopt::check_explicit_receive_buffer_size(&ok_opts)
+            .expect("4 MiB = 免确认档，判定须通过");
+
+        // 显式大档（16 MiB，未确认）：dial 立即失败（不建 socket），错误点名确认开关。
+        let over_opts = xray_transport::sockopt::SocketOptions {
+            receive_buffer_size: 16 * 1024 * 1024,
+            ..Default::default()
+        };
+        let err = match dial(DialOptions {
+            config: &cfg,
+            destination: &d,
+            early_data: None,
+            tls_config: None,
+            tls_server_name: None,
+            fingerprint: None,
+            security_json: None,
+            tcpmask: None,
+            sockopt: &over_opts,
+        })
+        .await
+        {
+            Ok(_) => panic!("未确认的大档 receiveBufferSize 必须让拨号失败（不得静默钳制）"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
         assert!(
-            explicit > base,
-            "显式 receiveBufferSize 必须抬高 SO_RCVBUF 回读：explicit={explicit} 须高于缺省 {base}"
+            msg.contains(xray_transport::sockopt::ALLOW_LARGE_RCVBUF_ENV),
+            "错误须点名确认开关 {}：{msg}",
+            xray_transport::sockopt::ALLOW_LARGE_RCVBUF_ENV
         );
     }
 }

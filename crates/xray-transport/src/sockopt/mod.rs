@@ -445,6 +445,129 @@ pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<
     Ok(())
 }
 
+/// 显式接收缓冲（SO_RCVBUF）**免确认档上限**（字节）：≤ 此值直接生效。
+///
+/// 依据 `docs/guide-highrtt-sockopt.md` §9/§11（bd adch 2026-09-17，随发行物
+/// 分发）：RTT>50ms 的长肥管**必须**显式 `sockopt.receiveBufferSize`（指南推荐
+/// 4MB），否则 Linux tcp_rmem 128KB ⇒ 吞吐锁死窗/RTT（322ms 实测塌 1.5-2.0Mbps）。
+/// 容量公式 `receiveBufferSize ≥ BDP = 带宽 × RTT / 8`（4MB@322ms 只支撑 ~99Mbps，
+/// 1Gbps×322ms 需 40MB）⇒ 4MB 是「指南推荐档」，无需任何额外动作。
+pub const SO_RCVBUF_FREE_TIER_MAX: usize = 4 * 1024 * 1024;
+
+/// 显式接收缓冲**硬上限**（字节）：> 此值恒拒（防手滑）。
+///
+/// 依据指南 §96-98：4MB 设定 ⇒ 内核 **2× 记账**（8MB/连接）；账面 =
+/// 并发 × 2 × 值。大并发要降档到 1-2MB ⇒ 64 MiB 是「单机单连接」的防手滑红线。
+pub const SO_RCVBUF_HARD_MAX: usize = 64 * 1024 * 1024;
+
+/// 大档显式接收缓冲的**确认开关名**（env，进程级语义；**单一真值源**——全仓只
+/// 此一处定义与读取，见 [`large_rcvbuf_confirmed`]）。
+///
+/// 语义：`XRAY_ALLOW_LARGE_RCVBUF=1` ⇒ 允许 (4 MiB, 64 MiB] 档。缺省 = 未确认。
+/// 依据指南 §96-98 的 2× 记账与并发账面公式 `并发 × 2 × 值`——大档是**显式运维
+/// 决策**，必须由运维自己确认，程序不替用户赌内存。
+pub const ALLOW_LARGE_RCVBUF_ENV: &str = "XRAY_ALLOW_LARGE_RCVBUF";
+
+/// 显式接收缓冲（SO_RCVBUF）**三档裁决**（PM 终裁 2026-11-05，替代单一 4 MiB 硬拒：
+/// 硬拒会把指南 §11 的 BDP 公式掐死 = 往回优化）。
+///
+/// 1. **≤ [`SO_RCVBUF_FREE_TIER_MAX`]（4 MiB）**：直接生效（指南推荐档）。
+/// 2. **4 MiB < value ≤ [`SO_RCVBUF_HARD_MAX`]（64 MiB）**：BDP 大带宽档，需**显式
+///    确认**（[`ALLOW_LARGE_RCVBUF_ENV`]=1）；未确认 ⇒ **fail-visible 拒**（文案点名 值、开关名、2×
+///    内核记账与 `并发 × 2 × 值` 的并发账面后果）。**禁静默钳制**。
+/// 3. **> 64 MiB**：恒拒（防手滑）。
+///
+/// 判定用**用户设定值**（不用回读值）：Linux 下 setsockopt 受 `net.core.rmem_max`
+/// 静默钳制（回读远小于设定值），但回读小不代表没风险——用户填 16 MiB 就是 16 MiB
+/// 的语义，且上限判定必须**早于** setsockopt（否则超限值先被内核钳住，回读看着
+/// 「没超」）。缺省 0 ⇒ 完全不碰 socket（r5j96，交 OS autotune）。
+///
+/// 旋钮性质（bd o93t）：Go `SocketConfig` **无此字段**，本仓刻意加的 **opt-in 运维
+/// 扩展**（o93t 终裁明文「opt-in 字段保留为高 BDP 运维工具」，验收项「默认 0 零行为
+/// 变化」）；bd 88m0 曾把**缺省**设成 4 MiB（治 Rust 特有的 64 KB 出生接收窗钉死），
+/// bd r5j96 已把**缺省**回归 0（交 OS autotune，WSL netem 实测追平 go/sing-box）。
+/// 本裁决只约束**显式值**的分档，不动缺省。
+pub const MAX_EXPLICIT_RECEIVE_BUFFER_SIZE: usize = SO_RCVBUF_FREE_TIER_MAX;
+
+/// 显式 `receiveBufferSize` 预算判定（纯判定，不需 socket；`confirmed` 可注入
+/// 供测试做「带确认 ⇒ 生效」观测，避免测试改进程 env）。
+///
+/// 三档（PM 终裁，详见 [`MAX_EXPLICIT_RECEIVE_BUFFER_SIZE`]）：
+/// - `≤ 4 MiB` ⇒ Ok（免确认档）；
+/// - `4 MiB < v ≤ 64 MiB` ⇒ 需确认（`confirmed`）⇒ 否则 Err（文案点名值、开关名、 2× 内核记账与
+///   `并发 × 2 × 值` 的并发账面后果）；
+/// - `> 64 MiB` ⇒ 恒拒。
+///
+/// **以用户设定的值判定，不用回读值**：Linux 下 setsockopt 受 `net.core.rmem_max`
+/// 静默钳制（回读远小于设定值），但回读小不代表没风险——用户填 16 MiB 就是 16 MiB
+/// 的语义，且上限判定必须**早于** setsockopt（否则超限值先被内核钳住，回读看着
+/// 「没超」）。错误文案点名上限值与配置来源（fail-visible）：**禁静默钳到上限**
+/// ——静默钳会骗运维「配了 16 MiB 实际 4 MiB」。
+fn check_explicit_receive_buffer_size_with(
+    opts: &SocketOptions,
+    confirmed: bool,
+) -> std::io::Result<()> {
+    let requested = opts.receive_buffer_size;
+    if requested <= 0 {
+        // 缺省 = 不设置（r5j96：交 OS autotune），无预算占用。
+        return Ok(());
+    }
+    let requested = requested as usize;
+    if requested <= SO_RCVBUF_FREE_TIER_MAX {
+        return Ok(());
+    }
+    if requested > SO_RCVBUF_HARD_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socketSettings.receiveBufferSize={requested} exceeds hard cap \
+                 {SO_RCVBUF_HARD_MAX} bytes (64 MiB per-connection hard limit; \
+                 see docs/guide-highrtt-sockopt.md §96-98)"
+            ),
+        ));
+    }
+    if !confirmed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socketSettings.receiveBufferSize={requested} exceeds free tier \
+                 {SO_RCVBUF_FREE_TIER_MAX} bytes and requires explicit confirmation: \
+                 set {ALLOW_LARGE_RCVBUF_ENV}=1 (kernel books 2x per socket => {} bytes; \
+                 total = concurrent_conns × 2 × {requested}; \
+                 see docs/guide-highrtt-sockopt.md §96-98)",
+                requested * 2
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 显式 `receiveBufferSize` 预算判定（公开口：读进程级确认开关）。
+pub fn check_explicit_receive_buffer_size(opts: &SocketOptions) -> std::io::Result<()> {
+    check_explicit_receive_buffer_size_with(opts, large_rcvbuf_confirmed())
+}
+
+/// 大档确认开关读数（**全仓唯一 env 读取点** = 单一真值源）。
+fn large_rcvbuf_confirmed() -> bool {
+    std::env::var(ALLOW_LARGE_RCVBUF_ENV).as_deref() == Ok("1")
+}
+
+/// 显式 `receiveBufferSize` 判定 + 下发（**三 transport 拨号点的统一口**）。
+///
+/// - 缺省（0）⇒ 完全不碰 socket（r5j96：交 OS autotune）；
+/// - 显式（>0 且 ≤ 上限）⇒ setsockopt 下发（失败即拨号失败，对齐 bd 88m0 口径）；
+/// - 超限 ⇒ Err（fail-visible，文案点名上限值与配置来源），**不静默钳制**。
+pub fn apply_explicit_receive_buffer_size(
+    tcp: &tokio::net::TcpStream,
+    opts: &SocketOptions,
+) -> std::io::Result<()> {
+    check_explicit_receive_buffer_size(opts)?;
+    if opts.receive_buffer_size > 0 {
+        socket2::SockRef::from(tcp).set_recv_buffer_size(opts.receive_buffer_size as usize)?;
+    }
+    Ok(())
+}
+
 /// Linux connect 前的 TFO（`TCP_FASTOPEN_CONNECT`，出站）——transport 裸拨号路径
 /// 专用（[`dial_client_tcp`] 复用 `dial_tcp_raw` 时经此接线）。尽力而为：失败只记
 /// debug 不阻断拨号（纯优化项不能成为拨号失败原因）。非 Linux 无 TFO 语义，恒空。
@@ -556,6 +679,9 @@ pub fn apply_outbound_socket_options(
     // vs autotune 57MB/s）；Linux 受 net.core.rmem_max 静默钳制（stock 208KB）+
     // 锁 autotune → 窗钉 208KB（WSL netem RTT 300ms 实测 0.80 vs 7.43MB/s，9 倍差）。
     // 0 = 不下 setsockopt（socket2 跨平台，unix/Winsock SO_RCVBUF）。
+    // bd u91se 预算闸：显式值过统一上限判定（超限 ⇒ Err，文案点名上限值与字段名；
+    // 缺省 0 = 不碰 socket，r5j96 语义不变）。判定用用户设定值（不用回读值）。
+    check_explicit_receive_buffer_size(opts)?;
     let rcvbuf =
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     if rcvbuf > 0 {
@@ -695,6 +821,9 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
     set_keepalive_config(socket, opts)?;
     // SO_RCVBUF：显式 `receiveBufferSize` 优先；缺省两平台均**不设置**
     // （bd r5j96，见 `TCP_RCVBUF_DEFAULT`）——交 OS autotune；0 = 不下 setsockopt。
+    // bd u91se 预算闸：入站 socket 同样占每连接预算（96MB 分账按连接计）⇒ 显式值
+    // 过同一上限判定（超限 ⇒ Err；缺省 0 = 不碰 socket）。
+    check_explicit_receive_buffer_size(opts)?;
     let rcvbuf =
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     if rcvbuf > 0 {
@@ -791,6 +920,8 @@ const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
 /// # Errors
 ///
 /// socket 创建 / bind 失败照常传播（硬错）；缓冲设置失败不传播（见上）。
+/// **显式缓冲超上限**（`receiveBufferSize`/`sendBufferSize` > 4 MiB，bd u91se 预算闸）
+/// ⇒ 传播 `InvalidInput`（fail-visible，拒绑，不静默钳制）。
 pub fn bind_udp_endpoint(
     addr: std::net::SocketAddr,
     opts: &SocketOptions,
@@ -798,8 +929,8 @@ pub fn bind_udp_endpoint(
     let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     let v6only = addr.is_ipv6() && opts.ipv6_only;
     let _ = sock.set_only_v6(v6only);
-    tune_udp_buffer(&sock, opts.receive_buffer_size, UdpBufDir::Recv);
-    tune_udp_buffer(&sock, opts.send_buffer_size, UdpBufDir::Send);
+    tune_udp_buffer(&sock, opts.receive_buffer_size, UdpBufDir::Recv)?;
+    tune_udp_buffer(&sock, opts.send_buffer_size, UdpBufDir::Send)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
     Ok(std::net::UdpSocket::from(sock))
@@ -852,27 +983,98 @@ impl UdpBufDir {
 }
 
 /// 单方向缓冲调谐：显式值优先直接设置；缺省走 Go `wrapConn` 下限语义。
-fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) {
+///
+/// **显式值走预算闸**（bd u91se / PM 终裁 2026-11-05）：显式 `>0` 超过
+/// [`MAX_EXPLICIT_UDP_BUFFER_SIZE`]（4 MiB，与 TCP 显式接收缓冲同上限）⇒
+/// **Err（fail-visible，拒绑）**——不静默钳到上限（会骗运维「配了 16 MB 实际
+/// 4 MB」）。判定用**用户设定值**（不用回读值）：Linux 受 `net.core.rmem_max` /
+/// `wmem_max` 静默钳制时回读远小于设定值，但用户填 16 MB 就是 16 MB 的语义。
+///
+/// **缺省（0）不动**：走 Go quic-go `wrapConn` 的 8 MB parity 下限
+/// （[`QUIC_UDP_MIN_BUFFER`]，PM 裁决保留），不受本闸约束。
+fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) -> std::io::Result<()> {
     if explicit > 0 {
+        check_explicit_udp_buffer_size(explicit, dir)?;
         if let Err(e) = dir.set(sock, explicit as usize) {
             crate::LOG.warn(format!("dir={dir:?} explicit={explicit} UDP buffer setsockopt failed (kernel may clamp): {e}"));
         }
-        return;
+        return Ok(());
     }
     // 下限语义：当前值已达标则不动（只升不降）。
     if matches!(dir.get(sock), Ok(cur) if cur >= QUIC_UDP_MIN_BUFFER) {
-        return;
+        return Ok(());
     }
     if dir.set(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
-        return;
+        return Ok(());
     }
     #[cfg(target_os = "linux")]
     if dir.force(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
-        return;
+        return Ok(());
     }
     crate::LOG.warn(format!(
         "dir={dir:?} failed to raise UDP socket buffer to {QUIC_UDP_MIN_BUFFER} bytes (need CAP_NET_ADMIN for FORCE on Linux); consider net.core.rmem_max/wmem_max"
     ));
+    Ok(())
+}
+
+/// UDP/QUIC 端点**显式**缓冲上限（SO_RCVBUF / SO_SNDBUF 各向，字节）。
+///
+/// 与 TCP 显式接收缓冲**同口径**（[`SO_RCVBUF_FREE_TIER_MAX`] 免确认档 +
+/// [`SO_RCVBUF_HARD_MAX`] 硬上限 + [`ALLOW_LARGE_RCVBUF_ENV`] 确认开关）：同一笔
+/// 96 MB 整机预算里 pipe 与 socket 不重复计账。
+///
+/// **只约束显式值**（用户显式配置的 `receiveBufferSize`/`sendBufferSize`）；
+/// 缺省 8 MB 是 Go quic-go `wrapConn` parity 下限（[`QUIC_UDP_MIN_BUFFER`]），
+/// PM 裁决保留、不受本闸约束。
+pub const MAX_EXPLICIT_UDP_BUFFER_SIZE: usize = SO_RCVBUF_HARD_MAX;
+
+/// 显式 UDP 缓冲值预算判定（recv/send 各向；`confirmed` 可注入供测试）。
+///
+/// 三档口径与 TCP 显式接收缓冲**同**（PM 终裁）：`≤ 4 MiB` 免确认；`4 MiB < v ≤
+/// 64 MiB` 需确认开关（[`ALLOW_LARGE_RCVBUF_ENV`]）；`> 64 MiB` 恒拒。以**用户设定
+/// 值**判定（不用回读值）。**缺省（0）不判定**——缺省 8 MB 是 Go quic-go
+/// `wrapConn` parity 下限（PM 裁决保留）。
+fn check_explicit_udp_buffer_size_with(
+    explicit: i32,
+    dir: UdpBufDir,
+    confirmed: bool,
+) -> std::io::Result<()> {
+    if explicit <= 0 {
+        // 缺省 = 走 Go quic-go 8 MB parity 下限，不受本闸约束。
+        return Ok(());
+    }
+    let requested = explicit as usize;
+    let key = match dir {
+        UdpBufDir::Recv => "receiveBufferSize",
+        UdpBufDir::Send => "sendBufferSize",
+    };
+    if requested > SO_RCVBUF_HARD_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socketSettings.{key}={requested} exceeds hard cap {SO_RCVBUF_HARD_MAX} bytes \
+                 (64 MiB per-connection hard limit; see docs/guide-highrtt-sockopt.md §96-98)"
+            ),
+        ));
+    }
+    if requested > SO_RCVBUF_FREE_TIER_MAX && !confirmed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "socketSettings.{key}={requested} exceeds free tier {SO_RCVBUF_FREE_TIER_MAX} \
+                 bytes and requires explicit confirmation: set {ALLOW_LARGE_RCVBUF_ENV}=1 \
+                 (kernel books 2x per socket => {} bytes; total = concurrent_conns × 2 × {requested}; \
+                 see docs/guide-highrtt-sockopt.md §96-98)",
+                requested * 2
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 显式 UDP 缓冲值预算判定（公开口：读进程级确认开关）。
+fn check_explicit_udp_buffer_size(explicit: i32, dir: UdpBufDir) -> std::io::Result<()> {
+    check_explicit_udp_buffer_size_with(explicit, dir, large_rcvbuf_confirmed())
 }
 
 /// 应用 [`SocketOptions::custom_sockopt`]。对应 Go 各平台 apply*SocketOptions 的
@@ -1846,5 +2048,179 @@ mod tests {
 
         drop(socket);
         accept_task.await.unwrap();
+    }
+
+    /// bd u91se：`dial_system` 出站路径（`apply_outbound_socket_options`）与入站路径
+    /// （`apply_inbound_socket_options`）的**显式超限 ⇒ Err**（fail-visible，文案点名
+    /// 上限值与字段名）；**缺省路径仍不碰 socket**（r5j96，回读 == 内核缺省对照）。
+    #[test]
+    fn inbound_and_outbound_socket_options_enforce_explicit_buffer_budget() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        let before = socket.recv_buffer_size().unwrap();
+
+        // 缺省：两向都不得下发 setsockopt（回读不变 = 内核缺省对照）。
+        let default_opts = SocketOptions::default();
+        apply_outbound_socket_options(&socket, &default_opts, None).unwrap();
+        assert_eq!(
+            socket.recv_buffer_size().unwrap(),
+            before,
+            "出站缺省不得下发 setsockopt(SO_RCVBUF)（bd r5j96）"
+        );
+        apply_inbound_socket_options(&socket, &default_opts).unwrap();
+        assert_eq!(
+            socket.recv_buffer_size().unwrap(),
+            before,
+            "入站缺省不得下发 setsockopt(SO_RCVBUF)（bd r5j96）"
+        );
+
+        // 显式大档（16 MiB，未确认）：出站/入站各 ⇒ Err（InvalidInput，文案点名
+        // 确认开关与 2× 记账后果）。
+        let over = SocketOptions { receive_buffer_size: 16 * 1024 * 1024, ..Default::default() };
+        let err = apply_outbound_socket_options(&socket, &over, None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(ALLOW_LARGE_RCVBUF_ENV),
+            "出站错误须点名确认开关 {ALLOW_LARGE_RCVBUF_ENV}：{msg}"
+        );
+        assert!(msg.contains("receiveBufferSize"), "出站错误须点名字段名：{msg}");
+        let err = apply_inbound_socket_options(&socket, &over).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains(ALLOW_LARGE_RCVBUF_ENV), "入站错误须点名确认开关：{msg}");
+        assert!(msg.contains("receiveBufferSize"), "入站错误须点名字段名：{msg}");
+        // 未确认的大档不得 setsockopt（禁静默钳到上限）。
+        assert_eq!(
+            socket.recv_buffer_size().unwrap(),
+            before,
+            "超限不得下发 setsockopt（禁静默钳到上限）"
+        );
+    }
+
+    /// bd u91se 预算闸契约（**三 transport 共用的唯一判定口**；PM 终裁三档）：
+    /// - 缺省（0）⇒ 不碰 socket（r5j96：交 OS autotune）；
+    /// - 显式 ≤ 4 MiB（免确认档）⇒ setsockopt 生效（回读高于缺省对照）；
+    /// - 显式 4 MiB < v ≤ 64 MiB ⇒ **未确认即拒**（文案含开关名 + 2× 记账 + `并发 × 2 × 值`
+    ///   后果）；**带确认 ⇒ 生效**；
+    /// - 显式 > 64 MiB ⇒ 恒拒（防手滑）。
+    ///
+    /// 上限判定用**用户设定值**（不用回读值）：Linux 下 setsockopt 受
+    /// `net.core.rmem_max` 静默钳制，回读远小于设定值——但用户填 16 MiB 就是
+    /// 16 MiB 的语义，回读小不代表没超预算。
+    #[tokio::test]
+    async fn explicit_receive_buffer_budget_gate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 缺省：不碰 socket（回读前后一致）。
+        let base_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let base = socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap();
+        check_explicit_receive_buffer_size(&SocketOptions::default()).unwrap();
+        apply_explicit_receive_buffer_size(&base_sock, &SocketOptions::default()).unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&base_sock).recv_buffer_size().unwrap(),
+            base,
+            "缺省不得改变 SO_RCVBUF（r5j96：缺省不设）"
+        );
+
+        // 档 1：显式 4 MiB（免确认上限）⇒ 生效，回读高于缺省对照。
+        let ok_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let ok_opts = SocketOptions {
+            receive_buffer_size: SO_RCVBUF_FREE_TIER_MAX as i32,
+            ..Default::default()
+        };
+        check_explicit_receive_buffer_size(&ok_opts).unwrap();
+        apply_explicit_receive_buffer_size(&ok_sock, &ok_opts).unwrap();
+        let ok_read = socket2::SockRef::from(&ok_sock).recv_buffer_size().unwrap();
+        assert!(ok_read > base, "显式 4 MiB 必须抬高 SO_RCVBUF 回读：{ok_read} 须高于缺省 {base}");
+
+        // 档 2：4 MiB < v ≤ 64 MiB —— 未确认 ⇒ 拒（文案点名值/开关名/2× 记账/
+        // 并发账面公式）；带确认 ⇒ 生效。
+        let big_opts =
+            SocketOptions { receive_buffer_size: 16 * 1024 * 1024, ..Default::default() };
+        let err = check_explicit_receive_buffer_size_with(&big_opts, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains("16777216"), "错误须点名设定值：{msg}");
+        assert!(
+            msg.contains(ALLOW_LARGE_RCVBUF_ENV),
+            "错误须点名确认开关 {ALLOW_LARGE_RCVBUF_ENV}：{msg}"
+        );
+        assert!(msg.contains("2 ×"), "错误须点名 2× 内核记账与并发账面公式：{msg}");
+        assert!(msg.contains("receiveBufferSize"), "错误须点名配置来源：{msg}");
+        // 带确认 ⇒ 判定通过（注入点观测；公开口读 env）。
+        check_explicit_receive_buffer_size_with(&big_opts, true).unwrap();
+        // 未确认时公开口也拒（进程级 env 未设）。
+        let err = check_explicit_receive_buffer_size(&big_opts).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let big_sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let err2 = apply_explicit_receive_buffer_size(&big_sock, &big_opts).unwrap_err();
+        assert_eq!(err2.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            socket2::SockRef::from(&big_sock).recv_buffer_size().unwrap(),
+            base,
+            "未确认的大档不得 setsockopt（禁静默钳到上限）"
+        );
+
+        // 档 3：> 64 MiB ⇒ 恒拒（防手滑），文案点名硬上限。
+        let huge_opts =
+            SocketOptions { receive_buffer_size: 128 * 1024 * 1024, ..Default::default() };
+        let err = check_explicit_receive_buffer_size_with(&huge_opts, true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&SO_RCVBUF_HARD_MAX.to_string()),
+            "错误须点名硬上限值 {}：{msg}",
+            SO_RCVBUF_HARD_MAX
+        );
+    }
+
+    /// bd u91se：UDP/QUIC 端点**显式**缓冲值同三档（recv/send 各向）。
+    /// 缺省 8 MB 是 Go quic-go `wrapConn` parity 下限（PM 裁决保留）⇒ **不受闸约束**。
+    #[test]
+    fn explicit_udp_buffer_budget_gate() {
+        // 档 1：显式 4 MiB（免确认上限）：两端向均通过。
+        let ok = SocketOptions {
+            receive_buffer_size: SO_RCVBUF_FREE_TIER_MAX as i32,
+            send_buffer_size: SO_RCVBUF_FREE_TIER_MAX as i32,
+            ..Default::default()
+        };
+        check_explicit_udp_buffer_size(ok.receive_buffer_size, UdpBufDir::Recv).unwrap();
+        check_explicit_udp_buffer_size(ok.send_buffer_size, UdpBufDir::Send).unwrap();
+
+        // 缺省（0）：不判定（走 8 MB parity 下限）。
+        check_explicit_udp_buffer_size(0, UdpBufDir::Recv).unwrap();
+        check_explicit_udp_buffer_size(0, UdpBufDir::Send).unwrap();
+
+        // 档 2：4 MiB < v ≤ 64 MiB —— 未确认 ⇒ 拒（文案含开关名）；带确认 ⇒ 通过。
+        let big = 16 * 1024 * 1024;
+        let err = check_explicit_udp_buffer_size_with(big, UdpBufDir::Recv, false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(msg.contains(ALLOW_LARGE_RCVBUF_ENV), "错误须点名确认开关：{msg}");
+        assert!(msg.contains("receiveBufferSize"), "错误须点名配置项名：{msg}");
+        check_explicit_udp_buffer_size_with(big, UdpBufDir::Recv, true).unwrap();
+        let err = check_explicit_udp_buffer_size_with(big, UdpBufDir::Send, false).unwrap_err();
+        assert!(err.to_string().contains("sendBufferSize"), "错误须点名配置项名：{err}");
+
+        // 档 3：> 64 MiB ⇒ 恒拒。
+        let err = check_explicit_udp_buffer_size_with(128 * 1024 * 1024, UdpBufDir::Recv, true)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains(&SO_RCVBUF_HARD_MAX.to_string()),
+            "错误须点名硬上限值：{err}"
+        );
+
+        // 端到端：bind_udp_endpoint 对**未确认**的大档显式值 **拒绑**（fail-visible）。
+        let over = SocketOptions { receive_buffer_size: big, ..Default::default() };
+        let err = bind_udp_endpoint("127.0.0.1:0".parse().unwrap(), &over).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(ALLOW_LARGE_RCVBUF_ENV), "bind 失败须点名确认开关：{err}");
     }
 }
