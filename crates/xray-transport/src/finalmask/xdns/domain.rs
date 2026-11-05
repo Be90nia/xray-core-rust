@@ -16,6 +16,12 @@ pub(crate) const TYPE_CNAME: u16 = 5;
 pub(crate) const TYPE_TXT: u16 = 16;
 pub(crate) const TYPE_AAAA: u16 = 28;
 
+/// 客户端 `Types` 缺省（Go `client.go:72-74`）。
+pub(crate) const DEFAULT_CLIENT_TYPES: [u16; 1] = [TYPE_TXT];
+
+/// 服务端 `Types` 缺省（Go `server.go:55-57`）。
+pub(crate) const DEFAULT_SERVER_TYPES: [u16; 4] = [TYPE_A, TYPE_CNAME, TYPE_TXT, TYPE_AAAA];
+
 /// qtype → 2bit 标识（塞进首字节低 2 位），对齐 Go `TypeMap`。
 pub(crate) fn type_map(qtype: u16) -> io::Result<u8> {
     match qtype {

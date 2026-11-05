@@ -27,7 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 use super::{
     Config, ResolverKind, UdpIo,
     dns::{CLASS_IN, Message, Question, RR, RR_TYPE_OPT, message_from_wire_format},
-    domain::{Domain, type_map},
+    domain::{DEFAULT_CLIENT_TYPES, Domain, type_map},
     resp::Resp,
 };
 
@@ -80,11 +80,13 @@ impl XdnsConnClient {
         for d in &config.domains {
             let edns0 = u16::try_from(d.edns0)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xdns: invalid edns0"))?;
+            // Go client.go:72-74：Types 为空取 [16]
+            let types = if d.types.is_empty() { &DEFAULT_CLIENT_TYPES[..] } else { &d.types[..] };
             domains.push(Domain::new(
                 &d.name,
                 d.len_limit as usize,
                 d.label_limit as usize,
-                &d.types,
+                types,
                 edns0,
             )?);
         }

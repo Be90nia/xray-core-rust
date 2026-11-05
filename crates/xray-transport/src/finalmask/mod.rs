@@ -1520,12 +1520,10 @@ fn build_sudoku_config(settings: &serde_json::Value) -> sudoku::SudokuConfig {
     }
 }
 
-/// Go `XDNS.Build` → `xdns::Config`（bd 2ktp ④ 对齐 v26.9.30：domains 为对象
-/// 数组（lenLimit/labelLimit 缺省 255/63），resolvers 为 `{type,settings.addr}`，
-/// extraPoll 0-3；`domain` 键已废弃）。resolver `settings` 内 `addr` 以外的键
-/// （worker/tlsConfig/quicConfig 等）本 JSON 层不支持，显式报错不静默丢弃
-/// （Go conf 层由 `XDNSResolver` 展开为 `ResolverProto` 字段，Rust conf 层
-/// 尚未实现该形态，见 bd o7ns D4 能力边界）。
+/// Go `XDNS.Build` → `xdns::Config`（对齐 Go v26.10.17 `transport_finalmask.go:815-911`）：
+/// domains 为对象数组（`names[]` 展开，lenLimit/labelLimit 缺省 255/63），resolvers 为
+/// Go 形态 `{addrs[], worker, tlsConfig, quicConfig}`（`type` 由 scheme 决定，见
+/// [`xdns::build_resolver_configs`]），extraPoll 0-3；`domain` 键已废弃。
 fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
     if settings.get("domain").is_some_and(|x| !x.is_null()) {
         return Err(mask_err(
@@ -1538,50 +1536,7 @@ fn build_xdns_config(settings: &serde_json::Value) -> io::Result<xdns::Config> {
             domains.extend(xdns::build_domain_config(d)?);
         }
     }
-    let mut resolvers = Vec::new();
-    if let Some(serde_json::Value::Array(arr)) = settings.get("resolvers") {
-        for r in arr {
-            let obj = r.as_object().ok_or_else(|| mask_err("xdns: resolver must be an object"))?;
-            let rtype = obj
-                .get("type")
-                .and_then(|t| t.as_str())
-                .ok_or_else(|| mask_err("xdns: resolver missing type"))?;
-            let resolver_settings = obj
-                .get("settings")
-                .and_then(|s| s.as_object())
-                .ok_or_else(|| mask_err("xdns: resolver missing settings"))?;
-            let addr = resolver_settings
-                .get("addr")
-                .and_then(|a| a.as_str())
-                .ok_or_else(|| mask_err("xdns: resolver missing settings.addr"))?;
-            for key in resolver_settings.keys() {
-                if key != "addr" {
-                    return Err(mask_err(format!(
-                        "xdns: resolver setting {key:?} not supported (only addr)"
-                    )));
-                }
-            }
-            let kind = match rtype {
-                "udp" => xdns::ResolverKind::Udp,
-                "tcp" => xdns::ResolverKind::Tcp,
-                "https" => {
-                    return Err(mask_err(
-                        "xdns: DOH (https) resolver not supported (UDP-only stack)",
-                    ));
-                },
-                other => {
-                    return Err(mask_err(format!("xdns: unknown resolver type {other:?}")));
-                },
-            };
-            resolvers.push(xdns::ResolverConfig {
-                kind,
-                addr: addr.to_string(),
-                worker: 0,
-                tls_config: None,
-                quic_config: None,
-            });
-        }
-    }
+    let resolvers = xdns::build_resolver_configs(settings)?;
     let extra_poll = match settings.get("extraPoll") {
         Some(x) if !x.is_null() => {
             x.as_i64().ok_or_else(|| mask_err("xdns: invalid extraPoll"))? as i32
@@ -2657,11 +2612,13 @@ mod tests {
         assert_eq!(legacy.padding_min, 10);
     }
 
+    /// Go `XDNS.Build`（`transport_finalmask.go:833-911`）全字段：Go 形态
+    /// `resolvers[{addrs[],worker,tlsConfig,quicConfig}]`，`type` 由每个 addrs 项的
+    /// scheme 决定（bd zg6eg P0-1：此前强制 `type`+`settings` 形态，Go 配置读不进来）。
     #[test]
     fn parse_json_xdns_config_fields_and_validations() {
-        // v26.9.30 形态（bd 2ktp ④）：domains 对象数组 + resolvers {type,settings}
-        let cfg = build_xdns_config(&fm(r#"{"domains":[{"name":"t.example.com","types":[16]}],
-                "resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}],
+        let cfg = build_xdns_config(&fm(r#"{"domains":[{"names":["t.example.com"],"types":[16]}],
+                "resolvers":[{"addrs":["1.1.1.1:53"],"worker":8}],
                 "extraPoll":1}"#))
         .unwrap();
         assert_eq!(cfg.domains.len(), 1);
@@ -2670,38 +2627,33 @@ mod tests {
         assert_eq!(cfg.domains[0].types, vec![16]);
         assert_eq!(cfg.resolvers[0].kind, xdns::ResolverKind::Udp);
         assert_eq!(cfg.resolvers[0].addr, "1.1.1.1:53");
+        assert_eq!(cfg.resolvers[0].worker, 8);
         assert_eq!(cfg.extra_poll, 1);
         // 已废弃 domain 键报错（对齐 Go PrintRemovedFeatureError）
         assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
         // extraPoll 越界报错（对齐 Go Build 校验）
         assert!(build_xdns_config(&fm(r#"{"extraPoll":4}"#)).is_err());
-        // resolver 未知 type 报错
+        // 未知 scheme 报错（Go Build :903-904 default → "invalid protocol"）
         assert!(
-            build_xdns_config(&fm(
-                r#"{"resolvers":[{"type":"quic","settings":{"addr":"1.1.1.1:53"}}]}"#
-            ))
-            .is_err()
+            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["quic://1.1.1.1:53"]}]}"#)).is_err()
         );
-        // https（DOH）已知 type 但 Rust 栈未实现 → 显式报错（bd o7ns D4）
-        assert!(
-            build_xdns_config(&fm(
-                r#"{"resolvers":[{"type":"https","settings":{"addr":"dns.google"}}]}"#
-            ))
-            .is_err()
-        );
-        // settings 未知键显式报错，不静默丢弃（bd o7ns D4）
-        assert!(
-            build_xdns_config(&fm(
-                r#"{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53","worker":8}}]}"#
-            ))
-            .is_err()
-        );
+        // https（DOH）Go 支持但本栈未实现 → 配置期点名报错（不静默改成 udp）
+        let Err(e) =
+            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["https://dns.google/dns-query"]}]}"#))
+        else {
+            panic!("https must reject");
+        };
+        assert!(e.to_string().contains("DOH"), "{e}");
+        // Rust 旧方言（type/settings）硬错指路，禁静默失效
+        let Err(e) = build_xdns_config(&fm(
+            r#"{"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}"#,
+        )) else {
+            panic!("legacy dialect must reject");
+        };
+        assert!(e.to_string().contains("addrs"), "{e}");
         // tcp resolver 可解析（wrap 期报 UDP-only 不支持）
         assert!(
-            build_xdns_config(&fm(
-                r#"{"resolvers":[{"type":"tcp","settings":{"addr":"1.1.1.1:53"}}]}"#
-            ))
-            .is_ok()
+            build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["tcp://1.1.1.1:53"]}]}"#)).is_ok()
         );
     }
 
@@ -2878,7 +2830,7 @@ mod tests {
         let json = fm(r#"{"udp":[
                 {"type":"noise","settings":{"reset":{"from":1,"to":2}}},
                 {"type":"sudoku","settings":{"password":"p"}},
-                {"type":"xdns","settings":{"domains":[{"name":"t.example.com","types":[16]}],"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}},
+                {"type":"xdns","settings":{"domains":[{"names":["t.example.com"],"types":[16]}],"resolvers":[{"addrs":["1.1.1.1:53"]}]}},
                 {"type":"xicmp","settings":{"ips":["10.0.0.1"]}},
                 {"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}},
                 {"type":"header-custom","settings":{"client":[]}}
@@ -2981,13 +2933,13 @@ mod tests {
     }
 
     /// Go XDNSDomain.Names[]（transport_finalmask.go:813，Build :841-858）：一项
-    /// names 展开多条域；Rust 旧方言 name 兜底。
+    /// names 展开多条域（单数 `name` 是 Rust 旧方言，已删）。
     #[test]
     fn xdns_names_array_expands_domains() {
         let cfg = build_xdns_config(&fm(r#"{"domains":[
                 {"names":["a.example.com","b.example.com"],"types":[16]},
-                {"name":"c.example.com","types":[1]}
-            ],"resolvers":[{"type":"udp","settings":{"addr":"1.1.1.1:53"}}]}"#))
+                {"names":["c.example.com"],"types":[1]}
+            ],"resolvers":[{"addrs":["1.1.1.1:53"]}]}"#))
         .unwrap();
         assert_eq!(cfg.domains.len(), 3);
         assert_eq!(cfg.domains[0].name, "a.example.com");

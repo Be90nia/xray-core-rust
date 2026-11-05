@@ -27,7 +27,7 @@ use super::{
         Message, RCODE_FORMAT_ERROR, RCODE_NAME_ERROR, RCODE_NO_ERROR, RCODE_NOT_IMPLEMENTED,
         RR_TYPE_OPT, message_from_wire_format,
     },
-    domain::{Domain, type_map_},
+    domain::{DEFAULT_SERVER_TYPES, Domain, type_map_},
     frag::{ClientID, FragManager},
     resp::{Resp, SendManager},
 };
@@ -114,11 +114,13 @@ impl XdnsConnServer {
         for d in &config.domains {
             let edns0 = u16::try_from(d.edns0)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xdns: invalid edns0"))?;
+            // Go server.go:55-57：Types 为空取 [1,5,16,28]
+            let types = if d.types.is_empty() { &DEFAULT_SERVER_TYPES[..] } else { &d.types[..] };
             domains.push(Domain::new(
                 &d.name,
                 d.len_limit as usize,
                 d.label_limit as usize,
-                &d.types,
+                types,
                 edns0,
             )?);
         }
