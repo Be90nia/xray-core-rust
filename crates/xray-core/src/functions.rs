@@ -265,6 +265,9 @@ async fn start_full_dispatched(
     install_secret_masking(built);
     register_all_features();
     register_all_transports();
+    // bd azcoe：装配期内存预算门（256MB 小鸡口径）——两路共用本函数，违例
+    // fail-visible 拒启（对齐 vaye2/o91s4 启动期硬错纪律），先于一切装配分配。
+    crate::memory_budget::check_startup_budget(built).map_err(CoreFunctionError::InstanceInit)?;
     let mut instance = Instance::new_from_built(built)?;
 
     let ohm = Arc::new(SimpleOhm::new());

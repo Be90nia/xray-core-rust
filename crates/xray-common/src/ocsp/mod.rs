@@ -1,9 +1,6 @@
 //! OCSP（在线证书状态协议）支持
 //!
 //! 对应 Go 版本 `common/ocsp` 包。
-//! 当前为占位实现，完整的 OCSP 需要证书解析功能，将在后续阶段完成。
-
-use std::path::Path;
 
 /// OCSP 响应状态码
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,38 +115,6 @@ pub enum OcspError {
     NotSupported(String),
 }
 
-/// 从 DER 编码的证书文件获取 OCSP 响应。
-///
-/// 对应 Go 版本 `ocsp.GetOCSPForFile`。
-///
-/// # 注意
-/// 当前为占位实现，完整 OCSP 需要证书解析功能。
-pub fn get_ocsp_for_file(_path: &Path) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported("OCSP certificate parsing is not yet implemented".into()))
-}
-
-/// 从证书字节获取 OCSP stapling 响应。
-///
-/// 对应 Go 版本 `ocsp.GetOCSPStapling`。
-///
-/// # 注意
-/// 实际 OCSP stapling 实现在 `xray_tls::ocsp_stapling` 模块中，
-/// 使用 `ocsp-stapler` crate 自动获取并装订 OCSP 响应。
-/// 本函数为兼容性保留，建议直接使用 `xray_tls::ocsp_stapling`。
-pub fn get_ocsp_stapling(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported("use xray_tls::ocsp_stapling instead".into()))
-}
-
-/// 从证书 DER 字节获取 OCSP 响应。
-///
-/// 对应 Go 版本 `ocsp.GetOCSPForCert`。
-///
-/// # 注意
-/// 当前为占位实现。
-pub fn get_ocsp_for_cert(_cert_der: &[u8]) -> Result<Option<OcspResponse>, OcspError> {
-    Err(OcspError::NotSupported("OCSP for certificate is not yet implemented".into()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,28 +170,6 @@ mod tests {
         assert!(!resp.is_good());
         assert!(!resp.is_revoked());
         assert_eq!(resp.status, OcspStatus::Unknown);
-    }
-
-    #[test]
-    fn test_get_ocsp_for_file_not_supported() {
-        let result = get_ocsp_for_file(Path::new("/tmp/test.crt"));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, OcspError::NotSupported(_)));
-    }
-
-    #[test]
-    fn test_get_ocsp_stapling_not_supported() {
-        let result = get_ocsp_stapling(&[]);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), OcspError::NotSupported(_)));
-    }
-
-    #[test]
-    fn test_get_ocsp_for_cert_not_supported() {
-        let result = get_ocsp_for_cert(&[]);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), OcspError::NotSupported(_)));
     }
 
     #[test]

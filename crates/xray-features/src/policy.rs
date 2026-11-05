@@ -198,15 +198,20 @@ pub fn default_buffer_connection_from_env(env_mb: Option<i64>) -> i32 {
             {
                 0
             }
-            // 架构分支对齐 Go policy.go：arm/mips → 0，mips64 → 4KB，其余 → 512KB。
-            // 注意 rustc 的 target_arch 无 "arm64"/"mips64el" 值（对应 aarch64/mips64），
-            // 原写法这两个值恒不匹配；aarch64 落入 512KB 分支与 Go 的 4KB 分支存在
-            // 已知偏差，改 cfg 值会变更激活行为，维持现状待专项票。
-            #[cfg(target_arch = "mips64")]
+            // Go policy.go:97-99 `case "arm64", "mips64", "mips64le": return 4 * 1024`。
+            // rustc 架构名映射：Go "arm64" = `aarch64`；mips64/mips64le 同报 `mips64`。
+            // bd 9utc3（F7）：改前漏 `aarch64`，ARM 小机落 512KB 分支 = Go 缺省的
+            // 128 倍（本专项票已收口，原「维持现状待专项票」注释随之作废）。
+            #[cfg(any(target_arch = "mips64", target_arch = "aarch64"))]
             {
                 (4 * 1024) as i32
             }
-            #[cfg(not(any(target_arch = "arm", target_arch = "mips", target_arch = "mips64")))]
+            #[cfg(not(any(
+                target_arch = "arm",
+                target_arch = "mips",
+                target_arch = "mips64",
+                target_arch = "aarch64"
+            )))]
             {
                 512 * 1024
             }
@@ -332,6 +337,27 @@ mod tests {
     fn test_default_buffer_env_zero_means_unlimited() {
         let size = default_buffer_connection_from_env(Some(0));
         assert_eq!(size, -1_i32, "env=0 must map to unlimited (-1_i32), got {size}");
+    }
+
+    /// bd 9utc3（F7）：env 缺省的**当前架构分支值**钉死——本测试在哪个架构编译
+    /// 就断言哪个架构的分支（x86_64 = 512KB 不变；aarch64 = 4KB 对齐 Go arm64，
+    /// CI build matrix 的 aarch64-apple-darwin 会编译本测试；arm/mips = 0 不变）。
+    /// 同一测试三架构各自为锚，aarch64 分支改坏在任一架构的 CI 上都红。
+    #[test]
+    fn test_default_buffer_env_none_matches_goarch_table() {
+        let expected = if cfg!(any(target_arch = "arm", target_arch = "mips")) {
+            0
+        } else if cfg!(any(target_arch = "mips64", target_arch = "aarch64")) {
+            4 * 1024
+        } else {
+            512 * 1024
+        };
+        assert_eq!(
+            default_buffer_connection_from_env(None),
+            expected,
+            "arch={} 的 env 缺省分支漂移（Go policy.go:91-105 分架构表）",
+            std::env::consts::ARCH
+        );
     }
     /// `XRAY_BUFSIZE=N`（N>0）→ N MiB（policy.go:104 `defaultBufferSize = int32(size) * 1024 *
     /// 1024`）。

@@ -70,6 +70,8 @@ pub mod outbound;
 pub mod register;
 // bd nip4p：VLESS Reverse Proxy 装配（bridge/portal 编排件接线）。
 pub(crate) mod reverse;
+// bd azcoe：装配面内存预算（256MB 小鸡口径）——显式常量登记簿 + 装配期预算门。
+pub mod memory_budget;
 // T1.1：Instance::close 停机编排桥（feature 门 `shutdown-coordinator`，默认开；关=旧逆序循环）。
 #[cfg(feature = "shutdown-coordinator")]
 mod shutdown_bridge;

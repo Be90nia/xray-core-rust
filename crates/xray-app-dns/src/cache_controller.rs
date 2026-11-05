@@ -9,7 +9,7 @@
 //!   `FxScope` 托管（P1-11：配置期零 spawn，坑约束 5）。
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -36,6 +36,11 @@ pub const SHRINK_ABSOLUTE_THRESHOLD: usize = 10240;
 pub const SHRINK_RATIO_THRESHOLD: f64 = 0.65;
 /// 后台清理周期（Go `cacheCleanup.Interval = 300 * time.Second`）。
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
+/// 缓存键数上界（9utc3，Go 同源无此界——Rust 侧防洪泛加界）。新键插入使
+/// 键数超界时淘汰一名牺牲者：过期键优先（与 cleanup 同一 `effective_now`
+/// 口径，serve_stale 宽限内的键不算过期），无过期则退化为最旧插入键。
+/// 16384 键 ≈ 4-5 MiB（票面：10 万键 ≈ 20-30 MiB），远高于常规解析工作集。
+pub const MAX_CACHE_ENTRIES: usize = 16384;
 
 /// DNS 缓存控制器。对应 Go `CacheController`。
 pub struct CacheController {
@@ -53,6 +58,10 @@ pub struct CacheController {
     /// 或 A/AAAA 空表）的过期时刻（bd 2bmns G-5）。
     pub negative_ttl_secs: u32,
     ips: RwLock<HashMap<String, Arc<Record>>>,
+    /// 插入序键队列（9utc3 淘汰序）：新键入队尾，淘汰自队首取（最旧优先），
+    /// 淘汰扫描中过期键优先命中。FIFO 近似 LRU 尾——真 LRU 需 `find_records`
+    /// 命中时记账（读路径 read 锁 → write 锁），为守住读路径零开销不做。
+    insert_order: RwLock<VecDeque<String>>,
     /// 缓存生命周期峰值，用于收缩阈值计算。
     high_watermark: RwLock<usize>,
     /// 广播通道发送端（响应到达时发 `CacheEvent`）。
@@ -143,6 +152,7 @@ impl CacheController {
             serve_expired_ttl_secs: -(serve_expired_ttl as i32),
             negative_ttl_secs,
             ips: RwLock::new(HashMap::new()),
+            insert_order: RwLock::new(VecDeque::new()),
             high_watermark: RwLock::new(0),
             tx,
             single_flight: parking_lot::Mutex::new(HashMap::new()),
@@ -190,18 +200,62 @@ impl CacheController {
     /// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
     ///
     /// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
+    /// 9utc3：新键插入后若键数超 [`MAX_CACHE_ENTRIES`]，就地淘汰一名牺牲者
+    /// （过期优先，无过期退最旧插入），保证键数硬上界。
     pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
         if self.disable_cache {
             return;
         }
+        let key = fqdn.to_string();
         let mut ips = self.ips.write();
-        let entry = ips.entry(fqdn.to_string()).or_insert_with(|| Arc::new(Record::default()));
+        let is_new = !ips.contains_key(fqdn);
+        if is_new {
+            self.insert_order.write().push_back(key.clone());
+        }
+        let entry = ips.entry(key).or_insert_with(|| Arc::new(Record::default()));
         // Arc::make_mut：如独占则就地修改，否则 COW。
         let entry_mut = Arc::make_mut(entry);
         if is_v4 {
             entry_mut.a = Some(record);
         } else {
             entry_mut.aaaa = Some(record);
+        }
+        if is_new && ips.len() > MAX_CACHE_ENTRIES {
+            let effective_now = self.effective_now(self.clock.now_instant());
+            self.evict_victim(&mut ips, effective_now);
+        }
+    }
+
+    /// 键数上界的淘汰步（9utc3）：自插入序队首旋转扫描一圈——过期键首个命中
+    /// 即逐（表 + 队列同删）；无过期则逐最旧存活键（FIFO 近似 LRU 尾）。
+    /// 死键（cleanup 已删表未及清队）顺手出队。锁序恒 ips → insert_order。
+    fn evict_victim(&self, ips: &mut HashMap<String, Arc<Record>>, effective_now: Instant) {
+        let mut order = self.insert_order.write();
+        let is_expired = |rec: &Arc<Record>| {
+            rec.a.as_ref().is_some_and(|r| r.expire < effective_now)
+                || rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now)
+        };
+        let total = order.len();
+        let mut scanned = 0usize;
+        let mut oldest: Option<String> = None;
+        while scanned < total {
+            scanned += 1;
+            let Some(key) = order.pop_front() else { break };
+            let Some(rec) = ips.get(&key) else {
+                continue;
+            };
+            if is_expired(rec) {
+                ips.remove(&key);
+                return;
+            }
+            if oldest.is_none() {
+                oldest = Some(key.clone());
+            }
+            order.push_back(key);
+        }
+        if let Some(key) = oldest {
+            // 队列里的副本已随旋转移至队尾并变为死键，由后续 cleanup/淘汰清出。
+            ips.remove(&key);
         }
     }
 
@@ -263,10 +317,14 @@ impl CacheController {
 
         let len_after = ips.len();
 
+        // 9utc3：淘汰序队列与表同步——cleanup 删掉的键出队，防死键长期占位。
+        self.insert_order.write().retain(|key| ips.contains_key(key));
+
         if len_after == 0 {
             if *high >= MIN_SIZE_FOR_EMPTY_REBUILD {
                 // 空表重建以回收内存。
                 *ips = HashMap::new();
+                self.insert_order.write().clear();
                 *high = 0;
                 return true;
             }
@@ -720,5 +778,99 @@ mod tests {
         let (cleaned, _) = c.run_cleanup(clock.now_instant());
         assert!(cleaned);
         assert!(c.find_records("d.com.").is_none());
+    }
+
+    /// 9utc3 ①：键数硬上界——插满 MAX+1 后长度钉在 MAX，最旧插入键被逐，
+    /// 最新键存活（全新鲜的 FIFO 退化路径）。
+    #[test]
+    fn upsert_is_bounded_at_max_cache_entries() {
+        let c = make_ctrl();
+        let now = c.clock().now_instant();
+        let live_ttl = Duration::from_secs(3600);
+        for i in 0..=MAX_CACHE_ENTRIES {
+            let rec = ip_record(
+                1,
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))],
+                live_ttl,
+                0,
+                now,
+            );
+            c.upsert(&format!("d{i}.example.com."), true, rec);
+        }
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES, "键数必须钉在上界");
+        assert!(c.find_records("d0.example.com.").is_none(), "最旧插入键必须被逐");
+        assert!(
+            c.find_records(&format!("d{MAX_CACHE_ENTRIES}.example.com.")).is_some(),
+            "最新键必须存活"
+        );
+    }
+
+    /// 9utc3 ②：淘汰过期优先——队首短 TTL 键过期后，超界插入逐它而非最旧
+    /// 存活键（同一 effective_now 口径）。
+    #[test]
+    fn evict_prefers_expired_over_oldest_live() {
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, false, 0, 0, clock.clone());
+        let now = clock.now_instant();
+        let short =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(1), 0, now);
+        c.upsert("short.example.com.", true, short);
+        for i in 1..MAX_CACHE_ENTRIES {
+            let rec = ip_record(
+                1,
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))],
+                Duration::from_secs(3600),
+                0,
+                now,
+            );
+            c.upsert(&format!("live{i}.example.com."), true, rec);
+        }
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES);
+        // short（TTL 1s）已过期，live*（TTL 3600s）全部新鲜。
+        clock.advance(Duration::from_secs(2));
+        let fresh = ip_record(
+            1,
+            vec![IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1))],
+            Duration::from_secs(60),
+            0,
+            clock.now_instant(),
+        );
+        c.upsert("fresh.example.com.", true, fresh);
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES);
+        assert!(c.find_records("short.example.com.").is_none(), "过期键必须先被逐");
+        assert!(c.find_records("fresh.example.com.").is_some(), "触发淘汰的新键必须存活");
+        assert!(c.find_records("live1.example.com.").is_some(), "存在过期键时最旧存活键不得被逐");
+    }
+
+    /// 9utc3 ③：cleanup 删除后队列同步——多轮「插满超界 → cleanup 清光」
+    /// 后上界依旧成立（队列死键不击穿键数界）。
+    #[test]
+    fn bound_survives_cleanup_cycles() {
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, false, 0, 0, clock.clone());
+        for round in 0..3u32 {
+            let now = clock.now_instant();
+            for i in 0..=MAX_CACHE_ENTRIES {
+                let rec = ip_record(
+                    1,
+                    vec![IpAddr::V4(Ipv4Addr::new(
+                        10,
+                        round as u8,
+                        (i / 256) as u8,
+                        (i % 256) as u8,
+                    ))],
+                    Duration::from_secs(60),
+                    0,
+                    now,
+                );
+                c.upsert(&format!("r{round}d{i}.example.com."), true, rec);
+            }
+            assert_eq!(c.len(), MAX_CACHE_ENTRIES, "round {round}: 键数必须钉在上界");
+            // TTL 60s，推进 120s 全表过期 → cleanup 清光。
+            clock.advance(Duration::from_secs(120));
+            let (cleaned, _) = c.run_cleanup(clock.now_instant());
+            assert!(cleaned, "round {round}: 必须发生清理");
+            assert_eq!(c.len(), 0, "round {round}: 清理后必须为空");
+        }
     }
 }

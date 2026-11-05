@@ -195,6 +195,23 @@ pub fn build_server_config(
     // 证书级键（ocspStapling/oneTimeLoading/buildChain）在 certificates[] 条目内
     // 解析（Go TLSCertConfig），见 cert_entry_flags / any_cert_ocsp_stapling。
 
+    // bd mvmwu（blocker）：证书级 `ocspStapling` 在本仓**未实现**——Go 侧靠
+    // `setupOcspTicker` 后台 goroutine 周期向 issuer 的 OCSP responder 发请求取
+    // 响应并塞进 `cert.OCSPStaple`；Rust 侧既无 OCSP responder 客户端，
+    // `ocsp-stapling` feature 也从未被任何 crate 打开（其接线函数
+    // `ServerConfigAndStapler::wrap_server_config` 根本不存在——该分支从未编译
+    // 通过）。⇒ 配置写了该键 = 运行零效果（用户以为开了 OCSP 校验，实际没
+    // 开）= 安全面静默失效 ⇒ **硬错拒启**（CLAUDE.md L5 装配门 fail-visible），
+    // 不做无声降级。Go 语义对齐：uint64 秒（>0 启用；0 = 关闭）。
+    if any_cert_ocsp_stapling(&json) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "certificates[].ocspStapling is not supported by this build: OCSP stapling \
+             needs an issuer certificate chain plus an OCSP responder client, neither \
+             of which this build provides; remove the field to start",
+        ));
+    }
+
     let entries = build_named_cert_keys(&json)?;
 
     // 缺证书不再自签（bd mwvwd F2）：Go 服务端没证书时每条连接都失败
@@ -302,20 +319,6 @@ pub fn build_server_config(
     } else {
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
-    }
-
-    // pwh6: 证书级 ocspStapling（uint64 >0，Go TLSCertConfig）→ 挂 OCSP 装订。
-    // 对齐 Go `tls.Config.OCSPStaple`——Rust 端通过 ocsp-stapling feature 提供
-    // `ServerConfigAndStapler::wrap_server_config`，把 SniCertResolver 包成
-    // 自动从 issuer 取 OCSP 响应的 resolver。feature gate 控制 build。
-    #[cfg(feature = "ocsp-stapling")]
-    if any_cert_ocsp_stapling(&json) {
-        return crate::ocsp_stapling::ServerConfigAndStapler::wrap_server_config(config)
-            .map(|wrapped| Some(Arc::new(wrapped) as Arc<ServerConfig>));
-    }
-    #[cfg(not(feature = "ocsp-stapling"))]
-    {
-        let _ = any_cert_ocsp_stapling(&json); // feature 关闭时抑制 dead_code
     }
 
     Ok(Some(Arc::new(config)))
@@ -612,6 +615,29 @@ mod tests {
     fn tls_with_inline_pem_works() {
         let (cert_pem, key_pem) = leaf_cert(&["localhost"]);
         let json = serde_json::json!({ "cert": cert_pem, "key": key_pem });
+        let config = build_server_config("tls", Some(&json)).unwrap();
+        assert!(config.is_some());
+    }
+
+    /// bd mvmwu：证书级 `ocspStapling` 未实现 ⇒ 配置期硬错拒启（fail-visible），
+    /// 不得静默接受后运行无效果。
+    #[test]
+    fn ocsp_stapling_certificate_entry_rejected() {
+        let (cert_pem, key_pem) = leaf_cert(&["localhost"]);
+        let json = serde_json::json!({
+            "certificates": [{ "certificate": cert_pem, "key": key_pem, "ocspStapling": 60 }]
+        });
+        let err = build_server_config("tls", Some(&json)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("not supported"), "got: {err}");
+    }
+
+    /// 同一条目去掉 `ocspStapling` ⇒ 正常构建（对照：Err 由该键触发）。
+    #[test]
+    fn certificate_entry_without_ocsp_stapling_builds() {
+        let (cert_pem, key_pem) = leaf_cert(&["localhost"]);
+        let json =
+            serde_json::json!({ "certificates": [{ "certificate": cert_pem, "key": key_pem }] });
         let config = build_server_config("tls", Some(&json)).unwrap();
         assert!(config.is_some());
     }

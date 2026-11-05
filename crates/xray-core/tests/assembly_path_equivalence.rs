@@ -17,11 +17,19 @@
 //! 依赖本 crate —— 集成测试既跨不过 crate 可见性，也跨不过依赖环。故本测试的
 //! 直接观测面是两侧的**权威数据源**：生产 = `arm_builders` 的构造表（纯数据，
 //! 唯一构造路径），框架 = `family_catalog` 的协议 arm 表（注册集的派生源）；再
-//! 加一条生产侧**运行时**探针把 ② 失败语义差钉死（zhvi3 发现时生产路是静默跳过，
-//! bd o91s4 之后改为断言「生产路也必须拒启」，差异只剩时机/文案）。
+//! 加一条生产侧**运行时**探针把 ② 的生产侧钉死（zhvi3 发现时生产路是静默跳过，
+//! bd o91s4 之后改为断言「生产路也必须拒启」）。
 //!
-//! shortcut: ③ 的框架侧 fail-visible 行为只有源码级证据（数据源层面无键可观测），
-//! 真机端到端在 `--features framework-assembly` 的 e2e 里；升级时机 = 框架路转
+//! ## ② 的真相（bd gjqm7 修正）
+//!
+//! ② 是**语义差**，不是时机/文案差：生产路拒启（`register_outbounds` 构造期硬错）；
+//! 框架路对未迁移族/桥转换失败是 **warn + skip**——条目静默不达 bridge，进程照常起
+//! （`framework.rs` `run_framework` ①③ 两段）。框架侧无运行时探针，由 `include_str!`
+//! 锚点钉住 warn 文案；升级路径同 ③。
+//!
+//! shortcut: ② 框架侧与 ③ 的 guard 面一样只有源码级证据（数据源层面无键可观测），
+//! 真机端到端在 `--features framework-assembly` 的 e2e 里；且 CI 不编译该 feature
+//! （bd gjqm7 附建议 diff，待授权后落 `.github/workflows`）；升级时机 = 框架路转
 //! 生产主路由本测试改成跑两路真表。
 
 use std::collections::BTreeSet;
@@ -56,7 +64,8 @@ const INBOUND_SHARED_ENTRY: &str = "start_full_with_outbound_handlers";
 enum Class {
     /// ① 覆盖差：某协议只有一侧有（含两侧名称不同源）。
     Coverage,
-    /// ② 失败语义差：坏段/缺段 → fail-visible 的门只在框架路生效。
+    /// ② 失败语义差：坏段/缺段 → 生产路启动前拒启；框架路 warn+skip 继续跑
+    /// （未迁移族条目不达 bridge——bd gjqm7 修正，非「仅时机/文案差」）。
     FailureSemantics,
     /// ③ 框架路额外门：同 protocol 只转首个 / guard 面拒绝 / 代理链 late-bind。
     FrameworkGate,
@@ -275,15 +284,26 @@ fn assembly_path_difference_ledger() {
     for anchor in ["vless", "trojan", "vmess", "shadowsocks"] {
         assert!(prod_in.contains(anchor), "生产入站表跨行条目解析失效：缺 `{anchor}`");
     }
+    // ② 框架侧 warn+skip 的源码锚点（bd gjqm7）：warn 文案漂移或框架路改为拒启
+    // 都必须触发台账重审——台账 ② 的「框架路 warn+skip」描述靠这两段源码钉住。
+    for anchor in ["has no plugin family (unmigrated)", "bridge conversion failed tag="] {
+        assert!(
+            FRAMEWORK_SRC.contains(anchor),
+            "框架路 warn+skip 锚点丢失（台账 ② 需重审）：{anchor}"
+        );
+    }
 
     let mut rows = classify_coverage(&prod_out, &fw);
     rows.extend(classify_gates(FRAMEWORK_SRC));
     rows.push(classify_inbound(&prod_in, FRAMEWORK_SRC));
     rows.push(LedgerRow {
         class: Class::FailureSemantics,
-        // bd o91s4 收口后：两路都 fail-visible，只剩时机/文案差异（不是行为差）。
-        item: "坏段/缺段：两路均启动前拒启；差异仅时机（生产 register_outbounds 构造期 / \
-               框架插件 build 期）与错误文案"
+        // bd gjqm7 修正（zhvi3 旧结论「两路均拒启，仅时机/文案差」不成立）：
+        // 生产路拒启（bd o91s4，register_outbounds 构造期硬错，运行时探针见下）；
+        // 框架路 warn+skip——未迁移族/桥转换失败的条目静默不达 bridge，进程照常
+        // 起（framework.rs run_framework ①③），与生产路是语义差。
+        item: "坏段/缺段：生产路启动前拒启（register_outbounds 构造期硬错）；\
+               框架路 warn+skip（条目不达 bridge，进程照常起）"
             .to_string(),
         known: true,
     });
@@ -335,9 +355,9 @@ fn unknown_difference_is_reported_not_absorbed() {
     );
 }
 
-/// ② 失败语义差的运行时证据：两路对「未知协议」**都**在启动前失败（bd o91s4 之后
-/// 生产路也 fail-visible），差异只剩失败时机与文案（生产 = `register_outbounds`
-/// 构造期；框架 = 插件 build 期）。
+/// ② 生产侧的运行时证据：生产路对「未知协议」在启动前失败（bd o91s4）。
+/// 台账 ② 的框架侧（warn+skip）由上方 `include_str!` 锚点钉住（bd gjqm7 修正：
+/// 两路**不**等价——框架路不拒启，这是语义差，不是时机/文案差）。
 ///
 /// 本票（zhvi3）发现时的原始状态是生产路 warn + skip（默认可执行文件里没有
 /// 「缺段/坏段 → 启动前 fail-visible」的门）；o91s4 把该门补上后，此探针改为
