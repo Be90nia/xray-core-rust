@@ -96,7 +96,7 @@ async fn ss2022_uot_multi_user_udp_dispatch_roundtrip() {
         parse_ss_config(serde_json::to_vec(&outbound_config_json(server_port)).unwrap().as_slice())
             .expect("parse ss2022 uot config"),
     );
-    // uot/uotVersion 解析进配置（Go shadowsocks.go:243-244 口径）
+    // uot/uotVersion 解析进配置（Rust 扩展：Go 26.10.17 无 UoT）
     assert!(cfg.udp_over_tcp.enabled, "uot:true must be parsed");
     assert_eq!(cfg.udp_over_tcp.version, 1);
     // 多用户密码拆分：iPSK:uPSK → PSK 链收全段

@@ -116,7 +116,6 @@ mod tests {
         let c = default_config();
         assert_eq!(c.auth, "");
         assert_eq!(c.masq_type, "");
-        assert_eq!(c.version, 0);
     }
 
     #[test]
@@ -137,7 +136,6 @@ mod tests {
     /// 全 11 字段填充的 Config（canonical 形态：masq_type 小写、status_code 非 0）。
     fn full_config() -> Config {
         Config {
-            version: 2,
             auth: "server-auth".into(),
             udp_idle_timeout: 60,
             masq_type: "string".into(),
@@ -160,12 +158,8 @@ mod tests {
         use crate::hub::MasqType;
         // 4 种变体 × 自洽 source（variant 消费的 masq 字段填值，其余默认），
         // from_config → to_config → 全 11 字段恒等
-        let direct = Config {
-            version: 2,
-            auth: "server-auth".into(),
-            udp_idle_timeout: 60,
-            ..Config::default()
-        };
+        let direct =
+            Config { auth: "server-auth".into(), udp_idle_timeout: 60, ..Config::default() };
         let cases: Vec<(Config, MasqType)> = vec![
             (Config { masq_type: String::new(), ..direct.clone() }, MasqType::NotFound),
             (
@@ -220,12 +214,11 @@ mod tests {
 
     #[test]
     fn transport_config_direct_fields_documented_consumers() {
-        // version/auth/udp_idle_timeout 非 masq 字段：运行时直接读 prost 字段
+        // auth/udp_idle_timeout 非 masq 字段：运行时直接读 prost 字段
         //（Go hub.go:63 config.Auth、hub.go:95 config.UdpIdleTimeout、
-        // dialer.go:202 config.Auth；version 仅 JSON 层校验 ==2，
-        // infra/conf/transport_internet.go:526-527）。
+        // dialer.go:202 config.Auth）。`version` 不在 proto：Go
+        // `hysteria/config.proto:10` 是 `reserved 1`，JSON 校验归 infra/conf。
         let c = full_config();
-        assert_eq!(c.version, 2);
         assert_eq!(c.auth, "server-auth");
         assert_eq!(c.udp_idle_timeout, 60);
     }

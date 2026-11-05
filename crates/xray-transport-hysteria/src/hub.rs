@@ -66,7 +66,7 @@ impl MasqType {
     /// - NotFound → `masq_type = ""`（Go 默认分支，hub.go:212）
     /// - String status_code 恒写非 0 值（from_config 已把 0 归一为 200）
     ///
-    /// `version`/`auth`/`udp_idle_timeout` 三字段不在 masq 范围，
+    /// `auth`/`udp_idle_timeout` 两字段不在 masq 范围，
     /// 由上层直接读写 prost Config（Go hub.go:63/95、dialer.go:202）。
     pub fn to_config(&self, config: &mut Config) {
         match self {

@@ -5,9 +5,7 @@
 use std::time::Duration;
 
 pub use xray_features::policy::SystemStats;
-use xray_features::policy::{
-    BufferPolicy, DEFAULT_BUFFER_WRITE, Policy, StatsPolicy, TimeoutPolicy,
-};
+use xray_features::policy::{BufferPolicy, Policy, StatsPolicy, TimeoutPolicy};
 use xray_proto::xray::app::policy::{
     Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
 };
@@ -82,29 +80,25 @@ pub fn policy_from_proto(proto: &ProtoPolicy) -> Policy {
 
 /// 把 proto `SystemPolicy` 转换为本地 [`SystemStats`]。
 ///
-/// 对应 Go `(*SystemPolicy).ToCorePolicy()`。Batch10 P3 增补 proto `buffer`
-/// 子消息透传到 `SystemStats.buffer.connection`（i32 1:1）。
+/// 对应 Go `(*SystemPolicy).ToCorePolicy()`。Go `System.Buffer` 由
+/// `defaultBufferPolicy()` 供给（`features/policy/policy.go:118-121`），proto
+/// `SystemPolicy` 只有 `stats` → buffer 恒回落架构/环境默认。
 pub fn system_stats_from_proto(proto: &ProtoSystemPolicy) -> SystemStats {
     let stats = proto.stats.as_ref();
-    let buffer = proto.buffer.as_ref().map_or_else(BufferPolicy::default, |b| BufferPolicy {
-        connection: b.connection,
-        write: DEFAULT_BUFFER_WRITE,
-    });
     SystemStats {
         inbound_uplink: stats.map(|s| s.inbound_uplink).unwrap_or(false),
         inbound_downlink: stats.map(|s| s.inbound_downlink).unwrap_or(false),
         outbound_uplink: stats.map(|s| s.outbound_uplink).unwrap_or(false),
         outbound_downlink: stats.map(|s| s.outbound_downlink).unwrap_or(false),
-        buffer,
+        buffer: BufferPolicy::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use xray_features::policy::DEFAULT_BUFFER_CONNECTION;
     use xray_proto::xray::app::policy::{
         policy::{Buffer as PolicyBuffer, Stats as PolicyStats, Timeout as PolicyTimeout},
-        system_policy::{Buffer as SystemPolicyBuffer, Stats as SystemPolicyStats},
+        system_policy::Stats as SystemPolicyStats,
     };
 
     use super::*;
@@ -210,7 +204,7 @@ mod tests {
 
     #[test]
     fn system_stats_from_proto_default() {
-        let proto = ProtoSystemPolicy { stats: None, buffer: None };
+        let proto = ProtoSystemPolicy { stats: None };
         let s = system_stats_from_proto(&proto);
         assert!(!s.inbound_uplink);
         assert!(!s.inbound_downlink);
@@ -230,7 +224,6 @@ mod tests {
                 outbound_uplink: true,
                 outbound_downlink: true,
             }),
-            buffer: None,
         };
         let s = system_stats_from_proto(&proto);
         assert!(s.inbound_uplink);
@@ -248,51 +241,11 @@ mod tests {
                 outbound_uplink: true,
                 outbound_downlink: false,
             }),
-            buffer: None,
         };
         let s = system_stats_from_proto(&proto);
         assert!(!s.inbound_uplink);
         assert!(s.inbound_downlink);
         assert!(s.outbound_uplink);
         assert!(!s.outbound_downlink);
-    }
-
-    // ====== 改（Batch10 P3 SystemPolicy proto buffer）======
-
-    #[test]
-    fn system_stats_from_proto_buffer_override_positive() {
-        let proto = ProtoSystemPolicy {
-            stats: None,
-            buffer: Some(SystemPolicyBuffer { connection: 2048 }),
-        };
-        let s = system_stats_from_proto(&proto);
-        assert_eq!(s.buffer.connection, 2048);
-    }
-
-    #[test]
-    fn system_stats_from_proto_buffer_override_unlimited() {
-        // SystemPolicy proto Buffer.connection=-1 → SystemStats.buffer.connection=-1（直接透传）。
-        let proto =
-            ProtoSystemPolicy { stats: None, buffer: Some(SystemPolicyBuffer { connection: -1 }) };
-        let s = system_stats_from_proto(&proto);
-        assert_eq!(s.buffer.connection, -1_i32);
-    }
-
-    #[test]
-    fn system_stats_from_proto_buffer_zero_is_legal() {
-        // SystemPolicy proto Buffer.connection=0 表示 ZeroBuffer；不走 default。
-        let proto =
-            ProtoSystemPolicy { stats: None, buffer: Some(SystemPolicyBuffer { connection: 0 }) };
-        let s = system_stats_from_proto(&proto);
-        assert_eq!(s.buffer.connection, 0, "Buffer=0 must survive round-trip");
-        assert_ne!(s.buffer.connection, DEFAULT_BUFFER_CONNECTION);
-    }
-
-    // 编译期自检：保证新生成 SystemPolicyBuffer struct 字段存在。
-    #[test]
-    fn system_policy_buffer_field_exists_compile_time() {
-        let buf = SystemPolicyBuffer::default();
-        assert_eq!(buf.connection, 0);
-        let _ = buf;
     }
 }

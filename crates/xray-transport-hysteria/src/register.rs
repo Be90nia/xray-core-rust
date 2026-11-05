@@ -309,7 +309,9 @@ async fn dial_hysteria(
 /// - `masquerade`：伪装配置嵌套对象（Go 用户配置形态，infra/conf transport_internet.go:498-510
 ///   `Masquerade` struct → :542-549 展开为 proto 扁平字段）
 /// - `udpIdleTimeout`：UDP 空闲超时（秒）
-/// - `version`：协议版本
+///
+/// `version` 不在接受面内：Go `transport/internet/hysteria/config.proto:10` 是
+/// `reserved 1`，JSON 层校验归 `xray-conf` lint（Go `infra/conf` 语义）。
 ///
 /// `None` 返回默认配置。
 fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
@@ -349,9 +351,7 @@ fn parse_hysteria_config(json: Option<&serde_json::Value>) -> io::Result<Config>
             }
         },
     };
-    let version = obj.get("version").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-
-    let mut config = Config { auth, masq_type, udp_idle_timeout, version, ..Config::default() };
+    let mut config = Config { auth, masq_type, udp_idle_timeout, ..Config::default() };
     if let Some(m) = obj.get("masquerade") {
         crate::proto_config::apply_masquerade_json(&mut config, m)?;
     }
@@ -448,7 +448,12 @@ mod tests {
         let cfg = parse_hysteria_config(Some(&v)).unwrap();
         assert_eq!(cfg.auth, "my-token");
         assert_eq!(cfg.udp_idle_timeout, 120);
-        assert_eq!(cfg.version, 2);
+        // Go `hysteria/config.proto:10` 是 `reserved 1`：JSON `version` 不进 proto。
+        // 仅 version 不同的两份配置必须产出同一个 proto（tag 1 永不写）。
+        let v1: serde_json::Value =
+            serde_json::from_str(r#"{"auth":"my-token","udpIdleTimeout":120,"version":1}"#)
+                .unwrap();
+        assert_eq!(cfg, parse_hysteria_config(Some(&v1)).unwrap());
     }
 
     #[test]

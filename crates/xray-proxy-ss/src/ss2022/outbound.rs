@@ -70,7 +70,9 @@ impl std::fmt::Debug for Ss2022Outbound {
 
 /// SS-2022 UDP 出站配置（支持 UDP-over-TCP 模式）。
 ///
-/// 对应 Go `ClientConfig.udp_over_tcp` + `udp_over_tcp_version`。
+/// Rust 扩展：Go 26.10.17 全仓无 UoT（`proxy/shadowsocks_2022/config.proto` 的
+/// `ClientConfig` 只有 address/port/method/key），故本配置只由 JSON
+/// `uot`/`uotVersion` 承载，不经 proto。
 #[derive(Debug, Clone, Default)]
 pub struct UdpOverTcpConfig {
     /// 是否启用 UDP-over-TCP。

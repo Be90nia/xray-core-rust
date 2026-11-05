@@ -5,28 +5,10 @@
 
 use std::collections::HashMap;
 
-use thiserror::Error;
 use xray_features::policy::{Policy, PolicyManager};
 use xray_proto::xray::app::policy::Config;
 
 use crate::convert::{SystemStats, policy_from_proto, system_stats_from_proto};
-
-/// Manager 构造错误。
-#[derive(Debug, Error)]
-pub enum ManagerError {
-    /// `system.buffer` 在 Go `app/policy/config.proto` 的 `SystemPolicy` 里**不存在**
-    /// （只有 `stats`），Rust 侧的 proto 扩展没有消费点：per-connection 管道上限
-    /// 只认 level 策略（`levels.<n>.bufferSize`，dispatcher 读 `Policy.buffer`）。
-    /// 装配期拒启，不留"配了不生效"的静默面（bd kyy50 ParityS3b）。
-    #[error(
-        "policy: system.buffer.connection={connection} has no consumer and is absent from Go's \
-         SystemPolicy proto; configure per-level `levels.<n>.bufferSize` instead"
-    )]
-    UnsupportedSystemBuffer {
-        /// 被拒的 `system.buffer.connection` 值（字节，-1=无限）。
-        connection: i32,
-    },
-}
 
 /// Policy manager 实例。
 ///
@@ -44,18 +26,13 @@ impl Manager {
     /// 对应 Go `New(ctx, config)`。Go 源码中 `ctx` 未使用，Rust 省略。
     /// 每个 level 的 proto Policy 先与默认值合并（Go `defaultPolicy().overrideWith(p)`），
     /// 再缓存到 `levels` 表里。
-    pub fn new(config: Config) -> Result<Self, ManagerError> {
-        // Go proto 没有 `SystemPolicy.Buffer`，且全仓无消费点：放行就等于
-        // 「配了静默无效」，装配期直接拒（bd kyy50）。
-        if let Some(buffer) = config.system.as_ref().and_then(|s| s.buffer.as_ref()) {
-            return Err(ManagerError::UnsupportedSystemBuffer { connection: buffer.connection });
-        }
+    pub fn new(config: Config) -> Self {
         let mut levels = HashMap::with_capacity(config.level.len());
         for (lv, proto_policy) in &config.level {
             levels.insert(*lv, policy_from_proto(proto_policy));
         }
         let system = config.system.as_ref().map(system_stats_from_proto).unwrap_or_default();
-        Ok(Self { levels, system })
+        Self { levels, system }
     }
 }
 
@@ -119,7 +96,7 @@ mod tests {
 
     #[test]
     fn manager_new_empty_config() {
-        let m = Manager::new(Config::default()).unwrap();
+        let m = Manager::new(Config::default());
         assert_eq!(m.for_system(), SystemStats::default());
         assert_eq!(
             m.policy_for_level(0).timeout.handshake,
@@ -137,7 +114,7 @@ mod tests {
             },
             system: None,
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let p = manager.policy_for_level(1);
         assert!(p.stats.user_uplink);
         assert!(!p.stats.user_downlink);
@@ -153,7 +130,7 @@ mod tests {
             },
             system: None,
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let p = manager.policy_for_level(99);
         assert!(!p.stats.user_uplink);
         assert!(!p.stats.user_downlink);
@@ -170,10 +147,9 @@ mod tests {
                     outbound_uplink: true,
                     outbound_downlink: false,
                 }),
-                buffer: None,
             }),
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let s = manager.for_system();
         assert!(s.inbound_uplink);
         assert!(!s.inbound_downlink);
@@ -184,32 +160,8 @@ mod tests {
     #[test]
     fn manager_default_system_stats_when_absent() {
         let cfg = Config { level: HashMap::new(), system: None };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         assert_eq!(manager.for_system(), SystemStats::default());
-    }
-
-    /// bd kyy50（ParityS3b）：`system.buffer` 无消费点 → 装配期硬错，禁静默无效。
-    /// 修前红：`Manager::new` 恒 `Ok`，配了 `system.buffer` 的实例照常启动且不生效。
-    #[test]
-    fn manager_rejects_system_buffer_setting() {
-        for connection in [2048, -1, 0] {
-            let cfg = Config {
-                level: HashMap::new(),
-                system: Some(ProtoSystemPolicy {
-                    stats: None,
-                    buffer: Some(xray_proto::xray::app::policy::system_policy::Buffer {
-                        connection,
-                    }),
-                }),
-            };
-            let Err(err) = Manager::new(cfg) else {
-                panic!("system.buffer must be rejected");
-            };
-            let msg = err.to_string();
-            assert!(msg.contains("system.buffer"), "error must name the rejected key: {msg}");
-            assert!(msg.contains("bufferSize"), "error must name the supported knob: {msg}");
-            assert!(msg.contains(&connection.to_string()), "error must echo the value: {msg}");
-        }
     }
 
     #[test]
@@ -222,7 +174,7 @@ mod tests {
             },
             system: None,
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let p = manager.policy_for_level(5);
         assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(42));
         // 未覆盖的字段保留默认
@@ -231,7 +183,7 @@ mod tests {
 
     #[test]
     fn manager_implements_policy_manager_trait() {
-        let m = Manager::new(Config::default()).unwrap();
+        let m = Manager::new(Config::default());
         // 通过 trait object 验证接口可用
         let pm: &dyn PolicyManager = &m;
         let p = pm.policy_for_level(0);
@@ -253,7 +205,7 @@ mod tests {
             },
             system: None,
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let p = manager.policy_for_level(0);
         assert!(p.stats.user_online);
         assert!(!p.stats.user_uplink);
@@ -263,7 +215,7 @@ mod tests {
     fn manager_level_1_conn_idle_promoted_to_600s() {
         // 对齐 Go features/policy/default.go:18-20：level==1 时 ConnectionIdle 强制为 600s
         // （覆盖 SessionDefault 的 300s）。其它字段保持默认。
-        let m = Manager::new(Config::default()).unwrap();
+        let m = Manager::new(Config::default());
         let p = m.policy_for_level(1);
         assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(600));
         // 其他超时仍是 SessionDefault 值
@@ -275,7 +227,7 @@ mod tests {
     #[test]
     fn manager_level_0_keeps_default_300s() {
         // 对齐 Go SessionDefault().Timeouts.ConnectionIdle=300s（policy.go:119）。
-        let m = Manager::new(Config::default()).unwrap();
+        let m = Manager::new(Config::default());
         let p = m.policy_for_level(0);
         assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(300));
         assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(60));
@@ -304,7 +256,7 @@ mod tests {
             },
             system: None,
         };
-        let manager = Manager::new(cfg).unwrap();
+        let manager = Manager::new(cfg);
         let p = manager.policy_for_level(1);
         assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(7200));
     }

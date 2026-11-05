@@ -33,7 +33,7 @@ pub mod manager;
 
 pub use convert::{SystemStats, policy_from_proto, system_stats_from_proto};
 pub use feature::PolicyFeature;
-pub use manager::{Manager, ManagerError};
+pub use manager::Manager;
 pub use xray_proto::xray::app::policy::{
     Config, Policy as ProtoPolicy, Second, SystemPolicy as ProtoSystemPolicy,
 };

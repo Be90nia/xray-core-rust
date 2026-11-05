@@ -272,7 +272,7 @@ pub fn parse_ss_config(data: &[u8]) -> Result<SsOutboundConfig, String> {
         let port = u16::try_from(port).map_err(|_| "port out of range")?;
         let level = first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let email = first.get("email").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // uot/uotVersion → UdpOverTcpConfig（Go shadowsocks.go:243-244，零值 false/0）。
+        // uot/uotVersion → UdpOverTcpConfig（Rust 扩展，Go 26.10.17 无 UoT；零值 false/0）。
         let uot_cfg = UdpOverTcpConfig {
             enabled: first.get("uot").and_then(|v| v.as_bool()).unwrap_or(false),
             version: first.get("uotVersion").and_then(|v| v.as_i64()).unwrap_or(0) as u32,
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn parse_ss_config_maps_uot_to_udp_over_tcp() {
-        // 2022 路径：uot/uotVersion → UdpOverTcpConfig（Go shadowsocks.go:243-244）。
+        // 2022 路径：uot/uotVersion → UdpOverTcpConfig（Rust 扩展，Go 无 UoT）。
         let data = br#"{"servers":[{"address":"ss.example.com","port":8388,
             "method":"2022-blake3-aes-256-gcm",
             "password":"aGkgZnJvbSBzczIwMjIgc2VydmVyIHByaW1hcnkga2V5IQ==",
