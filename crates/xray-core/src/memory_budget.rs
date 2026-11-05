@@ -26,6 +26,46 @@ pub const XRAY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 /// （16MB/方向 × 数十连接即吃满预算）这类配置级超支。
 pub const MAX_PER_CONN_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
 
+/// 每连接 **socket** 缓冲上限（显式值，字节）——与 [`MAX_PER_CONN_BUFFER_BYTES`]
+/// **同口径**：二者共用同一个 4 MiB 每连接份额，pipe 与 socket 不重复计账。
+///
+/// 依据（bd u91se ④ PM 终裁 2026-11-05）：显式 `receiveBufferSize` /
+/// `sendBufferSize`（TCP 三 transport 收 + QUIC/UDP 端点收/发各向）分三档——
+/// `≤ 4 MiB` 免确认直接生效；`4 MiB < v ≤ 64 MiB` 需 `XRAY_ALLOW_LARGE_RCVBUF=1`
+/// 确认；`> 64 MiB` 恒拒。判定用**用户设定值**（Linux 回读受 `rmem_max` 钳制偏小，
+/// 回读小 ≠ 没超限），超限 fail-visible 拒拨/拒绑，**禁静默钳制**。
+///
+/// 记账：每条连接 ≤ 4 MiB，条数 × 4 MiB 计入整机 96 MB（[`XRAY_BUDGET_BYTES`]）。
+/// 执行点（Trans2 已落地）：`xray_transport::sockopt::MAX_EXPLICIT_RECEIVE_BUFFER_SIZE`
+/// / `MAX_EXPLICIT_UDP_BUFFER_SIZE`（后者 = 64 MiB 硬顶，4 MiB 免确认档同
+/// [`xray_transport::sockopt::SO_RCVBUF_FREE_TIER_MAX`]）。
+pub const MAX_EXPLICIT_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// QUIC/UDP socket **缺省**接收缓冲（字节/连接）= 8 MiB，**行为不动**（登记项）。
+///
+/// Go quic-go `wrapConn` 的 `DesiredReceiveBufferSize` parity
+/// （`internal/protocol/params.go:5-9`，`sys_conn.go:51-53`）：缺省
+/// `receiveBufferSize=0` ⇒ [`xray_transport::sockopt::bind_udp_endpoint`] 的
+/// `tune_udp_buffer` 只升不降到本值（Linux 再走 `SO_RCVBUFFORCE`，失败只 warn）。
+/// 对拍一致优先于本地优化，故本项只登记 + 披露，不改缺省。
+///
+/// **Windows 无 `net.core.rmem_max` 钳制** ⇒ 每 socket 真 8 MiB，内核记账 ×2
+/// ⇒ 按 [`QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES`]（16 MiB/连接）口径。
+/// Linux 受 `net.core.rmem_max` 钳制（stock ≈416 KiB 实际账面）⇒ 8 MiB 只在运维
+/// 抬过 `rmem_max` 后成立。TCP 路径缺省为 0（不设，交 OS autotune，bd r5j96）。
+pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
+/// socket 缓冲的**内核记账倍数**：`SO_RCVBUF` 设定值 ×2 才等于内核账面字节
+/// （设定值的一半是纯开销，同 `docs/guide-highrtt-sockopt.md` §96-98）。
+pub const SOCKET_KERNEL_BOOKKEEPING_FACTOR: usize = 2;
+
+/// QUIC/UDP 缺省接收缓冲的**账面**口径（字节/连接）= 8 MiB × 2 = 16 MiB。
+///
+/// 256 MB 机型判据：QUIC 连接数 × 本值必须落在 [`XRAY_BUDGET_BYTES`] 内
+/// （例：32 个 QUIC 连接 ≈ 512 MiB 账面 ⇒ 已超整机预算）。
+pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES: usize =
+    QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR;
+
 /// 握手在途任务并发上限（P0-1 accept 解耦后 per-conn 握手任务数）。
 ///
 /// 128 × ~6KB/任务 ≈ 0.75MB ≤ 1MB 配额。**执行点在 ws/httpupgrade accept 接线
@@ -188,5 +228,54 @@ mod tests {
             DNS_CACHE_MAX_ENTRIES,
             "xray-app-dns 缓存上界与本登记簿不一致：两处同步改（bd azcoe）"
         );
+    }
+
+    /// socket 显式缓冲上限与 transport 机制面**同一常量**（bd u91se ④）：
+    /// 改 transport 闸而不同步登记簿 ⇒ 96 MB 分账失真。
+    #[test]
+    fn socket_buffer_ledger_matches_transport_gate() {
+        use xray_transport::sockopt;
+        assert_eq!(
+            sockopt::MAX_EXPLICIT_RECEIVE_BUFFER_SIZE,
+            MAX_EXPLICIT_SOCKET_BUFFER_BYTES,
+            "transport TCP 显式接收缓冲上限与本登记簿不一致（bd u91se ④）"
+        );
+        // pipe 与 socket 同口径：同一笔 4 MiB 每连接份额（不重复计账）。
+        assert_eq!(
+            usize::try_from(MAX_PER_CONN_BUFFER_BYTES).expect("4 MiB 恒正"),
+            MAX_EXPLICIT_SOCKET_BUFFER_BYTES,
+            "socket 显式上限必须与 pipe 每连接份额同口径（4 MiB）"
+        );
+        // UDP 显式值走同一 4 MiB 免确认档（Trans2：check_explicit_udp_buffer_size）；
+        // 其硬顶是 64 MiB 防手滑线，与 TCP 硬顶同源。
+        assert_eq!(
+            sockopt::SO_RCVBUF_FREE_TIER_MAX,
+            MAX_EXPLICIT_SOCKET_BUFFER_BYTES,
+            "UDP 显式值免确认档必须与登记簿同值"
+        );
+        assert_eq!(
+            sockopt::MAX_EXPLICIT_UDP_BUFFER_SIZE,
+            sockopt::SO_RCVBUF_HARD_MAX,
+            "UDP 显式值硬顶必须与 TCP 硬顶同源"
+        );
+    }
+
+    /// QUIC/UDP 缺省接收缓冲与 sockopt 侧 parity 下限**同一常量**（bd lidaf ①）：
+    /// 缺省行为不动（8 MiB 是 Go quic-go wrapConn parity），只要求两处不漂移。
+    #[test]
+    fn quic_udp_default_buffer_ledger_matches_sockopt_parity() {
+        use xray_transport::sockopt;
+        assert_eq!(
+            sockopt::QUIC_UDP_MIN_BUFFER,
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES,
+            "QUIC/UDP 缺省接收缓冲与本登记簿不一致（bd lidaf ①）"
+        );
+        // 账面口径 = 设定值 × 内核 2× 记账（Windows 无 rmem_max 钳制时真占这么多）。
+        assert_eq!(
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR,
+            "账面口径必须等于设定值 × 内核记账倍数"
+        );
+        assert_eq!(SOCKET_KERNEL_BOOKKEEPING_FACTOR, 2, "内核 SO_RCVBUF 记账恒 2×（§96-98）");
     }
 }

@@ -131,6 +131,40 @@ WSL 同台架三方对照（netem 150ms / RTT 300ms / ss2022，n=20，报告 `re
 - 大并发部署的降档路径：receiveBufferSize 降到 1-2MB（2MB @ 322ms 仍支撑 ~50Mbps），或改走 §5 宿主级方案（无 per-socket 记账翻倍）。
 - 上面的账面公式按 4 MiB 档算；**大档（§3.5）按 `并发 × 2 × 实际值`** 算（例如 16 MiB 档 ⇒ 每连接账面 32 MiB ⇒ 100 并发即 3.2 GB 账面）。
 
+### 4.1 QUIC/UDP 的**缺省**接收缓冲：8 MiB/连接（不写配置也占）
+
+**这一项与 `receiveBufferSize` 无关**——它是 QUIC 系端点（quic / hysteria / tuic 的 UDP socket）
+的**缺省**行为，对齐 Go quic-go `wrapConn` 的 `DesiredReceiveBufferSize`（8 MiB），
+见 `crates/xray-transport/src/sockopt/mod.rs::QUIC_UDP_MIN_BUFFER`（`bind_udp_endpoint` 的
+`tune_udp_buffer` 只升不降到该值；Linux 再试 `SO_RCVBUFFORCE`）。
+
+| 平台 | 每个 UDP socket 实际接收缓冲 | 账面口径（内核 ×2） |
+|---|---|---|
+| **Windows** | 无 `rmem_max` 钳制 ⇒ **真 8 MiB** | **16 MiB/连接** |
+| Linux（stock `net.core.rmem_max`≈208KB） | 钳到 ~208KB（FORCE 需 CAP_NET_ADMIN） | ~416 KiB/连接 |
+| Linux（运维抬过 `rmem_max` ≥8MB） | 8 MiB | 16 MiB/连接 |
+
+**连接数 × 内存关系表（Windows / 抬过 `rmem_max` 的 Linux，16 MiB 账面口径）**：
+
+| QUIC/UDP 连接数 | 账面内存 |
+|---|---|
+| 1 | 16 MiB |
+| 8 | 128 MiB |
+| 32 | **512 MiB（已超 256 MB 机型整机预算）** |
+| 64 | 1 GiB |
+| 256 | 4 GiB |
+
+判据：**256 MB 小机的 QUIC/UDP 连接数应按「≤ xray 预算 ÷ 16 MiB」估**（再扣除同机 TCP
+pipe/其它池的份额）：`memory_budget.rs` 的 96 MB 预算下，16 MiB 账面口径理论只容得下 **6 条**
+并发 QUIC 连接。实际物理占用只在积压到高水位时才真实发生（同 §4 的 TCP 结论），但**内核账面**
+会先撞压力线。
+
+**TCP 路径不在此列**：`receiveBufferSize` 缺省 = `0` = 不设置 socket，交 OS autotune
+（bd r5j96 裁决；WSL netem 150ms 实测 ours 7.09-7.67 ≈ go 7.00-7.09 ≈ sing-box
+6.87-7.09 MB/s）。显式值仍受 §3.5 三档闸约束（4 MiB 免确认 / ≤64 MiB 需
+`XRAY_ALLOW_LARGE_RCVBUF=1` / >64 MiB 恒拒），UDP 的显式 `receiveBufferSize` /
+`sendBufferSize` 走同一闸（超限拒绑，不静默钳制）。
+
 ## 5. 宿主级备选：tcp_rmem
 
 ```bash

@@ -898,8 +898,9 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
 /// `internal/protocol/params.go:5-9`（Xray fork v0.61.1）：`DesiredReceiveBufferSize`
 /// 与 `DesiredSendBufferSize` 同为 8MB。Go 侧在每个 QUIC UDP socket 上自动应用
 /// （`sys_conn.go:51-53`），Rust quinn-udp 无对应行为——本常量是 [`bind_udp_endpoint`]
-/// 默认路径的 parity 下限。
-const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
+/// 默认路径的 parity 下限。**pub 是为了登记簿交叉断言**（`xray-core`
+/// `memory_budget.rs` 的 socket 项必须与本常量同步，bd u91se ④ / lidaf ①）。
+pub const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
 
 /// QUIC 系 UDP 端点 socket 创建：族匹配的 DGRAM socket + 缓冲调谐 + bind。
 ///
