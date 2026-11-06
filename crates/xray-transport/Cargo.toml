@@ -57,6 +57,12 @@ hickory-resolver = { workspace = true }
 bytes = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
+# xdns DoH-over-QUIC（RFC 8484 over HTTP/3，bd lf69h 后半）：Go `resolver_doh.go:52-104`
+# 的 `http3.Transport` 对位。三件均为 workspace 既有依赖（quinn 0.11 / h3 0.0.8 /
+# h3-quinn 0.0.10，仓内 splithttp H3 / tuic / hysteria 同源），零新增外部 crate。
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
 # B6（bd t975）第二波：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-observatory（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "pool"] }

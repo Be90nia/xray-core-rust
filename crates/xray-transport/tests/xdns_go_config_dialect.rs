@@ -7,8 +7,9 @@
 //!    extraPoll}` 能被读入（此前强制 `type`+`settings` 键，Go 写的配置整段读不进）；
 //! 2. Rust 旧方言（`type`/`settings`）硬错指路——它 Go 侧是未知键（静默忽略 → xdns
 //!    实际失效），禁再产；
-//! 3. `https`（DoH）Go 支持且本栈已实现（bd lf69h）→ 配置期读入；DoH-over-QUIC （`quic://` / `quicConfig`
-//!    / ALPN h3）本轮未实现 → 配置期点名指路 `https://`， 不静默降级成 udp。
+//! 3. `https`（DoH）Go 支持且本栈已实现（bd lf69h）→ 配置期读入；`tlsConfig.alpn ["h3"]` = DoH-over-QUIC（HTTP/3）同样读入；`quic://`
+//!    scheme Go 侧就是 "invalid protocol"（非 tcp/udp/https）⇒ `quic://` 配置期点名指路 `https://`，
+//!    不静默降级成 udp。
 //!
 //! 字段级断言（type/addr/worker/tls/quic 逐项）在 `src/finalmask/xdns/mod.rs` 单测。
 
@@ -70,15 +71,30 @@ fn doh_resolver_loads() {
     build_udpmask_manager_from_json(Some(&json)).expect("https resolver 必须可读入");
 }
 
-/// DoH-over-QUIC（本轮未实现）：`quic://` 错误文案点名并指路 `https://`。
+/// `quic://` scheme：Go `:903-904` 对非 tcp/udp/https 一律 "invalid protocol"，本栈
+/// 保留更明确的指路文案（DoH-over-QUIC 走 `https://` + `tlsConfig.alpn ["h3"]`）。
 #[test]
-fn doh_over_quic_rejected_loudly() {
+fn quic_scheme_rejected_loudly() {
     let json = udpmask(serde_json::json!({ "resolvers": [{ "addrs": ["quic://8.8.8.8:53"] }] }));
     let Err(e) = build_udpmask_manager_from_json(Some(&json)) else {
-        panic!("DoH-over-QUIC 必须硬错");
+        panic!("quic:// 必须硬错");
     };
     assert!(e.to_string().contains("DoH-over-QUIC"), "错误须点明 DoH-over-QUIC：{e}");
     assert!(e.to_string().contains("https://"), "错误须指路 https：{e}");
+}
+
+/// `https://` + `tlsConfig.alpn ["h3"]` + `quicConfig`：DoH-over-QUIC 配置期读入
+/// （连接期的 H3 端到端见 `src/finalmask/xdns/doh3.rs::doh3_resolver_end_to_end`）。
+#[test]
+fn doh_over_quic_config_loads() {
+    let json = udpmask(serde_json::json!({
+        "domains": [{ "names": ["t.example.com"] }],
+        "resolvers": [{ "addrs": ["https://dns.google/dns-query"], "worker": 4,
+                        "tlsConfig": { "serverName": "dns.google", "alpn": ["h3"] },
+                        "quicConfig": { "congestion": "bbr", "maxIdleTimeout": 30,
+                                        "keepAlivePeriod": 10 } }]
+    }));
+    build_udpmask_manager_from_json(Some(&json)).expect("DoH-over-QUIC 配置必须可读入");
 }
 
 /// 未知 scheme（Go `:903-904` → "invalid protocol"）同样配置期硬错。

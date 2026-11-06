@@ -13,6 +13,7 @@
 //! - `client`：`XdnsConnClient` 实现 [`super::UdpIo`]（Go `client.go`）
 //! - `server`：`XdnsConnServer` 实现 [`super::UdpIo`]（Go `server.go`）
 //! - `doh`：DoH resolver（RFC 8484，对应 Go `resolver_doh.go`）
+//! - `doh3`：DoH-over-QUIC（HTTP/3，ALPN `["h3"]` 时启用，对应 `resolver_doh.go:52-104`）
 //! - `base32`：RFC4648 base32（无 padding）
 //!
 //! 配置形态对齐 Go v26.10.17 `XDNS`（`infra/conf/transport_finalmask.go:815-911`）：
@@ -20,13 +21,14 @@
 //! `addrs` 项的 URL scheme 决定（见 `build_resolver_configs`）：`udp` / `tcp` /
 //! `https`（DoH）。Rust finalmask 隧道为 UDP-only ⇒ `tcp` resolver 运行期拒绝
 //! （Go `resolver_tcp.go` 经 finalmask 拨号，本栈无 TCP 拨号句柄）；DoH 走独立
-//! TLS+h2 直连（差异见 `doh` 模块头）；DoH-over-QUIC（`quicConfig` / ALPN h3）
-//! 本轮未实现，配置期硬错点路。
+//! TLS+h2 直连，`tlsConfig.alpn == ["h3"]` 时改走 HTTP/3 over QUIC（差异见 `doh`
+//! 与 `doh3` 模块头）。
 
 pub(crate) mod base32;
 mod client;
 mod dns;
 mod doh;
+mod doh3;
 mod domain;
 mod frag;
 mod resp;
@@ -247,7 +249,8 @@ pub(crate) fn build_domain_config(v: &serde_json::Value) -> io::Result<Vec<Domai
 ///   配置期硬错，同 Go `NewDOHResolver` "invalid worker"）
 /// - `tlsConfig`/`quicConfig`：只被 `NewDOHResolver` 读（`resolver_doh.go:46-53`）⇒ 仅在 `https`
 ///   项上校验并 materialize 成 [`doh::DohParams`]（udp/tcp 上恒 inert， 与 Go
-///   运行时等价）；未支持键/`quicConfig` 配置期硬错（禁静默忽略）
+///   运行时等价）；`tlsConfig` 未支持键配置期硬错（禁静默忽略），`quicConfig` 按 Go
+///   `QuicParamsConfig.Build()` 校验后只在 ALPN `["h3"]` 时生效
 /// - `type`/`settings`：Rust 旧方言，Go 无此键 ⇒ 硬错指路
 pub(crate) fn build_resolver_configs(v: &serde_json::Value) -> io::Result<Vec<ResolverConfig>> {
     let mut out = Vec::new();
@@ -315,8 +318,9 @@ fn resolve_addr(raw: &str) -> io::Result<(ResolverKind, String)> {
         "tcp" => ResolverKind::Tcp,
         // Go 保留 `url.String()`（含 path/query）——DoH 的 POST 目标就是它
         "https" => return Ok((ResolverKind::Doh, url.to_string())),
-        // DoH-over-QUIC 本轮未实现：点名指路，不做静默降级（Go 侧走 ALPN h3 的
-        // http3.Transport，见 resolver_doh.go:47-60）
+        // Go `:903-904` 对 tcp/udp/https 之外的 scheme 一律 "invalid protocol"（`quic://`
+        // 同样被拒；DoH-over-QUIC 走 `https://` + `tlsConfig.alpn ["h3"]`）⇒ 本栈保留
+        // 更明确的指路文案，不做静默降级。
         "quic" | "http3" => return Err(doh::doh_over_quic()),
         other => return Err(mask_err(format!("xdns: invalid protocol {other:?}"))),
     };
@@ -523,19 +527,31 @@ mod tests {
         .unwrap();
         assert!(rs[0].doh.is_none() && rs[0].tls_config.is_none());
 
-        // quicConfig / h3 → DoH-over-QUIC 硬错
-        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+        // quicConfig（无 alpn h3）→ 配置期读入，仍走 h2（Go 只在 h3 分支消费其值）
+        let rs = build_resolver_configs(&serde_json::json!({"resolvers": [{
             "addrs": ["https://dns.google/dns-query"], "quicConfig": {"congestion": "bbr"}
-        }]})) else {
-            panic!("quicConfig 必须硬错");
-        };
-        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
-        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+        }]}))
+        .unwrap();
+        let doh = rs[0].doh.as_ref().expect("https 必须产出 DoH 参数");
+        assert!(!doh.h3, "无 alpn [\"h3\"] ⇒ 仍 h2");
+        assert_eq!(doh.tls.alpn, vec!["h2".to_string()]);
+        // alpn ["h3"] → DoH-over-QUIC（bd lf69h 后半）
+        let rs = build_resolver_configs(&serde_json::json!({"resolvers": [{
             "addrs": ["https://dns.google/dns-query"], "tlsConfig": {"alpn": ["h3"]}
+        }]}))
+        .unwrap();
+        let doh = rs[0].doh.as_ref().expect("https 必须产出 DoH 参数");
+        assert!(doh.h3, "alpn [\"h3\"] 必须走 HTTP/3");
+        assert_eq!(doh.tls.alpn, vec!["h3".to_string()]);
+        // 未实现的 congestion（brutal/force-brutal）配置期硬错
+        let Err(e) = build_resolver_configs(&serde_json::json!({"resolvers": [{
+            "addrs": ["https://dns.google/dns-query"],
+            "tlsConfig": {"alpn": ["h3"]},
+            "quicConfig": {"congestion": "force-brutal"}
         }]})) else {
-            panic!("alpn h3 必须硬错");
+            panic!("force-brutal 必须硬错");
         };
-        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
+        assert!(e.to_string().contains("force-brutal"), "{e}");
     }
 
     /// Go 侧 fixture（Go xray-core config.pb.go proto.Marshal 真实输出，
@@ -594,6 +610,35 @@ mod tests {
         .unwrap();
         assert_eq!(https.kind, ResolverKind::Doh);
         assert!(https.doh.is_some());
+        // proto 路径：`next_protocol == ["h3"]` + quicConfig ⇒ DoH-over-QUIC
+        let h3 = ResolverConfig::from_proto(&proto_xdns::ResolverProto {
+            r#type: "https".into(),
+            addr: "https://dns.google/dns-query".into(),
+            worker: 4,
+            tls_config: Some(TlsConfig { next_protocol: vec!["h3".into()], ..Default::default() }),
+            quic_config: Some(QuicParams {
+                congestion: "bbr".into(),
+                max_idle_timeout: 30,
+                ..Default::default()
+            }),
+        })
+        .unwrap();
+        let doh = h3.doh.as_ref().expect("https 必须产出 DoH 参数");
+        assert!(doh.h3, "proto next_protocol [\"h3\"] 必须走 HTTP/3");
+        assert_eq!(doh.tls.alpn, vec!["h3".to_string()]);
+        // proto 路径的未实现控制器同样硬错
+        let Err(e) = ResolverConfig::from_proto(&proto_xdns::ResolverProto {
+            r#type: "https".into(),
+            addr: "https://dns.google/dns-query".into(),
+            quic_config: Some(QuicParams {
+                congestion: "force-brutal".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }) else {
+            panic!("proto force-brutal 必须硬错");
+        };
+        assert!(e.to_string().contains("force-brutal"), "{e}");
         // 非 https 的 addr 形态（Go 从 JSON 层拿到的就是 URL）
         assert!(ResolverConfig::from_proto(&p("https")).is_err());
         assert!(ResolverConfig::from_proto(&p("quic")).is_err());

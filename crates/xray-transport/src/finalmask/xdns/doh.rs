@@ -9,13 +9,18 @@
 //! 起 goroutine 组，共享一个无缓冲 `sendCh`）；JSON 层 worker 缺省 32（Go
 //! `transport_finalmask.go:860-862`）。
 //!
+//! ALPN `["h3"]`（且仅此形态）改走 DoH-over-QUIC（`http3.Transport` 对位），见
+//! `doh3` 子模块——与 Go `resolver_doh.go:52-104` 的 `len(NextProtocol)==1 &&
+//! NextProtocol[0]=="h3"` 判据一致；其余 ALPN 组合零行为变化。
+//!
 //! ## 与 Go 的差异（bd lf69h）
 //!
 //! 1. **拨号面**：Go 用 finalmask `dialer.DialTCP` 拨 DoH 服务器（可带代理链/拨号 选项）；Rust xdns
 //!    wrap 期只拿得到 `Box<dyn UdpIo>`（UDP-only，无 TCP 拨号 句柄）⇒ 本实现直连，不带 dialer
 //!    能力面。
-//! 2. **协议**：只做 HTTP/2（Go 默认 ALPN `["h2","http/1.1"]`，仅 h1.1 的服务器 Go 也能用）；本栈
-//!    ALPN 固定 `h2`，握手失败记日志（不静默降级到明文）。
+//! 2. **协议**：h2 路只做 HTTP/2（Go 默认 ALPN `["h2","http/1.1"]`，仅 h1.1 的服务器 Go 也能用）；
+//!    本栈 ALPN 固定 `h2`，握手失败记日志（不静默降级到明文）。`["h3"]` 走 QUIC（差异见 `doh3`
+//!    模块头）。
 //! 3. **连接复用**：每请求独立建连（Go `http.Transport` 复用 keep-alive 连接）。
 //! 4. **超时**：单请求 30s（Go `http.Client` 无 timeout，挂死的 worker 永久失能）。
 //! 5. **429 冷却**：Go 解析 `Retry-After` 到点前不发；本栈丢弃该请求并记日志。
@@ -26,8 +31,8 @@
 //!
 //! `tlsConfig` 只接受 `serverName` / `alpn` / `certificates[].certificate` /
 //! `disableSystemRoot` / `minVersion`（`allowInsecure: false` 也无害放行），其余键
-//! 配置期硬错点名（禁静默忽略）；`quicConfig` 与 ALPN `h3` 属 DoH-over-QUIC，配置
-//! 期硬错并指路 `https://`。
+//! 配置期硬错点名（禁静默忽略）；`quicConfig` 按 Go `QuicParamsConfig.Build()` 校验
+//! 后落 `doh3::QuicOptions`，只在 ALPN `h3` 时生效（Go 只在 h3 分支读它）。
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -43,28 +48,36 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use xray_proto::xray::transport::internet::{QuicParams, tls::Config as TlsConfigProto};
 
+use super::doh3;
 use crate::finalmask::{
     mask_err,
     realm::tls::{MinTlsVersion, TlsConfig, build_rustls_client_config, pem_certificates_to_der},
 };
 
 /// DoH 响应体上限（Go `resolver_doh.go` `pool4K`）。
-const DOH_RECV_MAX: usize = 4096;
+pub(super) const DOH_RECV_MAX: usize = 4096;
 /// 请求队列深度（Go `sendCh` 无缓冲；深度 1 等效「生产端等空闲 worker」）。
 const QUEUE_CAP: usize = 1;
 /// 单请求超时（Go 无 timeout，见模块头差异 4）。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// DoH 媒体类型（RFC 8484 §4）。
-const DNS_MEDIA_TYPE: &str = "application/dns-message";
+pub(super) const DNS_MEDIA_TYPE: &str = "application/dns-message";
 /// 本轮支持的 `tlsConfig` 顶层键；其余硬错。
 const TLS_KEYS: [&str; 5] =
     ["serverName", "alpn", "certificates", "disableSystemRoot", "minVersion"];
 /// 缺省 HTTPS 端口（Go `url.URL` 无端口时由 http 栈取 443）。
 const DEFAULT_HTTPS_PORT: u16 = 443;
 
-/// DoH-over-QUIC 的配置期硬错文案（`quicConfig` / ALPN `h3` / `quic://` 共用）。
+/// `quic://` / `http3://` scheme 的配置期硬错文案。
+///
+/// Go `transport_finalmask.go:903-904` 对 tcp/udp/https 之外的 scheme 一律
+/// "invalid protocol"（`quic://` 同样被拒），本栈保留更明确的指路文案：
+/// DoH-over-QUIC 走 `https://` + `tlsConfig.alpn ["h3"]`。
 pub(crate) fn doh_over_quic() -> io::Error {
-    mask_err("xdns: 暂不支持 DoH-over-QUIC，请用 https://（TCP）")
+    mask_err(
+        "xdns: scheme quic:// is not a Go xdns resolver scheme (Go rejects any scheme other \
+         than tcp/udp/https): use https:// with tlsConfig.alpn [\"h3\"] for DoH-over-QUIC",
+    )
 }
 
 /// `https` resolver 的配置期产物（JSON / proto 两路校验后同形）。
@@ -76,6 +89,10 @@ pub struct DohParams {
     pub(crate) sni: Option<String>,
     /// 已校验 TLS 参数（信任根 / ALPN / 协议版本）。
     pub(crate) tls: TlsConfig,
+    /// `tlsConfig.alpn == ["h3"]`（Go `resolver_doh.go:52`）⇒ 走 HTTP/3 over QUIC。
+    pub(crate) h3: bool,
+    /// Go `quicConfig`（缺省 = Go 零值 `&internet.QuicParams{}`）；只在 [`Self::h3`] 时生效。
+    pub(crate) quic: doh3::QuicOptions,
 }
 
 impl DohParams {
@@ -85,14 +102,16 @@ impl DohParams {
         tls: Option<&Value>,
         quic: Option<&Value>,
     ) -> io::Result<Self> {
-        if quic.is_some_and(|v| !v.is_null()) {
-            return Err(doh_over_quic());
-        }
+        // Go `XDNS.Build` 对每个带 quicConfig 的 resolver 都调 `QuicConfig.Build()`
+        // （校验与 ALPN 无关），只在 h3 分支消费其值。
+        let quic = doh3::QuicOptions::from_json(quic)?;
         parse_target(url)?; // 配置期校验 scheme/host（构造期不再失败）
         let mut out = Self {
             url: url.to_string(),
             sni: None,
             tls: TlsConfig { alpn: vec!["h2".to_string()], ..TlsConfig::default() },
+            h3: false,
+            quic,
         };
         let Some(tls) = tls.filter(|v| !v.is_null()) else {
             return Ok(out); // 缺省：URL host 作 SNI + webpki 根（见模块头差异 6）
@@ -136,14 +155,14 @@ impl DohParams {
         tls: Option<&TlsConfigProto>,
         quic: Option<&QuicParams>,
     ) -> io::Result<Self> {
-        if quic.is_some() {
-            return Err(doh_over_quic());
-        }
+        let quic = doh3::QuicOptions::from_proto(quic)?;
         parse_target(url)?;
         let mut out = Self {
             url: url.to_string(),
             sni: None,
             tls: TlsConfig { alpn: vec!["h2".to_string()], ..TlsConfig::default() },
+            h3: false,
+            quic,
         };
         let Some(p) = tls else { return Ok(out) };
 
@@ -186,7 +205,8 @@ impl DohParams {
         Ok(out)
     }
 
-    /// ALPN：空 = `h2`；`["h2"]` 放行；`["h3"]` = DoH-over-QUIC（硬错）；其余硬错。
+    /// ALPN：空 = `h2`；`["h2"]` 放行；`["h3"]` = DoH-over-QUIC（Go `resolver_doh.go:52`
+    /// 的 `len==1 && [0]=="h3"` 判据）；其余硬错。
     fn apply_alpn(&mut self, alpn: Option<&Value>) -> io::Result<()> {
         let Some(alpn) = alpn.filter(|v| !v.is_null()) else { return Ok(()) };
         let arr =
@@ -201,10 +221,14 @@ impl DohParams {
         match protocols.as_slice() {
             [] => Ok(()),
             [one] if one == "h2" => Ok(()),
-            [one] if one == "h3" => Err(doh_over_quic()),
+            [one] if one == "h3" => {
+                self.h3 = true;
+                self.tls.alpn = vec!["h3".to_string()];
+                Ok(())
+            },
             other => Err(mask_err(format!(
-                "xdns: tlsConfig alpn {other:?} is not supported: DoH resolver speaks HTTP/2 (h2) \
-                 only"
+                "xdns: tlsConfig alpn {other:?} is not supported: DoH resolver speaks HTTP/2 \
+                 (h2) or, as exactly [\"h3\"], HTTP/3 over QUIC"
             ))),
         }
     }
@@ -374,6 +398,23 @@ impl DohEndpoint {
     }
 }
 
+/// DoH 传输选择（Go `resolver_doh.go:52-104` 的 `switch`）：`alpn == ["h3"]` 走
+/// HTTP/3 over QUIC，其余走既有 TLS+h2（该路径一行未改）。
+enum DohTransport {
+    H2(DohEndpoint),
+    H3(doh3::Doh3Endpoint),
+}
+
+impl DohTransport {
+    /// POST 一条 DNS 查询，返回响应体（≤ [`DOH_RECV_MAX`] 字节）。
+    async fn post(&self, body: &[u8], remote: &Mutex<SocketAddr>) -> io::Result<Vec<u8>> {
+        match self {
+            Self::H2(endpoint) => endpoint.post(body, remote).await,
+            Self::H3(endpoint) => endpoint.post(body, remote).await,
+        }
+    }
+}
+
 /// DoH 传输端：`worker` 个 POST 任务共享一条请求队列（Go `DOHResolver`）。
 pub(crate) struct DohResolver {
     tx: mpsc::Sender<Vec<u8>>,
@@ -396,18 +437,32 @@ impl DohResolver {
         let target = parse_target(&params.url)?;
         let tls = build_rustls_client_config(&params.tls)?
             .ok_or_else(|| io::Error::other("xdns: DoH tls config produced no client config"))?;
-        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(
-            params.sni.clone().unwrap_or_else(|| target.host.clone()),
-        )
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("xdns: invalid DoH SNI: {e}"))
-        })?;
-        let endpoint = Arc::new(DohEndpoint {
-            uri: target.uri,
-            host: target.host,
-            port: target.port,
-            tls: Arc::new(tls),
-            server_name,
+        let sni = params.sni.clone().unwrap_or_else(|| target.host.clone());
+        let tls = Arc::new(tls);
+        let endpoint = Arc::new(if params.h3 {
+            DohTransport::H3(doh3::Doh3Endpoint::new(
+                target.uri,
+                target.host,
+                target.port,
+                tls,
+                sni,
+                params.quic.clone(),
+            ))
+        } else {
+            let server_name =
+                tokio_rustls::rustls::pki_types::ServerName::try_from(sni).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("xdns: invalid DoH SNI: {e}"),
+                    )
+                })?;
+            DohTransport::H2(DohEndpoint {
+                uri: target.uri,
+                host: target.host,
+                port: target.port,
+                tls,
+                server_name,
+            })
         });
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(QUEUE_CAP);
@@ -501,28 +556,42 @@ mod tests {
         assert!(e.to_string().contains("maxVersion"), "{e}");
     }
 
-    /// ALPN：`h3` → DoH-over-QUIC 文案；其它 → 只支持 h2。
+    /// ALPN：`["h3"]` → DoH-over-QUIC（`h3` 标记 + ALPN 落 rustls）；其它 → 只支持 h2。
     #[test]
     fn json_alpn_h3_and_other_rejected() {
-        let e = params(Some(serde_json::json!({"alpn": ["h3"]}))).unwrap_err();
-        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
+        let p = params(Some(serde_json::json!({"alpn": ["h3"]}))).unwrap();
+        assert!(p.h3, "alpn [\"h3\"] 必须走 HTTP/3");
+        assert_eq!(p.tls.alpn, vec!["h3".to_string()]);
         let e = params(Some(serde_json::json!({"alpn": ["http/1.1"]}))).unwrap_err();
         assert!(e.to_string().contains("h2"), "{e}");
-        // 显式 ["h2"] 放行
-        params(Some(serde_json::json!({"alpn": ["h2"]}))).unwrap();
+        // `["h3","h2"]` 不是 Go 的 h3 判据（要求 len==1）⇒ 硬错不静默择一
+        let e = params(Some(serde_json::json!({"alpn": ["h3", "h2"]}))).unwrap_err();
+        assert!(e.to_string().contains("alpn"), "{e}");
+        // 显式 ["h2"] 放行，走 h2
+        let p = params(Some(serde_json::json!({"alpn": ["h2"]}))).unwrap();
+        assert!(!p.h3);
     }
 
-    /// `quicConfig` 出现即 DoH-over-QUIC 硬错（Go 只在 ALPN h3 时读它）。
+    /// `quicConfig` 解析并按 Go `QuicParamsConfig.Build()` 校验（只在 h3 生效）。
     #[test]
-    fn json_rejects_quic_config() {
-        let e = DohParams::from_json(
+    fn json_accepts_quic_config() {
+        let p = DohParams::from_json(
             "https://127.0.0.1/dns-query",
             None,
-            Some(&serde_json::json!({"congestion": "bbr"})),
+            Some(&serde_json::json!({"congestion": "bbr", "maxIdleTimeout": 30})),
+        )
+        .unwrap();
+        assert!(!p.h3, "quicConfig 单独出现不走 h3（Go 只在 alpn h3 时读它）");
+        assert_eq!(p.tls.alpn, vec!["h2".to_string()]);
+
+        // 未实现控制器硬错点名（禁静默忽略）
+        let e = DohParams::from_json(
+            "https://127.0.0.1/dns-query",
+            Some(&serde_json::json!({"alpn": ["h3"]})),
+            Some(&serde_json::json!({"congestion": "force-brutal"})),
         )
         .unwrap_err();
-        assert!(e.to_string().contains("DoH-over-QUIC"), "{e}");
-        assert!(e.to_string().contains("https://"), "{e}");
+        assert!(e.to_string().contains("force-brutal"), "{e}");
     }
 
     /// `minVersion` 1.2/1.3 生效；1.0/1.1 与乱值硬错。
