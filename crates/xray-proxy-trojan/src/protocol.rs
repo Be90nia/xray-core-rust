@@ -26,9 +26,8 @@
 //!
 //! **声明**：v1 逐字节对齐 Go `proxy/trojan`（v26.9.9 实码）；v2 **不在任何权威
 //! 规范或主流实现中存在**——Go Xray-core v26.9.9 `proxy/trojan` 无 0x02/MD5 逻辑
-//! （全仓 grep 零匹配），trojan-gfw 官方协议文档仅 v1。本节格式来自研究草案
-//! `docs/research-transport-stack-2026-09-15b.md` §7.1（其引用来源亦不含该格式
-//! 定义），按「SOCKS5 风格」语义对齐：
+//! （全仓 grep 零匹配），trojan-gfw 官方协议文档仅 v1。本节格式来自已删除的
+//! 研究草案（其引用来源亦不含该格式定义），按「SOCKS5 风格」语义对齐：
 //!
 //! ```text
 //! [0x02][16 字节 md5(password)][1 字节 ATYP][DST.ADDR][2 字节 BE DST.PORT][payload...]

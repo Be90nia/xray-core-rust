@@ -57,14 +57,12 @@ cargo doc --workspace --no-deps
 | **`ARCHITECTURE.md`（在 `docs/`）** | **治理宪法**——MVVM 五层 + 八条原则 + 五阶段映射（必读）|
 | **`docs/refs/`** | 治理输入（v1/v2/v3 裁决 + alloc-audit 报告）——**红线** |
 | **`docs/benchmarks/baseline.md`** | 性能 baseline（loopback 154-167 MB/s + alloc/MB 2.15/2.22）|
-| **`docs/audit-*.md`** | 5 维审计 6 份 + 综合 + 立项级 |
-| **`D:/tmp/audit-*.md`** | PM 工具链产物（审计上下文 + 9 票审视 + 框架前瞻债 v1/v2）|
+| **`docs/audit-*-2026-10-12.md`** | 立项级审计 6 份（架构/性能/安全/规范 + 综合 + 立项级）——**历史基线**，当前态以 `reports/audit-2026-11-06/` 为准 |
 | **`bd list --status open`** | 当前活跃票面（label=audit/framework/standards 等）|
 | **`docs/architecture/xray-frame-强约束插件模型-2026-10-23.md`** | **框架纪律核心**——三层定位 + 五层强制约束 L1-L5 + 协议坑约束表 12 条（造件/评审必读）|
-| `docs/architecture/xray-frame-派生件全景与工作列表-2026-10-23.md` | 继承面全表 + 派生面 8 件 + 差距分析 + P0-P4 工作列表（本地规划文档，未入库）|
-| `docs/architecture/xray-frame-契约级任务书-*.md` | P0 / P1-P4 契约级任务书（可派单形态，本地文档）|
 | `docs/research/xray-frame-*.md` | 盘点底料：主仓 53 crate 能力盘点 / udf 机制差距 / 池化归 udf / DNS 面 / inbound-outbound 面（本地文档）|
 | **`docs/architecture/xray-frame-udf功能域全景-2026-10-23.md`** | **udf 32 域全景 × 主仓覆盖对照**——udf 有什么/没什么/主仓哪些面能接管/10 个未接线高价值域/3 条反模式（造件选依托件前先查）|
+| `docs/architecture/xray-frame-深度融合战役计划-2026-10-26.md` · `xray-frame-masque-契约级任务书-2026-10-30.md` | **在飞规划**（未完成）——当前唯一仍有效的框架规划文档 |
 
 ---
 
@@ -186,7 +184,7 @@ serena-cli undo                                                        # 改坏�
 
 **已定裁决**：`MergePolicy`（tag-aware 数组合并 / outbounds prepend）归 xray-frame，且必须与 udf `merge_over` 的"数组整体替换"语义**并存可见**（后者是 udf 刻意设计，不得被覆盖或混淆）；本轮**不动父仓**加 `ConfigFile::fold_with`。
 
-**详案**（本地文档，未入库）：`docs/architecture/xray-frame-能力收敛方案-2026-10-27.md`（六面派生方案 + 8 波次实施表 + 融合度预估 57%→79%→100% 路径）
+**详案**：本节即详案（能力收敛方案已于 2026-10-27 完工收口，原文档已随轮次清理删除；裁决以本节 + `CLAUDE.md` §3.5 全表为准）
 
 ### 3.5.6 spawn 三分类口径（D6 面⑦ ≡ D7 统一判据，2026-10-30 定案）
 

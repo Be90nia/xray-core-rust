@@ -4,8 +4,8 @@
 //! A 类件直接用（契约词汇/池化/FxScope/logx），B 类继承管理面派生特化面，
 //! C 类自有件（plugin/accept/deadline/…）随 P0/P1 落地。
 //!
-//! 继承派生规划：`docs/architecture/udf-frame继承派生规划-2026-10-23.md`；
-//! 实施计划：`docs/architecture/xray-frame-impl-plan-2026-10-19.md`（P0-P4）。
+//! 继承派生纪律：见 `CLAUDE.md` §3.5（三层定位 + 造件查重 + 派生回路）；
+//! 框架规范源：`docs/architecture/xray-frame-强约束插件模型-2026-10-23.md`。
 //!
 //! 本文件承载**接线冒烟**（udf 依赖面可解析、继承面编译期可见）与 P0 骨架
 //! 模块挂载。P0-1..P0-8 均已落（plugin/error/context/logging/registry/lifecycle

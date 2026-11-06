@@ -79,5 +79,5 @@ python dist/interop_ci.py
 
 ## 文档
 
-- [docs/](docs/) — 29 份文档：28 份战役与审计报告（`audit2-*`/`audit3-*` 配置/路由/HTTP/并发/安全/wire-format 审计、`impl-*` 修复战役、`interop-expand-2026-09-24.md` 互通矩阵扩展、`impl-perf-wave-a-2026-09-24.md` 性能波 A、`impl-stress-leak-{a,b}-2026-09-22.md` 压测泄漏修复）+ 1 份部署调优 [guide-highrtt-sockopt.md](docs/guide-highrtt-sockopt.md)
-- [HANDOFF.md](HANDOFF.md) — 会话交接状态（当前基线、验收口径、CI 打法）
+- [docs/](docs/) — 治理文档：宪法 [ARCHITECTURE.md](docs/ARCHITECTURE.md) + 裁决输入 [refs/](docs/refs/) + 框架契约 [architecture/](docs/architecture/) + 性能基线 [benchmarks/](docs/benchmarks/) + 改造空间 [research/](docs/research/) + 立项级审计（`audit-*-2026-10-12.md`）+ 部署调优 [guide-highrtt-sockopt.md](docs/guide-highrtt-sockopt.md)
+- 历史轮次快照（一次性审计/战役报告）已清理，不入仓；当前轮次产物在 `reports/`（本地，不入仓）

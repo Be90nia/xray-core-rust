@@ -690,7 +690,7 @@ fn reality_server_config(
         }
     }
     // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
-    // 之前注入 43200 + 按秒解释 = 三重语义偏差（详见 docs/audit/crypto.md）。
+    // 之前注入 43200 + 按秒解释 = 三重语义偏差（详见 Go 端 maxTimeDiff 语义）。
     let max_time_diff_ms = json.get("maxTimeDiff").and_then(|x| x.as_u64()).unwrap_or(0);
     let max_time_diff = (max_time_diff_ms / 1000) as u32;
 

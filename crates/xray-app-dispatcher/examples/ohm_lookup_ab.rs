@@ -1,8 +1,8 @@
 //! SimpleOhm 查表面 A/B 采集器（C 面 R1a 性能门 · ns/op）。
 //!
-//! 对应 gate：`docs/architecture/xray-frame-能力收敛方案-2026-10-27.md` §10.1 **R1 行**
-//! 「热路径改动 → 同窗 A/B 吞吐 ≥3 轮不降」的**查表面微观锚**——SimpleOhm 的
-//! `get_handler`/`select_handler` 是 dispatch 每次选路的唯一查表面。
+//! 对应 gate：`CLAUDE.md` §5「性能改动的 A/B 门」**热路径改动 → 同窗 A/B 吞吐 ≥3 轮不降**
+//! 的**查表面微观锚**——SimpleOhm 的 `get_handler`/`select_handler` 是 dispatch
+//! 每次选路的唯一查表面。
 //!
 //! 只用 `SimpleOhm` 的**公开 API**，故同一份源码可分别对
 //! A 态（`RwLock<HashMap>` 时期）/ B 态（udf `BoundedRegistry`）编译，两态只差

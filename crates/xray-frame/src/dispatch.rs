@@ -1,7 +1,9 @@
 //! 查表分发面（P3-1 S1 旁路表骨架）。
 //!
-//! 契约源：`docs/architecture/xray-frame-契约级任务书-P1P4.md` §P3-1
-//! 「dispatcher 中央 match 臂 → Registry 查表」。dispatcher 中央 match 臂
+//! 契约源：`docs/architecture/xray-frame-强约束插件模型-2026-10-23.md`（L1-L5 强制约束）
+//! + `CLAUDE.md` §3.5 派生纪律。原 P3-1 契约「dispatcher 中央 match 臂 → Registry 查表」。
+//!
+//! dispatcher 中央 match 臂
 //! （`xray-app-dispatcher/src/default.rs` `dispatch_link`）的退役路径按四阶段
 //! 迁移：S0 旧臂基线 → **S1 本查表面旁路并存** → S2 双写对照差异率必须为 0 →
 //! S3 切查表 → S4 删旧臂。S0/S2 的对照仪器（dispatcher 侧 feature flag 与其

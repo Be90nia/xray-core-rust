@@ -21,7 +21,7 @@
 //!   trait。`dispatch`/`dispatch_link` 流程已实装（嗅探 + 路由 + 计数 + 兜底选择面）
 //! - [`fakednssniffer`] — `FakeDnsEngine` trait、`FakeDnsSnifferFactory` 占位
 //!
-//! ## 关键决策（详见 docs/translation-conventions.md §10）
+//! ## 关键决策
 //!
 //! 1. 不实现 `xray_features::routing::Router`：API 简化（`(dest, session) -> tag`）， Go 的
 //!    `routing.Context` 含 source IP/user/protocol 等丰富字段。crate 内部定义 独立 `RoutingContext`

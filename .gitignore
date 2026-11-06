@@ -113,3 +113,13 @@ dist/tmp_*/
 /CONTRIBUTING.md
 /CODE_OF_CONDUCT.md
 /CHANGELOG.md
+# CITATION.cff 同属社区标配（CLAUDE.md §4 口径「及 CITATION 类」）；2026-11-06 清理时
+# 发现它仍被跟踪且内容已过期（写着 7 万行/20+ crate/master 87d72569/CI 9 绿，实际
+# 55 crate/36 万行/master ceb6a487/CI 10 门）⇒ GitHub 的 "Cite this repository"
+# 按钮会展示错误项目信息。已取消跟踪，本地文件保留。
+CITATION.cff
+
+# 审计/验证报告默认不入仓（AGENTS.md 落盘路由：报告进 <repo>/reports/ 且默认 .gitignore）
+# 2026-11-06：reports/ 下曾积压 178 个未跟踪文件，一次 `git add -A` 即全部误入仓。
+# 例外：已跟踪的历史报告保持跟踪（bd 票按路径引用它们，移动会断引用）。
+reports/

@@ -48,8 +48,7 @@
 //!
 //! 通用 KCP crate（`kcp`、`kcp-tokio`、`tokio-kcp`）使用标准 KCP 协议格式，
 //! 与 xray Go 端**字节级不兼容**——若用现成 crate 等于放弃与 xray Go 互通。
-//! 因此 1:1 翻译 Go 源码，与 `docs/translation-conventions.md` §0「源码 1:1
-//! 映射」原则一致。
+//! 因此 1:1 翻译 Go 源码，遵循「源码 1:1 映射」原则。
 
 pub mod config;
 pub mod connection;
