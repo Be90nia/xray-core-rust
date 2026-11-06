@@ -8,13 +8,13 @@
 //! 这里改为池化：块从池借出、装进 `Bytes::from_owner`，帧被 hyper 释放后由池句柄
 //! Drop 归还——稳态零分配。帧粒度与原实现一致（一次 `poll_read` 一帧），块大小由
 //! 调用方指定（下行 = duplex 缓冲 64 KiB，上行同值）。块池实体是 udf `ObjectPool`
-//! （2026-11-03 迁移，见 [`PoolStream`] 文档）。
+//! （2026-11-03 迁移，见 `PoolStream` 文档）。
 //!
 //! **进程级共享池（bd kw2si）**：同 chunk 全进程唯一一份 `ObjectPool`（上行
 //! `UPLINK_CHUNK` 与下行 `DUPLEX_BUF` 同为 64 KiB ⇒ 上行/下行全部流共享同一份），
 //! 预算 [`POOL_BYTE_BUDGET`] 从「每流一份」的乘积面（N 流 = N × 2 MiB）收敛为
 //! 进程级常量上界。并发借还线程安全由池自身保证（分片 + 片锁），测试用
-//! [`PoolStream::with_pool`] 注入独立池隔离读数。
+//! `PoolStream::with_pool` 注入独立池隔离读数。
 //!
 //! 留主仓（方向件：依赖 `bytes::Bytes::from_owner`）——池化读流只服务 h2 body
 //! 这一网络方向，`bytes` 属方向件非 udf 依赖纪律，不上浮。
@@ -38,16 +38,17 @@ pub(crate) const UPLINK_CHUNK: usize = 64 * 1024;
 
 /// 进程级共享块池的**常驻字节预算**（每 chunk 一池、同池全进程共享）：256 MB
 /// 小机场口径下 xray 只有 ~96 MB，本池独占 ≤2 MB（
-/// `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md` §1「全部池/缓存合计 ≤4 MB」）。
+/// `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md`；登记于 xray-core
+/// `memory_budget::SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES`，交叉断言钉住，bd sgdwm）。
 ///
 /// 旧口径按 hyper 16 MB send_buf 推导块数（64 KiB chunk ⇒ 258 块 ≈ 16.5 MB/流），
 /// 且 `idle_cap` 随在飞峰值涨到该上限 ⇒ 高负载后空闲常驻可逼近 16.5 MB。
 /// hyper 的 send_buf 属另一份账（连接缓冲面），**不是**本池可以跟着涨的理由。
 ///
-/// 生产只存在 64 KiB 一种 chunk（上行 [`UPLINK_CHUNK`] = 下行
-/// [`crate::hub::handler::DUPLEX_BUF`]）⇒ 进程级合计 ≤ [`POOL_BYTE_BUDGET`]；
+/// 生产只存在 64 KiB 一种 chunk（上行 `UPLINK_CHUNK` = 下行
+/// `DUPLEX_BUF`，hub handler）⇒ 进程级合计 ≤ [`POOL_BYTE_BUDGET`]；
 /// 测试面的小 chunk 各自成池，不进生产预算口径。
-pub(super) const POOL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+pub const POOL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 
 /// 块数下限：chunk 偏大时预算算出的块数可能小于窗口必要量，保底 4 块——
 /// 池外降级直构 64 KiB 实测 3.7–4.1 µs/次，而池借还仅 ~100–300 ns
@@ -75,8 +76,9 @@ impl Drop for PooledBuf {
         // `[..len]`**（`ReadBuf` 只写 `[0..len)`，尾部从未承载本流数据），不是整块 64 KiB。
         // 清零量必须与写入量同阶：全量 memset 64 KiB 实测 190.8µs/次，而池借还仅
         // ~100-300ns ⇒ 全清直接吃掉池化收益（本次修法就是为避开这一形态）。
-        // 不变量：块借出时 `[..len]` 恒为零（每次写入都在本 Drop 里按同一范围清零，
-        // 未写入就归还的路径不会引入新数据）⇒ 跨帧/跨连接无明文残留。
+        // 不变量：块借出时 `[..len]` 恒为零——数据帧由本 Drop 按 `[..len]` 清零，
+        // Pending/EOF/Err 三个未产出帧的归还路径由 `poll_next` 就地清零（bd vjii0）
+        // ⇒ 跨帧/跨连接无明文残留。
         self.data[..self.len].fill(0);
     }
 }
@@ -101,9 +103,13 @@ impl AsRef<[u8]> for PooledBuf {
 /// - `idle_cap` 恒等于池上界（[`pool_max_blocks`]）：共享池的 2 MiB 是进程级预算
 ///   承诺，恒定上界可审计；`idle_cap` 不预分配内存（块只有借过才占 idle 槽）， 低负载下常驻 =
 ///   历史峰值在飞数 × chunk，与旧自适应抬升的稳态一致；
-/// - reset 钩子只做容量归一（红线：池化对象等重，防池毒化）；明文清零**不在钩子里**： 钩子跑在整块
-///   64 KiB 上（memset 实测 190.8µs/次，直接吃掉池化收益），改由持有方在 [`PooledBuf::drop`]
-///   里按实际写入量 `[..len]` 清零（见该 Drop 的契约注）。
+/// - reset 钩子只做容量归一（红线：池化对象等重，防池毒化）；明文清零**不在钩子里**，
+///   在**写入现场**按实际写入量做（bd vjii0 收口）：数据帧 [`PooledBuf::drop`] 的
+///   `[..len]`、Pending 臂 `[..filled]`（违约型内层写后挂起，合规路径零成本）、 EOF/Err
+///   臂整块（写入量不可知 / 内容未定义，且两者每流一次不构成路径成本）。 **不采用 udf
+///   `with_zeroing_reset`**：池的归还钩子看不到「本次借出的写入区」 （`ReadBuf` 不改 `Vec` 的
+///   len），钩子内清零只能整块 memset——64 KiB 实测 190.8µs/次跑在含 Pending
+///   的热路径上，直接吃掉池化收益（bd hdugl 判据 「清零成本必须与写入量同阶」）。
 pub(crate) struct PoolStream<R> {
     inner: R,
     pool: Arc<ObjectPool<Vec<u8>>>,
@@ -177,13 +183,20 @@ impl<R: AsyncRead + Unpin> Stream for PoolStream<R> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let mut buf = this.take_block();
-        let polled = {
+        let (polled, filled) = {
             let mut rb = ReadBuf::new(buf.as_mut_slice());
             let res = Pin::new(&mut this.inner).poll_read(cx, &mut rb);
-            res.map(|r| r.map(|()| rb.filled().len()))
+            let filled = rb.filled().len();
+            (res.map(|r| r.map(|()| filled)), filled)
         };
         match polled {
             Poll::Pending => {
+                // vjii0：Pending 合约上不写数据，但违约型内层（写后 Pending——探针
+                // `pending_path_leaves_no_plaintext_in_pooled_block` 实证）会把明文
+                // 留在块里裸归还；进程级共享池（bd kw2si）下一个租户即读到上一连接
+                // 的 h2 body 明文。按实际写入区清零（合规内层 filled=0 ⇒ 零成本）；
+                // 禁整块清零（hdugl：Pending 是热路径）。
+                buf[..filled].fill(0);
                 drop(buf); // 句柄 Drop ⇒ 块回池
                 Poll::Pending
             },
@@ -195,10 +208,15 @@ impl<R: AsyncRead + Unpin> Stream for PoolStream<R> {
                 Poll::Ready(Some(Err(err)))
             },
             // EOF：内层随流结束释放（下行会话 guard 在此触发，同 ReaderStream 语义）。
+            // vjii0：违约型内层可能「已写入却不推进 filled」（探针
+            // `eof_path_leaves_no_plaintext_in_pooled_block` 实证）⇒ 写入量不可知，
+            // 整块清零再回池；EOF 每流一次，同 Err 臂口径不构成路径成本。
             Poll::Ready(Ok(0)) => {
+                buf.fill(0);
                 drop(buf);
                 Poll::Ready(None)
             },
+            // vjii0：数据帧由 `PooledBuf::drop` 按 `[..len]` 清零（成本与写入量同阶）。
             Poll::Ready(Ok(len)) => {
                 Poll::Ready(Some(Ok(Bytes::from_owner(PooledBuf { data: buf, len }))))
             },
@@ -322,6 +340,108 @@ mod tests {
         assert!(
             reused.iter().all(|&b| b == 0),
             "归还前必须清零已写入区：禁把上一帧明文发给下一个借出方"
+        );
+    }
+
+    // ===== vjii0 探针：Pending / EOF 归还路径的明文残留 =====
+
+    /// 探针 reader（vjii0）：把可识别明文写进 `ReadBuf` 后按指定结局返回——
+    /// `advance=true`：`put_slice` 推进 filled 后**违约**返回 Pending（写后挂起）；
+    /// `advance=false`：只写不推进（filled=0）——poll_next 会把它判进 EOF 臂。
+    struct LeakyReader {
+        pattern: Vec<u8>,
+        advance: bool,
+        done: bool,
+    }
+
+    impl AsyncRead for LeakyReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            rb: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.done {
+                return Poll::Pending; // 探针只 poll 一次，此后挂住即可
+            }
+            self.done = true;
+            let n = self.pattern.len().min(rb.remaining());
+            let pattern = &self.pattern[..n];
+            if self.advance {
+                rb.put_slice(pattern);
+                Poll::Pending
+            } else {
+                // 只写不推进：filled 仍 0 ⇒ poll_next 按 EOF 臂处置；明文已入块。
+                // （tokio 1.54 ReadBuf 是纯 u8 版：initialize_unfilled_to 返回 &mut [u8]。）
+                let slots = rb.initialize_unfilled_to(n);
+                for (slot, &byte) in slots.iter_mut().zip(pattern) {
+                    *slot = byte;
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    /// 探针 A（vjii0 · Pending）：违约型 reader 写入明文（filled>0）后返回
+    /// Pending——该路径此前对块裸 `drop` 归还，明文留在进程级共享池里（同 chunk
+    /// 全进程唯一一份，bd kw2si），下一个租户即可读到上一连接的 h2 body 明文。
+    /// 断言：归还后取同块残余全零；且清零只覆盖已写入区（写入区外哨兵不被抹，
+    /// hdugl 成本纪律）。
+    /// **反向自检锚点**：删掉 Pending 臂的 `buf[..filled].fill(0)`，本断言必红。
+    #[tokio::test]
+    async fn pending_path_leaves_no_plaintext_in_pooled_block() {
+        const PAYLOAD: usize = 512;
+        const SENTINEL: usize = 16;
+        let chunk = 8 * 1024;
+        let pool = isolated_pool(chunk);
+        // 预置哨兵：写入区之外的既有字节，清零不得越界抹除。
+        {
+            let mut block = pool.acquire_owned();
+            block[PAYLOAD..PAYLOAD + SENTINEL].fill(0xC3);
+        }
+        let stream = PoolStream::with_pool(
+            LeakyReader { pattern: vec![0xA7u8; PAYLOAD], advance: true, done: false },
+            pool.clone(),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut pinned = std::pin::pin!(stream);
+        assert!(
+            pinned.as_mut().poll_next(&mut cx).is_pending(),
+            "探针 reader 首次 poll 应返回 Pending（块随之归还池）"
+        );
+        // 空闲表此刻恰有一块（埋哨兵的那块，已被本次 poll 写入明文）⇒ 取回同块。
+        let reused = pool.acquire_owned();
+        assert!(
+            reused[..PAYLOAD].iter().all(|&b| b == 0),
+            "Pending 路径归还的块不得残留明文（vjii0；明文=0xA7×{PAYLOAD}）"
+        );
+        assert!(
+            reused[PAYLOAD..PAYLOAD + SENTINEL].iter().all(|&b| b == 0xC3),
+            "清零只覆盖已写入区：写入区外哨兵不得被抹（hdugl 成本纪律）"
+        );
+    }
+
+    /// 探针 B（vjii0 · EOF）：违约型 reader 写入明文但不推进 filled（filled=0）
+    /// ——poll_next 按 EOF 臂处置并裸归还，明文留池。断言：归还后块内无残留。
+    /// **反向自检锚点**：删掉 EOF 臂的整块清零，本断言必红。
+    #[tokio::test]
+    async fn eof_path_leaves_no_plaintext_in_pooled_block() {
+        const PAYLOAD: usize = 512;
+        let chunk = 8 * 1024;
+        let pool = isolated_pool(chunk);
+        let stream = PoolStream::with_pool(
+            LeakyReader { pattern: vec![0x5Eu8; PAYLOAD], advance: false, done: false },
+            pool.clone(),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut pinned = std::pin::pin!(stream);
+        match pinned.as_mut().poll_next(&mut cx) {
+            Poll::Ready(None) => {},
+            other => panic!("EOF 探针应收 Ready(None)，实际 {other:?}"),
+        }
+        let reused = pool.acquire_owned();
+        assert!(
+            reused[..PAYLOAD].iter().all(|&b| b == 0),
+            "EOF 路径归还的块不得残留明文（vjii0；明文=0x5E×{PAYLOAD}）"
         );
     }
 

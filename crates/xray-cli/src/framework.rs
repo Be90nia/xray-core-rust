@@ -520,6 +520,59 @@ fn loopback_family() -> RegisteredFamily {
     }
 }
 
+/// 族工厂签名：入参 = freedom 默认规则表（其余族忽略）。
+type FamilyFactory =
+    fn(&HashMap<String, xray_proxy_freedom::DefaultRuleType>) -> Option<RegisteredFamily>;
+
+/// 协议族目录表：`Config::to_json_value()` 的 `protocol` 字段逐字对齐（插件
+/// `name()` 同源）。原为 match 臂，改**纯数据表**后键集可运行时枚举
+/// （[`framework_family_names`]）——双主路一致性台账（xray-core
+/// `tests/assembly_path_equivalence.rs`）的框架侧数据源；单一清单不存在
+/// 「臂有键、枚举清单无键」的第二漂移面。
+static FAMILY_CATALOG: &[(&str, FamilyFactory)] = &[
+    // 入站面 + xray-core 单出站构建（客户端解析在 xray-core 内部）。
+    ("socks", |_| Some(core_outbound_family::<SocksPlugin>("socks"))),
+    ("http", |_| Some(core_outbound_family::<HttpPlugin>("http"))),
+    ("trojan", |_| Some(core_outbound_family::<TrojanPlugin>("trojan"))),
+    ("tuic", |_| Some(core_outbound_family::<TuicPlugin>("tuic"))),
+    ("anytls", |_| Some(core_outbound_family::<AnytlsPlugin>("anytls"))),
+    ("hysteria", |_| Some(core_outbound_family::<HysteriaPlugin>("hysteria"))),
+    ("wireguard", |_| Some(core_outbound_family::<WireguardPlugin>("wireguard"))),
+    ("tun", |_| Some(core_outbound_family::<TunPlugin>("tun"))),
+    ("dns", |_| Some(core_outbound_family::<DnsPlugin>("dns"))),
+    // 纯入站协议（无出站形态；xray-core 出站构造表键为 "dokodemo"，与配置
+    // protocol 名 "dokodemo-door" 不同源，故不走单出站构建）。
+    ("dokodemo-door", |_| Some(inbound_only::<DokodemoPlugin>("dokodemo-door"))),
+    ("freedom", |rules| Some(freedom_family(rules))),
+    ("vmess", |_| {
+        Some(dial_fn_family::<VmessPlugin, _>("vmess", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            // 接缝暂自持 for_plugin ctx（族级单实例）；P3 装配接线时改传装配根 ctx。
+            Ok(xray_proxy_vmess::make_vmess_dial_fn(
+                Arc::new(config),
+                Arc::new(PluginContext::for_plugin("vmess")),
+            ))
+        }))
+    }),
+    ("vless", |_| {
+        Some(dial_fn_family::<VlessPlugin, _>("vless", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            Ok(xray_proxy_vless::make_vless_dial_fn(Arc::new(config)))
+        }))
+    }),
+    ("shadowsocks", |_| {
+        Some(dial_fn_family::<SsPlugin, _>("shadowsocks", |p, stream| {
+            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
+            Ok(xray_proxy_ss::make_ss_dial_fn_with_ctx(
+                Arc::new(config),
+                Arc::new(PluginContext::for_plugin("shadowsocks")),
+            ))
+        }))
+    }),
+    ("blackhole", |_| Some(blackhole_family())),
+    ("loopback", |_| Some(loopback_family())),
+];
+
 /// 协议目录：配置 `protocol` 串 → 插件族构造。目录只提供**构造器**，注册集 =
 /// 配置引用集（禁硬编码清单）；目录未覆盖 = 未迁移（shadowsocks）/未知族 →
 /// [`derive_families`] 记账不注册。族名与 xray-conf `BuiltEntry.kind` /
@@ -528,45 +581,10 @@ fn family_catalog(
     protocol: &str,
     inbound_rules: &HashMap<String, xray_proxy_freedom::DefaultRuleType>,
 ) -> Option<RegisteredFamily> {
-    let family = match protocol {
-        // 入站面 + xray-core 单出站构建（客户端解析在 xray-core 内部）。
-        "socks" => core_outbound_family::<SocksPlugin>("socks"),
-        "http" => core_outbound_family::<HttpPlugin>("http"),
-        "trojan" => core_outbound_family::<TrojanPlugin>("trojan"),
-        "tuic" => core_outbound_family::<TuicPlugin>("tuic"),
-        "anytls" => core_outbound_family::<AnytlsPlugin>("anytls"),
-        "hysteria" => core_outbound_family::<HysteriaPlugin>("hysteria"),
-        "wireguard" => core_outbound_family::<WireguardPlugin>("wireguard"),
-        "tun" => core_outbound_family::<TunPlugin>("tun"),
-        "dns" => core_outbound_family::<DnsPlugin>("dns"),
-        // 纯入站协议（无出站形态；xray-core 出站构造表键为 "dokodemo"，与配置
-        // protocol 名 "dokodemo-door" 不同源，故不走单出站构建）。
-        "dokodemo-door" => inbound_only::<DokodemoPlugin>("dokodemo-door"),
-        "freedom" => freedom_family(inbound_rules),
-        "vmess" => dial_fn_family::<VmessPlugin, _>("vmess", |p, stream| {
-            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
-            // 接缝暂自持 for_plugin ctx（族级单实例）；P3 装配接线时改传装配根 ctx。
-            Ok(xray_proxy_vmess::make_vmess_dial_fn(
-                Arc::new(config),
-                Arc::new(PluginContext::for_plugin("vmess")),
-            ))
-        }),
-        "vless" => dial_fn_family::<VlessPlugin, _>("vless", |p, stream| {
-            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
-            Ok(xray_proxy_vless::make_vless_dial_fn(Arc::new(config)))
-        }),
-        "shadowsocks" => dial_fn_family::<SsPlugin, _>("shadowsocks", |p, stream| {
-            let config = (**p.built_outbound()?).clone().with_stream_settings(stream);
-            Ok(xray_proxy_ss::make_ss_dial_fn_with_ctx(
-                Arc::new(config),
-                Arc::new(PluginContext::for_plugin("shadowsocks")),
-            ))
-        }),
-        "blackhole" => blackhole_family(),
-        "loopback" => loopback_family(),
-        _ => return None,
-    };
-    Some(family)
+    FAMILY_CATALOG
+        .iter()
+        .find(|(name, _)| *name == protocol)
+        .and_then(|(_, factory)| factory(inbound_rules))
 }
 
 /// 配置派生的注册计划。
@@ -623,6 +641,13 @@ impl HandlerBridge {
 
     fn contains_key(&self, tag: &str) -> bool {
         self.handlers.contains_key(tag)
+    }
+
+    /// 桥内容 tag 集（字典序；台账观测面 [`project_assembly`] 消费）。
+    fn tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self.handlers.keys().cloned().collect();
+        tags.sort();
+        tags
     }
 }
 
@@ -905,6 +930,75 @@ pub(crate) async fn run_framework_until(
     } else {
         Err(CliError::StartFailed(format!("framework shutdown unclean: {report:?}")))
     }
+}
+
+// ============ 台账观测面（双主路一致性，xray-core 集成测试消费） ============
+
+/// 框架路派生投影（轻量、纯同步）：只跑 [`derive_families`]（目录解析），不装配、
+/// 不 build 插件。目录键可派生性（族工厂真跑）由台账①的运行时探针消费。
+pub fn project_derivation(
+    built: &BuiltConfig,
+) -> (Vec<String> /* family_protocols */, Vec<String> /* unregistered */) {
+    let plan = derive_families(built);
+    let family_protocols = plan.families.iter().map(|f| f.protocol.to_string()).collect();
+    (family_protocols, plan.unregistered)
+}
+
+/// 框架路装配投影：`run_framework_until` ①②③ 三段的**真实复现**——
+/// `derive_families` → [`assemble`]（探针 canary + 族插件注册 + 共享池注入）→
+/// `bring_up`（插件 build：`ctx.section()` 段路由 + `ctx.pool()` 装配门）→
+/// [`fill_bridge`] → `shutdown`（停机不净即 panic，投影不得污染测试进程）。
+/// 不起 socket、不灌 listener、不注册生产出站表（④ 段
+/// `start_full_with_outbound_handlers` 不在本投影内，由 xray-core 侧注入点
+/// 存在断言覆盖）。
+///
+/// `config_root`：`Config::to_json_value()` 同源投影（段路由底座）——探针配置
+/// 须包含每个在场族的 `protocol` 段（缺段 fail-fast，坑约束 7）。
+///
+/// 双主路一致性台账（xray-core `tests/assembly_path_equivalence.rs`）的框架侧
+/// 运行时证据源：取代旧 `include_str!` 源码文本锚点（测源码文本 = 反模式）；
+/// 台账②的语义（未迁移族 warn+skip、条目不达 bridge、进程照常起）由本投影的
+/// 行为断言钉死。
+pub async fn project_assembly(
+    built: &BuiltConfig,
+    config_root: serde_json::Value,
+) -> AssemblyProjection {
+    let plan = derive_families(built);
+    let family_protocols = plan.families.iter().map(|f| f.protocol.to_string()).collect();
+    let mut framework = assemble(config_root, &plan.families)
+        .unwrap_or_else(|e| panic!("台账投影 assemble 失败（run_framework 同路径）：{e}"));
+    if let Err(e) = framework.bring_up() {
+        let _ = framework.shutdown().await;
+        panic!("台账投影 bring_up 失败（插件 build 面）：{e}");
+    }
+    let dispatcher = Arc::new(DefaultDispatcher::new());
+    let fill = fill_bridge(built, &plan.families, &dispatcher);
+    let report = framework.shutdown().await;
+    assert!(report.is_clean(), "台账投影停机不净（投影不得污染测试进程）：{report:?}");
+    AssemblyProjection {
+        family_protocols,
+        unregistered: plan.unregistered,
+        bridge_tags: fill.bridge.tags(),
+        failed: fill.failed,
+    }
+}
+
+/// 框架路装配投影的账面（[`project_assembly`] 返回值）。
+pub struct AssemblyProjection {
+    /// 注册族协议名（首现序）。
+    pub family_protocols: Vec<String>,
+    /// 目录未覆盖协议（warn+skip 面：条目不达 bridge，进程照常起）。
+    pub unregistered: Vec<String>,
+    /// 到达桥的 handler tag 集（字典序；出站成功转换 + 入站 dispatch 面）。
+    pub bridge_tags: Vec<String>,
+    /// 桥转换失败面 `(tag, reason)`（守卫拒/未注册族/解析失败，逐条记账）。
+    pub failed: Vec<(String, String)>,
+}
+
+/// 协议族目录键集（表序；框架路注册能力的运行时枚举面）。双主路台账①的框架
+/// 侧数据源——新增/删除目录键不经源码文本、直接被运行时对比抓住。
+pub fn framework_family_names() -> Vec<&'static str> {
+    FAMILY_CATALOG.iter().map(|(name, _)| *name).collect()
 }
 
 #[cfg(test)]

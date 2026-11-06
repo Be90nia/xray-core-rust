@@ -85,7 +85,9 @@ use crate::{
 };
 
 /// TUN 设备接收缓冲。
-#[allow(dead_code)] // 缓冲区调优预留：当前 netstack 路径按 slice 切片接收
+// 非 Linux 接收路径消费（RxPackets::new 的单包缓冲）；Linux GRO 批读路径按
+// slice 接收不消费整缓冲 → Linux 构建下 dead_code，需抑制。Go tun 读缓冲对位锚点。
+#[allow(dead_code)]
 const TUN_RECV_BUF_SIZE: usize = 65535;
 
 /// smoltcp poll 定时器间隔。

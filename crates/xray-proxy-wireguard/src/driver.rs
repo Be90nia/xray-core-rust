@@ -806,7 +806,7 @@ async fn direct_read_loop(
 ///
 /// `bind_addr` 形如 `"0.0.0.0:0"`（client 随机端口）或 `"0.0.0.0:51820"`（server 固定端口）。
 pub async fn bind_udp_socket(bind_addr: &str) -> Result<Arc<UdpSocket>> {
-    let sock = UdpSocket::bind(bind_addr).await.map_err(WgError::Io)?;
+    let sock = xray_transport::udp::bind_udp_no_connreset(bind_addr).await.map_err(WgError::Io)?;
     Ok(Arc::new(sock))
 }
 

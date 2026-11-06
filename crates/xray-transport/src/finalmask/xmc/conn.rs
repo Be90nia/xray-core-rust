@@ -639,7 +639,12 @@ async fn run_encode_pump<R: AsyncRead + Unpin>(
         match pipe_r.read(&mut buf).await {
             Ok(0) => break,
             Err(e) => {
-                crate::hot_log!(DEBUG, "error={e} xmc bridge proxy-side read failed");
+                // 桥数据腿死亡 = xmc 隧道功能失效，一次性留痕（循环随即终止，
+                // 无刷屏面）；DEBUG 在生产默认 warn 门下不可见（bd u0pe2 ①）。
+                crate::hot_log!(
+                    tracing::Level::WARN,
+                    "error={e} xmc bridge proxy-side read failed"
+                );
                 break;
             },
             Ok(n) => match encode_custom_payload(local_cp_id, &buf[..n]) {
@@ -728,7 +733,12 @@ pub(super) async fn tcp_bridge(
             let (id, data) = match read_packet_async(&mut dec_reader).await {
                 Ok(v) => v,
                 Err(e) => {
-                    crate::hot_log!(DEBUG, "error={e} xmc packet stream read failed");
+                    // 解密读泵死亡 = xmc 数据面失效，一次性留痕（循环随即 break）；
+                    // DEBUG 在生产默认 warn 门下不可见（bd u0pe2 ①）。
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} xmc packet stream read failed"
+                    );
                     break;
                 },
             };

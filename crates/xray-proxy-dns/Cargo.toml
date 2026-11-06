@@ -25,6 +25,12 @@ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"
 # plugin.rs 段路由解析（settings → Config，同规 xray-core build_dns_outbound_config）。
 serde_json = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# bd d597w：UDP ICMP-unreachable 上报关闭薄转调（src/udp_connreset.rs）所需
+# WSAIoctl；语义正本在 xray_transport::udp（本 crate 依赖图不含 xray-transport）。
+# WSAIoctl 签名引用 OVERLAPPED ⇒ 该符号在 windows-sys 里被 Win32_System_IO 门控。
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+
 [dev-dependencies]
 hickory-resolver = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

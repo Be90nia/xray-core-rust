@@ -542,6 +542,7 @@ mod tests {
         let cfg = PluginConfig::section("rec", &root).expect("section");
         #[derive(serde::Deserialize, Debug)]
         struct S {
+            // 反序列化面字段：本测试只断言错误文案含字段路径，不读解析值
             #[allow(dead_code)]
             port: u16,
         }

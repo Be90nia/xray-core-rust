@@ -1000,7 +1000,8 @@ where
                     }
                     Err(e) => {
                         this.mark_closed();
-                        crate::hot_log!(DEBUG, "error={e} GET recv_response failed");
+                        // GET 失败 = 下载腿死，一次性留痕（任务随即 return；u0pe2）。
+                        crate::hot_log!(tracing::Level::WARN, "error={e} GET recv_response failed");
                         return;
                     }
                 }

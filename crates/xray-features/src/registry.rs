@@ -60,12 +60,15 @@ const MAX_FEATURE_ENTRIES: usize = 1024;
 /// - `type_url`：prost `Any::type_url`，如 `"type.googleapis.com/xray.app.dns.Config"`。 必须是
 ///   `'static str`（保证注册表生命周期无界）。
 /// - `factory`：闭包，输入 `&[u8]`（prost Any value），输出 `Arc<dyn Feature>`。
+///
+/// # Errors
+///
+/// - [`FeatureError::RegistryFull`]：注册表已满（`MAX_FEATURE_ENTRIES`）且 `type_url`
+///   为新键（同键覆盖注册不受满表限制，幂等语义保全）。
 pub fn register_feature(type_url: &'static str, factory: FeatureFactory) -> Result<()> {
     let mut reg = registry().write();
     if reg.len() >= MAX_FEATURE_ENTRIES && !reg.contains_key(type_url) {
-        return Err(FeatureError::NotFound {
-            name: format!("registry full ({MAX_FEATURE_ENTRIES})"),
-        });
+        return Err(FeatureError::RegistryFull { max: MAX_FEATURE_ENTRIES });
     }
     reg.insert(type_url, factory);
     Ok(())
@@ -170,6 +173,9 @@ mod tests {
 
     #[test]
     fn registry_is_process_wide_singleton() {
+        // 持锁：与本文件所有触及全局 registry 的测试互斥（registry_full 测试的
+        // clear/灌满窗会吞掉无锁注册 ⇒ 无锁即 flake，2026-11-07 实测）。
+        let _g = TEST_LOCK.lock();
         // 不 clear，验证注册表跨测试调用持久（仅作可观察性检查，不依赖顺序）。
         let before = is_registered("type.googleapis.com/test.Stub");
         let _ = register_feature(
@@ -178,5 +184,44 @@ mod tests {
         );
         assert!(is_registered("type.googleapis.com/test.SingletonCheck"));
         let _ = before; // 不 assert，避免依赖测试执行顺序
+    }
+
+    #[test]
+    fn registry_full_returns_registry_full_error() {
+        let _g = TEST_LOCK.lock();
+        clear_registry_for_test();
+
+        // 灌满注册表，再注册新键必须报 **RegistryFull**（满表语义换代：不再伪装
+        // NotFound，bd u0pe2 ③）。反向自检：把 `register_feature` 满表分支改回
+        // `FeatureError::NotFound { name: format!("registry full (…)") }` ⇒ 下方
+        // matches! 断言必红。
+        for i in 0..MAX_FEATURE_ENTRIES {
+            let key: &'static str =
+                Box::leak(format!("type.googleapis.com/test.Full{i}").into_boxed_str());
+            register_feature(
+                key,
+                Arc::new(|_| Ok(Arc::new(StubFeature { tag: "full" }) as Arc<dyn Feature>)),
+            )
+            .expect("灌满阶段不得失败");
+        }
+        let err = register_feature(
+            "type.googleapis.com/test.Overflow",
+            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "overflow" }) as Arc<dyn Feature>)),
+        )
+        .expect_err("满表后注册新键必须失败");
+        assert!(
+            matches!(err, FeatureError::RegistryFull { max } if max == MAX_FEATURE_ENTRIES),
+            "满表必须报 RegistryFull（旧指纹 NotFound registry full）: {err:?}"
+        );
+        assert!(err.to_string().contains("registry full"), "{err}");
+
+        // 满表不影响同键覆盖注册（幂等语义保全）。
+        register_feature(
+            "type.googleapis.com/test.Full0",
+            Arc::new(|_| Ok(Arc::new(StubFeature { tag: "x" }) as Arc<dyn Feature>)),
+        )
+        .expect("满表时同键覆盖注册仍须成功");
+
+        clear_registry_for_test();
     }
 }

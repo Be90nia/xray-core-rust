@@ -134,8 +134,11 @@ impl Config {
 /// 4 KiB，32 KiB = 8× Go 默认，安全余量充足。`max_message_size`（64 MiB）/
 /// `max_frame_size`（16 MiB）是协议 OOM 防线，与每连接常驻内存无关（只有实际
 /// 收到大帧才占），不动；`WebSocketConfig` 是 `#[non_exhaustive]`，走 builder。
+///
+/// 内存面：读 + 写 = 64 KiB/连接，登记于 xray-core
+/// `memory_budget::WS_PER_CONN_BUFFER_BOOKED_BYTES`（交叉断言钉住，bd sgdwm）。
 #[must_use]
-pub(crate) fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+pub fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
     tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .read_buffer_size(32 * 1024)
         .write_buffer_size(32 * 1024)

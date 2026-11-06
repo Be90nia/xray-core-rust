@@ -12,7 +12,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -42,6 +42,9 @@ const UDP_READ_BUF: usize = 4096;
 /// Go 用 `[255]byte` 定长数组规避 `decoded[13]`/`decoded[14]` 越界，但其
 /// `decoded[15:n]` 在 `n < 15` 时同样越界 panic（上游同缺陷，不复刻）。
 const FRAG_MIN_DECODED_LEN: usize = 15;
+/// recv 噪音错误的限频：`ConnectionReset` 成批出现时每 N 条打一条 WARN
+/// （同 `handshake_gate.rs` 的 `LOG_EVERY` 形态），避免刷屏又不丢可见证据。
+const RECV_ERR_LOG_EVERY: u64 = 256;
 
 /// 错误即时响应（Go `resp` struct in server.go）。
 struct DrResp {
@@ -65,6 +68,9 @@ struct ServerState {
     read_tx: mpsc::Sender<Packet>,
     rec_tx: mpsc::Sender<Rec>,
     dr_tx: mpsc::Sender<DrResp>,
+    /// recv 侧 `ConnectionReset` 累计数（只用于限频打 WARN，见
+    /// [`RECV_ERR_LOG_EVERY`]）。
+    recv_resets: AtomicU64,
 }
 
 /// 上层数据包：payload + clientID 派生的 fd 地址（Go `clientID.Addr()`）。
@@ -97,10 +103,13 @@ pub(crate) struct XdnsConnServer {
     state: Arc<ServerState>,
     closed: Arc<AtomicBool>,
     read_rx: Mutex<mpsc::Receiver<Packet>>,
-    /// B6（bd t975）：maintain_loop 唯一托管口（坑约束 5）。recv/send/dr 为
-    /// 数据面泵热路径豁免（约束⑫）；scope 随 conn drop 兜底 abort，
-    /// 协作停机仍走 `closed`。
-    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 uot/TcpWorker 先例。
+    /// B6（bd t975）：四个循环（recv/send/dr/maintain）的唯一托管口（坑约束 5）。
+    /// 全部走 `spawn_tracked` ⇒ 进 `JoinSet`，scope 随 conn drop 时 **abort 全组**
+    /// 才成立（bd ej1nn：`spawn_detached` 的句柄 Drop 是 detach，兜底不成立——
+    /// recv 泵会阻塞在 `recv_from` 上永久持有 `Arc<dyn UdpIo>`，fd 不释放且该
+    /// socket 继续收包应答）。协作停机仍走 `closed`。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），生产无显式读点——同 uot/TcpWorker
+    // 先例；单测读 `in_flight()` 验「进集」与否。
     #[allow(dead_code)]
     fx: Arc<FxScope>,
 }
@@ -142,6 +151,7 @@ impl XdnsConnServer {
             read_tx,
             rec_tx,
             dr_tx,
+            recv_resets: AtomicU64::new(0),
         });
 
         let this = Self {
@@ -151,18 +161,21 @@ impl XdnsConnServer {
             fx: Arc::new(FxScope::new()),
         };
 
-        // 数据面泵：走显式脱管口（bd hj3jf）——三循环寿命随 `closed` 信号自终，
-        // 托管记账无收益（上游无 drain，条目会滞留到 scope drop）。
+        // 三个数据面泵走**记账托管**（bd ej1nn）：`spawn_detached` 的返回句柄
+        // Drop = detach，.expect() 后句柄即丢 ⇒ 无任何持有者能 abort 它们，conn
+        // drop 后 recv 泵继续阻塞在 recv_from 上、持有 `Arc<dyn UdpIo>` ⇒ fd 不
+        // 释放且该 socket 继续收包应答。进 JoinSet 后 `FxScope` drop ⇒ JoinSet
+        // drop ⇒ abort 全组，「scope 随 conn drop 兜底 abort」才成立。
         this.fx
-            .spawn_detached(recv_loop(state.clone(), closed.clone()))
+            .spawn_tracked(recv_loop(state.clone(), closed.clone()))
             .expect("internal FxScope is never closed");
         this.fx
-            .spawn_detached(send_loop(state.clone(), rec_rx, closed.clone()))
+            .spawn_tracked(send_loop(state.clone(), rec_rx, closed.clone()))
             .expect("internal FxScope is never closed");
         this.fx
-            .spawn_detached(dr_loop(state.clone(), dr_rx, closed.clone()))
+            .spawn_tracked(dr_loop(state.clone(), dr_rx, closed.clone()))
             .expect("internal FxScope is never closed");
-        // maintain_loop 相反：周期维护任务适用记账托管（长寿、单条）。
+        // maintain_loop 同属托管集（长寿单条）。
         // 闸关不可达：内部 scope 无 close 调用（分片维护管理任务随 scope 收口）。
         this.fx
             .spawn_tracked(maintain_loop(frag, send_mgr, closed))
@@ -298,6 +311,19 @@ async fn server_read(state: &ServerState, buf: &[u8], addr: SocketAddr) {
 }
 
 /// recv 循环：读隧道 → 处理查询（对应 Go `recv` goroutine）。
+///
+/// 错误分类（bd quznp）。旧行为是无分类 `Err(_) => continue`：底层持续报错时
+/// 就是 100% CPU 紧循环。
+///
+/// - `Interrupted` ⇒ 继续（信号打断，可恢复）。
+/// - `ConnectionReset` ⇒ 限频 WARN + 继续。Windows 上这是 ICMP unreachable 的 回投；socket 层已由
+///   [`crate::udp::bind_udp_no_connreset`] 根治，这里兜住 没走该口的 socket。它与 socks `relay.rs`
+///   / kcp `udp_hub.rs` 同口径。
+/// - 其它 ⇒ ERROR + 退泵（对齐 Go `server.go:255-260` 的 `return`）。此时才是 真半死
+///   conn，继续读只会紧循环。
+///
+/// **有意差异**：Go xdns 不分类、任何错误都 `return`；本仓在 `ConnectionReset`
+/// 这一类上更宽容（比 Go 健壮），对拍时勿判为 bug。
 async fn recv_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
     let mut buf = vec![0u8; UDP_READ_BUF];
     loop {
@@ -306,7 +332,23 @@ async fn recv_loop(state: Arc<ServerState>, closed: Arc<AtomicBool>) {
         }
         let (n, addr) = match state.inner.recv_from(&mut buf).await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => match e.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::ConnectionReset => {
+                    let seen = state.recv_resets.fetch_add(1, Ordering::Relaxed) + 1;
+                    if seen % RECV_ERR_LOG_EVERY == 1 {
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "count={seen} xdns server: recv connreset ignored"
+                        );
+                    }
+                    continue;
+                },
+                _ => {
+                    crate::hot_log!(tracing::Level::ERROR, "error={e} xdns server: recv err");
+                    return;
+                },
+            },
         };
         server_read(&state, &buf[..n], addr).await;
     }
@@ -456,5 +498,41 @@ impl UdpIo for XdnsConnServer {
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(SocketAddr::from(([0u8, 0, 0, 0], 0)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单域最小配置（域名合法性由 `Domain::new` 在校验）。
+    fn config() -> Config {
+        Config {
+            domains: vec![super::super::DomainConfig {
+                name: "example.com".into(),
+                len_limit: 255,
+                label_limit: 63,
+                types: Vec::new(),
+                edns0: 0,
+            }],
+            ..Config::default()
+        }
+    }
+
+    /// bd ej1nn 反向自检锚点：四个循环必须**进生命周期集**（`in_flight` = 4）。
+    ///
+    /// 改回 `spawn_detached` ⇒ `in_flight()` 只剩 maintain 的 1 ⇒ 本断言红。
+    /// `in_flight() == 0`（drop 后归零）在集成探针
+    /// `tests/xdns_server_pumps_probe.rs` 用「存活任务数 + 端口可重新 bind」验：
+    /// 本单测拿不到 drop 之后的读数——scope 的最后一个 `Arc` 与 conn 同归于尽。
+    #[tokio::test]
+    async fn pumps_are_scope_tracked() {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let srv = XdnsConnServer::new(Arc::new(sock), &config()).expect("construct");
+        assert_eq!(
+            srv.fx.in_flight(),
+            4,
+            "recv/send/dr 三泵 + maintain 均须进 JoinSet（spawn_detached ⇒ 只剩 1）"
+        );
     }
 }

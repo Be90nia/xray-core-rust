@@ -33,6 +33,9 @@ log = "0.4"
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log", "memgov"] }
 # bd bf92：antireplay MapFilter 时间源走 skeleton::clock（热路径泛型静态分发）。
 udf-skeleton = { path = "../udf-frame/skeleton" }
+# ARCH-06：UUID::new 委托 xray_frame::uuid::Uuid（udf RandomId CSPRNG 派生件），
+# 消除第二套 v4 生成面。xray-frame 零 xray-common 依赖（骨架不感知血肉），无环。
+xray-frame = { path = "../xray-frame" }
 
 [dev-dependencies]
 # 双写收敛断言需要 capture 订阅者（workspace.dependencies 已有条目）。

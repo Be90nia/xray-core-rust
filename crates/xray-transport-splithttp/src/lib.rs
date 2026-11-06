@@ -67,19 +67,16 @@ macro_rules! hot_log {
 }
 pub(crate) use hot_log;
 
-pub mod batched_upload;
-pub mod browser_client;
 pub mod client;
 pub mod config;
 pub mod connection;
 pub mod dialer;
 pub mod error;
 pub(crate) mod flow_window;
-pub mod h1_conn;
 pub mod h3_client;
 pub mod hub;
 pub mod mux;
-pub(crate) mod pool_stream;
+pub mod pool_stream;
 pub mod register;
 pub mod transport;
 pub mod upload_queue;

@@ -187,17 +187,16 @@ pub struct Budget {
 // 本 impl 即仓内唯一 tokio 虚拟钟取时桥：tokio advance/timeout_at 只收 tokio::time::Instant，
 // 接 udf Clock 会作废虚拟推进测试语义（713x6 裁决 tokio 面不迁）；墙钟语义走 wall(Clock) 出口；
 // std Instant 臂为跨源构造漂移的防御兜底（源与起点同源构造，实际不可达）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "tokio 虚拟钟取时桥本体（唯一登记面）：advance/timeout_at 只收 tokio Instant，接 udf Clock 即作废虚拟推进语义（713x6）；墙钟语义走 Budget::wall(Clock) 出口（本文件已就位）"
-)]
+// 登记粒度 = 点级（bd 1z3pl ARCH-10）：每个取时点独立 #[allow] + reason，无 impl/文件级 allow。
 impl Budget {
     /// 默认源 = tokio（虚拟可推进；`tokio::time::advance` 语义完整保留）。
     pub fn tokio() -> Self {
-        Self {
-            source: BudgetSource::Tokio,
-            start: BudgetInstant::Tokio(tokio::time::Instant::now()),
-        }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "tokio 虚拟钟取时桥点（713x6 tokio 面不迁）：advance 虚拟推进语义只存在于 tokio Instant，接 udf Clock 即作废；墙钟出口 = wall(Clock)"
+        )]
+        let now = tokio::time::Instant::now();
+        Self { source: BudgetSource::Tokio, start: BudgetInstant::Tokio(now) }
     }
 
     /// 墙钟源（注入 udf `Clock`；`MockClock` → 冻结/推进可控）。
@@ -223,6 +222,10 @@ impl Budget {
                 BudgetInstant::Wall(start.checked_add(d).unwrap_or(*start))
             },
             // 源与起点同源构造 → 该臂不可达（保留兜底防未来改构造时静默错配）。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "跨源兜底臂（构造不可达防御）：tokio 取时桥点，兜底防未来改构造时静默错配；正路径取时只在 tokio()/wall() 构造点"
+            )]
             _ => match tokio::time::Instant::now().checked_add(d) {
                 Some(at) => BudgetInstant::Tokio(at),
                 None => BudgetInstant::Tokio(tokio::time::Instant::now()),
@@ -235,11 +238,20 @@ impl Budget {
     pub fn elapsed(&self) -> Duration {
         match &self.start {
             BudgetInstant::Tokio(start) => {
-                tokio::time::Instant::now().saturating_duration_since(*start)
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（713x6 tokio 面不迁）：Tokio 源随虚拟时间推进测耗，接 udf Clock 即作废 advance 语义"
+                )]
+                let now = tokio::time::Instant::now();
+                now.saturating_duration_since(*start)
             },
             BudgetInstant::Wall(start) => {
                 let now = match &self.source {
                     BudgetSource::Wall(clock) => clock.now_instant(),
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "跨源兜底臂（构造不可达防御）：Wall 起点配 Tokio 源属构造漂移，兜底读 std 墙钟，不接 udf Clock"
+                    )]
                     BudgetSource::Tokio => std::time::Instant::now(),
                 };
                 now.saturating_duration_since(*start)
@@ -261,6 +273,10 @@ impl Budget {
     pub fn arm_timer(&self, d: Duration) -> BudgetTimer {
         match &self.source {
             BudgetSource::Tokio => {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（bd 23vrp timer-arm）：sleep_until/Sleep 只收 tokio Instant，接 udf Clock 即作废 advance 语义；墙钟臂在下方走 clock.now_instant()"
+                )]
                 let now = tokio::time::Instant::now();
                 let at = now.checked_add(d).unwrap_or(now);
                 BudgetTimer {
@@ -283,11 +299,8 @@ pub struct BudgetDeadline {
     at: BudgetInstant,
 }
 
-// 同 Budget：tokio 源臂与跨源兜底臂都属取时桥本体（登记见上方 Budget 侧注）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "tokio 虚拟钟取时桥本体（唯一登记面）：timeout_at/is_expired/remaining 的 tokio 源臂只收 tokio Instant，std 臂为跨源防御兜底（713x6 tokio 面不迁）"
-)]
+// 同 Budget：tokio 源臂与跨源兜底臂都属取时桥本体（713x6 裁决 tokio 面不迁，墙钟走
+// wall(Clock) 出口）；登记粒度 = 点级（bd 1z3pl ARCH-10），各取时点独立 #[allow] 见下。
 impl BudgetDeadline {
     /// 预算超时包装：Tokio 源 → `tokio::time::timeout_at`（**保 advance 语义**）；
     /// Wall 源 → tokio 计时器 + 墙钟判负（`MockClock` 推进可强制判负）。
@@ -304,6 +317,10 @@ impl BudgetDeadline {
             BudgetSource::Tokio => {
                 let at = match self.at {
                     BudgetInstant::Tokio(at) => at,
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "tokio 虚拟钟取时桥点（713x6 tokio 面不迁）：timeout_at 只收 tokio Instant，接 udf Clock 即作废 advance 语义"
+                    )]
                     BudgetInstant::Wall(_) => tokio::time::Instant::now(),
                 };
                 tokio::time::timeout_at(at, fut).await
@@ -311,6 +328,10 @@ impl BudgetDeadline {
             BudgetSource::Wall(clock) => {
                 let at = match self.at {
                     BudgetInstant::Wall(at) => at,
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "跨源兜底臂（构造不可达防御）：Wall 源配 Tokio 锚点属构造漂移，兜底读 std 墙钟；正路径到期判定在 wall_expiry_watch(Clock)"
+                    )]
                     BudgetInstant::Tokio(_) => std::time::Instant::now(),
                 };
                 // 墙钟源：**到期判定完全由 `Clock` 决定**（冻结 → 永不到期；
@@ -329,7 +350,14 @@ impl BudgetDeadline {
     /// 是否已过期（Tokio 源随虚拟时间；Wall 源随 `Clock`）。
     pub fn is_expired(&self) -> bool {
         match (&self.source, &self.at) {
-            (BudgetSource::Tokio, BudgetInstant::Tokio(at)) => tokio::time::Instant::now() >= *at,
+            (BudgetSource::Tokio, BudgetInstant::Tokio(at)) => {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（713x6 tokio 面不迁）：is_expired 的 Tokio 源臂随虚拟时间判定，接 udf Clock 即作废 advance 语义"
+                )]
+                let now = tokio::time::Instant::now();
+                now >= *at
+            },
             (BudgetSource::Wall(clock), BudgetInstant::Wall(at)) => clock.now_instant() >= *at,
             _ => false,
         }
@@ -339,7 +367,12 @@ impl BudgetDeadline {
     pub fn remaining(&self) -> Duration {
         match (&self.source, &self.at) {
             (BudgetSource::Tokio, BudgetInstant::Tokio(at)) => {
-                at.saturating_duration_since(tokio::time::Instant::now())
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（713x6 tokio 面不迁）：remaining 的 Tokio 源臂随虚拟时间计算，接 udf Clock 即作废 advance 语义"
+                )]
+                let now = tokio::time::Instant::now();
+                at.saturating_duration_since(now)
             },
             (BudgetSource::Wall(clock), BudgetInstant::Wall(at)) => {
                 at.saturating_duration_since(clock.now_instant())
@@ -411,12 +444,8 @@ pub struct BudgetTimer {
     inner: TimerInner,
 }
 
-// tokio 虚拟钟计时桥本体（与 [`Budget`]/[`BudgetDeadline`] 同一唯一登记面；
-// 见上方 Budget impl 注释：713x6 裁决 tokio 面不迁 udf，墙钟走 wall(Clock) 出口）。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "tokio 虚拟钟计时桥本体（唯一登记面，bd 23vrp timer-arm）：arm/reset 只收 tokio Instant，接 udf Clock 即作废虚拟推进语义（713x6）；墙钟语义走 wall(Clock) 出口"
-)]
+// tokio 虚拟钟计时桥本体（与 [`Budget`]/[`BudgetDeadline`] 同一桥面；713x6 裁决 tokio 面
+// 不迁 udf，墙钟走 wall(Clock) 出口）；登记粒度 = 点级（bd 1z3pl ARCH-10），见下。
 impl BudgetTimer {
     /// 重置计时窗口：自**此刻**起再计 `d`（idle-reset 语义——"最近一次活动起
     /// 重新计时"；等价 `Sleep::reset(Instant::now() + d)`）。已触发/未触发态
@@ -426,6 +455,10 @@ impl BudgetTimer {
             TimerInner::Tokio { sleep, at } => {
                 // 溢出（恒非法 = 调用方给了荒谬时限）→ 锚点停在当前时刻（立即
                 // 可触发，fail-closed，同 [`Budget::deadline`] 的溢出臂）。
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（bd 23vrp timer-arm）：Sleep::reset 只收 tokio Instant，接 udf Clock 即作废虚拟推进语义（713x6）；墙钟臂在下方走 clock.now_instant()"
+                )]
                 let now = tokio::time::Instant::now();
                 *at = now.checked_add(d).unwrap_or(now);
                 sleep.as_mut().reset(*at);
@@ -454,7 +487,14 @@ impl BudgetTimer {
     /// 是否已触发（Tokio 源随虚拟时间；Wall 源随 `Clock`）。
     pub fn is_expired(&self) -> bool {
         match &self.inner {
-            TimerInner::Tokio { at, .. } => tokio::time::Instant::now() >= *at,
+            TimerInner::Tokio { at, .. } => {
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "tokio 虚拟钟取时桥点（bd 23vrp timer-arm）：is_expired 的 Tokio 源臂随虚拟时间判定，接 udf Clock 即作废 advance 语义"
+                )]
+                let now = tokio::time::Instant::now();
+                now >= *at
+            },
             TimerInner::Wall { clock, at } => clock.now_instant() >= *at,
         }
     }

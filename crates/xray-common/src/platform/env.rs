@@ -203,8 +203,8 @@ pub fn tun_fd_raw() -> Option<String> {
 /// 启动期扫描「Rust 无消费点」的 Go env：被设置即 warn 指名，不静默丢。
 ///
 /// 覆盖（Go common/platform/platform.go:25,29）：
-/// - `xray.browser.dialer`：browser dialer 传输未装配（xray-transport 的 `browser-dialer`
-///   模块存在但无生产启动路径）。
+/// - `xray.browser.dialer`：browser dialer 传输未装配（无生产启动路径；xray-transport 的
+///   `browser-dialer` feature 保留占位）。
 /// - `xray.tun.fd`：仅 Linux 有 fd 继承消费点（xray-proxy-tun `tun_fd`）；Linux 上设置
 ///   不告警（值非法由 tun 侧建设备时报错），其余平台无该能力，设置即指名告警 （tun 侧 `create`
 ///   会硬错，这里提前给运维线索）。

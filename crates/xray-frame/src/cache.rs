@@ -40,7 +40,11 @@ use skeleton::clock::Clock;
 use std_ext::cache::SyncTtlCache;
 
 /// 无上限 stale 窗口时的物理保留下限（一年）。
-const UNBOUNDED_RETENTION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+///
+/// pub（audit ARCH-04）：DNS 答案表换 `SyncTtlCache` 底座后，serveStale 无上限
+/// 窗口（`serve_stale && serveExpiredTTL == 0`）的条目物理保留沿用同一口径——
+/// 单一事实源，禁消费方复制魔数。
+pub const UNBOUNDED_RETENTION: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 /// 值形状：业务值 + 新鲜截止时刻（`fresh_until`）。
 ///

@@ -5,8 +5,6 @@
 
 use std::fmt;
 
-use rand::RngCore;
-
 /// 自定义 UUID 类型，基于 16 字节数组存储。
 ///
 /// 对应 Go 版本的 `uuid.UUID`，支持 v4 随机生成和标准格式解析。
@@ -31,16 +29,16 @@ impl Default for UUID {
 impl UUID {
     /// 生成随机 v4 UUID。
     ///
-    /// 使用 `rand` crate 填充随机字节，并设置 v4 版本位和变体位。
+    /// 委托 [`xray_frame::uuid::Uuid`]（bd h4bl5 派生件 2：udf
+    /// `std_ext::id::RandomId`——OS getrandom CSPRNG、失败 fail-closed、
+    /// ver/var 位面归一），本仓不再有第二套 v4 生成器（audit ARCH-06）。
+    /// 失败 panic 对齐 Go `uuid.New` 的 `Must` 语义（CSPRNG 不可用 = 环境坏，
+    /// 静默降级弱熵禁），本仓既有 `UUID::new` 签名（无 `Result`）保持不变。
     #[must_use]
     pub fn new() -> Self {
-        let mut bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut bytes);
-        // 设置版本号为 v4 (0100)
-        bytes[6] = (bytes[6] & 0x0F) | 0x40;
-        // 设置变体为 RFC 4122 (10xx)
-        bytes[8] = (bytes[8] & 0x3F) | 0x80;
-        Self(bytes)
+        let id = xray_frame::uuid::Uuid::new()
+            .expect("uuid: OS CSPRNG unavailable (fail-closed; Go uuid.New Must() parity)");
+        Self(id.as_u128().to_be_bytes())
     }
 
     /// 从 16 字节数组创建 UUID。

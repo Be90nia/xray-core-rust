@@ -1,14 +1,13 @@
-//! bd n580i：bridge 背压闸「按**条目**计」口径的行为钉桩。
+//! bd n580i 条目口径钉桩 + u440m 字节闸收口：`bridge_link_with_stream_full`
+//! 两向背压 = **条目闸 64 条**（`PIPE_BUF_CAP`）**+ 字节闸 2MiB/方向**
+//! （`BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES`，1KiB 许可粒度，许可随条目 drop
+//! 归还）。
 //!
-//! `bridge_link_with_stream_full` 的两向背压闸是 bounded mpsc，容量按
-//! **条目**（MultiBuffer 个数）计：每方向 `PIPE_BUF_CAP` = 64 条。单条的字节数
-//! 由**生产侧**决定（下行 readv 腿顶格 = 8 块 × 64KiB = 512KiB），故单方向
-//! 在途上界 = 64 条 × 512KiB = **32MiB**——**不是** 512KiB（512KiB 是 Go 每连接
-//! pipe 的字节软限，与本闸的条目闸不同量纲）。
-//!
-//! 本测试从**行为**侧钉住条目语义（纯注释会被后续改动悄悄改漂，正是本票的成因）：
-//! 写侧永久阻塞时，读侧最多产出 `64（mpsc 缓冲）+ 1（writer 持有）+ 1（send
-//! 阻塞）` = 65..66 条；把单条放大到 64KiB 后累计字节远超 512KiB ⇒ 闸不是字节闸。
+//! n580i 当年的口径「64 条 × 512KiB = 32MiB、闸按条目不按字节」已被 u440m
+//! 取代：32MiB 在途远超 xray_buf 池驻留 8MiB ⇒ 归还全丢 ⇒ 池命中率 0%
+//! （sim-bridge-bytegate.md v3）。单条 64KiB（readv 腿一块）时字节闸先封顶：
+//! 2048 许可 ÷ 64 许可/条 = 32 条在途，读侧拉取停在 `32（闸内）+ 1（手上一条
+//! 待许可）` = **33 条**——写侧永久阻塞时拉取数钉在 33，改任一闸值即红。
 //!
 //! 复现：
 //! ```text
@@ -36,9 +35,11 @@ use xray_transport::{bridge::bridge_link_with_stream_full, connection::Connectio
 /// 单条 MultiBuffer 的字节数（64KiB = readv 升窗后的一块；亦即 readv 腿的顶格量级）。
 const ENTRY_BYTES: usize = 64 * 1024;
 
-/// 闸的**条目**容量（= `bridge_link_with_stream_full` 内的 `PIPE_BUF_CAP`）。
-/// 此处复制一份供断言：改实现容量须同步改本值，否则本测试变红（正是要的效果）。
-const PIPE_BUF_CAP: usize = 64;
+/// 字节闸下 64KiB 条目的封顶拉取数 = `2MiB/64KiB`（闸内 32 条）`+ 1`（手上一条
+/// 待许可）。此处**有意复制硬编码**而非从实现常量推导：改任一闸值/条目口径
+/// 须同步改本值，否则本测试变红（正是要的效果；实现侧另有 memory_budget
+/// 交叉断言与 bridge.rs 单测钉同一数字）。
+const EXPECTED_PRODUCED: usize = 33;
 
 /// 计数读腿：每轮交一条 [`ENTRY_BYTES`] 的 MultiBuffer，统计被拉起次数。
 struct CountingReader {
@@ -105,7 +106,7 @@ impl Connection for StalledConn {
 }
 
 #[tokio::test]
-async fn backpressure_gate_counts_entries_not_bytes() {
+async fn backpressure_byte_gate_caps_entries_at_budget() {
     let calls = Arc::new(AtomicUsize::new(0));
     let link = Link::new(
         Box::new(CountingReader { calls: Arc::clone(&calls) }) as Box<dyn Reader>,
@@ -119,15 +120,15 @@ async fn backpressure_gate_counts_entries_not_bytes() {
                 .await;
     });
 
-    // 等闸封顶：条目数涨到 PIPE_BUF_CAP+1 即说明 mpsc 已满、reader 正卡在 send。
-    // （不靠「两次采样相等」判稳定——慢 CI 上采样间隙可能恰好无进展而误判。）
-    // 用轮次计数代替 Instant::now（后者在本 crate clippy 禁用清单上）。
+    // 等闸封顶：拉取数涨到 EXPECTED_PRODUCED 即说明字节闸已满、reader 正卡在
+    // acquire。 （不靠「两次采样相等」判稳定——慢 CI 上采样间隙可能恰好无进展
+    // 而误判。）用轮次计数代替 Instant::now（后者在本 crate clippy 禁用清单上）。
     let mut rounds = 0u32;
-    while calls.load(Ordering::SeqCst) < PIPE_BUF_CAP + 1 {
+    while calls.load(Ordering::SeqCst) < EXPECTED_PRODUCED {
         assert!(
             rounds < 500,
-            "10s 内未攒够 {} 条（实测 {}），背压闸未按预期封顶",
-            PIPE_BUF_CAP + 1,
+            "10s 内未攒够 {} 条（实测 {}），字节闸未按预期封顶",
+            EXPECTED_PRODUCED,
             calls.load(Ordering::SeqCst)
         );
         rounds += 1;
@@ -137,18 +138,16 @@ async fn backpressure_gate_counts_entries_not_bytes() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     let produced = calls.load(Ordering::SeqCst);
-    assert!(
-        (PIPE_BUF_CAP + 1..=PIPE_BUF_CAP + 2).contains(&produced),
-        "闸按条目计：mpsc 缓冲 {PIPE_BUF_CAP} 条 + writer 持有 1 条 + send 阻塞 1 条 \
-         ⇒ 读侧应产出 {}..{} 条，实测 {produced}",
-        PIPE_BUF_CAP + 1,
-        PIPE_BUF_CAP + 2,
+    assert_eq!(
+        produced, EXPECTED_PRODUCED,
+        "字节闸按字节记账：32×64KiB = 2MiB 占满许可 + 手上一条 ⇒ 读侧拉取应钉在 \
+         {EXPECTED_PRODUCED} 条，实测 {produced}（条目闸口径下会是 65..66 ⇒ 红）"
     );
-    // 单条 64KiB ⇒ 累计字节远超 512KiB ⇒ 闸绝不是 512KiB 的字节闸。
-    assert!(
-        produced * ENTRY_BYTES > 512 * 1024,
-        "累计在途字节 {} 应远超 512KiB（闸按条目不按字节）",
-        produced * ENTRY_BYTES,
+    // 在途字节 = 32×64KiB = 2MiB = 每方向预算（条目闸口径下应是 4MiB+ ⇒ 红）。
+    assert_eq!(
+        (produced - 1) * ENTRY_BYTES,
+        2 * 1024 * 1024,
+        "闸内条目字节账必须恰为每方向预算 2MiB"
     );
 
     handle.abort();

@@ -90,9 +90,7 @@ pub struct UdpDispatcher {
     /// 清理 task handle。
     cleanup_handle: Option<Spawned<()>>,
     /// B6（bd t975）：清理 task 唯一托管口（坑约束 5）。scope 随 dispatcher
-    /// drop 兜底 abort；显式停机走 [`Self::close`]。
-    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），无显式读点——同 uot/TcpWorker 先例。
-    #[allow(dead_code)]
+    /// drop 兜底 abort；显式停机走 [`Self::close`]（close 内读 `fx.close()`）。
     fx: Arc<FxScope>,
 }
 

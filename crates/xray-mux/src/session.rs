@@ -290,31 +290,40 @@ impl Session {
         // 发送 done 信号
         let _ = self.done_tx.send(true);
 
-        let mut xudp_guard = self.xudp.lock().await;
+        let has_xudp = {
+            // PM-13：xudp 锁只罩状态判定/迁移，不跨下方 input/output 锁与 inner 写锁
+            // （旧写法 else 路径的 guard 一直活到函数尾，跨 parent.inner.write().await）。
+            let mut xudp_guard = self.xudp.lock().await;
+            match xudp_guard.as_mut() {
+                None => false,
+                Some(xudp) => {
+                    // 有 XUDP：Active 状态转为 Expiring，设置 60 秒过期
+                    if xudp.status == XudpStatus::Active {
+                        xudp.status = XudpStatus::Expiring;
+                        xudp.expire = Instant::now() + Duration::from_secs(60);
+                        debug!("XUDP put: {:?}", xudp.global_id);
+                    }
+                    true
+                },
+            }
+        };
 
-        if xudp_guard.is_none() {
+        if !has_xudp {
             // 无 XUDP：中断输入，关闭输出
-            drop(xudp_guard);
-
             if let Some(reader) = &mut *self.input.lock().await {
                 reader.interrupt();
                 reader.close();
             }
-            if let Some(writer) = &mut *self.output.lock().await {
+            // PM-13：output 锁不跨 flush——take 出所有权落盘再原样归还（落盘后
+            // 槽内状态与旧实现一致：Some(已 shutdown 的 writer)）。持锁 flush 在
+            // carrier 停滞时会让 close 与 SessionManager 摘除链相互卡死。
+            if let Some(mut writer) = { self.output.lock().await.take() } {
                 let _ = writer.flush().await;
                 // Go Session.Close：common.Close(s.output)——pipe 关闭让 app
                 // 下行读端收 EOF；只 flush 不关会让 dispatcher 下行 bridge 永久
                 // 悬挂（bd txhn：carrier 死后 8 流 87s 零字节冻结）。
                 writer.shutdown();
-            }
-        } else {
-            // 有 XUDP：Active 状态转为 Expiring，设置 60 秒过期
-            if let Some(ref mut xudp) = *xudp_guard {
-                if xudp.status == XudpStatus::Active {
-                    xudp.status = XudpStatus::Expiring;
-                    xudp.expire = Instant::now() + Duration::from_secs(60);
-                    debug!("XUDP put: {:?}", xudp.global_id);
-                }
+                *self.output.lock().await = Some(writer);
             }
         }
 
@@ -427,8 +436,14 @@ impl XUDP {
                     reader.interrupt();
                 }
                 // 关闭输出
-                if let Some(ref mut writer) = *session.output.lock().await {
+                // PM-13：output 锁不跨 flush——take 出所有权落盘再原样归还（同
+                // Session::close 的修法）。持锁 flush 会与该会话的写路径（worker/
+                // client 持 output 锁 write）互卡在 carrier 写上；落盘窗口内并发
+                // 写看到 None 直接跳过 = 写入已关闭会话失败的同义（Go Interrupt 后
+                // output.Close 同样拒新写）。
+                if let Some(mut writer) = { session.output.lock().await.take() } {
                     let _ = writer.flush().await;
+                    *session.output.lock().await = Some(writer);
                 }
             }
         }

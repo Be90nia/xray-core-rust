@@ -135,7 +135,7 @@ pub async fn bind_tcp_listener<A: tokio::net::ToSocketAddrs>(
 use crate::filelocker::FileLocker;
 use crate::{
     connection::{Connection, TcpConnection},
-    sockopt::{SocketOptions, apply_inbound_socket_options},
+    sockopt::{SocketOptions, apply_inbound_socket_options, check_explicit_receive_buffer_size},
 };
 
 /// fd 级监听控制器。对应 Go `func(network, address string, c syscall.RawConn) error`。
@@ -182,6 +182,11 @@ impl DefaultListener {
     /// 对应 Go `DefaultListener.Listen(ctx, addr, sockopt)` 的 TCP 分支。
     /// sockopt 在 `accept` 时应用到每个入站连接（与 Go 一致）。
     pub async fn bind(addr: SocketAddr, sockopt: SocketOptions) -> io::Result<Self> {
+        // bd gm0n3：入站预算闸 fail-closed——显式 `receiveBufferSize` 超限在 bind 期
+        // 硬拒（监听器起不来 = 配置错误启动即报），不再 DEBUG 放行半配置 socket
+        // 继续服役；与出站 `dial_system` 每连接 Err（bd o91s4）语义对称。accept 期
+        // 其余 setsockopt 失败只 WARN（socket 仍可用，见 [`SystemListener::accept`]）。
+        check_explicit_receive_buffer_size(&sockopt)?;
         let inner = if sockopt.tcp_mptcp {
             Self::bind_mptcp(addr, &sockopt).await?
         } else if Self::needs_prelisten_sockopt(&sockopt) {
@@ -388,9 +393,13 @@ impl SystemListener for DefaultListener {
             let std_stream = stream.into_std()?;
             let socket = socket2::Socket::from(std_stream);
 
-            // 应用 inbound sockopt（TCP_NODELAY + keepalive）。
+            // 应用 inbound sockopt（TCP_NODELAY + keepalive）。分级语义（bd gm0n3）：
+            // 预算闸超限已在 bind 期硬拒，这里不可能再见到；能到这里的失败全部是
+            // set-option 类（系统态失败，socket 本身可用，缺的只是优化项）⇒ WARN
+            // 可见后继续服役（Go system_listener 同为 Log 后不拒连；DEBUG 会把
+            // 配置错误埋进默认不可见的级别，故升 WARN）。
             if let Err(e) = apply_inbound_socket_options(&socket, &self.sockopt) {
-                crate::LOG.debug(format!("error={e} failed to apply inbound socket options"));
+                crate::LOG.warn(format!("error={e} failed to apply inbound socket options"));
             }
 
             // 应用 fd 控制器。
@@ -580,6 +589,9 @@ impl InboundTcpListener {
     /// # Errors
     /// bind 失败时返回 `io::Error`。
     pub async fn bind(addr: &str, sockopt: SocketOptions) -> io::Result<Self> {
+        // bd gm0n3：入站预算闸 fail-closed——同 [`DefaultListener::bind`]，超限配置
+        // 在 bind 期硬拒（裸 TCP 路径 serve 层同样「配置错启动即报」）。
+        check_explicit_receive_buffer_size(&sockopt)?;
         // bd hjtt：统一走 backlog=1024 helper（tokio 缺省 128 生产 listen overflow）。
         Ok(Self {
             inner: bind_tcp_listener(addr, effective_listen_backlog()).await?,
@@ -641,18 +653,21 @@ impl InboundTcpListener {
 
     /// accept 一个连接并应用 inbound sockopt（TCP_NODELAY / keepalive 等）。
     ///
-    /// sockopt 应用失败仅 debug log 不拒绝连接（与 [`DefaultListener::accept`]
-    /// 及 Go Log 级处理一致）。
+    /// 分级语义（bd gm0n3）：预算闸超限在 [`Self::bind`] 期硬拒（启动即报）；
+    /// accept 期 sockopt 应用失败只 WARN 不拒绝连接（set-option 类，socket 仍
+    /// 可用；与 [`DefaultListener`] 的 accept 及 Go Log 级处理一致）。
     ///
     /// # Errors
     /// accept 或 fd 往返转换失败时返回 `io::Error`。
     pub async fn accept(&self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
         let (stream, peer) = self.inner.accept().await?;
         // tokio TcpStream → std → socket2 应用 sockopt（DefaultListener 同款转换）。
+        // 分级语义（bd gm0n3）：预算闸超限已在 bind 期硬拒；accept 期失败 = set-option
+        // 类（socket 仍可用）⇒ WARN 后继续服役，不再 DEBUG 埋没。
         let std_stream = stream.into_std()?;
         let socket = Socket::from(std_stream);
         if let Err(e) = apply_inbound_socket_options(&socket, &self.sockopt) {
-            crate::LOG.debug(format!("error={e} failed to apply inbound socket options"));
+            crate::LOG.warn(format!("error={e} failed to apply inbound socket options"));
         }
         Ok((tokio::net::TcpStream::from_std(socket.into())?, peer))
     }
@@ -1159,6 +1174,33 @@ mod tests {
         assert_eq!(&buf, b"hello");
 
         server.await.unwrap();
+    }
+
+    /// bd gm0n3：入站预算闸 fail-closed——显式 `receiveBufferSize` 超限 ⇒ bind 期
+    /// 硬拒（Err，监听器起不来 = 配置错误启动即报），不再 DEBUG 放行半配置
+    /// socket 继续服役；与出站 `dial_system` 每连接 Err（bd o91s4 fail-closed）
+    /// 语义对称。两个生产构造入口（[`DefaultListener`] / [`InboundTcpListener`]）
+    /// 都要拒。
+    /// **反向自检锚点**：撤掉两处 bind 的 `check_explicit_receive_buffer_size`，
+    /// 本测试必红（bind 会成功返回 listener）。
+    #[tokio::test]
+    async fn bind_rejects_over_budget_receive_buffer() {
+        let over = SocketOptions { receive_buffer_size: 16 * 1024 * 1024, ..Default::default() };
+        // 手动 match 取 Err（listener 类型未实现 Debug，unwrap_err 用不了）。
+        let err = match DefaultListener::bind("127.0.0.1:0".parse().unwrap(), over.clone()).await {
+            Ok(_) => panic!("DefaultListener 对超限 receiveBufferSize 必须拒 bind（gm0n3）"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("XRAY_ALLOW_LARGE_RCVBUF"),
+            "bind 失败须点名确认开关（fail-visible）：{err}"
+        );
+        let err = match InboundTcpListener::bind("127.0.0.1:0", over).await {
+            Ok(_) => panic!("InboundTcpListener 对超限 receiveBufferSize 必须拒 bind（gm0n3）"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[tokio::test]

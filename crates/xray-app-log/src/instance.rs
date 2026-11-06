@@ -411,6 +411,7 @@ pub struct FileHandler {
     inner: Mutex<FileHandleState>,
 }
 
+// 同上：字段仅在 unix 分支 write_line() 读写，非 unix 平台整结构体无消费点
 #[cfg_attr(not(unix), allow(dead_code))]
 struct FileHandleState {
     file: Option<File>,

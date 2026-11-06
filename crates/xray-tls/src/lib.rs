@@ -22,7 +22,6 @@
 //! - `error`：统一 `TlsError` 枚举
 //! - `ocsp_stapling`：OCSP stapling 集成（`OcspStaplerConfig` +
 //!   `build_server_config_with_stapling`）
-//! - `unsafe_conn`：`TLS_CLOSE_TIMEOUT` 常量
 //!
 //! ## IO 边界与实现状态
 //! - `utls`：标准 rustls 包装的 `Conn`/`UConn`，async 工厂 `client`/`server`/`u_client`
@@ -49,7 +48,6 @@ pub mod fingerprint;
 pub mod ocsp_stapling;
 pub mod pin;
 pub mod server_config;
-pub mod unsafe_conn;
 pub use utls::ConnInterface;
 
 pub mod btls_client;

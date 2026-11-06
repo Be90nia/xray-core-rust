@@ -318,7 +318,7 @@ fn resolve_addr(raw: &str) -> io::Result<(ResolverKind, String)> {
         "tcp" => ResolverKind::Tcp,
         // Go 保留 `url.String()`（含 path/query）——DoH 的 POST 目标就是它
         "https" => return Ok((ResolverKind::Doh, url.to_string())),
-        // Go `:903-904` 对 tcp/udp/https 之外的 scheme 一律 "invalid protocol"（`quic://`
+        // Go `:901-902` 对 tcp/udp/https 之外的 scheme 一律 "invalid protocol"（`quic://`
         // 同样被拒；DoH-over-QUIC 走 `https://` + `tlsConfig.alpn ["h3"]`）⇒ 本栈保留
         // 更明确的指路文案，不做静默降级。
         "quic" | "http3" => return Err(doh::doh_over_quic()),
@@ -330,7 +330,11 @@ fn resolve_addr(raw: &str) -> io::Result<(ResolverKind, String)> {
     let (host, port) = super::split_host_port(authority)?;
     let port = port.unwrap_or_else(|| "53".to_string());
     if !port.chars().all(|c| c.is_ascii_digit()) {
-        return Err(mask_err(format!("xdns: invalid port in resolver addr {raw:?}")));
+        // 原串可能带 userinfo / path / query ⇒ 只留 scheme://host（bd rjcu4）
+        return Err(mask_err(format!(
+            "xdns: invalid port in resolver addr {}",
+            doh::url_label(raw)
+        )));
     }
     Ok((kind, join_host_port(&host, &port)))
 }
@@ -453,8 +457,11 @@ mod tests {
         assert!(build_resolver_configs(&serde_json::json!({})).unwrap().is_empty());
     }
 
-    /// scheme 分派对齐 Go `:883-905`：`https` = DoH（全 URL 保留），`quic`/`http3`
-    /// 本轮未实现 → 点名指路，其余未知 scheme 同 Go "invalid protocol"。
+    /// scheme 分派对齐 Go `:883-905`：`https` = DoH（全 URL 保留）；`quic`/`http3`
+    /// scheme 本身 Go 亦拒（同 Go `transport_finalmask.go:901-902` "invalid protocol"），
+    /// 本栈保留更明确的指路文案（非静默降级）；DoH-over-QUIC 落地形态 = `https://` +
+    /// `tlsConfig.alpn ["h3"]`（bd lf69h，见 `doh3` 模块）。其余未知 scheme 同 Go
+    /// "invalid protocol"。
     ///
     /// 期望值由 Go 26.10.17 源码逐行复刻的探针实跑得出（`url.Parse` +
     /// `Hostname()`/`Port()` + `JoinHostPort`），不是推导。

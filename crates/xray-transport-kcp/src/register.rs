@@ -421,8 +421,8 @@ impl KcpDialerFactory for StdKcpDialerFactory {
             crate::error::KcpError::Io(std::io::Error::other(format!("invalid dest addr: {e}")))
         })?;
 
-        // 绑定本地 UDP socket
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        // 绑定本地 UDP socket（Windows 关 ICMP-unreachable 上报，bd d597w）
+        let socket = xray_transport::udp::bind_std_udp_no_connreset("0.0.0.0:0")?;
         let local_addr = socket.local_addr().ok();
         socket.connect(dest_addr)?;
 

@@ -9,7 +9,9 @@
 //! - 记录 A 与 AAAA 两条查询被**收到**的时刻，算出发起时刻差；
 //! - 记录整次查询耗时。
 //!
-//! 断言（修复后口径）：`gap < 50ms` 且 `MOCK_RTT <= 总耗时 < 250ms`（≈1×RTT）。
+//! 断言（修复后口径，raxoj 相对判据）：`gap < 0.5×MOCK_RTT` 且
+//! `MOCK_RTT <= 总耗时 < 1.5×MOCK_RTT`（≈1×RTT；阈值 = 并发 1×RTT 与串行 2×RTT 两假设中点，
+//! 随 RTT 缩放，不依赖绝对墙钟）。
 //!
 //! 复现命令：
 //! ```text
@@ -158,14 +160,18 @@ async fn a_aaaa_queries_are_issued_concurrently() {
         MOCK_RTT, MOCK_RTT
     );
 
-    // ── 修复后验收（bd oab4a）：A/AAAA 并发 ⇒ 两条查询同时发出、总耗时 ≈ 1×RTT ──
+    // ── 修复后验收（bd oab4a / raxoj 相对判据）：并发 ⇒ 总耗时 ≈ 1×RTT、间隔 ≈ 0；
+    // 串行 ⇒ 总耗时 ≈ 2×RTT、间隔 ≈ 1×RTT。阈值取两假设中点（1.5×RTT / 0.5×RTT），
+    // 随 MOCK_RTT 缩放：调度抖动容忍 ±0.5×RTT，不再依赖绝对墙钟（高负载机器不 flaky）。
     assert!(
-        gap < Duration::from_millis(50),
-        "并发后 A/AAAA 应几乎同时发出（间隔 <50ms），实测 {gap:?}"
+        gap < MOCK_RTT / 2,
+        "并发后 A/AAAA 应几乎同时发出（间隔 < 0.5×RTT = {:?}），实测 {gap:?}",
+        MOCK_RTT / 2
     );
     assert!(
-        elapsed < Duration::from_millis(250),
-        "并发后总耗时应 ≈ 1×RTT（<250ms，mock RTT = {MOCK_RTT:?}），实测 {elapsed:?}"
+        elapsed < MOCK_RTT + MOCK_RTT / 2,
+        "并发后总耗时应 ≈ 1×RTT（< 1.5×RTT = {:?}），串行会 ≈ 2×RTT 落红，实测 {elapsed:?}",
+        MOCK_RTT + MOCK_RTT / 2
     );
     // 下界：不得快于单 RTT（否则说明 mock 延迟没生效，测试无效）。
     assert!(

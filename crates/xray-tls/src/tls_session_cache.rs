@@ -52,10 +52,12 @@ use tracing::{debug, trace};
 /// Session cache 条目上界（对齐 Go `tls.NewLRUClientSessionCache(128)`，
 /// `transport/internet/tls/config.go:25`）——满则逐 LRU 尾，**禁无界增长**。
 ///
+/// 会话条目上界（登记于 xray-core `memory_budget::TLS_SESSION_CACHE_MAX_ENTRIES`，
+/// 交叉断言钉住，bd sgdwm）。
 /// 字节口径（256MB 机器「全部池/缓存 ≤4MB」硬顶）：单条 `SSL_SESSION`
 /// （TLS 1.3 ticket + master secret + peer 证书链引用）估 2~20KiB
 /// ⇒ 128 条最坏 ≈ 2.5MiB。
-const TLS_SESSION_CACHE_CAPACITY: usize = 128;
+pub const TLS_SESSION_CACHE_CAPACITY: usize = 128;
 
 /// Session cache TTL（24h，对齐 BoringSSL `SSL_SESSION` 默认 timeout）。
 ///

@@ -1,8 +1,9 @@
 # L3 静态闸（bd a5r4j/lzzja 核心切片；家族模板 = crates/xray-app-dns/clippy.toml，
 # 三禁令全量范本 = crates/xray-common/clippy.toml）：异步托管唯一口 = FxScope/
 # PluginContext::spawn（坑约束 #5），时钟唯一源 = skeleton::clock（L3-5）。
-# 存量调用按分层登记（避属性海）：≤20 处/文件逐点 #[allow] + 理由归类；
-# >20 处/文件文件头 inner allow + 计数与票号；托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，否则逐点登记显式脱管）；上游 drain 缺口见 bd 39hko。
+# 存量调用登记（避属性海）：生产路径一律逐点 #[allow] + 理由归类，**文件级 inner allow
+# 已废**（bd 1z3pl ARCH-10 收口 outbound.rs；批量机械豁免仅限测试面 = 测试模块级
+# inner allow，先例 xray-app-dns）；托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，否则逐点登记显式脱管）；上游 drain 缺口见 bd 39hko。
 # CI 宽门 clippy -D warnings 使 warn 升级为红线。
 # 注：`path` 是被禁方法的 def path，不是源码 glob——glob 写进 path 不报 fatal 但
 # 禁令静默无效（xray-frame 探针 1 实测），落地禁用该形态。

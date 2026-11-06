@@ -405,6 +405,10 @@ pub struct DefaultDialerClient {
 /// 256MB 机器口径：单条空闲 h2/h1 连接 RSS < 100KiB（TLS 状态 + h2 帧缓冲，
 /// 流控窗是信用不是预分配）⇒ 4 × 100KiB = 400KiB/host。取 4：packet-up 的
 /// GET(下)/POST(上) 各一条 + 一条 xmux 并发余量，池满即直接关连接（不排队）。
+///
+/// 内存登记簿锚（bd sgdwm）：xray-core `memory_budget::HYPER_MAX_IDLE_PER_HOST_CONNECTIONS`
+/// 与本常量交叉断言；h2 发送缓冲（[`crate::transport::H2_MAX_SEND_BUF_SIZE`]）
+/// 单独按连接数入簿。
 pub const MAX_IDLE_PER_HOST: usize = 4;
 
 impl DefaultDialerClient {
@@ -787,7 +791,8 @@ fn spawn_upload_body_drain(body: hyper::body::Incoming) {
         let mut body = body;
         while let Some(frame) = body.frame().await {
             if let Err(e) = frame {
-                crate::hot_log!(DEBUG, "error={e} stream-up upload response drain");
+                // 上传响应体读失败 = 上行流断，一次性留痕（随即 break；u0pe2）。
+                crate::hot_log!(tracing::Level::WARN, "error={e} stream-up upload response drain");
                 break;
             }
         }
@@ -891,7 +896,8 @@ fn spawn_h2_lazy_reader(
                     }
                     Err(e) => {
                         closed.store(true, Ordering::Relaxed);
-                        crate::hot_log!(DEBUG, "error={e} GET request failed");
+                        // GET 失败 = 下载腿死，一次性留痕（任务随即 return；u0pe2）。
+                        crate::hot_log!(tracing::Level::WARN, "error={e} GET request failed");
                     }
                 }
             }

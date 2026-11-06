@@ -701,10 +701,12 @@ pub fn check_routes() -> (bool, bool) {
 fn probe_routes() -> (bool, bool) {
     // Go: net.Dial("udp4", "192.33.4.12:53") —— 创建 UDP socket 并 connect。
     // Rust std: UdpSocket::bind → connect。connect 不发送数据，仅检查路由可达性。
-    let ipv4 =
-        std::net::UdpSocket::bind("0.0.0.0:0").and_then(|s| s.connect("192.33.4.12:53")).is_ok();
-    let ipv6 =
-        std::net::UdpSocket::bind("[::]:0").and_then(|s| s.connect("[2001:500:2::c]:53")).is_ok();
+    let ipv4 = xray_transport::udp::bind_std_udp_no_connreset("0.0.0.0:0")
+        .and_then(|s| s.connect("192.33.4.12:53"))
+        .is_ok();
+    let ipv6 = xray_transport::udp::bind_std_udp_no_connreset("[::]:0")
+        .and_then(|s| s.connect("[2001:500:2::c]:53"))
+        .is_ok();
     (ipv4, ipv6)
 }
 

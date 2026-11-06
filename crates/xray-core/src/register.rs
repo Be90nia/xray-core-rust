@@ -30,38 +30,56 @@ use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 /// （Linux/Android/FreeBSD）真实构建在 inbound/outbound 构建层，
 /// 不支持平台 factory/构建层明确拒绝。
 pub fn register_all_features() {
+    // 注册失败聚合口（bd u0pe2 ③）：`register_feature` 唯一失败路径是注册表满
+    // （`FeatureError::RegistryFull`）。禁逐条刷屏——失败按 kind 收集，末尾一条
+    // 汇总 warn；正常路径（1024 上限远未触及）零日志。
+    let mut failed: Vec<&'static str> = Vec::new();
+    fn reg(failed: &mut Vec<&'static str>, kind: &'static str, factory: FeatureFactory) {
+        if registry::register_feature(kind, factory).is_err() {
+            failed.push(kind);
+        }
+    }
+
     // --- App kinds ---
     // Real factories (construct actual Feature implementations)
-    let _ = registry::register_feature("log", log_factory());
-    let _ = registry::register_feature("dns", dns_factory());
-    let _ = registry::register_feature("routing", default_feature_factory("routing"));
-    let _ = registry::register_feature("policy", policy_factory());
-    let _ = registry::register_feature("observatory", observatory_factory());
-    let _ = registry::register_feature("metrics", metrics_factory());
-    let _ = registry::register_feature("stats", default_feature_factory("stats"));
-    let _ = registry::register_feature("api", commander_factory());
-    let _ = registry::register_feature("fakeDns", fake_dns_factory());
+    reg(&mut failed, "log", log_factory());
+    reg(&mut failed, "dns", dns_factory());
+    reg(&mut failed, "routing", default_feature_factory("routing"));
+    reg(&mut failed, "policy", policy_factory());
+    reg(&mut failed, "observatory", observatory_factory());
+    reg(&mut failed, "metrics", metrics_factory());
+    reg(&mut failed, "stats", default_feature_factory("stats"));
+    reg(&mut failed, "api", commander_factory());
+    reg(&mut failed, "fakeDns", fake_dns_factory());
 
-    let _ = registry::register_feature("burstObservatory", burst_observatory_factory());
-    let _ = registry::register_feature("version", version_factory());
-    let _ = registry::register_feature("geodata", geodata_factory());
+    reg(&mut failed, "burstObservatory", burst_observatory_factory());
+    reg(&mut failed, "version", version_factory());
+    reg(&mut failed, "geodata", geodata_factory());
     // Reverse：proto Config 程序化构造（Go v26 已移除 JSON 配置路径，见 reverse_factory）
-    let _ = registry::register_feature("reverse", reverse_factory());
+    reg(&mut failed, "reverse", reverse_factory());
 
     // --- Proxy inbound kinds ---
     for &kind in PROXY_INBOUND_KINDS {
-        let _ = registry::register_feature(kind, stub_factory(kind));
+        reg(&mut failed, kind, stub_factory(kind));
     }
 
     // --- Proxy outbound kinds ---
     for &kind in PROXY_OUTBOUND_KINDS {
-        let _ = registry::register_feature(kind, stub_factory(kind));
+        reg(&mut failed, kind, stub_factory(kind));
     }
 
     // TUN（入站/出站同 kind "tun"）——全平台注册，平台差异在
-    // factory/构建层拒绝（bd b8i，对齐 Go handler.go:186 无条件注册）。
+    // （支持/不支持由 factory 构造层裁决，见 tun_factory 与注释）
     for &kind in TUN_KINDS {
-        let _ = registry::register_feature(kind, tun_factory(kind));
+        reg(&mut failed, kind, tun_factory(kind));
+    }
+
+    if !failed.is_empty() {
+        tracing::warn!(
+            "feature registration: {} kind(s) FAILED (registry full?): {}",
+            failed.len(),
+            failed.join(", ")
+        );
     }
 }
 
@@ -69,6 +87,12 @@ pub fn register_all_features() {
 ///
 /// 必须在 `register_outbounds` / `spawn_inbounds` 之前调用，
 /// 否则传输注册表为空——除裸 TCP 外所有 dial/listen 返回 NotFound。
+///
+/// **`let _ =` 是有意的**（bd u0pe2 ③）：下方全部注册函数的唯一失败路径是
+/// `io::ErrorKind::AlreadyExists`（同名重复注册保护，见 `xray-transport/src/
+/// dialer.rs` / `listener_registry.rs`）——重复调用幂等，失败仅表示「已注册过」，
+/// 无需留痕。除 AlreadyExists 外不应存在其它失败路径；若未来新增失败模式，
+/// 应在此处改为聚合 warn（同 `register_all_features` 的形态）。
 pub fn register_all_transports() {
     // TCP（系统传输）
     let _ = xray_transport::tcp::register_tcp_transport();
@@ -885,8 +909,6 @@ impl std::fmt::Debug for FakeDnsEngineBridge {
 
 impl xray_app_dispatcher::fakednssniffer::FakeDnsEngine for FakeDnsEngineBridge {
     fn get_domain_from_fake_dns(&self, addr: &std::net::IpAddr) -> String {
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         self.0.get_domain_from_fake_dns(*addr).unwrap_or_default()
     }
 }
@@ -1331,8 +1353,6 @@ mod tests {
         // 直接验证引擎可做域名↔Fake IP 双向映射。
         let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(json).unwrap();
         let engine = build_fake_dns_holder(&cfg).expect("holder should initialize");
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let ips = engine.get_fake_ip_for_domain("example.com");
         assert!(!ips.is_empty(), "engine should allocate fake IPs");
         let ip = ips[0];
@@ -1395,8 +1415,6 @@ mod tests {
     fn fake_dns_factory_uses_default_pool_when_config_empty() {
         let cfg: xray_conf::app_config::FakeDnsConfig = serde_json::from_slice(b"{}").unwrap();
         let engine = build_fake_dns_holder(&cfg).expect("default pool should initialize");
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let ips = engine.get_fake_ip_for_domain("x.com");
         assert!(!ips.is_empty());
         // 缺省池 240.0.0.0/4——分配的 IP 必须落在池内。
@@ -1407,8 +1425,6 @@ mod tests {
     /// （fake_ip → 域名反查；dispatcher 侧签名 &IpAddr -> String）。
     #[test]
     fn fake_dns_engine_bridge_recovers_domain_from_fake_ip() {
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_app_dns::nameserver::fakedns::FakeDnsEngine as _;
         let cfg: xray_conf::app_config::FakeDnsConfig =
             serde_json::from_slice(br#"{"ipPool":"198.18.0.0/15"}"#).unwrap();
         let feature = FakeDnsFeature { holder: build_fake_dns_holder(&cfg).unwrap() };

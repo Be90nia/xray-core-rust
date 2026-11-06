@@ -122,6 +122,8 @@ pub fn write_u16_be<W: Write>(w: &mut W, v: u16) -> io::Result<()> {
 }
 
 /// 读 MC Long（8 字节大端 i64）。
+// MC 协议 codec 完整面（对齐 Go mcpack readLong）：当前包解析未触达 Long 字段，
+// 保留供后续协议字段接线（与 write_i64 族对称）
 pub fn read_i64_be<R: Read>(r: &mut R) -> io::Result<i64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
@@ -186,6 +188,8 @@ pub fn write_packet<W: Write>(w: &mut W, packet_id: i32, payload: &[u8]) -> io::
 }
 
 /// 写 Disconnect packet（packet_id=0x00，单 String 字段）。
+// MC 协议 codec 完整面：server 踢客户端场景（Go writeDisconnect 对位）当前
+// 消费链路未接线，保留供 xmc server 面后续批次接线
 pub fn write_disconnect<W: Write>(w: &mut W, reason: &str) -> io::Result<()> {
     let mut payload = Vec::with_capacity(reason.len() + 5);
     write_string(&mut payload, reason)?;

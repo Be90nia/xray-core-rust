@@ -84,8 +84,6 @@ pub mod system_listener;
 pub mod tls_handshake_gate;
 
 // 以下模块依赖 Phase 4+ 才会出现的 features（dns/outbound/policy 等），当前为 stub。
-#[cfg(feature = "browser-dialer")]
-pub mod config;
 pub mod filelocker;
 pub mod finalmask;
 pub mod handshake_gate;
@@ -96,7 +94,6 @@ pub mod pipe;
 pub mod proxy_protocol;
 pub mod record_framer;
 pub mod sockopt;
-pub mod tagged;
 pub mod tcp;
 pub mod udp;
 // 顶层 re-export。

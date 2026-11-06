@@ -305,8 +305,9 @@ where
         // protocol.go:199-205）， 未配置回退 127.0.0.1（既有默认行为不变）；BND.ADDR 回
         // relay 实际地址
         let bind_ip = config_address_ip(config);
-        let relay_socket =
-            tokio::net::UdpSocket::bind((bind_ip, 0)).await.map_err(SocksError::Io)?;
+        let relay_socket = xray_transport::udp::bind_udp_no_connreset((bind_ip, 0))
+            .await
+            .map_err(SocksError::Io)?;
         let relay_addr = relay_socket.local_addr().map_err(SocksError::Io)?;
         stream.write_all(&encode_socks5_reply(STATUS_SUCCESS, Some(relay_addr))).await?;
 

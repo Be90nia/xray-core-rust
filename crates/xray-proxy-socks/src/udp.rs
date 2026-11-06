@@ -109,7 +109,7 @@ impl SocksUdpClient {
             SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
-        let relay = UdpSocket::bind(bind_addr).await?;
+        let relay = xray_transport::udp::bind_udp_no_connreset(bind_addr).await?;
         relay.connect(relay_addr).await?;
         Ok(Self { ctrl, relay, relay_addr, frag_dropped: AtomicU64::new(0) })
     }

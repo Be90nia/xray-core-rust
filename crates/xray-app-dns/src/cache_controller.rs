@@ -2,14 +2,17 @@
 //!
 //! ## 范围
 //!
-//! - 缓存数据结构 + cleanup 逻辑 + 内存收缩策略：完整翻译。
+//! - 缓存数据结构 + cleanup 逻辑 + 内存收缩策略：完整翻译。**答案表底座 = udf
+//!   `std_ext::cache::SyncTtlCache`**（audit ARCH-04：`&self` 共享 + 短临界 Mutex + LRU 淘汰序 +
+//!   逐条 TTL；本仓 9utc3 的自造 FIFO 淘汰队列已删—— Go 同源无淘汰界，LRU 是 Rust
+//!   侧防洪泛策略的升级，非对拍差异）。
 //! - `pubsub.Service` / `singleflight.Group`：Rust 端用 `tokio::sync::broadcast` + `Mutex<HashMap>`
 //!   简化模拟；真实订阅/去重逻辑见 `nameserver/cached.rs`。
 //! - `task.Periodic`：用 `tokio::time::interval`，经 `start_managed` 在**启动期** 注册进实例
 //!   `FxScope` 托管（P1-11：配置期零 spawn，坑约束 5）。
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -17,11 +20,13 @@ use std::{
 use parking_lot::RwLock;
 use skeleton::clock::{Clock, SystemClock};
 use skeleton_infra::fx::FxScope;
+use std_ext::cache::SyncTtlCache;
 use tokio::sync::broadcast;
 // 派生件 1（bd h4bl5）：serveStale 的窗口口径 + 同 fqdn 单飞刷新许可。
 // DNS 答案本体仍留 `ips`（Go 对拍面：per-family 过期 + cleanup/shrink + pubsub
 // 广播），换掉的只是本仓原先自实现的「过期可服务窗口 + 后台刷新去重」。
-use xray_frame::cache::{RefreshGate, RefreshPermit, stale_window};
+// UNBOUNDED_RETENTION（audit ARCH-04）：无上限宽限窗的条目物理保留下限同源。
+use xray_frame::cache::{RefreshGate, RefreshPermit, UNBOUNDED_RETENTION, stale_window};
 
 use crate::{
     config::IpOption,
@@ -36,11 +41,17 @@ pub const SHRINK_ABSOLUTE_THRESHOLD: usize = 10240;
 pub const SHRINK_RATIO_THRESHOLD: f64 = 0.65;
 /// 后台清理周期（Go `cacheCleanup.Interval = 300 * time.Second`）。
 pub const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
-/// 缓存键数上界（9utc3，Go 同源无此界——Rust 侧防洪泛加界）。新键插入使
-/// 键数超界时淘汰一名牺牲者：过期键优先（与 cleanup 同一 `effective_now`
-/// 口径，serve_stale 宽限内的键不算过期），无过期则退化为最旧插入键。
+/// 缓存键数上界（9utc3，Go 同源无此界——Rust 侧防洪泛加界）。键数达界后再插
+/// 新键时淘汰：**基件先清物理过期键**（与 cleanup 同一 expire + serveStale
+/// 宽限口径），仍满再逐 **LRU 尾**（audit ARCH-04 起淘汰序由 udf
+/// `SyncTtlCache` 给出；旧自造 FIFO 队列已删）。
 /// 16384 键 ≈ 4-5 MiB（票面：10 万键 ≈ 20-30 MiB），远高于常规解析工作集。
 pub const MAX_CACHE_ENTRIES: usize = 16384;
+
+/// 条目物理保留 TTL 下限（基件 `ttl == 0` fail-fast panic）：已过期条目入表
+/// （负缓存回填/测试确定性）也给 1s 缓冲，过期判定仍由 per-family cleanup 口径
+/// 负责，物理面只兜底。
+const MIN_ENTRY_TTL: Duration = Duration::from_secs(1);
 
 /// DNS 缓存控制器。对应 Go `CacheController`。
 pub struct CacheController {
@@ -57,11 +68,16 @@ pub struct CacheController {
     /// 大于 0 时 `nameserver::cached::fetch` 用它覆写负答案（rcode 非 NO_ERROR
     /// 或 A/AAAA 空表）的过期时刻（bd 2bmns G-5）。
     pub negative_ttl_secs: u32,
-    ips: RwLock<HashMap<String, Arc<Record>>>,
-    /// 插入序键队列（9utc3 淘汰序）：新键入队尾，淘汰自队首取（最旧优先），
-    /// 淘汰扫描中过期键优先命中。FIFO 近似 LRU 尾——真 LRU 需 `find_records`
-    /// 命中时记账（读路径 read 锁 → write 锁），为守住读路径零开销不做。
-    insert_order: RwLock<VecDeque<String>>,
+    /// 答案表（audit ARCH-04：底座 = udf `SyncTtlCache`——`&self` 共享 + 内部
+    /// Mutex 短临界 + get 自带 touch（LRU recency）+ 满插先清过期再逐 LRU 尾 +
+    /// 惰性过期）。条目物理保留 TTL = 家族最晚过期时刻 + serveStale 宽限
+    /// （见 [`Self::entry_retention`]），过期语义本体仍按 per-family 判定
+    /// （Go 对拍面：cleanup/shrink/pubsub 不变）。
+    ips: SyncTtlCache<String, Arc<Record>>,
+    /// 复合写闸：`upsert` 的 get→改→insert 与 cleanup 的槽清写在基件「单操作
+    /// 原子」之上补复合原子性——v4/v6 同键合并不被另一族 upsert 交错覆盖
+    /// （旧 `ips.write()` 全局写锁的等价替代；读路径不经本闸，锁争用面更小）。
+    write_gate: parking_lot::Mutex<()>,
     /// 缓存生命周期峰值，用于收缩阈值计算。
     high_watermark: RwLock<usize>,
     /// 广播通道发送端（响应到达时发 `CacheEvent`）。
@@ -151,8 +167,8 @@ impl CacheController {
             serve_stale,
             serve_expired_ttl_secs: -(serve_expired_ttl as i32),
             negative_ttl_secs,
-            ips: RwLock::new(HashMap::new()),
-            insert_order: RwLock::new(VecDeque::new()),
+            ips: SyncTtlCache::new(Arc::clone(&clock), MAX_CACHE_ENTRIES),
+            write_gate: parking_lot::Mutex::new(()),
             high_watermark: RwLock::new(0),
             tx,
             single_flight: parking_lot::Mutex::new(HashMap::new()),
@@ -174,13 +190,13 @@ impl CacheController {
     /// 当前缓存条目数。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.ips.read().len()
+        self.ips.len()
     }
 
     /// 是否为空。
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.ips.read().is_empty()
+        self.ips.is_empty()
     }
 
     /// 高水位（峰值）。
@@ -191,72 +207,65 @@ impl CacheController {
 
     /// 查询缓存。对应 Go `findRecords`。
     ///
-    /// 返回 `Arc` 共享记录，调用方可不持锁使用。
+    /// 返回 `Arc` 共享记录，调用方可不持锁使用。基件 `get` 自带 touch（命中刷
+    /// 新 LRU recency——audit ARCH-04：淘汰序升级为 LRU 的记账面，读路径零写锁
+    /// 升级）；条目超物理保留（家族过期 + 宽限窗尽）按惰性过期返回 `None`
+    /// （与 cleanup 的 effective_now 口径对齐：宽限尽即消费侧本就拒绝服务）。
     #[must_use]
     pub fn find_records(&self, fqdn: &str) -> Option<Arc<Record>> {
-        self.ips.read().get(fqdn).cloned()
+        // shortcut: SyncTtlCache 无 Borrow<str> 查表面，每次 `&str` 查一次小分配；
+        // DNS 每查询一次、远小于上游往返，热起来再给 udf 提 Borrow 口。
+        self.ips.get(&fqdn.to_string())
+    }
+
+    /// 条目物理保留 TTL：家族最晚过期时刻 + serveStale 宽限窗（宽限内条目必须
+    /// 物理存活，否则 serveStale 无旧值可服务；判定边界与 cleanup 的
+    /// `effective_now = now - 宽限` 精确互补）；无上限窗口 ⇒ 至少
+    /// [`UNBOUNDED_RETENTION`]（对齐 `xray_frame::cache` 口径，至容量淘汰）。
+    /// 全家族已过期（物理即逝）给 [`MIN_ENTRY_TTL`] 下限兜底（基件 `ttl == 0`
+    /// fail-fast panic）；过期语义本体由 per-family cleanup 口径负责。
+    fn entry_retention(rec: &Record, window: Option<Duration>, now: Instant) -> Duration {
+        let max_expire = rec
+            .a
+            .as_ref()
+            .map(|r| r.expire)
+            .into_iter()
+            .chain(rec.aaaa.as_ref().map(|r| r.expire))
+            .max();
+        let Some(max_expire) = max_expire else {
+            return MIN_ENTRY_TTL;
+        };
+        match window {
+            Some(w) => max_expire
+                .checked_add(w)
+                .and_then(|end| end.checked_duration_since(now))
+                .unwrap_or(MIN_ENTRY_TTL)
+                .max(MIN_ENTRY_TTL),
+            None => max_expire.saturating_duration_since(now).max(UNBOUNDED_RETENTION),
+        }
     }
 
     /// 写入 / 合并记录。对应 Go `addIoResult` / `setRecord`。
     ///
-    /// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。
-    /// 9utc3：新键插入后若键数超 [`MAX_CACHE_ENTRIES`]，就地淘汰一名牺牲者
-    /// （过期优先，无过期退最旧插入），保证键数硬上界。
+    /// `is_v4=true` 更新 A 记录，`false` 更新 AAAA。9utc3 键数硬上界由基件
+    /// 内生：新键达 [`MAX_CACHE_ENTRIES`] 满插时**先清物理过期键**、仍满逐
+    /// **LRU 尾**（淘汰序 = udf 件给出，audit ARCH-04）。
     pub fn upsert(&self, fqdn: &str, is_v4: bool, record: IpRecord) {
         if self.disable_cache {
             return;
         }
+        let _gate = self.write_gate.lock();
         let key = fqdn.to_string();
-        let mut ips = self.ips.write();
-        let is_new = !ips.contains_key(fqdn);
-        if is_new {
-            self.insert_order.write().push_back(key.clone());
-        }
-        let entry = ips.entry(key).or_insert_with(|| Arc::new(Record::default()));
-        // Arc::make_mut：如独占则就地修改，否则 COW。
-        let entry_mut = Arc::make_mut(entry);
+        let mut entry = self.ips.get(&key).unwrap_or_else(|| Arc::new(Record::default()));
+        // Arc::make_mut：如独占则就地修改，否则 COW（读侧 Arc 不受影响）。
+        let entry_mut = Arc::make_mut(&mut entry);
         if is_v4 {
             entry_mut.a = Some(record);
         } else {
             entry_mut.aaaa = Some(record);
         }
-        if is_new && ips.len() > MAX_CACHE_ENTRIES {
-            let effective_now = self.effective_now(self.clock.now_instant());
-            self.evict_victim(&mut ips, effective_now);
-        }
-    }
-
-    /// 键数上界的淘汰步（9utc3）：自插入序队首旋转扫描一圈——过期键首个命中
-    /// 即逐（表 + 队列同删）；无过期则逐最旧存活键（FIFO 近似 LRU 尾）。
-    /// 死键（cleanup 已删表未及清队）顺手出队。锁序恒 ips → insert_order。
-    fn evict_victim(&self, ips: &mut HashMap<String, Arc<Record>>, effective_now: Instant) {
-        let mut order = self.insert_order.write();
-        let is_expired = |rec: &Arc<Record>| {
-            rec.a.as_ref().is_some_and(|r| r.expire < effective_now)
-                || rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now)
-        };
-        let total = order.len();
-        let mut scanned = 0usize;
-        let mut oldest: Option<String> = None;
-        while scanned < total {
-            scanned += 1;
-            let Some(key) = order.pop_front() else { break };
-            let Some(rec) = ips.get(&key) else {
-                continue;
-            };
-            if is_expired(rec) {
-                ips.remove(&key);
-                return;
-            }
-            if oldest.is_none() {
-                oldest = Some(key.clone());
-            }
-            order.push_back(key);
-        }
-        if let Some(key) = oldest {
-            // 队列里的副本已随旋转移至队尾并变为死键，由后续 cleanup/淘汰清出。
-            ips.remove(&key);
-        }
+        let ttl = Self::entry_retention(entry_mut, self.stale_window, self.clock.now_instant());
+        self.ips.insert(key, entry, ttl);
     }
 
     /// 收集已过期 key。对应 Go `collectExpiredKeys`（内部逻辑）。
@@ -264,17 +273,30 @@ impl CacheController {
     /// **注意**：`serve_stale && serve_expired_ttl != 0` 时，把 `now` 提前以保留过期数据。
     #[must_use]
     pub fn collect_expired_keys(&self, now: Instant) -> Vec<String> {
-        let ips = self.ips.read();
-        if ips.is_empty() {
+        let len = self.ips.len();
+        if len == 0 {
             return Vec::new();
         }
+        let _gate = self.write_gate.lock();
         let effective_now = self.effective_now(now);
-        let mut keys = Vec::with_capacity(ips.len() / 4);
-        for (domain, rec) in ips.iter() {
+        // 扫描面：基件 `SyncTtlCache` 无键迭代 API（迭代面只在单线程 `TtlCache`
+        // ——udf 基件面缺口，提炼候选见 impl 报告）。以 `pop_lru` 全量出栈 +
+        // **正序**回插实现一次 O(n) 扫描：pop 序 = recency 序（旧→新），正序回插
+        // 使 LRU 序与扫描前逐位一致；回插时重算物理保留（家族最晚过期 + 宽限）。
+        // 已知代价：出栈与回插之间读路径看到半空表（miss → 上游重查），每
+        // 300s 清理一轮、亚毫秒窗口，换 udf 迭代面后消失。
+        let mut drained = Vec::with_capacity(len);
+        while let Some((key, rec)) = self.ips.pop_lru() {
+            drained.push((key, rec));
+        }
+        let mut keys = Vec::with_capacity(len / 4);
+        for (key, rec) in &drained {
+            let ttl = Self::entry_retention(rec, self.stale_window, now);
+            self.ips.insert(key.clone(), Arc::clone(rec), ttl);
             let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
             let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
             if a_expired || aaaa_expired {
-                keys.push(domain.clone());
+                keys.push(key.clone());
             }
         }
         keys
@@ -282,49 +304,52 @@ impl CacheController {
 
     /// 清理 + 收缩。对应 Go `writeAndShrink`。
     ///
-    /// 在持有写锁时调用，返回是否触发了收缩。
+    /// 经复合写闸（读路径不受阻）调用，返回是否触发了收缩。
     pub fn cleanup_and_maybe_shrink(&self, expired_keys: Vec<String>, now: Instant) -> bool {
-        let mut ips = self.ips.write();
+        let _gate = self.write_gate.lock();
         let mut high = self.high_watermark.write();
 
-        let len_before = ips.len();
+        let len_before = self.ips.len();
         if len_before > *high {
             *high = len_before;
         }
 
         let effective_now = self.effective_now(now);
         for domain in &expired_keys {
-            let Some(rec) = ips.get_mut(domain) else {
+            // peek（不 touch、惰性过期）：物理已逝条目此处即回收并跳过。
+            let Some(rec) = self.ips.peek(domain) else {
                 continue;
             };
             let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
             let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
-            // 通过 Arc::make_mut 以避免 clone 整个 HashMap。
-            // （此处 `ips.get_mut` 已返回 &mut Arc<Record>，但修 Arc 内容需要 make_mut。）
-            if a_expired || aaaa_expired {
-                let rec_mut = Arc::make_mut(rec);
-                if a_expired {
-                    rec_mut.a = None;
-                }
-                if aaaa_expired {
-                    rec_mut.aaaa = None;
-                }
-                if rec_mut.a.is_none() && rec_mut.aaaa.is_none() {
-                    ips.remove(domain);
-                }
+            if !(a_expired || aaaa_expired) {
+                continue;
+            }
+            let mut rec = rec;
+            // 通过 Arc::make_mut 以避免 clone 整个表（读侧 Arc 不受影响）。
+            let rec_mut = Arc::make_mut(&mut rec);
+            if a_expired {
+                rec_mut.a = None;
+            }
+            if aaaa_expired {
+                rec_mut.aaaa = None;
+            }
+            if rec_mut.a.is_none() && rec_mut.aaaa.is_none() {
+                let _ = self.ips.remove(domain);
+            } else {
+                // 存活家族续命：物理保留重算（家族最晚过期 + 宽限）。
+                let ttl =
+                    Self::entry_retention(rec_mut, self.stale_window, self.clock.now_instant());
+                self.ips.insert(domain.clone(), rec, ttl);
             }
         }
 
-        let len_after = ips.len();
-
-        // 9utc3：淘汰序队列与表同步——cleanup 删掉的键出队，防死键长期占位。
-        self.insert_order.write().retain(|key| ips.contains_key(key));
+        let len_after = self.ips.len();
 
         if len_after == 0 {
             if *high >= MIN_SIZE_FOR_EMPTY_REBUILD {
-                // 空表重建以回收内存。
-                *ips = HashMap::new();
-                self.insert_order.write().clear();
+                // 空表重建以回收内存（基件 arena 随逐条 remove 已回落；pop 兜底排空）。
+                while self.ips.pop_lru().is_some() {}
                 *high = 0;
                 return true;
             }
@@ -335,10 +360,8 @@ impl CacheController {
         if reduction > SHRINK_ABSOLUTE_THRESHOLD
             && (reduction as f64) > (*high as f64) * SHRINK_RATIO_THRESHOLD
         {
-            // 收缩：重建更小的 HashMap。
-            let old = std::mem::take(&mut *ips);
-            *ips = old; // Rust HashMap 默认 capacity 收缩逻辑需 reserve/shrink_to_fit
-            ips.shrink_to_fit();
+            // 收缩判定保持 Go 对拍布尔语义；HashMap 重建面已随底座更换消失
+            // （基件 arena 自管理容量）。
             true
         } else {
             false
@@ -781,7 +804,7 @@ mod tests {
     }
 
     /// 9utc3 ①：键数硬上界——插满 MAX+1 后长度钉在 MAX，最旧插入键被逐，
-    /// 最新键存活（全新鲜的 FIFO 退化路径）。
+    /// 最新键存活（全新鲜、零读路径 ⇒ LRU 尾 == 最旧插入键，与旧 FIFO 同判）。
     #[test]
     fn upsert_is_bounded_at_max_cache_entries() {
         let c = make_ctrl();
@@ -805,8 +828,8 @@ mod tests {
         );
     }
 
-    /// 9utc3 ②：淘汰过期优先——队首短 TTL 键过期后，超界插入逐它而非最旧
-    /// 存活键（同一 effective_now 口径）。
+    /// 9utc3 ②：淘汰过期优先——短 TTL 键过期后，超界插入先清它而非最旧
+    /// 存活键（基件满插「先清物理过期、仍满逐 LRU 尾」）。
     #[test]
     fn evict_prefers_expired_over_oldest_live() {
         let clock = Arc::new(MockClock::new());
@@ -842,8 +865,8 @@ mod tests {
         assert!(c.find_records("live1.example.com.").is_some(), "存在过期键时最旧存活键不得被逐");
     }
 
-    /// 9utc3 ③：cleanup 删除后队列同步——多轮「插满超界 → cleanup 清光」
-    /// 后上界依旧成立（队列死键不击穿键数界）。
+    /// 9utc3 ③：cleanup 删除后上界依旧——多轮「插满超界 → cleanup 清光」
+    /// 后键数界不破（淘汰序队列已删，基件 LRU 面自带同步）。
     #[test]
     fn bound_survives_cleanup_cycles() {
         let clock = Arc::new(MockClock::new());
@@ -872,5 +895,103 @@ mod tests {
             assert!(cleaned, "round {round}: 必须发生清理");
             assert_eq!(c.len(), 0, "round {round}: 清理后必须为空");
         }
+    }
+
+    /// ARCH-04 行为级①（淘汰序 = LRU，非旧 FIFO）：命中 d0 使其晋升 MRU 后，
+    /// 超界插入逐 LRU 尾 d1——d0 因被读过而存活，d1（从未读）被逐。旧 FIFO
+    /// 下这里被逐的是 d0，本测试即淘汰序变更的行为钉。
+    #[test]
+    fn lru_eviction_respects_recency_of_hits() {
+        let c = make_ctrl();
+        let now = c.clock().now_instant();
+        let live_ttl = Duration::from_secs(3600);
+        for i in 0..MAX_CACHE_ENTRIES {
+            let rec = ip_record(
+                1,
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))],
+                live_ttl,
+                0,
+                now,
+            );
+            c.upsert(&format!("d{i}.example.com."), true, rec);
+        }
+        // 读 d0：基件 get 触碰 → d0 晋升 MRU；LRU 尾变为 d1。
+        assert!(c.find_records("d0.example.com.").is_some());
+        let fresh = ip_record(1, vec![IpAddr::V4(Ipv4Addr::new(10, 1, 0, 1))], live_ttl, 0, now);
+        c.upsert("fresh.example.com.", true, fresh);
+        assert_eq!(c.len(), MAX_CACHE_ENTRIES, "满插逐尾后键数仍钉在上界");
+        assert!(
+            c.find_records("d0.example.com.").is_some(),
+            "被命中过的键必须因 recency 晋升而存活（LRU ≠ FIFO 的行为面）"
+        );
+        assert!(c.find_records("d1.example.com.").is_none(), "从未被读的最旧键必须是 LRU 尾被逐者");
+        assert!(c.find_records("fresh.example.com.").is_some(), "触发淘汰的新键必须存活");
+    }
+
+    /// ARCH-04 行为级②（物理保留 = 过期 + serveStale 宽限）：宽限内条目必须
+    /// 可读（serveStale 有旧值可服务），宽限尽后读取按惰性过期判 miss——
+    /// 与 cleanup 的 effective_now 口径互补（消费侧在宽限尽时本就拒绝服务）。
+    #[test]
+    fn physical_retention_matches_serve_stale_grace() {
+        let clock = Arc::new(MockClock::new());
+        // serve_stale = true + 宽限 30s；记录 TTL 10s。
+        let c = CacheController::with_clock("test", false, true, 30, 0, clock.clone());
+        let now = clock.now_instant();
+        c.upsert(
+            "g.com.",
+            true,
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now),
+        );
+        // 过期点 t0+10s，宽限至 t0+40s：+20s 宽限内仍可读。
+        clock.advance(Duration::from_secs(20));
+        assert!(c.find_records("g.com.").is_some(), "宽限内条目必须物理存活");
+        // +41s（超宽限 1s）：读取惰性过期 → miss；无 cleanup 参与也成立。
+        clock.advance(Duration::from_secs(21));
+        assert!(c.find_records("g.com.").is_none(), "宽限尽后读取必须按惰性过期判 miss");
+        assert_eq!(c.len(), 0, "惰性回收后条目数归零");
+    }
+
+    /// ARCH-04 行为级③（无上限宽限 ⇒ 物理保留至少一年，至容量淘汰）：
+    /// serve_stale + serveExpiredTTL=0（Go 语义：过期无限期可服务）下条目
+    /// 不随 TTL 消失。
+    #[test]
+    fn unbounded_stale_window_retains_entry_physically() {
+        let clock = Arc::new(MockClock::new());
+        let c = CacheController::with_clock("test", false, true, 0, 0, clock.clone());
+        let now = clock.now_instant();
+        c.upsert(
+            "g.com.",
+            true,
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(10), 0, now),
+        );
+        clock.advance(Duration::from_secs(100_000));
+        assert!(
+            c.find_records("g.com.").is_some(),
+            "无上限宽限窗下条目必须物理保留（至少一年，至容量淘汰）"
+        );
+    }
+
+    /// ARCH-04 行为级④（同键 v4/v6 复合合并原子性）：先 v4 后 v6 两次 upsert
+    /// 合并为单条目双族齐备；键数界上 A-only 客户端与 AAAA-only 客户端并发
+    /// 各自更新本族槽位时由复合写闸串行化（行为断言取顺序等价形态）。
+    #[test]
+    fn dual_family_upsert_merges_into_one_entry_under_write_gate() {
+        let c = make_ctrl();
+        let now = c.clock().now_instant();
+        let rec4 =
+            ip_record(1, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], Duration::from_secs(60), 0, now);
+        let rec6 = ip_record(
+            2,
+            vec![IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)],
+            Duration::from_secs(60),
+            0,
+            now,
+        );
+        c.upsert("x.com.", true, rec4);
+        c.upsert("x.com.", false, rec6);
+        let r = c.find_records("x.com.").expect("合并后条目必须存在");
+        assert!(r.a.is_some(), "v4 槽位不得被 v6 upsert 覆盖丢失");
+        assert!(r.aaaa.is_some(), "v6 槽位不得被 v4 upsert 覆盖丢失");
+        assert_eq!(c.len(), 1, "同键两族必须合并为单条目");
     }
 }

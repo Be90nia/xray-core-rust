@@ -31,7 +31,6 @@ pub mod runtime_guard;
 pub mod serial;
 pub mod session;
 pub mod signal;
-pub mod singbridge;
 pub mod testing;
 pub mod text;
 pub mod uuid;

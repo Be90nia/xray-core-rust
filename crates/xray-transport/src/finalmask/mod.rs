@@ -57,6 +57,10 @@ pub const UDP_SIZE: usize = 4096;
 /// 对齐内核 socket 缓冲满时的丢包行为，杜绝 unbounded 队列无界增长。
 const PACKET_QUEUE_CAP: usize = 128;
 
+/// send worker 失败留痕限频窗（首条 + 每 N 条）：逐包路径的故障证据必须可见，
+/// 但不随 UDP ICMP 风暴逐包刷屏（handshake_gate::LOG_EVERY 同形态，bd u0pe2 ①）。
+const SEND_FAIL_LOG_EVERY: u64 = 256;
+
 /// `AsyncRead + AsyncWrite + Send + Unpin` 的组合 trait（用于 trait object）。
 ///
 /// Rust 的 trait object 只能含一个非 auto trait，故 `dyn AsyncRead + AsyncWrite` 非法。
@@ -187,16 +191,6 @@ impl TcpmaskManager {
             raw = mask.wrap_conn_server(raw)?;
         }
         Ok(raw)
-    }
-}
-
-/// TCP 伪装连接标记（对应 Go `TcpMaskConn` interface）。
-pub trait TcpMaskConn: AsyncIo {
-    fn raw_conn(&self) -> Option<&dyn AsyncIo> {
-        None
-    }
-    fn splice(&self) -> bool {
-        false
     }
 }
 
@@ -464,6 +458,8 @@ pub fn wrap_packet_conn_client_into_connection(
 ///
 /// `remote_addr` 在 server 方向语义弱（UDP 不记录 peer，但传入供 caller 记录上下文）。
 /// 默认返回 `Ok(None)`，因 server 真正 peer 来自下一次 recv。
+// 生产链路当前未消费；保留 = finalmask udp mask Connection 形态的 server 侧半边，
+// 由本文件 mod tests 的 mask roundtrip 用例消费（与 client 侧对称成对验证 wire 语义）
 pub fn wrap_packet_conn_server_into_connection(
     udpio: Box<dyn UdpIo>,
     _remote_hint: SocketAddr,
@@ -617,11 +613,20 @@ impl PacketIoConn {
             reason = "数据面泵任务（PacketIo send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
         )]
         let worker = tokio::spawn(async move {
+            // 限频计数（首条 + 每 SEND_FAIL_LOG_EVERY 条，不重置：UDP ICMP 风暴
+            // 间歇成功时重置会造成每窗首条重复刷屏，bd u0pe2 ①）。
+            let mut send_fails: u64 = 0;
             while let Some(data) = snd_rx.recv().await {
                 // ponytail: send 失败仅记日志——Connection 写入 UDP 失败无 caller 同步点，
                 // UDP 写错误由 socket 层 NAT/ICMP 反馈呈现（Go PacketConn.WriteTo 同）。
                 if let Err(e) = worker_inner.send_to(&data, remote_addr).await {
-                    crate::hot_log!(DEBUG, "error={e} PacketIoConn send_to failed");
+                    send_fails += 1;
+                    if send_fails == 1 || send_fails % SEND_FAIL_LOG_EVERY == 0 {
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "fails={send_fails} error={e} PacketIoConn send_to failed"
+                        );
+                    }
                 }
             }
         });
@@ -1021,6 +1026,9 @@ fn build_tcpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Tcpmask>
 
 // ===== JSON settings → 各 mask 模块 Config（对齐 Go `infra/conf/transport_finalmask.go`）=====
 
+/// 构造配置期错误：**不做任何脱敏/清洗**——名字里的 `mask` 指 finalmask 子系统，不是
+/// masking（bd rjcu4）。调用方不得把含凭据的串（`user:pass@`、`?key=…`）塞进 `msg`：
+/// URL 一律先经 `xdns::doh::url_label` 剥到 `scheme://host:port`。
 fn mask_err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg.into())
 }
@@ -2633,7 +2641,9 @@ mod tests {
         assert!(build_xdns_config(&fm(r#"{"domain":"x.com"}"#)).is_err());
         // extraPoll 越界报错（对齐 Go Build 校验）
         assert!(build_xdns_config(&fm(r#"{"extraPoll":4}"#)).is_err());
-        // quic:// = DoH-over-QUIC：本轮未实现 → 配置期点名指路 https://（不是静默降级）
+        // quic:// scheme 本身 Go 亦拒（同 Go transport_finalmask.go:901-902 "invalid
+        // protocol"）；DoH-over-QUIC 落地形态 = https:// + tlsConfig.alpn ["h3"]
+        // （bd lf69h）⇒ 配置期点名指路 https://（不是静默降级）。
         let Err(e) = build_xdns_config(&fm(r#"{"resolvers":[{"addrs":["quic://1.1.1.1:53"]}]}"#))
         else {
             panic!("DoH-over-QUIC must reject");

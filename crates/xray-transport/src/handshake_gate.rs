@@ -12,6 +12,23 @@
 //!
 //! 两个窗叠加后单连接最长占用 ≈ 首字节窗 + 4s（协议窗），比 Go 的单一 4s
 //! `ReadHeaderTimeout` 清得更快。
+//!
+//! ## 归属裁决（bd 1z3pl ARCH-09，§3.5.5 三判据）
+//!
+//! 机制代码零 Xray 类型/零 Go wire 语义（tokio Semaphore + TcpStream + 原子计数），
+//! 但**判据①不过闸**：按 §3.5.3 方向件纪律，网络/accept 循环纪律**即使零 xray 类型
+//! 也不进 udf-frame**（先例：`accept_policy.rs` 留主仓 xray-transport）——本件正是
+//! accept 循环纪律家族（握手移出循环后的准入面），且硬绑两处主仓面：`TcpStream::peek`
+//! （网络 IO 方向）与 `crate::LOG`（主仓日志 facade）。
+//! **udf 为何不适用**（实查非凭印象）：udf `skeleton_infra::fx::FxScope::with_concurrency`
+//! 是 permit-in-future **排队**语义（超限任务在 future 内等 permit，abort 连带回收），
+//! 本闸是 **fail-fast 不排队**（满即丢连接，内存不随请求数涨）——语义相反，白拿即错；
+//! udf 也无「fail-fast 有界准入闸」等价件（udf reference 全量检索 2026-11-06）。
+//! **应落层 = 主仓 xray-transport（§3.5.3 方向件最近消费方）**，非判据③「派生层放不下」
+//! 例外，而是方向件纪律的直接适用。
+//! udf-promotion-candidate：若将来出现**第二消费栈**需要同款 fail-fast 准入闸，先把
+//! 与 IO/日志解耦的「Semaphore fail-fast 计数闸 + 节流计数」提炼 udf（零方向），首字节
+//! 窗（TcpStream peek）随网络方向留仓。
 
 use std::{
     fmt::Display,

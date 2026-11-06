@@ -165,7 +165,7 @@ impl Client {
             ));
         }
         let bind = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let sock = UdpSocket::bind(bind).await?;
+        let sock = crate::udp::bind_udp_no_connreset(bind).await?;
         // 源过滤在连接层做：非网关的应答内核直接丢弃（不再逐包比对 peer）
         sock.connect(SocketAddr::V4(server)).await?;
         Ok(Self { sock, server, timeout })

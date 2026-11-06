@@ -31,6 +31,7 @@ pub mod handler;
 pub mod inbound;
 pub mod outbound;
 pub mod plugin;
+mod udp_connreset;
 
 // 顶层 re-export。
 pub use config::{Config, DnsRule, DnsRuleConfig, RuleAction};

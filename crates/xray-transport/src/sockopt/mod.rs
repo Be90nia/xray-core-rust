@@ -440,7 +440,11 @@ pub(crate) const TCP_RCVBUF_DEFAULT: i32 = 0;
 /// autotune，理由见常量文档）。
 pub fn apply_client_dial_rcvbuf(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
     if TCP_RCVBUF_DEFAULT > 0 {
-        socket2::SockRef::from(tcp).set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)?;
+        let sock = socket2::SockRef::from(tcp);
+        sock.set_recv_buffer_size(TCP_RCVBUF_DEFAULT as usize)?;
+        // bd unpg5：同显式口径，下发后回读（当前常量恒 0 = 本分支不活；若未来
+        // 翻常量，钳制可见性随行，见 r5j96 裁决）。
+        warn_if_rcvbuf_clamped(TCP_RCVBUF_DEFAULT, sock.recv_buffer_size());
     }
     Ok(())
 }
@@ -552,6 +556,30 @@ fn large_rcvbuf_confirmed() -> bool {
     std::env::var(ALLOW_LARGE_RCVBUF_ENV).as_deref() == Ok("1")
 }
 
+/// 显式 SO_RCVBUF 钳制判据（bd unpg5）：回读 < 请求值 = 内核未足额受理。足额时
+/// 回读 ≥ 请求值——Linux 2× 记账（命中时 2×设定值）、Windows/macOS 原样或向上取整；
+/// 被 `net.core.rmem_max` 钳制时回读 = 2×rmem_max < 请求值。`requested <= 0`
+/// （缺省不设，r5j96）恒 false。模块私有，测试同模块直测判据。
+fn rcvbuf_clamped(requested: i32, actual: usize) -> bool {
+    requested > 0 && actual < requested as usize
+}
+
+/// 显式 SO_RCVBUF 下发后回读核对（bd unpg5）：此前不回读 ⇒ `net.core.rmem_max`
+/// （stock 208KB）静默钳制 + autotune 锁死完全不可见（请求 4MB 实得 208KB 照常
+/// 服役）。只做可见性（WARN 点名实际值），**不改行为**——预算闸判定仍用用户
+/// 设定值（见 [`check_explicit_receive_buffer_size`]），缺省 0 不设语义不变。
+fn warn_if_rcvbuf_clamped(requested: i32, actual: std::io::Result<usize>) {
+    if let Ok(actual) = actual {
+        if rcvbuf_clamped(requested, actual) {
+            crate::LOG.warn(format!(
+                "receiveBufferSize={requested} clamped by kernel: actual SO_RCVBUF={actual} \
+                 bytes (net.core.rmem_max caps silently on Linux and locks autotune; \
+                 see docs/guide-highrtt-sockopt.md §9-§11)"
+            ));
+        }
+    }
+}
+
 /// 显式 `receiveBufferSize` 判定 + 下发（**三 transport 拨号点的统一口**）。
 ///
 /// - 缺省（0）⇒ 完全不碰 socket（r5j96：交 OS autotune）；
@@ -563,7 +591,10 @@ pub fn apply_explicit_receive_buffer_size(
 ) -> std::io::Result<()> {
     check_explicit_receive_buffer_size(opts)?;
     if opts.receive_buffer_size > 0 {
-        socket2::SockRef::from(tcp).set_recv_buffer_size(opts.receive_buffer_size as usize)?;
+        let sock = socket2::SockRef::from(tcp);
+        sock.set_recv_buffer_size(opts.receive_buffer_size as usize)?;
+        // bd unpg5：下发后回读，内核钳制可见（WARN 带实际值；只观测不改行为）。
+        warn_if_rcvbuf_clamped(opts.receive_buffer_size, sock.recv_buffer_size());
     }
     Ok(())
 }
@@ -686,6 +717,8 @@ pub fn apply_outbound_socket_options(
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     if rcvbuf > 0 {
         socket.set_recv_buffer_size(rcvbuf as usize)?;
+        // bd unpg5：下发后回读，内核钳制可见（WARN 带实际值；只观测不改行为）。
+        warn_if_rcvbuf_clamped(rcvbuf, socket.recv_buffer_size());
     }
     // SO_KEEPALIVE + TCP_KEEPIDLE/TCP_KEEPINTVL（Go KeepAliveConfig 语义，见
     // [`set_keepalive_config`]）。Darwin 平台 keepalive 走 darwin 模块自带逻辑。
@@ -828,6 +861,8 @@ pub fn apply_inbound_socket_options(socket: &Socket, opts: &SocketOptions) -> st
         if opts.receive_buffer_size > 0 { opts.receive_buffer_size } else { TCP_RCVBUF_DEFAULT };
     if rcvbuf > 0 {
         socket.set_recv_buffer_size(rcvbuf as usize)?;
+        // bd unpg5：下发后回读，内核钳制可见（WARN 带实际值；只观测不改行为）。
+        warn_if_rcvbuf_clamped(rcvbuf, socket.recv_buffer_size());
     }
 
     #[cfg(target_os = "linux")]
@@ -921,20 +956,38 @@ pub const QUIC_UDP_MIN_BUFFER: usize = 8 << 20;
 /// # Errors
 ///
 /// socket 创建 / bind 失败照常传播（硬错）；缓冲设置失败不传播（见上）。
-/// **显式缓冲超上限**（`receiveBufferSize`/`sendBufferSize` > 4 MiB，bd u91se 预算闸）
-/// ⇒ 传播 `InvalidInput`（fail-visible，拒绑，不静默钳制）。
+/// **显式缓冲走三档裁决**（bd u91se / PM 终裁 2026-11-05，与 TCP 显式接收缓冲同口径，
+/// 判定细节见 `check_explicit_udp_buffer_size`）：≤ 4 MiB 免确认直接生效；4 MiB < v ≤
+/// 64 MiB 需 `XRAY_ALLOW_LARGE_RCVBUF=1` 确认；未确认 / > 64 MiB 恒拒 ⇒ 传播
+/// `InvalidInput`（fail-visible，拒绑，不静默钳制）。
 pub fn bind_udp_endpoint(
     addr: std::net::SocketAddr,
     opts: &SocketOptions,
 ) -> std::io::Result<std::net::UdpSocket> {
     let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
     let v6only = addr.is_ipv6() && opts.ipv6_only;
-    let _ = sock.set_only_v6(v6only);
+    // ipv6Only 设置失败不得硬失败（Windows 上 IPv6-only 的 set_only_v6 失败较
+    // 常见），但必须留痕：失败即回退 OS 默认 dual-stack，与配置意图相反（bd
+    // u0pe2 ②，同函数其它 setsockopt 失败均有 warn）。endpoint 创建频率远低于
+    // 逐包，逐次 warn + 累计计数即可。
+    if let Err(e) = sock.set_only_v6(v6only) {
+        static V6ONLY_SET_FAILS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = V6ONLY_SET_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        crate::hot_log!(
+            tracing::Level::WARN,
+            "fails={n} error={e} set_only_v6({v6only}) failed on UDP endpoint {addr}, ipv6Only may not take effect"
+        );
+    }
     tune_udp_buffer(&sock, opts.receive_buffer_size, UdpBufDir::Recv)?;
     tune_udp_buffer(&sock, opts.send_buffer_size, UdpBufDir::Send)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
-    Ok(std::net::UdpSocket::from(sock))
+    let std_sock = std::net::UdpSocket::from(sock);
+    // Windows：QUIC endpoint 也是 UDP socket——Go netFD.init 对**全部** UDP 关
+    // ICMP-unreachable 上报（bd d597w）；fail-open 同 [`crate::udp::bind_udp_no_connreset`]。
+    crate::udp::disable_icmp_unreachable_report(&std_sock);
+    Ok(std_sock)
 }
 
 /// 缓冲调谐方向（SO_RCVBUF / SO_SNDBUF 两分支逻辑对称，仅常量不同）。
@@ -985,11 +1038,13 @@ impl UdpBufDir {
 
 /// 单方向缓冲调谐：显式值优先直接设置；缺省走 Go `wrapConn` 下限语义。
 ///
-/// **显式值走预算闸**（bd u91se / PM 终裁 2026-11-05）：显式 `>0` 超过
-/// [`MAX_EXPLICIT_UDP_BUFFER_SIZE`]（4 MiB，与 TCP 显式接收缓冲同上限）⇒
-/// **Err（fail-visible，拒绑）**——不静默钳到上限（会骗运维「配了 16 MB 实际
-/// 4 MB」）。判定用**用户设定值**（不用回读值）：Linux 受 `net.core.rmem_max` /
-/// `wmem_max` 静默钳制时回读远小于设定值，但用户填 16 MB 就是 16 MB 的语义。
+/// **显式值走三档裁决**（bd u91se / PM 终裁 2026-11-05）：≤ 4 MiB 免确认直接生效；
+/// 4 MiB < v ≤ [`MAX_EXPLICIT_UDP_BUFFER_SIZE`]（64 MiB 硬顶）需
+/// `XRAY_ALLOW_LARGE_RCVBUF=1` 确认，未确认 ⇒ **Err（fail-visible，拒绑）**；
+/// 超 64 MiB 恒拒——**禁静默钳制**，档位不符一律显式报错（不让运维「配了 16 MB
+/// 实际生效值对不上账」）。判定用**用户设定值**（不用回读值）：Linux 受
+/// `net.core.rmem_max` / `wmem_max` 静默钳制时回读远小于设定值，但用户填 16 MB
+/// 就是 16 MB 的语义。
 ///
 /// **缺省（0）不动**：走 Go quic-go `wrapConn` 的 8 MB parity 下限
 /// （[`QUIC_UDP_MIN_BUFFER`]，PM 裁决保留），不受本闸约束。
@@ -998,6 +1053,10 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) -> std::io::Res
         check_explicit_udp_buffer_size(explicit, dir)?;
         if let Err(e) = dir.set(sock, explicit as usize) {
             crate::LOG.warn(format!("dir={dir:?} explicit={explicit} UDP buffer setsockopt failed (kernel may clamp): {e}"));
+        } else if matches!(dir, UdpBufDir::Recv) {
+            // bd unpg5：显式 SO_RCVBUF 下发后回读（钳制可见性，WARN 带实际值）。
+            // SO_SNDBUF 的 wmem_max 同型缺口不在本票范围，另票报告。
+            warn_if_rcvbuf_clamped(explicit, dir.get(sock));
         }
         return Ok(());
     }
@@ -1357,6 +1416,65 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// 最小 tracing 捕获订阅者（测试内本地件；`xray_frame::contract_assert::
+    /// CaptureSubscriber` 无公开读数口，形状照抄其 `CaptureVisitor`）——断言
+    /// `crate::LOG` 发出的 WARN 文案（bd unpg5 回读可见性验收）。
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct WarnVisitor {
+        message: String,
+    }
+
+    impl tracing::field::Visit for WarnVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_owned();
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = WarnVisitor { message: String::new() };
+            event.record(&mut visitor);
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(visitor.message);
+        }
+    }
+
+    impl WarnCapture {
+        fn snapshot(&self) -> Vec<String> {
+            self.messages.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+    }
 
     /// 平台对照值（bd r5j96 判据核心）：新建一个 socket，按 `bytes` 显式
     /// `setsockopt(SO_RCVBUF, bytes)`（`bytes == 0` = **不下发** = 纯内核缺省），
@@ -2178,6 +2296,49 @@ mod tests {
             msg.contains(&SO_RCVBUF_HARD_MAX.to_string()),
             "错误须点名硬上限值 {}：{msg}",
             SO_RCVBUF_HARD_MAX
+        );
+    }
+
+    /// bd unpg5：显式 SO_RCVBUF 下发后**回读可见性**——回读 < 请求值（内核
+    /// `net.core.rmem_max` 静默钳制 + autotune 锁死）必须产出点名实际值的 WARN。
+    /// 附防回档锚点：`TCP_RCVBUF_DEFAULT` 恒 0（bd r5j96，缺省交 OS autotune），
+    /// 本票只加可见性，禁把缺省改回设值。
+    #[test]
+    fn explicit_rcvbuf_clamp_is_visible_via_readback_warn() {
+        // 防回档：缺省必须保持 0 = 不设置（bd r5j96）；unpg5 只做回读可见性。
+        assert_eq!(TCP_RCVBUF_DEFAULT, 0, "缺省必须保持 0（bd r5j96），不得改回设值");
+
+        // 判据直测（跨平台确定，不依赖内核 rmem_max 现值）。
+        assert!(!rcvbuf_clamped(0, 208 * 1024), "缺省不设：无钳制可言");
+        assert!(!rcvbuf_clamped(1 << 20, 2 << 20), "足额受理（Linux 2× 记账）不算钳制");
+        assert!(!rcvbuf_clamped(1 << 20, 1 << 20), "足额（原样回读）不算钳制");
+        assert!(rcvbuf_clamped(1 << 20, 425_984), "回读 2×rmem_max(208KB) < 请求 = 被钳制");
+        assert!(!rcvbuf_clamped(-1, 0), "负值/缺省不判钳制");
+
+        // WARN 记录实测回读值（mock 回读值注入，跨平台确定）。
+        let sink = WarnCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(sink.clone());
+            warn_if_rcvbuf_clamped(1 << 20, Ok(425_984));
+        }
+        let msgs = sink.snapshot();
+        let warn = msgs
+            .iter()
+            .find(|m| m.contains("clamped by kernel"))
+            .expect("钳制必须产出 WARN（回读值被记录 = unpg5 验收核心）");
+        assert!(warn.contains("receiveBufferSize=1048576"), "WARN 须点名请求值：{warn}");
+        assert!(warn.contains("actual SO_RCVBUF=425984"), "WARN 须点名实际回读值：{warn}");
+
+        // 足额场景不得产出钳制 WARN（对照组）。
+        let sink = WarnCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(sink.clone());
+            warn_if_rcvbuf_clamped(1 << 20, Ok(2 << 20));
+            warn_if_rcvbuf_clamped(0, Ok(208 * 1024));
+        }
+        assert!(
+            sink.snapshot().iter().all(|m| !m.contains("clamped by kernel")),
+            "足额/缺省不得告警"
         );
     }
 

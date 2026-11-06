@@ -407,3 +407,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 tools/check_geo_assets.py
+
+  # 框架路编译门（ARCH-01 / bd gjqm7 G1，je3u3 ①）：目标主路（xray-cli
+  # --features framework-assembly 组合根）此前在 CI 里一次都不被编译（全量
+  # grep --features = 0 命中），本地绿只因恰好有人跑过。本 job 只增不减——
+  # 不改既有 job 语义。缓存键与 clippy job 同源（UDF_HEAD 防 udf 产物串味）。
+  framework-assembly:
+    name: Framework Assembly (clippy + lib test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: fw-assembly-v1
+          key: ${{ env.UDF_HEAD }}
+      # 依赖闭包含 xray-proto(prost-build)，构建需要 protoc
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      # btls-sys bindings 含注入符号（bd mygg/z32z）；顺序须在 rust-cache 之后
+      # （action 尾部清理恢复的旧 btls-sys 产物）
+      - uses: ./.github/actions/setup-boringssl
+      - run: cargo clippy -p xray-cli --features framework-assembly --all-targets -- -D warnings
+      - run: cargo test -p xray-cli --features framework-assembly --lib
+
+  # 质量门四件套（je3u3 ②，tools/check_quality_gates.py）：失败留痕（禁
+  # hot_log!(DEBUG, "error=…")，白名单 1 条瞬断重放）/ 抑制登记（allow 带
+  # 理由 + unused_imports 恒 0）/ 登记簿漂移（跑 memory_budget 交叉断言）/
+  # 注释漂移抽查。静态门无需 cargo；(c) 需要——与 test job 同源配方。
+  quality-gates:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: quality-gates-v1
+          key: ${{ env.UDF_HEAD }}
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - uses: ./.github/actions/setup-boringssl
+      - run: python3 tools/check_quality_gates.py

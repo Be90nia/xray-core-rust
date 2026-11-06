@@ -63,7 +63,6 @@ pub mod context;
 #[cfg(feature = "shutdown-coordinator")]
 mod feature_framework;
 pub mod functions;
-pub mod grpc_server;
 pub mod inbound;
 pub mod instance;
 pub mod outbound;
@@ -82,6 +81,9 @@ pub mod version;
 pub mod wiring;
 
 // 顶层 re-export：常用类型直接从 crate 根访问。
+// 双主路一致性台账（tests/assembly_path_equivalence.rs）的生产键枚举面
+// （arm_registry 本体 pub(crate)，仅此只读投影公开）。
+pub use arm_registry::arm_protocol_keys;
 pub use functions::{CoreFunctionError, start_from_built, start_full, start_instance};
 pub use instance::Instance;
 pub use register::{register_all_features, register_all_transports};

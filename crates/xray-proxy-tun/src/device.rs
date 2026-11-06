@@ -25,6 +25,7 @@ use crate::{
 /// 平台无关（`header_len` 参数化）：Linux 侧传 `VIRTIO_NET_HDR_LEN`；
 /// 契约测试在任意平台可跑。tun-rs `send_multiple` 以 `&mut [B]` 借用不消耗
 /// 缓冲（GRO 合并仅原地 `buf_extend_from_slice`），发送后可安全回收。
+// 生产消费仅在 Linux GRO 批量读路径；非 Linux 平台仅契约测试触达 → 抑制 dead_code
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod hdr_free_list {
     /// 回收上限：GRO 单批典型 ≤64 包（64KiB/MTU），256 覆盖突发批，内存上限

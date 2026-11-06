@@ -23,6 +23,7 @@ use std::{
 
 use async_trait::async_trait;
 use rand::RngCore;
+use skeleton_infra::fx::FxScope;
 use tokio::sync::{Mutex, mpsc};
 
 use super::{
@@ -73,6 +74,14 @@ pub(crate) struct XdnsConnClient {
     closed: Arc<AtomicBool>,
     write_tx: mpsc::Sender<Vec<u8>>,
     read_rx: Mutex<mpsc::Receiver<Packet>>,
+    /// ar3tf：三泵（recv/doh_recv/send）的唯一托管口（server.rs 同款）。
+    /// 全部走 `spawn_tracked` ⇒ 进 `JoinSet`，scope 随 conn drop 时 **abort 全组**
+    /// 才成立（`tokio::spawn` 句柄丢弃 ⇒ drop 后 recv 泵永阻塞在 `recv_from` 上
+    /// 持有 `Arc<dyn UdpIo>` ⇒ fd 不释放）。协作停机另走 `closed`（见 [`Drop`]）。
+    // fx 仅经 drop glue 生效（JoinSet 兜底 abort），生产无显式读点——同
+    // server.rs / uot/TcpWorker 先例。
+    #[allow(dead_code)]
+    fx: Arc<FxScope>,
 }
 
 impl XdnsConnClient {
@@ -159,30 +168,44 @@ impl XdnsConnClient {
         let (read_tx, read_rx) = mpsc::channel::<Packet>(1);
 
         let closed = Arc::new(AtomicBool::new(false));
+        let fx = Arc::new(FxScope::new());
 
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面泵任务（xdns client recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
-        )]
-        tokio::spawn(recv_loop(
-            state.clone(),
-            inner.clone(),
-            closed.clone(),
-            read_tx.clone(),
-            poll_tx.clone(),
-        ));
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面泵任务（xdns client DoH 响应解码环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
-        )]
-        tokio::spawn(doh_recv_loop(state.clone(), doh_rx, read_tx, poll_tx, closed.clone()));
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面泵任务（xdns client send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
-        )]
-        tokio::spawn(send_loop(state.clone(), inner, closed.clone(), write_rx, poll_rx));
+        let this = Self { closed: closed.clone(), write_tx, read_rx: Mutex::new(read_rx), fx };
 
-        Ok(Self { closed, write_tx, read_rx: Mutex::new(read_rx) })
+        // 三个数据面泵走**记账托管**（ar3tf，server.rs 同款）：`tokio::spawn` 句柄
+        // 丢弃 = detach ⇒ conn drop 后 recv 泵继续阻塞在 `recv_from` 上、持有
+        // `Arc<dyn UdpIo>` ⇒ fd 不释放。进 JoinSet 后 `fx` drop ⇒ JoinSet drop ⇒
+        // abort 全组，「scope 随 conn drop 兜底 abort」才成立。DoH worker 在
+        // doh.rs 内部 spawn（本层拿不到句柄），随 `state` drop ⇒ `DohResolver.tx`
+        // drop ⇒ worker `rx.recv()` 返 None 级联退出（探针 `after_drop == base`
+        // 实测覆盖该闭环）。
+        this.fx
+            .spawn_tracked(recv_loop(
+                state.clone(),
+                inner.clone(),
+                closed.clone(),
+                read_tx.clone(),
+                poll_tx.clone(),
+            ))
+            .expect("internal FxScope is never closed");
+        this.fx
+            .spawn_tracked(doh_recv_loop(state.clone(), doh_rx, read_tx, poll_tx, closed.clone()))
+            .expect("internal FxScope is never closed");
+        this.fx
+            .spawn_tracked(send_loop(state.clone(), inner, closed.clone(), write_rx, poll_rx))
+            .expect("internal FxScope is never closed");
+
+        Ok(this)
+    }
+}
+
+impl Drop for XdnsConnClient {
+    fn drop(&mut self) {
+        // ar3tf：置协作停机位（对齐 Go `Close` 的 close(closeCh)，client.go:383-392
+        // ——此前 `closed` 全仓无 store(true)，协作停机路径完全失效）。三泵 abort
+        // 由 `fx` 字段 drop glue 完成；本字段 drop 后 `write_tx`/`read_rx` 随之
+        // 关闭（send_loop 见 None 即退、client_read 投递短路）。
+        self.closed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -228,7 +251,14 @@ async fn client_read(
             bs.clear();
             break;
         }
-        bs.push(b[..length].to_vec());
+        // i86yo / B-11：0 长度帧不投递。Go 同点（client.go:265-267）会产出空条目，
+        // 但 Go `ReadFrom` 交付的是 `n=0, err=nil` 的空数据报（net.PacketConn 无
+        // EOF 语义）；Rust 侧 `UdpIo::recv_from` 的 Ok(0) 会被上层 AsyncRead 消费
+        // 方读成 EOF ⇒ 隧道被误判断链。空包对上层无信息量 ⇒ 跳过；其余拆包
+        // quirk（超界清批 / 非终帧尾残清批）逐字节保留。
+        if length > 0 {
+            bs.push(b[..length].to_vec());
+        }
         if last {
             break;
         }
@@ -262,7 +292,17 @@ async fn recv_loop(
         }
         let (n, addr) = match inner.recv_from(&mut buf).await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                // 对齐 Go `client.go:308-314`：closed 先查（静默退），否则记日志后
+                // **退出泵**（Go 为 LogErrorInner + return）。旧 `Err(_) => continue`
+                // = 持续 recv 错误零日志紧循环（bd ar3tf / CQ-02 / B-06）。用 WARN
+                // 不用 DEBUG：生产默认 loglevel=warn 下失败必须留痕。
+                if closed.load(Ordering::Relaxed) {
+                    return;
+                }
+                crate::hot_log!(tracing::Level::WARN, "error={e} xdns client: recv failed");
+                break;
+            },
         };
         let Some(idx) =
             state.resolvers.iter().position(|r| matches!(r, Resolver::Udp(a) if *a == addr))
@@ -419,6 +459,10 @@ async fn send_loop(
     mut poll_rx: mpsc::Receiver<()>,
 ) {
     let mut delay = INIT_POLL_DELAY;
+    // DNS 查询发送失败 = 解析面断（查询发不出去 = DNS 全断），必须在生产默认
+    // warn 门下可见（Go 同点恒 error 级；DEBUG 不可见，bd u0pe2 ①）。限频：
+    // 故障窗首条 + 每 32 条，防上游不可达时随 poll/写入节奏刷屏。
+    let mut send_fails = 0u64;
     loop {
         if closed.load(Ordering::Relaxed) {
             return;
@@ -442,12 +486,26 @@ async fn send_loop(
         }
 
         if let Err(e) = send_once(&state, inner.as_ref(), pkt.as_deref().unwrap_or(&[])).await {
-            crate::hot_log!(DEBUG, "error={e} xdns client: send failed");
+            send_fails += 1;
+            if send_fails == 1 || send_fails % 32 == 0 {
+                crate::hot_log!(
+                    tracing::Level::WARN,
+                    "fails={send_fails} error={e} xdns client: send failed"
+                );
+            }
+        } else {
+            send_fails = 0;
         }
         // extraPoll：真实包后追加的空 poll 包
         for _ in 0..state.extra_poll {
             if let Err(e) = send_once(&state, inner.as_ref(), &[]).await {
-                crate::hot_log!(DEBUG, "error={e} xdns client: extra poll send failed");
+                send_fails += 1;
+                if send_fails == 1 || send_fails % 32 == 0 {
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "fails={send_fails} error={e} xdns client: extra poll send failed"
+                    );
+                }
             }
         }
 

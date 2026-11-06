@@ -48,6 +48,8 @@ cargo doc --workspace --no-deps
 
 **当前活跃票面**：以 `bd list --status open` 实时输出为准（上表审计时点的票号 `6su8`/`2ktp`/`fzir`/`75rv`/`sf5b`/`syvm`/`mc11`/`akqh`/`8pne` 均已 CLOSED，快照不写死票号）。
 
+**当前态（2026-11-06 审计轮，取代上表历史基线）**：多维终审 + 缺口台账 + 分维报告与修复交付已落 `reports/audit-2026-11-06/`（索引见 §3 文档地图该行）；上表 2026-10-12 评分仅为立项级历史快照，不得作为现状依据。
+
 ---
 
 ## 3. 文档地图
@@ -58,11 +60,13 @@ cargo doc --workspace --no-deps
 | **`docs/refs/`** | 治理输入（v1/v2/v3 裁决 + alloc-audit 报告）——**红线** |
 | **`docs/benchmarks/baseline.md`** | 性能 baseline（loopback 154-167 MB/s + alloc/MB 2.15/2.22）|
 | **`docs/audit-*-2026-10-12.md`** | 立项级审计 6 份（架构/性能/安全/规范 + 综合 + 立项级）——**历史基线**，当前态以 `reports/audit-2026-11-06/` 为准 |
+| **`reports/audit-2026-11-06/`** | **2026-11-06 审计轮产物索引**——`FINAL-MULTIDIM-AUDIT.md`（多维终审）+ `MASTER-BACKLOG.md`（缺口台账/修复波次）+ 分维报告（`architecture.md`/`perf-memory.md`/`security.md`/`code-quality.md` + security-A/B/C 专项）+ `impl-*.md`（本轮修复交付记录）+ `HANDOFF-2026-11-06.md`（轮次交接）|
 | **`bd list --status open`** | 当前活跃票面（label=audit/framework/standards 等）|
 | **`docs/architecture/xray-frame-强约束插件模型-2026-10-23.md`** | **框架纪律核心**——三层定位 + 五层强制约束 L1-L5 + 协议坑约束表 12 条（造件/评审必读）|
 | `docs/research/xray-frame-*.md` | 盘点底料：主仓 53 crate 能力盘点 / udf 机制差距 / 池化归 udf / DNS 面 / inbound-outbound 面（本地文档）|
 | **`docs/architecture/xray-frame-udf功能域全景-2026-10-23.md`** | **udf 32 域全景 × 主仓覆盖对照**——udf 有什么/没什么/主仓哪些面能接管/10 个未接线高价值域/3 条反模式（造件选依托件前先查）|
-| `docs/architecture/xray-frame-深度融合战役计划-2026-10-26.md` · `xray-frame-masque-契约级任务书-2026-10-30.md` | **在飞规划**（未完成）——当前唯一仍有效的框架规划文档 |
+|**`docs/architecture/xray-frame-深度融合战役计划-2026-10-26.md` · `xray-frame-masque-契约级任务书-2026-10-30.md`**|**在飞规划**（未完成）——当前唯一仍有效的框架规划文档|
+|`docs/architecture/adr/`|**ADR 目录**（37vjq 立）——架构归属裁决五节体（ADR-0001 池派生件 / ADR-0002 登记簿拆分）+ 批次公共 API 记账表；造件归属争议先查此目录|
 
 ---
 
@@ -151,7 +155,7 @@ serena-cli undo                                                        # 改坏�
 | **日志 Handler 分发 + 双写** ✅ 已归一化（P1-10-b） | 旧 `HANDLERS` 扇出 + tracing 双写已删；主仓 `xray-common/src/log/mod.rs` 收敛为 udf `logx::ChannelRegistry` 单入口：general/access/dns 三通道，`register_channel` 装配期注册（同通道二次注册 fail-visible），`Channel`/`ChannelSink` re-export，便捷入口 `debug`/`info`/`warning`/`error` 只走 general 通道 | ——（已完成；udf 侧多通道 sink 缺口已由 udf `2f586c1` 补上并被主仓消费，原「单 sink 缺口」警示作废） | Go 级别名（`Severity::as_str`）与 Go 消息语义留主仓 |
 | **配置装配** | `xray-conf`：`confloader.rs:18 load_file`/`serial.rs:185 merge_configs`+`:211 build_config`/`protocols.rs:35`（各协议 settings 结构体集）/`init.rs:34 register_builtin_stages`/`built.rs:86 BuiltConfig` | 分层装载/端口/测试替身归 udf `ConfigFile<C>`/`ConfigPort`/`MockEnv`/`parse_mock` | `BuiltConfig` 中间态 + proto 双向属 Xray 语义，留主仓。**`ConfigFile<C>` 接管已判 NO-GO（bd 77r0q）**：3 条差异属 Xray 语义（RFC 8259 严格解码 / `JSONMarshalWithoutEscape`+4 空格缩进 / 注释容忍边界），影子比对后不进产；**`config-toml` 无 TOML 配置需求 → 不接**（编造消费方=造假接线）。D5 分母据此重裁为 **11 族**（剔除 config-json/config-toml）。 |
 | **注册表族** | 生产 outbound 表 = dispatcher `SimpleOhm`（定位：`grep -n "pub struct SimpleOhm" crates/xray-app-dispatcher/src/default.rs`）；生产 inbound 表 = xray-core `InboundRuntime`（**`ohm: Arc<SimpleOhm>`** —— 与 outbound 同底座，已归一化到 udf `BoundedRegistry`；⚠️ 旧记「slots `RwLock<Vec>` / **O(n) 线性扫**」**已过期**，定位：`grep -n "pub struct InboundRuntime" crates/xray-core/src/inbound.rs`）；proxyman 只提供 handler 载体与 gRPC 命令编排（`lib.rs` 的 pub use 导出面），**无** `InboundManager`/`OutboundManager` 类型（全仓 grep 0 命中）；`TcpWorker`/`UdpWorker` 存在但生产零消费 | 走 udf `BoundedRegistry`（fail-closed insert/确定序 iter/泄漏断言）或 xray-frame `PluginRegistry` 查表 | ⚠️ **反模式警示**：注册表≠池深借还模型，`borrowed` 恒 0 = **假同构**——**禁把注册表整面 impl `PoolManaged`** |
-| **BufferPool 接缝（`with_pool`）** ⚠️ 已规划未落地（bd a0m9d 台账）| `DialBridge::with_pool` 全仓仅装配测试调用（`crates/xray-core/src/assembly.rs` 的 `with_pool` 2 处，均测试面）；目标主路 `xray-cli/src/framework.rs` 只 `builder.build()` 无 `with_pool`；`PluginContext::pool()` 缺省 panic 但生产从不触发；生产实际用 `xray_buf` 分层池（22 处 `Buffer::new` + 3 处 `new_pooled`）|目标：接缝由 `xray-frame` 能力句柄（`PluginContext`）真正供给，协议 crate 只经框架 API 取池；在接上之前**不得**在协议 crate 另造池（§3.5.2）|定性=已规划未落地（bd nn8os 已按「机制就绪」降格关票），非缺陷；L3 lint 闸（clippy 禁 `xray_buf::alloc`）尚未存在。插件模型文档 §2.3/§2.4 的「已生效」表述与本节冲突，以本节为准 |
+|**BufferPool 接缝（`with_pool`）** ✅ 接缝已落地；插件消费面=canary 装配门（r9z0g 举证，2026-11-06）|`with_pool` 生产装配已接线 2 处：`xray-cli/src/framework.rs`（`assemble`，`XrayBufPool` 并发 1024/常驻 64，懒分配）+ `xray-core/src/feature_framework.rs`（同底座）。`ctx.pool()` 生产消费 = `AssemblyProbe` canary（`require_pool`：build 期借一块立刻归还，未注入即 fail-visible——坑约束 4 装配门）。**协议插件零直接消费（已举证，非缺口）**：数据面缓冲物理池唯一 = `xray_buf` 全局分层池（`Buffer::new_pooled`：buf reader/readv/dispatcher udp_session 消费）；`ctx.pool()`（`XrayBufPool::acquire`）物理分配即委托同一 `xray_buf::alloc`——插件经 ctx 取池与直取分层池**物理同池**，仅多并发记账面；插件形态 = 薄适配（dial_fn 变换既有 MultiBuffer，无原始分配热点）；独立池件 = udf `ObjectPool`（hysteria udphop / splithttp pool_stream 进程池，老化托管见 ADR-0001）。**禁**为「看起来接线」造假消费方；未来插件若出现真实原始分配热点，经 `ctx.pool()` 取池并走性能 A/B 门（CLAUDE.md §5）|目标态已达成（接缝供给）；剩余缺口 = L3 lint 闸（clippy 禁 `xray_buf::alloc` 绕池直取）尚未存在。插件模型文档 §2.3/§2.4 的「已生效」表述以本节为准|
 | **中央 match 臂** ✅ 已落地（T4.2 phase 4 + bd 7y07s + W1 表实现收口） | 主路径已表化：`xray-core/src/arm_builders/`（`INBOUND_CTORS`/`OUTBOUND_CTORS` **纯数据源切片**，BTreeMap 已删）→ `arm_registry.rs` 装配成 `xray-frame::PluginRegistry`（构造即跑 deps 拓扑门）；唯一查表入口 `lookup_inbound_builder`/`lookup_outbound_builder`，未命中显式失败：inbound `Err` **拒启**（bd vdl95）/ outbound `BuildError::Unsupported` **整配置拒启**（bd o91s4）；旧 match 与回退 feature 已删。**unix/UDS/tun 的 9 臂已于 2026-10-30 全部收进同一张 `INBOUND_CTORS` 表**（表值 `InboundCtor{stream, needs_listen_addr, uds_stream, uds_transport}`，20 键含 `inbound:tun`；`UDS_SUPPORTED_PROTOCOLS` 白名单与两处内联 match 已删；契约测试 `arm_builders/uds_tests.rs` 覆盖 9 变体起监听 + 无槽协议显式失败） | 已完成 —— 收口方式 = 复用 `arm_builders::inbound` 构造函数（原「inbound unix 变体 4 臂」是旧数，实测 9 臂） | 表实现选型已改写：数据源 → PluginRegistry 装配（`arm_builders/mod.rs` 选型节；旧「明确不用 `xray-frame::PluginRegistry`」判定作废）；wire 语义与协议特化臂留协议 crate |
 | **任务托管 / 停机编排** | dispatcher `background_tasks` 单把 async Mutex + 收割债（定位：`grep -n "background_tasks" crates/xray-app-dispatcher/src/default.rs`）；停机多风格并存（各组件自持停机路径，现场为准：`grep -rn "shutdown" crates/xray-core/src/inbound.rs`）；`Instance.close` 逆序无超时无隔离（定位：`grep -n "pub fn close" crates/xray-core/src/instance.rs`） | `FxScope`（spawn 唯一托管口）+ `ShutdownCoordinator`（注册窗/编排窗/超时/panic 隔离/报告） | 组件内容与停机顺序的业务语义 |
 
@@ -163,7 +167,7 @@ serena-cli undo                                                        # 改坏�
 >
 > **关键事实（2026-11-05 复核更正，bd ikk0z）**：**生产主路已是 fail-visible**——出站侧 `register_outbounds`（`xray-core/src/outbound.rs`）任一条目失败即返回 `Err` 并**整配置拒启**（bd o91s4：解析失败 / 协议不支持都不再 warn+skip，避免默认出站前移成明文直连）；入站侧未知协议经 `lookup_inbound_builder`（`xray-core/src/arm_registry.rs`）未命中即 `Err` **拒启**（bd vdl95；旧行为 warn+skip 会让节点静默消失、端口无监听而管理员无感）。因此**「配置写错 → 启动即报」在生产主路成立**。
 >
-> 需要显式指明主路的是**框架路**：`xray-cli` 的 `framework-assembly` 对未命中协议走 warn+skip，且该路当前零 CI 保护（bd gjqm7）。引用「启动即报」时不得泛化到框架路。
+> 需要显式指明主路的是**框架路**：`xray-cli` 的 `framework-assembly` 对未命中协议走 warn+skip（**语义仍真**，已由行为级台账断言钉死：xray-core `tests/assembly_path_equivalence.rs`——37vjq-c 从 `include_str!` 源码文本升级为 `xray_cli::framework::project_assembly` 运行时投影 + dev-dep 闭环（xray-core dev-dep xray-cli，framework-assembly 特性随测试构建启用），`cargo test -p xray-core` 默认执行 ⇒ bd gjqm7「框架路零 CI 保护」就此收口）；`run_framework` 真机端到端门仍另票 je3u3。引用「启动即报」时不得泛化到框架路。
 
 ### 3.5.5 能力归属三层判定与派生回路（ADR-1，2026-10-27 PM 拍板 · 评审打回项）
 

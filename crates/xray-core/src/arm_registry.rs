@@ -230,6 +230,23 @@ pub(crate) fn lookup_outbound_builder(protocol: &str) -> Option<OutboundBuilder>
     }
 }
 
+/// 生产构造键枚举（双主路一致性台账 `tests/assembly_path_equivalence.rs` 的
+/// 生产侧数据源）：遍历 `ARM_REGISTRY` 注册键（`<方向>:<协议>`），按方向分组
+/// 返回 `(入站键, 出站键)`（注册序）。只读投影，零行为差异。
+pub fn arm_protocol_keys() -> (Vec<String>, Vec<String>) {
+    let mut inbound = Vec::new();
+    let mut outbound = Vec::new();
+    for plugin in ARM_REGISTRY.iter() {
+        let name = plugin.name();
+        if let Some(rest) = name.strip_prefix(INBOUND_PREFIX) {
+            inbound.push(rest.to_string());
+        } else if let Some(rest) = name.strip_prefix(OUTBOUND_PREFIX) {
+            outbound.push(rest.to_string());
+        }
+    }
+    (inbound, outbound)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

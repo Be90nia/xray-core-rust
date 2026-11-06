@@ -63,6 +63,16 @@ http = { workspace = true }
 quinn = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
+# xdns DoH h2 连接复用（bd 5lpw3）：hyper-util legacy Client = 连接池 + HTTP/2 多路
+# 复用（Go `http.Transport` ForceAttemptHTTP2 + keep-alive 对位）。四件均为 workspace
+# 既有依赖（splithttp 同源；lock 已有 tower-service 0.3），零新增外部 crate。
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tower-service = "0.3"
+# xdns DoH worker 队列（bd PM-06）：tokio mpsc Receiver 单消费者，多 worker 只能
+# `Mutex<Receiver>` 锁跨 await ⇒ 换 MPMC 有界通道（lock 内既有 async-channel 2.5.0）。
+async-channel = "2"
 # B6（bd t975）第二波：spawn 托管面走 udf skeleton_infra::fx::FxScope（坑约束 5）。
 # path 形态同 xray-app-observatory（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料，不锁 rev）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio", "pool"] }

@@ -276,7 +276,10 @@ impl DotNameServer {
             .map_err(|_| DnsError::WireFormat("query too large for DoT".to_string()))?
             .to_be_bytes();
 
-        let mut conn = match self.conn.lock().await.pop() {
+        // PM-13：池锁不跨握手——match scrutinee 的临时 guard 存活到整个 match 结束，
+        // 持锁跨 connect_tls 会让并发查询在 TLS 握手期间串行化并阻塞 put_conn 归还。
+        let pooled = { self.conn.lock().await.pop() };
+        let mut conn = match pooled {
             Some(conn) => conn,
             None => self.connect_tls(deadline.clone()).await?,
         };

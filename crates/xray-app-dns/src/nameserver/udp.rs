@@ -68,7 +68,8 @@ const UDP_RECV_BUF: usize = 4096;
 /// 条目 = req_id u16(2) + token u64(8) + `oneshot::Sender<Vec<u8>>`(≈40) +
 /// HashMap 装载开销 ≈ 80B ⇒ 512 × 80B ≈ **41KB**（远低于 0.5MB 上限）。
 /// 到顶直接拒发（禁排队：排队时内存随并发查询数线性上涨）。
-const MAX_PENDING_QUERIES: usize = 512;
+/// 登记于 xray-core `memory_budget::DNS_PENDING_MAX_ENTRIES`（交叉断言钉住，bd sgdwm）。
+pub const MAX_PENDING_QUERIES: usize = 512;
 
 /// 单 socket + pending map 通道（一 NS 一族一个，惰性建立）。
 ///
@@ -125,7 +126,7 @@ impl UdpChannel {
     async fn bind(is_ipv6: bool) -> Result<Self, DnsError> {
         let local = if is_ipv6 { "[::]:0" } else { "0.0.0.0:0" };
         let sock = Arc::new(
-            UdpSocket::bind(local)
+            xray_transport::udp::bind_udp_no_connreset(local)
                 .await
                 .map_err(|e| DnsError::WireFormat(format!("udp bind: {e}")))?,
         );

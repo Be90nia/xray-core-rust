@@ -383,8 +383,7 @@ pub(crate) async fn handle_mux_inbound_link(
     handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
     allowed_network: Option<Network>,
 ) {
-    #[allow(unused_imports)] // 存量清零批次
-    use xray_buf::{reader::BufferedReader, writer::BufferedWriter};
+    use xray_buf::reader::BufferedReader;
     use xray_mux::worker::{DispatchHandlerAdapter, ServerWorker};
     let adapter = Arc::new(DispatchHandlerAdapter::new(handler));
     let worker = match allowed_network {
@@ -2122,7 +2121,9 @@ pub async fn serve_ss(
     };
     if let Some(flavor) = udp_flavor {
         let port = listener.local_addr()?.port();
-        match tokio::net::UdpSocket::bind(("0.0.0.0", port)).await {
+        // 走掩码 UDP 监听专用绑定：Windows 上关掉 ICMP-unreachable 的错误上报
+        // （bd quznp；否则一个伪造包就能让 xdns 的 recv 泵拿假错误自旋）。
+        match xray_transport::udp::bind_udp_no_connreset(("0.0.0.0", port)).await {
             Ok(sock) => {
                 // finalmask.udp（bd 05js，Go udp/hub.go:71-77 WrapPacketConnServer）：
                 // recv 侧 decode、回包 send_to 侧 encode；未配置 → 裸 socket 原样。
@@ -7078,8 +7079,6 @@ mod tests {
     async fn hysteria_tcp_dispatch_to_freedom_e2e() {
         use xray_app_dispatcher::default::DialBridge;
         use xray_proxy_freedom::make_freedom_dial_fn;
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_proxy_hysteria::TcpDispatcher as _;
         use xray_transport_hysteria::conn::{InterStreamConn, QuicStream};
 
         // duplex-backed mock QUIC stream（读写 halves 独立锁，避免 dispatch 桥双向互锁）

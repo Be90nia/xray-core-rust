@@ -5976,6 +5976,7 @@ dependencies = [
  "udf-skeleton-infra",
  "uuid",
  "xray-buf",
+ "xray-frame",
 ]
 
 [[package]]
@@ -6037,6 +6038,7 @@ dependencies = [
  "xray-app-stats",
  "xray-app-version",
  "xray-buf",
+ "xray-cli",
  "xray-common",
  "xray-conf",
  "xray-crypto",
@@ -6268,6 +6270,7 @@ dependencies = [
  "tokio",
  "tracing",
  "udf-skeleton-infra",
+ "windows-sys 0.59.0",
  "xray-common",
  "xray-features",
  "xray-frame",
@@ -6753,6 +6756,7 @@ name = "xray-transport"
 version = "0.1.0"
 dependencies = [
  "aes 0.9.1",
+ "async-channel",
  "async-trait",
  "base64",
  "blake2",
@@ -6764,6 +6768,9 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "num-integer",
  "num-traits",
@@ -6785,6 +6792,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
+ "tower-service",
  "tracing",
  "udf-skeleton-infra",
  "udf-std-ext",

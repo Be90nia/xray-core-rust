@@ -10,7 +10,6 @@
 //! integers and bounded random byte filling.
 
 pub mod aead;
-pub mod auth_reader;
 pub mod auth_writer;
 pub mod authenticator;
 pub mod chunk;

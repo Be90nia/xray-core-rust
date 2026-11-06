@@ -14,7 +14,7 @@ use std::{
 };
 
 use skeleton_infra::fx::FxScope;
-use tokio::{net::UdpSocket, task::JoinHandle};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_common::net::network::Network;
@@ -896,7 +896,7 @@ pub(crate) async fn build_dns_inbound(
     let dns_idle = dns_idle_timeout_for(policy.as_deref(), 0);
     let (handler, outbound) = parse_dns_inbound_config(&ib.entry.data, &ib.tag, dns_idle)?;
     let inbound = Arc::new(DnsInbound::new(&ib.tag, handler, outbound));
-    let udp = UdpSocket::bind(addr).await?;
+    let udp = xray_transport::udp::bind_udp_no_connreset(addr).await?;
     let tcp = InboundTcpListener::bind(addr, inbound_sockopts.clone())
         .await?
         .with_tcpmask_manager(inbound_tcpmask(settings)?);

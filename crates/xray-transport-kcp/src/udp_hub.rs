@@ -52,9 +52,9 @@ const READ_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 const KCP_RECV_BUF_SIZE: usize = 8192;
 
 impl StdUdpHub {
-    /// 绑定 UDP socket（对应 Go `net.ListenUDP`）。
+    /// 绑定 UDP socket（对应 Go `net.ListenUDP`；Windows 关 ICMP-unreachable 上报，bd d597w）。
     pub fn bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Self> {
-        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = xray_transport::udp::bind_std_udp_no_connreset(addr)?;
         let local = socket.local_addr().ok();
         socket.set_read_timeout(Some(READ_POLL_TIMEOUT))?;
         Ok(Self { socket: Arc::new(socket), local, closed: Arc::new(AtomicBool::new(false)) })
@@ -322,5 +322,40 @@ mod tests {
         let expected = socket.local_addr().unwrap();
         let hub = StdUdpHub::from_socket(socket);
         assert_eq!(hub.local_addr(), Some(expected));
+    }
+
+    /// bd d597w：`StdUdpHub::bind` 经 `bind_std_udp_no_connreset` 关掉 Windows
+    /// ICMP-unreachable 上报——发往死端口的包不得让下次 recv 拿 10054。
+    /// 对照组用裸 socket 证明本机确实投递该错误（对照组拿不到 = 探针失效）。
+    #[cfg(windows)]
+    #[test]
+    fn hub_bind_suppresses_icmp_unreachable() {
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // 端口无人监听 ⇒ 后续 ICMP Port Unreachable
+
+        let probe = |sock: &std::net::UdpSocket| -> std::io::Result<()> {
+            sock.connect(dead_addr).unwrap();
+            sock.send(b"x").unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(600))).unwrap();
+            sock.recv(&mut [0u8; 32]).map(|_| ())
+        };
+
+        // 对照组：裸 socket 必须拿到 ConnectionReset，否则本机不复现。
+        let bare = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let err = probe(&bare).expect_err("对照组必须交回错误");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset, "实际 {err}");
+
+        // hub socket：预期超时（WouldBlock/TimedOut），不得是 ConnectionReset。
+        let hub = StdUdpHub::bind("127.0.0.1:0").unwrap();
+        let sock = hub.socket_handle();
+        match probe(&sock) {
+            Ok(_) => panic!("死端口不该有真应答"),
+            Err(e) => assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "ICMP 假错误必须被关掉，实际 {e}"
+            ),
+        }
     }
 }

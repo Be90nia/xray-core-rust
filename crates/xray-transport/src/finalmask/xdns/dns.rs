@@ -277,6 +277,11 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     let mut rd_len_buf = [0u8; 2];
     r.read_exact(&mut rd_len_buf)?;
     let rd_length = u16::from_be_bytes(rd_len_buf) as usize;
+    // 先按声明长度做边界检查再分配（Go unpack 在拷贝前即校验）：零填充式预分配
+    // 会让 25B 报文声称 rd_length=65535 时先付 64KB（未认证远程可达）。
+    if rd_length as u64 > remaining_bytes(r)? {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected eof reading rdata"));
+    }
     let mut data = vec![0u8; rd_length];
     r.read_exact(&mut data)?;
     let rr = RR { name, rtype, rclass, ttl, data };
@@ -286,7 +291,11 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     // 回退到 rdata 起始解嵌套名；失败则保留原始字节（resp 侧跳过）
     let after_data = r.stream_position()?;
     r.seek(SeekFrom::Current(-(rd_length as i64)))?;
-    match read_name(r) {
+    let nested = read_name(r);
+    // 无条件复位到 rdata 之后：read_name 只在跟随过压缩指针时复位游标，未压缩的
+    // 嵌套名会停在 rdata 中部 ⇒ 成功分支若不复位，后续所有 RR 从错位置读。
+    r.seek(SeekFrom::Start(after_data))?;
+    match nested {
         Ok(cname) => {
             let mut norm = Vec::new();
             for label in &cname.labels {
@@ -296,11 +305,16 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
             norm.push(0);
             Ok(RR { data: norm, ..rr })
         },
-        Err(_) => {
-            r.seek(SeekFrom::Start(after_data))?;
-            Ok(rr)
-        },
+        Err(_) => Ok(rr),
     }
+}
+
+/// 当前位置到 reader 末尾的剩余字节数（用完复位游标）。
+fn remaining_bytes<R: Read + Seek>(r: &mut R) -> io::Result<u64> {
+    let cur = r.stream_position()?;
+    let end = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(cur))?;
+    Ok(end.saturating_sub(cur))
 }
 
 /// 读取 Name，支持压缩指针（0xC0 前缀）。
@@ -310,6 +324,11 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
     let mut labels: Vec<Vec<u8>> = Vec::new();
     let mut num_pointers = 0u8;
     let mut seek_to: Option<u64> = None;
+    // 边读边累计编码后总长（首字节 + 每 label 的 1 长度字节 + 末尾 0）。
+    // 压缩指针可回跳到同一区域重复展开，指针上限只限跳数不限累积量 ⇒ 若等
+    // Name::new 在循环结束后才校验，峰值先于拒绝发生（未认证远程可达的放大面）。
+    // 过程中拒绝与 Name::new 的接受集合一致（对齐 Go 的 errNameTooLong 时机）。
+    let mut total: usize = 1;
 
     loop {
         let mut label_type_buf = [0u8; 1];
@@ -327,6 +346,10 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
                 let length = (label_type & 0x3f) as usize;
                 if length == 0 {
                     break;
+                }
+                total += 1 + length;
+                if total > 255 {
+                    return Err(invalid_data("name is longer than 255 octets"));
                 }
                 let mut label = vec![0u8; length];
                 r.read_exact(&mut label)?;
@@ -752,5 +775,213 @@ mod tests {
         let result = read_name(&mut cursor);
         // 应该在第 11 个指针时报错（COMPRESSION_POINTER_LIMIT=10）
         assert!(result.is_err());
+    }
+
+    // ── 加固回归（bd c6z6q / oavzu / a1pfm）──
+
+    fn hdr(qd: u16, an: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 12];
+        h[0] = 0xab;
+        h[1] = 0xcd;
+        h[2] = 0x01; // RD
+        h[4..6].copy_from_slice(&qd.to_be_bytes());
+        h[6..8].copy_from_slice(&an.to_be_bytes());
+        h
+    }
+
+    /// 一条 RR 的 wire 形态（name 直接给字节，rdata 给未压缩字节）。
+    fn rr_wire(name: &[u8], rtype: u16, ttl: u32, rdata: &[u8]) -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend_from_slice(name);
+        w.extend_from_slice(&rtype.to_be_bytes());
+        w.extend_from_slice(&CLASS_IN.to_be_bytes());
+        w.extend_from_slice(&ttl.to_be_bytes());
+        w.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+        w.extend_from_slice(rdata);
+        w
+    }
+
+    /// bd c6z6q：压缩指针只限跳数不限累积 ⇒ 2000 个 1 字节 label + 指回报文开头的
+    /// 压缩指针（4KB 输入）会重复展开同一区域。累计到 255 就拒绝后分配与峰值均有界
+    /// （修复前实测 22018 次分配 / 1.6MB 峰值）。
+    #[test]
+    fn compression_pointer_amplification_is_bounded() {
+        let mut msg = hdr(1, 0);
+        for _ in 0..2000 {
+            msg.extend_from_slice(&[0x01, b'a']);
+        }
+        msg.extend_from_slice(&[0xc0, 0x0c]); // 压缩指针 → offset 12（回到报文自身区域）
+        msg.extend_from_slice(&[0x00, 0x10, 0x00, 0x01]); // qtype TXT / qclass IN
+        assert_eq!(msg.len(), 4018);
+
+        let (res, c) = alloc_probe::measure(|| message_from_wire_format(&msg));
+        let err = res.expect_err("超长 name 必须拒绝，不得返回 Ok");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "name is longer than 255 octets");
+        assert!(c.allocs < 500, "allocs={} 未压到有界（上限 500）", c.allocs);
+        assert!(c.peak < 64 * 1024, "peak={}B 未压到 64KB 内", c.peak);
+    }
+
+    /// bd oavzu：rd_length 必须按剩余字节先校验再分配（Go unpack 的顺序）。
+    /// 25B 报文声称 rd_length=65535 ⇒ 拒绝且不预分配 64KB。
+    #[test]
+    fn rdata_overclaim_allocates_nothing() {
+        let mut msg = hdr(0, 1);
+        msg.push(0x00); // RR name = root
+        msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]); // A / IN / ttl
+        msg.extend_from_slice(&[0xff, 0xff]); // rd_length = 65535
+        msg.extend_from_slice(&[0xaa, 0xbb]); // 实际只有 2 字节
+        assert_eq!(msg.len(), 25);
+
+        let (res, c) = alloc_probe::measure(|| message_from_wire_format(&msg));
+        let err = res.expect_err("rd_length 越界必须拒绝");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(c.bytes < 4096, "alloc_bytes={} 仍按声明长度预分配", c.bytes);
+        assert!(c.peak < 4096, "peak={}B 仍按声明长度预分配", c.peak);
+    }
+
+    /// bd a1pfm：CNAME rdata 解嵌套名**成功**后也必须复位游标 —— 5 种 rdata 形态
+    /// 逐一验证后续 RR 字段全对（`[CNAME][A][TXT]`，第 2/3 条错位即失败）。
+    #[test]
+    fn cname_rdata_forms_keep_cursor_aligned() {
+        const ROOT: &[u8] = &[0x00];
+        // offset 12 起的未压缩名 "example.com"（形态 2/5 的指针目标）
+        const EXAMPLE_COM: &[u8] =
+            &[0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00];
+        // 归一化后的未压缩 "t.example.com"
+        const T_EXAMPLE_COM: &[u8] = &[
+            0x01, b't', 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+            0x00,
+        ];
+        // 形态 3：嵌套名只占 3 字节，其余按 rd_length 补零（rdata 内无指针 ⇒
+        // read_name 不会自行复位游标，正是错位触发面）
+        let mut short_padded: Vec<u8> = vec![0x01, b'a', 0x00];
+        short_padded.resize(15, 0x00);
+
+        // (形态, CNAME RR 的 name, CNAME rdata, 期望的归一化 rdata)
+        type WireForm<'a> = (&'a str, &'a [u8], Vec<u8>, &'a [u8]);
+        let forms: [WireForm; 5] = [
+            (
+                "未压缩嵌套名",
+                ROOT,
+                vec![1, b't', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0],
+                T_EXAMPLE_COM,
+            ),
+            ("尾随压缩指针", EXAMPLE_COM, vec![1, b't', 0xc0, 0x0c], T_EXAMPLE_COM),
+            ("短名 + 补齐", ROOT, short_padded, &[0x01, b'a', 0x00]),
+            ("纯压缩指针", EXAMPLE_COM, vec![0xc0, 0x0c], EXAMPLE_COM),
+            ("非 name rdata（Err 分支）", ROOT, vec![0x80], &[0x80]),
+        ];
+
+        for (form, rr_name, rdata, expected) in forms {
+            let mut msg = hdr(0, 3);
+            msg.extend_from_slice(&rr_wire(rr_name, RR_TYPE_CNAME, 60, &rdata));
+            msg.extend_from_slice(&rr_wire(ROOT, RR_TYPE_A, 60, &[1, 2, 3, 4]));
+            msg.extend_from_slice(&rr_wire(ROOT, RR_TYPE_TXT, 61, &[2, b'h', b'i']));
+
+            let m = message_from_wire_format(&msg)
+                .unwrap_or_else(|e| panic!("形态 {form}: 解析失败 {e}"));
+            assert_eq!(m.answer.len(), 3, "形态 {form}");
+            assert_eq!(m.answer[0].rtype, RR_TYPE_CNAME, "形态 {form}");
+            assert_eq!(m.answer[0].data, expected, "形态 {form}: CNAME rdata 归一化");
+            // 后续 RR 必须字段全对（游标未复位的指纹：第 2/3 条整体错位）
+            assert_eq!(
+                (m.answer[1].name.clone(), m.answer[1].rtype, m.answer[1].ttl),
+                (Name::default(), RR_TYPE_A, 60),
+                "形态 {form}: 第 2 条 RR 错位"
+            );
+            assert_eq!(m.answer[1].data, vec![1, 2, 3, 4], "形态 {form}: 第 2 条 rdata");
+            assert_eq!(
+                (m.answer[2].name.clone(), m.answer[2].rtype, m.answer[2].ttl),
+                (Name::default(), RR_TYPE_TXT, 61),
+                "形态 {form}: 第 3 条 RR 错位"
+            );
+            assert_eq!(m.answer[2].data, vec![2, b'h', b'i'], "形态 {form}: 第 3 条 rdata");
+        }
+    }
+
+    /// 分配取证：线程局部计数分配器（libtest 并行下他线程分配不串扰；本 crate lib
+    /// 目标仅此一处 `#[global_allocator]`，与 `udp_session` 同款做法）。
+    mod alloc_probe {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+
+        #[derive(Clone, Copy, Default)]
+        pub(super) struct Counts {
+            pub allocs: usize,
+            pub bytes: usize,
+            live: usize,
+            pub peak: usize,
+        }
+
+        thread_local! {
+            // const 初始化：分配器内读取无惰性分配、无析构注册
+            static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+                allocs: 0,
+                bytes: 0,
+                live: 0,
+                peak: 0,
+            }) };
+        }
+
+        fn note_alloc(size: usize, freed: usize) {
+            // try_with：TLS 析构期分配无归属线程，跳过记账（分配器内禁 panic）
+            let _ = COUNTS.try_with(|c| {
+                let mut n = c.get();
+                n.allocs += 1;
+                n.bytes += size;
+                n.live = n.live.saturating_sub(freed) + size;
+                n.peak = n.peak.max(n.live);
+                c.set(n);
+            });
+        }
+
+        fn note_dealloc(size: usize) {
+            let _ = COUNTS.try_with(|c| {
+                let mut n = c.get();
+                n.live = n.live.saturating_sub(size);
+                c.set(n);
+            });
+        }
+
+        struct CountingAlloc;
+
+        unsafe impl GlobalAlloc for CountingAlloc {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                note_alloc(layout.size(), 0);
+                // SAFETY: 透传 System，布局合法性由 GlobalAlloc 契约保证
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                note_alloc(layout.size(), 0);
+                // SAFETY: 同上
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                note_alloc(new_size, layout.size());
+                // SAFETY: 指针/布局配对由 GlobalAlloc 契约保证
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                note_dealloc(layout.size());
+                // SAFETY: 同上
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static PROBE_ALLOC: CountingAlloc = CountingAlloc;
+
+        /// 在独立计数窗口内跑 `f`，返回结果与窗口内的分配统计。
+        pub(super) fn measure<T>(f: impl FnOnce() -> T) -> (T, Counts) {
+            COUNTS.with(|c| c.set(Counts::default()));
+            let out = f();
+            (out, COUNTS.with(|c| c.get()))
+        }
     }
 }

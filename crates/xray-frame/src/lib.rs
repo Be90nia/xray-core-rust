@@ -44,6 +44,10 @@ pub mod contract_assert;
 // P1 即件：超时唯一入口（坑约束 2）+ 握手/空闲限时（P1-4）+ 预算面
 // （面 3：Budget/BudgetDeadline 双源预算句柄，保 tokio 虚拟推进语义）。
 pub mod deadline;
+// 装配面内存预算登记簿（ADR-B · audit ARCH-07 拆分裁决）：纯常量簿上浮本件；
+// 预算门 check_startup_budget（吃 xray_conf::BuiltConfig）留 xray-core
+// （xray-conf 已依赖 xray-frame，门上浮即反向成环）。
+pub mod budget;
 // P3-1 S1 旁路查表面（dispatcher 中央 match 臂退役的查表骨架，契约 §P3-1）。
 pub mod dispatch;
 pub mod error;

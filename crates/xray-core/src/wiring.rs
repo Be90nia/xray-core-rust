@@ -39,8 +39,6 @@ use xray_geodata::{
     rule_parser::{parse_domain_rule, parse_ip_rules},
 };
 use xray_mux::client::MUX_COOL_ADDRESS;
-#[allow(unused_imports)] // 存量清零批次
-use xray_proto::xray::common::geodata::CidrRule;
 use xray_transport::link::Link;
 
 /// 把 `xray_app_router::Router` 暴露为 dispatcher 的 [`RoutingRouter`]。

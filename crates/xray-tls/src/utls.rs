@@ -108,15 +108,6 @@ impl<S> Conn<S> {
     pub fn get_ref(&self) -> (&S, &tokio_rustls::rustls::ClientConnection) {
         self.inner.get_ref()
     }
-
-    /// 启用 REALITY Spider 流量填充。
-    ///
-    /// 当前为 no-op：rustls 不提供 per-record 大小控制 API。
-    /// 未来可通过 TLS record layer 手动分段实现。
-    pub fn enable_spider_padding(&mut self, _limit: Option<usize>) {
-        // TODO: rustls 无 set_plaintext_buffer_limit API。
-        // 需自定义 TLS record wrapper 或等待 rustls PR #2382 合入。
-    }
 }
 
 impl<S: Connection + Unpin> AsyncRead for Conn<S> {
@@ -259,13 +250,6 @@ impl<S> ServerConn<S> {
     #[must_use]
     pub fn get_ref(&self) -> (&S, &tokio_rustls::rustls::ServerConnection) {
         self.inner.get_ref()
-    }
-
-    /// 启用 Spider 流量填充（服务端）。
-    ///
-    /// 当前为 no-op：rustls 不提供 per-record 大小控制 API。
-    pub fn enable_spider_padding(&mut self, _limit: Option<usize>) {
-        // TODO: 同 Conn::enable_spider_padding
     }
 }
 

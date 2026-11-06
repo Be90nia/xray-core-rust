@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use tokio::net::UdpSocket;
 use xray_frame::deadline::Budget;
 
 /// UPnP SSDP 组播地址（UPnP Device Architecture 1.1 §1.2.2 固定值）。
@@ -461,7 +460,7 @@ async fn ssdp_location(
     search_addr: SocketAddrV4,
     timeout: Duration,
 ) -> io::Result<(String, Ipv4Addr)> {
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let sock = crate::udp::bind_udp_no_connreset((Ipv4Addr::UNSPECIFIED, 0)).await?;
     for target in SSDP_SEARCH_TARGETS {
         let message = build_msearch(target);
         sock.send_to(message.as_bytes(), SocketAddr::V4(search_addr)).await?;
@@ -559,7 +558,7 @@ async fn local_ipv4_towards(control_url: &reqwest::Url) -> io::Result<Ipv4Addr> 
                 format!("UPnP: control url host {host:?} resolved to no IPv4 address"),
             )
         })?;
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let sock = crate::udp::bind_udp_no_connreset((Ipv4Addr::UNSPECIFIED, 0)).await?;
     sock.connect(target).await?;
     match sock.local_addr()?.ip() {
         std::net::IpAddr::V4(v4) => Ok(v4),
@@ -618,7 +617,10 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UdpSocket,
+    };
 
     use super::*;
     use crate::finalmask::realm::portmap::test_support::{DESCRIPTION_XML, HttpStub, SsdpStub};

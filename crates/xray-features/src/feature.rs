@@ -28,6 +28,10 @@ pub enum FeatureError {
     /// 请求的 Feature 类型未注册。`name` 兼容静态类型名与 prost `type_url`。
     #[error("feature not found: {name}")]
     NotFound { name: String },
+    /// Feature 注册表已满（`registry::MAX_FEATURE_ENTRIES`），拒绝注册。
+    /// 满表 ≠ NotFound——专用变体避免「满了报找不到」的语义错位（bd u0pe2 ③）。
+    #[error("feature registry full: max {max} entries")]
+    RegistryFull { max: usize },
     /// Feature 启动失败。`source` 保留原始错误链。
     #[error("feature {name} failed to start: {message}")]
     StartFailed { name: &'static str, message: String },

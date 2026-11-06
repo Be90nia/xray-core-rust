@@ -1,102 +1,38 @@
-//! 装配面内存预算（bd azcoe · 256MB 小鸡口径）。
+//! 装配期预算门（bd azcoe · 256MB 小鸡口径）——`check_startup_budget` 本体。
 //!
-//! 用户定调（2026-11-04）：整机 256MB（含 kernel/基础系统 ~60MB + 陪跑进程
-//! ~40MB），xray 保守按 **96MB** 设计；约束现在写死进代码，不留「以后再调」。
-//! 三条铁律（`reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md`）：
-//! ① 上界一律显式常量，禁从 sysinfo/系统内存推导（换机器不改代码）；
-//! ② 禁预分配大缓冲；
-//! ③ 超限 fail-fast 立即拒启/丢弃，禁排队（排队 = 内存与请求数同涨）。
+//! **归属裁决（ADR-B · 2026-11-06，audit ARCH-07 拆分）**：本模块只剩两件事——
+//! ① **预算门** [`check_startup_budget`]（吃 [`xray_conf::BuiltConfig`]；反向依赖
+//! 硬约束 ⇒ 门不可能上浮：`xray-conf` 已依赖 `xray-frame`，门上浮成环）；
+//! ② **登记簿 re-export**：纯常量簿上浮 `xray_frame::budget`（派生层，含逐条
+//! 口径 doc），本模块 `pub use` 转出——**禁两份常量定义**（§3.5.2）；登记簿
+//! 交叉断言（改实现值即红）住本模块 `mod tests`（它同时可见实现 crate 与簿）。
 //!
-//! 本模块两部分：
-//! - [`check_startup_budget`]：**装配期可校验**的预算门，在 `start_full_dispatched` 入口执行（生产
-//!   `start_full` 与 framework `start_full_with_outbound_handlers` 两路共用），违例逐条列出并拒启
-//!   （对齐 vaye2/o91s4 的启动期硬错纪律）。
-//! - 其余 `pub const`：运行时结构配额**登记簿**——执行点在归属 crate/票（见各 常量
-//!   doc），登记防漂移；xray-core 装配面只强校验装配期可知项。
+//! 门在 `start_full_dispatched` 入口执行（生产 `start_full` 与 framework
+//! `start_full_with_outbound_handlers` 两路共用），违例逐条列出并拒启
+//! （对齐 vaye2/o91s4 的启动期硬错纪律）。校验面（bd sgdwm 扩面）：
+//! 1. 配置派生值：env 缺省档 + policy 各 level `bufferSize`（KB；负值 = 无界 ⇒ 硬拒，Go 同源坑
+//!    audit4-memory F8；本仓装配期硬拒负值 ⇒ 96MB 门下不存在「Go 同源
+//!    无界」活口，**无界一律硬拒零豁免**；0 = Go 合法「limit 0 不排队」，必须放行）；
+//! 2. 实际占用面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]）、QUIC/xhttp 每
+//!    listener/dialer 的端点账面（socket 与 h2 send_buf）、预算内最小并发乘以每连接 pipe
+//!    占用——配置合法但合计超 [`XRAY_BUDGET_BYTES`] 同样拒启。
 
-/// 整机 256MB 分账后 xray 的保守预算（96MB；留 24MB 给抖动/page cache）。
-pub const XRAY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
-
-/// 每连接 pipe 软上限的硬顶（字节）——**装配期强校验项**。
-///
-/// 依据：pipe limit 是「单连接可排队字节」的软上限（policy buffer，Go
-/// `BufferPolicy.Connection`），x86_64 缺省 512KB、aarch64 缺省 4KB（bd 9utc3）。
-/// 96MB 预算下安全并发 300–600 连接（audit4-memory §8，每连接常驻 40–200KB）；
-/// 4MiB = x86 缺省 8×，留 1–2MiB 级合法调优空间，拦截 `XRAY_BUFSIZE=16+`
-/// （16MB/方向 × 数十连接即吃满预算）这类配置级超支。
-pub const MAX_PER_CONN_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
-
-/// 每连接 **socket** 缓冲上限（显式值，字节）——与 [`MAX_PER_CONN_BUFFER_BYTES`]
-/// **同口径**：二者共用同一个 4 MiB 每连接份额，pipe 与 socket 不重复计账。
-///
-/// 依据（bd u91se ④ PM 终裁 2026-11-05）：显式 `receiveBufferSize` /
-/// `sendBufferSize`（TCP 三 transport 收 + QUIC/UDP 端点收/发各向）分三档——
-/// `≤ 4 MiB` 免确认直接生效；`4 MiB < v ≤ 64 MiB` 需 `XRAY_ALLOW_LARGE_RCVBUF=1`
-/// 确认；`> 64 MiB` 恒拒。判定用**用户设定值**（Linux 回读受 `rmem_max` 钳制偏小，
-/// 回读小 ≠ 没超限），超限 fail-visible 拒拨/拒绑，**禁静默钳制**。
-///
-/// 记账：每条连接 ≤ 4 MiB，条数 × 4 MiB 计入整机 96 MB（[`XRAY_BUDGET_BYTES`]）。
-/// 执行点（Trans2 已落地）：`xray_transport::sockopt::MAX_EXPLICIT_RECEIVE_BUFFER_SIZE`
-/// / `MAX_EXPLICIT_UDP_BUFFER_SIZE`（后者 = 64 MiB 硬顶，4 MiB 免确认档同
-/// [`xray_transport::sockopt::SO_RCVBUF_FREE_TIER_MAX`]）。
-pub const MAX_EXPLICIT_SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-
-/// QUIC/UDP socket **缺省**接收缓冲（字节/连接）= 8 MiB，**行为不动**（登记项）。
-///
-/// Go quic-go `wrapConn` 的 `DesiredReceiveBufferSize` parity
-/// （`internal/protocol/params.go:5-9`，`sys_conn.go:51-53`）：缺省
-/// `receiveBufferSize=0` ⇒ [`xray_transport::sockopt::bind_udp_endpoint`] 的
-/// `tune_udp_buffer` 只升不降到本值（Linux 再走 `SO_RCVBUFFORCE`，失败只 warn）。
-/// 对拍一致优先于本地优化，故本项只登记 + 披露，不改缺省。
-///
-/// **Windows 无 `net.core.rmem_max` 钳制** ⇒ 每 socket 真 8 MiB，内核记账 ×2
-/// ⇒ 按 [`QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES`]（16 MiB/连接）口径。
-/// Linux 受 `net.core.rmem_max` 钳制（stock ≈416 KiB 实际账面）⇒ 8 MiB 只在运维
-/// 抬过 `rmem_max` 后成立。TCP 路径缺省为 0（不设，交 OS autotune，bd r5j96）。
-pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-
-/// socket 缓冲的**内核记账倍数**：`SO_RCVBUF` 设定值 ×2 才等于内核账面字节
-/// （设定值的一半是纯开销，同 `docs/guide-highrtt-sockopt.md` §96-98）。
-pub const SOCKET_KERNEL_BOOKKEEPING_FACTOR: usize = 2;
-
-/// QUIC/UDP 缺省接收缓冲的**账面**口径（字节/连接）= 8 MiB × 2 = 16 MiB。
-///
-/// 256 MB 机型判据：QUIC 连接数 × 本值必须落在 [`XRAY_BUDGET_BYTES`] 内
-/// （例：32 个 QUIC 连接 ≈ 512 MiB 账面 ⇒ 已超整机预算）。
-pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES: usize =
-    QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR;
-
-/// 握手在途任务并发上限（P0-1 accept 解耦后 per-conn 握手任务数）。
-///
-/// 128 × ~6KB/任务 ≈ 0.75MB ≤ 1MB 配额。**执行点在 ws/httpupgrade accept 接线
-/// （P0-1 任务书，transport crate）**；本登记簿供评审对账，防实现漂移。
-pub const HANDSHAKE_INFLIGHT_MAX: usize = 128;
-
-/// DNS pending map 字节预算（0.5MB）。执行点：xray-app-dns（bd 9utc3 第 1 项）。
-pub const DNS_PENDING_MAX_BYTES: usize = 512 * 1024;
-
-/// DNS 解析缓存条目上界（**已落地**：xray-app-dns `MAX_CACHE_ENTRIES`）。
-/// 16384 键 ≈ 4–5MiB：远高于常规解析工作集，且拦住「TTL 窗内唯一域名数 =
-/// 内存」的无界增长（Go 同源无界；Rust 侧按预算收口——有界优于逐字节对拍）。
-pub const DNS_CACHE_MAX_ENTRIES: usize = 16_384;
-
-/// TLS session cache 条目上界（**已落地**：xray-tls 128 条 LRU + 24h TTL 双界，
-/// ≈ ≤2.5MiB）。该常量在 xray-tls 内为私有 const，故只登记不交叉断言。
-pub const TLS_SESSION_CACHE_MAX_ENTRIES: usize = 128;
-
-/// finalmask xmc manager 池字节上界（≤4MB）。执行点：finalmask 池接线票。
-pub const FINALMASK_XMC_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-/// hyper 每主机 idle 连接缓冲字节上界（≤2MB）。执行点：xray-transport-splithttp
-/// （bd cgmcj）。
-pub const HYPER_MAX_IDLE_PER_HOST_BYTES: usize = 2 * 1024 * 1024;
-
-/// 本轮新增池/缓存合计硬顶（4MB）。逐池 byte 上界的分账执行点见上各项 + bd f516k。
-pub const NEW_POOLS_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
-
-/// 总盘预留余量下限（整机 256MB 口径运维判据：256 − 系统 ~60 − 陪跑 ~40 −
-/// xray ~96 ≈ 60MB，票面判据取 ≥50MB）。上线由 PM 亲核实测 RSS，非代码强校验。
-pub const RESERVE_MARGIN_MIN_BYTES: usize = 50 * 1024 * 1024;
+// 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
+pub use xray_frame::budget::{
+    BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES, BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES,
+    DNS_CACHE_ESTIMATE_BYTES, DNS_CACHE_MAX_ENTRIES, DNS_PENDING_EST_BYTES,
+    DNS_PENDING_MAX_ENTRIES, DNS_SINGLEFLIGHT_UNBOUNDED_NOTE, DOH3_SESSION_SOCKET_BOOKED_BYTES,
+    FINALMASK_XMC_POOL_MAX_BYTES, H2_MAX_SEND_BUF_PER_CONN_BYTES, HANDSHAKE_INFLIGHT_MAX,
+    HANDSHAKE_TASK_EST_BYTES, HYPER_IDLE_CONN_EST_BYTES, HYPER_MAX_IDLE_PER_HOST_CONNECTIONS,
+    MAX_EXPLICIT_SOCKET_BUFFER_BYTES, MAX_PER_CONN_BUFFER_BYTES, MIN_VIABLE_CONCURRENCY,
+    NEW_POOLS_TOTAL_MAX_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+    QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES, RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR,
+    SPLITHTTP_ENDPOINT_BOOKED_BYTES, SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
+    SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES, SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
+    TLS_SESSION_CACHE_ESTIMATE_BYTES, TLS_SESSION_CACHE_MAX_ENTRIES,
+    WS_PER_CONN_BUFFER_BOOKED_BYTES, XRAY_BUDGET_BYTES, XRAY_BUF_POOL_TOTAL_MAX_BYTES,
+    startup_fixed_floor_bytes, startup_fixed_floor_bytes_for,
+};
 
 /// 单项每连接缓冲预算校验（字节；`origin` 指明值的来源，进错误文案）。
 ///
@@ -116,18 +52,35 @@ fn check_conn_buffer(value_bytes: i64, origin: &str, violations: &mut Vec<String
     }
 }
 
-/// 装配期预算门：校验配置派生的内存面，违例逐条列出（fail-visible 拒启）。
+/// streamSettings 的 transport 名（`method` 覆盖 `network`，Go
+/// `transport_internet.go:85-88`；本仓单一规范表
+/// `xray_common::net::transport::canonical_transport_protocol`）。
+fn stream_network(
+    ss: Option<&serde_json::Value>,
+) -> Option<xray_common::net::transport::TransportProtocol> {
+    let name =
+        ss.and_then(|v| v.get("method").or_else(|| v.get("network"))).and_then(|v| v.as_str())?;
+    xray_common::net::transport::canonical_transport_protocol(name)
+}
+
+/// 装配期预算门：校验「配置派生值 + 实际占用面」，违例逐条列出（fail-visible 拒启）。
 ///
-/// 当前校验面 = 每连接 pipe 软上限的取值来源：
-/// - env 缺省档（`xray.ray.buffer.size` / `XRAY_RAY_BUFFER_SIZE` / `XRAY_BUFSIZE` →
-///   `BufferPolicy::default`，level 未配 bufferSize 时的生效值）；
-/// - policy app 各 level 的 `bufferSize`（KB 单位；负值 = 无界，Go ×1024 转字节）。
+/// 校验面（bd sgdwm 扩面后）：
+/// 1. 每连接 pipe 软上限的取值来源：env 缺省档（`xray.ray.buffer.size` / `XRAY_RAY_BUFFER_SIZE` /
+///    `XRAY_BUFSIZE` → `BufferPolicy::default`，level 未配 bufferSize 时的生效值）+ policy app 各
+///    level 的 `bufferSize`（KB 单位； 负值 = 无界硬拒；0 = Go 合法「不排队」放行）。
+/// 2. 实际占用面：[`startup_fixed_floor_bytes`]（进程级池/缓存）+ QUIC/xhttp 端点账面（扫
+///    inbounds/outbounds 的 streamSettings transport 名）+ [`MIN_VIABLE_CONCURRENCY`] × 最大 pipe
+///    档 × 2 方向，合计超 [`XRAY_BUDGET_BYTES`]
+///    即拒——「配置合法但实际占用超预算」的组合同样过不了门。
 pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String> {
     let mut violations = Vec::new();
 
+    // ── 1) 配置派生面（bd azcoe 原面，口径不变）──
     let env_default = i64::from(xray_features::policy::BufferPolicy::default().connection);
     check_conn_buffer(env_default, "env default buffer", &mut violations);
 
+    let mut max_pipe_bytes = env_default.max(0) as usize;
     for app in &built.apps {
         if app.kind != "policy" {
             continue;
@@ -138,8 +91,45 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
             if let Some(kb) = level.buffer_size {
                 let bytes = if kb < 0 { -1 } else { i64::from(kb) * 1024 };
                 check_conn_buffer(bytes, &format!("policy level {lv} buffer"), &mut violations);
+                if bytes > max_pipe_bytes as i64 {
+                    max_pipe_bytes = bytes as usize;
+                }
             }
         }
+    }
+
+    // ── 2) 实际占用面（bd sgdwm 扩面）──
+    let mut quic_endpoints = 0usize;
+    let mut splithttp_endpoints = 0usize;
+    let stream_settings = built
+        .inbounds
+        .iter()
+        .map(|i| i.stream_settings_json.as_ref())
+        .chain(built.outbounds.iter().map(|o| o.stream_settings_json.as_ref()));
+    for ss in stream_settings {
+        match stream_network(ss) {
+            Some(xray_common::net::transport::TransportProtocol::Quic) => quic_endpoints += 1,
+            Some(xray_common::net::transport::TransportProtocol::SplitHttp) => {
+                splithttp_endpoints += 1;
+            },
+            _ => {},
+        }
+    }
+
+    let fixed = startup_fixed_floor_bytes();
+    let endpoint_booked = quic_endpoints * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES
+        + splithttp_endpoints * SPLITHTTP_ENDPOINT_BOOKED_BYTES;
+    // 每连接 pipe 占用按两方向计（上/下行各一条 policy pipe，见 MAX_PER_CONN_BUFFER_BYTES doc）。
+    let per_conn_pipe = max_pipe_bytes * 2;
+    let projected = fixed + endpoint_booked + MIN_VIABLE_CONCURRENCY * per_conn_pipe;
+    if projected > XRAY_BUDGET_BYTES {
+        violations.push(format!(
+            "actual occupancy {projected}B > budget {}B: fixed {fixed}B (pools+caches) \
+             + endpoints {endpoint_booked}B ({quic_endpoints} QUIC x {}B socket booked \
+             + {splithttp_endpoints} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B h2 send_buf+idle) \
+             + {MIN_VIABLE_CONCURRENCY} conns x {per_conn_pipe}B pipe(2-way)",
+            XRAY_BUDGET_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+        ));
     }
 
     if violations.is_empty() {
@@ -151,7 +141,7 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use xray_conf::BuiltEntry;
+    use xray_conf::{BuiltEntry, BuiltInbound, BuiltOutbound};
 
     use super::*;
 
@@ -160,6 +150,29 @@ mod tests {
         let mut built = xray_conf::BuiltConfig::default();
         built.apps.push(BuiltEntry { kind: "policy".into(), data: json.as_bytes().to_vec() });
         built
+    }
+
+    fn quic_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            entry: BuiltEntry { kind: "dokodemo-door".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            port: Some(443),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::json!({"network": "quic"})),
+            sniffing_json: None,
+        }
+    }
+
+    fn xhttp_outbound(tag: &str) -> BuiltOutbound {
+        BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            send_through: None,
+            stream_settings_json: Some(serde_json::json!({"network": "splithttp"})),
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }
     }
 
     #[test]
@@ -220,7 +233,87 @@ mod tests {
         assert!(err.contains("invalid policy config"), "{err}");
     }
 
-    /// 登记簿与已落地实现对账：xray-app-dns 缓存上界改动必须同步本登记簿。
+    /// audit4-memory F8 语义钉（bd sgdwm 验收 4）：`bufferSize 0` = Go 合法
+    /// 「limit 0 不排队」，必须过门；`-1` 才是无界，必须拒。两者分界不许被
+    /// 「无界一律硬拒」扩面误伤。
+    #[test]
+    fn f8_buffer_size_zero_is_legal_but_negative_is_unbounded() {
+        let zero = built_with_policy(r#"{"levels": {"0": {"bufferSize": 0}}}"#);
+        check_startup_budget(&zero).expect("bufferSize=0（Go 合法不排队）必须过门");
+        let neg = built_with_policy(r#"{"levels": {"0": {"bufferSize": -1}}}"#);
+        let err = check_startup_budget(&neg).expect_err("bufferSize=-1（无界）必须拒");
+        assert!(err.contains("unbounded"), "{err}");
+    }
+
+    /// 「配置合法但实际占用超预算」必须拒（bd sgdwm 验收 3）：
+    /// bufferSize 4MiB 是上界本身（合法），1 个 QUIC 端点 + 8 条满额 pipe 双向
+    /// 的占用面合计 > 96MiB ⇒ 扩面门必须点名算式拒启。
+    #[test]
+    fn gate_rejects_legal_config_whose_occupancy_exceeds_budget() {
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        built.inbounds.push(quic_inbound("quic-in"));
+        let err =
+            check_startup_budget(&built).expect_err("配置合法但占用超预算必须拒（bd sgdwm 扩面）");
+        assert!(err.contains("actual occupancy"), "错误必须带占用算式：{err}");
+        assert!(err.contains("1 QUIC"), "错误必须点名 QUIC 端点数：{err}");
+        assert!(err.contains("pipe(2-way)"), "错误必须点名 pipe 双向口径：{err}");
+    }
+
+    /// 同拓扑（1 QUIC 入站 + 1 xhttp 出站）+ 缺省 pipe：固定 ~19MiB + 端点账面
+    /// ~32MiB + 8 × 1MiB pipe ≈ 60MiB ≤ 96MiB ⇒ 过门（防扩面门误伤常规配置）。
+    #[test]
+    fn gate_accepts_same_topology_within_budget() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(quic_inbound("quic-in"));
+        built.outbounds.push(xhttp_outbound("xhttp-out"));
+        check_startup_budget(&built).expect("同拓扑缺省 pipe 必须过门");
+    }
+
+    /// 扩面门取「最大显式 level」做 pipe 底数：显式 4MiB 比缺省 512KiB 大 ⇒
+    /// 可行性算式按 4MiB（与上条拒例同一算式路径，防只按 env 缺省漏算）。
+    #[test]
+    fn occupancy_scan_counts_inbound_and_outbound_endpoints() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(quic_inbound("q1"));
+        built.inbounds.push(quic_inbound("q2"));
+        built.outbounds.push(xhttp_outbound("x1"));
+        // 3 端点账面 = 2×16MiB + 1×(16MiB+400KiB)；缺省 pipe 下合计 < 96MiB。
+        check_startup_budget(&built).expect("3 端点 + 缺省 pipe 必须过门");
+        // 抬到 4MiB pipe ⇒ 可行性破线，错误里 QUIC=2、xhttp=1 逐一可见。
+        built.apps.push(BuiltEntry {
+            kind: "policy".into(),
+            data: br#"{"levels": {"0": {"bufferSize": 4096}}}"#.to_vec(),
+        });
+        let err = check_startup_budget(&built).expect_err("4MiB pipe + 3 端点必须破线");
+        assert!(err.contains("2 QUIC"), "{err}");
+        assert!(err.contains("1 xhttp"), "{err}");
+    }
+
+    // ── 登记簿交叉断言（bd sgdwm：从实现处导入对照，改实现值即红）──
+
+    /// 握手在途上限与 gate 实现**同一常量**（bd sgdwm 修正 PM-04 漂移：旧簿 128
+    /// vs 实现 64，现簿直接从实现导入）。
+    #[test]
+    fn handshake_inflight_ledger_matches_gate() {
+        assert_eq!(
+            HANDSHAKE_INFLIGHT_MAX,
+            xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES,
+            "握手在途上限与本登记簿不一致：两处同步改（bd sgdwm/PM-04）"
+        );
+    }
+
+    /// DNS pending 条数闸与 xray-app-dns 实现**同一常量**（bd sgdwm 修正旧簿
+    /// 「512KiB 字节」口径错位——实现是 512 条）。
+    #[test]
+    fn dns_pending_ledger_matches_udp_cap() {
+        assert_eq!(
+            DNS_PENDING_MAX_ENTRIES,
+            xray_app_dns::nameserver::udp::MAX_PENDING_QUERIES,
+            "DNS pending 条数上界与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+    }
+
+    /// DNS 缓存条数与 xray-app-dns 实现**同一常量**（既有断言，bd azcoe）。
     #[test]
     fn dns_cache_ledger_matches_landed_constant() {
         assert_eq!(
@@ -228,6 +321,132 @@ mod tests {
             DNS_CACHE_MAX_ENTRIES,
             "xray-app-dns 缓存上界与本登记簿不一致：两处同步改（bd azcoe）"
         );
+    }
+
+    /// TLS session cache 条数与 xray-tls 实现**同一常量**（bd sgdwm：实现常量
+    /// 已转 pub，旧「私有 const 无法断言」作废）。
+    #[test]
+    fn tls_session_cache_ledger_matches_impl() {
+        assert_eq!(
+            TLS_SESSION_CACHE_MAX_ENTRIES,
+            xray_tls::tls_session_cache::TLS_SESSION_CACHE_CAPACITY,
+            "TLS session cache 条数上界与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+    }
+
+    /// xray-buf 分层池进程级预算与实现**同一常量**（bd sgdwm/PM-04「宪法破」的
+    /// 主体：8MiB 单列分账）；thread_local 单线程配额 128KiB 一并钉（PM-07
+    /// 公式口径的成员）。
+    #[test]
+    fn xray_buf_pool_ledger_matches_impl() {
+        assert_eq!(
+            XRAY_BUF_POOL_TOTAL_MAX_BYTES,
+            xray_buf::alloc::POOL_BYTE_BUDGET,
+            "xray-buf 池进程级预算与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+        assert_eq!(xray_buf::alloc::TLS_BYTE_BUDGET, 128 * 1024, "PM-07 公式成员");
+    }
+
+    /// splithttp 进程级共享块池与实现**同一常量**（bd sgdwm：pub(super)→pub
+    /// 仅可见性，值不动）。
+    #[test]
+    fn splithttp_block_pool_ledger_matches_impl() {
+        assert_eq!(
+            SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
+            xray_transport_splithttp::pool_stream::POOL_BYTE_BUDGET,
+            "splithttp 块池预算与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+    }
+
+    /// hyper 每 host 空闲**连接数**与实现**同一常量**（bd sgdwm 修正 PM-04：
+    /// 旧簿 2MiB 字节口径错位，实现闸是 hyper-util `pool_max_idle_per_host`）。
+    #[test]
+    fn hyper_idle_ledger_matches_conn_count() {
+        assert_eq!(
+            HYPER_MAX_IDLE_PER_HOST_CONNECTIONS,
+            xray_transport_splithttp::client::MAX_IDLE_PER_HOST,
+            "hyper 每 host 空闲连接数与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+    }
+
+    /// h2 发送缓冲（真缓冲）与 splithttp 客户端/服务端实现**同一常量**
+    /// （bd sgdwm/PM-05 入簿）；SETTINGS 流窗/连窗（信用计数器）一并钉住防回档
+    /// ——非内存账面，不计入预算门算式。
+    #[test]
+    fn h2_send_buf_and_flow_window_ledger_matches_impl() {
+        use xray_transport_splithttp::transport as st;
+        assert_eq!(
+            H2_MAX_SEND_BUF_PER_CONN_BYTES,
+            st::H2_MAX_SEND_BUF_SIZE,
+            "h2 客户端每连接发送缓冲与本登记簿不一致（bd sgdwm/PM-05）"
+        );
+        assert_eq!(
+            st::H2_SERVER_MAX_SEND_BUF_SIZE,
+            st::H2_MAX_SEND_BUF_SIZE,
+            "服务端 h2 发送缓冲必须与客户端同值（16MiB）"
+        );
+        assert_eq!(
+            SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
+            st::H2_INITIAL_STREAM_WINDOW,
+            "客户端流窗回档即红（bd wz2b/c9oc）"
+        );
+        assert_eq!(
+            SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
+            st::H2_INITIAL_CONNECTION_WINDOW,
+            "客户端连窗不得低于流窗（bd c9oc F-A）"
+        );
+        assert_eq!(
+            SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES,
+            st::H2_SERVER_INITIAL_STREAM_WINDOW,
+            "服务端流窗 16MiB（bd rjzw2：不得偷抬到客户端 32MiB）"
+        );
+        assert_eq!(
+            SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
+            st::H2_SERVER_INITIAL_CONNECTION_WINDOW,
+            "服务端连窗 32MiB"
+        );
+        assert_eq!(H2_MAX_SEND_BUF_PER_CONN_BYTES, 16 * 1024 * 1024);
+    }
+
+    /// ws（tungstenite）每连接缓冲与实现**同一构造**（bd sgdwm：读+写 = 64KiB，
+    /// bd i37bz 收窄后的口径）。
+    #[test]
+    fn ws_buffer_ledger_matches_impl() {
+        let ws = xray_transport_websocket::config::ws_config();
+        assert_eq!(
+            ws.read_buffer_size + ws.write_buffer_size,
+            WS_PER_CONN_BUFFER_BOOKED_BYTES,
+            "ws 每连接帧缓冲账面与本登记簿不一致：两处同步改（bd sgdwm）"
+        );
+    }
+
+    /// DoH3 会话 socket 账面与 QUIC 端点**同源**（doh3.rs dial 走
+    /// bind_udp_endpoint 缺省 8MiB 下限 ×2 内核记账；会话按端点复用，bd 0x4tl）。
+    #[test]
+    fn doh3_session_socket_ledger_derives_from_quic_booked() {
+        assert_eq!(
+            DOH3_SESSION_SOCKET_BOOKED_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+            "DoH3 会话 socket 账面必须与 QUIC 端点同源（同一 8MiB 下限）"
+        );
+    }
+
+    /// QUIC/UDP 缺省接收缓冲与 sockopt 侧 parity 下限**同一常量**（bd lidaf ①）：
+    /// 缺省行为不动（8 MiB 是 Go quic-go wrapConn parity），只要求两处不漂移。
+    #[test]
+    fn quic_udp_default_buffer_ledger_matches_sockopt_parity() {
+        use xray_transport::sockopt;
+        assert_eq!(
+            sockopt::QUIC_UDP_MIN_BUFFER,
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES,
+            "QUIC/UDP 缺省接收缓冲与本登记簿不一致（bd lidaf ①）"
+        );
+        // 账面口径 = 设定值 × 内核 2× 记账（Windows 无 rmem_max 钳制时真占这么多）。
+        assert_eq!(
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR,
+            "账面口径必须等于设定值 × 内核记账倍数"
+        );
+        assert_eq!(SOCKET_KERNEL_BOOKKEEPING_FACTOR, 2, "内核 SO_RCVBUF 记账恒 2×（§96-98）");
     }
 
     /// socket 显式缓冲上限与 transport 机制面**同一常量**（bd u91se ④）：
@@ -260,22 +479,80 @@ mod tests {
         );
     }
 
-    /// QUIC/UDP 缺省接收缓冲与 sockopt 侧 parity 下限**同一常量**（bd lidaf ①）：
-    /// 缺省行为不动（8 MiB 是 Go quic-go wrapConn parity），只要求两处不漂移。
+    /// 小池档条款（bd sgdwm 重写后的 NEW_POOLS 语义）：四成员合计必须 ≤ 4MiB。
+    /// 大池（xray-buf/splithttp）与 DNS 缓存、finalmask xmc 池单列分账，不入本档。
     #[test]
-    fn quic_udp_default_buffer_ledger_matches_sockopt_parity() {
-        use xray_transport::sockopt;
-        assert_eq!(
-            sockopt::QUIC_UDP_MIN_BUFFER,
-            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES,
-            "QUIC/UDP 缺省接收缓冲与本登记簿不一致（bd lidaf ①）"
+    fn small_pool_bucket_fits_new_pools_clause() {
+        let bucket = HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
+            + DNS_PENDING_EST_BYTES
+            + TLS_SESSION_CACHE_ESTIMATE_BYTES
+            + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES;
+        assert!(
+            bucket <= NEW_POOLS_TOTAL_MAX_BYTES,
+            "小池档合计 {bucket}B 超出 NEW_POOLS 档 {}B：条款或成员须同步改（bd sgdwm）",
+            NEW_POOLS_TOTAL_MAX_BYTES
         );
-        // 账面口径 = 设定值 × 内核 2× 记账（Windows 无 rmem_max 钳制时真占这么多）。
-        assert_eq!(
-            QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
-            QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR,
-            "账面口径必须等于设定值 × 内核记账倍数"
+    }
+
+    /// 固定占用底数 ≤ 预算的固定份额（**按 8 核参考机折算** ~19.4MiB；本断言防
+    /// 固定面悄悄长穿预算的 1/4 —— 超过即须重审分账，不是硬顶；thread_local
+    /// 项随核数线性，换机器断言不漂移，铁律①）。
+    #[test]
+    fn fixed_floor_stays_within_quarter_of_budget() {
+        let fixed = startup_fixed_floor_bytes_for(8);
+        assert_eq!(fixed, 20_316_160, "8 核参考机固定底数变了：成员或估算须重审（bd sgdwm）");
+        assert!(
+            fixed <= XRAY_BUDGET_BYTES / 4,
+            "装配期固定占用 {fixed}B 超过预算 1/4（{}B）：池/缓存面须重审（bd sgdwm）",
+            XRAY_BUDGET_BYTES / 4
         );
-        assert_eq!(SOCKET_KERNEL_BOOKKEEPING_FACTOR, 2, "内核 SO_RCVBUF 记账恒 2×（§96-98）");
+    }
+
+    /// 桥字节闸与实现**同一常量**（u440m）：改任一实现值即红。
+    #[test]
+    fn bridge_byte_gate_ledger_matches_impl() {
+        use xray_transport::bridge;
+        assert_eq!(
+            bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES,
+            BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES,
+            "桥字节闸每方向预算与本登记簿不一致：两处同步改（u440m）"
+        );
+        assert_eq!(
+            bridge::BRIDGE_BYTE_GATE_PERMIT_BYTES,
+            1024,
+            "许可粒度 1KiB（登记簿口径；改粒度须重算许可数并同步）"
+        );
+        assert_eq!(
+            bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES / bridge::BRIDGE_BYTE_GATE_PERMIT_BYTES,
+            2048,
+            "每方向许可总数 = 2048（2MiB / 1KiB）"
+        );
+        // 每连接 = 双方向，恰等于 pipe 每连接份额（不重复计账的口径锚）。
+        assert_eq!(
+            BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
+            usize::try_from(MAX_PER_CONN_BUFFER_BYTES).expect("4 MiB 恒正"),
+            "桥每连接在途份额必须 = pipe 每连接份额（4 MiB 同份额不重复计账）"
+        );
+    }
+
+    /// 桥字节闸入簿后的**总实算** ≤ 96 MiB（u440m 验收④）：固定面 + 最小并发
+    /// ×（pipe 双向 + 桥在途 4MiB）不超总预算。pipe 按 env 缺省档折算
+    /// （`BufferPolicy::default().connection`，**字节口径**——check_startup_budget
+    /// 的 env 档同源）；8 核参考机（铁律①）。
+    #[test]
+    fn ledger_total_with_bridge_gate_stays_within_budget() {
+        let pipe_bytes =
+            i64::from(xray_features::policy::BufferPolicy::default().connection).max(0);
+        let pipe_per_conn = (pipe_bytes * 2) as usize; // 双方向
+        let total = startup_fixed_floor_bytes_for(8)
+            + MIN_VIABLE_CONCURRENCY * (pipe_per_conn + BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES);
+        assert!(
+            total <= XRAY_BUDGET_BYTES,
+            "总实算 {total}B（固定面 + {} 连接 × (pipe 双向 {pipe_per_conn}B + 桥在途 \
+             {}B)）超预算 {}B：分账须重审，禁自行放宽总额（u440m）",
+            MIN_VIABLE_CONCURRENCY,
+            BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
+            XRAY_BUDGET_BYTES
+        );
     }
 }

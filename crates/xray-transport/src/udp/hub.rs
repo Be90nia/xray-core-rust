@@ -335,14 +335,15 @@ async fn start_recv_loop_masked(
 ///
 /// TPROXY 模式（Linux + `recv_orig_dest`）下用 `socket2` 在 bind 前设置
 /// `IP_TRANSPARENT`/`IP_RECVORIGDSTADDR`（IPv6 对应）socket option，使其能接收透明
-/// 代理流量并附带原始目标地址；其余情况走普通 `UdpSocket::bind`。
+/// 代理流量并附带原始目标地址；其余情况走 [`super::bind_udp_no_connreset`]
+/// （Windows 上顺带关掉 ICMP-unreachable 的错误上报，bd quznp）。
 async fn bind_udp(addr: SocketAddr, recv_orig_dest: bool) -> io::Result<UdpSocket> {
     #[cfg(target_os = "linux")]
     if recv_orig_dest {
         return bind_udp_tproxy_linux(addr);
     }
     let _ = recv_orig_dest;
-    UdpSocket::bind(addr).await
+    super::bind_udp_no_connreset(addr).await
 }
 
 #[cfg(target_os = "linux")]
@@ -578,44 +579,6 @@ fn parse_orig_dst_from_cmsg(
         )))
     } else {
         None
-    }
-}
-
-// ===== 旧 API 兼容 =====
-//
-// 保留 `register_udp_listener` / `unregister_udp_listener` 向后兼容，
-// 但标记为 deprecated——新代码应使用 `UdpHub::listen()`。
-
-use std::{collections::HashMap, sync::Mutex};
-
-static UDP_HUB: std::sync::OnceLock<Mutex<HashMap<SocketAddr, ()>>> = std::sync::OnceLock::new();
-fn udp_hub() -> &'static Mutex<HashMap<SocketAddr, ()>> {
-    UDP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// UDP hub 注册表最大条目数。
-const MAX_UDP_HUB_ENTRIES: usize = 4096;
-
-/// 注册 UDP listener。锁中毒时静默忽略。
-#[deprecated(note = "use UdpHub::listen() instead")]
-pub fn register_udp_listener(addr: SocketAddr) -> io::Result<()> {
-    if let Ok(mut hub) = udp_hub().lock() {
-        if hub.len() >= MAX_UDP_HUB_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("UDP hub registry full ({MAX_UDP_HUB_ENTRIES})"),
-            ));
-        }
-        hub.insert(addr, ());
-    }
-    Ok(())
-}
-
-/// 注销 UDP listener。锁中毒时静默忽略。
-#[deprecated(note = "use UdpHub::close() instead")]
-pub fn unregister_udp_listener(addr: SocketAddr) {
-    if let Ok(mut hub) = udp_hub().lock() {
-        hub.remove(&addr);
     }
 }
 

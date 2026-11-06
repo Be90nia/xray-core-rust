@@ -226,21 +226,6 @@ pub fn composite_matches(matches: &[Vec<u32>]) -> Vec<u32> {
     matches.iter().flatten().cloned().collect()
 }
 
-/// 合并多组匹配结果（逆序扁平化）。
-///
-/// 对应 Go 版本 `CompositeMatchesReverse`，将 `Vec<Vec<u32>>` 按
-/// 逆序扁平化。适用于域名和子串匹配的优先级规则（更远匹配优先）。
-#[must_use]
-pub fn composite_matches_reverse(matches: &[Vec<u32>]) -> Vec<u32> {
-    if matches.is_empty() {
-        return Vec::new();
-    }
-    if matches.len() == 1 {
-        return matches[0].clone();
-    }
-    matches.iter().rev().flatten().cloned().collect()
-}
-
 pub mod attributes;
 pub mod domain;
 pub mod ip;

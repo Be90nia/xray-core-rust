@@ -443,8 +443,9 @@ pub fn make_ss_dial_fn_with_ctx(config: Arc<SsOutboundConfig>, ctx: Arc<PluginCo
                         .await
                         .map_err(|e| format!("ss udp dial: {e}"))?;
                     let local = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-                    let sock =
-                        UdpSocket::bind(local).await.map_err(|e| format!("ss udp bind: {e}"))?;
+                    let sock = xray_transport::udp::bind_udp_no_connreset(local)
+                        .await
+                        .map_err(|e| format!("ss udp bind: {e}"))?;
                     sock.connect(server).await.map_err(|e| format!("ss udp connect: {e}"))?;
                     let default_dest = Destination::udp(target_addr, Port::new(target_port));
                     if let Some(p) = &config.ss2022 {

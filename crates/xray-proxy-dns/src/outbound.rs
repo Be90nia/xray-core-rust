@@ -136,7 +136,8 @@ pub async fn forward_udp_raw(
     timeout: Duration,
 ) -> Result<Vec<u8>> {
     let addr = dest_to_socket_addr(dest).await.map_err(DnsProxyError::UpstreamForwardFailed)?;
-    let sock = tokio::net::UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
+    let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = crate::udp_connreset::bind_udp_no_connreset(bind)
         .await
         .map_err(|e| DnsProxyError::UpstreamForwardFailed(format!("bind: {e}")))?;
     sock.connect(addr)

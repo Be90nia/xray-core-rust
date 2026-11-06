@@ -1,11 +1,3 @@
-// L3 静态闸存量登记（bd a5r4j/lzzja 切片 / f17zu）：本文件 31 处（29 tokio::spawn +
-// 2 Instant）>20 → 按 clippy.toml 分层规则挂文件级（含 reason）。
-// 托管裁决（bd hj3jf）：文件内 spawn 两态并存——句柄返回调用方的由调用方托管，
-// 其余显式脱管（寿命随所属连接/请求对象）；Clock 注入收口见 bd 39hko。
-#![allow(
-    clippy::disallowed_methods,
-    reason = "outbound.rs 存量 31 处（29 tokio::spawn + 2 std Instant），>20 处/文件按 clippy.toml 分层规则挂文件级；spawn 站点裁决两态（句柄外返=调用方托管 / 其余显式脱管，寿命随所属连接或请求对象），Clock 注入收口见 bd 39hko（bd hj3jf 裁定）"
-)]
 //! Outbound handler 注册：从 BuiltConfig 构建 DialBridge 注册到 SimpleOhm。
 //!
 //! 对应 Go `core.addOutboundHandlers`：遍历配置中的 outbound 列表，
@@ -254,8 +246,6 @@ pub fn register_outbounds(
         Arc::new(OhmRef { inner: ohm });
     xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
         move |tag: &str, dest: &Destination| {
-            #[allow(unused_imports)] // 存量清零批次
-            use xray_app_dispatcher::OutboundHandlerManager;
             let tag = tag.to_string();
             let dest = dest.clone();
             let ohm = Arc::clone(&dialer_proxy_ohm);
@@ -278,6 +268,10 @@ pub fn register_outbounds(
                     xray_buf::io::new_writer(server_w),
                 );
                 let fut = handler.dispatch(&dest, link);
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：dialerProxy 代理链拨号的后台投递（Go dispatch goroutine 直译），投递不等结果，寿命随该 dispatch 的 duplex 链路，句柄无需持有"
+                )]
                 tokio::spawn(async move {
                     let _ = fut.await;
                 });
@@ -1918,6 +1912,10 @@ async fn dispatch_dns_link(
     let mut writer_task = {
         let tag = tag.clone();
         let mut writer = link.writer;
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：DNS outbound 客户端帧泵（client_rx → link.writer），寿命随 dispatch_dns_link 会话，句柄无需持有"
+        )]
         tokio::spawn(async move {
             while let Some(msg) = client_rx.recv().await {
                 match msg {
@@ -2033,6 +2031,10 @@ async fn dispatch_dns_link(
                         if let Some(svc) = dns_service.clone() {
                             let w = client_tx_for_req.clone();
                             let t = tag.clone();
+                            #[allow(
+                                clippy::disallowed_methods,
+                                reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：单条 DNS IP 查询的异步应答写回，寿命随该查询的客户端帧，句柄无需持有"
+                            )]
                             tokio::spawn(async move {
                                 if let Some(resp) = handle_ip_query(&query, &svc).await {
                                     write_client_frame(&w, &t, &resp);
@@ -2814,9 +2816,6 @@ async fn pump_tuic_udp(
     link: Link,
     params: Arc<TuicUdpParams>,
 ) -> std::result::Result<(), String> {
-    #[allow(unused_imports)] // 存量清零批次
-    use xray_xudp::packet::{PacketError, PacketReader, PacketWriter};
-
     let client = xray_proxy_tuic::TuicClient::connect_with(
         params.server_addr.as_str(),
         &params.server_name,
@@ -3413,6 +3412,10 @@ impl BuildError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "测试基建批量豁免（bd 1z3pl ARCH-10；先例 = xray-app-dns 各测试模块 inner allow、xray-app-dispatcher lib.rs cfg_attr(test)）：本模块 31 处 tokio::spawn 全为同质测试基建（本地 echo/recorder/socks/dns 服务器与回环桥任务，句柄或被超时窗收敛或随测试体结束），4 处 std Instant 全为测试超时窗墙钟读数（非生产取时）——逐点登记将是 35 条同文复制（避属性海）；生产路径逐点登记见本文件 dialerProxy/帧泵/IP 查询三处，禁令不松"
+    )]
     use std::pin::Pin;
 
     use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
@@ -5635,8 +5638,6 @@ mod tests {
     /// 手工 socks5 服务器：no-auth 握手 + 记录 CONNECT 目标 + 双向桥接。
     /// 记录是「经代理而非直连」的判别器。返回 (端口, 记录)。
     async fn spawn_socks5_recorder() -> (u16, Arc<Mutex<Vec<(std::net::IpAddr, u16)>>>) {
-        #[allow(unused_imports)] // 存量清零批次
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let recorded: Arc<Mutex<Vec<(std::net::IpAddr, u16)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -6551,9 +6552,7 @@ mod tests {
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_carries_global_id_for_udp() {
         use tokio::io::AsyncWriteExt as _;
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_buf::io::{Reader as _, Writer as _};
-
+        use xray_buf::io::Reader as _;
         // ---- 捕获 carrier 字节的假 underlying（DialingWorkerFactory 拨号落点）----
         #[derive(Debug)]
         struct CaptureUnderlying {
@@ -6645,9 +6644,7 @@ mod tests {
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_tcp_has_no_global_id() {
         use tokio::io::AsyncWriteExt as _;
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_buf::io::{Reader as _, Writer as _};
-
+        use xray_buf::io::Reader as _;
         #[derive(Debug)]
         struct CaptureUnderlying {
             captured: Arc<parking_lot::Mutex<Vec<u8>>>,
@@ -6727,9 +6724,7 @@ mod tests {
     #[tokio::test]
     async fn mux_bridge_dispatch_with_access_non_whitelisted_inbound_has_no_global_id() {
         use tokio::io::AsyncWriteExt as _;
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_buf::io::{Reader as _, Writer as _};
-
+        use xray_buf::io::Reader as _;
         #[derive(Debug)]
         struct CaptureUnderlying {
             captured: Arc<parking_lot::Mutex<Vec<u8>>>,
@@ -7154,8 +7149,6 @@ mod tests {
     /// TCP 载荷静默发出、响应永不回流。
     #[tokio::test]
     async fn tuic_udp_dispatch_relays_xudp_frames() {
-        #[allow(unused_imports)] // 存量清零批次
-        use xray_buf::io::{Reader as _, Writer as _};
         use xray_xudp::packet::{PacketReader, PacketWriter};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -7269,6 +7262,10 @@ mod tests {
 /// 全红：本条挂死、并发条在同进程里等不到收尾）。
 #[cfg(test)]
 mod dns_client_writer_queue {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "测试面批量豁免（bd 1z3pl ARCH-10）：2 处 spawn 起 dispatch_dns_link 测试会话、1 处 std Instant 为测试超时预算墙钟读数（uwq9n 收尾门）；生产禁令不松，理由同 mod tests 头"
+    )]
     use std::{
         future::Future,
         pin::Pin,
@@ -7422,6 +7419,10 @@ mod dns_client_writer_queue {
 /// tag 恰好一个成功，其余拿到明确失败（`existing tag found: <tag>`）。
 #[cfg(test)]
 mod api_outbound_atomic_add {
+    #![allow(
+        clippy::disallowed_methods,
+        reason = "测试面批量豁免（bd 1z3pl ARCH-10）：1 处 spawn 起并发 add_outbound 竞态测试任务；生产禁令不松，理由同 mod tests 头"
+    )]
     use std::sync::Arc;
 
     use xray_app_commander::OutboundRuntime as _;

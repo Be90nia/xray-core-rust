@@ -1,1 +1,0 @@
-//! SplitHTTP browser client simulation

@@ -371,45 +371,6 @@ pub fn tcp_unix_listen_fn() -> crate::listener_registry::UnixTransportListenFn {
     )
 }
 
-// ===== 旧 API 兼容 =====
-//
-// 保留 `register_tcp_listener` / `take_tcp_listener` 向后兼容，
-// 但标记为 deprecated——新代码应使用 `listener_registry::register_transport_listener`。
-
-use std::{collections::HashMap, sync::Mutex};
-
-use tokio::net::TcpListener as TokioTcpListener;
-
-static TCP_HUB: std::sync::OnceLock<Mutex<HashMap<SocketAddr, TokioTcpListener>>> =
-    std::sync::OnceLock::new();
-fn tcp_hub() -> &'static Mutex<HashMap<SocketAddr, TokioTcpListener>> {
-    TCP_HUB.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// TCP hub 注册表最大条目数。
-const MAX_TCP_HUB_ENTRIES: usize = 4096;
-
-/// 注册 TCP listener。锁中毒时静默忽略。
-#[deprecated(note = "use listener_registry::register_transport_listener instead")]
-pub fn register_tcp_listener(addr: SocketAddr, listener: TokioTcpListener) -> io::Result<()> {
-    if let Ok(mut hub) = tcp_hub().lock() {
-        if hub.len() >= MAX_TCP_HUB_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("TCP hub registry full ({MAX_TCP_HUB_ENTRIES})"),
-            ));
-        }
-        hub.insert(addr, listener);
-    }
-    Ok(())
-}
-
-/// 取出已注册的 TCP listener（从注册表中移除）。
-#[deprecated(note = "use listener_registry::get_transport_listener instead")]
-pub fn take_tcp_listener(addr: SocketAddr) -> Option<TokioTcpListener> {
-    tcp_hub().lock().ok().and_then(|mut hub| hub.remove(&addr))
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::{

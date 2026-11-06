@@ -35,7 +35,6 @@ pub static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
 
 pub mod alloc_stats;
 pub mod commands;
-pub mod distro;
 pub mod error;
 // B5 第一步：框架装配路径（feature 门控，默认不编译——见 Cargo.toml features）。
 #[cfg(feature = "framework-assembly")]

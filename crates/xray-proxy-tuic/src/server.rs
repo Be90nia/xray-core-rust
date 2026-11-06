@@ -592,7 +592,7 @@ async fn udp_assoc_task(
 /// direct 模式（mock server / 直连）：每包直接 `udp.send_to`。
 async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<UdpAssocItem>) {
     let log = &*SERVER_LOG;
-    let udp = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+    let udp = match xray_transport::udp::bind_udp_no_connreset("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
             log.debug(format!("tuic udp assoc {assoc_id} bind: {e:?}"));

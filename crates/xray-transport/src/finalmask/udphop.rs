@@ -264,7 +264,7 @@ async fn bind_unspecified(target: SocketAddr) -> io::Result<UdpSocket> {
     } else {
         SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 0)
     };
-    UdpSocket::bind(bind).await
+    crate::udp::bind_udp_no_connreset(bind).await
 }
 
 /// 单 socket 收包转发任务：所有包推入共享队列（对应 Go recv 协程 + readCh）。

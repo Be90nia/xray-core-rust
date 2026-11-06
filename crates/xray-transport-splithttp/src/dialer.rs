@@ -182,11 +182,20 @@ pub async fn dial_packet_up(
                 match joined {
                     Ok(Ok(())) => {},
                     Ok(Err(e)) => {
-                        crate::hot_log!(DEBUG, "error={e} post_packet failed, terminating upload");
+                        // POST 失败终止上传 = 上行功能失效，一次性留痕（随即
+                        // break 'pump，无刷屏面）；DEBUG 在 warn 门下不可见（u0pe2）。
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "error={e} post_packet failed, terminating upload"
+                        );
                         break 'pump;
                     },
                     Err(e) => {
-                        crate::hot_log!(DEBUG, "error={e} upload post task join failed");
+                        // JoinError = POST 任务 panic，一次性留痕（u0pe2）。
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "error={e} upload post task join failed"
+                        );
                         break 'pump;
                     },
                 }
@@ -203,7 +212,8 @@ pub async fn dial_packet_up(
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    crate::hot_log!(DEBUG, "error={e} upload pipe read failed");
+                    // pipe 读失败 = 上行泵死亡，一次性留痕（随即 break，u0pe2）。
+                    crate::hot_log!(tracing::Level::WARN, "error={e} upload pipe read failed");
                     break;
                 },
             };
@@ -240,10 +250,18 @@ pub async fn dial_packet_up(
             match joined {
                 Ok(Ok(())) => {},
                 Ok(Err(e)) => {
-                    crate::hot_log!(DEBUG, "error={e} post_packet failed while draining upload");
+                    // 收尾期 POST 失败：每连接最多 MAX_INFLIGHT_POSTS 条，非逐包
+                    // 路径；失败即功能失效，WARN 可见（u0pe2）。
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} post_packet failed while draining upload"
+                    );
                 },
                 Err(e) => {
-                    crate::hot_log!(DEBUG, "error={e} upload post task join failed while draining");
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} upload post task join failed while draining"
+                    );
                 },
             }
         }
@@ -551,7 +569,8 @@ where
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    crate::hot_log!(DEBUG, "error={e} upload pipe read failed");
+                    // pipe 读失败 = 上行泵死亡，一次性留痕（随即 break，u0pe2）。
+                    crate::hot_log!(tracing::Level::WARN, "error={e} upload pipe read failed");
                     break;
                 },
             };
@@ -568,7 +587,7 @@ where
                 .await
             {
                 crate::hot_log!(
-                    DEBUG,
+                    tracing::Level::WARN,
                     "error={e} seq={seq} h3 post_packet failed, terminating upload"
                 );
                 break;
@@ -817,7 +836,8 @@ where
     )]
     tokio::spawn(async move {
         if let Err(e) = conn.await {
-            crate::hot_log!(DEBUG, "error={e} h2 connection driver ended");
+            // h2 连接驱动异常退出 = 该连接整体失效，一次性留痕（u0pe2）。
+            crate::hot_log!(tracing::Level::WARN, "error={e} h2 connection driver ended");
         }
     });
 

@@ -472,6 +472,9 @@ pub async fn dial_udp_packet_conn(
     run_dialer_controllers(&socket, &dest)?;
     socket.set_nonblocking(true)?;
     let std_sock: std::net::UdpSocket = socket.into();
+    // Windows：Go DialSystem UDP 分支同样过 netFD.init（关 ICMP-unreachable 上报，
+    // bd d597w）；fail-open 同 [`crate::udp::bind_udp_no_connreset`]。
+    crate::udp::disable_icmp_unreachable_report(&std_sock);
     tokio::net::UdpSocket::from_std(std_sock)
 }
 
