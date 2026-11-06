@@ -926,6 +926,149 @@ mod tests {
         }
     }
 
+    // ========== PM-13 回归：output 锁不跨 flush（take/put-back） ==========
+
+    use std::future::Future;
+
+    /// flush 卡死型 carrier：`write_multi_buffer` 进入即挂起，Notify 放行后才
+    /// Ready。用于证明 close/interrupt 的 flush 发生在 **take 出 writer 之后
+    /// 的无锁窗口内**（旧实现持 output 锁跨 flush，carrier 停滞时锁永占）。
+    struct GatedCarrier {
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    impl xray_buf::io::Writer for GatedCarrier {
+        fn write_multi_buffer<'a>(
+            &'a mut self,
+            _mb: xray_buf::multi::MultiBuffer,
+        ) -> std::pin::Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + 'a>> {
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                gate.notified().await;
+                Ok(())
+            })
+        }
+    }
+
+    /// 装载预填了 1 字节的卡死型 output。merge_bytes 产出池化 DEFAULT_SIZE
+    /// 缓冲（1 ≤ 容量一半 ⇒ 留在 BufferedWriter 内部缓冲，不触 carrier），
+    /// close 的 flush 才会真正走进底层写——空缓冲 flush 立即返回，测不到持锁形态。
+    async fn set_gated_output(session: &Session, gate: Arc<tokio::sync::Notify>) {
+        use xray_buf::io::Writer as _;
+        let mut mb = xray_buf::multi::MultiBuffer::new();
+        mb.merge_bytes(&b"x"[..]);
+        let mut writer = BufferedWriter::new(Box::new(GatedCarrier { gate }));
+        writer.write_multi_buffer(mb).await.expect("预填内部缓冲");
+        session.set_output(writer).await;
+    }
+
+    /// PM-13 回归（`Session::close`）：flush 卡死在 carrier 上时 output 锁必须
+    /// **自由**（take 出所有权无锁 flush）。旧实现锁跨 flush ⇒ 探针的
+    /// `output().await` 永挂 ⇒ 5s 截止红。take/put-back 在位：探针观察到槽位
+    /// 被 take（None）且 close 未完成（carrier 未放行），放行后 close 完成、
+    /// 槽位恢复 Some（与旧实现落盘态一致的并发写语义）。
+    #[allow(clippy::disallowed_methods, reason = "测试：卡死 flush 的 close 任务")]
+    #[tokio::test]
+    async fn session_close_output_lock_free_while_flush_pending() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let session = Arc::new(Session::new(20, TransferType::Stream));
+        set_gated_output(&session, Arc::clone(&gate)).await;
+
+        // done 标志：close 任务真正返回才置位（JoinHandle 不可克隆，探针用标志
+        // 观测「close 未提前完成」，handle 本体留给收尾 await）。
+        let close_done = Arc::new(AtomicBool::new(false));
+        let closer_done = Arc::clone(&close_done);
+        let closer_session = Arc::clone(&session);
+        let closer = tokio::spawn(async move {
+            let closed = closer_session.close().await;
+            closer_done.store(true, Ordering::SeqCst);
+            closed
+        });
+
+        let probe_session = Arc::clone(&session);
+        let probe_done = Arc::clone(&close_done);
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            loop {
+                let guard = probe_session.output().await;
+                if guard.is_none() {
+                    // writer 已被 take、flush 正在 carrier 上 Pending；此刻
+                    // close 绝不能已完成（notify 在 break 之后才发生）。
+                    assert!(
+                        !probe_done.load(Ordering::SeqCst),
+                        "flush 未放行 close 就结束 = take/put-back 语义破坏"
+                    );
+                    break;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(probe.is_ok(), "close 持 output 锁跨 flush（PM-13 回归：take/put-back 被回退）");
+
+        gate.notify_one(); // 放行 flush
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), closer)
+            .await
+            .expect("放行后 close 必须完成")
+            .expect("close 任务不应 panic");
+        assert!(closed, "close 必须以 true 完成");
+        assert!(session.output().await.is_some(), "close 后 output 槽必须恢复 Some（put-back）");
+    }
+
+    /// PM-13 回归（`XUDP::interrupt`）：同款 take/flush/put-back。interrupt 的
+    /// flush 卡死窗口内 output 锁必须自由（持锁 flush 会与该会话写路径互卡在
+    /// carrier 写上）；放行后 interrupt 完成、槽位恢复 Some。
+    #[allow(clippy::disallowed_methods, reason = "测试：卡死 flush 的 interrupt 任务")]
+    #[tokio::test]
+    async fn xudp_interrupt_output_lock_free_while_flush_pending() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let session = Arc::new(Session::new(21, TransferType::Packet));
+        set_gated_output(&session, Arc::clone(&gate)).await;
+
+        // done 标志：interrupt 任务真正返回才置位（JoinHandle 不可克隆，探针用
+        // 标志观测「interrupt 未提前完成」，handle 本体留给收尾 await）。
+        let intr_done = Arc::new(AtomicBool::new(false));
+        let interrupter_done = Arc::clone(&intr_done);
+        let mut xudp = XUDP::new([7u8; 8]);
+        xudp.set_mux(&session);
+        let interrupter = tokio::spawn(async move {
+            xudp.interrupt().await;
+            interrupter_done.store(true, Ordering::SeqCst);
+        });
+
+        let probe_session = Arc::clone(&session);
+        let probe_done = Arc::clone(&intr_done);
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            loop {
+                let guard = probe_session.output().await;
+                if guard.is_none() {
+                    assert!(
+                        !probe_done.load(Ordering::SeqCst),
+                        "flush 未放行 interrupt 就结束 = take/put-back 语义破坏"
+                    );
+                    break;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            probe.is_ok(),
+            "interrupt 持 output 锁跨 flush（PM-13 回归：take/put-back 被回退）"
+        );
+
+        gate.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), interrupter)
+            .await
+            .expect("放行后 interrupt 必须完成")
+            .expect("interrupt 任务不应 panic");
+        assert!(
+            session.output().await.is_some(),
+            "interrupt 后 output 槽必须恢复 Some（put-back）"
+        );
+    }
+
     // ========== SessionManager 测试 ==========
 
     #[tokio::test]

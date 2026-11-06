@@ -297,6 +297,15 @@ async fn recv_loop(
                 // **退出泵**（Go 为 LogErrorInner + return）。旧 `Err(_) => continue`
                 // = 持续 recv 错误零日志紧循环（bd ar3tf / CQ-02 / B-06）。用 WARN
                 // 不用 DEBUG：生产默认 loglevel=warn 下失败必须留痕。
+                // rjaxs-②（`ConnectionReset` 容忍，评估不加）：server.rs（bd quznp）
+                // 的 `ConnectionReset => continue` 是**服务端角色**的有意发散（多
+                // 客户端服务面 + 兜没走 no-connreset 口的 socket，server.rs 头注
+                // 「有意差异」）。客户端对齐 Go：任何 recv 错误即退泵。且 Windows
+                // 假错误已在 socket 层根治（bd d597w ioctl，`tools/check_udp_binds.py`
+                // 静态门守「生产裸 bind 即红」⇒ 隧道 socket 不可能上报
+                // ConnectionReset）；Linux 无连接 UDP 不产 ConnectionReset；
+                // `Interrupted` 由 tokio/mio 吞（同 Go netpoll）⇒ 此处加容忍 =
+                // 永不命中的死代码，且 Go 同点也 `return`（对拍不判 bug）。
                 if closed.load(Ordering::Relaxed) {
                     return;
                 }

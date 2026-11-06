@@ -27,13 +27,19 @@ pub const MIN_HOP_INTERVAL: Duration = Duration::from_secs(5);
 /// 接收 channel 缓冲（对应 Go `packetQueueSize = 1024`）。
 pub const PACKET_QUEUE_SIZE: usize = 1024;
 
-/// 池**空闲**块额度（每连接常驻上界）：128 × [`UDP_BUFFER_SIZE`] = **192 KB/连接**。
+/// 池**空闲**块额度（bd ccy5d 起 = **进程级**常驻上界，全连接共享一份池）：
+/// 128 × [`UDP_BUFFER_SIZE`] = **192 KB/进程**（账本
+/// `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`，交叉断言钉住）。
 ///
 /// 旧值 = `PACKET_QUEUE_SIZE` ⇒ 1500 B × 1024 = 1.5 MB/连接（20 条连接 30 MB，撞
 /// 256 MB 小机场的 96 MB xray 预算，见 `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md`）。
-/// `max` 仍取 `PACKET_QUEUE_SIZE * 2`：它只按值认领宇宙配额、**不预分配**，管的是
+/// 2026-11-06 前本池**每连接一份**（idle 额度即每连接上界 192 KB，N 连接 =
+/// N × 192 KB 乘积面）；bd ccy5d 起改挂框架进程级共享表
+/// [`xray_frame::pool::SharedPoolRegistry`]（同尺寸块全进程唯一一份池，对齐 Go
+/// `sync.Pool` 的包级语义），上界收敛为进程级常量。`max` 仍取
+/// `PACKET_QUEUE_SIZE * 2`：它只按值认领宇宙配额、**不预分配**，管的是
 /// 「在飞 + idle」总量，突发照收（超 max 走降级直构，不进 idle 常驻）。
-const POOL_IDLE_CAP: usize = 128;
+pub const POOL_IDLE_CAP: usize = 128;
 
 /// 池老化窗：idle 块距上次使用超此值即释放。Go 的 `sync.Pool` 靠 GC 回收，Rust 无
 /// GC ⇒ 不修剪就永久常驻（本池的 idle 额度即上界，故必须有显式老化）。
@@ -84,6 +90,13 @@ fn reset_returned_block(buf: &mut Vec<u8>) {
 /// recv_loop 与 read_from 消费端共享：buf 随 [`UdpPacket`] 零拷贝流转，
 /// 消费端拷出数据后归还（对齐 Go `ReadFrom` 的 `pool.Put`）。
 ///
+/// **进程级共享（bd ccy5d）**：生产池走 [`BufPool::new`] ⇒ 框架
+/// [`xray_frame::pool::SharedPoolRegistry`]（1500B class 全进程唯一一份，
+/// N 连接复用——Go `sync.Pool` 本就是包级共享，逐连接池是本仓旧偏差）；
+/// 池常驻上界从 N × 192 KB 乘积面收敛为进程级常量（账本
+/// `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`）。测试面用
+/// [`BufPool::isolated`] 注入独立池隔离读数。
+///
 /// 槽位存储 / 借还记账 / 有界降级 / 分片全部由 udf [`ObjectPool`] 承担（2026-11-03
 /// 迁移，依据见 `reports/audit-2026-11-03/bufpool-migration.md`）：
 /// - 取出走 `acquire_owned`：`'static` 句柄，跨 `recv_from` 的 await 持有成立， 任务被取消时 Drop
@@ -91,27 +104,46 @@ fn reset_returned_block(buf: &mut Vec<u8>) {
 /// - 归还走 `insert`（按值入池）：`Some(buf)` = 池已满，裸块就地释放； `dropped_overflow` +
 ///   审计事件由池留痕（原实现的静默丢弃变成可观测）；
 /// - reset 钩子做**容量归一 + 已写区清零**（红线：池化对象等重，防池毒化；安全：明文不随
-///   块进池）。清零范围与成本见钩子内注。
+///   块进池——进程级共享后清零契约不变，下一个租户（可能是另一条连接）拿到的
+///   仍是零块）。清零范围与成本见钩子内注。
 struct BufPool {
     inner: Arc<ObjectPool<Vec<u8>>>,
 }
 
+/// 共享池构造（单源）：[`BufPool::new`]（经注册表，进程一份）与
+/// [`BufPool::isolated`]（测试，独立实例）同一形状。
+fn build_buf_pool() -> Arc<ObjectPool<Vec<u8>>> {
+    Arc::new(ObjectPool::with_reset(
+        // max = idle 额度 + 在途额度：插入件按值认领宇宙配额，留一倍余量，
+        // 使「容量因拒收」只发生在 idle 面（= 原 `put` 的 `PACKET_QUEUE_SIZE` 门）。
+        PACKET_QUEUE_SIZE * 2,
+        // idle 面按字节预算收窄（192 KB/进程，bd ccy5d 起进程级）：`max` 不预分配，只限总量。
+        POOL_IDLE_CAP,
+        // 工厂 = 原 `get` 的 miss 分支（池空才分配）。
+        || vec![0u8; UDP_BUFFER_SIZE],
+        // 归还即清零已写入区（契约见函数本体）。
+        reset_returned_block,
+        ResetPhase::OnReturn,
+    ))
+}
+
+/// 生产取口：1500B class 的进程级共享池（框架注册表，同尺寸全进程唯一一份）。
+fn shared_buf_pool() -> Arc<ObjectPool<Vec<u8>>> {
+    xray_frame::pool::SharedPoolRegistry::shared().get_or_init(UDP_BUFFER_SIZE, build_buf_pool)
+}
+
 impl BufPool {
+    /// 生产构造：进程级共享池（bd ccy5d）——同尺寸块（1500B）全进程唯一一份，
+    /// 全部连接复用；预算账本 `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`。
     fn new() -> Self {
-        Self {
-            inner: Arc::new(ObjectPool::with_reset(
-                // max = idle 额度 + 在途额度：插入件按值认领宇宙配额，留一倍余量，
-                // 使「容量因拒收」只发生在 idle 面（= 原 `put` 的 `PACKET_QUEUE_SIZE` 门）。
-                PACKET_QUEUE_SIZE * 2,
-                // idle 面按字节预算收窄（192 KB/连接）：`max` 不预分配，只限总量。
-                POOL_IDLE_CAP,
-                // 工厂 = 原 `get` 的 miss 分支（池空才分配）。
-                || vec![0u8; UDP_BUFFER_SIZE],
-                // 归还即清零已写入区（契约见函数本体）。
-                reset_returned_block,
-                ResetPhase::OnReturn,
-            )),
-        }
+        Self { inner: shared_buf_pool() }
+    }
+
+    /// 注入缝：测试面隔离（独立池的 metrics 读数不被共享池上并行测试污染）；
+    /// 生产一律走 [`Self::new`]。形状与 [`build_buf_pool`] 完全一致。
+    #[cfg(test)]
+    fn isolated() -> Self {
+        Self { inner: build_buf_pool() }
     }
 
     /// 取 buf（Go `pool.Get`）：优先复用，池空才按工厂分配。
@@ -184,7 +216,8 @@ pub struct UdpHopPacketConn {
     /// 接收 channel。
     recv_rx: tokio::sync::Mutex<mpsc::Receiver<UdpPacket>>,
     recv_tx: mpsc::Sender<UdpPacket>,
-    /// 池化 buf（recv_loop 与 read_from 共享，对应 Go 包级 sync.Pool）。
+    /// 池化 buf（recv_loop 与 read_from 共享；bd ccy5d 起进程级共享池——
+    /// 对应 Go `udphop` 包级 `sync.Pool`，全连接复用一份）。
     pool: Arc<BufPool>,
     /// hop 任务句柄（Drop/close 时 abort）。
     hop_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -227,6 +260,10 @@ impl UdpHopPacketConn {
     ///
     /// 异步：内部 spawn 两个 tokio 任务（hop_loop + recv_loop on current_conn）。
     ///
+    /// 池面（bd ccy5d）：进程级共享池——1500B class 全进程唯一一份
+    /// （`SharedPoolRegistry`），全部连接复用，N 连接常驻不再随连接数翻倍；
+    /// 测试注入独立池走 `Self::with_pool`（测试面）。
+    ///
     /// # Panics
     /// - `addrs` 为空
     /// - `hop_interval_min < 5s` 或 `hop_interval_max < 5s`
@@ -239,6 +276,52 @@ impl UdpHopPacketConn {
         listen_udp_func: ListenUdpFunc,
         current_conn: Arc<dyn PacketConn>,
         addr_index: usize,
+    ) -> Result<Arc<Self>> {
+        Self::assemble(
+            addrs,
+            hop_interval_min,
+            hop_interval_max,
+            listen_udp_func,
+            current_conn,
+            addr_index,
+            Arc::new(BufPool::new()),
+        )
+        .await
+    }
+
+    /// 注入缝：测试面隔离（指定池的 metrics 读数不被共享池上并行测试污染）；
+    /// 生产一律走 [`Self::new`]（进程级共享池，bd ccy5d）。
+    #[cfg(test)]
+    async fn with_pool(
+        addrs: Vec<SocketAddr>,
+        hop_interval_min: Duration,
+        hop_interval_max: Duration,
+        listen_udp_func: ListenUdpFunc,
+        current_conn: Arc<dyn PacketConn>,
+        addr_index: usize,
+        pool: Arc<BufPool>,
+    ) -> Result<Arc<Self>> {
+        Self::assemble(
+            addrs,
+            hop_interval_min,
+            hop_interval_max,
+            listen_udp_func,
+            current_conn,
+            addr_index,
+            pool,
+        )
+        .await
+    }
+
+    /// 构造本体（`new` / `with_pool` 单源）：校验与任务编排见内。
+    async fn assemble(
+        addrs: Vec<SocketAddr>,
+        hop_interval_min: Duration,
+        hop_interval_max: Duration,
+        listen_udp_func: ListenUdpFunc,
+        current_conn: Arc<dyn PacketConn>,
+        addr_index: usize,
+        pool: Arc<BufPool>,
     ) -> Result<Arc<Self>> {
         if addrs.is_empty() {
             return Err(HysteriaError::InvalidUdpHop("len(addrs) == 0".into()));
@@ -267,7 +350,6 @@ impl UdpHopPacketConn {
         }
 
         let (recv_tx, recv_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
-        let pool = Arc::new(BufPool::new());
 
         let inner = Arc::new(Mutex::new(UdpHopInner {
             addrs,
@@ -316,6 +398,10 @@ impl UdpHopPacketConn {
         // 未安装能力集时兜底 = `SystemClock`，迁移前行为不变）。旧手写 ManagedScope
         // loop 已删（单账本）；ManagedScope 门面（reap/停机报告/三段排空）原样保留，
         // 底层句柄经 `fx_scope()` 喂统一托管口（bd hj3jf 系 ManagedScope 先例延续）。
+        // 目标池 = 进程级共享池（bd ccy5d）：每条活连接各挂一个 pruner 同扫一份池
+        // （prune 幂等，多 pruner 无冲突）；连接全关后 pruner 随 scope 停，残余
+        // idle ≤ POOL_IDLE_CAP × 1500B = 192 KB 进程级常驻（账本口径），下次连接
+        // 直接复用。
         let prune_scope = ManagedScope::new("xray_frame::transport::hysteria::udphop");
         if xray_frame::pool::spawn_idle_pruner(
             prune_scope.fx_scope(),
@@ -707,13 +793,17 @@ mod tests {
     #[tokio::test]
     async fn recv_loop_recycles_bufs_to_pool() {
         let addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
-        let conn = UdpHopPacketConn::new(
+        // 注入独立池（BufPool::isolated，bd ccy5d）：生产路径 new 已是进程级共享池，
+        // 精确 metrics 读数必须隔离，不被共享池上并行测试污染；借还行为本体
+        // （recv_loop ↔ read_from 的 get/detach/put）与生产同一条代码路。
+        let conn = UdpHopPacketConn::with_pool(
             vec![addr],
             MIN_HOP_INTERVAL,
             MIN_HOP_INTERVAL,
             Arc::new(|_| Box::pin(async { unreachable!() })),
             Arc::new(MockRecvConn { payload_len: 16, addr }),
             0,
+            Arc::new(BufPool::isolated()),
         )
         .await
         .expect("new");
@@ -742,9 +832,20 @@ mod tests {
         conn.close().await.ok();
     }
 
+    /// bd ccy5d 契约：进程级共享池 = 同尺寸（1500B）全进程唯一一份——生产取口
+    /// `BufPool::new` 经框架 `SharedPoolRegistry` 取池，两次取同一 `Arc`。
+    /// **反向自检锚点**：`shared_buf_pool` 退回每连接直构（不走注册表），本断言必红。
+    #[test]
+    fn shared_buf_pool_is_process_unique() {
+        assert!(
+            Arc::ptr_eq(&shared_buf_pool(), &shared_buf_pool()),
+            "1500B class 的共享池必须全进程唯一一份（SharedPoolRegistry，bd ccy5d）"
+        );
+    }
+
     #[test]
     fn buf_pool_get_put_reuses() {
-        let pool = BufPool::new();
+        let pool = BufPool::isolated();
         let b = pool.get().detach();
         assert_eq!(b.len(), UDP_BUFFER_SIZE);
         assert_eq!(pool.inner.metrics().constructed, 1, "池空 ⇒ 工厂造一块");
@@ -762,7 +863,7 @@ mod tests {
     /// **反向自检锚点**：把钩子改成 no-op，本断言必红（迁移报告有实测记录）。
     #[test]
     fn buf_pool_reset_normalizes_poisoned_block() {
-        let pool = BufPool::new();
+        let pool = BufPool::isolated();
         pool.put(vec![0xCD; UDP_BUFFER_SIZE * 3]);
         assert_eq!(pool.inner.metrics().core.idle, 1, "归一到定长的块才入池");
         let reused = pool.get();
@@ -780,7 +881,7 @@ mod tests {
     /// **反向自检锚点**：把钩子改回「仅当 `len != 定长` 才归一」，本断言必红。
     #[test]
     fn buf_pool_zeroes_compliant_block_on_return() {
-        let pool = BufPool::new();
+        let pool = BufPool::isolated();
         let mut written = pool.get().detach();
         assert_eq!(written.len(), UDP_BUFFER_SIZE);
         // 模拟一个真实 UDP 包：明文落在 [0..64)。
@@ -799,7 +900,7 @@ mod tests {
     /// 留痕，池不静默吞块（改前的静默丢弃在这里变成可观测）。
     #[test]
     fn buf_pool_insert_overflow_returns_object_and_counts() {
-        let pool = BufPool::new();
+        let pool = BufPool::isolated();
         for _ in 0..POOL_IDLE_CAP {
             pool.put(vec![0u8; UDP_BUFFER_SIZE]);
         }
@@ -842,7 +943,7 @@ mod tests {
     /// **反向自检锚点**：不接老化任务，本断言必红（idle 恒 8）。
     #[test]
     fn prune_idle_releases_aged_blocks() {
-        let pool = BufPool::new();
+        let pool = BufPool::isolated();
         for _ in 0..8 {
             pool.put(vec![0u8; UDP_BUFFER_SIZE]);
         }
@@ -995,7 +1096,7 @@ mod tests {
             closed: false,
         }));
         let (tx, _rx) = mpsc::channel::<UdpPacket>(1);
-        let pool = Arc::new(BufPool::new());
+        let pool = Arc::new(BufPool::isolated());
         let recv_handles = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
         assert!(hop_once(&inner, &tx, &pool, &recv_handles).await);

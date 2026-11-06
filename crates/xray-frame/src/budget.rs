@@ -131,6 +131,26 @@ pub const TLS_SESSION_CACHE_ESTIMATE_BYTES: usize = 128 * 20 * 1024;
 /// （**未落地 ⇒ 仅登记不保证**；落地时必须回填交叉断言）。
 pub const FINALMASK_XMC_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// finalmask xdns 分片重组器（`FragManager`，**每 xdns server 实例一份**，
+/// `ServerState.frag`）**最坏堆占用**（字节，bd wpa3o-b）= 43,155,456 ≈ 41.2MiB。
+///
+/// 账面算式（实现侧 `xray_transport::finalmask::xdns::frag::WORST_CASE_BYTES`
+/// 以同一式从实现常量计算，交叉断言钉住——**改 frag 任一上限即红**）：
+/// - payload：`FRAG_COUNT(4096) × FRAG_SIZE(4096)` = 16,777,216
+/// - 片槽数组：`FRAG_COUNT × 255(u8 片数上限) × 24B(Option<Vec<u8>>)` = 25,063,680 ——slot 结构项与
+///   Go 同界（Go slice header 同 24B/槽），名义 25MB 口径即此；
+/// - entry 结构 + m 表桶 + by_deadline/sizem 索引面：entry 结构按**平台无关上沿 64B**（Windows
+///   `Instant` 16B 携带 QPC 频率 ⇒ 64B；Linux/macOS 56B）， 索引面 ≈0.83MiB ⇒ 取整上沿 1MiB。
+///
+/// **只登记不改 frag 上限**（票面纪律）：41MiB 是服务端 xdns 分片重组**满表瞬态**
+/// （TTL 8s 滑窗、填充度随负载），装配期不可判定 ⇒ **不进预算门固定占用算式**
+/// （同桥在途口径，运维判据）；多 server 实例按份叠加。
+///
+/// **总实算**（bd wpa3o-b 验收：入簿后固定底数 + 本项 ≤ 总额）：
+/// `startup_fixed_floor_bytes_for(8)` 20,316,160 + 43,155,456 = 63,471,616
+/// ≈ 60.5MiB ≤ [`XRAY_BUDGET_BYTES`]（96MiB）✓（断言住 `xray-core::memory_budget`）。
+pub const XDNS_FRAG_WORST_CASE_BYTES: usize = 43_155_456;
+
 /// hyper 每 host **空闲连接数**上界（**已落地**：
 /// `xray_transport_splithttp::client::MAX_IDLE_PER_HOST`，交叉断言钉住）。
 ///
@@ -165,6 +185,20 @@ pub const XRAY_BUF_POOL_TOTAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// `xray_transport_splithttp::pool_stream::POOL_BYTE_BUDGET` = 2MiB，交叉断言钉住；
 /// bd kw2si 起全进程唯一一份，同 chunk 不随连接数翻倍）。
 pub const SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// hysteria udphop 进程级共享块池字节预算（**已落地**（bd ccy5d）：
+/// `xray_transport_hysteria::udphop::POOL_IDLE_CAP`（128 块）× 实现侧
+/// `UDP_BUFFER_SIZE`（1500B）= **192_000B**，交叉断言钉住
+/// （断言面 `xray-core::memory_budget` tests——它同时可见实现 crate）。
+///
+/// 旧口径**每连接一份**池（N 连接 = N × 192KB 乘积面，audit4-memory 未入簿）；
+/// bd ccy5d 起同尺寸块（1500B）全进程唯一一份池（`xray_frame` 的
+/// `SharedPoolRegistry`，尺寸 class 分桶），上界收敛为**进程级常量**。
+/// 账面只含 idle 常驻（≤128 块）+ 池内在飞；块随 `UdpPacket` detach 进
+/// mpsc 队列/桥后脱离池记账，归 [`MAX_PER_CONN_BUFFER_BYTES`] 每连接份额口径
+/// （不与本项重复计账）。连接全关后老化任务随连接 scope 停，残余 idle 块
+/// ≤ 本上界驻留至下次连接复用——仍是进程级常量。
+pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 128 * 1500;
 
 /// h2 每连接发送缓冲（**真缓冲**，连接级；**已落地**：splithttp
 /// `H2_MAX_SEND_BUF_SIZE` / `H2_SERVER_MAX_SEND_BUF_SIZE` = 16MiB，交叉断言钉住）。
@@ -257,6 +291,7 @@ pub fn startup_fixed_floor_bytes_for(cores: usize) -> usize {
     XRAY_BUF_POOL_TOTAL_MAX_BYTES
         + cores * xray_buf::alloc::TLS_BYTE_BUDGET
         + SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES
+        + HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES
         + DNS_CACHE_ESTIMATE_BYTES
         + DNS_PENDING_EST_BYTES
         + TLS_SESSION_CACHE_ESTIMATE_BYTES
@@ -269,9 +304,10 @@ mod tests {
 
     /// 固定占用底数（8 核参考机）随簿搬家后数值不变（断言本体住
     /// `xray-core::memory_budget`——它同时可见实现 crate；此处只钉搬家无漂移）。
+    /// bd ccy5d 起含 hysteria 共享块池 192_000B：20_316_160 + 192_000 = 20_508_160。
     #[test]
     fn floor_moves_without_drift() {
-        assert_eq!(startup_fixed_floor_bytes_for(8), 20_316_160);
+        assert_eq!(startup_fixed_floor_bytes_for(8), 20_508_160);
         assert_eq!(XRAY_BUDGET_BYTES, 96 * 1024 * 1024);
         assert_eq!(DNS_CACHE_MAX_ENTRIES, 16_384);
     }

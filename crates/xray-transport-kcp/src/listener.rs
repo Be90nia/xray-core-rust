@@ -76,6 +76,13 @@ pub struct Listener {
 }
 
 struct ListenerInner {
+    /// rd8yj④ 判不改（与 Go 同形，收紧会偏离 parity 口径）：本表无条目上界，
+    /// 任意「源地址+conv」首包即建表项——Go 26.10.17
+    /// `transport/internet/kcp/listener.go:21` `sessions map[ConnectionID]*Connection`
+    /// 同样无界（`OnReceive` :86-133 首包建表项亦无上界/每源配额）；摘表仅
+    /// `Writer.Close → Remove`（Go :167-170 同源）与 `Close`。Go 的
+    /// `udp.HubCapacity(1024)`（listener.go:60）只是收包队列长度，不构成会话上界。
+    /// 属内存放大增强项而非 parity 缺口；如需收紧须另行出票并接受行为偏离 Go。
     sessions: HashMap<ConnectionId, Arc<Connection>>,
     closed: bool,
 }

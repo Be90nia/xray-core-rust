@@ -30,7 +30,9 @@ mod dns;
 mod doh;
 mod doh3;
 mod domain;
-mod frag;
+/// 分片重组器（对应 Go `xdns/frag.go`）。**pub 是为了登记簿交叉断言**
+/// （bd wpa3o-b，同 `sockopt::QUIC_UDP_MIN_BUFFER` 先例；类型面仍 pub(crate)）。
+pub mod frag;
 mod resp;
 mod server;
 

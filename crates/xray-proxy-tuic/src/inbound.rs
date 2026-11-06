@@ -9,6 +9,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -18,6 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_frame::LogFacade;
+use xray_transport::handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES};
 
 use crate::{
     client::{CongestionControl, apply_congestion_to_transport, apply_default_windows},
@@ -38,6 +40,15 @@ use crate::{
 /// mask_secrets。只在 listen/close/连接错误/datagram·bi 帧解析错误分支发射
 /// （连接级/错误分支，非逐包稳态）。
 static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
+
+/// 认证读窗（rd8yj②）：QUIC 握手完成后，`accept_uni` 等 Authenticate 帧必须
+/// 在此窗内完成；超窗即 `close(1, "auth timeout")` 放弃连接——慢速/不发数据的
+/// 客户端不再能长期占用 per-conn 任务与连接状态（quinn idle 超时缺省 300s 才回收）。
+///
+/// 取 4s = 本仓应用层「首个协议交换窗」家族口径（`xray_transport::tls_handshake_gate::
+/// TLS_HANDSHAKE_TIMEOUT` 4s、ws H14 `HandshakeTimeout` 4s、httpupgrade 合并窗 4s）；
+/// 真实客户端连上即发 Authenticate（loopback 常耗 <100ms），4s 为 >40× 余量。
+const AUTH_WINDOW: Duration = Duration::from_secs(4);
 
 /// TUIC inbound 配置。
 #[derive(Debug, Clone)]
@@ -237,10 +248,19 @@ impl InboundHandler for TuicInboundHandler {
         // fx 本体，future 各捕获独立 clone），规避 E0505。
         let fx = Arc::clone(&self.fx);
         let accept_loop = async move {
+            // rd8yj①：每监听握手并发闸——满即 fail-fast 丢弃该 Incoming（不排队，
+            // HandshakeGate 家族纪律，ws/httpupgrade 同款；预算依据见常量注释）。
+            let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
             loop {
                 let incoming = endpoint_for_accept.accept().await;
                 let Some(incoming) = incoming else {
                     break;
+                };
+                // 许可决策在 spawn 之前同步完成：超额连接不进任务。
+                let Some(permit) = gate.try_admit() else {
+                    gate.record_reject("tuic");
+                    drop(incoming);
+                    continue;
                 };
                 let pwd = password.clone();
                 let t = tag.clone();
@@ -248,9 +268,21 @@ impl InboundHandler for TuicInboundHandler {
                 let fx_task = Arc::clone(&fx);
                 // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
                 xray_frame::compat::spawn_reaping(&fx, &INBOUND_LOG, "tuic conn", async move {
-                    if let Err(e) =
-                        handle_connection(incoming, uuid, &pwd, dispatch, &fx_task).await
+                    // rd8yj①：QUIC 握手应用层窗——quinn idle 超时（缺省 300s）只管
+                    // 空闲期，攻击者持续发包可无限续命，故对 `incoming.await` 显式
+                    // 罩窗；取值与 QUIC transport 同源（Go QUIC 族 8s 口径）。
+                    let conn = match tokio::time::timeout(
+                        xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT,
+                        incoming,
+                    )
+                    .await
                     {
+                        Ok(Ok(c)) => c,
+                        // 握手失败/超窗：Incoming drop 即静默丢弃，许可随 task 结束归还。
+                        Ok(Err(_)) | Err(_) => return,
+                    };
+                    drop(permit); // 握手完成即让位
+                    if let Err(e) = handle_connection(conn, uuid, &pwd, dispatch, &fx_task).await {
                         INBOUND_LOG
                             .debug(format!("tuic inbound connection error tag={t} error={e:?}"));
                     }
@@ -284,21 +316,35 @@ impl InboundHandler for TuicInboundHandler {
 }
 
 async fn handle_connection(
-    incoming: quinn::Incoming,
+    conn: quinn::Connection,
     expected_uuid: Uuid,
     password: &str,
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
     fx: &Arc<FxScope>,
 ) -> Result<()> {
-    let conn = incoming.await?;
     // 生成 expected_token (对齐官方 tuic v5: label=UUID 16字节)
     let mut expected_token = [0u8; TOKEN_LEN];
     conn.export_keying_material(&mut expected_token, expected_uuid.as_bytes(), password.as_bytes())
         .map_err(|_| TuicError::KeyingMaterialExport)?;
 
-    // accept_uni 读 Authenticate（流式分段读——QUIC 流分片安全，票 ieik）
-    let mut uni = conn.accept_uni().await?;
-    let cmd = read_authenticate(&mut uni).await?;
+    // rd8yj②：认证读窗——accept_uni + read_authenticate 全程罩窗（读仍为流式
+    // 分段，票 ieik 不变）。慢速/不发数据的客户端超窗即被 close 放弃，不再占
+    // task + 连接状态等 quinn idle（300s）回收（行为断言见 tests::auth_window_tests）。
+    let cmd = match tokio::time::timeout(AUTH_WINDOW, async {
+        let mut uni = conn.accept_uni().await?;
+        read_authenticate(&mut uni).await
+    })
+    .await
+    {
+        Ok(cmd) => cmd?,
+        Err(_) => {
+            conn.close(1u32.into(), b"auth timeout");
+            return Err(TuicError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "auth window timeout",
+            )));
+        },
+    };
     match cmd {
         Command::Authenticate { uuid_bytes, token } => {
             if uuid_bytes != *expected_uuid.as_bytes() || token != expected_token {
@@ -546,5 +592,79 @@ mod cc_tests {
                 .build_server_config()
                 .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod auth_window_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    /// rd8yj② 行为断言：握手完成但**从不发 Authenticate** 的连接，必须在认证读窗
+    /// 超时后被真实关闭——对端以 `ApplicationClosed("auth timeout")` 可观测，
+    /// per-conn 任务随之结束（不是只打日志）。客户端 idle 超时抬高到 60s ⇒ 唯一
+    /// 关连方 = 服务器认证读窗。窗改大（如 60s）⇒ 本测试 6s 观测截止必红。
+    // 测试耗时断言用 std 即时读数（墙钟差），非生产时钟取用（nn8os 2b 同款豁免）。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_window_closes_connection_that_never_authenticates() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let handler = TuicInboundHandler::new(
+            "auth-window-test",
+            TuicInboundConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                server_name: "localhost".to_string(),
+                uuid: Uuid::new_v4(),
+                password: "auth-window".to_string(),
+                cert_der: None,
+                key_der: None,
+                congestion_control: None,
+                brutal_up_bps: 0,
+                sockopt: Default::default(),
+            },
+        )
+        .unwrap();
+        handler.start().await.expect("start");
+        let addr = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), handler.port());
+        let cert_der = handler.cert_der().expect("cert after start");
+
+        // 真实 quinn 客户端：信任自签证书、ALPN=tuic，握手完成后静默。
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.into()).expect("add cert");
+        let mut client_tls =
+            rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"tuic".to_vec()];
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(60_000))));
+        client_cfg.transport_config(Arc::new(transport));
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(client_cfg);
+
+        let started = Instant::now();
+        let conn = ep.connect(addr, "localhost").unwrap().await.expect("handshake");
+
+        // 服务器认证读窗超时 ⇒ close(1, "auth timeout") 必须以 ApplicationClosed
+        // 形态抵达客户端；观测截止固定 6s（窗 4s + 2s 余量）。
+        let err = tokio::time::timeout(Duration::from_secs(6), conn.closed())
+            .await
+            .expect("auth window must fire within 6s");
+        let elapsed = started.elapsed();
+        match err {
+            quinn::ConnectionError::ApplicationClosed(closed) => {
+                assert_eq!(closed.reason.as_ref(), b"auth timeout", "关闭原因必须是认证读窗超时");
+            },
+            other => panic!("期望 ApplicationClosed(\"auth timeout\")，实际 {other:?}"),
+        }
+        assert!(
+            elapsed >= AUTH_WINDOW - Duration::from_millis(300),
+            "连接在认证读窗之前就被关（{elapsed:?}）——窗失效"
+        );
+
+        handler.close().await.ok();
+        ep.close(0u32.into(), b"test done");
     }
 }

@@ -27,6 +27,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use bytes::BytesMut;
@@ -35,9 +36,20 @@ use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
     dialer::StreamSettings,
+    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
     listener_registry::{ConnHandler, TransportListener},
     sockopt::SocketOptions,
 };
+
+/// QUIC 应用层握手窗（rd8yj①）：`incoming.await`（quinn 握手）超过此窗未完成即
+/// 放弃该连接。quinn 侧无独立握手超时——`max_idle_timeout`（本 crate 缺省 300s，
+/// 见 config.rs）只对空闲期生效，攻击者持续发包即可无限续命，必须在应用层补闸。
+///
+/// 取 8s = Go 侧唯一显式 QUIC 握手窗（26.10.17 `app/dns/nameserver_quic.go:27`
+/// `const handshakeTimeout = time.Second * 8`，喂 quic-go `HandshakeIdleTimeout`）；
+/// TCP-TLS 族的 4s（`tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT`）刻意不沿用：
+/// QUIC Initial 走 UDP 往返且需 PTO 重传容忍，Go QUIC 族实取 8s。
+pub const QUIC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 主动拨号 QUIC 连接。对应 Go `quic::Dial`。
 ///
@@ -128,6 +140,25 @@ pub async fn listen(
     sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
+    let endpoint = make_server_endpoint(addr, settings, sockopt)?;
+    let local = endpoint.local_addr()?;
+
+    // endpoint clone 给 listener 句柄；本体 move 进 accept task。
+    let listener_endpoint = endpoint.clone();
+    // rd8yj①：每监听握手并发闸 + 应用层握手窗（见 [`spawn_quic_accept`]）。
+    // 闸容量 = MAX_INFLIGHT_HANDSHAKES，预算依据见其常量注释（handshake_gate 家族口径）。
+    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    spawn_quic_accept(endpoint, gate, handler);
+
+    Ok(Box::new(QuicListener { local, endpoint: listener_endpoint }))
+}
+
+/// 构建监听 endpoint（TLS + quicSettings transport config；`listen` 与测试共用）。
+fn make_server_endpoint(
+    addr: SocketAddr,
+    settings: &StreamSettings,
+    sockopt: &SocketOptions,
+) -> io::Result<quinn::Endpoint> {
     let tls_cfg = xray_tls::server_config::build_server_config(
         &settings.security,
         settings.security_json.as_ref(),
@@ -146,13 +177,18 @@ pub async fn listen(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config.transport_config(Arc::new(qc.build_transport_config()));
     // 同 dial：GSO 默认开，disableGSO=true 走 NoGsoSocket 单段路径。
-    let endpoint =
-        crate::udp_gso::make_endpoint(Some(server_config), addr, qc.disable_gso, sockopt)
-            .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
-    let local = endpoint.local_addr()?;
+    crate::udp_gso::make_endpoint(Some(server_config), addr, qc.disable_gso, sockopt)
+        .map_err(|e| io::Error::other(format!("quinn bind: {e}")))
+}
 
-    // endpoint clone 给 listener 句柄；本体 move 进 accept task。
-    let listener_endpoint = endpoint.clone();
+/// accept 泵 + 每连接握手闸（rd8yj①）。
+///
+/// - **并发闸**：满即 fail-fast 丢弃该 Incoming（**不排队**——排队 = 内存与请求数
+///   同涨，`handshake_gate` 家族纪律）；许可决策在 accept 循环同步完成，超额连接 不 spawn
+///   任务。QUIC 侧静默丢弃 = 对端收不到回应。
+/// - **握手窗**：per-conn 以 [`QUIC_HANDSHAKE_TIMEOUT`] 罩 `incoming.await`， 超时放弃——「发
+///   Initial 不完成握手」的连接最多占在途名额一个窗的时间。
+fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handler: ConnHandler) {
     #[allow(
         clippy::disallowed_methods,
         reason = "数据面连接任务（QUIC accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
@@ -163,16 +199,29 @@ pub async fn listen(
                 Some(c) => c,
                 None => break, // endpoint closed
             };
+            let Some(permit) = gate.try_admit() else {
+                gate.record_reject("quic");
+                drop(incoming);
+                continue;
+            };
+            let g = Arc::clone(&gate);
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每连接 stream 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "数据面连接任务（每连接握手+stream 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
             )]
             tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
+                let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(_)) => return, // 握手协议层失败（对端放弃/参数错）
+                    Err(_) => {
+                        // rd8yj①：握手窗超时——Incoming 被 drop 即静默丢弃，
+                        // 许可随 task 结束归还（行为断言见 tests）。
+                        g.record_failure("quic", &"handshake window timeout");
+                        return;
+                    },
                 };
+                drop(permit); // 握手完成即让位；已建连接的活性归 idle 超时管
                 let local = conn.local_ip().map(|ip| SocketAddr::new(ip, 0));
                 let remote = conn.remote_address();
                 // 每个 QUIC 连接上接受任意数量的 bi-stream，每个 stream 都作为独立 Connection
@@ -184,8 +233,6 @@ pub async fn listen(
             });
         }
     });
-
-    Ok(Box::new(QuicListener { local, endpoint: listener_endpoint }))
 }
 
 /// quinn (SendStream, RecvStream) + tokio DuplexStream 桥接的 Connection。
@@ -466,5 +513,161 @@ mod tests {
     #[tokio::test]
     async fn echo_roundtrip_gso_default() {
         echo_roundtrip_with(false).await;
+    }
+
+    // ---- rd8yj①：握手并发闸 + 应用层握手窗 ----
+
+    /// 永挂式证书验证器：进入 `verify_server_cert` 即挂起——模拟「Initial 合法发出
+    /// （服务器接纳并回飞行包）、Finished 永不到达」的慢速/恶意客户端。真实 quinn
+    /// 客户端路径，握手永远无法完成 ⇒ 服务器端唯一退路 = 应用层握手窗超时。
+    ///
+    /// trait 要 `Debug + Send + Sync`：entered 走 tokio oneshot，hold 用
+    /// AtomicBool + sleep 自旋（礼貌驻留，测试收尾置位即退）。
+    #[derive(Debug)]
+    struct ParkedVerifier {
+        entered: parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for ParkedVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if let Some(entered) = self.entered.lock().take() {
+                let _ = entered.send(());
+            }
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(rustls::Error::General("parked verifier released".into()))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            ]
+        }
+    }
+
+    /// 测试收尾守卫：无论断言过红，Drop 都解除验证器自旋——否则 panic 路径下
+    /// quinn 驱动线程永远卡在自旋里，测试进程 runtime drop 卡死。
+    struct ReleaseGuard(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 行为断言（rd8yj①）：握手在途名额必须在握手窗超时后**真实释放**——
+    /// 许可被占满整窗、窗后回到可再取（不是只看日志）。
+    ///
+    /// 客户端走真实 quinn 路径 + 永挂验证器 ⇒ 服务器接纳后握手永远无法完成，
+    /// 名额唯一的让出途径就是 [`QUIC_HANDSHAKE_TIMEOUT`] 超时放弃该连接。
+    /// 把窗改大（如 60s）/删掉超时 ⇒ 释放探针在 20s 截止后必红。
+    ///
+    /// 结构纪律：**先清理、后断言**——panic 只允许发生在解除验证器自旋并关闭
+    /// endpoint 之后（否则 panic 路径下阻塞式 poll 卡死 worker，进程挂死）。
+    // worker 4 起：永挂验证器自旋会占死一个 worker（阻塞式 poll 内 spin），
+    // 剩余 worker 供服务端驱动/accept 泵/echo 客户端并行使用。
+    // 测试耗时断言用 std 即时读数（墙钟差），非生产时钟取用（nn8os 2b 同款豁免）。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handshake_gate_releases_quota_after_window_timeout() {
+        ensure_provider();
+        let endpoint = make_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &tls_server_settings(),
+            &Default::default(),
+        )
+        .expect("make server endpoint");
+        let addr = endpoint.local_addr().unwrap();
+        let keepalive = endpoint.clone(); // endpoint 本体 move 进 accept 泵，clone 保活
+        let gate = HandshakeGate::new(1); // 容量 1：单名额可观测占用/释放
+        spawn_quic_accept(endpoint, Arc::clone(&gate), echo_handler());
+
+        // 永挂验证器 + 完成信号（entered ⇒ 服务器已接纳该连接并回过飞行包）。
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _release_guard = ReleaseGuard(Arc::clone(&release)); // panic 安全收尾
+        let mut client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ParkedVerifier {
+                entered: parking_lot::Mutex::new(Some(entered_tx)),
+                release: Arc::clone(&release),
+            }))
+            .with_no_client_auth();
+        // 服务端缺省 ALPN = ["h2","http/1.1"]（server_config parse_alpn 缺省）；
+        // 不设 ALPN 会在证书验证之前就被 ALPN 协商拒掉，验证器永远到不了。
+        client_tls.alpn_protocols = vec![b"h2".to_vec()];
+        let quinn_client = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        ));
+        // 客户端 transport 用缺省（idle 30s > 窗 8s），排除 idle 抢先关连的假阳性。
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn_client);
+        // 不 await Connecting：Initial 由 endpoint 驱动发出，握手卡死在验证器。
+        let _connecting = ep.connect(addr, "localhost").unwrap();
+
+        // 客户端收到服务器飞行包（= 验证器被唤起）⇒ 服务器侧接纳已发生、名额已被占。
+        tokio::time::timeout(Duration::from_secs(15), entered_rx)
+            .await
+            .expect("verifier must be reached within 15s (stall not established)")
+            .expect("entered channel");
+        let admitted_at = std::time::Instant::now();
+
+        // 释放观测窗口与生产窗解耦（固定 20s）：窗改大/删掉 ⇒ released_at = None。
+        let mut released_at = None;
+        while admitted_at.elapsed() < Duration::from_secs(20) {
+            if gate.try_admit().is_some() {
+                released_at = Some(std::time::Instant::now());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // ---- 清理先行（此时不得有任何 panic）：解除自旋 + 关两端 endpoint ----
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(_connecting);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ep.close(0u32.into(), b"test done");
+        keepalive.close(0u32.into(), b"test done");
+
+        // ---- 断言（全部在清理之后，panic 不再阻塞 runtime 收尾）----
+        // 名额释放后的可复用性由既有 echo_roundtrip_* 测试（经 listen() 同一闸接线）
+        // 覆盖；本测试只钉「释放确实发生 + 占满整窗」两个行为断言。
+        let released_at = released_at
+            .expect("握手窗超时后名额必须被释放（连接放弃、许可归还）——闸失效或窗被改大/删掉");
+        let held_for = released_at.duration_since(admitted_at);
+        assert!(
+            held_for >= QUIC_HANDSHAKE_TIMEOUT - Duration::from_secs(1),
+            "名额仅被占 {held_for:?}（窗 = {QUIC_HANDSHAKE_TIMEOUT:?}）——提前让位 = 闸未按窗工作"
+        );
     }
 }

@@ -94,7 +94,9 @@ pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{HotBuf, HotLog, LogFacade, init_from_env};
 pub use observe::{ObserveFields, ObserveSink, Stage, emit};
 pub use plugin::{ClauseId, Lifecycle, Plugin, PluginContract, PluginDep};
-pub use pool::{BufferPool, ManagedBufferPool, PoolError, PooledBuffer, XrayBufPool};
+pub use pool::{
+    BufferPool, ManagedBufferPool, PoolError, PooledBuffer, SharedPoolRegistry, XrayBufPool,
+};
 pub use redline::{RedlineSite, SITES};
 pub use registry::PluginRegistry;
 // reload::Stage 不挂根（与 observe::Stage 撞名），走 xray_frame::reload::Stage。

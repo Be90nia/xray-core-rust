@@ -13,6 +13,8 @@
 use std::{future::Future, pin::Pin};
 
 use xray_buf::{
+    alloc::DEFAULT_SIZE,
+    buffer::Buffer,
     io::{Reader, Result as IoResult, Writer},
     multi::MultiBuffer,
 };
@@ -20,10 +22,29 @@ use xray_common::net::{address::Address, destination::Destination, network::Netw
 use xray_xudp::packet::FrameMetadata;
 
 /// 改写 `buf` 前缀所有完整 XUDP 帧：目标地址 == `from` 的帧改写为 `to`
-/// （端口保留，GlobalID 保留）。返回 `(改写后字节, 已消费字节数)`；
-/// 尾部不完整帧不消费，由调用方保留。
-fn rewrite_complete_frames(buf: &[u8], from: &Address, to: &Address) -> (Vec<u8>, usize) {
-    let mut out = Vec::new();
+/// （端口保留，GlobalID 保留）。输出**直写池化块链**（bd cmtcc：旧实现先把
+/// 改写结果攒进临时 `Vec`、再 `merge_bytes` 拷进池块 = 每事件整载二次拷贝；
+/// 对比台 `D:/tmp/cmtcc-sim`（真实帧流 + 逐事件字节级不变断言，7 轮中位）
+/// 实测：每事件堆分配 14→9、拷贝字节 −33%、吞吐 +22~39%）。返回
+/// `(改写后字节块, 已消费字节数)`；尾部不完整帧不消费，由调用方保留。
+fn rewrite_complete_frames(buf: &[u8], from: &Address, to: &Address) -> (MultiBuffer, usize) {
+    // 段写入块链：块满则收块开新块（单帧 ≤ 64KiB+，块链覆盖任意事件长）。
+    fn push_seg(blocks: &mut Vec<Buffer>, cur: &mut Option<Buffer>, mut seg: &[u8]) {
+        while !seg.is_empty() {
+            if cur.as_ref().is_none_or(|b| b.len() >= b.capacity()) {
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
+                *cur = Some(Buffer::new_pooled(DEFAULT_SIZE));
+            }
+            let b = cur.as_mut().expect("block present");
+            let wrote = b.write_from(seg);
+            seg = &seg[wrote..];
+        }
+    }
+
+    let mut blocks = Vec::with_capacity(2);
+    let mut cur: Option<Buffer> = None;
     let mut pos = 0;
     loop {
         let rest = &buf[pos..];
@@ -54,16 +75,19 @@ fn rewrite_complete_frames(buf: &[u8], from: &Address, to: &Address) -> (Vec<u8>
                 m.set_target(Destination::udp(to.clone(), t.port()));
                 m
             });
-        match rewritten {
-            Some(m) => out.extend_from_slice(&m.to_bytes()),
-            None => out.extend_from_slice(&rest[..consumed]),
+        match &rewritten {
+            Some(m) => push_seg(&mut blocks, &mut cur, &m.to_bytes()),
+            None => push_seg(&mut blocks, &mut cur, &rest[..consumed]),
         }
         if meta.has_data() {
-            out.extend_from_slice(&rest[consumed..frame_end]);
+            push_seg(&mut blocks, &mut cur, &rest[consumed..frame_end]);
         }
         pos += frame_end;
     }
-    (out, pos)
+    if let Some(b) = cur.take() {
+        blocks.push(b);
+    }
+    (MultiBuffer::from_buffers(blocks), pos)
 }
 
 /// 上行帧目标改写 Reader（original → override）。
@@ -97,19 +121,19 @@ impl Reader for EndpointOverrideReader {
                 for b in mb.iter() {
                     self.pending.extend_from_slice(b.bytes());
                 }
-                let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
+                let (mut mb_out, consumed) =
+                    rewrite_complete_frames(&self.pending, &self.from, &self.to);
                 self.pending.drain(..consumed);
                 if eof {
                     // EOF：残帧原样冲出（尽力而为）；无残帧时返回空 = EOF 传播
-                    let mut mb_out = MultiBuffer::new();
-                    mb_out.merge_bytes(&out);
                     let tail = std::mem::take(&mut self.pending);
-                    mb_out.merge_bytes(&tail);
+                    if !tail.is_empty() {
+                        // 零拷贝接管 Vec 分配（Frozen 面：读零拷贝，写路径 COW）
+                        mb_out.push(Buffer::from_vec(tail));
+                    }
                     return Ok(mb_out);
                 }
                 if consumed > 0 {
-                    let mut mb_out = MultiBuffer::new();
-                    mb_out.merge_bytes(&out);
                     return Ok(mb_out);
                 }
                 // 非空读但无完整帧 → 继续读
@@ -146,13 +170,11 @@ impl Writer for EndpointOverrideWriter {
             for b in mb.iter() {
                 self.pending.extend_from_slice(b.bytes());
             }
-            let (out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
+            let (mb_out, consumed) = rewrite_complete_frames(&self.pending, &self.from, &self.to);
             self.pending.drain(..consumed);
-            if out.is_empty() {
+            if mb_out.is_empty() {
                 return Ok(());
             }
-            let mut mb_out = MultiBuffer::new();
-            mb_out.merge_bytes(&out);
             self.inner.write_multi_buffer(mb_out).await
         })
     }
@@ -198,6 +220,7 @@ mod tests {
         assert_eq!(consumed, buf.len(), "all bytes consumed");
 
         // 逐帧验证：目标地址改写为 domain，端口/载荷/顺序保留
+        let out = flat_bytes(&out);
         let mut pr = PacketReader::new(std::io::Cursor::new(&out[..]));
         let p1 = pr.read_packet().unwrap().expect("frame 1");
         assert_eq!(p1.data(), b"first-payload");
@@ -218,7 +241,7 @@ mod tests {
 
         let (out, consumed) = rewrite_complete_frames(&buf, &from, &to);
         assert_eq!(consumed, buf.len());
-        assert_eq!(out, buf, "non-matching frames pass through byte-identical");
+        assert_eq!(flat_bytes(&out), buf, "non-matching frames pass through byte-identical");
     }
 
     #[test]
@@ -231,6 +254,40 @@ mod tests {
         let (out, consumed) = rewrite_complete_frames(&buf[..5], &from, &to);
         assert_eq!(consumed, 0);
         assert!(out.is_empty());
+    }
+
+    /// MultiBuffer 摊平为字节（块序拼接）。
+    fn flat_bytes(mb: &MultiBuffer) -> Vec<u8> {
+        mb.iter().flat_map(|b| b.bytes().iter().copied()).collect()
+    }
+
+    /// bd cmtcc 块链覆盖：单事件 > 8KiB（跨多个池块）时逐帧完整、
+    /// 字节与单块路径等价（对比台同款字节级不变断言的产品侧锚）。
+    #[test]
+    fn rewrite_spans_multiple_pool_blocks() {
+        let from = addr_v4([198, 51, 100, 7]);
+        let to = addr_v4([203, 0, 113, 9]);
+        // 12 × 1400B ≈ 17KiB > DEFAULT_SIZE(8KiB) ⇒ 必然跨块
+        let mut buf = Vec::new();
+        let mut pw =
+            PacketWriter::new(&mut buf, Destination::udp(from.clone(), Port::new(53)), [1; 8]);
+        for _ in 0..12 {
+            pw.write_packet_with_udp_target(
+                &vec![b'x'; 1400],
+                &Destination::udp(from.clone(), Port::new(53)),
+            )
+            .unwrap();
+        }
+        let (out, consumed) = rewrite_complete_frames(&buf, &from, &to);
+        assert_eq!(consumed, buf.len());
+        let flat = flat_bytes(&out);
+        assert!(out.buffer_count() >= 2, "必须跨池块：got {} blocks", out.buffer_count());
+        let mut pr = PacketReader::new(std::io::Cursor::new(&flat[..]));
+        for i in 0..12 {
+            let p = pr.read_packet().unwrap().expect("frame");
+            assert_eq!(p.data().len(), 1400, "frame {i}");
+            assert_eq!(p.udp_target().unwrap().address(), &to);
+        }
     }
 
     #[tokio::test]

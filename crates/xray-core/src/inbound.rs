@@ -2771,6 +2771,11 @@ impl xray_proxy_hysteria::TcpDispatcher for HysteriaTcpDispatch {
 /// 同时监听 UDP 和 TCP：
 /// - UDP：recv_from → handle_packet → send_to 响应
 /// - TCP：accept → handle_conn（2B 长度前缀帧循环）
+///
+/// rd8yj③ 已核：TCP 帧读并非无窗——连接级 inactivity 窗在
+/// `xray-proxy-dns` 的 `DnsInbound::handle_conn`（ActivityTimer = policy
+/// ConnectionIdle，读帧即重置窗口；同 Go proxy/dns/dns.go:226
+/// CancelAfterInactivity 形态，Go 26.10.17 inbound 协议表无 dns、无对位面）。
 pub async fn serve_dns(
     udp: UdpSocket,
     tcp: InboundTcpListener,

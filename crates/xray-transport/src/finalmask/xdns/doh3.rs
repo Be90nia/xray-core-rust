@@ -246,6 +246,15 @@ pub(super) struct Doh3Endpoint {
     quic: QuicOptions,
     /// 复用会话槽（Go `http3.Transport` 连接池对位，bd 5lpw3）：worker 完成一次交换后
     /// 放回，下一个 worker 直接复用；`None` = 下次拨新。锁内只取/放（不跨 await）。
+    /// rjaxs-①（单槽非池，评估不改）：Go 对并发请求复用**同一条** origin 连接
+    /// （h3 流多路复用）；本槽 worker 独占会话整个交换期 ⇒ 并发 post 各自拨新
+    /// 连接，`put_session` 后写覆盖先写（旧会话 RAII CONNECTION_CLOSE）
+    /// ——突发 N 并发最坏 N 次握手、复用退化到零，churn 有界（≤ worker 数，
+    /// Go 缺省 32；`QUEUE_CAP=1` 只界排队**不界在飞**）。不改依据：h3 仅
+    /// ALPN==["h3"] 的 opt-in 形态、生产无用量数据；顶替频率不可观测（无计数
+    /// 器，单独加表无消费方）；若重访，正解是 Arc 共享会话（对位 Go 单连接
+    /// 多路复用；代价 = 一处失败殃及在飞全体）而非 N 槽小池（悬崖只挪到 N+1
+    /// 并发）。触发条件：生产启用 h3 且实测突发 DNS 尾延迟劣化。
     session: Mutex<Option<Doh3Session>>,
     /// 单请求超时（生产 = [`REQUEST_TIMEOUT`]；测试注入短超时验证 0x4tl 关闭语义）。
     timeout: Duration,

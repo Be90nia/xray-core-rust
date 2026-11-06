@@ -19,12 +19,19 @@ xray-proxy-dns crate 内薄转调）。本门把守：**生产代码出现裸 `U
   行号与列位置保持不变。
 - 剥离 `#[cfg(test)] mod X { ... }` 整块；`#[cfg(test)] mod X;` 挂载的
   X.rs / X/mod.rs 视为测试文件（不扫）。
-- 白名单（bind 机制本体，禁在此之外新增）：
-    crates/xray-transport/src/udp/mod.rs      —— helper 正本
+- 两条规则（jcnjb④ 起扩面）：
+    1. `UdpSocket::bind`（tokio/std 同名构造）——生产代码零命中。
+    2. `Type::DGRAM`（socket2 UDP 组装形态：`Socket::new(.., Type::DGRAM, ..)`）——
+       该路径绕开第一规则的构造点，必须有 ioctl 转调/机制本体白名单背书。
+- 白名单（bind/组装机制本体，禁在此之外新增）：
+    crates/xray-transport/src/udp/mod.rs      —— bind helper 正本
     crates/xray-proxy-dns/src/udp_connreset.rs —— proxy-dns 薄转调本体
-- 已知盲区（登记，不静默）：socket2 `Socket::bind` 路径（QUIC endpoint /
-  system dialer / TPROXY Linux 分支）不匹配文本门；QUIC endpoint 与 system
-  dialer 已手工接 ioctl（见 bd 票报告），TPROXY 分支 Linux-only 不适用。
+    crates/xray-transport/src/sockopt/mod.rs   —— bind_udp_endpoint 正本（QUIC endpoint 组装）
+    crates/xray-transport/src/system_dialer.rs —— system dialer UDP 组装本体（手工接 dialer controllers）
+    crates/xray-transport/src/udp/hub.rs       —— TPROXY Linux 分支本体（Linux-only，Windows ioctl 不适用）
+- 残余盲区（登记，不静默）：自 raw fd 组装（`from_raw_socket`/libc socket()）
+  词法不可判，靠评审兜底；QUIC endpoint 与 system dialer 已手工接 ioctl 且有
+  探针（见 bd 票报告）。
 """
 
 from __future__ import annotations
@@ -36,10 +43,26 @@ import tempfile
 from pathlib import Path
 
 PATTERN = re.compile(r"UdpSocket::bind")
+# jcnjb④：socket2 UDP 组装形态（Socket::new(.., Type::DGRAM, ..)）。组装点不经过
+# `UdpSocket::bind` 文本构造，第一规则对其失明——以 Type::DGRAM 为组装标记。
+SOCKET2_DGRAM_PATTERN = re.compile(r"Type::DGRAM")
+
+# (pattern, rule id, 违规指引)：rule id 进 hit 记录，cmd_gate 按它出指引。
+RULES = [
+    (PATTERN, "bind", "改走 xray_transport::udp::bind_udp_no_connreset 族"),
+    (
+        SOCKET2_DGRAM_PATTERN,
+        "socket2-dgram",
+        "socket2 DGRAM 组装必须落 bind_udp_endpoint / bind_udp_no_connreset 族（或机制本体白名单）",
+    ),
+]
 
 WHITELIST: dict[str, str] = {
     "crates/xray-transport/src/udp/mod.rs": "bind 机制本体（helper 正本，d597w）",
     "crates/xray-proxy-dns/src/udp_connreset.rs": "proxy-dns 薄转调本体（依赖图不含 xray-transport，d597w）",
+    "crates/xray-transport/src/sockopt/mod.rs": "bind_udp_endpoint 正本（QUIC endpoint 组装，jcnjb④）",
+    "crates/xray-transport/src/system_dialer.rs": "system dialer UDP 组装本体（dialer controllers 接 ioctl，jcnjb④）",
+    "crates/xray-transport/src/udp/hub.rs": "TPROXY Linux 分支本体（Linux-only，Windows ioctl 不适用，jcnjb④）",
 }
 
 ATTR_OPEN = re.compile(r"\s*#\s*\[")
@@ -273,21 +296,23 @@ def scan(root: Path, whitelist: dict[str, str] | None = None) -> list[dict]:
         for name in mods:
             mounted.add((rs.parent / f"{name}.rs").relative_to(root).as_posix())
             mounted.add((rs.parent / name / "mod.rs").relative_to(root).as_posix())
-    # Pass 2：命中扫描。
+    # Pass 2：命中扫描（双规则）。
     hits: list[dict] = []
     for rs, src in raw.items():
         rel = rs.relative_to(root).as_posix()
         if rel in mounted:
             continue  # #[cfg(test)] mod X; 挂载的测试支撑文件 = 测试面
         cleaned, _ = strip_cfg_test_blocks(strip_comments_and_strings(src))
-        for m in PATTERN.finditer(cleaned):
-            kind = "HELPER-WHITELIST" if rel in whitelist else "PRODUCTION"
-            hits.append({
-                "file": rel,
-                "line": line_of(cleaned, m.start()),
-                "kind": kind,
-                "reason": whitelist.get(rel, ""),
-            })
+        for pattern, rule, _hint in RULES:
+            for m in pattern.finditer(cleaned):
+                kind = "HELPER-WHITELIST" if rel in whitelist else "PRODUCTION"
+                hits.append({
+                    "file": rel,
+                    "line": line_of(cleaned, m.start()),
+                    "kind": kind,
+                    "rule": rule,
+                    "reason": whitelist.get(rel, ""),
+                })
     return hits
 
 
@@ -318,12 +343,16 @@ def cmd_list(root: Path) -> int:
 def cmd_gate(root: Path) -> int:
     hits = [h for h in scan(root) if h["kind"] == "PRODUCTION"]
     if hits:
-        print(f"FAIL: 生产代码裸 `UdpSocket::bind` {len(hits)} 处（bd d597w 门）：")
+        print(f"FAIL: 生产代码裸 UDP bind / socket2 DGRAM 组装 {len(hits)} 处（bd d597w 门 + jcnjb④ 扩面）：")
         for h in hits:
             print(f"  {h['file']}:{h['line']}")
-            print(f"    → 改走 xray_transport::udp::bind_udp_no_connreset 族")
+            rule = h.get("rule", "bind")
+            for pattern, rid, hint in RULES:
+                if rid == rule:
+                    print(f"    → {hint}")
+                    break
         return 1
-    print("OK: 生产代码零裸 UdpSocket::bind（白名单=bind 机制本体 2 文件）")
+    print("OK: 生产代码零裸 UdpSocket::bind / socket2 Type::DGRAM（白名单=机制本体 5 文件）")
     return 0
 
 
@@ -354,11 +383,30 @@ def cmd_self_test() -> int:
                 "fn h() { let _ = UdpSocket::bind(\"127.0.0.1:0\"); }\n"
             ),
             "helper.rs": 'pub async fn bind_udp_no_connreset() { let s = UdpSocket::bind("x").await; }\n',
+            # jcnjb④：socket2 DGRAM 组装形态——绕过 `UdpSocket::bind` 构造点的
+            # 组装路径必须在白名单外被报出（扩面回归锚）。
+            "socket2_prod.rs": (
+                "fn assemble(addr: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {\n"
+                "    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM,\n"
+                "        Some(socket2::Protocol::UDP))?;\n"
+                "    sock.bind(&addr.into())?;\n"
+                "    Ok(sock.into())\n"
+                "}\n"
+            ),
+            "helper_socket2.rs": (
+                "fn ep_socket(addr: std::net::SocketAddr) -> socket2::Socket {\n"
+                "    let s = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM,\n"
+                "        Some(socket2::Protocol::UDP)).unwrap();\n"
+                "    s.bind(&addr.into()).unwrap();\n"
+                "    s\n"
+                "}\n"
+            ),
         }
         for name, content in files.items():
             (crate / "src" / name).write_text(content, encoding="utf-8")
         wl = {
             "crates/fx/src/helper.rs": "self-test whitelist",
+            "crates/fx/src/helper_socket2.rs": "self-test whitelist (socket2 组装本体)",
         }
         hits = scan(troot, whitelist=wl)
         by_file = {}
@@ -375,10 +423,12 @@ def cmd_self_test() -> int:
             return True
 
         ok &= expect("crates/fx/src/prod.rs", True, "故意违规必须报")
+        ok &= expect("crates/fx/src/socket2_prod.rs", True, "socket2 DGRAM 组装违规必须报（jcnjb④）")
         ok &= expect("crates/fx/src/in_test.rs", False, "cfg(test) 块内必须放行")
         ok &= expect("crates/fx/src/in_doc.rs", False, "注释内必须放行")
         ok &= expect("crates/fx/src/in_string.rs", False, "字符串内必须放行")
         ok &= expect("crates/fx/src/helper.rs", False, "白名单必须放行")
+        ok &= expect("crates/fx/src/helper_socket2.rs", False, "socket2 白名单必须放行（jcnjb④）")
     print("SELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 2
 

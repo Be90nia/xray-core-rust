@@ -20,10 +20,9 @@
 //! 这一网络方向，`bytes` 属方向件非 udf 依赖纪律，不上浮。
 
 use std::{
-    collections::HashMap,
     io,
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -115,42 +114,39 @@ pub(crate) struct PoolStream<R> {
     pool: Arc<ObjectPool<Vec<u8>>>,
 }
 
-/// 进程级共享池表类型（clippy `type_complexity` 收敛别名）。
-type SharedPools = LazyLock<Mutex<HashMap<usize, Arc<ObjectPool<Vec<u8>>>>>>;
-
-/// 进程级共享池表（每 chunk 一份）：生产路径 [`PoolStream::new`] 取池的唯一入口。
+/// 共享池构造（单源）：生产取口 [`shared_pool`] 与测试隔离
+/// `isolated_pool`（mod tests）同一形状——预算见 [`POOL_BYTE_BUDGET`]、
+/// 块数公式见 [`pool_max_blocks`]。
 ///
-/// - 线程安全：udf `ObjectPool` 内部分片 + 片锁（64 KiB chunk ⇒ `idle_cap` 32 经 `clamp(1, 8)` 定 8
-///   分片，借还争用摊薄），`acquire_owned` 句柄归还点是 任意线程的引用计数归零——共享不新增锁成本；
-/// - 借出**永不阻塞、永不失败**（池空即 factory 新造，宇宙满即降级直构交付），
-///   共享不引入单流独占饿死；N 流并发 > 池宇宙时的代价是降级直构的性能差异 （实测 3.7–4.1 µs/次 vs
-///   池借还 ~100–300 ns），不是饥饿；
-/// - 表锁只在 `PoolStream::new`（每流一次）走，借还热路径只碰 `Arc` 克隆结果；
-/// - `Mutex` 中毒恢复（`into_inner`）：表操作本身不 panic，真毒化（构造池 validate
-///   panic）后恢复表继续服务，不放大故障。
+/// **表本体已上浮（bd ccy5d / ARCH-05）**：进程级共享表 = 框架
+/// [`xray_frame::pool::SharedPoolRegistry`]——本 crate 的静态表已删（禁双套），
+/// 按尺寸 class 分桶 / first-wins / 中毒恢复等语义文档见该件；本 crate 只留
+/// 池构造形状（预算公式 + reset 钩子，方向件留主仓口径不变）。
+fn build_chunk_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
+    Arc::new(ObjectPool::with_reset(
+        // idle_cap = max = 池上界：归还即留池（不预分配）；分片数 =
+        // 构造期 `idle_cap.clamp(1, 8)` ⇒ 8 分片摊薄并发借还争用。
+        pool_max_blocks(chunk),
+        pool_max_blocks(chunk),
+        move || vec![0u8; chunk],
+        move |buf: &mut Vec<u8>| {
+            // 容量归一：合规块只付一次 len 比较（`ReadBuf` 不改 Vec 的 len）。
+            if buf.len() != chunk {
+                buf.clear();
+                buf.resize(chunk, 0);
+            }
+        },
+        ResetPhase::OnReturn,
+    ))
+}
+
+/// 进程级共享池取口（每 chunk 一份）：生产路径 [`PoolStream::new`] 的唯一入口。
+///
+/// 借出**永不阻塞、永不失败**（池空即 factory 新造，宇宙满即降级直构交付），
+/// 共享不引入单流独占饿死；N 流并发 > 池宇宙时的代价是降级直构的性能差异
+/// （实测 3.7–4.1 µs/次 vs 池借还 ~100–300 ns），不是饥饿。
 fn shared_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
-    static POOLS: SharedPools = LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut pools = POOLS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    pools
-        .entry(chunk)
-        .or_insert_with(|| {
-            Arc::new(ObjectPool::with_reset(
-                pool_max_blocks(chunk),
-                // idle_cap = max = 池上界：归还即留池（不预分配）；分片数 =
-                // 构造期 `idle_cap.clamp(1, 8)` ⇒ 8 分片摊薄并发借还争用。
-                pool_max_blocks(chunk),
-                move || vec![0u8; chunk],
-                move |buf: &mut Vec<u8>| {
-                    // 容量归一：合规块只付一次 len 比较（`ReadBuf` 不改 Vec 的 len）。
-                    if buf.len() != chunk {
-                        buf.clear();
-                        buf.resize(chunk, 0);
-                    }
-                },
-                ResetPhase::OnReturn,
-            ))
-        })
-        .clone()
+    xray_frame::pool::SharedPoolRegistry::shared().get_or_init(chunk, || build_chunk_pool(chunk))
 }
 
 impl<R> PoolStream<R> {
@@ -196,6 +192,15 @@ impl<R: AsyncRead + Unpin> Stream for PoolStream<R> {
                 // 留在块里裸归还；进程级共享池（bd kw2si）下一个租户即读到上一连接
                 // 的 h2 body 明文。按实际写入区清零（合规内层 filled=0 ⇒ 零成本）；
                 // 禁整块清零（hdugl：Pending 是热路径）。
+                // rjaxs-③（「写而不推进 filled」的违约形态，评估不加防御）：
+                // `ReadBuf::new` 起 `initialized()` 恒满长 ⇒ 无 API 观测「初始化未
+                // 推进」的写入区，残余防御手段只剩整块 memset（hdugl 禁）或违约
+                // 计数器（同样不可实现）。生产内层面 = tokio 1.54 `duplex` 两半
+                // （dialer ×4 上行 + dl_stream 下行，`GuardedReader` 纯转发）：
+                // tokio `io/util/mem.rs:308-334` `poll_read_internal` 有数据 ⇒
+                // `put_slice` + Ready 同步提交、Pending 臂零写入 ⇒ 违约形态对唯一
+                // 生产内层不可构造。重访触发：PoolStream 接非仓内/非 tokio reader
+                // 时，先补「Pending 零写入」契约测试再接。
                 buf[..filled].fill(0);
                 drop(buf); // 句柄 Drop ⇒ 块回池
                 Poll::Pending
@@ -231,21 +236,11 @@ mod tests {
 
     use super::*;
 
-    /// 独立池（测试隔离）：形状与 [`shared_pool`] 构造完全一致——断言读数不被
-    /// 共享池上其他并行测试的借还污染。
+    /// 独立池（测试隔离）：形状与生产 [`shared_pool`] 完全一致（同走
+    /// [`build_chunk_pool`] 单源，bd ccy5d）——断言读数不被共享池上其他并行
+    /// 测试的借还污染。
     fn isolated_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
-        Arc::new(ObjectPool::with_reset(
-            pool_max_blocks(chunk),
-            pool_max_blocks(chunk),
-            move || vec![0u8; chunk],
-            move |buf: &mut Vec<u8>| {
-                if buf.len() != chunk {
-                    buf.clear();
-                    buf.resize(chunk, 0);
-                }
-            },
-            ResetPhase::OnReturn,
-        ))
+        build_chunk_pool(chunk)
     }
 
     #[tokio::test]

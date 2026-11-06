@@ -860,22 +860,11 @@ async fn listen_h3(
     let listener_endpoint = endpoint.clone();
     // accept 循环托管（bd x2ywg）：panic 后 endpoint clone 仍留在 listener 句柄里，
     // UDP 端口保持绑定但永不 accept——监听的死必须留痕（accept_policy 铁律 3）。
-    spawn_supervised_h3_accept(local, async move {
-        while let Some(incoming) = endpoint.accept().await {
-            let ctx = Arc::clone(&ctx);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
-            )]
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                serve_h3_conn(conn, ctx).await;
-            });
-        }
-    });
+    // jcnjb⑤：每监听握手并发闸 + 应用层握手窗（rd8yj① 同款配方，见 [`spawn_h3_accept`]）。
+    let gate = xray_transport::handshake_gate::HandshakeGate::new(
+        xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES,
+    );
+    spawn_h3_accept(endpoint, gate, ctx);
     Ok(Box::new(SplithttpListener { local, tcp_abort: None, h3_endpoint: Some(listener_endpoint) }))
 }
 
@@ -899,6 +888,59 @@ fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> 
         local.to_string(),
         accept_task,
     ));
+}
+
+/// H3 accept 泵 + 每连接握手并发闸 + 应用层握手窗（jcnjb⑤，rd8yj① 同款配方）。
+///
+/// - **并发闸**：accept 循环内同步 `try_admit`，满即 fail-fast 丢弃该 Incoming
+///   （**不排队**——`handshake_gate` 家族纪律；决策在 accept 循环同步完成，超额 连接不 spawn
+///   任务；预算依据见 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES` 常量注释）。
+///   修复前形态：每 Incoming 无条件 spawn、握手无窗——「发 Initial 不完成握手」 的连接占 task +
+///   连接状态直到 idle 超时（持续发包可续命）。
+/// - **握手窗**：per-conn 以 `xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT` （8s，Go
+///   `nameserver_quic.go:27` 口径）罩 `incoming.await`（quinn 握手）； 握手完成即 `drop(permit)`
+///   让位，已建连接的活性归 idle 超时管。
+fn spawn_h3_accept(
+    endpoint: quinn::Endpoint,
+    gate: std::sync::Arc<xray_transport::handshake_gate::HandshakeGate>,
+    ctx: Arc<HandlerContext>,
+) {
+    let local = endpoint.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
+    spawn_supervised_h3_accept(local, async move {
+        while let Some(incoming) = endpoint.accept().await {
+            // jcnjb⑤：闸满即丢（不排队）；同步决策，超额连接不 spawn 任务。
+            let Some(permit) = gate.try_admit() else {
+                gate.record_reject("splithttp-h3");
+                drop(incoming);
+                continue;
+            };
+            let ctx = Arc::clone(&ctx);
+            let g = Arc::clone(&gate);
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            )]
+            tokio::spawn(async move {
+                let conn = match tokio::time::timeout(
+                    xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT,
+                    incoming,
+                )
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(_)) => return, // 握手协议层失败（对端放弃/参数错）
+                    Err(_) => {
+                        // 握手窗超时：Incoming 被 drop = 静默丢弃；许可随 task 归还
+                        // （行为断言见 tests）。
+                        g.record_failure("splithttp-h3", &"handshake window timeout");
+                        return;
+                    },
+                };
+                drop(permit); // 握手完成即让位；已建连接活性归 idle 超时管
+                serve_h3_conn(conn, ctx).await;
+            });
+        }
+    });
 }
 
 /// 单个 QUIC 连接：h3 server handshake → accept 请求循环。
@@ -1410,6 +1452,190 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1, "handler should see 1 conn");
         drop(send_req);
         drop(endpoint);
+    }
+
+    // ---- jcnjb⑤：握手并发闸 + 应用层握手窗（rd8yj① 同款判据） ----
+
+    /// 永挂式证书验证器（rd8yj 同款）：进入 `verify_server_cert` 即驻留——
+    /// Initial 合法发出（服务器接纳并回飞行包）、Finished 永不到达 ⇒ 握手永远
+    /// 无法完成，闸许可唯一的让出途径 = 握手窗（QUIC_HANDSHAKE_TIMEOUT）超时放弃。
+    #[derive(Debug)]
+    struct ParkedVerifier {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for ParkedVerifier {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if let Some(entered) = self.entered.lock().expect("parked verifier lock").take() {
+                let _ = entered.send(());
+            }
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(rustls::Error::General("parked verifier released".into()))
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            ]
+        }
+    }
+
+    /// 测试收尾守卫（rd8yj 同款）：无论断言过红，Drop 都解除验证器自旋——
+    /// 否则 panic 路径下 quinn 驱动线程卡在自旋里，测试进程 runtime drop 卡死。
+    struct ReleaseGuard(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ReleaseGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 行为断言（jcnjb⑤，rd8yj① 判据）：h3 accept 泵（[`spawn_h3_accept`]，
+    /// 与 [`listen_h3`] 同一生产泵函数）的握手闸必须在握手窗超时后**真实释放**
+    /// 许可——许可被占满整窗、窗后回到可再取。
+    ///
+    /// 容量 1 闸注入；永挂验证器客户端占住唯一名额。
+    /// - 删掉 try_admit 接线 ⇒ 持有探针期间许可恒可取 ⇒ 红；
+    /// - 窗改大（60s）/删掉超时 ⇒ 释放探针 20s 截止拿不到 ⇒ 红。
+    ///
+    /// 结构纪律（rd8yj 同款）：**先清理、后断言**——panic 只允许发生在解除
+    /// 验证器自旋并关闭 endpoint 之后。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn handshake_gate_releases_quota_after_window_timeout() {
+        use std::time::Duration;
+
+        ensure_provider();
+
+        // 服务端：真证书 + h3 ALPN（生产 listen_h3 同构的手工端点，闸容量注入 1）。
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let tls = xray_tls::server_config::build_server_config(
+            "tls",
+            Some(&serde_json::json!({
+                "alpn": ["h3"],
+                "certificates": [{ "certificate": cert_pem, "key": key_pem }],
+            })),
+        )
+        .expect("build server tls config")
+        .expect("is_h3 implies Some");
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &SocketOptions::default(),
+        )
+        .expect("bind udp endpoint");
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from((*tls).clone())
+                    .expect("rustls→quic server"),
+            ))),
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .expect("server endpoint");
+        let server_addr = endpoint.local_addr().expect("local addr");
+        let keepalive = endpoint.clone(); // endpoint 本体 move 进 accept 泵，clone 保活
+
+        let config = Arc::new(crate::register::parse_splithttp_config(None).expect("parse config"));
+        let (handler, _count) = greeting_handler();
+        let ctx = build_context(&config, server_addr, handler);
+        let gate = xray_transport::handshake_gate::HandshakeGate::new(1); // 容量 1：单名额可观测
+        spawn_h3_accept(endpoint, Arc::clone(&gate), ctx);
+
+        // 永挂验证器客户端：占住唯一名额（entered ⇒ 服务器已接纳、许可已被占）。
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _release_guard = ReleaseGuard(Arc::clone(&release));
+        let mut hang_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ParkedVerifier {
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: Arc::clone(&release),
+            }))
+            .with_no_client_auth();
+        hang_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut hang_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        hang_ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(hang_tls).unwrap(),
+        )));
+        // 不 await Connecting：Initial 由 endpoint 驱动发出，握手卡死在验证器。
+        let _connecting = hang_ep.connect(server_addr, "localhost").unwrap();
+
+        tokio::time::timeout(Duration::from_secs(15), entered_rx)
+            .await
+            .expect("verifier must be reached within 15s (stall not established)")
+            .expect("entered channel");
+        let admitted_at = std::time::Instant::now();
+
+        // 持有探针（2s 窗）：许可必须被占（删掉 try_admit 接线 ⇒ 恒可取 ⇒ 红）。
+        let mut held = true;
+        while admitted_at.elapsed() < Duration::from_secs(2) {
+            if gate.try_admit().is_some() {
+                held = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // 释放观测窗口（固定 20s）：窗改大/删掉 ⇒ released_at = None。
+        let mut released_at = None;
+        while admitted_at.elapsed() < Duration::from_secs(20) {
+            if gate.try_admit().is_some() {
+                released_at = Some(std::time::Instant::now());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // ---- 清理先行（此时不得有任何 panic）：解除自旋 + 关两端 endpoint ----
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(_connecting);
+        drop(hang_ep);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        keepalive.close(0u32.into(), b"test done");
+
+        // ---- 断言（全部在清理之后）----
+        assert!(held, "握手未完成期间闸许可必须被占（try_admit 接线被删 = 恒可取）");
+        let released_at = released_at
+            .expect("握手窗超时后名额必须被释放（连接放弃、许可归还）——闸失效或窗被改大/删掉");
+        let held_for = released_at.duration_since(admitted_at);
+        assert!(
+            held_for
+                >= xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT - Duration::from_secs(1),
+            "名额仅被占 {held_for:?}（窗 = 8s）——提前让位 = 闸未按窗工作"
+        );
     }
 
     /// h3 + stream-one：Rust 客户端 POST（带 body）→ Rust h3 服务端 → **完整响应体**回传。

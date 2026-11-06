@@ -580,6 +580,40 @@ fn warn_if_rcvbuf_clamped(requested: i32, actual: std::io::Result<usize>) {
     }
 }
 
+/// 显式 SO_SNDBUF 钳制判据（bd wpa3o）：回读 < 请求值 = 内核未足额受理。
+/// **各平台回读语义依据**（票面要求逐平台自查后定判据，非照抄 RCVBUF）：
+/// - **Linux**：`sock_setsockopt` 2× 记账（`sk_sndbuf = 2×min(v, wmem_max)`， 下限
+///   `SOCK_MIN_SNDBUF`；socket(7) 明文 "the kernel doubles this value ... and this doubled value is
+///   returned by getsockopt"）——足额时回读 = 2×设定 ≥ 请求值；受 `net.core.wmem_max`（stock
+///   212992）钳制时回读 = 2×wmem_max < 请求值（请求 > 2×wmem_max 才可判，粗钳必中）。
+/// - **Windows**：无倍率、无上限钳制、无下限抬升——2026-11-07 本机 Win32 实测 （独立探针：TCP/UDP ×
+///   set 64B/1MiB/8MiB/64MiB/256MiB）set N → get N **全等值**。
+/// - **macOS/BSD**：`sbreserve` 原样存放（doubling 是 Linux 特有，SO 21146955； quic-go
+///   `sys_conn_buffers*.go` 在全平台用同一判据 `newSize < desired`）， TCP 发送 autotune 只升不降 ⇒
+///   回读 ≥ 设定值。
+///
+/// 综上三平台「足额受理 ⇒ 回读 ≥ 请求值」恒成立，判据取 `actual < requested`；
+/// `requested <= 0`（缺省不设）恒 false。模块私有，测试同模块直测判据。
+fn sndbuf_clamped(requested: i32, actual: usize) -> bool {
+    requested > 0 && actual < requested as usize
+}
+
+/// 显式 SO_SNDBUF 下发后回读核对（bd wpa3o）：此前不回读 ⇒ `net.core.wmem_max`
+/// （stock 208KB 量级）静默钳制完全不可见。只做可见性（WARN 点名实际值），
+/// **不改行为**——预算闸判定仍用用户设定值（见
+/// [`check_explicit_udp_buffer_size_with`]）。
+fn warn_if_sndbuf_clamped(requested: i32, actual: std::io::Result<usize>) {
+    if let Ok(actual) = actual {
+        if sndbuf_clamped(requested, actual) {
+            crate::LOG.warn(format!(
+                "sendBufferSize={requested} clamped by kernel: actual SO_SNDBUF={actual} \
+                 bytes (net.core.wmem_max caps silently on Linux; \
+                 see docs/guide-highrtt-sockopt.md §9-§11)"
+            ));
+        }
+    }
+}
+
 /// 显式 `receiveBufferSize` 判定 + 下发（**三 transport 拨号点的统一口**）。
 ///
 /// - 缺省（0）⇒ 完全不碰 socket（r5j96：交 OS autotune）；
@@ -1053,10 +1087,14 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) -> std::io::Res
         check_explicit_udp_buffer_size(explicit, dir)?;
         if let Err(e) = dir.set(sock, explicit as usize) {
             crate::LOG.warn(format!("dir={dir:?} explicit={explicit} UDP buffer setsockopt failed (kernel may clamp): {e}"));
-        } else if matches!(dir, UdpBufDir::Recv) {
-            // bd unpg5：显式 SO_RCVBUF 下发后回读（钳制可见性，WARN 带实际值）。
-            // SO_SNDBUF 的 wmem_max 同型缺口不在本票范围，另票报告。
-            warn_if_rcvbuf_clamped(explicit, dir.get(sock));
+        } else {
+            // bd unpg5 / wpa3o：显式值下发后回读（钳制可见性，WARN 带实际值）。
+            // Recv 受 rmem_max、Send 受 wmem_max 静默钳制（Linux stock 208KB 量级，
+            // setsockopt 恒成功 ⇒ 只有回读能见）。
+            match dir {
+                UdpBufDir::Recv => warn_if_rcvbuf_clamped(explicit, dir.get(sock)),
+                UdpBufDir::Send => warn_if_sndbuf_clamped(explicit, dir.get(sock)),
+            }
         }
         return Ok(());
     }
@@ -1065,6 +1103,12 @@ fn tune_udp_buffer(sock: &Socket, explicit: i32, dir: UdpBufDir) -> std::io::Res
         return Ok(());
     }
     if dir.set(sock, QUIC_UDP_MIN_BUFFER).is_ok() {
+        // bd wpa3o：Linux setsockopt 恒成功但受 rmem_max/wmem_max 静默钳制
+        // ⇒ 8MB parity 下限可能未真正达成（quic-go wrapConn 语义），回读可见。
+        match dir {
+            UdpBufDir::Recv => warn_if_rcvbuf_clamped(QUIC_UDP_MIN_BUFFER as i32, dir.get(sock)),
+            UdpBufDir::Send => warn_if_sndbuf_clamped(QUIC_UDP_MIN_BUFFER as i32, dir.get(sock)),
+        }
         return Ok(());
     }
     #[cfg(target_os = "linux")]
@@ -2335,6 +2379,47 @@ mod tests {
             let _guard = tracing::subscriber::set_default(sink.clone());
             warn_if_rcvbuf_clamped(1 << 20, Ok(2 << 20));
             warn_if_rcvbuf_clamped(0, Ok(208 * 1024));
+        }
+        assert!(
+            sink.snapshot().iter().all(|m| !m.contains("clamped by kernel")),
+            "足额/缺省不得告警"
+        );
+    }
+
+    /// bd wpa3o：显式 SO_SNDBUF 下发后**回读可见性**——回读 < 请求值（Linux
+    /// `net.core.wmem_max` 静默钳制，stock 208KB 量级）必须产出点名实际值的 WARN。
+    /// 判据各平台依据见 [`sndbuf_clamped`] doc（逐平台自查后定，非照抄 RCVBUF）：
+    /// Linux 2× 记账足额回读翻倍；Windows 原样等值（2026-11-07 本机探针实测）；
+    /// macOS/BSD 原样或 autotune 只升不降 ⇒ 三平台足额均 ≥ 请求值。
+    #[test]
+    fn sndbuf_clamp_is_visible_via_readback_warn() {
+        // 判据直测（跨平台确定，不依赖内核 wmem_max 现值）。
+        assert!(!sndbuf_clamped(0, 208 * 1024), "缺省不设：无钳制可言");
+        assert!(!sndbuf_clamped(1 << 20, 2 << 20), "足额受理（Linux 2× 记账）不算钳制");
+        assert!(!sndbuf_clamped(1 << 20, 1 << 20), "足额（Windows/macOS 原样回读）不算钳制");
+        assert!(sndbuf_clamped(1 << 20, 425_984), "回读 2×wmem_max(208KB) < 请求 = 被钳制");
+        assert!(!sndbuf_clamped(-1, 0), "负值/缺省不判钳制");
+
+        // WARN 记录实测回读值（mock 回读值注入，跨平台确定）。
+        let sink = WarnCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(sink.clone());
+            warn_if_sndbuf_clamped(1 << 20, Ok(425_984));
+        }
+        let msgs = sink.snapshot();
+        let warn = msgs
+            .iter()
+            .find(|m| m.contains("clamped by kernel"))
+            .expect("钳制必须产出 WARN（回读值被记录 = wpa3o 验收核心）");
+        assert!(warn.contains("sendBufferSize=1048576"), "WARN 须点名请求值：{warn}");
+        assert!(warn.contains("actual SO_SNDBUF=425984"), "WARN 须点名实际回读值：{warn}");
+
+        // 足额场景不得产出钳制 WARN（对照组）。
+        let sink = WarnCapture::default();
+        {
+            let _guard = tracing::subscriber::set_default(sink.clone());
+            warn_if_sndbuf_clamped(1 << 20, Ok(2 << 20));
+            warn_if_sndbuf_clamped(0, Ok(208 * 1024));
         }
         assert!(
             sink.snapshot().iter().all(|m| !m.contains("clamped by kernel")),

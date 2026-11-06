@@ -18,7 +18,12 @@
 //! `borrowed == 0` fail-fast 断言兜底；**L5/坑约束 12** 管理面挂在分配路径
 //! 外侧，xray-buf 分配路径字节级不动（红线隔离测试：`tests/pool_isolation.rs`）。
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, LazyLock, Mutex},
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use skeleton::{
@@ -351,6 +356,60 @@ pub fn spawn_idle_pruner<T: Send + 'static>(
     })
 }
 
+// ── 进程级共享块池注册表（bd ccy5d / ARCH-05）────────────────────────────
+
+/// 进程级**共享块池注册表**：同尺寸 class（块字节数）全进程唯一一份
+/// [`ObjectPool`]，不同尺寸 class 各自独立成池、互不串用（毒化防护）。
+///
+/// 与 [`BufferPool`]/[`ManagedBufferPool`] 同族（L2 池能力层）：后两者管
+/// 「借还契约 + 管理面记账」，本件管「**进程级共享的表**」——同一进程的 N 个
+/// 消费方（流/连接）对同尺寸块的借还落在同一份池上，池常驻上界从「每消费方
+/// 一份」的乘积面（N × cap）收敛为**进程级常量**（账本：`crate::budget` 的
+/// `SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES` / `HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`）。
+///
+/// **归属（ADR-1 三判据 · bd ccy5d）**：keyed 共享表是零方向语义的机制件，
+/// 但池的 key 形态（chunk 尺寸 class、协议侧预算公式与 reset 钩子）带网络方向
+/// 语义——按 §3.5.3 方向件纪律**不进 udf**，机制本体落本件（派生层）。两消费方
+/// （splithttp `pool_stream` / hysteria `udphop`）只留各自的池构造参数，
+/// **禁在协议 crate 自造第二张表**（§3.5.2）。
+///
+/// 语义（沿 bd kw2si 的 splithttp 静态表原样上浮；2026-11-07 起 splithttp 改调
+/// 本件，hysteria 从每连接一份改挂本件）：
+/// - **按尺寸 class 分桶**：key = 块字节数。一个 class 的异形块（reset 归一
+///   前后的膨胀块）只可能落回自己的池，永不串入其他 class——一个消费方的膨胀 尺寸不能污染另一个；
+/// - **first-wins**：同 class 首个 `get_or_init` 的构造结果全进程复用，后到者
+///   的构造闭包不执行——同尺寸块的构造形状必须一致（等重块共享的前提）；
+/// - **借还不经表**：表锁只在取池时走（每流/每连接一次），借还热路径只碰 `Arc`
+///   克隆结果，共享不新增锁成本；
+/// - **`Mutex` 中毒恢复**（`into_inner`）：表操作本身不 panic，真毒化（构造池 validate
+///   panic）后恢复表继续服务，不放大故障。
+pub struct SharedPoolRegistry {
+    pools: Mutex<HashMap<usize, Arc<ObjectPool<Vec<u8>>>>>,
+}
+
+impl SharedPoolRegistry {
+    /// 进程级单例。
+    #[must_use]
+    pub fn shared() -> &'static Self {
+        static REGISTRY: LazyLock<SharedPoolRegistry> =
+            LazyLock::new(|| SharedPoolRegistry { pools: Mutex::new(HashMap::new()) });
+        &REGISTRY
+    }
+
+    /// 取/建 `block_size` class 的共享池：同尺寸全进程唯一一份（first-wins）。
+    ///
+    /// `build` 只在该 class **首次**取池时执行；闭包内的池参数（max/idle_cap/
+    /// factory/reset）即该 class 的进程级预算承诺，登记面见 `crate::budget`。
+    pub fn get_or_init(
+        &self,
+        block_size: usize,
+        build: impl FnOnce() -> Arc<ObjectPool<Vec<u8>>>,
+    ) -> Arc<ObjectPool<Vec<u8>>> {
+        let mut pools = self.pools.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pools.entry(block_size).or_insert_with(build).clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -362,6 +421,7 @@ mod tests {
     };
 
     use skeleton::pool::PoolAuditKind;
+    use skeleton_infra::objpool::ResetPhase;
 
     use super::*;
 
@@ -608,5 +668,78 @@ mod tests {
         // 托管语义：scope 关闸 + 排空 ⇒ pruner 随 JoinSet 收割，无孤儿循环。
         drop(spawned);
         let _ = scope.shutdown().await;
+    }
+
+    // ── 共享块池注册表（bd ccy5d）────────────────────────────────────────
+
+    /// 注册表契约：同尺寸 class 全进程唯一一份；不同尺寸 class 独立成池。
+    /// **反向自检锚点**：把 `get_or_init` 的 key 换成常量（全员共池），
+    /// `!Arc::ptr_eq` 断言必红。
+    #[test]
+    fn shared_registry_buckets_by_size_class() {
+        // 局部注册表（不碰进程单例的既存 bucket，读数可精确断言）。
+        let registry = SharedPoolRegistry { pools: Mutex::new(HashMap::new()) };
+        let build = || Arc::new(ObjectPool::new(4, 4, Vec::<u8>::new));
+
+        let a1 = registry.get_or_init(4096, build);
+        let a2 = registry.get_or_init(4096, build);
+        assert!(Arc::ptr_eq(&a1, &a2), "同尺寸 class 必须命中同一份池（first-wins 复用）");
+
+        let b = registry.get_or_init(1500, build);
+        assert!(!Arc::ptr_eq(&a1, &b), "不同尺寸 class 禁串池（毒化防护，bd ccy5d）");
+
+        // 进程单例同契约：同一尺寸两次取池 ⇒ 同一份（消费方契约的表侧锚）。
+        let s1 = SharedPoolRegistry::shared().get_or_init(7777, build);
+        let s2 = SharedPoolRegistry::shared().get_or_init(7777, build);
+        assert!(Arc::ptr_eq(&s1, &s2), "进程单例：同尺寸 class 全进程唯一一份");
+    }
+
+    /// 毒化防护（bd ccy5d 验收）：一个 class 里的膨胀块（异形块）只落回自己的
+    /// 池（归一后入 idle），**另一个 class 的池零接触**——膨胀尺寸不跨 class
+    /// 污染。**反向自检锚点**：全员共池（key 换常量）时 B 池的 idle/borrowed
+    /// 读数必被 A 的异形块污染，本断言必红。
+    #[test]
+    fn inflated_block_in_one_class_never_leaks_to_another() {
+        let registry = SharedPoolRegistry { pools: Mutex::new(HashMap::new()) };
+        // reset 钩子做容量归一（消费方形状：异形块换定长零块）。
+        let normalize = |chunk: usize| {
+            move |buf: &mut Vec<u8>| {
+                if buf.len() != chunk {
+                    *buf = vec![0u8; chunk];
+                }
+            }
+        };
+        let a = registry.get_or_init(4096, || {
+            Arc::new(ObjectPool::with_reset(
+                4,
+                4,
+                || vec![0u8; 4096],
+                normalize(4096),
+                ResetPhase::OnReturn,
+            ))
+        });
+        let b = registry.get_or_init(1500, || {
+            Arc::new(ObjectPool::with_reset(
+                4,
+                4,
+                || vec![0u8; 1500],
+                normalize(1500),
+                ResetPhase::OnReturn,
+            ))
+        });
+
+        // 消费方 A 把膨胀块（3× 尺寸）塞回自己的 class。
+        let inflated = vec![0xAu8; 4096 * 3];
+        assert!(a.insert(inflated).is_none(), "idle 额度内归一收下");
+        let m_a = a.metrics();
+        assert_eq!(m_a.core.idle, 1, "A 池归一后收下 1 块");
+        let recycled = a.acquire();
+        assert_eq!(recycled.len(), 4096, "膨胀块必须归一到 class 尺寸才可复用");
+
+        // B 池零接触：A 的膨胀块没有串进来。
+        let m_b = b.metrics();
+        assert_eq!(m_b.core.idle, 0, "B class 不得收到 A 的块");
+        assert_eq!(m_b.core.borrowed, 0, "B class 无在外块");
+        assert_eq!(b.metrics().constructed, 0, "B class 零构造（无借出即无工厂调用）");
     }
 }

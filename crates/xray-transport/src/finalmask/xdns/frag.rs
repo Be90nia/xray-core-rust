@@ -13,9 +13,39 @@ use tokio::sync::Mutex;
 pub(crate) type ClientID = [u8; 8];
 
 const FRAG_TTL: Duration = Duration::from_secs(8);
-const FRAG_SIZE: usize = 4096;
-const FRAG_CLIENT_ID_SIZE: usize = 16384;
-const FRAG_COUNT: usize = 4096;
+/// 单 entry 载荷上限（字节）。对应 Go `frag.go` 同界。**pub 是为了登记簿
+/// 交叉断言**（`xray-core::memory_budget` 的 frag 账面必须与本常量同步，
+/// bd wpa3o-b——同 `sockopt::QUIC_UDP_MIN_BUFFER` 先例）。
+pub const FRAG_SIZE: usize = 4096;
+/// 单 client 未重组总量上限（字节）。对应 Go 同界。pub 理由同上（wpa3o-b）。
+pub const FRAG_CLIENT_ID_SIZE: usize = 16384;
+/// 全表 entry 条数上限。对应 Go 同界。pub 理由同上（wpa3o-b）。
+pub const FRAG_COUNT: usize = 4096;
+
+/// 本容器**最坏堆占用**（字节）——登记簿账面的实现侧算式（bd wpa3o-b）。
+///
+/// - payload：`FRAG_COUNT × FRAG_SIZE`（每 entry 载荷 ≤ 4KiB，feed 侧拒绝超限）
+/// - 片槽数组：每 entry `vec![None; frag_n]`，`frag_n` 为 u8 ⇒ ≤ 255 槽 ×
+///   `size_of::<Option<Vec<u8>>>()`（niche 优化 = 24B，64 位平台恒定）
+/// - entry 结构 + m 表桶 + by_deadline/sizem 索引面 ⇒ 取整上沿 1MiB（登记簿面
+///   用取整值，禁猜实现细节）
+///
+/// entry 结构按 `ENTRY_STRUCT_BOOKED`（64B 上沿，见下）计（**平台无关**：Windows 上
+/// `Instant` 携带 QPC 频率 = 16B ⇒ FragEntry = 64B；Linux/macOS Instant = 8B
+/// ⇒ 56B。账面字面量不得随平台漂移 ⇒ 统一按大值登记）。
+///
+/// 合计 = 4096 × (4096 + 6120 + 64) + 1,048,576 = **43,155,456**（≈41.2MiB）。
+/// 交叉断言住 `xray-core::memory_budget` tests（改任一上限即红，账面随重算）。
+pub const WORST_CASE_BYTES: usize = FRAG_COUNT
+    * (FRAG_SIZE
+        + (u8::MAX as usize) * std::mem::size_of::<Option<Vec<u8>>>()
+        + ENTRY_STRUCT_BOOKED)
+    + 1_048_576;
+
+/// FragEntry 单结构的**平台无关账面上沿**（字节）：Windows 64B（`Instant` 16B =
+/// QPC 频率 + 计数，rust#103182 起）、Linux/macOS 56B ⇒ 统一按 64B 登记；
+/// 布局增长超过本值的测试锚见 `worst_case_layout_and_value_anchor`（即红须重算账面）。
+const ENTRY_STRUCT_BOOKED: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct FragKey {
@@ -208,6 +238,21 @@ impl FragManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd wpa3o-b：账面算式的布局假设 + 数值锚。改 FragEntry 布局或任一上限
+    /// 即红——登记簿（`xray-frame::budget::XDNS_FRAG_WORST_CASE_BYTES`）须随重算
+    /// （交叉断言本体住 `xray-core::memory_budget`，它同时可见两侧）。
+    #[test]
+    fn worst_case_layout_and_value_anchor() {
+        assert_eq!(std::mem::size_of::<Option<Vec<u8>>>(), 24, "niche 优化假设");
+        assert!(
+            std::mem::size_of::<FragEntry>() <= ENTRY_STRUCT_BOOKED,
+            "FragEntry 布局增长超账面上沿 {}B（实测 {}B）：登记簿须重算（bd wpa3o-b）",
+            ENTRY_STRUCT_BOOKED,
+            std::mem::size_of::<FragEntry>()
+        );
+        assert_eq!(WORST_CASE_BYTES, 43_155_456, "4096×(4096+255×24+64)+1MiB 上沿");
+    }
 
     #[tokio::test]
     async fn feed_assembles_in_order() {
