@@ -646,7 +646,8 @@ impl CachedNameserver for DohNameServer {
             Some(Ok(rec)) => outcome.rec_v4 = Some(rec),
             Some(Err(e)) => {
                 // bd d881①：失败路径必须可观察（此前 body(()) Err `?` 静默早退）。
-                tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                // bd c43mw：Go `resolver_doh.go:207` = LogErrorInner（默认 warn 门可见）。
+                tracing::warn!(target: "xray.dns.doh", server = %self.name, fqdn,
                     family = "v4", error = %e, "doh: query failed");
                 outcome.errors.push(e);
             },
@@ -655,7 +656,8 @@ impl CachedNameserver for DohNameServer {
         match v6 {
             Some(Ok(rec)) => outcome.rec_v6 = Some(rec),
             Some(Err(e)) => {
-                tracing::debug!(target: "xray.dns.doh", server = %self.name, fqdn,
+                // bd c43mw：Go `resolver_doh.go:215` = LogErrorInner（默认 warn 门可见）。
+                tracing::warn!(target: "xray.dns.doh", server = %self.name, fqdn,
                     family = "v6", error = %e, "doh: query failed");
                 outcome.errors.push(e);
             },

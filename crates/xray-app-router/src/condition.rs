@@ -404,15 +404,22 @@ pub struct InboundTagMatcherCondition {
 
 impl InboundTagMatcherCondition {
     /// 从 proto `inbound_tag` 列表构造。
+    ///
+    /// Go `NewInboundTagMatcher`（condition.go:212-220）构造期**剔除空串**——
+    /// 否则 gRPC `AddRule` 推 `[""]` 会绕过 JSON 侧校验，得到一条恒真规则。
     #[must_use]
     pub fn new(tags: Vec<String>) -> Self {
-        Self { tags }
+        Self { tags: tags.into_iter().filter(|t| !t.is_empty()).collect() }
     }
 }
 
 impl Condition for InboundTagMatcherCondition {
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
         let tag = ctx.get_inbound_tag();
+        // Go condition.go:226-228：ctx 无 inbound tag ⇒ 不命中（空 == 空不算命中）。
+        if tag.is_empty() {
+            return false;
+        }
         self.tags.iter().any(|t| t == tag)
     }
 }
@@ -427,15 +434,21 @@ pub struct ProtocolMatcherCondition {
 }
 
 impl ProtocolMatcherCondition {
+    /// 构造。Go `NewProtocolMatcher`（condition.go:237-245）构造期**剔除空串**——
+    /// 空串前缀 `starts_with("")` 恒真，会让一条空条件规则命中全部流量。
     #[must_use]
     pub fn new(prefixes: Vec<String>) -> Self {
-        Self { prefixes }
+        Self { prefixes: prefixes.into_iter().filter(|p| !p.is_empty()).collect() }
     }
 }
 
 impl Condition for ProtocolMatcherCondition {
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
         let p = ctx.get_protocol();
+        // Go condition.go:249-251：ctx 无 protocol ⇒ 不命中。
+        if p.is_empty() {
+            return false;
+        }
         self.prefixes.iter().any(|x| p.starts_with(x.as_str()))
     }
 }
@@ -1162,6 +1175,20 @@ mod tests {
         assert!(!m.apply(&miss));
     }
 
+    /// yh01f-c 回归：空串条目 + 空 ctx tag 都不得命中（Go `NewInboundTagMatcher`
+    /// / `Apply` 的双重防线）。旧实现 `[""]` 恒真 ⇒ gRPC `AddRule` 推 `[""]`
+    /// 可绕过 JSON 侧校验，一条空条件规则命中全部流量。
+    #[test]
+    fn test_inbound_tag_matcher_ignores_empty_strings() {
+        let m = InboundTagMatcherCondition::new(vec![String::new()]);
+        assert!(!m.apply(&RoutingData::new()), "空 ctx tag 不得与空串条目相等命中");
+        assert!(!m.apply(&RoutingData::new().with_inbound_tag("in0")));
+        // 空串与真实 tag 混排：只保留真实 tag 的语义。
+        let m2 = InboundTagMatcherCondition::new(vec![String::new(), "in0".into()]);
+        assert!(m2.apply(&RoutingData::new().with_inbound_tag("in0")));
+        assert!(!m2.apply(&RoutingData::new().with_inbound_tag("in1")));
+    }
+
     // ── ProtocolMatcher ──
 
     #[test]
@@ -1173,6 +1200,15 @@ mod tests {
         assert!(m.apply(&hit1));
         assert!(m.apply(&hit2));
         assert!(!m.apply(&miss));
+    }
+
+    /// yh01f-c 回归：空串前缀恒真（`starts_with("")`）必须被构造期剔除，
+    /// 且 ctx 无 protocol 时不命中（Go `NewProtocolMatcher` / `Apply`）。
+    #[test]
+    fn test_protocol_matcher_ignores_empty_prefix() {
+        let m = ProtocolMatcherCondition::new(vec![String::new()]);
+        assert!(!m.apply(&RoutingData::new().with_protocol("http/1.1")));
+        assert!(!m.apply(&RoutingData::new()), "空 ctx protocol 不得命中");
     }
 
     // ── AttributeMatcher ──

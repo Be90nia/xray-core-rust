@@ -181,8 +181,22 @@ pub fn build_server_config(
 ) -> io::Result<Option<Arc<ServerConfig>>> {
     xray_common::ensure_default_crypto_provider();
 
-    if !matches!(security, "tls" | "reality") {
-        return Ok(None);
+    // bd c0p71：与 `build_client_config` 同口径先归一化大小写（上游
+    // `StreamSettings::is_tls()` 是 `to_lowercase()`）。改前此处大小写敏感
+    // ⇒ `security:"TLS"` 的入站拿到 `Ok(None)` = 无 TLS acceptor = 明文入站，
+    // 而 Go `transport_internet.go:98` 走 `strings.ToLower` 建真 TLS。
+    let security = security.to_ascii_lowercase();
+    if !matches!(security.as_str(), "tls" | "reality") {
+        // `Ok(None)` 只允许表示"明确不加密"（`none` / 空）；未知取值 fail-visible。
+        if security.is_empty() || security == "none" {
+            return Ok(None);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported transport security {security:?}: expected \"none\", \"tls\" or \"reality\""
+            ),
+        ));
     }
 
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
@@ -212,6 +226,21 @@ pub fn build_server_config(
         ));
     }
 
+    // bd 4w092(b)：`echServerKeys` 在本仓**零消费**——btls v0.5.6 未导出
+    // `SslEchKeys`/`SslEchKeysBuilder`，服务端握手又走 rustls（无 ECH feature）。
+    // 配了等于没配：客户端 ECH 到该入站解不出内层 SNI。这里 fail-visible 告警
+    // （不硬错：Go 合法配置不得因本仓能力缺口拒启）。同族键 `ocspStapling`
+    // 因属安全语义静默失效而选了硬错，两者取舍不同。
+    if json.get("echServerKeys").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+        tracing::warn!(
+            target: "xray_tls::server_config",
+            security = %security,
+            "echServerKeys is set but this build cannot register ECH decryption keys \
+             (server handshake uses rustls, which has no ECH support): clients using ECH \
+             against this inbound will fail ECH and cannot reveal their inner SNI"
+        );
+    }
+
     let entries = build_named_cert_keys(&json)?;
 
     // 缺证书不再自签（bd mwvwd F2）：Go 服务端没证书时每条连接都失败
@@ -222,7 +251,7 @@ pub fn build_server_config(
     if entries.is_empty() {
         tracing::warn!(
             target: "xray_tls::server_config",
-            security,
+            security = %security,
             "no TLS certificate configured (certificates[] / cert+key): every handshake \
              will fail with 'no server certificate chain resolved' (Go: tls: no certificates configured)"
         );

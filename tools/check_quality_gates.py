@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""je3u3 质量门四件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
+"""je3u3 质量门五件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
 
-四道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发）：
+五道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发 +
+bd st3l1/s4xsk 的 `#[ignore]` 登记）：
   (a) 失败留痕门    生产代码禁 `hot_log!(DEBUG, "error=…")` 形态——失败在默认
                     warn 门下必须可见（bd u0pe2 ① 缺陷指纹：26 处失败留痕在
                     loglevel=warn 下零痕迹）。白名单只登记有 Go 源码依据的
@@ -19,16 +20,30 @@
                     注释中 ⇒ 报漂移嫌疑。保守放行三口：值已复述 / 注释自述
                     「交叉断言」（(c) 已钉住，数字漂移有测试兜底）/ 登记簿在飞债。
                     抽查语义：启发式，误放由人审兜，误红登记后收紧。
+  (e) ignore 理由门 每个 `#[ignore]` 必须带 `reason = "..."`（bd st3l1 / s4xsk：
+                    裸 ignore 12 处全无理由，且理由是「这测试为什么不能常跑」的
+                    唯一档案）。**不判 reason 内容**（票号是否仍 OPEN 由人审）——
+                    门只管「有没有写」；理由里的票号过期属登记面债，见 bd s4xsk。
+  (f) 锁跨 await 门 tokio 锁 guard 跨 `.await` 的静态门（bd auf6h / PM-13）：
+                    clippy 的 `await_holding_lock` 只认 `std::sync` 与「guard 绑定在
+                    async 块里」的形态；本仓大量用 `tokio::sync::Mutex<Receiver>` /
+                    `Mutex<Stream>` 作「!Sync 容器 + 独占读写」包装，clippy 完全不看。
+                    门扫两种 tokio 形态：① 链式 `x.lock().await.m().await`（PM-06 家族，
+                    持锁等对端）② 绑定 `let g = x.lock().await` 后同一块内 `.await`
+                    （`drop(g)` 之前）。`parking_lot`/`std` 的 `!Send` guard 跨 await 在
+                    Send future 里根本编译不过，故不入本门（(f) 只收 tokio 面）。
 
 用法（房规 check_udp_binds.py / check_proto_drift.py）：
-  python tools/check_quality_gates.py             # 四道门全跑（(c) 含 cargo）
-  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)（快路径）
-  python tools/check_quality_gates.py --list      # 枚举 (a)(b)(d) 全部命中与分类
-  python tools/check_quality_gates.py --self-test # 四道门各一条故意违反→必须报错
+  python tools/check_quality_gates.py             # 六道门全跑（(c) 含 cargo）
+  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)(e)(f)（快路径）
+  python tools/check_quality_gates.py --list      # 枚举 (a)(b)(d)(f) 全部命中与分类
+  python tools/check_quality_gates.py --self-test # 每道门各一条故意违反→必须报错
 
 扫描语义（与 check_udp_binds.py 同源，直接复用其基础设施）：
-- 只扫 crates/*/src/**（排除 crates/udf-frame——独立仓工作副本，纪律归 udf CI；
-  排除 tests 目录与 `#[cfg(test)]` 块——测试面不属生产纪律面）。
+- (a)(b)(d) 只扫 crates/*/src/**（排除 crates/udf-frame——独立仓工作副本，纪律归
+  udf CI；排除 tests 目录与 `#[cfg(test)]` 块——测试面不属生产纪律面）。
+- (e) 相反：`#[ignore]` 只长在测试面，故扫 crates/** 与 tests/** 全树（仍排除
+  udf-frame），不剥离 `#[cfg(test)]`。
 - 命中判定在注释/字符串剥离后的文本上做（位置保持，行号不变）；理由判定
   （(b)）与注释窗口（(d)）回原文本取——剥离函数逐字符掏空、不位移。
 - 已知盲区（登记，不静默）：(a) 只匹配消息字面量以 `error=` 开头的形态
@@ -68,6 +83,144 @@ INT_TYPES = {
 HOT_LOG_DEBUG_ERROR = re.compile(
     r"\bhot_log!\s*\(\s*(?:tracing::)?(?:Level::)?DEBUG\s*,\s*\"error"
 )
+
+# ---------------------------------------------------------------------------
+# (a) 门扩面：DEBUG 级失败留痕（bd c43mw）
+# ---------------------------------------------------------------------------
+# 旧 (a) 只认 `hot_log!(DEBUG, "error…` 一种字面形态；生产里大量失败留痕写成
+# `LOG.debug(...)` / `tracing::debug!(...)`，默认 `warn` 门下同样零痕迹，门看不见。
+# 扩面后：**任意 DEBUG 级日志**（hot_log! / LOG.debug / tracing::debug! / debug!）
+# 的消息窗口里出现失败语义标记 ⇒ 命中。
+DEBUG_LEVEL_CALL = re.compile(
+    r"\bhot_log!\s*\(\s*(?:tracing::)?(?:Level::)?DEBUG\b"
+    r"|\bLOG\.debug\s*\("
+    r"|\btracing::debug!\s*\("
+    r"|\blog::debug!\s*\("
+    r"|(?<![\w:.])debug!\s*\("
+)
+# 失败语义标记（宁误红不漏放；窗口内命中即算）。
+FAILURE_TEXT = re.compile(r"error\s*=|err\s*=|failed|failure|失败", re.IGNORECASE)
+# 消息窗口上限：一份日志调用连同格式化参数很少超过这个宽度（括号配对失败时的兜底）。
+DEBUG_TRACE_WINDOW = 240
+
+
+def log_call_span(text: str, call_start: int) -> str:
+    """取一条日志调用的实参区间文本（括号配对，跳过字符串体）。
+
+    只在**调用自身**的实参里找失败标记——否则 240 字符窗口会吃掉下一条语句
+    （实测会把「querying SRV record」误判成失败留痕）。括号配对失败时退化成
+    固定宽度窗口（宁误红不漏放）。
+    """
+    text = text[:call_start + DEBUG_TRACE_WINDOW]
+    i = text.find("(", call_start)
+    if i < 0:
+        return text[call_start:]
+    depth = 0
+    in_str = False
+    j = i
+    while j < len(text):
+        c = text[j]
+        if in_str:
+            if c == "\\":
+                j += 2
+                continue
+            if c == '"':
+                in_str = False
+            j += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[call_start:j + 1]
+        j += 1
+    return text[call_start:]
+
+
+# 登记簿（bd c43mw 分批）：键 = 文件相对路径，值 = 该文件「保留 DEBUG」的依据。
+# 契约分两档：
+#   【go-debug】Go 同位也是 DEBUG/不记日志（单连接级 accept / 逐包瞬断 / 重试中继）
+#   【defer】   本票配额内未覆盖（bd c43mw 第二批），逐文件点名，门每次运行都报数
+FAILURE_TRACE_DEBUG_REGISTRY: dict[str, str] = {
+    "crates/xray-app-dispatcher/src/default.rs": (
+        "go-debug：sniffing 失败 → 用原 dest 继续（降级非失败，Go sniff 失败同样不报错）"
+    ),
+    "crates/xray-app-dns/src/dial.rs": (
+        "go-debug：多地址顺序尝试的逐地址失败（connect failed / TIMEOUT / skipped DNS "
+        "server）——最终失败经 last_err 上抛给查询方；DoH resolve failed 已提 WARN"
+    ),
+    "crates/xray-app-dns/src/nameserver/doh.rs": (
+        "go-debug：热会话失效 → 重建连接（瞬断中继，重连成功无痕）；query failed 已提 WARN"
+    ),
+    "crates/xray-app-dns/src/nameserver/dot.rs": (
+        "go-debug：池化连接失效 → 立即重连（瞬断中继）"
+    ),
+    "crates/xray-app-dns/src/nameserver/tcp.rs": (
+        "go-debug：池化连接失效 → 立即重连（瞬断中继）"
+    ),
+    "crates/xray-app-dns/src/nameserver/udp.rs": (
+        "go-debug：per-NS UDP recv loop 退出（单查询失败由 query 路径上抛给调用方）"
+    ),
+    "crates/xray-app-reverse/src/relay.rs": (
+        "defer：bd c43mw 第二批（属主面 xray-app-reverse 本轮禁碰，F 在改同树）"
+    ),
+    "crates/xray-app-router/src/router.rs": (
+        "go-debug：DNS 解析失败后规则仅按域名匹配（降级路径，非连接失败）"
+    ),
+    "crates/xray-cli/src/identity.rs": "go-debug：构建指纹不可得 → 'unknown'（信息性降级）",
+    "crates/xray-core/src/inbound.rs": (
+        "defer：bd c43mw 第二批（属主面 xray-core/src/inbound.rs 本轮禁碰，F 在改同树）；"
+        "27 处均为逐连接握手/逐包留痕，提级需逐站点对 Go LogDebugInner/LogErrorInner 定级"
+        "并按包限频"
+    ),
+    "crates/xray-stress/src/scenarios.rs": "go-debug：压测 harness 逐轮重连留痕（非产品面）",
+    "crates/xray-tls/src/btls_client.rs": (
+        "go-debug：SSL_set_session 失败 → 走 full handshake（无会话复用，功能不损）"
+    ),
+    "crates/xray-transport/src/happy_eyeballs.rs": (
+        "go-debug：竞速拨号逐地址失败（最终由胜者 / 汇总错误决定）"
+    ),
+    "crates/xray-transport/src/sockopt/mod.rs": (
+        "go-debug：TCP_FASTOPEN_CONNECT 不可用 → 普通握手（内核能力探测）"
+    ),
+    "crates/xray-transport/src/system_dialer.rs": (
+        "go-debug：逐地址拨号尝试失败 / fallback family 探测（最终错误上抛调用方）"
+    ),
+    "crates/xray-transport/src/system_listener.rs": (
+        "go-debug：MPTCP / listener controller / SO_PEERCRED 能力不可用 → 回退（能力探测）"
+    ),
+    "crates/xray-transport/src/tcp/hub.rs": (
+        "go-debug：单连接级 accept 错误 → 继续监听（按连接刷屏，不可提级）"
+    ),
+    "crates/xray-transport-grpc/src/transport.rs": (
+        "go-debug：dial 重试中间态（最终失败上抛）/ tcpmask wrap 失败回退 None"
+    ),
+    "crates/xray-transport-httpupgrade/src/register.rs": (
+        "go-debug：单连接级 accept / 首字节等待 / 握手失败 → 继续监听（按连接刷屏）"
+    ),
+    "crates/xray-transport-hysteria/src/quinn_adapter.rs": (
+        "go-debug：单流/单连接级 QUIC accept·读失败与 h3 会话结束（按连接刷屏）"
+    ),
+    "crates/xray-transport-hysteria/src/register.rs": (
+        "go-debug：单连接级 accept 错误 → 继续监听"
+    ),
+    "crates/xray-transport-naive/src/dial.rs": "go-debug：h2 连接驱动结束（连接级终态）",
+    "crates/xray-transport-naive/src/inbound.rs": (
+        "go-debug：单连接级 TLS accept / h2 连接结束 / tunnel upgrade 失败（按连接刷屏）"
+    ),
+    "crates/xray-transport-splithttp/src/transport.rs": (
+        "go-debug：单连接级 accept 错误 / XHTTP tcpmask wrap 回退 / REALITY fallback"
+    ),
+    "crates/xray-transport-websocket/src/register.rs": (
+        "go-debug：单连接级握手/accept 错误与连接池补给拨号失败（按连接刷屏；池补给失败"
+        "最终由拨号方错误兜底）"
+    ),
+}
+
+
 
 # 白名单（文件级，房规同 check_udp_binds）。**只准登记「有 Go 源码依据的瞬断
 # 重放噪声」**，新增白名单条目必须在报告/票面点名 Go 对位依据。
@@ -310,6 +463,35 @@ def scan_failure_traces(root: Path, whitelist: dict[str, str] | None = None) -> 
                 "line": line_of(cleaned, m.start()),
                 "kind": "WHITELISTED" if r in whitelist else "PRODUCTION",
                 "reason": whitelist.get(r, ""),
+            })
+    return hits
+
+
+def scan_failure_traces_debug(
+    root: Path, registry: dict[str, str] | None = None
+) -> list[dict]:
+    """DEBUG 级日志里的失败留痕（bd c43mw 扩面；旧 (a) 只认 `error=` 字面形态）。
+
+    窗口判定：从调用点起 240 字符内出现 `error=` / `err=` / `failed` / `failure` /
+    `失败` 即算命中（宁误红不漏放）。已由旧 (a) 形态覆盖的 `hot_log!(DEBUG, "error…`
+    不重复报。
+    """
+    registry = FAILURE_TRACE_DEBUG_REGISTRY if registry is None else registry
+    hits: list[dict] = []
+    for rs, src in load_production(root).items():
+        cleaned = strip_cfg_test_blocks(strip_comments_keep_strings(src))[0]
+        r = rel(root, rs)
+        for m in DEBUG_LEVEL_CALL.finditer(cleaned):
+            if HOT_LOG_DEBUG_ERROR.match(cleaned, m.start()) is not None:
+                continue  # 旧形态归 (a) 主门（白名单契约更严）
+            window = log_call_span(cleaned, m.start())
+            if FAILURE_TEXT.search(window) is None:
+                continue
+            hits.append({
+                "file": r,
+                "line": line_of(cleaned, m.start()),
+                "registered": r in registry,
+                "reason": registry.get(r, ""),
             })
     return hits
 
@@ -582,10 +764,223 @@ def scan_comment_drift(root: Path, raw: dict[Path, str], cleaned_map: dict[Path,
 
 
 # ---------------------------------------------------------------------------
+# (e) ignore 理由门扫描
+# ---------------------------------------------------------------------------
+
+# 裸 `#[ignore]` 与等价物 `#[ignore = ""]`（有属性无理由，同属「没写为什么」）。
+IGNORE_BARE = re.compile(r'#\[\s*ignore\s*(?:=\s*""\s*)?\]')
+
+
+def scan_bare_ignores(root: Path) -> list[dict]:
+    """`#[ignore]`（无 `reason`）全仓命中（bd st3l1 / s4xsk）。
+
+    `#[ignore]` 只长在测试面（`#[cfg(test)]` 块 / `tests/` 目录），故本门与
+    (a)(b)(d) 相反：扫全树、不剥离 cfg(test)。注释里提到 `#[ignore]`（如
+    「标 #[ignore] 因需要网络」）先被掏空，不算命中。
+    """
+    hits: list[dict] = []
+    for base in (root / "crates", root / "tests"):
+        if not base.is_dir():
+            continue
+        for rs in sorted(base.rglob("*.rs")):
+            if "udf-frame" in rs.relative_to(root).parts:
+                continue
+            src = rs.read_text(encoding="utf-8", errors="replace")
+            cleaned = strip_comments_keep_strings(src)
+            for m in IGNORE_BARE.finditer(cleaned):
+                hits.append({"file": rel(root, rs), "line": line_of(cleaned, m.start())})
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# (f) 锁跨 await 门（bd auf6h / PM-13）
+# ---------------------------------------------------------------------------
+
+# tokio 锁绑定形态：`let [mut] v[: T] = <recv>.lock().await`
+TOKIO_LOCK_BINDING = re.compile(
+    r"let\s+(?:mut\s+)?(?P<var>\w+)\s*(?::[^=;]+)?=\s*(?P<expr>[^;]*?)\.\s*lock\s*\(\s*\)\s*\.await"
+)
+# 绑定合法收尾：`?` / `unwrap()` / `unwrap_or_else(..)` / `expect(..)` 之后即 `;`。
+# 收尾不成立 ⇒ `let` 拿到的不是 guard（guard 是临时，语句末就 drop）——此时另按
+# 「链式形态」判：同一语句里还有 `.await` ⇒ 临时 guard 跨 await。
+LOCK_BIND_TAIL = re.compile(
+    r"\s*(?:\?|\.unwrap\(\)|\.unwrap_or_else\([^;]*\)|\.expect\((?:[^()]|\([^()]*\))*\))*\s*;"
+)
+# 不透明边界：此后的 `.await` 不属 guard 生命周期（新 task / 新 future 自带所有权）。
+OPAQUE_BOUNDARY = re.compile(r"\basync\s+move\b|\basync\s*\{|\bspawn\s*\(|\bspawn_blocking\s*\(")
+
+# 登记簿：键 = f"{文件}#{变量名}"（按符号锚，不按行号——行号随树漂移，见 pzjpj）。
+# 值前缀两类：
+#   【accepted】 设计性：guard 就是「独占读写 / !Sync 包装 / 单飞 / 启动期一次性」的
+#                本体，跨 await 不可消除；改窄要么无 API 支持（`&mut` 独占），要么
+#                引入竞态（单飞失效、多 spawn 一组泵）。
+#   【debt】     真隐患（持锁等对端 / 跨慢 syscall）：应改窄，逐条写清属主面与改法。
+GUARD_ACROSS_AWAIT_REGISTRY: dict[str, str] = {
+    "crates/xray-app-dns/src/nameserver/doh.rs#_gate": (
+        "accepted：建连门（并发 A/AAAA 冷启动只建一条连接，门内复查）——持锁跨 "
+        "open_session 就是单飞语义本体，一次建连即释放"
+    ),
+    "crates/xray-app-dns/src/nameserver/udp.rs#slot": (
+        "accepted：per-NS 通道槽，持锁跨 UdpChannel::bind 防重复 bind（毫秒级一次性）"
+    ),
+    "crates/xray-core/src/outbound.rs#guard": (
+        "accepted：DNS 上游写半部独占（Mutex<Option<OwnedWriteHalf>>），临界区只有一次 "
+        "write_dns_frame().await；拨号/解析已移出锁外（bd pzxvn）"
+    ),
+    "crates/xray-mux/src/writer.rs#guard": (
+        "accepted：carrier 写半部独占（lock 即「单写者」），一次 write_multi_buffer"
+    ),
+    "crates/xray-proxy-anytls/src/inbound.rs#slot": (
+        "accepted：inbound start 一次性（AlreadyStarted 门），持锁跨建服务器是该门本体"
+    ),
+    "crates/xray-proxy-dokodemo/src/server.rs#guard": (
+        "accepted：inbound start 一次性（AlreadyStarted 门）"
+    ),
+    "crates/xray-proxy-tuic/src/pool.rs#_guard": (
+        "accepted：per-key 单飞拨号锁（double-check 后复用池内连接）——持锁跨 dial "
+        "正是单飞本体，去掉即重复拨号"
+    ),
+    "crates/xray-proxy-vless/src/dispatcher.rs#rx": (
+        "debt：`pop()` 持 Mutex<Receiver> 跨 recv().await（PM-06 同窝）；属主面 "
+        "xray-proxy-vless（bd auf6h 本轮禁碰）——改法与 PM-06 同：async_channel 取代 "
+        "Mutex<Receiver>，或让读者持 &mut 单读者"
+    ),
+    "crates/xray-proxy-wireguard/src/driver.rs#_single": (
+        "accepted：单飞拨号闸——持锁跨 dialer().await 就是「并发 send 只拨一条」本体"
+    ),
+    "crates/xray-proxy-wireguard/src/driver.rs#res": (
+        "accepted：连接写锁 + 有界写超时（DIALED_WRITE_TIMEOUT），死锁不成立"
+    ),
+    "crates/xray-proxy-wireguard/src/driver.rs#stack": (
+        "debt：netstack 锁跨 send_wg().await（socket 写）；建议先聚 outputs → 放锁 "
+        "poll → 锁外 send（属主面 xray-proxy-wireguard，需数据面回环测兜底）"
+    ),
+    "crates/xray-transport-grpc/src/encoding.rs#data": (
+        "accepted：HunkStream 读写要 &mut，Mutex 即独占读写本体（recv_hunk）"
+    ),
+    "crates/xray-transport-grpc/src/encoding.rs#stream": (
+        "accepted：同上（send_hunk 要 &mut）"
+    ),
+    "crates/xray-transport-grpc/src/encoding.rs#raw": (
+        "accepted：同上（MultiHunk recv_hunk 要 &mut）"
+    ),
+    "crates/xray-transport-hysteria/src/conn.rs#data": (
+        "accepted：Mutex<Receiver> 是 Receiver 非 Sync 的容器，持锁即「独占读」语义"
+        "（去掉则多读者语义不成立）"
+    ),
+    "crates/xray-transport-hysteria/src/udphop.rs#pkt": (
+        "accepted：同 conn.rs#data（Mutex<Receiver> 独占读）"
+    ),
+    "crates/xray-transport-splithttp/src/h3_client.rs#send_req": (
+        "accepted：h3 `SendRequest` 建流要 &mut，send_request().await 期间必须持锁；"
+        "已在拿到 stream 后立即 drop（PM-13/N7 建议形态）"
+    ),
+    "crates/xray-transport-websocket/src/ws_bridge.rs#guard": (
+        "accepted：per-conn 写锁（心跳 ping 一次 send），锁粒度=一次写"
+    ),
+    "crates/xray-transport/src/finalmask/realm/conn.rs#guard": (
+        "accepted：Mutex<Receiver> 独占读（realm 数据面单读者）"
+    ),
+    "crates/xray-transport/src/finalmask/xdns/client.rs#pkt": (
+        "accepted：Mutex<Receiver> 独占读（xdns 客户端应答取包）"
+    ),
+    "crates/xray-transport/src/finalmask/xdns/server.rs#pkt": (
+        "accepted：Mutex<Receiver> 独占读（xdns 服务端取包）"
+    ),
+    "crates/xray-transport/src/finalmask/xicmp.rs#sh": (
+        "accepted：Mutex<Receiver> 独占读（xicmp 共享收包队列）"
+    ),
+    "crates/xray-transport/src/udp/relay.rs#sock": (
+        "debt：sessions 表锁在慢路径跨 dial_udp_packet_conn/connect（网络 syscall）；"
+        "快路径已是短锁。改法 = per-dest 单飞（建会话期间不占表锁）+ 建好后二次入表"
+        "（需防并发同 dest 多 spawn 一组 reader/timer），属主面 xray-transport"
+    ),
+}
+
+
+
+def enclosing_block_end(text: str, pos: int) -> int | None:
+    """`pos` 处代码所属最内层 `{...}` 的收口位置（找不到返回 None）。"""
+    j = pos - 1
+    depth = 0
+    while j >= 0:
+        if text[j] == "}":
+            depth += 1
+        elif text[j] == "{":
+            if depth == 0:
+                break
+            depth -= 1
+        j -= 1
+    if j < 0:
+        return None
+    depth = 0
+    k = j
+    while k < len(text):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return None
+
+
+def scan_guard_across_await(root: Path) -> list[dict]:
+    """tokio 锁 guard 跨 `.await` 命中（bd auf6h）。
+
+    两种形态：
+    - `chain`：`let v = x.lock().await.recv().await;` —— guard 是临时值，锁一直持有到
+      内层 await 返回（PM-06 家族：持锁等对端）。
+    - `bound`：`let g = x.lock().await;` 后同一块内出现 `.await`，且 `drop(g)` 之前
+      （`Mutex<Receiver>` / `Mutex<Writer>` 的「独占读写」语义，或真隐患）。
+
+    判定边界（都是「宁可少报也不刷屏」的口径，逐条登记在登记簿）：
+    - `drop(g)` 之后不再计（显式放锁）；
+    - 嵌套 `async move {}` / `spawn(..)` 之后不再计（所有权已交给新 task）。
+    """
+    hits: list[dict] = []
+    for rs, src in load_production(root).items():
+        cleaned = strip_cfg_test_blocks(strip_comments_and_strings(src))[0]
+        r = rel(root, rs)
+        for m in TOKIO_LOCK_BINDING.finditer(cleaned):
+            var = m.group("var")
+            if m.group("expr").strip().startswith("*"):
+                continue  # `*lock()` 解引用取值：guard 是临时，语句末 drop
+            after = cleaned[m.end():]
+            tail = LOCK_BIND_TAIL.match(after)
+            if tail is None:
+                # 链式形态：同一语句内还有 `.await`
+                semi = after.find(";")
+                stmt = after[:semi] if semi >= 0 else after
+                if ".await" in stmt:
+                    hits.append(
+                        {"file": r, "line": line_of(cleaned, m.start()), "var": var, "form": "chain"}
+                    )
+                continue
+            block_end = enclosing_block_end(cleaned, m.end())
+            if block_end is None:
+                continue
+            seg = cleaned[m.end() + len(tail.group(0)):block_end]
+            drop = re.search(r"\bdrop\s*\(\s*" + re.escape(var) + r"\s*\)", seg)
+            if drop is not None:
+                seg = seg[:drop.start()]
+            opaque = OPAQUE_BOUNDARY.search(seg)
+            if opaque is not None:
+                seg = seg[:opaque.start()]
+            if ".await" in seg:
+                hits.append(
+                    {"file": r, "line": line_of(cleaned, m.start()), "var": var, "form": "bound"}
+                )
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # 门执行
 # ---------------------------------------------------------------------------
 
-def gate_a(root: Path) -> tuple[bool, str]:
+def gate_a_hot_log(root: Path) -> tuple[bool, str]:
+    """(a) 主形态：`hot_log!(DEBUG, "error=…")` 硬红 + 白名单。"""
     hits = scan_failure_traces(root)
     prod = [h for h in hits if h["kind"] == "PRODUCTION"]
     lines = []
@@ -602,6 +997,45 @@ def gate_a(root: Path) -> tuple[bool, str]:
         f"OK (a) 失败留痕门：生产代码零 DEBUG error= 留痕"
         f"（白名单 {len(wl)} 处：{'; '.join(sorted({h['file'] for h in wl})) or '无'}）"
     )
+
+
+def gate_a(root: Path, registry: dict[str, str] | None = None) -> tuple[bool, str]:
+    """(a) 失败留痕门：主形态（旧）+ DEBUG 级扩面（bd c43mw）合并判定。"""
+    registry = FAILURE_TRACE_DEBUG_REGISTRY if registry is None else registry
+    ok, msg = gate_a_hot_log(root)
+    dbg = scan_failure_traces_debug(root, registry)
+    unreg = [h for h in dbg if not h["registered"]]
+    defer = [
+        h for h in dbg if h["registered"] and registry[h["file"]].startswith("defer")
+    ]
+    if not dbg:
+        return ok, msg + "\nOK (a2) DEBUG 级失败留痕：零命中"
+    if unreg:
+        files = sorted({h["file"] for h in unreg})
+        out = [msg]
+        out.append(
+            f"FAIL (a2) DEBUG 级失败留痕（bd c43mw 扩面）：未登记 {len(unreg)} 处 / "
+            f"{len(files)} 文件："
+        )
+        for h in unreg:
+            out.append(f"  {h['file']}:{h['line']}")
+        out.append(
+            "    → 真失败提级 WARN/ERROR（逐包/单连接级加限频）；确属 Go 同位 DEBUG 则登记 "
+            "FAILURE_TRACE_DEBUG_REGISTRY（go-debug: <Go 依据>）"
+        )
+        return False, "\n".join(out)
+    out = [
+        msg,
+        f"OK (a2) DEBUG 级失败留痕（bd c43mw 扩面）：{len(dbg)} 处全部登记"
+        f"（go-debug {len(dbg) - len(defer)} / defer {len(defer)}）",
+    ]
+    if defer:
+        per_file: dict[str, int] = {}
+        for h in defer:
+            per_file[h["file"]] = per_file.get(h["file"], 0) + 1
+        detail = "; ".join(f"{f}×{n}" for f, n in sorted(per_file.items()))
+        out.append(f"  defer（bd c43mw 第二批待提级）：{detail}")
+    return ok, "\n".join(out)
 
 
 def gate_b(root: Path) -> tuple[bool, str]:
@@ -664,6 +1098,57 @@ def gate_d(root: Path) -> tuple[bool, str]:
     if stale:
         return True, ok_msg + "\n" + "\n".join(lines)
     return True, ok_msg
+
+
+def gate_e(root: Path) -> tuple[bool, str]:
+    hits = scan_bare_ignores(root)
+    if not hits:
+        return True, "OK (e) ignore 理由门：全部 `#[ignore]` 带 reason"
+    lines = [f"FAIL (e) ignore 理由门：`#[ignore]` 无 reason {len(hits)} 处："]
+    for h in hits:
+        lines.append(f"  {h['file']}:{h['line']}")
+    lines.append(
+        "    → 补 `reason = \"...\"`（写清为何不能常跑：外部对端 / 真机网络 / 人工诊断床）；"
+        "禁删测试或改成永不执行"
+    )
+    return False, "\n".join(lines)
+
+
+def gate_f(
+    root: Path, registry: dict[str, str] | None = None
+) -> tuple[bool, str]:
+    """锁跨 await 门（bd auf6h）：未登记即红；登记簿分 accepted / debt 两档。"""
+    registry = GUARD_ACROSS_AWAIT_REGISTRY if registry is None else registry
+    hits = scan_guard_across_await(root)
+    keys = {f"{h['file']}#{h['var']}" for h in hits}
+    unreg = [h for h in hits if f"{h['file']}#{h['var']}" not in registry]
+    stale = [k for k in registry if k not in keys]
+    lines: list[str] = []
+    if stale:
+        lines.append(f"WARN (f)：登记簿陈旧条目（命中已消失，可删）：{'; '.join(stale)}")
+    if unreg:
+        lines.append(
+            f"FAIL (f) 锁跨 await 门：未登记的 tokio guard 跨 `.await` {len(unreg)} 处："
+        )
+        for h in unreg:
+            lines.append(f"  {h['file']}:{h['line']}  {h['var']}（{h['form']}）")
+        lines.append(
+            "    → 改窄（锁内只取/放，或 `drop(guard)` 后再 await）；"
+            "确属设计性（独占读写/单飞/!Sync 包装）则登记理由"
+        )
+        return False, "\n".join(lines)
+    debt = [h for h in hits if registry[f"{h['file']}#{h['var']}"].startswith("debt")]
+    accepted = len(hits) - len(debt)
+    ok = (
+        f"OK (f) 锁跨 await 门：tokio guard 跨 await 命中 {len(hits)} 处全部登记"
+        f"（accepted {accepted} / debt {len(debt)}）"
+    )
+    if debt:
+        detail = "; ".join(f"{h['file']}:{h['line']} {h['var']}" for h in debt)
+        ok += f"\n  debt（待改窄）：{detail}"
+    if stale:
+        return True, ok + "\n" + "\n".join(lines)
+    return True, ok
 
 
 def gate_c(run_cargo: bool) -> tuple[bool, str]:
@@ -735,6 +1220,27 @@ def cmd_self_test() -> int:
         check("(a) 非 error DEBUG 留痕不误报", "crates/fx/src/ok_trace.rs" not in by)
         check("(a) 多行形态 + 白名单必须放行", by.get("crates/fx/src/wl.rs") == "WHITELISTED")
 
+        # (a2) DEBUG 级失败留痕扩面（bd c43mw）：LOG.debug/tracing::debug! 形态必须命中；
+        # 消息不含失败语义、或失败语义落在**下一条语句**，都不许误报。
+        (src / "dbg_trace.rs").write_text(
+            'fn f(e: String) {\n'
+            '    crate::LOG.debug(format!("error={e} grpc accept failed"));\n'
+            '    tracing::debug!(error = %e, "doh: query failed");\n'
+            '    crate::LOG.debug("tick processed");\n'
+            '    crate::LOG.debug("querying SRV record for address port strategy");\n'
+            '    let _ = could_fail();\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        dbg_hits = scan_failure_traces_debug(troot, registry={})
+        dbg_lines = [h["line"] for h in dbg_hits if h["file"] == "crates/fx/src/dbg_trace.rs"]
+        check("(a2) LOG.debug / tracing::debug! 失败留痕必须报", dbg_lines == [2, 3])
+        ok_a2, msg_a2 = gate_a(troot, registry={})
+        check("(a2) 未登记 ⇒ 门必须红", not ok_a2 and "FAIL (a2)" in msg_a2)
+        # 只判 (a2) 面：临时树里的旧形态违规（bad_trace.rs）属 (a) 主门，不在本条断言范围
+        _, msg_a2_reg = gate_a(troot, registry={"crates/fx/src/dbg_trace.rs": "go-debug: self-test"})
+        check("(a2) 登记后 ⇒ (a2) 面绿", "OK (a2)" in msg_a2_reg)
+
         # (b) 裸 allow 必须报；同行/下2行/前向注释理由必须放行；unused_imports 恒报
         (src / "bare.rs").write_text(
             "#[allow(dead_code)]\n"
@@ -797,6 +1303,78 @@ def cmd_self_test() -> int:
                   ["cargo", "test", "-p", "xray-frame", "--lib", "budget"],
               ])
 
+        # (e) 裸 #[ignore] 必须报；带 reason / 注释里提及必须放行
+        (src / "ignored.rs").write_text(
+            "#[tokio::test]\n"
+            "#[ignore]\n"
+            "async fn bare_ignored() {}\n"
+            "#[tokio::test]\n"
+            '#[ignore = ""]\n'
+            "async fn empty_reason_ignored() {}\n",
+            encoding="utf-8",
+        )
+        (src / "ignored_ok.rs").write_text(
+            "/// 注释里提到 #[ignore] 不算命中。\n"
+            "#[tokio::test]\n"
+            '#[ignore = "需要外部对端"]\n'
+            "async fn reasoned_ignored() {}\n",
+            encoding="utf-8",
+        )
+        bare_lines = {h["line"] for h in scan_bare_ignores(troot) if h["file"] == "crates/fx/src/ignored.rs"}
+        check("(e) 裸 #[ignore] 与空 reason 故意违规必须报", bare_lines == {2, 5})
+        check(
+            "(e) 带 reason / 注释提及不误报",
+            all(
+                h["file"] != "crates/fx/src/ignored_ok.rs" for h in scan_bare_ignores(troot)
+            ),
+        )
+
+        # (f) tokio guard 跨 await：链式/绑定两形态必须报；drop/嵌套 spawn 必须放行
+        (src / "lock_bad.rs").write_text(
+            "async fn chain(m: &tokio::sync::Mutex<Rx>) -> Option<i32> {\n"
+            "    let v = m.lock().await.recv().await;\n"
+            "    v\n"
+            "}\n"
+            "async fn bound(m: &tokio::sync::Mutex<Rx>) {\n"
+            "    let g = m.lock().await;\n"
+            "    other().await;\n"
+            "    drop(g);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (src / "lock_ok.rs").write_text(
+            "async fn dropped(m: &tokio::sync::Mutex<Rx>) {\n"
+            "    let g = m.lock().await;\n"
+            "    drop(g);\n"
+            "    other().await;\n"
+            "}\n"
+            "async fn spawned(m: &tokio::sync::Mutex<Rx>) {\n"
+            "    let g = m.lock().await;\n"
+            "    tokio::spawn(async move {\n"
+            "        other().await;\n"
+            "    });\n"
+            "    drop(g);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        lock_hits = scan_guard_across_await(troot)
+        lock_forms = {(h["file"], h["form"]) for h in lock_hits}
+        check(
+            "(f) 链式 + 绑定两形态故意违规必须报",
+            {("crates/fx/src/lock_bad.rs", "chain"), ("crates/fx/src/lock_bad.rs", "bound")}
+            <= lock_forms,
+        )
+        check(
+            "(f) drop 后 await / 嵌套 spawn 内 await 不误报",
+            all(h["file"] != "crates/fx/src/lock_ok.rs" for h in lock_hits),
+        )
+        ok_f, _ = gate_f(troot)
+        check("(f) 有命中且未登记 ⇒ 门必须红", not ok_f)
+        ok_f_reg, _ = gate_f(
+            troot, registry={"crates/fx/src/lock_bad.rs#v": "accepted", "crates/fx/src/lock_bad.rs#g": "accepted"}
+        )
+        check("(f) 全部登记 ⇒ 门必须绿", ok_f_reg)
+
     print("SELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 2
 
@@ -818,14 +1396,25 @@ def cmd_list(root: Path) -> int:
     for s in d:
         mark = "REGISTERED" if s["registered"] else "SUSPECT"
         print(f"  {mark}  {s['file']}:{s['line']}  {s['const']} = {s['value']}  注释数字={s['comment_numbers']}")
-    return 0 if (a_ok and b_ok) else 1
+    e_ok, e_msg = gate_e(root)
+    print(e_msg)
+    print("(f) tokio guard 跨 await 命中（含登记簿放行）：")
+    for h in scan_guard_across_await(root):
+        key = f"{h['file']}#{h['var']}"
+        mark = "REGISTERED" if key in GUARD_ACROSS_AWAIT_REGISTRY else "UNREGISTERED"
+        print(f"  {mark}  {h['file']}:{h['line']}  {h['var']}（{h['form']}）")
+    f_ok, f_msg = gate_f(root)
+    print(f_msg)
+    return 0 if (a_ok and b_ok and e_ok and f_ok) else 1
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="je3u3 质量门四件套（失败留痕/抑制登记/登记簿漂移/注释漂移）")
+    ap = argparse.ArgumentParser(
+        description="je3u3 质量门六件套（失败留痕/抑制登记/登记簿漂移/注释漂移/ignore 理由/锁跨 await）"
+    )
     ap.add_argument("--no-cargo", action="store_true", help="跳过 (c) cargo 面（纯静态快路径）")
-    ap.add_argument("--list", action="store_true", help="枚举 (a)(b)(d) 全部命中与分类")
-    ap.add_argument("--self-test", action="store_true", help="注入违规自测（四道门各一条）")
+    ap.add_argument("--list", action="store_true", help="枚举 (a)(b)(d)(f) 全部命中与分类")
+    ap.add_argument("--self-test", action="store_true", help="注入违规自测（六道门各一条）")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     args = ap.parse_args()
     if args.self_test:
@@ -841,6 +1430,12 @@ def main() -> int:
     d_gate = gate_d(args.root)
     results.append(("d", *d_gate))
     print(d_gate[1])
+    e_gate = gate_e(args.root)
+    results.append(("e", *e_gate))
+    print(e_gate[1])
+    f_gate = gate_f(args.root)
+    results.append(("f", *f_gate))
+    print(f_gate[1])
     c_gate = gate_c(run_cargo=not args.no_cargo)
     results.append(("c", *c_gate))
     print(c_gate[1])
@@ -849,7 +1444,10 @@ def main() -> int:
     if failed:
         print(f"\n质量门 FAIL：{'/'.join(failed)}")
         return 1
-    print("\n质量门 PASS：(a) 失败留痕 / (b) 抑制登记 / (c) 登记簿漂移 / (d) 注释漂移抽查")
+    print(
+        "\n质量门 PASS：(a) 失败留痕 / (b) 抑制登记 / (c) 登记簿漂移 / (d) 注释漂移抽查"
+        " / (e) ignore 理由 / (f) 锁跨 await"
+    )
     return 0
 
 

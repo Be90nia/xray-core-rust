@@ -28,6 +28,7 @@ use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
 };
 
 use crate::{
@@ -42,7 +43,8 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_reality(&dest, &settings).await })
     });
-    let _ = register_transport_dialer("reality", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1）。
+    ignore_already_exists(register_transport_dialer("reality", dialer))?;
     Ok(())
 }
 
@@ -150,9 +152,21 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     let short_id = if short_id_str.is_empty() {
         Vec::new()
     } else {
-        hex::decode(short_id_str).map_err(|e| {
+        let raw = hex::decode(short_id_str).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("reality: invalid shortId hex: {e}"))
-        })?
+        })?;
+        // bd 4w092(e)：Go `copy(hello.SessionId[8:], config.ShortId)`
+        // （reality.go:161）只搬前 min(len,24) 字节，服务端也只比 SessionId
+        // 前 8 字节 ⇒ >8 字节 shortId 在 Go 上等价于"截断到 8 字节"可用。
+        // Rust 原先在握手期 `InvalidShortIdLen` 硬错 = 互通差异；此处按 Go 截断。
+        if raw.len() > 8 {
+            tracing::warn!(
+                target: "xray_reality::register",
+                len = raw.len(),
+                "reality: shortId longer than 8 bytes; using its first 8 bytes (Go truncates identically)"
+            );
+        }
+        raw.into_iter().take(8).collect()
     };
     // 257w：mldsa65Verify 配置期校验（Go transport_security.go:209-213，
     // base64 RawURL 解码 + 1952B 公钥），配错即拒启而非静默忽略。

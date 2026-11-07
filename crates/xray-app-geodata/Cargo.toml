@@ -36,6 +36,8 @@ webpki-roots = { workspace = true }
 [dev-dependencies]
 xray-geodata = { path = "../xray-geodata" }
 prost = { workspace = true }
+# bd vfu5l：https_handshake 真握手回归（本地回环 rustls 服务端需自签证书）。
+rcgen = "0.13"
 
 [lints.clippy]
 # bd g3cr / T0.3 基线段（模板同 xray-frame）：生产零 unwrap；

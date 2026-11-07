@@ -7,6 +7,12 @@
 //!   [`crate::ech_https_rr::extract_ech_and_ttl_from_dns_response`]
 //!
 //! # 对齐差异（有意为之）
+//! - **DoH 查询连接的 TLS 栈**（bd 4w092 a）：本函数用 rustls 原生 ClientHello
+//!   （`DEFAULT_DOH_TLS_CONFIG` / [`crate::utls::default_client_config`]），Go 用 uTLS Chrome
+//!   模板（`ech.go:203-225` `utls.UClient(..., HelloChrome_Auto)`） ⇒ 向 DoH
+//!   服务器（Cloudflare/Google，本身是 TLS 指纹检测方）暴露"非浏览器栈"。 改走 btls 指纹需把 h2
+//!   客户端换成 `BtlsConn` 并处理其异步握手/回接验证， 收益仅在 ECH
+//!   场景；当前**显式登记为差异**而非静默。
 //! - Go 的 EDNS0(4096)+随机 padding 与 `X-Padding` 头是流量指纹混淆项，不 影响正确性（DoH 无 UDP
 //!   512B 限制，主流 DoH 对无 EDNS 查询正常回答）。 ponytail: 指纹级对齐需要时再加。
 //! - Go `udp://` 经典 UDP 查询：本版明确报错（Go 可成功），待真实需求再补 datagram 路径。
@@ -243,7 +249,7 @@ where
         .map_err(|e| TlsError::EchApply(format!("ECH DoH h2 handshake: {e}")))?;
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（DoH h2 conn driver）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（DoH h2 conn driver）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         let _ = conn.await;

@@ -37,22 +37,18 @@ impl Manager {
 }
 
 impl PolicyManager for Manager {
-    /// 按 level 查询运行时策略；找不到时返回 `Policy::default()`。
+    /// 按 level 查询运行时策略；找不到时返回 `Policy::default()`（SessionDefault）。
     ///
-    /// 对应 Go `(*Instance).ForLevel(level)` + `DefaultManager.ForLevel`：
-    /// - 默认返回 SessionDefault（Handshake=60s, ConnectionIdle=300s ...）
-    /// - level==1 强制 ConnectionIdle=600s（Go `default.go:18-20` 特判）
+    /// 对应 Go `(*Instance).ForLevel`：配置过的 level 走 default+override，
+    /// 未配置的 level 恒为 SessionDefault（**没有** level-1 特判）。
+    ///
+    /// yh01f-a：Go 的 level-1 `ConnectionIdle = 600s` 只存在于
+    /// `features/policy/default.go:18-20` 的 `DefaultManager.ForLevel`，即
+    /// **完全没有 policy 配置**时的兜底管理器；`Instance.ForLevel`（本类型，
+    /// 由配置构造）从不改写。原实现把该特判搬进 `Manager` 并用「值等于默认」
+    /// 猜用户意图 ⇒ 配了 policy 时 Rust 600s / Go 300s。
     fn policy_for_level(&self, level: u32) -> Policy {
-        let mut p = self.levels.get(&level).cloned().unwrap_or_default();
-        // sol6：Go level-1 特判仅在用户未配置 ConnectionIdle 时生效——
-        // 原实现直接覆写，导致用户显式 7200s 被静默改回 600s。
-        // "用户未配置" = 走默认 Policy::default().timeout.connection_idle
-        // （300s，对应 Go SessionDefault.ConnectionIdle）。其他值即视为用户
-        // 显式覆盖，应保留。
-        if level == 1 && p.timeout.connection_idle == Policy::default().timeout.connection_idle {
-            p.timeout.connection_idle = std::time::Duration::from_secs(600);
-        }
-        p
+        self.levels.get(&level).cloned().unwrap_or_default()
     }
 
     /// 查询系统级统计策略。
@@ -211,13 +207,26 @@ mod tests {
         assert!(!p.stats.user_uplink);
         assert!(!p.stats.user_downlink);
     }
+    /// yh01f-a 回归：配置了 policy 时 level 1 未配置 ⇒ SessionDefault（300s）。
+    ///
+    /// Go `Instance.ForLevel`（由 Config 构造的管理器）**没有** level-1 特判；
+    /// 600s 只存在于 `features/policy/default.go:18-20` 的 `DefaultManager`，即
+    /// 完全没有 policy 配置时的兜底管理器。原实现把该特判搬进本类型并用「值
+    /// 等于默认」猜用户意图 ⇒ 配了 policy 时 Rust 600s / Go 300s。
     #[test]
-    fn manager_level_1_conn_idle_promoted_to_600s() {
-        // 对齐 Go features/policy/default.go:18-20：level==1 时 ConnectionIdle 强制为 600s
-        // （覆盖 SessionDefault 的 300s）。其它字段保持默认。
-        let m = Manager::new(Config::default());
+    fn manager_level_1_keeps_session_default_300s() {
+        let cfg = Config {
+            level: {
+                let mut m = HashMap::new();
+                // 配一个**别的** level ⇒ Manager 走 Instance 语义，level 1 未配置。
+                m.insert(5, proto_policy_with_handshake(42));
+                m
+            },
+            system: None,
+        };
+        let m = Manager::new(cfg);
         let p = m.policy_for_level(1);
-        assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(600));
+        assert_eq!(p.timeout.connection_idle, std::time::Duration::from_secs(300));
         // 其他超时仍是 SessionDefault 值
         assert_eq!(p.timeout.handshake, std::time::Duration::from_secs(60));
         assert_eq!(p.timeout.uplink_only, std::time::Duration::from_secs(1));
@@ -234,8 +243,8 @@ mod tests {
     }
     #[test]
     fn manager_level_1_user_conn_idle_override_preserved() {
-        // sol6：用户显式配 ConnectionIdle=7200s 时，level-1 强制 600s 不能覆写。
-        // 仅在 ConnectionIdle 仍是 SessionDefault 值（300s）时才升级到 600s。
+        // 用户显式配 ConnectionIdle=7200s 必须原样生效（Go `Instance.ForLevel`：
+        // defaultPolicy().overrideWith(p)，无 level-1 改写）。
         let cfg = Config {
             level: {
                 let mut m = HashMap::new();

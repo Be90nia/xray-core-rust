@@ -65,7 +65,7 @@ fn ss_address_format_compatible_with_go() {
     // IPv4：1 字节 type(0x01) + 4 字节 addr + 2 字节 BE port
     let mut buf = Vec::new();
     let addr = Address::ipv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
-    write_address_port_ss(&mut buf, &addr, 443);
+    write_address_port_ss(&mut buf, &addr, 443).expect("write addr should succeed");
     assert_eq!(buf[0], 0x01, "IPv4 地址类型字节应为 0x01");
     assert_eq!(&buf[1..5], &[1, 2, 3, 4], "IPv4 地址字节");
     assert_eq!(&buf[5..7], &443u16.to_be_bytes(), "端口 BE 编码");
@@ -73,7 +73,7 @@ fn ss_address_format_compatible_with_go() {
     // Domain：1 字节 type(0x03) + 1 字节长度 + N 字节域名 + 2 字节 BE port
     let mut buf = Vec::new();
     let addr = Address::Domain("example.com".to_string());
-    write_address_port_ss(&mut buf, &addr, 80);
+    write_address_port_ss(&mut buf, &addr, 80).expect("write addr should succeed");
     assert_eq!(buf[0], 0x03, "Domain 地址类型字节应为 0x03");
     assert_eq!(buf[1], 11, "域名长度");
     assert_eq!(&buf[2..13], b"example.com", "域名内容");
@@ -81,7 +81,7 @@ fn ss_address_format_compatible_with_go() {
     // IPv6：1 字节 type(0x04) + 16 字节 addr + 2 字节 BE port
     let mut buf = Vec::new();
     let addr = Address::ipv6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
-    write_address_port_ss(&mut buf, &addr, 8443);
+    write_address_port_ss(&mut buf, &addr, 8443).expect("write addr should succeed");
     assert_eq!(buf[0], 0x04, "IPv6 地址类型字节应为 0x04");
     assert_eq!(buf.len(), 1 + 16 + 2, "IPv6 地址总长度 = 19 字节");
 }

@@ -49,9 +49,6 @@ pub enum ReverseError {
     #[error("portal dispatch failed: {0}")]
     PortalDispatchFailed(String),
 
-    #[error("invalid control state: {0}")]
-    InvalidControlState(i32),
-
     #[error("proto marshal/unmarshal failed: {0}")]
     ProtoError(String),
 
@@ -105,12 +102,6 @@ mod tests {
     fn display_proto_error() {
         let e = ReverseError::ProtoError("decode fail".into());
         assert!(format!("{e}").contains("decode fail"));
-    }
-
-    #[test]
-    fn display_invalid_control_state() {
-        let e = ReverseError::InvalidControlState(99);
-        assert!(format!("{e}").contains("99"));
     }
 
     #[test]

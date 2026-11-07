@@ -42,7 +42,7 @@ use crate::{
     weight::WeightManager,
 };
 
-/// Go `node`：健康检查结果的最小拷贝（ms 值，与 baselines/maxRTT 同单位比较）。
+/// Go `node`：健康检查结果的最小拷贝（RTT 全为纳秒，与 baselines/maxRTT 单位一致）。
 #[derive(Debug, Clone)]
 struct Node {
     tag: String,
@@ -217,7 +217,9 @@ impl LeastLoadStrategy {
         if !v.alive {
             return false;
         }
-        if self.max_rtt != 0 && v.delay >= self.max_rtt {
+        // Go strategy_leastload.go:185-188：`v.Delay >= maxRTT.Milliseconds()`
+        // —— max_rtt 是 Duration（ns），v.delay 是毫秒。
+        if self.max_rtt != 0 && v.delay >= self.max_rtt / 1_000_000 {
             return false;
         }
         if !candidates.iter().any(|t| t == &v.outbound_tag) {
@@ -246,11 +248,15 @@ impl LeastLoadStrategy {
             if !self.should_select_node(status, &selected) {
                 continue;
             }
+            // Go strategy_leastload.go:161-165：无 health ping 时三处 RTT 都取
+            // `time.Duration(v.Delay) * time.Millisecond`（ms → ns）；有 ping 时
+            // 取的派生值本就是 ns。单位必须统一，否则两类节点差 1e6 倍。
+            let delay_ns = status.delay.saturating_mul(1_000_000);
             let (average, deviation, count_all, count_fail) = match &status.health_ping {
                 Some(h) => (h.average, h.deviation, h.all, h.fail),
-                None => (status.delay, status.delay, 1, 1),
+                None => (delay_ns, delay_ns, 1, 1),
             };
-            let cost_value = if status.health_ping.is_some() { deviation } else { status.delay };
+            let cost_value = if status.health_ping.is_some() { deviation } else { delay_ns };
             let cost = rtt_deviation_cost(self.costs.as_ref(), &status.outbound_tag, cost_value);
             nodes.push(Node {
                 tag: status.outbound_tag.clone(),
@@ -499,14 +505,56 @@ mod tests {
     fn test_max_rtt_filter() {
         let obs =
             ObservationResult { status: vec![status("a", true, 1000), status("b", true, 50)] };
+        // maxRTT 承载的是 Duration（ns）：100ms = 1e8 ns。
         let s = LeastLoadStrategy::new(
-            &cfg(vec![], 1, 100, 0.0),
+            &cfg(vec![], 1, 100_000_000, 0.0),
             vec![],
             Arc::new(FixedSelector(vec!["a".into(), "b".into()])),
             Arc::new(FixedObs(obs)),
         )
         .unwrap();
         assert_eq!(s.pick_outbound().unwrap(), "b");
+    }
+
+    /// hjuvg 回归：`maxRTT: "1s"`（1e9 ns）必须过滤掉 1000ms 节点。
+    ///
+    /// 旧实现拿 `delay_ms >= max_rtt_ns` 比较（1000 >= 1e9 恒 false）⇒ 过滤完全失效。
+    #[test]
+    fn test_max_rtt_nanoseconds_filters_high_delay() {
+        let obs = ObservationResult {
+            status: vec![status("slow", true, 1000), status("fast", true, 999)],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 1_000_000_000, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["slow".into(), "fast".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        // 1000ms >= 1000ms → slow 剔除；仅剩 fast。
+        assert_eq!(s.pick_outbound().unwrap(), "fast");
+    }
+
+    /// w9gmd 回归：无 health ping 节点的 Delay 必须折成 ns 再与 ping 派生值混排。
+    ///
+    /// 旧实现直接把 ms 塞进 `rtt_average`/cost ⇒ 200ms 的无 ping 节点（200）
+    /// 排到 100ms 的有 ping 节点（1e8）前面，排序整体失真。
+    #[test]
+    fn test_no_ping_delay_scaled_to_nanoseconds() {
+        let obs = ObservationResult {
+            status: vec![
+                status("no_ping_200ms", true, 200),
+                ping_status("ping_100ms", true, 100, 100_000_000, 100_000_000, 10, 0),
+            ],
+        };
+        let s = LeastLoadStrategy::new(
+            &cfg(vec![], 1, 0, 0.0),
+            vec![],
+            Arc::new(FixedSelector(vec!["no_ping_200ms".into(), "ping_100ms".into()])),
+            Arc::new(FixedObs(obs)),
+        )
+        .unwrap();
+        assert_eq!(s.pick_outbound().unwrap(), "ping_100ms");
     }
 
     #[test]

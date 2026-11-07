@@ -348,7 +348,7 @@ pub(crate) async fn connect_stream(
         }
     }
     let addrs = resolve_dest_addrs(dest, resolver).await.map_err(|e| {
-        tracing::debug!(target: "xray.dns.doh", what = %what, error = %e, "doh: resolve failed");
+        tracing::warn!(target: "xray.dns.doh", what = %what, error = %e, "doh: resolve failed");
         crate::error::DnsError::WireFormat(format!("{what} resolve: {e}"))
     })?;
     // 多地址顺序尝试（bd ypsl：解析 v6 优先而本机 v6 不可达时回退后续地址；

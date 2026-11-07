@@ -52,6 +52,17 @@ fn rewrite_complete_frames(buf: &[u8], from: &Address, to: &Address) -> (MultiBu
             break;
         }
         let Ok((meta, consumed)) = FrameMetadata::from_bytes(rest) else {
+            // 解析失败有两种：字节不够（等下一批）与畸形（这段永远出不来帧）。
+            // 若 2B 长度前缀已声明整帧都在缓冲内、却仍解析失败 = 畸形 ⇒ 丢弃整帧
+            // 继续；否则 Reader 循环会停在 `consumed == 0` 上反复读 ⇒ pending
+            // 无界累积 + 读忙旋（bd 2cfqo，与 xdns「Err 不 drain」同族）。
+            if rest.len() >= 2 {
+                let body_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                if rest.len() >= 2 + body_len {
+                    pos += 2 + body_len;
+                    continue;
+                }
+            }
             break; // 帧头不完整
         };
         let data_len = if meta.has_data() {
@@ -133,10 +144,11 @@ impl Reader for EndpointOverrideReader {
                     }
                     return Ok(mb_out);
                 }
-                if consumed > 0 {
+                if consumed > 0 && !mb_out.is_empty() {
                     return Ok(mb_out);
                 }
-                // 非空读但无完整帧 → 继续读
+                // 非空读但无完整帧（或全是被丢弃的畸形段）→ 继续读：空
+                // MultiBuffer 返回给下游等于伪报 EOF。
             }
         })
     }
@@ -254,6 +266,32 @@ mod tests {
         let (out, consumed) = rewrite_complete_frames(&buf[..5], &from, &to);
         assert_eq!(consumed, 0);
         assert!(out.is_empty());
+    }
+
+    /// bd 2cfqo：畸形帧（长度前缀声明整帧都在、但状态字节非法）必须丢弃并
+    /// 继续解析后续合法帧，而不是当「半帧」留在 pending ⇒ 无界累积 + 读忙旋。
+    #[test]
+    fn rewrite_discards_malformed_frame_and_resyncs() {
+        let from = addr_v4([198, 51, 100, 7]);
+        let to = Address::new_domain(String::from("sniffed.example.com"));
+        let good = two_frames(&from, 53);
+
+        // 2B length=4 + 4B body，body[2] 状态字节 0xFF 非法 → 必然解析失败
+        let mut buf = vec![0x00, 0x04, 0xFF, 0x00, 0x00, 0x00];
+        buf.extend_from_slice(&good);
+
+        let (out, consumed) = rewrite_complete_frames(&buf, &from, &to);
+        assert_eq!(consumed, buf.len(), "畸形段与后续合法帧都必须消费掉");
+
+        let flat = flat_bytes(&out);
+        // 改写会把 IP 目标换成域名（帧变长），故只断言帧内容与顺序
+        let mut pr = PacketReader::new(std::io::Cursor::new(&flat[..]));
+        let p1 = pr.read_packet().unwrap().expect("frame 1");
+        assert_eq!(p1.data(), b"first-payload");
+        assert_eq!(p1.udp_target().unwrap().address(), &to);
+        let p2 = pr.read_packet().unwrap().expect("frame 2");
+        assert_eq!(p2.data(), b"second");
+        assert!(pr.read_packet().unwrap().is_none(), "畸形段不得混进输出");
     }
 
     /// MultiBuffer 摊平为字节（块序拼接）。

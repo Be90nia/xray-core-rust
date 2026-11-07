@@ -163,8 +163,12 @@ impl UdpDispatchSession {
         let Inner { frame, req, .. } = inner;
         meta.write_bytes_into(frame);
         frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        frame.extend_from_slice(payload);
-        req.write_all(frame).await
+        // 帧头与载荷分两次写（bd x6fkn）：duplex 是字节流，读侧按 `accum` 增量
+        // 重组，语义与单次写等价；省掉「payload → frame」整载拷贝，与 Go
+        // xudp `PacketWriter` 的单拷贝（MergeBytes 后一次写）同档。
+        // ponytail: 极端栈/背压下两次 write_all 之间可被读侧观察，无害（流语义）。
+        req.write_all(frame).await?;
+        req.write_all(payload).await
     }
 
     /// 接收一个响应数据报 `(来源, payload)`。
@@ -255,7 +259,7 @@ impl UdpDispatchSession {
         let access = self.access.lock().take();
         #[allow(
             clippy::disallowed_methods,
-            reason = "ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             // bd kol4a：有源走 dispatch_with_access（GlobalID 派生在出站

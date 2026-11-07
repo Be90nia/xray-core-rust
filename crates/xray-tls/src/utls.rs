@@ -38,7 +38,7 @@ use tokio_rustls::{
     rustls::{ClientConfig, ServerConfig},
     server::TlsStream as ServerTlsStream,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use xray_common::alloc_site;
 use xray_transport::connection::Connection;
 
@@ -504,7 +504,7 @@ where
                     Some(ech_resolved.as_str())
                 },
                 Err(e) => {
-                    debug!(target: "xray_tls::utls", error = %e,
+                    warn!(target: "xray_tls::utls", error = %e,
                         "ECH DoH query failed; falling back to invalid config (connection will fail)");
                     Some(list)
                 },
@@ -514,6 +514,19 @@ where
     };
     // 清单外指纹在 `connect_with_alpn` 内硬错（InvalidData）——没有 rustls
     // 回退：配置了指纹却静默回退标准 ClientHello 等于伪装失效（批3 裁决）。
+    // bd 4w092(c)：btls 路径不接 `masterKeyLog`（Go `copyConfig` 会把
+    // KeyLogWriter 搬进 utls 配置）。fail-visible 提示，避免排障时以为已落盘。
+    if !matches!(
+        crate::server_config::parse_master_key_log(
+            security_json.unwrap_or(&serde_json::Value::Null)
+        ),
+        crate::server_config::MasterKeyLogSetting::Off
+    ) {
+        tracing::warn!(
+            target: "xray_tls::utls",
+            "masterKeyLog has no effect on the btls fingerprint path (Go writes it via utls.Config.KeyLogWriter): key log will stay empty"
+        );
+    }
     let conn = crate::btls_client::BtlsConn::connect_with_alpn(
         stream,
         server_name,
@@ -525,10 +538,12 @@ where
         alpn_wire.as_deref(),
         // 0-RTT 总闸（幂等首写协议 opt-in，缺省关）。
         crate::tls_session_cache::parse_allow_early_data(security_json),
+        // bd 9anht：`enableSessionResumption` 真实取值（改前此处写死 None ⇒ 键失效）。
+        crate::tls_session_cache::parse_enable_session_resumption(security_json),
     )
     .await
     .inspect_err(|e| {
-        debug!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败（无 rustls 回退）");
+        warn!(target: "xray_tls::utls", ?fingerprint, error = %e, "btls 握手失败（无 rustls 回退）");
     })?;
     Ok(UConn { inner: conn, fingerprint })
 }
@@ -746,7 +761,7 @@ mod tests {
     /// 连接真实 TLS server (cloudflare.com:443)，验证握手成功。
     /// 标 #[ignore] 因需要网络——CI 默认跳过，手动跑 `cargo test -- --ignored`。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
+    #[ignore = "需真实网络（cloudflare.com:443 出网）；CI 无外网保证，手动 --ignored 跑"]
     async fn btls_chrome133_handshakes_with_real_server() {
         let tcp = tokio::net::TcpStream::connect("cloudflare.com:443")
             .await
@@ -774,7 +789,7 @@ mod tests {
     /// btls 连接自签证书 rustls server 的调试测试。
     /// 标 #[ignore]——用于诊断 'unknown BoringSSL error' 根因。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
+    #[ignore = "调试床：自签对端诊断 BoringSSL error，失败只打 stderr 不 panic，人工判读；手动 --ignored 跑"]
     async fn btls_chrome133_with_self_signed_server_debug() {
         let (addr, _cert_der) = spawn_test_server(b"btls-self-signed\n").await;
 
@@ -810,7 +825,7 @@ mod tests {
     ///
     /// 验证每个指纹都能成功握手 + ALPN 协商为 h2 或 http/1.1。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore]
+    #[ignore = "需真实网络（3 个真实 TLS server × 全 Modern 指纹）；CI 无外网保证，手动 --ignored 跑"]
     async fn btls_all_modern_fingerprints_handshake() {
         let fingerprints: Vec<(Fingerprint, &str)> = vec![
             (Fingerprint::Chrome, "Chrome(preset)"),

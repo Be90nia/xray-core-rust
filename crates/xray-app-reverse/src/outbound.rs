@@ -225,6 +225,20 @@ impl DispatchHandler for PortalOutbound {
         dest: &Destination,
         link: TransportLink,
     ) -> xray_app_dispatcher::default::PinFuture<()> {
+        self.dispatch_with_access(dest, link, xray_app_dispatcher::AccessContext::default())
+    }
+
+    /// 带 access 的 dispatch（bd zk9bv）：入站 ctx 的 `from`/`local` 必须进
+    /// `handle_connection`——它是 New 帧 source/local 的唯一来源（Go
+    /// `IsReverseMuxFromContext` 时 `NewWriter(..., inbound)` 携带 inbound）。
+    /// 旧实现恒传 `AccessContext::default()` ⇒ portal 侧拿不到真实客户端来源，
+    /// `sourceIP`/`sourcePort` 路由与 access log 全失效。
+    fn dispatch_with_access(
+        &self,
+        dest: &Destination,
+        link: TransportLink,
+        access: xray_app_dispatcher::AccessContext,
+    ) -> xray_app_dispatcher::default::PinFuture<()> {
         let tag = self.tag.clone();
         let picker = Arc::clone(&self.picker);
         let domain = self.domain.clone();
@@ -232,10 +246,7 @@ impl DispatchHandler for PortalOutbound {
         let dest = dest.clone();
         Box::pin(async move {
             let outbound = PortalOutbound { tag, picker, domain, fx };
-            if let Err(e) = outbound
-                .handle_connection(&dest, link, &xray_app_dispatcher::AccessContext::default())
-                .await
-            {
+            if let Err(e) = outbound.handle_connection(&dest, link, &access).await {
                 tracing::info!(
                     target: "xray_app_reverse",
                     error = %e,

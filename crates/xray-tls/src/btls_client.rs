@@ -1271,6 +1271,8 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             verifier,
             None,
             false,
+            // 遗留 5 参 API：保持历史行为（允许 session 复用）。
+            true,
         )
         .await
     }
@@ -1287,6 +1289,14 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     /// 行为与 0-RTT 关闭完全一致）。握手停在 0-RTT 写窗时返回的连接处于
     /// `EarlyData::Offering` 态——应用首写以 early data 发出，若服务端拒绝
     /// 则由 AsyncWrite/AsyncRead 内的重发路径兜底（数据零丢失）。
+    ///
+    /// `enable_session_resumption`：`tlsSettings.enableSessionResumption` 的
+    /// 真实取值（bd 9anht：此前此处写死 `parse_enable_session_resumption(None)`
+    /// ⇒ 配置键在主路径上恒失效）。false = 本次拨号不投递缓存 session
+    /// （ClientHello 无 `pre_shared_key`）。**Go 基线从不 resume**（uTLS
+    /// `copyConfig` 不搬 `ClientSessionCache`，握手恒 full）——要与 Go 的
+    /// ClientHello 形态一致，配置显式写 `enableSessionResumption: false`。
+    #[allow(clippy::too_many_arguments)] // 与 Go utls.Config 字段组对称，参数集不拆结构体（热路径零分配）
     pub async fn connect_with_alpn(
         stream: S,
         server_name: &str,
@@ -1295,6 +1305,7 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         verifier: Option<Arc<dyn ServerCertVerifier>>,
         alpn_wire: Option<&[u8]>,
         early_data: bool,
+        enable_session_resumption: bool,
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
@@ -1312,8 +1323,6 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         // BoringSSL `SSL_SESSION_to_bytes` 在 TLS 1.3 path 写「NOT RESUMABLE」
         // 占位符，无法还原 ticket）。`enableSessionResumption=false` 走 lookup
         // 早返（与 rustls 路径的 `Resumption::disabled()` 对齐）。
-        let enable_session_resumption =
-            crate::tls_session_cache::parse_enable_session_resumption(None);
         let mut ssl = cfg.into_ssl(server_name).map_err(|e| io::Error::other(e.to_string()))?;
         let mut session_set = false;
         if let Some(session) =
@@ -1910,10 +1919,18 @@ mod tests {
             #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（首连 full handshake）")]
             let s1 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp1 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c1 =
-                BtlsConn::connect_with_alpn(tcp1, SNI, Fingerprint::Chrome, None, None, None, true)
-                    .await
-                    .unwrap();
+            let mut c1 = BtlsConn::connect_with_alpn(
+                tcp1,
+                SNI,
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
             assert_eq!(c1.early_data_accepted(), None, "首连无缓存：不应有 0-RTT 终态");
             c1.write_all(b"PING1").await.unwrap();
             let mut buf = [0u8; 5];
@@ -1928,10 +1945,18 @@ mod tests {
             #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（warm cache 0-RTT）")]
             let s2 = tokio::spawn(serve(lsn.clone(), acceptor_ed.clone()));
             let tcp2 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c2 =
-                BtlsConn::connect_with_alpn(tcp2, SNI, Fingerprint::Chrome, None, None, None, true)
-                    .await
-                    .unwrap();
+            let mut c2 = BtlsConn::connect_with_alpn(
+                tcp2,
+                SNI,
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
             c2.write_all(b"PING2").await.unwrap();
             let mut buf = [0u8; 5];
             c2.read_exact(&mut buf).await.unwrap();
@@ -1946,10 +1971,18 @@ mod tests {
             #[allow(clippy::disallowed_methods, reason = "测试：serve 任务（无 0-RTT 对端）")]
             let s3 = tokio::spawn(serve(lsn, acceptor_plain));
             let tcp3 = TcpConnection::new(tokio::net::TcpStream::connect(addr).await.unwrap());
-            let mut c3 =
-                BtlsConn::connect_with_alpn(tcp3, SNI, Fingerprint::Chrome, None, None, None, true)
-                    .await
-                    .unwrap();
+            let mut c3 = BtlsConn::connect_with_alpn(
+                tcp3,
+                SNI,
+                Fingerprint::Chrome,
+                None,
+                None,
+                None,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
             c3.write_all(b"PING3").await.unwrap();
             let mut buf = [0u8; 5];
             c3.read_exact(&mut buf).await.unwrap();

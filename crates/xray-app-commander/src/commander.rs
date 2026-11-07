@@ -43,6 +43,11 @@ pub struct Config {
     /// 监听地址（`Some("127.0.0.1:8080")` / `Some("/path/to/unix.sock")`）。
     /// `None` 表示走 outbound 模式（通过 OutboundHandler 接收连接）。
     /// 对应 Go `Config.Listen`。
+    ///
+    /// **TCP 形态只许 loopback**（bd tbva2）：此面是 Rust 特有扩展（Go 只有 inband
+    /// 模式，门在路由规则），起的 gRPC server **无鉴权无 TLS**，`0.0.0.0`/`[::]`/
+    /// 任意网卡地址会在启动期被拒（`parse_listen_spec` 的 loopback 门）。远程管理
+    /// 走 SSH 隧道到本机 loopback，或用 Unix socket（权限由文件系统给）。
     pub listen: Option<String>,
     /// Service 配置列表（TypedMessage stub）。
     /// 对应 Go `Config.Service []TypedMessage`。

@@ -24,7 +24,9 @@ rustls-native-certs = "0.8"
 rustls-pki-types = { workspace = true }
 
 # OCSP stapling（对应 Go crypto/x509 + ocsp；自动获取并装订 OCSP 响应到 TLS 握手）
-ocsp-stapler = { workspace = true }
+# bd yyoy9(a)：唯一消费者 `src/ocsp_stapling.rs` 整体 gated（feature default=[]，
+# 全仓无启用点）⇒ 声明为 optional，避免恒编译进 supply-chain 面。
+ocsp-stapler = { workspace = true, optional = true }
 rustls-pemfile = "2"
 
 # uTLS 指纹伪造 (btls BoringSSL 绑定)
@@ -64,4 +66,4 @@ futures-util = { workspace = true }
 
 [features]
 default = []
-ocsp-stapling = []
+ocsp-stapling = ["dep:ocsp-stapler"]

@@ -842,7 +842,32 @@ fn get_or_register_counter_opt(
     stats: Option<&Arc<dyn xray_features::stats::Manager>>,
     name: &str,
 ) -> Option<Arc<dyn xray_features::stats::Counter>> {
-    stats.and_then(|m| xray_features::stats::get_or_register_counter(m.as_ref(), name).ok())
+    let m = stats?;
+    // 不用 `.ok()` 吞错（bd 441no）：注册失败 = 该连接无计数，必须留痕。
+    // 可见信号由 manager 侧 warn-once 给出（触顶/容量），此处只留 debug 轨迹——
+    // 本函数在每连接 dispatch 路径上，逐次 warn 会刷屏。
+    match xray_features::stats::get_or_register_counter(m.as_ref(), name) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::debug!("stats counter `{name}` unavailable: {e}");
+            None
+        },
+    }
+}
+
+/// 懒注册并取 online map（语义同上，`user>>>{email}>>>online` 计数面）。
+fn get_or_register_online_map_opt(
+    stats: Option<&Arc<dyn xray_features::stats::Manager>>,
+    name: &str,
+) -> Option<Arc<dyn xray_features::stats::OnlineMap>> {
+    let m = stats?;
+    match xray_features::stats::get_or_register_online_map(m.as_ref(), name) {
+        Ok(om) => Some(om),
+        Err(e) => {
+            tracing::debug!("stats online map `{name}` unavailable: {e}");
+            None
+        },
+    }
 }
 
 /// 从 access.from（`SocketAddr` 字符串形态）提取主机部分。
@@ -1440,13 +1465,10 @@ impl DefaultDispatcher {
                 // Go trackOnlineIP（default.go:224-229）：GetOrRegisterOnlineMap +
                 // AddIP；RemoveIP 由 guard 在连接 fut 结束时执行（引用计数归零）。
                 if policy_stats.user_online && !user_host.is_empty() {
-                    let om = stats.as_ref().and_then(|m| {
-                        xray_features::stats::get_or_register_online_map(
-                            m.as_ref(),
-                            &format!("user>>>{user_email}>>>online"),
-                        )
-                        .ok()
-                    });
+                    let om = get_or_register_online_map_opt(
+                        stats.as_ref(),
+                        &format!("user>>>{user_email}>>>online"),
+                    );
                     if let Some(om) = &om {
                         om.add_ip(&user_host);
                     }

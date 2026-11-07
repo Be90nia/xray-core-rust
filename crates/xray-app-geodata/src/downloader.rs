@@ -548,6 +548,9 @@ fn read_http_body<R: std::io::Read>(
 /// 返回的 Stream 借用两者，caller 在该 scope 内消费完毕后 conn/tcp 顺序 drop。
 ///
 /// 使用 webpki-roots 默认信任根（覆盖 GitHub 等常规 https 源）。SNI 取 host。
+///
+/// 握手推进用 [`rustls::ClientConnection::complete_io`]（bd vfu5l）：阻塞 socket +
+/// `SO_RCVTIMEO` 下由墙钟 deadline 兜底，无热旋。
 fn https_handshake<'a>(
     conn: &'a mut rustls::ClientConnection,
     tcp: &'a mut std::net::TcpStream,
@@ -555,8 +558,6 @@ fn https_handshake<'a>(
     clock: &dyn Clock,
     timeout: std::time::Duration,
 ) -> Result<rustls::Stream<'a, rustls::ClientConnection, std::net::TcpStream>, GeodataError> {
-    use std::io::Read;
-
     use rustls::{ClientConfig, pki_types::ServerName};
 
     xray_common::ensure_default_crypto_provider();
@@ -579,21 +580,32 @@ fn https_handshake<'a>(
 
     // 713x6：握手墙钟截止取自注入时钟（原 bd 39hko 挂账收口，逐点 allow 已撤）。
     let deadline = clock.now_instant() + timeout;
-    let mut scratch = [0u8; 0];
+    // bd vfu5l：必须用 `complete_io` 驱动握手。旧实现用零字节缓冲
+    // `tls.read(&mut [0u8; 0])` 推进——rustls `Reader::read` 在 `buf.is_empty()`
+    // 时直接 `Ok(0)` 早返（conn.rs:233-241），record 从不进状态机 ⇒
+    // `is_handshaking()` 恒 true，循环热旋到 deadline（https 下载 100% 失败且
+    // 期间 100% CPU）。`complete_io` 是 rustls 官方驱动方式（read → process_new_packets
+    // → write，直到握手完成）。
     while conn.is_handshaking() {
         if clock.now_instant() > deadline {
             return Err(GeodataError::IdleTimeout);
         }
-        // 每次循环短命 Stream 让 borrow checker 通过。
-        let mut tls = rustls::Stream::new(&mut *conn, &mut *tcp);
-        match tls.read(&mut scratch) {
+        match conn.complete_io(&mut *tcp) {
+            // 有进展则 continue（脱手时握手可能已完成）；零进展仍在握手 = 停滞，
+            // 不能再转（否则退化成热旋）。
+            Ok((0, 0)) => {
+                return Err(GeodataError::DownloadFailed {
+                    url: host.to_string(),
+                    reason: "rustls handshake stalled: no IO progress".to_string(),
+                });
+            },
             Ok(_) => {},
+            // 阻塞 socket + SO_RCVTIMEO：本次窗口内无数据（Windows=TimedOut，
+            // Unix=WouldBlock），回循环顶由 deadline 判定，不当作握手失败。
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            },
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted => {},
             Err(e) => {
                 return Err(GeodataError::DownloadFailed {
                     url: host.to_string(),
@@ -911,5 +923,70 @@ mod tests {
         let p = parsed("https", "example.com", 443);
         let err = p.resolve_location("https://example.com/a", "f.dat").unwrap_err();
         assert!(matches!(err, GeodataError::DownloadFailed { .. }), "got {err:?}");
+    }
+
+    /// bd vfu5l 验收：TLS 握手必须真的推进。
+    ///
+    /// 改前用零字节缓冲 `tls.read(&mut [0u8; 0])` 驱动握手——rustls
+    /// `Reader::read` 在 `buf.is_empty()` 时直接 `Ok(0)`（conn.rs:233-241），
+    /// record 永不进状态机 ⇒ `is_handshaking()` 恒 true ⇒ 循环热旋到
+    /// `IdleTimeout`（https geodata 下载 100% 失败 + 100% CPU）。
+    ///
+    /// 本地回环真 rustls 服务端（自签证书，不在 webpki-roots 内）：握手推进后
+    /// 客户端必然在**证书校验**处失败——错误必须来自握手层而不是 IdleTimeout，
+    /// 且必须立即返回。
+    #[test]
+    fn https_handshake_progresses_to_cert_verification() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_cfg = std::sync::Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .unwrap(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut conn = rustls::ServerConnection::new(server_cfg).unwrap();
+            // 客户端验签失败即断开 → 服务端拿到 EOF / alert，结果无关紧要。
+            let _ = conn.complete_io(&mut tcp);
+        });
+
+        let mut tcp = std::net::TcpStream::connect(addr).unwrap();
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        tcp.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut conn = rustls::ClientConnection::new(
+            std::sync::Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = match https_handshake(
+            &mut conn,
+            &mut tcp,
+            "localhost",
+            &SystemClock,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(_) => panic!("self-signed cert must fail verification"),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        drop(tcp);
+        server.join().unwrap();
+
+        assert!(!matches!(err, GeodataError::IdleTimeout), "改前症状（热旋到 IdleTimeout）: {err}");
+        assert!(err.to_string().contains("rustls handshake"), "应为握手层错误: {err}");
+        assert!(elapsed < std::time::Duration::from_secs(5), "握手必须立即推进，实际 {elapsed:?}");
     }
 }

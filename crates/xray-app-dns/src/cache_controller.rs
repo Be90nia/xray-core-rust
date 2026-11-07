@@ -53,6 +53,12 @@ pub const MAX_CACHE_ENTRIES: usize = 16384;
 /// 负责，物理面只兜底。
 const MIN_ENTRY_TTL: Duration = Duration::from_secs(1);
 
+/// cleanup 扫表的分批回插批大小（bd m6pkl N3）。
+///
+/// 基件无键迭代面 ⇒ 清理只能 `pop_lru` 出栈再回插；批内立即回插让读路径任何
+/// 时刻最多看到这一批（LRU 尾 = 最冷键）不在表中，而不是整张表出栈到底。
+const CLEANUP_CHUNK: usize = 256;
+
 /// DNS 缓存控制器。对应 Go `CacheController`。
 pub struct CacheController {
     /// 服务名（日志/诊断用）。
@@ -102,6 +108,14 @@ pub struct CacheController {
 pub type SfMap = parking_lot::Mutex<
     HashMap<(Arc<str>, bool, bool), broadcast::Sender<crate::nameserver::cached::QueryOutcome>>,
 >;
+
+/// singleflight 表条目软上界（bd 3pj18 / PM-08）。
+///
+/// 条目生命周期由领导者 `SfLeaderGuard` 兜底移除，「在飞并发 fqdn 数」本就有界；
+/// 但守卫未执行到的异常面（线程 panic 之外的自定义 abort 路径、未来改动引入的
+/// 泄漏）会让表无界增长。达界后**不再登记新领导者**（退化为直连查询，牺牲去重
+/// 换有界内存），已有条目照常服务与移除，故正常负载不会撞界。
+pub const SF_MAX_ENTRIES: usize = 4096;
 
 /// 广播事件。对应 Go `pubsub` 中的 `*IPRecord` 消息。
 #[derive(Debug, Clone)]
@@ -280,23 +294,36 @@ impl CacheController {
         let _gate = self.write_gate.lock();
         let effective_now = self.effective_now(now);
         // 扫描面：基件 `SyncTtlCache` 无键迭代 API（迭代面只在单线程 `TtlCache`
-        // ——udf 基件面缺口，提炼候选见 impl 报告）。以 `pop_lru` 全量出栈 +
+        // ——udf 基件面缺口，提炼候选见 impl 报告）。以 `pop_lru` 出栈 +
         // **正序**回插实现一次 O(n) 扫描：pop 序 = recency 序（旧→新），正序回插
         // 使 LRU 序与扫描前逐位一致；回插时重算物理保留（家族最晚过期 + 宽限）。
-        // 已知代价：出栈与回插之间读路径看到半空表（miss → 上游重查），每
-        // 300s 清理一轮、亚毫秒窗口，换 udf 迭代面后消失。
-        let mut drained = Vec::with_capacity(len);
-        while let Some((key, rec)) = self.ips.pop_lru() {
-            drained.push((key, rec));
-        }
+        // 两条代价控制（bd m6pkl N3）：
+        // ① 键按值消费——回插移动取回的 `String`，只有过期条目付一次拷贝
+        //    （旧形态 `key.clone()` 每条一次：16k 键 = 16k 次 String 分配/周期）；
+        // ② 分批回插——旧形态把整表出栈到底才回插，读路径在窗口内看到空表
+        //    （miss → 上游重查）。批内立即回插把窗口压到 ≤ [`CLEANUP_CHUNK`] 个
+        //    **最冷**键（LRU 尾，本来最不可能被查）。
         let mut keys = Vec::with_capacity(len / 4);
-        for (key, rec) in &drained {
-            let ttl = Self::entry_retention(rec, self.stale_window, now);
-            self.ips.insert(key.clone(), Arc::clone(rec), ttl);
-            let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
-            let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
-            if a_expired || aaaa_expired {
-                keys.push(key.clone());
+        let mut chunk: Vec<(String, Arc<Record>)> = Vec::with_capacity(CLEANUP_CHUNK.min(len));
+        // 扫描面 = 起始条数：回插的新条目不计入（否则 pop 与回插互相追逐死循环）。
+        let mut remaining = len;
+        while remaining > 0 {
+            for _ in 0..CLEANUP_CHUNK.min(remaining) {
+                let Some(entry) = self.ips.pop_lru() else { break };
+                chunk.push(entry);
+            }
+            if chunk.is_empty() {
+                break;
+            }
+            remaining -= chunk.len();
+            for (key, rec) in chunk.drain(..) {
+                let ttl = Self::entry_retention(&rec, self.stale_window, now);
+                let a_expired = rec.a.as_ref().is_some_and(|r| r.expire < effective_now);
+                let aaaa_expired = rec.aaaa.as_ref().is_some_and(|r| r.expire < effective_now);
+                if a_expired || aaaa_expired {
+                    keys.push(key.clone());
+                }
+                self.ips.insert(key, rec, ttl);
             }
         }
         keys
@@ -570,6 +597,48 @@ mod tests {
         let keys = c.collect_expired_keys(later);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], "gone.com.");
+    }
+
+    /// bd m6pkl N3：跨多批（[`CLEANUP_CHUNK`]）扫表。每条键恰好扫一次（回插的
+    /// 新条目不得被再扫）、过期集合完整且无重复、存活条目一条不丢。
+    #[test]
+    fn collect_expired_keys_across_chunks_scans_each_entry_once() {
+        let c = make_ctrl();
+        let now = c.clock().now_instant();
+        let n = CLEANUP_CHUNK * 3 + 7;
+        for i in 0..n {
+            // 偶数键短 TTL（过期），奇数键长 TTL（存活）
+            let ttl = if i % 2 == 0 { 0 } else { 120 };
+            let rec = ip_record(
+                1,
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))],
+                Duration::from_secs(ttl),
+                0,
+                now,
+            );
+            c.upsert(&format!("k{i}.com."), true, rec);
+        }
+        assert_eq!(c.len(), n);
+
+        let later = now + Duration::from_secs(1);
+        let keys = c.collect_expired_keys(later);
+        // 偶数键（0,2,…）短 TTL ⇒ 过期条数 = ⌈n/2⌉
+        assert_eq!(keys.len(), n.div_ceil(2), "过期集合必须恰好是偶数键（无遗漏）");
+        let unique: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "同一键不得重复收集");
+
+        assert_eq!(c.len(), n, "扫描（出栈 + 回插）不得丢条目");
+        // collect 只「报告」过期键；物理删除发生在 cleanup_and_maybe_shrink。
+        for i in (1..n).step_by(2) {
+            assert!(c.find_records(&format!("k{i}.com.")).is_some(), "存活条目不得丢");
+        }
+        let (cleaned, _) = c.run_cleanup(later);
+        assert!(cleaned, "有过期键时必须报告已清理");
+        for i in 0..n {
+            let fqdn = format!("k{i}.com.");
+            let found = c.find_records(&fqdn).is_some();
+            assert_eq!(found, i % 2 == 1, "{fqdn}：清理后过期必须消失、存活必须仍在");
+        }
     }
 
     #[test]

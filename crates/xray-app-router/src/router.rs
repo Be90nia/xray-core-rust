@@ -230,11 +230,16 @@ impl Router {
 
     /// 路由匹配。返回第一条命中规则的 tag。
     ///
-    /// 对应 Go `Router.PickRoute`。
+    /// 对应 Go `Router.PickRoute`：规则命中后 `GetTag()` 的失败（balancer 无可用
+    /// 节点且未配 fallbackTag 等）**上抛**，不当作「不命中」继续试下一条。
     pub fn pick_route(&self, ctx: &dyn RoutingContext) -> Result<Route, RouterError> {
         let rules = self.rules.read();
         for rule in rules.iter() {
-            if let Some(tag) = rule.apply(ctx) {
+            if let Some(tag) = rule.apply(ctx)? {
+                // Go router.go:77-79：tag 拿到之后才 Fire（fire-and-forget）。
+                if let Some(webhook) = &rule.webhook {
+                    webhook.fire(ctx, &tag);
+                }
                 // qrog：Go 行为——命中即中止，空 tag 即"交由上层走默认出站"。
                 // 此前 skip-and-continue 导致后续规则静默覆盖此意图。
                 return Ok(Route { outbound_tag: tag, rule_tag: rule.rule_tag.clone() });
@@ -271,8 +276,12 @@ impl Router {
                 }
             },
             DomainStrategy::IpIfNonMatch => {
-                if let Ok(r) = self.pick_route(ctx) {
-                    return Ok(r);
+                // 只有「没有规则命中」（NoClue）才值得解析域名重跑一轮；balancer
+                // 选路失败是硬错误，必须原样上抛（Go PickRoute 中 GetTag err 直返）。
+                match self.pick_route(ctx) {
+                    Ok(r) => return Ok(r),
+                    Err(RouterError::NoClue) => {},
+                    Err(e) => return Err(e),
                 }
                 if can_resolve {
                     if let Some(ips) = self.resolve_domain(ctx).await {
@@ -571,6 +580,37 @@ mod tests {
             webhook: None,
             local_os: vec![],
         }
+    }
+
+    /// trssj 回归：balancer 选路失败（无可用节点且未配 fallbackTag）必须**上抛**，
+    /// 不得被当成「本条规则不命中」而继续试后续规则（最坏静默落到 `direct`）。
+    #[test]
+    fn test_balancer_error_propagates_instead_of_falling_through() {
+        let cfg = Config {
+            // 空 fallbackTag ⇒ 策略无候选时 Balancer 硬失败（Go balancing.go:112-118）。
+            balancing_rule: vec![balancing_rule_with("leastload", "bl", "")],
+            rule: vec![
+                simple_balance_rule("bl"),
+                // 兜底规则也匹配同一域名：若错误被吞成「不命中」，就会落到这里。
+                simple_tag_rule("direct", "x.test"),
+            ],
+            ..Config::default()
+        };
+
+        let obs = Arc::new(MemoryObservationProvider::new());
+        obs.update(ObservationResult {
+            status: vec![
+                obs_with_alive("a", false, 100),
+                obs_with_alive("b", false, 50),
+                obs_with_alive("c", false, 200),
+            ],
+        });
+        let ohm = Arc::new(SimpleSelector::from_tags(["a", "b", "c"]));
+        let r = Router::init(&cfg, ohm, Some(obs), None).unwrap();
+
+        let ctx = RoutingData::new().with_target_domain("x.test");
+        let err = r.pick_route(&ctx).expect_err("balancer 失败必须上抛，不得静默落到 direct");
+        assert!(matches!(err, RouterError::EmptyBalancerResult), "unexpected: {err}");
     }
 
     #[test]

@@ -886,18 +886,14 @@ fn project_routing_context(
 
 /// 监听规格（Go `Commander.Start` commander.go:78-99 的 listen 分派）。
 pub(crate) enum ListenSpec {
-    /// TCP 地址（`:8080` 简写补 `0.0.0.0`）。
+    /// TCP 地址（必须是 loopback，见 [`parse_listen_spec`]）。
     Tcp(SocketAddr),
     /// Unix domain socket 路径（`/` 或 `@` 前缀；Go commander.go:81-82）。
     /// 生产构造/消费见 `commander.rs` 的 listen 分派（`Some(Ok(ListenSpec::Unix(_)))`）。
     Unix(String),
 }
 
-/// 解析监听地址为 [`ListenSpec`]。
-///
-/// 对应 Go `Commander.Start`（commander.go:78-90）：
-/// - `/path` 或 `@name` 前缀 → UnixAddr；
-/// - 其余 → TCP（`:port` 简写补 `0.0.0.0`）。
+/// 把地址串解析为 `SocketAddr`（`:port` 简写补 `0.0.0.0`）。
 pub(crate) fn parse_listen_addr(addr: &str) -> Result<SocketAddr, String> {
     let normalized =
         if addr.starts_with(':') { format!("0.0.0.0{addr}") } else { addr.to_string() };
@@ -906,11 +902,34 @@ pub(crate) fn parse_listen_addr(addr: &str) -> Result<SocketAddr, String> {
         .map_err(|e| format!("invalid listen address `{addr}` (normalized `{normalized}`): {e}"))
 }
 
+/// 解析监听地址为 [`ListenSpec`]。
+///
+/// 对应 Go `Commander.Start`（commander.go:78-90）：
+/// - `/path` 或 `@name` 前缀 → UnixAddr；
+/// - 其余 → TCP（`:port` 简写补 `0.0.0.0`，随后被 loopback 门拒绝）。
+///
+/// # loopback 门（bd tbva2）
+///
+/// `listen` 是 **Rust 特有扩展**（Go 只有 inband 模式，门在路由规则）。listen 模式
+/// 起的是**裸 gRPC、零鉴权零 TLS**：HandlerService（增删入/出站）、Stats、Routing、
+/// Logger、Observatory 全面对任何能连到该地址的客户端开放。故 TCP 形态硬拒非
+/// loopback（`0.0.0.0` / `::` / 任意公网网卡）——fail-visible，不发明鉴权语义
+/// （Go 无此面）。远程管理走 SSH 隧道到本机 loopback，或用 Unix socket（权限由
+/// 文件系统给）。
 pub(crate) fn parse_listen_spec(addr: &str) -> Result<ListenSpec, String> {
     if addr.starts_with('/') || addr.starts_with('@') {
         return Ok(ListenSpec::Unix(addr.to_string()));
     }
-    parse_listen_addr(addr).map(ListenSpec::Tcp)
+    let sock = parse_listen_addr(addr)?;
+    if !sock.ip().is_loopback() {
+        return Err(format!(
+            "commander listen `{addr}` → {sock}: the API gRPC server has no authentication or \
+             TLS, so binding beyond loopback exposes the whole control plane (add/remove \
+             inbound/outbound, stats, routing). Use `127.0.0.1:<port>` / `[::1]:<port>` (reach it \
+             over an SSH tunnel) or a unix socket path instead."
+        ));
+    }
+    Ok(ListenSpec::Tcp(sock))
 }
 
 /// `OutboundListenerImpl::accept` → tonic `serve_with_incoming` 的 Stream 适配。
@@ -1361,15 +1380,23 @@ mod tests {
             parse_listen_spec("@xray-api").unwrap(),
             ListenSpec::Unix(p) if p == "@xray-api"
         ));
-        // TCP 简写与完整地址
+        // TCP：loopback 形态可用
         assert!(matches!(
-            parse_listen_spec(":8080").unwrap(),
+            parse_listen_spec("127.0.0.1:8080").unwrap(),
             ListenSpec::Tcp(a) if a.port() == 8080
         ));
         assert!(matches!(
-            parse_listen_spec("127.0.0.1:9000").unwrap(),
+            parse_listen_spec("[::1]:9000").unwrap(),
             ListenSpec::Tcp(a) if a.port() == 9000
         ));
+        // bd tbva2：无鉴权的 listen 面硬拒非 loopback（fail-visible，不静默放开）。
+        // `:port` 简写补 0.0.0.0、显式全接口、显式网卡地址都必须报错。
+        for addr in [":8080", "0.0.0.0:8080", "[::]:8080", "192.168.1.10:8080"] {
+            let err = parse_listen_spec(addr)
+                .err()
+                .unwrap_or_else(|| panic!("`{addr}` 必须被 loopback 门拒绝"));
+            assert!(err.contains("no authentication"), "错误须说明为何拒绝：{err}");
+        }
         assert!(parse_listen_spec("not-an-addr").is_err());
     }
 

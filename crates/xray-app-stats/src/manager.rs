@@ -29,22 +29,40 @@ pub struct Manager {
     online_maps: RwLock<HashMap<String, Arc<dyn OnlineMap>>>,
     channels: RwLock<HashMap<String, Arc<dyn Channel>>>,
     running: AtomicBool,
+    /// 每类注册表条目上界（`None` = 无上限，对齐 Go）。
+    ///
+    /// Go `app/stats` 的 `RegisterCounter`/`RegisterOnlineMap`/`RegisterChannel`
+    /// **只在重名时报错，没有条目上界**。本仓此前硬编码 1024（三类各一份），而
+    /// counter 池按 inbound/outbound/user 三方按用户数线性增长 ⇒ 约 512 用户即
+    /// 触顶，之后所有新计数器被拒且调用方 `.ok()` 吞错 ⇒ 计数**永久静默停在 0**
+    /// （bd 441no）。缺省改回 Go 语义（无上限）；需要封顶的装配方经
+    /// [`Manager::with_registry_limit`] 显式给出，触顶走
+    /// [`ManagerError::CapacityExceeded`] + warn 一次（fail-visible，不再静默）。
+    registry_limit: Option<usize>,
+    /// 触顶 warn 只打一次（判据：首次拒绝由 `swap` 抢到）。
+    capacity_warned: AtomicBool,
 }
-
-/// 每种注册表最大条目数。
-const MAX_REGISTRY_ENTRIES: usize = 1024;
 
 impl Manager {
     /// 新建空 Manager。对应 Go `NewManager(ctx, config) (*Manager, error)`。
     ///
     /// Go 中 `ctx` 未使用，`config` 也是空（proto 只有 `Config{}`），均省略。
+    /// 条目上界缺省**无上限**（Go 语义，见 `registry_limit` 字段的说明）。
     #[must_use]
     pub fn new() -> Self {
+        Self::with_registry_limit(None)
+    }
+
+    /// 指定每类注册表条目上界（`None` = 无上限 = Go 语义）。
+    #[must_use]
+    pub fn with_registry_limit(registry_limit: Option<usize>) -> Self {
         Self {
             counters: RwLock::new(HashMap::new()),
             online_maps: RwLock::new(HashMap::new()),
             channels: RwLock::new(HashMap::new()),
             running: AtomicBool::new(false),
+            registry_limit,
+            capacity_warned: AtomicBool::new(false),
         }
     }
 
@@ -54,6 +72,23 @@ impl Manager {
         let m = Self::new();
         m.running.store(true, Ordering::SeqCst);
         m
+    }
+
+    /// 触顶判定：已达上界 ⇒ warn 一次 + `CapacityExceeded`（绝不静默拒绝）。
+    fn check_capacity(&self, len: usize, kind: &'static str) -> Result<(), ManagerError> {
+        let Some(limit) = self.registry_limit else {
+            return Ok(());
+        };
+        if len < limit {
+            return Ok(());
+        }
+        if !self.capacity_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "stats {kind} registry reached its configured limit ({limit}): further entries \
+                 are rejected and their counters will stay absent — raise the limit or unset it"
+            );
+        }
+        Err(ManagerError::CapacityExceeded { kind, limit })
     }
 }
 
@@ -74,12 +109,7 @@ impl ManagerTrait for Manager {
                 name: name.to_string(),
             });
         }
-        if counters.len() >= MAX_REGISTRY_ENTRIES {
-            return Err(ManagerError::AlreadyRegistered {
-                kind: "Counter",
-                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
-            });
-        }
+        self.check_capacity(counters.len(), "Counter")?;
         tracing::debug!("create new counter {name}");
         let c: Arc<dyn Counter> = Arc::new(StatsCounter::new());
         counters.insert(name.to_string(), Arc::clone(&c));
@@ -117,12 +147,7 @@ impl ManagerTrait for Manager {
                 name: name.to_string(),
             });
         }
-        if maps.len() >= MAX_REGISTRY_ENTRIES {
-            return Err(ManagerError::AlreadyRegistered {
-                kind: "OnlineMap",
-                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
-            });
-        }
+        self.check_capacity(maps.len(), "OnlineMap")?;
         tracing::debug!("create new OnlineMap {name}");
         let om: Arc<dyn OnlineMap> = Arc::new(StatsOnlineMap::new());
         maps.insert(name.to_string(), Arc::clone(&om));
@@ -160,12 +185,7 @@ impl ManagerTrait for Manager {
                 name: name.to_string(),
             });
         }
-        if channels.len() >= MAX_REGISTRY_ENTRIES {
-            return Err(ManagerError::AlreadyRegistered {
-                kind: "Channel",
-                name: format!("__capacity_exceeded_{MAX_REGISTRY_ENTRIES}"),
-            });
-        }
+        self.check_capacity(channels.len(), "Channel")?;
         tracing::debug!("create new channel {name}");
         let c: Arc<dyn Channel> = Arc::new(StatsChannel::new(ChannelConfig::default()));
         if self.running.load(Ordering::SeqCst) {
@@ -263,6 +283,37 @@ mod tests {
             Err(e) => panic!("expected AlreadyRegistered, got {e:?}"),
             Ok(_) => panic!("expected Err"),
         }
+    }
+
+    /// bd 441no：缺省无条目上界（Go 语义）——旧实现硬编码 1024，多用户节点过线
+    /// 之后新计数器被静默拒绝。这里越过旧阈值证明不再有天花板。
+    #[test]
+    fn default_registry_has_no_capacity_ceiling() {
+        let m = Manager::new();
+        for i in 0..1100 {
+            m.register_counter(&format!("user>>>u{i}>>>traffic>>>uplink")).expect("no ceiling");
+        }
+        assert!(m.get_counter("user>>>u1099>>>traffic>>>uplink").is_some());
+    }
+
+    /// 显式封顶时触顶必须 fail-visible：返回 `CapacityExceeded`（不是「已注册」），
+    /// 且不落库（后续 get 仍 None）。
+    #[test]
+    fn explicit_registry_limit_rejects_visibly() {
+        let m = Manager::with_registry_limit(Some(2));
+        m.register_counter("a").unwrap();
+        m.register_counter("b").unwrap();
+        match m.register_counter("c") {
+            Err(ManagerError::CapacityExceeded { kind, limit }) => {
+                assert_eq!(kind, "Counter");
+                assert_eq!(limit, 2);
+            },
+            Err(e) => panic!("expected CapacityExceeded, got {e:?}"),
+            Ok(_) => panic!("expected Err"),
+        }
+        assert!(m.get_counter("c").is_none(), "触顶条目不得落库");
+        // 上界按注册表各算：online map 不受 counter 计数影响。
+        m.register_online_map("u").expect("separate registry");
     }
 
     #[test]

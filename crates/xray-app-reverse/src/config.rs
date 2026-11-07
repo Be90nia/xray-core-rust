@@ -15,14 +15,23 @@ pub const INTERNAL_DOMAIN: &str = "reverse";
 pub enum ControlState {
     Active = 0,
     Drain = 1,
+    /// proto 里出现的未知/未来状态值（≥2）。
+    ///
+    /// Go 侧 `proto.Unmarshal` 对未定义枚举值**不报错**，`bridge.go:190`
+    /// 原样存进 `w.State`（非 ACTIVE ⇒ `IsActive()` false，但连接不断，等
+    /// 超时清理）。Rust 旧版把它当解析失败 ⇒ log + `SetTimeout(0)` 立即拆掉
+    /// 整条 bridge carrier，上游一旦新增状态值就会误伤（bd 08wkx-d）。
+    Unknown = 2,
 }
 
 impl ControlState {
-    pub fn from_proto_i32(v: i32) -> Result<Self, ReverseError> {
+    /// proto i32 → state（未知值落 [`Self::Unknown`]，不报错）。
+    #[must_use]
+    pub fn from_proto_i32(v: i32) -> Self {
         match v {
-            0 => Ok(Self::Active),
-            1 => Ok(Self::Drain),
-            other => Err(ReverseError::InvalidControlState(other)),
+            0 => Self::Active,
+            1 => Self::Drain,
+            _ => Self::Unknown,
         }
     }
 
@@ -46,8 +55,11 @@ impl Default for Control {
 
 impl Control {
     /// 从 prost Control 构造。
+    ///
+    /// 未知 state 值不报错（Go `proto.Unmarshal` 同款容忍，见
+    /// [`ControlState::Unknown`]）。
     pub fn from_proto(p: &ProtoControl) -> Result<Self, ReverseError> {
-        Ok(Self { state: ControlState::from_proto_i32(p.state)?, random: p.random.clone() })
+        Ok(Self { state: ControlState::from_proto_i32(p.state), random: p.random.clone() })
     }
 
     /// 转 prost Control。
@@ -133,13 +145,22 @@ mod tests {
     #[test]
     fn control_state_roundtrip() {
         for s in [ControlState::Active, ControlState::Drain] {
-            assert_eq!(ControlState::from_proto_i32(s.as_i32()).unwrap(), s);
+            assert_eq!(ControlState::from_proto_i32(s.as_i32()), s);
         }
     }
 
+    /// bd 08wkx-d：未知 state 值必须容忍（Go `proto.Unmarshal` 不报错、原样存
+    /// `w.State`，非 ACTIVE 即 IsActive false 但连接不断），不得当解析失败拆 carrier。
     #[test]
-    fn control_state_invalid() {
-        assert!(ControlState::from_proto_i32(2).is_err());
+    fn control_state_unknown_is_tolerated() {
+        assert_eq!(ControlState::from_proto_i32(2), ControlState::Unknown);
+        assert_eq!(ControlState::from_proto_i32(99), ControlState::Unknown);
+        assert!(!crate::worker::bridge_worker_is_active(ControlState::Unknown, false));
+
+        let proto = ProtoControl { state: 7, random: vec![1, 2] };
+        let c = Control::from_proto(&proto).expect("unknown state must not fail parsing");
+        assert_eq!(c.state, ControlState::Unknown);
+        assert_eq!(c.random, vec![1, 2]);
     }
 
     #[test]

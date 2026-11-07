@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use xray_frame::cache::RefreshPermit;
 
 use crate::{
-    cache_controller::{CacheController, SfMap},
+    cache_controller::{CacheController, SF_MAX_ENTRIES, SfMap},
     config::IpOption,
     dnscommon::{IpRecord, merge_records},
     error::DnsError,
@@ -69,10 +69,12 @@ impl Drop for SfLeaderGuard<'_> {
     }
 }
 
-/// singleflight 临界区结果：等待者拿接收端，领导者拿条目 sender。
+/// singleflight 临界区结果：等待者拿接收端，领导者拿条目 sender，表满走直连。
 enum SfSlot {
     Waiter(broadcast::Receiver<QueryOutcome>),
     Leader(broadcast::Sender<QueryOutcome>),
+    /// 表已达 [`SF_MAX_ENTRIES`]：不登记条目，本次查询不做去重。
+    Direct,
 }
 
 /// 缓存型 nameserver 接口。对应 Go `CachedNameserver` interface。
@@ -259,6 +261,7 @@ pub async fn fetch<S: CachedNameserver>(
                     drop(tx);
                     SfSlot::Waiter(rx)
                 },
+                None if sf.len() >= SF_MAX_ENTRIES => SfSlot::Direct,
                 None => {
                     let (tx, _) = broadcast::channel(1);
                     sf.insert(sf_key.clone(), tx.clone());
@@ -276,6 +279,7 @@ pub async fn fetch<S: CachedNameserver>(
                     _ => server.send_query(fqdn, option).await,
                 }
             },
+            SfSlot::Direct => server.send_query(fqdn, option).await,
             SfSlot::Leader(tx) => {
                 let _guard =
                     SfLeaderGuard { sf: &cache.single_flight, key: sf_key, tx: tx.clone() };
@@ -522,6 +526,32 @@ mod tests {
         let (ips, ttl) = query_ip(Arc::new(server), "example.com", v4_only_option()).await.unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ttl, 60);
+    }
+
+    /// bd 3pj18（PM-08）：singleflight 表有软上界——表满后不再登记新领导者，
+    /// 本次查询退化为直连（牺牲去重换有界内存），已有条目照常服务与移除。
+    #[tokio::test]
+    async fn singleflight_table_is_bounded_at_soft_cap() {
+        let cache = Arc::new(CacheController::new("test", false, false, 0, 0));
+        {
+            // 预填到软上界（模拟历史泄漏累积的条目）
+            let mut sf = cache.single_flight.lock();
+            for i in 0..SF_MAX_ENTRIES {
+                let (tx, _) = broadcast::channel(1);
+                sf.insert((Arc::from(format!("n{i}.example.")), true, false), tx);
+            }
+            assert_eq!(sf.len(), SF_MAX_ENTRIES);
+        }
+        let server =
+            StubServer { cache: Arc::clone(&cache), rec_v4: Some(v4_record(60)), rec_v6: None };
+        let (ips, _ttl) =
+            query_ip(Arc::new(server), "fresh.example.", v4_only_option()).await.unwrap();
+        assert_eq!(ips.len(), 1, "表满时仍必须给出答案（退化直连路径）");
+        assert_eq!(
+            cache.single_flight.lock().len(),
+            SF_MAX_ENTRIES,
+            "表满后不得再插入新 singleflight 条目（软上界失效）"
+        );
     }
 
     #[tokio::test]

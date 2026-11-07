@@ -64,24 +64,25 @@ impl Rule {
 
     /// 对上下文应用规则。
     ///
-    /// 返回 `Some(tag)` 表示命中；`None` 表示不命中。
-    /// 命中时触发 webhook（fire-and-forget，错误忽略）。
+    /// - `Ok(Some(tag))` 命中；`Ok(None)` 不命中；`Err` 命中但选路失败。
     ///
-    /// 对应 Go `Rule.Apply`。
-    pub fn apply(&self, ctx: &dyn crate::context::RoutingContext) -> Option<String> {
+    /// 对应 Go `Rule.Apply`（只测条件）+ `Router.PickRoute` 的
+    /// `tag, err := rule.GetTag(); if err != nil { return nil, err }`：
+    /// **balancer 失败不是「本条规则不命中」**，必须上抛给调用方走默认出站
+    /// 并留可见日志；旧实现把它当成 `None` 继续试下一条规则，最坏静默落到
+    /// `direct`（以为走了代理，实际直连）。
+    ///
+    /// Webhook 不在此触发（Go 在 `PickRoute` 里拿 tag 之后才 `Fire`）——见
+    /// [`Router::pick_route`](crate::router::Router::pick_route)。
+    pub fn apply(
+        &self,
+        ctx: &dyn crate::context::RoutingContext,
+    ) -> Result<Option<String>, RouterError> {
         let hit = self.condition.as_ref().is_none_or(|c| c.apply(ctx));
         if !hit {
-            return None;
+            return Ok(None);
         }
-        let tag = match self.get_tag_with_ctx(ctx) {
-            Ok(t) => t,
-            Err(_) => return None,
-        };
-        if let Some(wh) = &self.webhook {
-            let ev = crate::webhook::WebhookEvent::hit(&tag, &self.rule_tag);
-            let _ = wh.fire(&ev);
-        }
-        Some(tag)
+        Ok(Some(self.get_tag_with_ctx(ctx)?))
     }
 }
 

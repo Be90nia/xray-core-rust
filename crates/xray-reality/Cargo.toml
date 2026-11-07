@@ -43,3 +43,6 @@ ml-dsa = { version = "0.1", default-features = false, features = ["alloc"] }
 xray-proxy-vless = { path = "../xray-proxy-vless" }
 base64 = "0.22"
 hex = "0.4"
+# bd 5lmcm 握手窗验收：`#[tokio::test(start_paused = true)]` 虚拟时钟（tokio
+# `full` 不含 test-util）。仅测试构建生效。
+tokio = { workspace = true, features = ["test-util"] }

@@ -4,6 +4,8 @@
 //!
 //! # 实现
 //!
+//! - fire-and-forget：`fire` 只做事件构造 + 去重，POST 走旁路任务 （tokio 上下文内 `spawn`，无
+//!   runtime 时起临时线程），**绝不阻塞路由**。
 //! - `post` 走手写 HTTP/1.1 客户端（不引入 reqwest/hyper）：
 //!   - `http://host:port/path`           → `tokio::net::TcpStream`
 //!   - `https://host:port/path`          → TCP + `tokio-rustls` TLS 握手
@@ -14,7 +16,7 @@
 use std::{
     collections::HashSet,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use parking_lot::Mutex;
@@ -32,7 +34,7 @@ use tokio_rustls::{
 };
 use xray_proto::xray::app::router::WebhookConfig;
 
-use crate::error::RouterError;
+use crate::{context::RoutingContext, error::RouterError};
 
 /// 默认 HTTP POST 超时（毫秒）。
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -54,35 +56,99 @@ pub(crate) enum WebhookTarget {
 
 /// Webhook 事件。
 ///
-/// 对应 Go `router.event`。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// 对应 Go `app/router/webhook.go:23-37` 的 `event`：13 个字段、JSON 键名逐字
+/// 对齐（Go `*T` 指针语义 → `Option`，缺值序列化为 `null`；Go 无 omitempty）。
+///
+/// 4 个字段在 Rust 侧无来源（Go 从 `routing_session.Context` 的 Inbound/Outbound
+/// 载荷填充）——[`RoutingContext`] 不承载
+/// user level / inbound name / originalTarget / routeTarget ⇒ 恒 `null`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WebhookEvent {
-    /// 出站 tag。
-    pub outbound_tag: String,
-    /// 规则 tag。
-    pub rule_tag: String,
-    /// 当前状态（`hit` / `miss`）。
-    pub status: String,
-    /// 附加信息（如错误原因）。
-    pub message: String,
+    /// 用户邮箱（Go `email`；**也是去重键**）。
+    pub email: Option<String>,
+    /// 用户 level（Go `level`）。
+    pub level: Option<u32>,
+    /// 嗅探出的协议（Go `protocol`）。
+    pub protocol: Option<String>,
+    /// 网络类型（Go `network`）。
+    pub network: Option<String>,
+    /// `src_ip:src_port`（Go `source`）。
+    pub source: Option<String>,
+    /// `dst_ip|domain:port`（Go `destination`）。
+    pub destination: Option<String>,
+    /// 原始目标（Go `originalTarget`）。
+    #[serde(rename = "originalTarget")]
+    pub original_target: Option<String>,
+    /// 路由目标（Go `routeTarget`）。
+    #[serde(rename = "routeTarget")]
+    pub route_target: Option<String>,
+    /// 入站 tag（Go `inboundTag`）。
+    #[serde(rename = "inboundTag")]
+    pub inbound_tag: Option<String>,
+    /// 入站名（Go `inboundName`）。
+    #[serde(rename = "inboundName")]
+    pub inbound_name: Option<String>,
+    /// `local_ip:local_port`（Go `inboundLocal`）。
+    #[serde(rename = "inboundLocal")]
+    pub inbound_local: Option<String>,
+    /// 出站 tag（Go `outboundTag`）。
+    #[serde(rename = "outboundTag")]
+    pub outbound_tag: Option<String>,
+    /// 事件时间（Unix 秒；Go `ts`）。
+    pub ts: i64,
 }
 
 impl WebhookEvent {
-    /// 创建 hit 事件。
+    /// 从路由上下文构造。对应 Go `buildEvent`。
+    ///
+    /// `now` = Go `time.Now()`：由调用方从注入时钟（`WebhookNotifier.clock`）取，
+    /// 不在此直取挂钟（713x6 时钟唯一源 = `skeleton::clock`）。
     #[must_use]
-    pub fn hit(outbound_tag: impl Into<String>, rule_tag: impl Into<String>) -> Self {
+    pub fn from_context(ctx: &dyn RoutingContext, outbound_tag: &str, now: SystemTime) -> Self {
+        let destination = if ctx.get_target_domain().is_empty() {
+            ctx.get_target_ips()
+                .first()
+                .map(|ip| join_host_port(&ip.to_string(), ctx.get_target_port().value()))
+        } else {
+            Some(join_host_port(ctx.get_target_domain(), ctx.get_target_port().value()))
+        };
         Self {
-            outbound_tag: outbound_tag.into(),
-            rule_tag: rule_tag.into(),
-            status: "hit".into(),
-            message: String::new(),
+            email: non_empty(ctx.get_user()),
+            level: None,
+            protocol: Some(ctx.get_protocol().to_string()),
+            network: Some(ctx.get_network().as_str().to_string()),
+            source: ctx
+                .get_source_ips()
+                .first()
+                .map(|ip| join_host_port(&ip.to_string(), ctx.get_source_port().value())),
+            destination,
+            original_target: None,
+            route_target: None,
+            inbound_tag: Some(ctx.get_inbound_tag().to_string()),
+            inbound_name: None,
+            inbound_local: ctx
+                .get_local_ips()
+                .first()
+                .map(|ip| join_host_port(&ip.to_string(), ctx.get_local_port().value())),
+            outbound_tag: Some(outbound_tag.to_string()),
+            ts: unix_secs(now),
         }
     }
+}
 
-    /// 去重用的键。
-    fn dedup_key(&self) -> String {
-        format!("{}|{}|{}", self.outbound_tag, self.rule_tag, self.status)
-    }
+/// Go `net.JoinHostPort`：主机含 `:`（IPv6）时加方括号。
+fn join_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
+}
+
+/// Go `if user != "" { ev.Email = ptr(user) }`。
+fn non_empty(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+/// Go `time.Now().Unix()`。
+fn unix_secs(now: SystemTime) -> i64 {
+    now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Webhook 通知器。
@@ -138,29 +204,32 @@ impl WebhookNotifier {
         &self.url
     }
 
-    /// 触发事件（含去重）。返回是否真的发出。
+    /// 触发事件（fire-and-forget）。返回是否真的排队发送（close / 去重拦截 = false）。
     ///
-    /// 对应 Go `WebhookNotifier.Fire`。
-    pub fn fire(&self, event: &WebhookEvent) -> Result<bool, RouterError> {
+    /// 对应 Go `WebhookNotifier.Fire`：旁路发送，不阻塞路由、不 panic。
+    pub fn fire(&self, ctx: &dyn RoutingContext, outbound_tag: &str) -> bool {
         if *self.closed.lock() {
-            return Ok(false);
+            return false;
         }
-        if self.is_duplicate(event) {
-            return Ok(false);
+        let event = WebhookEvent::from_context(ctx, outbound_tag, self.clock.now_system());
+        if self.is_duplicate(event.email.as_deref().unwrap_or_default()) {
+            return false;
         }
-        let body = serde_json::to_value(event).map_err(|e| RouterError::Webhook(e.to_string()))?;
-        self.post(&body)?;
-        Ok(true)
+        self.spawn_post(event);
+        true
     }
 
-    /// 判重并记录。返回是否重复（true=重复，跳过）。
-    pub fn is_duplicate(&self, event: &WebhookEvent) -> bool {
-        if self.dedup_window.is_zero() {
+    /// 判重并记录。返回是否重复（true = 重复，跳过）。
+    ///
+    /// 对应 Go `isDuplicate`：去重键 = **email**；`deduplication == 0` 或 email
+    /// 为空时一律不去重。
+    pub fn is_duplicate(&self, email: &str) -> bool {
+        if self.dedup_window.is_zero() || email.is_empty() {
             return false;
         }
         let mut seen = self.seen.lock();
         self.cleanup_expired_locked(&mut seen);
-        let key = event.dedup_key();
+        let key = email.to_string();
         if seen.keys.contains(&key) {
             return true;
         }
@@ -170,102 +239,51 @@ impl WebhookNotifier {
         false
     }
 
-    /// 执行 HTTP POST 到 webhook URL。
+    /// Go `webhook.go:113` 的 goroutine 旁路：tokio 上下文内 `spawn`，
+    /// 无 runtime（同步调用/测试）起临时线程。
     ///
-    /// 通过 `tokio::net::TcpStream` 手写 HTTP POST，不依赖 reqwest/hyper。
-    /// 返回 2xx 视为成功，其余视为失败。
-    fn post(&self, body: &serde_json::Value) -> Result<(), RouterError> {
-        let body_str =
-            serde_json::to_string(body).map_err(|e| RouterError::Webhook(e.to_string()))?;
-
-        tokio::runtime::Handle::try_current()
-            .map(|handle| handle.block_on(async { self.post_async(&body_str).await }))
-            .unwrap_or_else(|_| {
-                // 无 tokio runtime 时创建临时 runtime
-                std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|e| RouterError::Webhook(e.to_string()))?;
-                        rt.block_on(async { self.post_async(&body_str).await })
-                    })
-                    .join()
-                    .unwrap_or_else(|e| {
-                        Err(RouterError::Webhook(format!("thread panicked: {e:?}")))
-                    })
-                })
-            })
-    }
-
-    /// 异步 HTTP POST 实现。
-    ///
-    /// 依据 URL 形式分派：
-    /// - `http://`      → [`tokio::net::TcpStream`] + 手写 HTTP/1.1
-    /// - `https://`     → TCP + [`tokio_rustls`] TLS 握手 + 手写 HTTP/1.1
-    /// - `/abs/path`    → [`tokio::net::UnixStream`] 抽象拨号（UDS）+ 手写 HTTP/1.1
-    async fn post_async(&self, body: &str) -> Result<(), RouterError> {
-        let url = self.url.trim();
-        if url.is_empty() {
-            return Err(RouterError::Webhook("empty webhook url".to_string()));
-        }
-        let target = parse_webhook_target(url).map_err(RouterError::Webhook)?;
-        let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
-
-        let request = match &target {
-            WebhookTarget::Http { host, path, .. } => {
-                build_request(host, "http", path, body, &self.headers)
-            },
-            WebhookTarget::Https { host, path, .. } => {
-                build_request(host, "https", path, body, &self.headers)
-            },
-            WebhookTarget::UnixSocket { http_path, .. } => {
-                build_request("localhost", "http", http_path, body, &self.headers)
+    /// nqs31：原实现在 async 上下文里调 `Handle::block_on`——tokio 语义必然
+    /// panic（"Cannot start a runtime from within a runtime"），且 `let _ =` 吞不掉 panic。
+    fn spawn_post(&self, event: WebhookEvent) {
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::warn!(target: "xray_router::webhook", error = %e, "webhook: marshal failed");
+                return;
             },
         };
-
-        // 连接 + 写 + 读 + 解析响应
-        let status = match target {
-            WebhookTarget::Http { host, port, .. } => {
-                let mut s = tcp_connect(&host, port, timeout).await?;
-                http_handshake(&mut s, request.as_bytes(), timeout).await?
-            },
-            WebhookTarget::Https { host, port, .. } => {
-                let s = tcp_connect(&host, port, timeout).await?;
-                let connector = tls_connector()?;
-                let server_name = ServerName::try_from(host.clone())
-                    .map_err(|e| RouterError::Webhook(format!("invalid tls server name: {e}")))?;
-                let mut tls = tokio::time::timeout(timeout, connector.connect(server_name, s))
-                    .await
-                    .map_err(|e| RouterError::Webhook(format!("tls handshake timeout: {e}")))?
-                    .map_err(|e| RouterError::Webhook(format!("tls handshake failed: {e}")))?;
-                http_handshake(&mut tls, request.as_bytes(), timeout).await?
-            },
-            #[cfg(unix)]
-            WebhookTarget::UnixSocket { socket_path, .. } => {
-                let mut s = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
-                    .await
-                    .map_err(|e| RouterError::Webhook(format!("unix connect timeout: {e}")))?
-                    .map_err(|e| RouterError::Webhook(format!("unix connect failed: {e}")))?;
-                http_handshake(&mut s, request.as_bytes(), timeout).await?
-            },
-            #[cfg(not(unix))]
-            WebhookTarget::UnixSocket { .. } => {
-                return Err(RouterError::Webhook(
-                    "unix socket webhook is not supported on this platform".to_string(),
-                ));
-            },
-        };
-
-        if (200..300).contains(&status) {
-            tracing::debug!(target: "xray_router::webhook", url = %self.url, status = status, "webhook post ok");
-            Ok(())
-        } else {
-            Err(RouterError::Webhook(format!("webhook returned status {status}")))
+        let url = self.url.clone();
+        let headers = self.headers.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = post_url(&url, &headers, &body).await {
+                    tracing::warn!(target: "xray_router::webhook", url = %url, error = %e, "webhook post failed");
+                }
+            });
+            return;
         }
+        // ② 豁免类（CLAUDE.md §3.5.6）：webhook POST 必须活得比调用方久
+        // （fire-and-forget I/O，Go 同样是裸 goroutine），且**无 tokio runtime 的
+        // 同步调用方**只能借 OS 线程起临时 runtime。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "webhook POST 属豁免类任务（须活得比调用方久）；无 runtime 的同步调用方只能走 OS 线程兜底"
+        )]
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(target: "xray_router::webhook", error = %e, "webhook: runtime build failed");
+                    return;
+                },
+            };
+            if let Err(e) = rt.block_on(post_url(&url, &headers, &body)) {
+                tracing::warn!(target: "xray_router::webhook", url = %url, error = %e, "webhook post failed");
+            }
+        });
     }
 
-    /// 关闭。后续 fire 返回 Ok(false)。
+    /// 关闭。后续 fire 返回 false。
     pub fn close(&self) {
         *self.closed.lock() = true;
     }
@@ -288,6 +306,75 @@ impl WebhookNotifier {
         }
         seen.keys = keep_keys;
         seen.timestamps = keep_ts;
+    }
+}
+
+/// 异步 HTTP POST 实现（自由函数：旁路任务持 owned 参数，无需 `&self`）。
+///
+/// 依据 URL 形式分派：
+/// - `http://`      → [`tokio::net::TcpStream`] + 手写 HTTP/1.1
+/// - `https://`     → TCP + [`tokio_rustls`] TLS 握手 + 手写 HTTP/1.1
+/// - `/abs/path`    → [`tokio::net::UnixStream`] 抽象拨号（UDS）+ 手写 HTTP/1.1
+async fn post_url(
+    url: &str,
+    headers: &std::collections::HashMap<String, String>,
+    body: &str,
+) -> Result<(), RouterError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(RouterError::Webhook("empty webhook url".to_string()));
+    }
+    let target = parse_webhook_target(url).map_err(RouterError::Webhook)?;
+    let timeout = Duration::from_millis(DEFAULT_TIMEOUT_MS);
+
+    let request = match &target {
+        WebhookTarget::Http { host, path, .. } => build_request(host, "http", path, body, headers),
+        WebhookTarget::Https { host, path, .. } => {
+            build_request(host, "https", path, body, headers)
+        },
+        WebhookTarget::UnixSocket { http_path, .. } => {
+            build_request("localhost", "http", http_path, body, headers)
+        },
+    };
+
+    // 连接 + 写 + 读 + 解析响应
+    let status = match target {
+        WebhookTarget::Http { host, port, .. } => {
+            let mut s = tcp_connect(&host, port, timeout).await?;
+            http_handshake(&mut s, request.as_bytes(), timeout).await?
+        },
+        WebhookTarget::Https { host, port, .. } => {
+            let s = tcp_connect(&host, port, timeout).await?;
+            let connector = tls_connector()?;
+            let server_name = ServerName::try_from(host.clone())
+                .map_err(|e| RouterError::Webhook(format!("invalid tls server name: {e}")))?;
+            let mut tls = tokio::time::timeout(timeout, connector.connect(server_name, s))
+                .await
+                .map_err(|e| RouterError::Webhook(format!("tls handshake timeout: {e}")))?
+                .map_err(|e| RouterError::Webhook(format!("tls handshake failed: {e}")))?;
+            http_handshake(&mut tls, request.as_bytes(), timeout).await?
+        },
+        #[cfg(unix)]
+        WebhookTarget::UnixSocket { socket_path, .. } => {
+            let mut s = tokio::time::timeout(timeout, UnixStream::connect(&socket_path))
+                .await
+                .map_err(|e| RouterError::Webhook(format!("unix connect timeout: {e}")))?
+                .map_err(|e| RouterError::Webhook(format!("unix connect failed: {e}")))?;
+            http_handshake(&mut s, request.as_bytes(), timeout).await?
+        },
+        #[cfg(not(unix))]
+        WebhookTarget::UnixSocket { .. } => {
+            return Err(RouterError::Webhook(
+                "unix socket webhook is not supported on this platform".to_string(),
+            ));
+        },
+    };
+
+    if (200..300).contains(&status) {
+        tracing::debug!(target: "xray_router::webhook", url = %url, status = status, "webhook post ok");
+        Ok(())
+    } else {
+        Err(RouterError::Webhook(format!("webhook returned status {status}")))
     }
 }
 
@@ -444,6 +531,7 @@ fn parse_http_status(response: &str) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::RoutingData;
 
     fn cfg(url: &str, dedup: u32) -> WebhookConfig {
         WebhookConfig {
@@ -453,69 +541,118 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_fire_attempts_post_and_returns_err_on_connect_failure() {
-        // 端口 1 通常不可达，fire 返回连接错误
+    /// nqs31 回归：async 执行上下文里 fire 不得 panic。
+    ///
+    /// 原实现走 `Handle::block_on`（tokio 语义必 panic"不能从 runtime 内部启动
+    /// runtime"），`let _ =` 只吞 `Result` 吞不掉 panic ⇒ 配置了 webhook 的规则
+    /// 首次命中即打穿任务边界。
+    #[tokio::test]
+    async fn test_fire_in_async_context_does_not_panic() {
+        // 端口 1 不可达：fire 只排队，连接失败在旁路任务里记日志。
         let n = WebhookNotifier::new(&cfg("http://127.0.0.1:1", 0));
-        let ev = WebhookEvent::hit("tag", "rule");
-        assert!(n.fire(&ev).is_err());
-    }
-
-    #[test]
-    fn test_dedup_blocks_second_within_window() {
-        // 直接测试去重逻辑（不触发 fire 的 HTTP POST）
-        let n = WebhookNotifier::new(&cfg("http://x", 60));
-        let ev = WebhookEvent::hit("tag", "rule");
-        assert!(!n.is_duplicate(&ev));
-        assert!(n.is_duplicate(&ev));
-    }
-
-    /// 713x6 时钟可注入性验收：MockClock 推进越过去重窗口 → 同事件重新放行
-    /// （行为断言，非"不 panic"；SystemClock 下需真等 60s 不可测）。
-    #[test]
-    fn mock_clock_advance_expires_dedup_window() {
-        let clock = Arc::new(skeleton::clock::MockClock::new());
-        let n = WebhookNotifier::new(&cfg("http://x", 60)).with_clock(clock.clone());
-        let ev = WebhookEvent::hit("tag", "rule");
-        assert!(!n.is_duplicate(&ev), "首见非重复");
-        assert!(n.is_duplicate(&ev), "窗口内重复");
-        clock.advance(Duration::from_secs(61));
-        assert!(!n.is_duplicate(&ev), "窗口过期后同事件重新放行");
-    }
-
-    #[test]
-    fn test_dedup_different_events_pass() {
-        let n = WebhookNotifier::new(&cfg("http://x", 60));
-        let ev1 = WebhookEvent::hit("tag1", "rule");
-        let ev2 = WebhookEvent::hit("tag2", "rule");
-        assert!(!n.is_duplicate(&ev1));
-        assert!(!n.is_duplicate(&ev2));
+        let ctx = RoutingData::new().with_target_domain("example.com");
+        assert!(n.fire(&ctx, "direct"), "首次命中应排队发送");
     }
 
     #[test]
     fn test_close_blocks_subsequent_fire() {
         let n = WebhookNotifier::new(&cfg("http://127.0.0.1:1", 0));
         n.close();
-        let ev = WebhookEvent::hit("x", "y");
-        // close 后 fire 返回 Ok(false)，不尝试 POST
-        assert!(!n.fire(&ev).unwrap());
+        let ctx = RoutingData::new();
+        // close 后 fire 返回 false，不排队 POST。
+        assert!(!n.fire(&ctx, "x"));
+    }
+
+    #[test]
+    fn test_dedup_blocks_second_within_window() {
+        let n = WebhookNotifier::new(&cfg("http://x", 60));
+        assert!(!n.is_duplicate("tag@example.com"));
+        assert!(n.is_duplicate("tag@example.com"));
+    }
+
+    /// 713x6 时钟可注入性验收：MockClock 推进越过去重窗口 → 同键重新放行
+    /// （行为断言，非"不 panic"；SystemClock 下需真等 60s 不可测）。
+    #[test]
+    fn mock_clock_advance_expires_dedup_window() {
+        let clock = Arc::new(skeleton::clock::MockClock::new());
+        let n = WebhookNotifier::new(&cfg("http://x", 60)).with_clock(clock.clone());
+        assert!(!n.is_duplicate("a@example.com"), "首见非重复");
+        assert!(n.is_duplicate("a@example.com"), "窗口内重复");
+        clock.advance(Duration::from_secs(61));
+        assert!(!n.is_duplicate("a@example.com"), "窗口过期后重新放行");
+    }
+
+    #[test]
+    fn test_dedup_different_emails_pass() {
+        let n = WebhookNotifier::new(&cfg("http://x", 60));
+        assert!(!n.is_duplicate("a@example.com"));
+        assert!(!n.is_duplicate("b@example.com"));
+    }
+
+    /// yh01f-b 回归：去重键 = **email**（Go `isDuplicate`），与 tag/rule 无关；
+    /// 空 email 一律不去重。
+    #[test]
+    fn test_dedup_key_is_email_and_empty_is_never_duplicate() {
+        let n = WebhookNotifier::new(&cfg("http://x", 60));
+        assert!(!n.is_duplicate(""), "空 email 不去重");
+        assert!(!n.is_duplicate(""), "空 email 仍不去重");
+        assert!(!n.is_duplicate("a@example.com"));
+        assert!(n.is_duplicate("a@example.com"));
     }
 
     #[test]
     fn test_is_duplicate_zero_window_never_dupes() {
         let n = WebhookNotifier::new(&cfg("", 0));
-        let ev = WebhookEvent::hit("a", "b");
-        assert!(!n.is_duplicate(&ev));
-        assert!(!n.is_duplicate(&ev));
+        assert!(!n.is_duplicate("a@example.com"));
+        assert!(!n.is_duplicate("a@example.com"));
     }
 
+    /// yh01f-b 回归：事件 JSON 键名逐字对齐 Go `router.event`（13 键，缺值为
+    /// `null`，无 omitempty），接 Go 生态接收端不会解析失败。
     #[test]
-    fn test_event_dedup_key_stable() {
-        let e1 = WebhookEvent::hit("a", "b");
-        let e2 = WebhookEvent::hit("a", "b");
-        assert_eq!(e1.dedup_key(), e2.dedup_key());
-        let e3 = WebhookEvent::hit("a", "c");
-        assert_ne!(e1.dedup_key(), e3.dedup_key());
+    fn test_event_json_schema_matches_go() {
+        let ctx = RoutingData::new()
+            .with_target_domain("example.com")
+            .with_inbound_tag("in0")
+            .with_protocol("tls")
+            .with_user("a@example.com");
+        let v = serde_json::to_value(WebhookEvent::from_context(
+            &ctx,
+            "direct",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        ))
+        .unwrap();
+        let obj = v.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "destination",
+                "email",
+                "inboundLocal",
+                "inboundName",
+                "inboundTag",
+                "level",
+                "network",
+                "originalTarget",
+                "outboundTag",
+                "protocol",
+                "routeTarget",
+                "source",
+                "ts",
+            ]
+        );
+        assert_eq!(obj["outboundTag"], serde_json::json!("direct"));
+        assert_eq!(obj["inboundTag"], serde_json::json!("in0"));
+        assert_eq!(obj["protocol"], serde_json::json!("tls"));
+        assert_eq!(obj["network"], serde_json::json!("tcp"));
+        assert_eq!(obj["email"], serde_json::json!("a@example.com"));
+        // 无来源的四个字段（Go 从 session 载荷填充）序列化为 null。
+        assert!(obj["level"].is_null());
+        assert!(obj["inboundName"].is_null());
+        assert!(obj["originalTarget"].is_null());
+        assert!(obj["routeTarget"].is_null());
     }
 
     // ── HTTP 辅助函数 ──

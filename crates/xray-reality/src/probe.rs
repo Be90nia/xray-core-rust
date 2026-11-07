@@ -192,9 +192,10 @@ async fn detect_one_inner(
         AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
     };
     let alpn_wire = alpn_wire(alpn);
-    let tls_conn = BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire, false)
-        .await
-        .ok()?;
+    let tls_conn =
+        BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire, false, false)
+            .await
+            .ok()?;
 
     // 拿底层 TCP 用于写 raw CCS + 读 Alert。`raw_tcp_clone` 与 BoringSSL BIO
     // 共享 fd；握手已结束、BIO 不主动 read，fd 接收缓冲不被消费。
@@ -304,7 +305,7 @@ pub fn detect_max_useless_records(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（REALITY 探测，后台填充探测表）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（REALITY 探测，后台填充探测表）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 if let Some(tier) = detect_one(&dest_c, &sni_c, alpn).await {
@@ -375,10 +376,18 @@ async fn detect_one_record_lens_inner(
         AlpnId::None => Fingerprint::RandomizedNoAlpn,
         AlpnId::Http11 | AlpnId::H2 => get_fingerprint("chrome").ok()?,
     };
-    let tls_conn =
-        BtlsConn::connect_with_alpn(conn, server_name, fp, None, None, alpn_wire(alpn), false)
-            .await
-            .ok()?;
+    let tls_conn = BtlsConn::connect_with_alpn(
+        conn,
+        server_name,
+        fp,
+        None,
+        None,
+        alpn_wire(alpn),
+        false,
+        false,
+    )
+    .await
+    .ok()?;
     let mut raw = tls_conn.raw_tcp_clone()?;
 
     let mut data = Vec::new();
@@ -440,7 +449,7 @@ pub fn detect_post_handshake_record_lens(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（record lens 探测，后台填充）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（record lens 探测，后台填充）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 let lens = timeout(

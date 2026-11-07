@@ -42,15 +42,16 @@ const DEFAULT_ALPN: &[&str] = &["h2", "http/1.1"];
 /// 对应 Go `ConfigFromStreamSettings` + `GetTLSConfig`。
 ///
 /// # 参数
-/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`）。非 `"tls"` / `"reality"` 返回
-///   `None`。
+/// - `security`：安全层名（`"none"` / `"tls"` / `"reality"`，大小写不敏感——内部先
+///   `to_ascii_lowercase`，与 `StreamSettings::is_tls()` / `validate_security()` 同口径）。
 /// - `security_json`：`tlsSettings` 或 `realitySettings` 的 JSON 值。`None` 用默认值。
 /// - `server_name`：默认 SNI（当 `tlsSettings.serverName` 缺失时使用）。
 ///
 /// # 返回
-/// - `Ok(None)`：不需要 TLS
+/// - `Ok(None)`：`security` 为 `"none"` 或空（唯一的"不加密"取值）
 /// - `Ok(Some(Arc<ClientConfig>))`：构建成功
-/// - `Err`：配置解析错误（如 `alpn` 元素非字符串、`pinnedPeerCertSha256` 非法 hex/长度）
+/// - `Err`：配置解析错误（如 `alpn` 元素非字符串、`pinnedPeerCertSha256` 非法 hex/长度）， 或
+///   `security` 为未知取值（fail-visible，绝不静默降级成明文）
 ///
 /// # 安全
 ///
@@ -85,8 +86,25 @@ pub fn build_client_config(
     // ponytail: 放在函数入口确保调用方不必显式 install。
     xray_common::ensure_default_crypto_provider();
 
-    if !matches!(security, "tls" | "reality") {
-        return Ok(None);
+    // bd c0p71（vwhnw 家族）：`security` 先归一化大小写再判定。上游
+    // `StreamSettings::is_tls()` / `validate_security()` 都是 `to_lowercase()`，
+    // 而此处曾是大小写敏感精确匹配 ⇒ `security:"TLS"` 通过上游校验却拿到
+    // `Ok(None)`，调用方按"无需 TLS"原样返回明文 —— 同时传输层已按
+    // `is_tls()==true` 套了 TLS record framer，明文流被当 TLS 记录解析。
+    // Go 基准 `infra/conf/transport_internet.go:98` 走 `strings.ToLower`，行为一致。
+    let security = security.to_ascii_lowercase();
+    if !matches!(security.as_str(), "tls" | "reality") {
+        // `Ok(None)` 只允许表示「明确不加密」（`none` / 空）。其余值一律
+        // fail-visible：静默返回 None 等于把未知安全层降级成明文。
+        if security.is_empty() || security == "none" {
+            return Ok(None);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unsupported transport security {security:?}: expected \"none\", \"tls\" or \"reality\""
+            ),
+        ));
     }
 
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
@@ -165,14 +183,32 @@ pub fn build_client_config(
         );
     }
 
+    // bd 4w092(b)：`echForceQuery` 只实现 `full` 语义（DoH 查询失败即连接失败，
+    // Go v26.3.27 缺省同义）；`half`/`none` 无消费点，写了等于按 `full` 跑。
+    // fail-visible 告警（不硬错：Go 合法配置不得因本仓能力缺口拒启）。
+    match json.get("echForceQuery").and_then(|v| v.as_str()) {
+        Some(mode) if !mode.eq_ignore_ascii_case("full") => tracing::warn!(
+            target: "xray_tls::client_config",
+            mode,
+            "echForceQuery is only implemented as \"full\" (ECH DoH query failure = connection failure); \
+             \"half\"/\"none\" are silently treated as \"full\""
+        ),
+        _ => {},
+    }
+
+    // allowInsecure 的 verifier 需要 provider 的签名算法集；builder 会拿走 provider，
+    // 故仅在需要时先取副本（其余路径零额外 clone）。
+    let insecure_sig_provider = allow_insecure.then(|| (*provider).clone());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
 
     // 信任根先算：pin/vcn 分支里的第二段名验证要用同一份根池（Go `RootCAs`）。
     let roots = verifier_roots(&json)?;
-    let builder = if allow_insecure {
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+    let builder = if let Some(prov) = insecure_sig_provider {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification(prov)))
     } else if !pins.is_empty() || !verify_peer_cert_by_name.is_empty() {
         // bd idtl1：vcn-only（无 pin）是合法配置——Go 的 pin 段在
         // `PinnedPeerCertSha256 == nil` 时整段跳过，vcn 段用 RootCAs 验链+验名。
@@ -297,6 +333,18 @@ pub fn build_server_cert_verifier(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     if allow_insecure {
+        // bd 1nrzk(a)：库直调面的第二道 fail-visible 关口。配置面由
+        // `xray-conf` lint 双向硬错（inbound+outbound），但直接调用本函数的
+        // 嵌入方/测试走不到 lint——这里至少不得静默：明确告知"链与主机名
+        // 全不校验"，避免 `build_server_cert_verifier(x)? == None` 被当作
+        // "无需验证器"从而无声接受任意证书。（`build_client_config` 侧对同一
+        // 键有 deprecation 提示，此处不重复。）
+        tracing::warn!(
+            target: "xray_tls::client_config",
+            "allowInsecure=true: server certificate chain and hostname verification are \
+             skipped for the btls/fingerprint path (Go InsecureSkipVerify semantics); \
+             only use for debugging"
+        );
         return Ok(None);
     }
     let pins = parse_pinned_hashes(&json)?;
@@ -580,14 +628,22 @@ impl ServerCertVerifier for PinnedServerCertVerifier {
     }
 }
 
-/// 永远通过证书验证的 verifier（对齐 Go `InsecureSkipVerify: true`）。
+/// 跳过**证书链**验证的 verifier（对齐 Go `InsecureSkipVerify: true`）。
+///
+/// bd 1nrzk：Go 的 `InsecureSkipVerify` 只跳过链/名验证，握手签名
+/// （`CertificateVerify` 证明持有私钥）仍照验。此前这里连签名都
+/// `assertion()` 直接放行、还额外宣告 SHA1 家族方案（比 Go 更弱，且会改变
+/// ClientHello 的 `signature_algorithms` 扩展 ⇒ JA4 可判别）。现按 Go 语义：
+/// - 链验证：跳过（本类型存在意义）
+/// - 握手签名：委托 provider 的 `signature_verification_algorithms` 真校验
+/// - 宣告方案：= provider 的受支持方案（无 SHA1 家族）
 ///
 /// # 安全
 ///
-/// 该 verifier 完全不检查证书，**仅在调试或明确接受 MITM 风险的场景使用**。
-/// 生产环境必须保持 `allowInsecure=false`。
+/// 证书链完全不校验（任何自签/过期/错名证书都通过），**仅在调试或明确接受
+/// MITM 风险的场景使用**。生产环境必须保持 `allowInsecure=false`。
 #[derive(Debug)]
-struct NoCertificateVerification;
+struct NoCertificateVerification(rustls::crypto::CryptoProvider);
 
 impl ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
@@ -598,46 +654,40 @@ impl ServerCertVerifier for NoCertificateVerification {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        // ponytail: 永远通过——与 Go InsecureSkipVerify 等价。
+        // 唯一被跳过的部分：链 + 主机名 + OCSP（Go InsecureSkipVerify 同义）。
         Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // 暴露所有 rustls 内置方案，避免与 peer 协商失败。
-        // ponytail: 不筛选 = dangerous verifier 接受任何签名方案。
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-        ]
+        self.0.signature_verification_algorithms.supported_schemes()
     }
 }
 
@@ -729,6 +779,45 @@ mod tests {
         install_provider();
         let r = build_client_config("reality", None, "example.com").unwrap();
         assert!(r.is_some(), "reality should produce a ClientConfig");
+    }
+
+    // ---- bd c0p71：security 大小写变体必须得到真 TLS 配置，不得 Ok(None) ----
+
+    /// `security:"TLS"` / `"Tls"` / `"REALITY"` 落到 TLS 分支（Go
+    /// `transport_internet.go:98` `strings.ToLower` 同义）。改前这三种取值返回
+    /// `Ok(None)` ⇒ 调用方按"无需 TLS"原样返回明文 conn，而传输层已按
+    /// `is_tls()==true` 套了 TLS record framer。
+    #[test]
+    fn uppercase_security_builds_tls_config() {
+        install_provider();
+        for security in ["TLS", "Tls", "tls", "REALITY", "Reality"] {
+            let cfg = build_client_config(security, None, "example.com").unwrap();
+            assert!(cfg.is_some(), "security={security:?} must build a ClientConfig, not Ok(None)");
+        }
+    }
+
+    /// `Ok(None)` 只表示"明确不加密"；未知取值必须 fail-visible（改前一律静默
+    /// `Ok(None)` = 明文降级）。
+    #[test]
+    fn unknown_security_fails_visible() {
+        install_provider();
+        for security in ["xtls", "TLSX", "reality2"] {
+            let err = build_client_config(security, None, "example.com")
+                .expect_err("unknown security must not degrade to plaintext");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "got: {err}");
+        }
+    }
+
+    /// bd 1nrzk(b)：宣告的签名方案集 = provider 集（改前额外宣告 SHA1 家族，
+    /// 会改 ClientHello 的 `signature_algorithms` ⇒ JA4 可判别）。
+    #[test]
+    fn insecure_verifier_advertises_provider_schemes_only() {
+        install_provider();
+        let verifier = NoCertificateVerification(rustls::crypto::ring::default_provider());
+        let schemes = verifier.supported_verify_schemes();
+        assert!(!schemes.contains(&SignatureScheme::RSA_PKCS1_SHA1), "{schemes:?}");
+        assert!(!schemes.contains(&SignatureScheme::ECDSA_SHA1_Legacy), "{schemes:?}");
+        assert!(schemes.contains(&SignatureScheme::ED25519), "{schemes:?}");
     }
 
     // ---- minVersion/maxVersion/cipherSuites/curvePreferences（security_params）----
@@ -1056,6 +1145,50 @@ mod tests {
             tokio_rustls::TlsConnector::from(cc).connect(name, b).await.map_err(io::Error::other)
         };
         tokio::join!(accept, connect)
+    }
+
+    /// bd c0p71 验收：`security:"TLS"`（大写）两端都必须握出**真 TLS 流**，
+    /// 而不是"明文 + TLS record framer"。改前客户端 `build_client_config("TLS", ...)`
+    /// 返回 `Ok(None)`（此处 `expect` 直接失败），服务端同样拿不到 ServerConfig。
+    ///
+    /// 顺带覆盖 bd 1nrzk(b)：`allowInsecure` 走 NoCertificateVerification 时，
+    /// 握手签名仍按 provider 真校验，合法握手续得上。
+    #[tokio::test]
+    async fn uppercase_security_yields_encrypted_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let sni = "uppercase.example";
+        let server_json = with_self_signed(serde_json::json!({}), sni);
+        let sc = crate::server_config::build_server_config("TLS", Some(&server_json))
+            .unwrap()
+            .expect("server side security=\"TLS\" must build a ServerConfig");
+        let cc = build_client_config("TLS", Some(&serde_json::json!({"allowInsecure": true})), sni)
+            .unwrap()
+            .expect("client side security=\"TLS\" must build a ClientConfig");
+
+        let (a, b) = tokio::io::duplex(4096);
+        let accept = async move {
+            let mut s =
+                tokio_rustls::TlsAcceptor::from(sc).accept(a).await.map_err(io::Error::other)?;
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await?;
+            s.write_all(b"pong").await?;
+            Ok::<_, io::Error>(buf)
+        };
+        let connect = async move {
+            let name = ServerName::try_from(sni.to_string()).unwrap();
+            let mut c = tokio_rustls::TlsConnector::from(cc)
+                .connect(name, b)
+                .await
+                .map_err(io::Error::other)?;
+            c.write_all(b"ping").await?;
+            let mut resp = [0u8; 4];
+            c.read_exact(&mut resp).await?;
+            Ok::<_, io::Error>(resp)
+        };
+        let (sr, cr) = tokio::join!(accept, connect);
+        assert_eq!(sr.expect("server handshake"), *b"ping");
+        assert_eq!(cr.expect("client handshake"), *b"pong");
     }
 
     #[tokio::test]

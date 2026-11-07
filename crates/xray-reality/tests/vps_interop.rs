@@ -31,7 +31,7 @@ const VLESS_VERSION: u8 = 0;
 /// 完整流程：TCP → REALITY TLS 握手 (watfaq-rustls with_reality) → VLESS header
 /// (flow=xtls-rprx-vision) → VisionConn padding + HTTP GET → 读响应。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 REALITY 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn vless_reality_vision_vps_interop() {
     use xray_proxy_vless::encryption::vision_conn::VisionConn;
 

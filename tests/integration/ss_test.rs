@@ -94,7 +94,7 @@ fn ss_address_format_roundtrip() {
     // IPv4
     let mut buf = Vec::new();
     let addr = Address::ipv4(std::net::Ipv4Addr::new(192, 168, 1, 1));
-    write_address_port_ss(&mut buf, &addr, 443);
+    write_address_port_ss(&mut buf, &addr, 443).expect("write addr should succeed");
     let (parsed_addr, parsed_port, consumed) =
         xray_proxy_ss::protocol::read_address_port_ss(&buf).expect("parse ipv4");
     assert_eq!(parsed_addr, addr);
@@ -104,7 +104,7 @@ fn ss_address_format_roundtrip() {
     // Domain
     let mut buf = Vec::new();
     let addr = Address::Domain("example.com".to_string());
-    write_address_port_ss(&mut buf, &addr, 8080);
+    write_address_port_ss(&mut buf, &addr, 8080).expect("write addr should succeed");
     let (parsed_addr, parsed_port, consumed) =
         xray_proxy_ss::protocol::read_address_port_ss(&buf).expect("parse domain");
     assert_eq!(parsed_addr, addr);
@@ -114,7 +114,7 @@ fn ss_address_format_roundtrip() {
     // IPv6
     let mut buf = Vec::new();
     let addr = Address::ipv6(std::net::Ipv6Addr::LOCALHOST);
-    write_address_port_ss(&mut buf, &addr, 9090);
+    write_address_port_ss(&mut buf, &addr, 9090).expect("write addr should succeed");
     let (parsed_addr, parsed_port, consumed) =
         xray_proxy_ss::protocol::read_address_port_ss(&buf).expect("parse ipv6");
     assert_eq!(parsed_addr, addr);

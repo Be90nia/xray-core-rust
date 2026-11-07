@@ -118,10 +118,20 @@ pub(crate) fn store_session(server_name: &str, session: SslSession) {
     );
 }
 
-/// 解析 `tlsSettings.enableSessionResumption` 缺省 = true（Go 语义）。
+/// 解析 `tlsSettings.enableSessionResumption` 缺省 = true（Go 配置语义）。
 ///
 /// 与 `client_config::build_client_config` 解析同名字段保持一致——缺省对齐 Go
 /// `SessionTicketsDisabled=false`（即允许会话复用）。
+///
+/// # 与 Go 的 wire 差异（bd 9anht，运维须知）
+///
+/// Go 客户端的 uTLS 路径 `copyConfig` **不搬** `ClientSessionCache`
+/// （utls v1.8.3 `common.go:773`），`reality.go:137` 更显式
+/// `SessionTicketsDisabled: true` ⇒ **Go 侧从不 resume**，每次 dial 都是
+/// full handshake（ClientHello 无 `pre_shared_key`）。Rust 侧缺省复用
+/// 缓存 ticket ⇒ 热身后的 ClientHello 带 PSK 扩展，JA3/JA4 与 Go 基线不同。
+/// 要拿到与 Go 同形态的握手，配置显式写 `"enableSessionResumption": false`
+/// （本模块读面早返，等价 Go 行为，代价是每次 dial 多一个 RTT）。
 pub(crate) fn parse_enable_session_resumption(security_json: Option<&serde_json::Value>) -> bool {
     security_json
         .and_then(|v| v.as_object())

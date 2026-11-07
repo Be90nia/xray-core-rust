@@ -564,6 +564,26 @@ fn verify_and_probe(
     Ok(VerifiedHandshake { auth_key, max_useless_records, mirror_record_lens })
 }
 
+/// REALITY 服务端握手窗（bd 5lmcm）：未认证连接不得无限占用握手 task。
+///
+/// TLS/h3/quic 家族都已立闸（`tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT` 4s /
+/// `QUIC_HANDSHAKE_TIMEOUT` 8s），唯 REALITY 监听路径原来裸等——连上不发或
+/// 发一半 ClientHello 的 slowloris 可无限堆积握手 task。这里复用同族 4s 窗，
+/// 超时按 [`RealityError::TlsHandshake`] 返回（调用方连接级失败，不污染入站）。
+async fn within_handshake_window<T>(
+    fut: impl Future<Output = std::io::Result<T>>,
+    what: &str,
+) -> std::result::Result<T, RealityError> {
+    let within = xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT;
+    match tokio::time::timeout(within, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(RealityError::TlsHandshake(format!("{what}: {e}"))),
+        Err(_) => Err(RealityError::TlsHandshake(format!(
+            "{what}: timed out after {within:?} (unauthenticated peer held the handshake task)"
+        ))),
+    }
+}
+
 /// REALITY 服务端握手（rustls 默认路径）。
 ///
 /// 流程：
@@ -612,9 +632,7 @@ pub async fn server_tls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let record = read_tls_record(&mut conn)
-        .await
-        .map_err(|e| RealityError::TlsHandshake(format!("read ClientHello: {e}")))?;
+    let record = within_handshake_window(read_tls_record(&mut conn), "read ClientHello").await?;
     // bd frxi：探测 key 需 sni + alpn，verify 失败路径（Invalid）不查表——
     // Go 侧消费点在 REALITY 握手成功分支内（tls.go:410-437），fallback 连接
     // 走原样转发，无消费。
@@ -640,13 +658,11 @@ where
     let server_config = build_server_config(cert_der, key_der)?;
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
     let prefixed = PrefixedReader::new(record, conn);
-    match acceptor.accept(prefixed).await {
-        Ok(tls) => Ok(RealityServerOutcome::Verified {
-            tls: RealityTlsStream::Rustls(tls),
-            max_useless_records: verified.max_useless_records,
-        }),
-        Err(e) => Err(RealityError::TlsHandshake(e.to_string())),
-    }
+    let tls = within_handshake_window(acceptor.accept(prefixed), "tls accept").await?;
+    Ok(RealityServerOutcome::Verified {
+        tls: RealityTlsStream::Rustls(tls),
+        max_useless_records: verified.max_useless_records,
+    })
 }
 
 /// dest 后握手记录长度列表探测可用性（Go `GlobalPostHandshakeRecordsLens`
@@ -709,9 +725,7 @@ pub async fn server_tls_btls<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let record = read_tls_record(&mut conn)
-        .await
-        .map_err(|e| RealityError::TlsHandshake(format!("read ClientHello: {e}")))?;
+    let record = within_handshake_window(read_tls_record(&mut conn), "read ClientHello").await?;
     let verified = match verify_and_probe(
         &record,
         server_private_key,
@@ -730,9 +744,11 @@ where
 
     let (cert_der, key_der) = generate_reality_ed25519_cert(&verified.auth_key)?;
     let prefixed = PrefixedReader::new(record, conn);
-    let mut tls = xray_tls::btls_server::accept(prefixed, &cert_der, &key_der)
-        .await
-        .map_err(|e| RealityError::TlsHandshake(format!("btls accept: {e}")))?;
+    let mut tls = within_handshake_window(
+        xray_tls::btls_server::accept(prefixed, &cert_der, &key_der),
+        "btls accept",
+    )
+    .await?;
 
     // bd z32z：mirror 发送体恢复——字节级等价形态（Go tls.go:417-426 镜像）。
     // 每条 dest 记录长度 L 构造 inner plaintext = [0x17] + (L-22) 个全零，
@@ -1917,6 +1933,31 @@ mod tests {
         );
     }
 
+    /// bd 5lmcm：连上不发一个字节的对端必须在同族握手窗内被清掉（slowloris 防护）。
+    ///
+    /// 改前 `read_tls_record` 裸等 ⇒ 未认证连接可无限占用握手 task。窗口取
+    /// `xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT`（TLS/h3/quic 同族 4s）。
+    #[tokio::test(start_paused = true)]
+    async fn server_tls_half_open_peer_hits_handshake_timeout() {
+        use tokio::io::duplex;
+        use xray_transport::tls_handshake_gate::TLS_HANDSHAKE_TIMEOUT;
+
+        let (client, server) = duplex(64); // client 只保持连接，不发 ClientHello
+        let t0 = tokio::time::Instant::now();
+        let result =
+            server_tls(server, &[0x11u8; 32], &[[0xaa; 8]], 43200, &[], &[], &[], None).await;
+        let waited = t0.elapsed();
+        drop(client);
+
+        let err = match result {
+            Ok(_) => panic!("half-open peer must not hold the handshake task"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, RealityError::TlsHandshake(_)), "got {err:?}");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(waited >= TLS_HANDSHAKE_TIMEOUT, "gate fired too early: {waited:?}");
+    }
+
     /// verify 通过后进入 acceptor.accept 阶段（成功分支标志）。
     ///
     /// server_tls 在 verify 失败时返回 `Ok(Invalid)`，不会进入 Err 路径。
@@ -2150,6 +2191,92 @@ mod tests {
         }
     }
 
+    /// bd f6mc9：firefox 系 / edge 变体的**实测归类**（取代"firefox 有独立兼容性
+    /// 问题、EOF 先于门禁"的旧注释）。
+    ///
+    /// 实测（2026-11-07，本机 loopback，rustls 服务端 + btls 客户端）：
+    /// - `firefox` / `safari` 预设：**REALITY 全链通过**（client ok + server `Verified`） ⇒
+    ///   旧注释的 EOF 现象已不复现，不需与 Go 侧再对照（无缺陷可对照）。
+    /// - `hellofirefox_120` / `edge`：服务端在 key_share 门禁处 reject （`key_share extension
+    ///   missing or no X25519 entry`）⇒ 与 Go 对非 MLKEM ClientHello 的 reject→forward 同一分类（见
+    ///   `server_tls_pure_x25519_ch_invalid_for_fallback`），非 firefox 特有缺陷。
+    #[tokio::test]
+    async fn fingerprint_firefox_family_classified() {
+        use std::time::Duration;
+
+        use tokio::io::duplex;
+        use x25519_dalek::{PublicKey, StaticSecret};
+        use xray_proto::transport::internet::reality::Config as ProtoConfig;
+
+        use crate::{
+            client::{UConnState, u_client},
+            config::RealityConfig,
+        };
+
+        let short_id = [0xaa; 8];
+        let server_priv_array = [0x11u8; 32];
+        let server_pub = PublicKey::from(&StaticSecret::from(server_priv_array));
+        let state_for = |fp: &str| {
+            let proto = ProtoConfig {
+                fingerprint: fp.to_string(),
+                public_key: server_pub.as_bytes().to_vec(),
+                server_name: "example.com".into(),
+                short_id: short_id.to_vec(),
+                ..Default::default()
+            };
+            UConnState::new(RealityConfig::from_proto(&proto).unwrap()).unwrap()
+        };
+
+        // ① 全链通过组。
+        for fp in ["firefox", "safari"] {
+            let (client, server) = duplex(65536);
+            let client = xray_transport::connection::DuplexConnection::new(client);
+            #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
+            let server_task = tokio::spawn(async move {
+                server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None)
+                    .await
+            });
+            let client_result =
+                tokio::time::timeout(Duration::from_secs(10), u_client(client, state_for(fp)))
+                    .await;
+            let server_result = server_task.await.unwrap();
+            assert!(
+                matches!(client_result, Ok(Ok(_))),
+                "[{fp}] firefox-family preset must complete the REALITY handshake"
+            );
+            assert!(
+                matches!(&server_result, Ok(RealityServerOutcome::Verified { .. })),
+                "[{fp}] server must report Verified"
+            );
+        }
+
+        // ② 门禁 reject 组（Go 一致分类，不做全链断言——客户端只会等超时）。
+        for fp in ["hellofirefox_120", "edge"] {
+            let (client, server) = duplex(65536);
+            let client = xray_transport::connection::DuplexConnection::new(client);
+            #[allow(clippy::disallowed_methods, reason = "测试：server_tls 任务")]
+            let server_task = tokio::spawn(async move {
+                server_tls(server, &server_priv_array, &[short_id], 43200, &[], &[], &[], None)
+                    .await
+            });
+            // 客户端只需推进到"发出 ClientHello"；门禁拒绝后服务端立即返回。
+            let _ =
+                tokio::time::timeout(Duration::from_millis(500), u_client(client, state_for(fp)))
+                    .await;
+            let server_result = server_task.await.unwrap();
+            match server_result {
+                Ok(RealityServerOutcome::Invalid { reason, .. }) => assert!(
+                    reason.to_string().contains("key_share"),
+                    "[{fp}] expected key_share gate rejection, got {reason}"
+                ),
+                Ok(RealityServerOutcome::Verified { .. }) => {
+                    panic!("[{fp}] expected Invalid(key_share), got Verified")
+                },
+                Err(e) => panic!("[{fp}] expected Invalid(key_share), got Err: {e}"),
+            }
+        }
+    }
+
     /// 566y：btls 主路径 **MLKEM-capable 指纹 active 矩阵**（实测 2026-09-19）。
     ///
     /// 从原 21 指纹大矩阵中摘出**当前 btls 栈上真实可完成 REALITY 全链**的
@@ -2178,8 +2305,13 @@ mod tests {
     /// - PASS（4）：chrome / android / hellochrome_131 / hellochrome_133 —— 已摘为上方 active 矩阵
     ///   [`reality_fingerprint_matrix_btls_mlkem`]；
     /// - FAIL（17）：非 MLKEM 模板。服务端按 Go 语义 reject→forward（正确行为）， 客户端等不到
-    ///   ServerHello → 10s timeout（edge/360/qq/safari/100/99 系） 或 EOF（firefox 系——rustls
-    ///   服务端对 firefox CH 另有兼容性问题，EOF 先于门禁发生，属既有独立问题）。
+    ///   ServerHello → 10s timeout（edge/360/qq/safari/100/99 系）。
+    ///
+    /// **bd f6mc9 更正（2026-11-07 实测）**：旧注释的"firefox 系 EOF 先于门禁发生、
+    /// 属独立兼容性问题"**已不复现**——`firefox` / `safari` 预设现在完整走通 REALITY
+    /// 全链（client ok + server `Verified`）；`hellofirefox_120` / `edge` 在
+    /// key_share 门禁处 reject（非 firefox 特有）。归类由
+    /// `fingerprint_firefox_family_classified` 锁定。
     ///
     /// **ignore 根因更新**：旧注释声称的"btls transcript mismatch → DECODE_ERROR"
     /// 已不复现（chrome 全链实测通过）；当前保留 ignore 是因为矩阵混合

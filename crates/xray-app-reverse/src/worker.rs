@@ -292,12 +292,13 @@ impl crate::picker::PickerWorker for PortalWorker {
         PortalWorker::is_draining(self)
     }
 
-    /// ponytail: Go 用 `client.ActiveConnections()`（SessionManager::size，async）；
-    /// Rust picker 为同步 trait，用 `session_count()`（累计值）近似。稳态下
-    /// 等价；会话关闭后不回收，偏向较新 worker。需要精确活跃数时给
-    /// SessionManager 加同步 active 计数。
+    /// 活跃连接数（Go `ClientManager.ActiveConnections()` = `SessionManager.Size()`）。
+    ///
+    /// bd j1mv0：旧实现拿 `session_count()`（**累计**分配数）冒充活跃数——累计值
+    /// 只增不减，选路恒偏向"累计最小"的 carrier（通常是最新加入者），老的长期
+    /// 闲置、新的被压死。`active_count()` 同步无锁原子读，无需 async。
     fn active_connections(&self) -> u32 {
-        u32::from(self.client.session_count())
+        u32::try_from(self.client.session_manager().active_count()).unwrap_or(u32::MAX)
     }
 }
 
@@ -402,10 +403,27 @@ impl BridgeWorker {
             Arc::new(tokio::sync::Mutex::new(Some(carrier.writer)));
         let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
         let frame_server = Arc::clone(&server);
+        let frame_tag = me.tag.clone();
         // 闸关不可达：内部 scope 无 close 调用（循环随 carrier EOF 自终止）。
         me.fx
             .spawn_tracked(async move {
-                while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
+                // 旧实现 `while let Ok(true)` 把帧错误静默吞掉：载体死亡零日志，
+                // 现场只剩「连接莫名断」（bd 08wkx-c）。错误分支记死因后再收摊。
+                loop {
+                    match frame_server.process_frame(&mut reader, &link_writer).await {
+                        Ok(true) => {},
+                        Ok(false) => break, // 干净 EOF
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "xray_app_reverse",
+                                tag = %frame_tag,
+                                error = %e,
+                                "bridge carrier frame loop terminated by error"
+                            );
+                            break;
+                        },
+                    }
+                }
                 frame_server.close();
                 monitor_h.abort();
             })
@@ -421,6 +439,7 @@ impl BridgeWorker {
     pub fn state(&self) -> ControlState {
         match self.state.load(Ordering::Acquire) {
             1 => ControlState::Drain,
+            2 => ControlState::Unknown,
             _ => ControlState::Active,
         }
     }
@@ -879,6 +898,31 @@ mod entity_tests {
         });
         worker
     }
+    /// bd j1mv0：picker 的活跃数必须取 `active_count()`（Go `SessionManager.Size()`），
+    /// 不是累计 `session_count()`——累计只增不减，选路会恒偏向最新加入的 carrier，
+    /// 老的长期闲置、新的被压死。
+    #[tokio::test]
+    async fn portal_worker_active_connections_uses_live_sessions() {
+        use crate::picker::PickerWorker as _;
+
+        let (c_read, _s_write) = pipe::new(); // server → client（本测试只用计数面）
+        let (_s_read, c_write) = pipe::new();
+        let client = ClientWorker::new(
+            MuxLink { reader: Box::new(c_read), writer: Box::new(c_write) },
+            ClientStrategy::default(),
+        );
+        let worker = PortalWorker::new(client.clone()).expect("portal worker");
+
+        let strategy = ClientStrategy::default();
+        let s1 = client.session_manager().allocate(&strategy).await.expect("allocate s1");
+        let _s2 = client.session_manager().allocate(&strategy).await.expect("allocate s2");
+        assert_eq!(worker.active_connections(), 2, "两条会话活跃");
+
+        client.session_manager().remove(s1.id()).await;
+        assert_eq!(client.session_count(), 2, "累计数不减（= 旧实现取的值）");
+        assert_eq!(worker.active_connections(), 1, "活跃数必须随会话移除递减");
+    }
+
     #[tokio::test]
     async fn portal_worker_heartbeat_sends_control_on_internal_dest() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
