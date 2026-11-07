@@ -13,9 +13,12 @@
 //! 1. 配置派生值：env 缺省档 + policy 各 level `bufferSize`（KB；负值 = 无界 ⇒ 硬拒，Go 同源坑
 //!    audit4-memory F8；本仓装配期硬拒负值 ⇒ 96MB 门下不存在「Go 同源
 //!    无界」活口，**无界一律硬拒零豁免**；0 = Go 合法「limit 0 不排队」，必须放行）；
-//! 2. 实际占用面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]）、QUIC/xhttp 每
-//!    listener/dialer 的端点账面（socket 与 h2 send_buf）、预算内最小并发乘以每连接 pipe
-//!    占用——配置合法但合计超 [`XRAY_BUDGET_BYTES`] 同样拒启。
+//! 2. 实际占用面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]）、QUIC 每 listener 的 UDP
+//!    socket 接收缓冲（bind 即真实分配）、预算内最小并发乘以每连接 pipe 占用——配置合法但 合计超
+//!    [`XRAY_BUDGET_BYTES`] 同样拒启。 xhttp 的 h2 send_buf
+//!    是**每连接发送缓冲上限**（仅背压时分配，装配期 0 占用），按 「上限 ≠
+//!    预约」统一口径**登记不入账**（同 bridge 在途 / xdns frag / DNS singleflight）； 真机依据见
+//!    `check_startup_budget` 内注释（bd sgdwm）。
 
 // 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
 pub use xray_frame::budget::{
@@ -69,10 +72,15 @@ fn stream_network(
 /// 1. 每连接 pipe 软上限的取值来源：env 缺省档（`xray.ray.buffer.size` / `XRAY_RAY_BUFFER_SIZE` /
 ///    `XRAY_BUFSIZE` → `BufferPolicy::default`，level 未配 bufferSize 时的生效值）+ policy app 各
 ///    level 的 `bufferSize`（KB 单位； 负值 = 无界硬拒；0 = Go 合法「不排队」放行）。
-/// 2. 实际占用面：[`startup_fixed_floor_bytes`]（进程级池/缓存）+ QUIC/xhttp 端点账面（扫
-///    inbounds/outbounds 的 streamSettings transport 名）+ [`MIN_VIABLE_CONCURRENCY`] × 最大 pipe
-///    档 × 2 方向，合计超 [`XRAY_BUDGET_BYTES`]
+/// 2. 实际占用面：[`startup_fixed_floor_bytes`]（进程级池/缓存）加上 QUIC 每 listener 的 UDP socket
+///    接收缓冲（扫 inbounds/outbounds 的 streamSettings transport 名；bind 即真实分配）， 再加
+///    [`MIN_VIABLE_CONCURRENCY`] × 最大 pipe 档 × 2 方向，合计超 [`XRAY_BUDGET_BYTES`]
 ///    即拒——「配置合法但实际占用超预算」的组合同样过不了门。
+///
+/// **xhttp 的 h2 send_buf 登记不入账（bd sgdwm 真机暴露）**：它是**每连接发送缓冲上限**，
+/// 只在背压时按需分配，装配期零连接 ⇒ 真实占用 0。若按 listener × 16MiB 预约，176 生产配置
+/// （7 个 xhttp 入站）会算出 120MiB 而**拒绝启动合法配置**；故按「上限 ≠ 预约」统一口径
+/// （同 bridge 在途 / xdns frag / DNS singleflight）只登记并在错误文案中点名，不计入实算。
 ///
 /// **桥在途不入门（jcnjb③ 决策，登记≠入账口径）**：桥在途上界登记在
 /// [`BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`]（条目闸口径 66MiB/连接缺省档；
@@ -126,8 +134,13 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
     }
 
     let fixed = startup_fixed_floor_bytes();
-    let endpoint_booked = quic_endpoints * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES
-        + splithttp_endpoints * SPLITHTTP_ENDPOINT_BOOKED_BYTES;
+    // QUIC 的 UDP socket 接收缓冲是**每 listener 的真实分配**（bind 即占，内核含 2× 记账）⇒ 入账。
+    let endpoint_booked = quic_endpoints * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES;
+    // h2 send_buf（xhttp）是**每连接的发送缓冲上限**，只在背压时按需分配，装配期零连接 ⇒ 0 占用。
+    // 按「上限 ≠ 预约」统一口径（同 bridge 在途 / xdns frag / DNS singleflight）**登记不入账**。
+    // 真机依据（bd sgdwm）：176 生产配置有 7 个 xhttp 入站，若按 listener × 16MiB 预约会算出
+    // 120MiB ⇒ 合法配置被拒启；而实际常驻远低于该上限。端点与容量仍在错误文案中点名。
+    let registered_only = splithttp_endpoints * SPLITHTTP_ENDPOINT_BOOKED_BYTES;
     // 每连接 pipe 占用按两方向计（上/下行各一条 policy pipe，见 MAX_PER_CONN_BUFFER_BYTES doc）。
     let per_conn_pipe = max_pipe_bytes * 2;
     // 桥在途不入门：满载瞬态（装配期零连接，连接数不可判定；jcnjb③；总实算
@@ -137,9 +150,10 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
     if projected > XRAY_BUDGET_BYTES {
         violations.push(format!(
             "actual occupancy {projected}B > budget {}B: fixed {fixed}B (pools+caches) \
-             + endpoints {endpoint_booked}B ({quic_endpoints} QUIC x {}B socket booked \
-             + {splithttp_endpoints} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B h2 send_buf+idle) \
-             + {MIN_VIABLE_CONCURRENCY} conns x {per_conn_pipe}B pipe(2-way)",
+             + endpoints {endpoint_booked}B ({quic_endpoints} QUIC x {}B socket booked) \
+             + {MIN_VIABLE_CONCURRENCY} conns x {per_conn_pipe}B pipe(2-way) \
+             [registered-only, not summed: {splithttp_endpoints} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B \
+             = {registered_only}B h2 send_buf cap — allocated only under backpressure]",
             XRAY_BUDGET_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
         ));
     }
@@ -171,6 +185,17 @@ mod tests {
             port: Some(443),
             listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::json!({"network": "quic"})),
+            sniffing_json: None,
+        }
+    }
+
+    fn splithttp_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            entry: BuiltEntry { kind: "dokodemo-door".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            port: Some(8080),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(serde_json::json!({"network": "splithttp"})),
             sniffing_json: None,
         }
     }
@@ -279,6 +304,20 @@ mod tests {
         built.inbounds.push(quic_inbound("quic-in"));
         built.outbounds.push(xhttp_outbound("xhttp-out"));
         check_startup_budget(&built).expect("同拓扑缺省 pipe 必须过门");
+    }
+
+    /// **真机回归（bd sgdwm，176 生产配置）**：7 个 xhttp 入站 + 缺省 pipe 必须过门。
+    /// h2 `send_buf` 是**每连接发送缓冲上限**（仅背压时分配，装配期零连接 ⇒ 真实占用 0），
+    /// 若按 listener × 16MiB 预约会算出 120MiB，把合法生产配置**拒启**——
+    /// 该形态由 2026-11-07 部署 176 时实际触发（服务起不来，自动回滚）。
+    #[test]
+    fn many_xhttp_inbounds_do_not_book_h2_cap_per_listener() {
+        let mut built = xray_conf::BuiltConfig::default();
+        for i in 0..7 {
+            built.inbounds.push(splithttp_inbound(&format!("xhttp-in-{i}")));
+        }
+        check_startup_budget(&built)
+            .expect("7 个 xhttp 入站（h2 上限登记不入账）必须过门（176 生产配置回归，bd sgdwm）");
     }
 
     /// 扩面门取「最大显式 level」做 pipe 底数：显式 4MiB 比缺省 512KiB 大 ⇒
