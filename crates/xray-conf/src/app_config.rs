@@ -255,10 +255,14 @@ pub struct ApiConfig {
     /// API handler tag。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
-    /// gRPC 监听地址（如 `"127.0.0.1:8080"` / `":8080"`）。
+    /// gRPC 监听地址（如 `"127.0.0.1:8080"` / `"/run/xray/api.sock"`）。
     ///
     /// 对应 Go proto `xray.app.commander.Config.Listen`。为空时走 outbound 模式
     /// （通过 OutboundHandler 接收 API 连接，需 transport 全链路）。
+    ///
+    /// **TCP 只许 loopback**（bd tbva2）：该 gRPC 面无鉴权无 TLS，`:8080` / `0.0.0.0:x`
+    /// / 网卡地址一律启动期拒启（控制面全暴露）。远程管理用 SSH 隧道到
+    /// `127.0.0.1:<port>`，或用 Unix socket 路径（权限由文件系统给）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
     /// 启用的 API 服务列表。

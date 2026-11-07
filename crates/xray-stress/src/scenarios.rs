@@ -132,7 +132,10 @@ pub async fn s4_mixed(
     stats: StatsHandle,
     delay_ms: u64,
 ) {
-    #[allow(clippy::disallowed_methods, reason = "压测：s4 短连接风暴场景任务")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：压测：s4 短连接风暴场景任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    )]
     let short = tokio::spawn(s1_short_burst(
         kcp_socks_port,
         echo_port,
@@ -141,7 +144,10 @@ pub async fn s4_mixed(
         stats.clone(),
         delay_ms,
     ));
-    #[allow(clippy::disallowed_methods, reason = "压测：s4 长流场景任务")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：压测：s4 长流场景任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    )]
     let long = tokio::spawn(s2_long_flow(kcp_socks_port, echo_port, long_conns, deadline, stats));
     let _ = tokio::join!(short, long);
 }

@@ -35,7 +35,7 @@ use xray_transport::{connection::Connection as _, system_listener::InboundTcpLis
 use crate::{
     inbound::{
         DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, PeekAhead, SsInboundMode,
-        build_tls_acceptor, build_trojan_fallbacks, build_trojan_users,
+        bind_ss_udp, build_tls_acceptor, build_trojan_fallbacks, build_trojan_users,
         build_trojan_validator_shared, build_vless_decryption, build_vless_fallbacks,
         build_vless_validator, build_vmess_validator, handshake_timeout_for, inbound_tcpmask,
         inbound_udpmask, is_transport_listener_protocol, parse_anytls_tls_acceptor,
@@ -562,7 +562,12 @@ pub(crate) async fn build_dokodemo_inbound(
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         let _scope = fx;
         for h in handles {
-            let _ = h.join().await;
+            // panic 不得静默（bd 16uis S7）：同 `spawn_inbound_serve` 外层壳的
+            // `TaskError::Panicked` 留痕语义——旧实现 `let _` 把 JoinError 丢掉，
+            // 任务 panic 后监听静默消失且无任何日志。
+            if let Err(e) = h.join().await {
+                tracing::error!(error = ?e, "dokodemo inbound task ended abnormally");
+            }
         }
         Ok(())
     })))
@@ -604,8 +609,11 @@ pub(crate) async fn build_shadowsocks_inbound(
         .with_tcpmask_manager(inbound_tcpmask(&settings)?);
     let inbound = parse_ss_inbound_config(&ib.entry.data)?;
     register_ss_user_manager(api, &ib.tag, &inbound);
-    // finalmask.udp（bd 05js，Go udp/hub.go:61-62）：同端口 UDP relay 装配
-    let inbound_udp_mask = inbound_udpmask(&settings)?;
+    // finalmask.udp（bd 05js，Go udp/hub.go:61-62）：同端口 UDP relay 装配。
+    // bd zhjhv：bind + mask 包装在**装配期**完成——地址取 TCP listener 的实际
+    // 绑定地址（= 配置 `listen`，Go worker.go:413 `udp.ListenUDP(ctx, w.address,
+    // w.port)`），失败即 `?` 拒启（Go udpWorker.Start() 返回 err）。
+    let inbound_udp = bind_ss_udp(&listener, inbound_udpmask(&settings)?).await?;
     tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
         let plugin_ctx = Arc::clone(&plugin_ctx);
@@ -615,7 +623,7 @@ pub(crate) async fn build_shadowsocks_inbound(
                 ohm,
                 inbound,
                 handshake_timeout_for(&policy, 0),
-                inbound_udp_mask,
+                Some(inbound_udp),
                 plugin_ctx,
             )
             .await
@@ -932,7 +940,7 @@ pub(crate) async fn build_blackhole_inbound(
     addr: &str,
     plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    let response = parse_blackhole_inbound_response(&ib.entry.data);
+    let response = parse_blackhole_inbound_response(&ib.entry.data)?;
     let handler = BlackholeInboundHandler::new(Arc::clone(&plugin_ctx), &ib.tag, response, addr);
     handler.start().await.map_err(|e| std::io::Error::other(format!("blackhole inbound: {e}")))?;
     // accept 循环在 start() 内部 spawn，此 task 保持 handler 存活并监听 shutdown。
@@ -993,7 +1001,7 @@ pub(crate) fn vless_transport_on_conn(
         let options = options.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（vless fallback，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（vless fallback，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -1043,7 +1051,7 @@ pub(crate) fn trojan_transport_on_conn(
         let fb_policy = fallbacks.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（trojan fallback，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（trojan fallback，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -1094,7 +1102,7 @@ pub(crate) fn vmess_transport_on_conn(
         let _cleanup_ctx = Arc::clone(&cleanup_ctx);
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（vmess，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（vmess，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
@@ -1132,7 +1140,7 @@ pub(crate) fn ss_transport_on_conn(
         let handler = Arc::clone(&handler);
         #[allow(
             clippy::disallowed_methods,
-            reason = "inbound 连接处理任务（ss/ss2022，每连接）；显式脱管：上游 drain 缺口——FxScope 的 JoinSet 无收割接口，每连接登记一条会无界累积，登记收益为负；句柄随连接任务自然结束（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（ss/ss2022，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
@@ -1469,7 +1477,7 @@ pub(crate) fn tun_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         // 记账）远小于风险 → 保留裸 spawn，逐点理由登记。
         #[allow(
             clippy::disallowed_methods,
-            reason = "tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留"
+            reason = "②豁免（bd kwevg · §3.5.6）：tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let handle = tokio::spawn(async move {
             if let Err(e) = handler.start().await {

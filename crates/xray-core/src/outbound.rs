@@ -30,7 +30,10 @@
 //! 当前不处理 streamSettings（TLS/WS/Reality）—— vless/trojan 走裸 TCP `dial_system`。
 //! transport 层补全后，`try_build_handler` 将在此注入 TLS-wrapped 拨号闭包。
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, Weak},
+};
 
 use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager,
@@ -91,39 +94,104 @@ impl LoopbackSink for DispatcherLoopbackSink {
     }
 }
 
-/// 包装 `&SimpleOhm` 为 `Arc<dyn OutboundHandlerManager>`。
+/// 出站表句柄：把「谁持有 `SimpleOhm`」这件事收敛成一个能力trait。
 ///
-/// `SimpleOhm` 实现了 `OutboundHandlerManager`，但 `register_outbounds` 接受 `&SimpleOhm` 借用，
-/// 不能直接创建 `Arc`。此 wrapper 持有裸指针（生命周期由调用方保证），
-/// 实现 `OutboundHandlerManager` trait 以供代理链查找 handler。
-///
-/// # Safety
-///
-/// `inner` 指针必须在 `OhmRef` 存活期间有效。`register_outbounds` 中 `ohm` 的生命周期
-/// 覆盖 Phase 2 设置 + 后续 dispatch 使用（因为 `SimpleOhm` 内部用 `RwLock`，指针始终有效）。
-struct OhmRef {
-    inner: *const SimpleOhm,
+/// - 生产（`xray-core::functions`）传 `&Arc<SimpleOhm>` ⇒ [`live`](Self::live) 给出
+///   强引用，`DIALER_PROXY_HOOK` 持 `Weak` 跟随实例生命周期（实例 drop ⇒ hook 侧
+///   自然失效，不再有悬垂指针）。
+/// - 测试/借用面传 `&SimpleOhm`（无所有权）⇒ [`live`](Self::live) 返回 `None`，
+///   调用方改为持有**安装期快照**（[`SimpleOhm::snapshot`]，handler 全是 `Arc` 共享），
+///   于是也不需要裸指针。
+pub trait OutboundTable {
+    /// 可弱化的强引用（生产路径有，借用路径无）。
+    fn live(&self) -> Option<Arc<SimpleOhm>>;
+
+    /// 借用面本体。
+    fn as_ohm(&self) -> &SimpleOhm;
 }
 
-// Safety: SimpleOhm 是 Send + Sync，裸指针在 register_outbounds 生命周期内有效。
-unsafe impl Send for OhmRef {}
-unsafe impl Sync for OhmRef {}
+impl OutboundTable for SimpleOhm {
+    fn live(&self) -> Option<Arc<SimpleOhm>> {
+        None
+    }
+
+    fn as_ohm(&self) -> &SimpleOhm {
+        self
+    }
+}
+
+impl OutboundTable for Arc<SimpleOhm> {
+    fn live(&self) -> Option<Arc<SimpleOhm>> {
+        Some(Arc::clone(self))
+    }
+
+    fn as_ohm(&self) -> &SimpleOhm {
+        self
+    }
+}
+
+/// 包装 `SimpleOhm` 为 `Arc<dyn OutboundHandlerManager>`（弱引用形态）。
+///
+/// 历史：本件曾是 `*const SimpleOhm` 的裸指针包装 + 手写 `unsafe impl Send/Sync`，
+/// 安全前提只在 `register_outbounds` 的单函数作用域成立；而 `DIALER_PROXY_HOOK`
+/// 是**进程级**全局，`start_full` 返回 `Arc` 后实例可能先 drop 再被拨号 ⇒ 悬垂
+/// 指针 / UAF（bd j7xic）。
+///
+/// 现在只持 [`Weak`]：实例已销毁时 lookup 失败并留痕（fail-visible，不 UB）。
+struct OhmRef {
+    inner: Weak<SimpleOhm>,
+}
+
+impl OhmRef {
+    /// 从强引用派生（不延长生命周期）。
+    fn new(ohm: &Arc<SimpleOhm>) -> Self {
+        Self { inner: Arc::downgrade(ohm) }
+    }
+
+    /// 升强引用；实例已销毁 ⇒ `None` + 一次 warn（hook 是进程级，晚到拨号会撞到）。
+    fn upgrade(&self, what: &str) -> Option<Arc<SimpleOhm>> {
+        let ohm = self.inner.upgrade();
+        if ohm.is_none() {
+            tracing::warn!(
+                call = what,
+                "dialerProxy hook: outbound table already dropped (instance closed); \
+                 failing the lookup instead of dereferencing"
+            );
+        }
+        ohm
+    }
+}
 
 impl std::fmt::Debug for OhmRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OhmRef").finish_non_exhaustive()
+        f.debug_struct("OhmRef").field("alive", &self.inner.strong_count()).finish_non_exhaustive()
     }
 }
 
 impl xray_app_dispatcher::OutboundHandlerManager for OhmRef {
     fn get_handler(&self, tag: &str) -> Option<Arc<dyn DispatchHandler>> {
-        // Safety: inner 指针在 OhmRef 存活期间有效
-        unsafe { &*self.inner }.get_handler(tag)
+        self.upgrade("get_handler")?.get_handler(tag)
     }
 
     fn get_default_handler(&self) -> Option<Arc<dyn DispatchHandler>> {
-        // Safety: inner 指针在 OhmRef 存活期间有效
-        unsafe { &*self.inner }.get_default_handler()
+        self.upgrade("get_default_handler")?.get_default_handler()
+    }
+}
+
+/// 取一个可以装进进程级 hook 的 `OhmRef`：优先用强引用（Weak 跟随实例），
+/// 无所有权时退化为安装期快照（由调用方持有存活句柄）。
+///
+/// 返回 `(manager, keepalive)`——`keepalive` 必须与 hook 一起存活（快照路径下它
+/// 是唯一持有者；生产路径为 `None`，靠调用方自己的 `Arc`）。
+fn ohm_ref_for_hook<T: OutboundTable>(
+    table: &T,
+) -> (Arc<dyn xray_app_dispatcher::OutboundHandlerManager>, Option<Arc<SimpleOhm>>) {
+    match table.live() {
+        Some(live) => (Arc::new(OhmRef::new(&live)), None),
+        None => {
+            let snapshot = Arc::new(table.as_ohm().snapshot());
+            (Arc::new(OhmRef::new(&snapshot)), Some(snapshot))
+        },
     }
 }
 
@@ -172,9 +240,9 @@ pub fn inbound_default_rules(
 /// `dns` 提供域名解析服务（对应 Go 全局 `internet.dnsClient`，由 `app/dns`
 /// 初始化后 `internet.InitDNSCache` 注入）。配置了 `targetStrategy`（非 AsIs）
 /// 的出站在拨号前经 `wrap_dial_with_target_strategy` 解析改写目标。
-pub fn register_outbounds(
+pub fn register_outbounds<T: OutboundTable>(
     built: &BuiltConfig,
-    ohm: &SimpleOhm,
+    ohm: &T,
     loopback_sink: Option<Arc<dyn LoopbackSink>>,
     dns: Option<Arc<xray_app_dns::DnsService>>,
     // sm80③/czwu：出站 DialBridge 的 session policy（connIdle/uplinkOnly/downlinkOnly）。
@@ -182,6 +250,8 @@ pub fn register_outbounds(
     // （Go freedom.go:222-225 h.policy()）。None = SessionDefault。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
 ) -> std::result::Result<(), BuildError> {
+    let table = ohm;
+    let ohm: &SimpleOhm = table.as_ohm();
     // Phase 1: 注册所有 handler，收集需要代理链的 DialBridge 引用
     let mut chain_bridges: Vec<(Arc<DialBridge>, String)> = Vec::new(); // (bridge, chain_tag)
     let mut mux_bridges: Vec<(Arc<MuxBridge>, Option<String>)> = Vec::new();
@@ -225,10 +295,9 @@ pub fn register_outbounds(
 
     // Phase 2: 设置代理链——为有 proxy_chain_tag 的 DialBridge 注入 outbound_manager
     if !chain_bridges.is_empty() {
-        let ohm_arc: Arc<dyn xray_app_dispatcher::OutboundHandlerManager> =
-            Arc::new(OhmRef { inner: ohm });
+        let (ohm_arc, _keepalive) = ohm_ref_for_hook(table);
         for (bridge, chain_tag) in chain_bridges {
-            bridge.set_proxy_chain(chain_tag, ohm_arc.clone());
+            bridge.set_proxy_chain(chain_tag, Arc::clone(&ohm_arc));
             tracing::debug!(
                 tag = %bridge.tag(),
                 chain_tag = %bridge.tag(),
@@ -242,10 +311,13 @@ pub fn register_outbounds(
     // sockopt.dialerProxy 非空时 dial_system 经此重定向到 tag 对应 handler
     // （redirect：pipe + h.Dispatch，dialer.go:111-136）。
     // ponytail: 进程级单钩子（最后注册生效）；多 Instance 并存场景待需要时再改 per-instance。
-    let dialer_proxy_ohm: Arc<dyn xray_app_dispatcher::OutboundHandlerManager> =
-        Arc::new(OhmRef { inner: ohm });
+    // bd j7xic：hook 持 **Weak**（生产路径）或安装期快照（借用路径），不再有裸指针逃逸。
+    let (dialer_proxy_ohm, hook_keepalive) = ohm_ref_for_hook(table);
     xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
         move |tag: &str, dest: &Destination| {
+            // 借用路径：安装期快照的唯一持有者就是本闭包（闭包全局存活 ⇒ 快照跟着活）；
+            // 生产路径为 `None`（Weak 跟随调用方自己的 `Arc<SimpleOhm>`）。本句只捕获。
+            let _snapshot_alive = &hook_keepalive;
             let tag = tag.to_string();
             let dest = dest.clone();
             let ohm = Arc::clone(&dialer_proxy_ohm);
@@ -270,7 +342,7 @@ pub fn register_outbounds(
                 let fut = handler.dispatch(&dest, link);
                 #[allow(
                     clippy::disallowed_methods,
-                    reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：dialerProxy 代理链拨号的后台投递（Go dispatch goroutine 直译），投递不等结果，寿命随该 dispatch 的 duplex 链路，句柄无需持有"
+                    reason = "①类·脱管债（bd kwevg · §3.5.6）：dialerProxy 代理链拨号的后台投递（Go dispatch goroutine 直译），投递不等结果，寿命随该 dispatch 的 duplex 链路，句柄无需持有；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
                 )]
                 tokio::spawn(async move {
                     let _ = fut.await;
@@ -1637,7 +1709,9 @@ async fn forward_raw(
     match r {
         Ok(resp) => Some(resp),
         Err(e) => {
-            tracing::debug!(upstream = %upstream, error = %e, "dns raw forward failed");
+            // bd c43mw：DNS 上游隧道失败 = 全部查询失效，默认 warn 门必须可见
+            // （对齐 Go DNS 客户端 LogErrorInner 口径）。
+            tracing::warn!(upstream = %upstream, error = %e, "dns raw forward failed");
             None
         },
     }
@@ -1914,7 +1988,7 @@ async fn dispatch_dns_link(
         let mut writer = link.writer;
         #[allow(
             clippy::disallowed_methods,
-            reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：DNS outbound 客户端帧泵（client_rx → link.writer），寿命随 dispatch_dns_link 会话，句柄无需持有"
+            reason = "②豁免（bd kwevg · §3.5.6）：DNS outbound 客户端帧泵（client_rx → link.writer），寿命随 dispatch_dns_link 会话，句柄无需持有；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             while let Some(msg) = client_rx.recv().await {
@@ -2033,7 +2107,7 @@ async fn dispatch_dns_link(
                             let t = tag.clone();
                             #[allow(
                                 clippy::disallowed_methods,
-                                reason = "显式脱管（bd hj3jf 两态裁决；生产依赖图无 PluginContext/ctx，FxScope 不可达）：单条 DNS IP 查询的异步应答写回，寿命随该查询的客户端帧，句柄无需持有"
+                                reason = "①类·脱管债（bd kwevg · §3.5.6）：单条 DNS IP 查询的异步应答写回，寿命随该查询的客户端帧，句柄无需持有；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
                             )]
                             tokio::spawn(async move {
                                 if let Some(resp) = handle_ip_query(&query, &svc).await {
@@ -2090,8 +2164,6 @@ async fn write_or_inline_upstream(
     query: &[u8],
     timeout: std::time::Duration,
 ) {
-    use tokio::io::AsyncWriteExt;
-
     if !upstream.is_tcp() {
         // UDP 上游：内联往返（等价 Go UDPWriter/connReader 单包语义）。
         if let Some(resp) = forward_raw(query, upstream, timeout).await {
@@ -2103,32 +2175,67 @@ async fn write_or_inline_upstream(
     let Ok(framed) = xray_proxy_dns::encode_tcp_dns_message(query) else {
         return;
     };
-    let mut guard = write_slot.lock().await;
-    if guard.is_none() {
-        // lazy dial（Go outboundConn.Write → dial）。
-        let addr = match xray_proxy_dns::resolve_dest_socket_addr(upstream).await {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(upstream = %upstream, error = %e, "dns upstream resolve failed");
-                return;
-            },
-        };
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(conn)) => {
-                let (rh, wh) = conn.into_split();
-                *guard = Some(wh);
-                let _ = read_tx.try_send(rh); // 唤醒 response loop
-            },
-            _ => {
-                tracing::debug!(upstream = %upstream, "dns upstream dial failed/timeout");
-                return;
-            },
+
+    // ① 快路径：已有连接 ⇒ 持锁短写（写者半部的独占访问就是这层锁的语义）。
+    {
+        let mut guard = write_slot.lock().await;
+        // 无连接 ⇒ 落到锁外拨号（bd pzxvn：resolve + connect 曾整段在临界区内，
+        // 一个慢/挂的上游会把同链路后续查询全排在锁上）。
+        if let Some(wh) = guard.as_mut() {
+            write_dns_frame(wh, &framed, upstream).await;
+        }
+        if guard.is_some() {
+            return;
         }
     }
-    if let Some(wh) = guard.as_mut() {
-        if let Err(e) = wh.write_all(&framed).await {
-            tracing::debug!(upstream = %upstream, error = %e, "dns upstream write failed");
+
+    // ② 慢路径：**锁外** resolve + connect（可能数十毫秒到 timeout）。
+    let addr = match xray_proxy_dns::resolve_dest_socket_addr(upstream).await {
+        Ok(a) => a,
+        Err(e) => {
+            // bd c43mw：同上（DNS 出站上游失败必须默认可见）。
+            tracing::warn!(upstream = %upstream, error = %e, "dns upstream resolve failed");
+            return;
+        },
+    };
+    let conn = match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(conn)) => conn,
+        _ => {
+            // bd c43mw：DNS 上游拨号失败/超时必须默认可见。
+            tracing::warn!(upstream = %upstream, "dns upstream dial failed/timeout");
+            return;
+        },
+    };
+    let (rh, wh) = conn.into_split();
+
+    // ③ 安装期二次检查：并发拨号者可能已先装上连接 ⇒ 本次连接作废（两半随 drop 关闭），
+    //    不覆盖先到者（先到者的 read 半边已在 response loop 里）。
+    {
+        let mut guard = write_slot.lock().await;
+        if guard.is_some() {
+            return;
         }
+        *guard = Some(wh);
+    }
+    let _ = read_tx.try_send(rh); // 唤醒 response loop
+
+    // ④ 装好后立刻写本帧（再取一次锁，仍只包一次短写）。
+    let mut guard = write_slot.lock().await;
+    if let Some(wh) = guard.as_mut() {
+        write_dns_frame(wh, &framed, upstream).await;
+    }
+}
+
+/// 往上游写一帧（失败留痕不打断 loop）。持锁调用——临界区只有这一次短写。
+async fn write_dns_frame(
+    wh: &mut tokio::net::tcp::OwnedWriteHalf,
+    framed: &[u8],
+    upstream: &Destination,
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = wh.write_all(framed).await {
+        // bd c43mw：上游写失败 = 该查询丢失，默认可见。
+        tracing::warn!(upstream = %upstream, error = %e, "dns upstream write failed");
     }
 }
 
@@ -3548,6 +3655,51 @@ mod tests {
 
     fn mux_outbound(tag: &str, mux_json: serde_json::Value) -> BuiltOutbound {
         BuiltOutbound { mux_json: Some(mux_json), ..make_outbound("freedom", tag, "{}") }
+    }
+
+    /// bd j7xic 最小复现（修复后形态，进程级 hook 的生存期语义）：
+    ///
+    /// 复现路径 = 生产形态（`Arc<SimpleOhm>` 交给 `register_outbounds` ⇒ 进程级
+    /// `DIALER_PROXY_HOOK` 拿到 manager）→ **先 drop 出站表**（实例关闭）→ 再经
+    /// manager 查 handler。修前 `OhmRef` 是 `*const SimpleOhm` + `unsafe impl
+    /// Send/Sync`，这一步是**悬垂指针解引用**（UB，往往不崩、读到已释放内存，
+    /// 所以只能靠结构改掉，不能靠断言覆盖）；修后是 `Weak::upgrade() == None`
+    /// ⇒ 返回 `None` 并留一条 warn（fail-visible）。
+    #[test]
+    fn hook_manager_after_table_drop_is_none_not_ub() {
+        use xray_app_dispatcher::OutboundHandlerManager;
+
+        let mut cfg = BuiltConfig::default();
+        cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
+        let table = Arc::new(SimpleOhm::new());
+        register_outbounds(&cfg, &table, None, None, None).unwrap();
+        assert!(table.get_handler("direct").is_some(), "前置：表里确有 handler");
+
+        // 生产形态：hook 侧拿到的是 Weak 门面。
+        let (manager, keepalive) = ohm_ref_for_hook(&table);
+        assert!(keepalive.is_none(), "Arc 路径不得退化成快照");
+        assert!(manager.get_handler("direct").is_some(), "表存活时可查");
+
+        drop(table); // 实例销毁
+        assert!(
+            manager.get_handler("direct").is_none(),
+            "表已销毁 ⇒ 必须 fail-visible 返回 None（修前这里解引用悬垂指针 = UAF）"
+        );
+        assert!(manager.get_default_handler().is_none());
+    }
+
+    /// 借用路径（无 `Arc` 所有权）也不许裸指针：退化为**安装期快照**，
+    /// 快照由 hook 闭包持有 ⇒ 表本体 drop 后仍能查（handler 是 `Arc` 共享）。
+    #[test]
+    fn borrowed_table_uses_install_time_snapshot() {
+        let mut cfg = BuiltConfig::default();
+        cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
+        let table = SimpleOhm::new();
+        register_outbounds(&cfg, &table, None, None, None).unwrap();
+
+        let (manager, keepalive) = ohm_ref_for_hook(&table);
+        assert!(keepalive.is_some(), "借用路径必须持有安装期快照");
+        assert!(manager.get_handler("direct").is_some());
     }
 
     /// 对齐 Go proxyman/outbound/outbound.go:109-111：default = 首个注册成功的

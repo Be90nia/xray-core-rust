@@ -11,7 +11,11 @@ pub const VERSION_X: u8 = 26;
 /// 次版本号。对应 Go `Version_y`。
 pub const VERSION_Y: u8 = 10;
 
-pub const VERSION_Z: u8 = 11;
+/// 修订号。对应 Go `Version_z`。
+///
+/// 对拍基准是 Go v26.10.17（CLAUDE.md §0）；写成 11 会让 `"min": "26.10.17"`
+/// 这类 Go 侧合法配置在装配期被自己判为不满足而拒启（bd 5uhaj）。
+pub const VERSION_Z: u8 = 17;
 
 /// 内部代号。对应 Go `codename`。
 pub const CODENAME: &str = "Xray, Penetrates Everything.";
@@ -88,5 +92,17 @@ mod tests {
         let _z: u8 = VERSION_Z;
         // 版本号非零由常量类型系统与 CI 构建保证，运行时布尔常量断言按 lint 建议移除。
         let _ = (VERSION_X, VERSION_Y, VERSION_Z);
+    }
+
+    #[test]
+    fn go_style_min_version_gate_passes() {
+        // 对拍基准是 Go v26.10.17（CLAUDE.md §0）：Go 侧合法的 `"min": "26.10.17"`
+        // 必须在本端版本门上通过（bd 5uhaj：VERSION_Z 落后 ⇒ 同一份配置被拒启）。
+        assert_eq!(version(), "26.10.17");
+        let cmp = xray_app_version::compare_versions("26.10.17", &version()).unwrap();
+        assert_eq!(cmp, 0, "min=26.10.17 与本端版本应相等");
+        // 更高要求仍应被拒。
+        let cmp = xray_app_version::compare_versions("26.10.18", &version()).unwrap();
+        assert_eq!(cmp, 1, "min=26.10.18 应判为不满足");
     }
 }

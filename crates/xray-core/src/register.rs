@@ -88,34 +88,48 @@ pub fn register_all_features() {
 /// 必须在 `register_outbounds` / `spawn_inbounds` 之前调用，
 /// 否则传输注册表为空——除裸 TCP 外所有 dial/listen 返回 NotFound。
 ///
-/// **`let _ =` 是有意的**（bd u0pe2 ③）：下方全部注册函数的唯一失败路径是
+/// **注册错误聚合 warn**（bd ccar4）：正常路径唯一失败是
 /// `io::ErrorKind::AlreadyExists`（同名重复注册保护，见 `xray-transport/src/
-/// dialer.rs` / `listener_registry.rs`）——重复调用幂等，失败仅表示「已注册过」，
-/// 无需留痕。除 AlreadyExists 外不应存在其它失败路径；若未来新增失败模式，
-/// 应在此处改为聚合 warn（同 `register_all_features` 的形态）。
+/// dialer.rs` / `listener_registry.rs`）——重复调用幂等，静默略过。其它失败
+/// （表满、内部构造失败、feature 缺失）逐个收集、末尾一条汇总 warn：旧实现的
+/// 全量 `let _ =` 会把该契约假设之外的失败吞掉，让传输在拨号期才报 NotFound。
 pub fn register_all_transports() {
+    // 聚合口：同 `register_all_features` 形态（正常路径零日志）。
+    let mut failed: Vec<String> = Vec::new();
+    fn reg(failed: &mut Vec<String>, name: &str, r: std::io::Result<()>) {
+        match r {
+            Ok(()) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(e) => failed.push(format!("{name}: {e}")),
+        }
+    }
+
     // TCP（系统传输）
-    let _ = xray_transport::tcp::register_tcp_transport();
+    reg(&mut failed, "tcp", xray_transport::tcp::register_tcp_transport());
 
     // TCP dialer（出站 + security 包装：tls/reality）——独立 crate，
     // 因 xray-transport 核心不能依赖 xray-tls（循环依赖）。
-    let _ = xray_transport_tcp::register::register_dialer();
+    reg(&mut failed, "tcp dialer", xray_transport_tcp::register::register_dialer());
 
     // WebSocket
-    let _ = xray_transport_websocket::register::register_dialer();
-    let _ = xray_transport_websocket::register::register_listener();
+    reg(&mut failed, "ws dialer", xray_transport_websocket::register::register_dialer());
+    reg(&mut failed, "ws listener", xray_transport_websocket::register::register_listener());
 
     // HTTPUpgrade
-    let _ = xray_transport_httpupgrade::register::register_dialer();
-    let _ = xray_transport_httpupgrade::register::register_listener();
+    reg(&mut failed, "httpupgrade dialer", xray_transport_httpupgrade::register::register_dialer());
+    reg(
+        &mut failed,
+        "httpupgrade listener",
+        xray_transport_httpupgrade::register::register_listener(),
+    );
 
     // gRPC
-    let _ = xray_transport_grpc::register::register_dialer();
-    let _ = xray_transport_grpc::register::register_listener();
+    reg(&mut failed, "grpc dialer", xray_transport_grpc::register::register_dialer());
+    reg(&mut failed, "grpc listener", xray_transport_grpc::register::register_listener());
 
     // SplitHTTP / XHTTP
-    let _ = xray_transport_splithttp::register::register_dialer();
-    let _ = xray_transport_splithttp::register::register_listener();
+    reg(&mut failed, "splithttp dialer", xray_transport_splithttp::register::register_dialer());
+    reg(&mut failed, "splithttp listener", xray_transport_splithttp::register::register_listener());
 
     // mKCP
     //
@@ -126,19 +140,19 @@ pub fn register_all_transports() {
     // `UdpmaskManager.WrapPacketConnClient/Server`（mkcp 算子对称、无握手，
     // 双端共用同一编解码）。接线见 `xray-transport-kcp/src/register.rs`
     // （`MaskedUdpHub` / `MaskedPacketInput`）。
-    let _ = xray_transport_kcp::register::register_dialer();
-    let _ = xray_transport_kcp::register::register_listener();
+    reg(&mut failed, "kcp dialer", xray_transport_kcp::register::register_dialer());
+    reg(&mut failed, "kcp listener", xray_transport_kcp::register::register_listener());
 
     // Hysteria transport
-    let _ = xray_transport_hysteria::register::register_dialer();
-    let _ = xray_transport_hysteria::register::register_listener();
+    reg(&mut failed, "hysteria dialer", xray_transport_hysteria::register::register_dialer());
+    reg(&mut failed, "hysteria listener", xray_transport_hysteria::register::register_listener());
 
     // QUIC
-    let _ = xray_transport_quic::register::register_dialer();
-    let _ = xray_transport_quic::register::register_listener();
+    reg(&mut failed, "quic dialer", xray_transport_quic::register::register_dialer());
+    reg(&mut failed, "quic listener", xray_transport_quic::register::register_listener());
 
     // REALITY
-    let _ = xray_reality::register::register_dialer();
+    reg(&mut failed, "reality dialer", xray_reality::register::register_dialer());
 
     // transport 级 Unix socket 监听（Go system_listener.go UnixAddr 分支）。
     // 与 TCP listener 平行的一张注册表（`register_transport_unix_listener`）：
@@ -146,13 +160,36 @@ pub fn register_all_transports() {
     // 故此处必须显式注册（审计 finding F2 / bd yubhp）。
     #[cfg(unix)]
     {
-        let _ = xray_transport::tcp::register_tcp_unix_transport();
-        let _ = xray_transport_websocket::register::register_unix_listener();
-        let _ = xray_transport_httpupgrade::register::register_unix_listener();
-        let _ = xray_transport_splithttp::register::register_unix_listener();
-        let _ = xray_transport_grpc::register::register_unix_listener();
+        reg(&mut failed, "tcp unix", xray_transport::tcp::register_tcp_unix_transport());
+        reg(
+            &mut failed,
+            "ws unix listener",
+            xray_transport_websocket::register::register_unix_listener(),
+        );
+        reg(
+            &mut failed,
+            "httpupgrade unix listener",
+            xray_transport_httpupgrade::register::register_unix_listener(),
+        );
+        reg(
+            &mut failed,
+            "splithttp unix listener",
+            xray_transport_splithttp::register::register_unix_listener(),
+        );
+        reg(
+            &mut failed,
+            "grpc unix listener",
+            xray_transport_grpc::register::register_unix_listener(),
+        );
     }
 
+    if !failed.is_empty() {
+        tracing::warn!(
+            "transport registration: {} entry(ies) FAILED: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
     tracing::info!("all transport dialers + listeners registered");
 }
 
@@ -991,7 +1028,10 @@ fn map_geodata_config(
         if host.is_empty() || host.starts_with('/') {
             return Err(FeatureError::ConfigInvalid {
                 name: "geodata",
-                message: format!("invalid geodata asset url: {url}"),
+                message: format!(
+                    "invalid geodata asset url: {}",
+                    xray_common::redact::redact_url(&url)
+                ),
             });
         }
         if file.is_empty() || !default_asset_dir().join(&file).exists() {

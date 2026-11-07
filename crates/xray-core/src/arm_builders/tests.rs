@@ -121,9 +121,9 @@ async fn arm_lookup_outbound_entry_builds_every_protocol() {
     }
 }
 
-/// inbound 表完备性 + fn 指针等同：19 协议（含 hysteria 双键别名 + tun）的表值必须
-/// 指向对应适配器函数；UDS 形态槽必须恰好登记 5 个裸流 + 4 个 transport 协议
-/// （原手写白名单/inline match 的替代真源）。
+/// inbound 表完备性 + fn 指针等同：20 协议（含 hysteria 双键别名 + dokodemo 双键 +
+/// Go 老式 `tunnel` 别名 + tun）的表值必须指向对应适配器函数；UDS 形态槽必须恰好
+/// 登记 5 个裸流 + 4 个 transport 协议（原手写白名单/inline match 的替代真源）。
 #[test]
 fn arm_lookup_inbound_table_is_complete() {
     use super::{InboundBuilder, inbound as entries};
@@ -138,6 +138,8 @@ fn arm_lookup_inbound_table_is_complete() {
         ("dokodemo", entries::dokodemo_entry),
         // Go 注册名（同臂别名键）：配置按 Go 文档写 `dokodemo-door` 必须命中。
         ("dokodemo-door", entries::dokodemo_entry),
+        // Go 老式别名（infra/conf/xray.go:29）：`tunnel` → DokodemoConfig。
+        ("tunnel", entries::dokodemo_entry),
         ("shadowsocks", entries::shadowsocks_entry),
         ("hysteria", entries::hysteria_entry),
         ("hysteria2", entries::hysteria_entry),

@@ -116,10 +116,15 @@ pub fn validate_outbound_transport_security(
     settings: &[u8],
     stream_settings: Option<&serde_json::Value>,
 ) -> Result<(), ConfError> {
-    // 1. stream_settings.security 非空 → 已有 TLS 等加密，跳过
+    // 1. stream_settings.security 归一后是 tls/reality → 已有加密，跳过。
+    // Go `validateOutboundTransportSecurity`（infra/conf/xray.go:245-266）判的是
+    // **Build 后的 `SecuritySettings`**——只有 tls/reality 才产 TypedMessage；
+    // `security:"none"` / 拼错值在 Go 侧没有加密层。此前本处只判「非空」，故
+    // `security:"none"` 能绕过 vless/trojan 明文禁令（bd vwhnw 同族：门用裸判、
+    // 实施用归一）。大小写按 Go `strings.ToLower` 归一（`security:"TLS"` 是真 TLS）。
     if let Some(ss) = stream_settings {
         if let Some(sec) = ss.get("security").and_then(|v| v.as_str()) {
-            if !sec.is_empty() {
+            if sec.eq_ignore_ascii_case("tls") || sec.eq_ignore_ascii_case("reality") {
                 return Ok(());
             }
         }
@@ -396,5 +401,38 @@ mod tests {
             msg.contains("outbound.settings"),
             "settings JSON 解析失败应通过 Build 错误传播: {msg}"
         );
+    }
+
+    /// bd vwhnw：`security` 大小写按 Go `strings.ToLower` 归一——`"TLS"`/`"REALITY"`
+    /// 是真加密层，必须放行（此前非空即放行，恰好也过——锁住不回退）。
+    #[test]
+    fn stream_security_case_insensitive_recognized() {
+        let settings = serde_json::json!({
+            "vnext": [{"address": "example.com", "port": 443, "users": [{"id": "u", "encryption": "none"}]}]
+        });
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        for sec in ["TLS", "Tls", "REALITY", "reality", "tls"] {
+            let stream = serde_json::json!({ "security": sec });
+            assert!(
+                validate_outbound_transport_security("vless", &bytes, Some(&stream)).is_ok(),
+                "security={sec:?} 是真加密层，不应触发明文禁令"
+            );
+        }
+    }
+
+    /// bd vwhnw：`security:"none"` 在 Go 侧不产生 `SecuritySettings`（无加密层），
+    /// 故不能绕过明文禁令。改前本判「非空即跳过」，`security:"none"` 直接放行。
+    #[test]
+    fn stream_security_none_does_not_bypass_plaintext_ban() {
+        let settings = serde_json::json!({
+            "vnext": [{"address": "example.com", "port": 443, "users": [{"id": "u", "encryption": "none"}]}]
+        });
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        for sec in ["none", "NONE", ""] {
+            let stream = serde_json::json!({ "security": sec });
+            let err = validate_outbound_transport_security("vless", &bytes, Some(&stream))
+                .expect_err(&format!("security={sec:?} 无加密层，必须触发明文禁令"));
+            assert!(format!("{err}").contains("vless without TLS"), "security={sec:?}: {err}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! 生产装配主路的构造器注册表（W1 切片 1a：arm 构造表并入 xray-frame PluginRegistry）。
 //!
-//! 机制：38 个 arm 构造器（入站 20 键 + 出站 18 键）以**类型擦除载荷**挂在
+//! 机制：41 个 arm 构造器（入站 21 键 + 出站 20 键）以**类型擦除载荷**挂在
 //! [`Plugin`] 实例上注册进 [`PluginRegistry`]；生产查表唯一路径 =
 //! [`lookup_inbound_builder`] / [`lookup_outbound_builder`]（`registry.get(<方向>:<协议>)`
 //! → 载荷下转 → 构造 fn → 调用）。
@@ -39,7 +39,7 @@ const INBOUND_PREFIX: &str = "inbound:";
 /// 出站方向前缀。
 const OUTBOUND_PREFIX: &str = "outbound:";
 
-/// 注册表容量上界（fail-closed）：当前 38 条（入站 20 + 出站 18），留余量给
+/// 注册表容量上界（fail-closed）：当前 41 条（入站 21 + 出站 20），留余量给
 /// 将来并入的 16 个协议 Plugin 条目。
 const REGISTRY_CAP: usize = 64;
 
@@ -172,7 +172,7 @@ impl Plugin for ArmEntry {
 /// 生产构造器注册表（唯一构造路径的权威表）。
 static ARM_REGISTRY: LazyLock<PluginRegistry> = LazyLock::new(build_arm_registry);
 
-/// 注册 38 个 arm 构造条目（数据源 = `arm_builders` 的构造器表）并走一遍 deps 门。
+/// 注册 41 个 arm 构造条目（数据源 = `arm_builders` 的构造器表）并走一遍 deps 门。
 fn build_arm_registry() -> PluginRegistry {
     let mut reg = PluginRegistry::new(REGISTRY_CAP).expect("arm registry cap > 0");
     for (name, ctor) in INBOUND_CTORS {
@@ -272,6 +272,9 @@ mod tests {
         let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
         vec![
             ("freedom", json!({}), None),
+            // Go 别名键（配置写 protocol:"direct"/"block"，见 infra/conf/xray.go:42-46）
+            ("direct", json!({}), None),
+            ("block", json!({}), None),
             (
                 "vless",
                 json!({"vnext":[{"address":"1.2.3.4","port":443,"users":[{"id":uuid,"encryption":"none"}]}]}),
@@ -348,7 +351,7 @@ mod tests {
             "trojan" => in_entries::trojan_entry,
             "vmess" => in_entries::vmess_entry,
             "http" => in_entries::http_entry,
-            "dokodemo" | "dokodemo-door" => in_entries::dokodemo_entry,
+            "dokodemo" | "dokodemo-door" | "tunnel" => in_entries::dokodemo_entry,
             "shadowsocks" => in_entries::shadowsocks_entry,
             "hysteria" | "hysteria2" => in_entries::hysteria_entry,
             "anytls" => in_entries::anytls_entry,
@@ -367,6 +370,9 @@ mod tests {
     fn expected_outbound(protocol: &str) -> Option<OutboundBuilder> {
         Some(match protocol {
             "freedom" => out_entries::freedom_entry,
+            // Go 老式别名（infra/conf/xray.go:42-46）：direct → Freedom、block → Blackhole。
+            "direct" => out_entries::freedom_entry,
+            "block" => out_entries::blackhole_entry,
             "vless" => out_entries::vless_entry,
             "trojan" => out_entries::trojan_entry,
             "blackhole" => out_entries::blackhole_entry,
@@ -388,7 +394,7 @@ mod tests {
         })
     }
 
-    /// 注册表键空间自检：38 条、方向前缀唯一、无裸协议名（为 16 个协议 Plugin 留位）。
+    /// 注册表键空间自检：41 条、方向前缀唯一、无裸协议名（为 16 个协议 Plugin 留位）。
     #[test]
     fn registry_keyspace_is_direction_prefixed_and_unique() {
         assert_eq!(ARM_REGISTRY.len(), INBOUND_CTORS.len() + OUTBOUND_CTORS.len());

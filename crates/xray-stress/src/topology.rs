@@ -49,12 +49,18 @@ pub async fn start_echo() -> std::net::SocketAddr {
     let echo_port = pick_free_port().await;
     let listener = TcpListener::bind(("127.0.0.1", echo_port)).await.expect("bind echo");
     let addr = listener.local_addr().expect("echo addr");
-    #[allow(clippy::disallowed_methods, reason = "压测：echo server 常驻任务")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：压测：echo server 常驻任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    )]
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((mut sock, _)) => {
-                    #[allow(clippy::disallowed_methods, reason = "压测：echo 每连接回显任务")]
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "②豁免（bd kwevg · §3.5.6）：压测：echo 每连接回显任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+                    )]
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 64 * 1024];
                         loop {
@@ -569,7 +575,10 @@ pub async fn start_anytls_link(_echo_port: u16) -> Result<LinkHandles> {
     .await
     .map_err(|e| StressError::Start(format!("anytls server bind: {e}")))?;
     // 持有 server 存活至 run 结束（abort 时随 task drop）
-    #[allow(clippy::disallowed_methods, reason = "压测：mock server 存活持有任务")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：压测：mock server 存活持有任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    )]
     let keep = tokio::spawn(async move {
         let _server = server;
         std::future::pending::<()>().await;

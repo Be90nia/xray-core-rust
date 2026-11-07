@@ -9,16 +9,26 @@
 //!
 //! 门在 `start_full_dispatched` 入口执行（生产 `start_full` 与 framework
 //! `start_full_with_outbound_handlers` 两路共用），违例逐条列出并拒启
-//! （对齐 vaye2/o91s4 的启动期硬错纪律）。校验面（bd sgdwm 扩面）：
+//! （对齐 vaye2/o91s4 的启动期硬错纪律）。**两栏口径（bd 258qt/pyka7/nlhht）**：
+//! 硬账（[`BudgetReport::hard`]，进判定）+ 上限面（[`BudgetReport::caps`]，只打印
+//! ——**96 MiB 不是运行期硬上界**）。校验面（bd sgdwm 扩面 + 本轮口径修正）：
 //! 1. 配置派生值：env 缺省档 + policy 各 level `bufferSize`（KB；负值 = 无界 ⇒ 硬拒，Go 同源坑
 //!    audit4-memory F8；本仓装配期硬拒负值 ⇒ 96MB 门下不存在「Go 同源
 //!    无界」活口，**无界一律硬拒零豁免**；0 = Go 合法「limit 0 不排队」，必须放行）；
-//! 2. 实际占用面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]）、QUIC 每 listener 的 UDP
-//!    socket 接收缓冲（bind 即真实分配）、预算内最小并发乘以每连接 pipe 占用——配置合法但 合计超
-//!    [`XRAY_BUDGET_BYTES`] 同样拒启。 xhttp 的 h2 send_buf
-//!    是**每连接发送缓冲上限**（仅背压时分配，装配期 0 占用），按 「上限 ≠
-//!    预约」统一口径**登记不入账**（同 bridge 在途 / xdns frag / DNS singleflight）； 真机依据见
-//!    `check_startup_budget` 内注释（bd sgdwm）。
+//! 2. 硬账面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]，**含每监听握手 在途**）+
+//!    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面（×2 内核记账）
+//!    + 预算内最小并发 × 每连接 pipe（双向）—— 配置合法但合计超 [`XRAY_BUDGET_BYTES`] 同样拒启；
+//! 3. 上限面（不判、只打印）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
+//!    预约会误杀合法配置）、xhttp h2 send_buf（每连接、惰性分配）、DoH3 resolver
+//!    socket（装配期不可数）、桥在途、xdns frag（同 bridge 口径：登记 ≠ 入账）。
+//!
+//! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
+//! `xray_common::mem_probe::MemoryPlan` 按**探测到的可用内存**分档派生——
+//! ≤256MB→40MB / ≤512MB→96MB / ≤1GB→192MB / >1GB→`min(512MB, 可用/4)`。同一份
+//! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB`，触顶由桥
+//! fail-visible 拒绝）。预算装不下时**不拒启**：按装得下的并发数降档并 warn
+//! （只有连 1 条连接都装不下才拒）。96MB 仍是 `min` 上沿的默认设计点，故原
+//! 「96MiB 不是运行期硬上界」口径不变。
 
 // 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
 pub use xray_frame::budget::{
@@ -66,31 +76,87 @@ fn stream_network(
     xray_common::net::transport::canonical_transport_protocol(name)
 }
 
-/// 装配期预算门：校验「配置派生值 + 实际占用面」，违例逐条列出（fail-visible 拒启）。
+/// 预算门两栏报告（bd 258qt / pyka7 / nlhht 的口径修正）。
 ///
-/// 校验面（bd sgdwm 扩面后）：
-/// 1. 每连接 pipe 软上限的取值来源：env 缺省档（`xray.ray.buffer.size` / `XRAY_RAY_BUFFER_SIZE` /
-///    `XRAY_BUFSIZE` → `BufferPolicy::default`，level 未配 bufferSize 时的生效值）+ policy app 各
-///    level 的 `bufferSize`（KB 单位； 负值 = 无界硬拒；0 = Go 合法「不排队」放行）。
-/// 2. 实际占用面：[`startup_fixed_floor_bytes`]（进程级池/缓存）加上 QUIC 每 listener 的 UDP socket
-///    接收缓冲（扫 inbounds/outbounds 的 streamSettings transport 名；bind 即真实分配）， 再加
-///    [`MIN_VIABLE_CONCURRENCY`] × 最大 pipe 档 × 2 方向，合计超 [`XRAY_BUDGET_BYTES`]
-///    即拒——「配置合法但实际占用超预算」的组合同样过不了门。
+/// - [`hard`](Self::hard)：**硬账**——装配期能判定、且真会占的字节（进
+///   [`projected`](Self::projected) 判定）。
+/// - [`caps`](Self::caps)：**上限面**——按连接数/端点的上界，装配期零连接 ⇒ 真实占用 0 或受 OS
+///   钳制（Linux `rmem_max`），**不并入硬账**，但要 显式打印：**96 MiB 因此不是运行期硬上界**。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BudgetReport {
+    /// 硬账合计（字节；与本机档位派生的 [`Self::budget`] 比较）。
+    pub projected: usize,
+    /// 本机档位派生的总预算（字节；bd sfqlu）。
+    pub budget: usize,
+    /// 本机可用内存（字节；`XRAY_MEM_LIMIT_MB` 覆盖后）。
+    pub available: u64,
+    /// 档位短名（`tiny`/`small`/`medium`/`large`）。
+    pub tier: &'static str,
+    /// 运行期连接数上限（条；触顶由桥 fail-visible 拒绝）。
+    pub max_conns: usize,
+    /// 硬账逐项（名, 字节）。
+    pub hard: Vec<(String, usize)>,
+    /// 上限面逐项（名, 上界字节；**不进合计**）。
+    pub caps: Vec<(String, usize)>,
+    /// 降档说明（`Some` = 预算装不下完整并发，已按能装下的条数封顶但**不拒启**）。
+    pub degraded: Option<String>,
+    /// 违例（空 = 过门）。
+    pub violations: Vec<String>,
+}
+
+impl BudgetReport {
+    /// 过门。
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.violations.is_empty()
+    }
+
+    /// 单行摘要（启动日志 + 错误文案共用）：档位 + 硬账 + 上限面 + 96MiB 的口径声明。
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let hard: Vec<String> =
+            self.hard.iter().map(|(name, bytes)| format!("{name} {bytes}B")).collect();
+        let caps: Vec<String> =
+            self.caps.iter().map(|(name, bytes)| format!("{name} {bytes}B")).collect();
+        format!(
+            "memory budget: tier {} (available {}B) hard {}B / {}B, max {} conns [{}] ; caps \
+             (per-conn/per-endpoint upper bounds, not summed — 96MiB is NOT a runtime hard bound) \
+             [{}]",
+            self.tier,
+            self.available,
+            self.projected,
+            self.budget,
+            self.max_conns,
+            hard.join(" + "),
+            caps.join(" + "),
+        )
+    }
+}
+
+/// 装配期预算门：产出两栏报告（违例见 [`BudgetReport::violations`]）。
 ///
-/// **xhttp 的 h2 send_buf 登记不入账（bd sgdwm 真机暴露）**：它是**每连接发送缓冲上限**，
-/// 只在背压时按需分配，装配期零连接 ⇒ 真实占用 0。若按 listener × 16MiB 预约，176 生产配置
-/// （7 个 xhttp 入站）会算出 120MiB 而**拒绝启动合法配置**；故按「上限 ≠ 预约」统一口径
-/// （同 bridge 在途 / xdns frag / DNS singleflight）只登记并在错误文案中点名，不计入实算。
+/// 校验面（bd sgdwm 扩面 + bd 258qt 口径修正 + bd sfqlu 档位自适应）：
+/// 1. 每连接 pipe 软上限（env 缺省档 + policy 各 level `bufferSize`；负值硬拒、 0 放行）；
+/// 2. **硬账**：固定底数（池/缓存 + **每监听**握手在途，bd 258qt(a)）+ 最小并发 × pipe 双向 +
+///    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面 （×2 内核记账，bd nlhht）；
+/// 3. **上限面**（不判、只报）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
+///    预约会误杀合法配置，bd 258qt(c)）、DoH3 resolver socket（装配期不可数， bd 258qt(d)）、xhttp
+///    h2 send_buf（惰性分配，bd pyka7）、桥在途、xdns frag。
 ///
-/// **桥在途不入门（jcnjb③ 决策，登记≠入账口径）**：桥在途上界登记在
-/// [`BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`]（条目闸口径 66MiB/连接缺省档；
-/// u440m 字节闸曾钉 4MiB，真机 A/B 中位比 0.939 −6.1% 超票面 5% 门已回退——
-/// 与 pipe 的 4MiB 每连接份额**不再是同一份额**，登记簿 doc 有回退记录），
-/// 但它是**满载瞬态**（写端堵塞 + 读端持续产的瞬态形态，装配期零连接 ⇒ 占用 0，
-/// 连接数本身装配期不可判定）⇒ 不并入「连接数 × 档位」扫描，也不进总实算
-/// 断言乘积（同 xdns frag 口径）；总实算（固定面 + 8 连接 × pipe 双向 ≤ 96MiB）
-/// 钉在 tests `ledger_total_stays_within_budget`——份额常量漂移即红。
-pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String> {
+/// 预算取自本机档位（[`xray_common::mem_probe::MemoryPlan::cached`]）；装不下
+/// 完整并发时只**降档**（[`BudgetReport::degraded`]），连 1 条都装不下才记违例。
+///
+/// # 错误
+/// `policy` 配置 JSON 坏 → `Err`；违例 → [`BudgetReport::violations`] 非空。
+pub fn budget_report(built: &xray_conf::BuiltConfig) -> Result<BudgetReport, String> {
+    budget_report_with(built, *xray_common::mem_probe::MemoryPlan::cached())
+}
+
+/// 同 [`budget_report`]，档位计划由调用方注入（单测按档位钉行为）。
+pub fn budget_report_with(
+    built: &xray_conf::BuiltConfig,
+    plan: xray_common::mem_probe::MemoryPlan,
+) -> Result<BudgetReport, String> {
     let mut violations = Vec::new();
 
     // ── 1) 配置派生面（bd azcoe 原面，口径不变）──
@@ -115,9 +181,10 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
         }
     }
 
-    // ── 2) 实际占用面（bd sgdwm 扩面）──
-    let mut quic_endpoints = 0usize;
-    let mut splithttp_endpoints = 0usize;
+    // ── 2) 端点扫描（inbounds + outbounds 的 streamSettings）──
+    let mut quic_default = 0usize;
+    let mut quic_explicit_booked = 0usize;
+    let mut splithttp = 0usize;
     let stream_settings = built
         .inbounds
         .iter()
@@ -125,44 +192,159 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
         .chain(built.outbounds.iter().map(|o| o.stream_settings_json.as_ref()));
     for ss in stream_settings {
         match stream_network(ss) {
-            Some(xray_common::net::transport::TransportProtocol::Quic) => quic_endpoints += 1,
-            Some(xray_common::net::transport::TransportProtocol::SplitHttp) => {
-                splithttp_endpoints += 1;
+            Some(xray_common::net::transport::TransportProtocol::Quic) => {
+                match explicit_receive_buffer(ss) {
+                    // 显式值 = 运维亲手指定 ⇒ bind 即真占（× 内核 2× 记账）⇒ 硬账。
+                    Some(bytes) => {
+                        quic_explicit_booked += bytes * SOCKET_KERNEL_BOOKKEEPING_FACTOR;
+                    },
+                    // 缺省 = 8MiB 只升不降，但 Linux `rmem_max` 钳制 ⇒ 上限面。
+                    None => quic_default += 1,
+                }
             },
+            Some(xray_common::net::transport::TransportProtocol::SplitHttp) => splithttp += 1,
             _ => {},
         }
     }
 
-    let fixed = startup_fixed_floor_bytes();
-    // QUIC 的 UDP socket 接收缓冲是**每 listener 的真实分配**（bind 即占，内核含 2× 记账）⇒ 入账。
-    let endpoint_booked = quic_endpoints * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES;
-    // h2 send_buf（xhttp）是**每连接的发送缓冲上限**，只在背压时按需分配，装配期零连接 ⇒ 0 占用。
-    // 按「上限 ≠ 预约」统一口径（同 bridge 在途 / xdns frag / DNS singleflight）**登记不入账**。
-    // 真机依据（bd sgdwm）：176 生产配置有 7 个 xhttp 入站，若按 listener × 16MiB 预约会算出
-    // 120MiB ⇒ 合法配置被拒启；而实际常驻远低于该上限。端点与容量仍在错误文案中点名。
-    let registered_only = splithttp_endpoints * SPLITHTTP_ENDPOINT_BOOKED_BYTES;
+    // ── 3) 硬账 + 档位降级（bd sfqlu）──
+    // 监听数 = 真正 listen 的入站数（握手闸每 accept 循环一份，bd 258qt(a)）。
+    let listeners = built.inbounds.iter().filter(|i| i.port.is_some()).count();
+    let fixed = startup_fixed_floor_bytes(listeners);
     // 每连接 pipe 占用按两方向计（上/下行各一条 policy pipe，见 MAX_PER_CONN_BUFFER_BYTES doc）。
     let per_conn_pipe = max_pipe_bytes * 2;
-    // 桥在途不入门：满载瞬态（装配期零连接，连接数不可判定；jcnjb③；总实算
-    // 钉在 tests ledger_total_stays_within_budget）。条目闸口径上界见登记簿
-    // BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES（u440m 字节闸已回退）。
-    let projected = fixed + endpoint_booked + MIN_VIABLE_CONCURRENCY * per_conn_pipe;
-    if projected > XRAY_BUDGET_BYTES {
+    let budget = plan.total_budget;
+    // 固定面与显式 socket 先扣，剩下的才是连接可用额。不足 = 一条满额 pipe 都装不下。
+    let for_conns = budget.saturating_sub(fixed + quic_explicit_booked);
+    // `bufferSize 0`（Go 合法「不排队」）不占字节 ⇒ 装得下的条数不受限。
+    let conns_fit = for_conns.checked_div(per_conn_pipe).unwrap_or(MIN_VIABLE_CONCURRENCY);
+    let conns = conns_fit.min(MIN_VIABLE_CONCURRENCY);
+    let projected = fixed + quic_explicit_booked + conns * per_conn_pipe;
+    // 运行期连接数上限 = 档位派生值与本配置实际装得下的条数取小。
+    let max_conns = plan.max_conns.min(conns_fit);
+    if conns_fit == 0 {
         violations.push(format!(
-            "actual occupancy {projected}B > budget {}B: fixed {fixed}B (pools+caches) \
-             + endpoints {endpoint_booked}B ({quic_endpoints} QUIC x {}B socket booked) \
-             + {MIN_VIABLE_CONCURRENCY} conns x {per_conn_pipe}B pipe(2-way) \
-             [registered-only, not summed: {splithttp_endpoints} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B \
-             = {registered_only}B h2 send_buf cap — allocated only under backpressure]",
-            XRAY_BUDGET_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+            "actual occupancy {projected}B > budget {budget}B even for 1 conn: fixed {fixed}B \
+             (pools+caches + {listeners} listeners x {HANDSHAKE_INFLIGHT_MAX} x \
+             {HANDSHAKE_TASK_EST_BYTES}B handshake) + explicit udp sockets \
+             {quic_explicit_booked}B + 1 conn x {per_conn_pipe}B pipe(2-way); \
+             tier {} (bd sfqlu)",
+            plan.tier.as_str(),
         ));
     }
+    // 装不下完整并发 ⇒ 降档运行（**不拒启**）：显式告警，让运维看得见少了多少条。
+    let degraded = (conns_fit > 0
+        && (conns < MIN_VIABLE_CONCURRENCY || max_conns < plan.max_conns))
+        .then(|| {
+            format!(
+                "内存降档运行（bd sfqlu）：档位 {}（{}，可用 {}B，来源 {}）总预算 {budget}B，\
+                 固定面 {fixed}B（{listeners} 个监听）+ 显式 socket {quic_explicit_booked}B 后\
+                 每连接 {per_conn_pipe}B pipe（双向）只装得下 {conns_fit} 条连接\
+                 （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
+                plan.tier.as_str(),
+                plan.tier.label(),
+                plan.available,
+                plan.source,
+                MIN_VIABLE_CONCURRENCY,
+                plan.max_conns,
+            )
+        });
 
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("memory budget exceeded: {}", violations.join("; ")))
+    // ── 4) 上限面（打印用；不进 projected）──
+    let caps = vec![
+        (
+            format!(
+                "{quic_default} QUIC x {QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES}B default socket"
+            ),
+            quic_default * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+        ),
+        (
+            format!(
+                "{splithttp} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B per-conn h2 send_buf cap"
+            ),
+            splithttp * SPLITHTTP_ENDPOINT_BOOKED_BYTES,
+        ),
+        (
+            format!("per DoH3 resolver {DOH3_SESSION_SOCKET_BOOKED_BYTES}B socket"),
+            DOH3_SESSION_SOCKET_BOOKED_BYTES,
+        ),
+        (
+            format!("per conn bridge in-flight {BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES}B cap"),
+            BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
+        ),
+        (
+            format!("per xdns server {XDNS_FRAG_WORST_CASE_BYTES}B frag worst case"),
+            XDNS_FRAG_WORST_CASE_BYTES,
+        ),
+        // bd sfqlu：档位派生值全部进上限面（运维核对用，不进硬账）。
+        (
+            format!("bridge byte gate {}B/dir x 2 dirs per conn", plan.bridge_gate),
+            2 * plan.bridge_gate,
+        ),
+        (format!("max {} conns (tier {})", max_conns, plan.tier.as_str()), max_conns),
+    ];
+
+    Ok(BudgetReport {
+        projected,
+        budget,
+        available: plan.available,
+        tier: plan.tier.as_str(),
+        max_conns,
+        hard: vec![
+            (format!("fixed floor ({listeners} listeners)"), fixed),
+            ("explicit udp sockets".to_string(), quic_explicit_booked),
+            (format!("{conns} conns x {per_conn_pipe}B pipe(2-way)"), conns * per_conn_pipe),
+        ],
+        caps,
+        degraded,
+        violations,
+    })
+}
+
+/// 端点显式 UDP 接收缓冲（字节；`sockopt.receiveBufferSize`，`0`/缺省 = `None`）。
+fn explicit_receive_buffer(ss: Option<&serde_json::Value>) -> Option<usize> {
+    let bytes = ss?.get("sockopt")?.get("receiveBufferSize")?.as_i64()?;
+    usize::try_from(bytes).ok().filter(|v| *v > 0)
+}
+
+/// 装配期预算门：违例逐条列出并拒启（fail-visible）；过门时把两栏摘要打一条 info。
+///
+/// 降档走 **warn**（启动继续——bd sfqlu 硬约束：不因预算不足直接拒启给用户看），
+/// 两档口径：
+/// 1. 档位本身低于 96MB 设计点（256MB 小鸡 ⇒ 40MB）—— 一条 warn 说明「降档到 NMB
+///    预算」，运维一眼看到为陪跑进程让了多少；
+/// 2. 本配置在该预算下装不下最小并发（[`BudgetReport::degraded`]）—— 再一条 warn
+///    说明连接数上限被压到多少。
+pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String> {
+    check_startup_budget_with(built, *xray_common::mem_probe::MemoryPlan::cached())
+}
+
+/// 同 [`check_startup_budget`]，档位计划由调用方注入（单测按档位钉行为）。
+fn check_startup_budget_with(
+    built: &xray_conf::BuiltConfig,
+    plan: xray_common::mem_probe::MemoryPlan,
+) -> Result<(), String> {
+    let report = budget_report_with(built, plan)?;
+    if !report.is_ok() {
+        return Err(format!("memory budget exceeded: {}", report.violations.join("; ")));
     }
+    let log = xray_frame::logging::LogFacade::new("memory_budget", Vec::new());
+    log.info(report.summary());
+    // 96MB = 原设计点（整机 256MB 上的保守分账）；低于它说明本机更小，必须显式告知。
+    if report.budget < XRAY_BUDGET_BYTES {
+        log.warn(format!(
+            "内存降档到 {}MB 预算（可用 {}B，档位 {}）：为系统 + 陪跑进程（sing-box / \
+             cloudflared 等）让出内存，本机连接数上限 {} 条（bd sfqlu）",
+            report.budget / (1024 * 1024),
+            report.available,
+            report.tier,
+            report.max_conns,
+        ));
+    }
+    if let Some(degraded) = &report.degraded {
+        log.warn(degraded);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -176,6 +358,79 @@ mod tests {
         let mut built = xray_conf::BuiltConfig::default();
         built.apps.push(BuiltEntry { kind: "policy".into(), data: json.as_bytes().to_vec() });
         built
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// 原设计点（96MB 预算）的档位计划（bd sfqlu 起预算随机器变 ⇒ 测试须注入）。
+    fn plan_96mb() -> xray_common::mem_probe::MemoryPlan {
+        xray_common::mem_probe::MemoryPlan::from_available(512 * MIB)
+    }
+
+    /// 256MB 小鸡档（40MB 预算）。
+    fn plan_256mb() -> xray_common::mem_probe::MemoryPlan {
+        xray_common::mem_probe::MemoryPlan::from_available(256 * MIB)
+    }
+
+    /// 四档（256MB / 512MB / 1GB / 大机器）派生出的预算与连接数上限必须与档位表一致，
+    /// 且派生值全部出现在报告的 caps 栏里（bd sfqlu 验收 5）。
+    #[test]
+    fn tier_plan_drives_budget_and_conn_cap() {
+        for (available, budget, conns) in [
+            (256 * MIB, 40 * MIB, 13usize),
+            (512 * MIB, 96 * MIB, 32),
+            (1024 * MIB, 192 * MIB, 64),
+            (16 * 1024 * MIB, 512 * MIB, 170),
+        ] {
+            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let report =
+                budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
+            assert_eq!(report.budget, budget as usize, "{available}B 档总预算");
+            assert_eq!(report.max_conns, conns, "{available}B 档连接数上限");
+            assert!(report.is_ok(), "{available}B 档缺省配置必须过门：{:?}", report.violations);
+            let summary = report.summary();
+            assert!(summary.contains(&format!("{budget}B")), "摘要必须带总预算：{summary}");
+            assert!(
+                report.caps.iter().any(|(n, _)| n.starts_with(&format!("max {conns} conns"))),
+                "连接数上限必须进 caps 栏：{:?}",
+                report.caps
+            );
+        }
+    }
+
+    /// 256MB 档装不下完整最小并发时**降档不拒启**（用户拍板）：
+    /// 4MiB/方向 pipe 下 8 条连接需 64MB > 40MB ⇒ 连接数上限被压到装得下的条数。
+    #[test]
+    fn tiny_tier_degrades_conns_instead_of_rejecting() {
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        built.inbounds.push(splithttp_inbound("xhttp-in"));
+        let plan = plan_256mb();
+        let report = budget_report_with(&built, plan).expect("report");
+        assert!(report.is_ok(), "256MB 档降档不得拒启：{:?}", report.violations);
+        assert!(
+            report.projected <= report.budget,
+            "降档后账面必须收在预算内：{} > {}",
+            report.projected,
+            report.budget
+        );
+        assert!(report.max_conns >= 1, "至少要能跑 1 条连接");
+        assert!(
+            report.degraded.as_deref().is_some_and(|d| d.contains("内存降档运行")),
+            "必须出降档 warn 文案：{:?}",
+            report.degraded
+        );
+    }
+
+    /// 反例：连 1 条满额 pipe 都装不下 ⇒ 这才是拒启（降档到底线）。
+    #[test]
+    fn rejects_only_when_not_even_one_conn_fits() {
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        // 4GiB 显式 UDP 账面（×2）= 8GiB ≫ 40MB 档预算。
+        built.inbounds.push(quic_inbound_with_recv("quic-in", 4 * 1024 * 1024 * 1024));
+        let err = check_startup_budget_with(&built, plan_256mb())
+            .expect_err("连 1 条连接都装不下必须拒启");
+        assert!(err.contains("even for 1 conn"), "错误必须点名「连 1 条都装不下」：{err}");
+        assert!(err.contains("tiny"), "错误必须点名档位：{err}");
     }
 
     fn quic_inbound(tag: &str) -> BuiltInbound {
@@ -197,6 +452,17 @@ mod tests {
             listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::json!({"network": "splithttp"})),
             sniffing_json: None,
+        }
+    }
+
+    /// QUIC 入站 + **显式** `sockopt.receiveBufferSize`（bd nlhht 的形态）。
+    fn quic_inbound_with_recv(tag: &str, bytes: i64) -> BuiltInbound {
+        BuiltInbound {
+            stream_settings_json: Some(serde_json::json!({
+                "network": "quic",
+                "sockopt": { "receiveBufferSize": bytes }
+            })),
+            ..quic_inbound(tag)
         }
     }
 
@@ -282,18 +548,116 @@ mod tests {
         assert!(err.contains("unbounded"), "{err}");
     }
 
-    /// 「配置合法但实际占用超预算」必须拒（bd sgdwm 验收 3）：
-    /// bufferSize 4MiB 是上界本身（合法），1 个 QUIC 端点 + 8 条满额 pipe 双向
-    /// 的占用面合计 > 96MiB ⇒ 扩面门必须点名算式拒启。
+    /// 「配置合法但实际占用超预算」必须拒（bd sgdwm 验收 3，bd nlhht 改口径）：
+    /// bufferSize 4MiB 是上界本身（合法），**显式** `receiveBufferSize=64MiB` 的 UDP
+    /// 端点账面（64MiB × 2 内核记账 = 128MiB）本身即超 96MiB ⇒ 硬账拒启。
+    ///
+    /// 旧口径用「1 QUIC 端点按缺省 16MiB 预约」构造违例——bd 258qt(c) 判定那是**误杀**
+    /// （Linux `rmem_max` 钳制，端点 socket 缺省只进上限面），故违例样本换成显式值。
+    /// bd sfqlu 起预算随机器档位变 ⇒ 本测试注入 96MB 档（原判据的设计点）。
     #[test]
     fn gate_rejects_legal_config_whose_occupancy_exceeds_budget() {
         let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
-        built.inbounds.push(quic_inbound("quic-in"));
-        let err =
-            check_startup_budget(&built).expect_err("配置合法但占用超预算必须拒（bd sgdwm 扩面）");
+        built.inbounds.push(quic_inbound_with_recv("quic-in", 64 * 1024 * 1024));
+        let err = check_startup_budget_with(&built, plan_96mb())
+            .expect_err("配置合法但占用超预算必须拒（bd sgdwm 扩面）");
         assert!(err.contains("actual occupancy"), "错误必须带占用算式：{err}");
-        assert!(err.contains("1 QUIC"), "错误必须点名 QUIC 端点数：{err}");
+        assert!(err.contains("explicit udp sockets"), "错误必须点名显式 socket 面：{err}");
+        assert!(err.contains("134217728"), "显式 64MiB × 2 内核记账必须入账：{err}");
         assert!(err.contains("pipe(2-way)"), "错误必须点名 pipe 双向口径：{err}");
+    }
+
+    /// bd nlhht：门的账面必须读配置里的 `receiveBufferSize`，不许按缺省 16MiB 记
+    /// （旧状：`grep receiveBufferSize` 在门里 0 命中 ⇒ 账面与真实可差 8×）。
+    #[test]
+    fn explicit_udp_buffer_is_read_from_config() {
+        let mut built = xray_conf::BuiltConfig::default();
+        // 8 端点 × 1MiB 显式（免确认档）：硬账 = 8 × 1MiB × 2 = 16MiB。
+        for i in 0..8 {
+            built.inbounds.push(quic_inbound_with_recv(&format!("q{i}"), 1024 * 1024));
+        }
+        let report = budget_report(&built).expect("report");
+        assert!(report.is_ok(), "8 × 1MiB 显式缓冲 + 最小并发应过门：{:?}", report.violations);
+        assert!(
+            report.hard.iter().any(|(n, b)| n == "explicit udp sockets" && *b == 16 * 1024 * 1024),
+            "显式 socket 必须按配置值 ×2 计入硬账：{:?}",
+            report.hard
+        );
+        // 显式端点不再进「缺省 socket」上限面（否则同一笔账算两遍）。
+        assert!(
+            report.caps.iter().all(|(n, _)| !n.starts_with("8 QUIC x")),
+            "显式端点不得同时计入缺省上限面：{:?}",
+            report.caps
+        );
+    }
+
+    /// bd 258qt(c)：**缺省** QUIC 端点 socket 只进上限面，不进硬账——否则 5 端点 =
+    /// 107.6MiB 会误杀合法配置（Linux `rmem_max` 缺省把 8MiB 钳到几百 KiB）。
+    #[test]
+    fn default_quic_sockets_are_caps_not_hard() {
+        let mut built = xray_conf::BuiltConfig::default();
+        for i in 0..5 {
+            built.inbounds.push(quic_inbound(&format!("q{i}")));
+        }
+        let report = budget_report(&built).expect("report");
+        assert!(
+            report.is_ok(),
+            "5 个缺省 QUIC 端点必须过门（bd 258qt(c)）：{:?}",
+            report.violations
+        );
+        assert!(
+            report
+                .caps
+                .iter()
+                .any(|(n, b)| n.starts_with("5 QUIC x") && *b == 5 * 16 * 1024 * 1024),
+            "上限面必须列出 5 × 16MiB：{:?}",
+            report.caps
+        );
+        assert!(
+            report.hard.iter().filter(|(n, _)| n == "explicit udp sockets").all(|(_, b)| *b == 0),
+            "缺省 socket 不得进硬账（账面必须为 0，缺省端点只进上限面）：{:?}",
+            report.hard
+        );
+        // 「96MiB 不是运行期硬上界」必须在摘要里明说（bd pyka7）。
+        assert!(
+            report.summary().contains("NOT a runtime hard bound"),
+            "摘要必须显式声明口径：{}",
+            report.summary()
+        );
+    }
+
+    /// bd 258qt(a)：握手在途**每监听一份**（64 × 55KiB）⇒ 监听多到一定量 + 满额
+    /// pipe 会吃掉预算的大头（旧簿按进程记 1 份 × 6KiB，7 监听真额 24MiB 只记 384KiB）。
+    ///
+    /// bd sfqlu 起这类「装不下完整最小并发」**不再拒启**：降档到装得下的条数并
+    /// warn（用户拍板：「预算不足不得直接拒启」）。拒启只剩「连 1 条都装不下」。
+    #[test]
+    fn many_listeners_with_max_pipe_degrades_conns() {
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        for i in 0..7 {
+            built.inbounds.push(splithttp_inbound(&format!("xhttp-in-{i}")));
+        }
+        let plan = plan_96mb();
+        let report = budget_report_with(&built, plan).expect("report");
+        assert!(
+            report.is_ok(),
+            "7 监听 × 4MiB pipe 在 96MB 档只降档不拒启（bd sfqlu）：{:?}",
+            report.violations
+        );
+        let degraded = report.degraded.as_deref().unwrap_or_default();
+        assert!(degraded.contains("内存降档运行"), "必须出降档 warn 文案：{degraded:?}");
+        assert!(degraded.contains("7 "), "warn 必须点名监听数带来的固定面：{degraded}");
+        assert!(
+            report.projected <= report.budget,
+            "降档后账面必须收在预算内：{} > {}",
+            report.projected,
+            report.budget
+        );
+        assert!(
+            report.hard.iter().any(|(n, _)| n.contains("pipe(2-way)")),
+            "硬账必须点名 pipe 双向口径：{:?}",
+            report.hard
+        );
     }
 
     /// 同拓扑（1 QUIC 入站 + 1 xhttp 出站）+ 缺省 pipe：固定 ~19MiB + 端点账面
@@ -320,24 +684,37 @@ mod tests {
             .expect("7 个 xhttp 入站（h2 上限登记不入账）必须过门（176 生产配置回归，bd sgdwm）");
     }
 
-    /// 扩面门取「最大显式 level」做 pipe 底数：显式 4MiB 比缺省 512KiB 大 ⇒
-    /// 可行性算式按 4MiB（与上条拒例同一算式路径，防只按 env 缺省漏算）。
+    /// 端点扫描两栏归属（bd 258qt(c)）：2 QUIC + 1 xhttp 走**上限面**（不判），
+    /// 4MiB pipe 只动硬账（2 监听 × 握手 + 8 连接 × pipe）。
     #[test]
     fn occupancy_scan_counts_inbound_and_outbound_endpoints() {
         let mut built = xray_conf::BuiltConfig::default();
         built.inbounds.push(quic_inbound("q1"));
         built.inbounds.push(quic_inbound("q2"));
         built.outbounds.push(xhttp_outbound("x1"));
-        // 3 端点账面 = 2×16MiB + 1×(16MiB+400KiB)；缺省 pipe 下合计 < 96MiB。
+        let report = budget_report(&built).expect("report");
         check_startup_budget(&built).expect("3 端点 + 缺省 pipe 必须过门");
-        // 抬到 4MiB pipe ⇒ 可行性破线，错误里 QUIC=2、xhttp=1 逐一可见。
+        // 上限面逐项可见（错误文案/日志共用同一 summary）。
+        let summary = report.summary();
+        assert!(summary.contains("2 QUIC"), "上限面必须点名 QUIC 端点数：{summary}");
+        assert!(summary.contains("1 xhttp"), "上限面必须点名 xhttp 端点数：{summary}");
+        // 抬到 4MiB pipe：2 监听固定底数（~27MiB）+ 64MiB pipe 仍 < 96MiB ⇒ 过门
+        // （pipe 是唯一硬账里的连接面，端点不再是硬账项）。
         built.apps.push(BuiltEntry {
             kind: "policy".into(),
             data: br#"{"levels": {"0": {"bufferSize": 4096}}}"#.to_vec(),
         });
-        let err = check_startup_budget(&built).expect_err("4MiB pipe + 3 端点必须破线");
-        assert!(err.contains("2 QUIC"), "{err}");
-        assert!(err.contains("1 xhttp"), "{err}");
+        let report = budget_report(&built).expect("report");
+        assert_eq!(report.hard.iter().map(|(_, b)| b).sum::<usize>(), report.projected);
+        assert!(
+            report
+                .hard
+                .iter()
+                .any(|(n, b)| n.contains("conns x")
+                    && *b == MIN_VIABLE_CONCURRENCY * 8 * 1024 * 1024),
+            "4MiB pipe 双向必须进硬账：{:?}",
+            report.hard
+        );
     }
 
     // ── 登记簿交叉断言（bd sgdwm：从实现处导入对照，改实现值即红）──
@@ -547,12 +924,12 @@ mod tests {
         );
     }
 
-    /// 小池档条款（bd sgdwm 重写后的 NEW_POOLS 语义）：四成员合计必须 ≤ 4MiB。
-    /// 大池（xray-buf/splithttp）与 DNS 缓存、finalmask xmc 池单列分账，不入本档。
+    /// 小池档条款（bd sgdwm 重写 + bd 258qt(a) 再收口）：**进程级**小池/缓存三成员
+    /// 合计必须 ≤ 4MiB。握手在途是**每监听**在途任务（64 × 55KiB/监听，随监听数
+    /// 线性），随固定底数分账，不入本档（否则单监听就 3.4MiB，两监听必然破 4MiB）。
     #[test]
     fn small_pool_bucket_fits_new_pools_clause() {
-        let bucket = HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
-            + DNS_PENDING_EST_BYTES
+        let bucket = DNS_PENDING_EST_BYTES
             + TLS_SESSION_CACHE_ESTIMATE_BYTES
             + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES;
         assert!(
@@ -562,16 +939,33 @@ mod tests {
         );
     }
 
-    /// 固定占用底数 ≤ 预算的固定份额（**按 8 核参考机折算** ~19.6MiB；本断言防
-    /// 固定面悄悄长穿预算的 1/4 —— 超过即须重审分账，不是硬顶；thread_local
-    /// 项随核数线性，换机器断言不漂移，铁律①）。
+    /// 握手在途单任务账面**不得低于**实现侧实测斜率（bd 258qt(a)：
+    /// `handshake_gate` 的 `MAX_INFLIGHT_HANDSHAKES` doc 记 54,975B/连接；旧簿写
+    /// 6KiB 低 9×）。改实现斜率或改本值须两处同步。
+    #[test]
+    fn handshake_task_est_matches_impl_measurement() {
+        const MEASURED_SLOPE: usize = 54_975;
+        // 两个都是常量 ⇒ 用编译期断言（clippy::assertions_on_constants：运行期 assert 对
+        // 常量无意义，且编译期就能拦住不一致）。
+        const _: () = assert!(
+            HANDSHAKE_TASK_EST_BYTES >= MEASURED_SLOPE,
+            "握手单任务账面低于实现侧实测斜率：账面必须取实测算术上沿（bd 258qt(a)）"
+        );
+        const _: () =
+            assert!(HANDSHAKE_TASK_EST_BYTES == 55 * 1024, "账面口径 = 实测取整上沿 55KiB");
+    }
+
+    /// 固定占用底数 ≤ 预算的固定份额（**8 核 / 1 监听参考机** = 23,719,424B
+    /// ≈ 22.6MiB；本断言防固定面悄悄长穿预算的 1/4 —— 超过即须重审分账，不是
+    /// 硬顶）。thread_local 项随核数线性、握手项随监听数线性（bd 258qt(a)），
+    /// 两者都显式注入 ⇒ 换机器断言不漂移（铁律①）。
     #[test]
     fn fixed_floor_stays_within_quarter_of_budget() {
-        let fixed = startup_fixed_floor_bytes_for(8);
+        let fixed = startup_fixed_floor_bytes_for(8, 1);
         assert_eq!(
-            fixed, 20_508_160,
-            "8 核参考机固定底数变了：成员或估算须重审（bd sgdwm；bd ccy5d 起 \
-             含 hysteria 共享块池 192_000B）"
+            fixed, 23_719_424,
+            "8 核/1 监听参考机固定底数变了：成员或估算须重审（bd sgdwm；bd ccy5d 起 \
+             含 hysteria 共享块池 192_000B；bd 258qt(a) 起握手按 55KiB × 监听数）"
         );
         assert!(
             fixed <= XRAY_BUDGET_BYTES / 4,
@@ -623,7 +1017,7 @@ mod tests {
         );
         // 总实算：固定底数（8 核参考机）+ frag 最坏 ≤ 96MiB。超限即红
         // （票面纪律：超了停下报 PM，禁自行缩 frag 上限或放宽总额）。
-        let total = startup_fixed_floor_bytes_for(8) + XDNS_FRAG_WORST_CASE_BYTES;
+        let total = startup_fixed_floor_bytes_for(8, 1) + XDNS_FRAG_WORST_CASE_BYTES;
         assert!(
             total <= XRAY_BUDGET_BYTES,
             "frag 入簿后总实算 {total}B 超预算 {}B：停下报 PM 重裁（bd wpa3o-b）",
@@ -646,7 +1040,7 @@ mod tests {
         let pipe_bytes =
             i64::from(xray_features::policy::BufferPolicy::default().connection).max(0);
         let pipe_per_conn = (pipe_bytes * 2) as usize; // 双方向
-        let total = startup_fixed_floor_bytes_for(8) + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
+        let total = startup_fixed_floor_bytes_for(8, 1) + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
         assert!(
             total <= XRAY_BUDGET_BYTES,
             "总实算 {total}B（固定面 + {} 连接 × pipe 双向 {pipe_per_conn}B）超预算 {}B：\

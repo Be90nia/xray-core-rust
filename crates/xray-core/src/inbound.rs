@@ -2077,6 +2077,40 @@ pub(crate) async fn ss_legacy_pipeline<C>(
     }
 }
 
+/// SS 同端口 UDP socket 装配（bd zhjhv）。
+///
+/// 地址取 **TCP listener 的实际绑定地址**（= 配置的 `listen`，含端口），对齐 Go
+/// `app/proxyman/inbound/worker.go:413` 的 `udp.ListenUDP(ctx, w.address, w.port)`。
+/// 旧实现硬编 `0.0.0.0`：配 `listen: 127.0.0.1` 时 TCP 只绑 loopback、UDP 却
+/// 全接口暴露（ss UDP 直接对外提供代理/放大面）。
+///
+/// 失败一律上抛（bind 失败 / finalmask 包装失败）——Go 的 `udpWorker.Start()`
+/// 返回错误即整 inbound 启动失败；旧实现只 `warn!` 后继续 ⇒ 用户以为 UDP 中继
+/// 在用、实际半启动。装配期失败 = 拒启（fail-visible）。
+pub(crate) async fn bind_ss_udp(
+    listener: &InboundTcpListener,
+    udpmask: Option<xray_transport::finalmask::UdpmaskManager>,
+) -> std::io::Result<Arc<dyn xray_transport::finalmask::UdpIo>> {
+    let bound = listener.local_addr()?;
+    let listen = std::net::SocketAddr::new(bound.ip(), bound.port());
+    // 走掩码 UDP 监听专用绑定：Windows 上关掉 ICMP-unreachable 的错误上报
+    // （bd quznp；否则一个伪造包就能让 xdns 的 recv 泵拿假错误自旋）。
+    let sock = xray_transport::udp::bind_udp_no_connreset(listen)
+        .await
+        .map_err(|e| std::io::Error::other(format!("ss udp bind {listen}: {e}")))?;
+    // finalmask.udp（bd 05js，Go udp/hub.go:71-77 WrapPacketConnServer）：
+    // recv 侧 decode、回包 send_to 侧 encode；未配置 → 裸 socket 原样。
+    match udpmask {
+        Some(mgr) if !mgr.udpmasks.is_empty() => {
+            let wrapped = mgr
+                .wrap_packet_conn_server(Box::new(sock))
+                .map_err(|e| std::io::Error::other(format!("ss udp mask wrap: {e}")))?;
+            Ok(Arc::from(wrapped))
+        },
+        _ => Ok(Arc::new(sock)),
+    }
+}
+
 /// Shadowsocks inbound 服务入口。
 ///
 /// 接受连接 → handle_conn → parse dest → dispatch。
@@ -2086,8 +2120,9 @@ pub async fn serve_ss(
     inbound: SsInboundMode,
     // sm80④：policy Timeouts.Handshake（legacy 与 ss2022 TCP 握手共用）
     handshake_timeout: std::time::Duration,
-    // finalmask.udp（bd 05js，Go udp/hub.go:61-62 FinalMask.ListenPacket；None = 未配置）
-    udpmask: Option<xray_transport::finalmask::UdpmaskManager>,
+    // 同端口 UDP relay 的已绑定 socket（finalmask 已套好）。装配期经
+    // [`bind_ss_udp`] 建好：**地址取配置的监听地址**、失败拒启（bd zhjhv）。
+    udp: Option<Arc<dyn xray_transport::finalmask::UdpIo>>,
     plugin_ctx: Arc<PluginContext>,
 ) -> std::io::Result<()> {
     let handler = ohm
@@ -2119,60 +2154,27 @@ pub async fn serve_ss(
         // 按 sessionId 的 PacketConn 中继（proto 默认 network = TCP+UDP）。
         SsInboundMode::Ss2022Relay(ib) => Some(SsUdpFlavor::Relay(Arc::clone(ib))),
     };
-    if let Some(flavor) = udp_flavor {
-        let port = listener.local_addr()?.port();
-        // 走掩码 UDP 监听专用绑定：Windows 上关掉 ICMP-unreachable 的错误上报
-        // （bd quznp；否则一个伪造包就能让 xdns 的 recv 泵拿假错误自旋）。
-        match xray_transport::udp::bind_udp_no_connreset(("0.0.0.0", port)).await {
-            Ok(sock) => {
-                // finalmask.udp（bd 05js，Go udp/hub.go:71-77 WrapPacketConnServer）：
-                // recv 侧 decode、回包 send_to 侧 encode；未配置 → 裸 socket 原样。
-                let udp: Option<Arc<dyn xray_transport::finalmask::UdpIo>> = match udpmask {
-                    Some(mgr) if !mgr.udpmasks.is_empty() => {
-                        match mgr.wrap_packet_conn_server(Box::new(sock)) {
-                            Ok(wrapped) => Some(Arc::from(wrapped)),
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e, port, "ss udp mask wrap failed, udp relay disabled"
-                                );
-                                None
-                            },
-                        }
+    if let (Some(flavor), Some(udp)) = (udp_flavor, udp) {
+        let handler = Arc::clone(&handler);
+        // scope 生命周期锚 + 嵌套 relay serve 的 spawn 句柄（克隆体各自再锚）
+        let task_ctx = Arc::clone(&plugin_ctx);
+        plugin_ctx
+            .spawn(async move {
+                let ctx = task_ctx;
+                let _ = match flavor {
+                    SsUdpFlavor::Legacy(ib) => {
+                        serve_ss_udp(udp, ib, handler, Arc::clone(&ctx)).await
                     },
-                    _ => Some(Arc::new(sock)),
+                    SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
+                        serve_ss2022_udp(udp, kind, server_psk, users, handler, Arc::clone(&ctx))
+                            .await
+                    },
+                    SsUdpFlavor::Relay(ib) => {
+                        serve_ss2022_relay_udp(udp, ib, handler, Arc::clone(&ctx)).await
+                    },
                 };
-                if let Some(udp) = udp {
-                    let handler = Arc::clone(&handler);
-                    // scope 生命周期锚 + 嵌套 relay serve 的 spawn 句柄（克隆体各自再锚）
-                    let task_ctx = Arc::clone(&plugin_ctx);
-                    plugin_ctx
-                        .spawn(async move {
-                            let ctx = task_ctx;
-                            let _ = match flavor {
-                                SsUdpFlavor::Legacy(ib) => {
-                                    serve_ss_udp(udp, ib, handler, Arc::clone(&ctx)).await
-                                },
-                                SsUdpFlavor::Ss2022 { kind, server_psk, users } => {
-                                    serve_ss2022_udp(
-                                        udp,
-                                        kind,
-                                        server_psk,
-                                        users,
-                                        handler,
-                                        Arc::clone(&ctx),
-                                    )
-                                    .await
-                                },
-                                SsUdpFlavor::Relay(ib) => {
-                                    serve_ss2022_relay_udp(udp, ib, handler, Arc::clone(&ctx)).await
-                                },
-                            };
-                        })
-                        .expect("arm FxScope is never closed");
-                }
-            },
-            Err(e) => tracing::warn!(error = %e, port, "ss udp bind failed, udp relay disabled"),
-        }
+            })
+            .expect("arm FxScope is never closed");
     }
     tracing::info!(addr = %listener.local_addr()?, "ss inbound listening");
     loop {
@@ -2329,8 +2331,26 @@ fn sweep_expired_ss2022_sessions(
     server_sessions.len()
 }
 
-/// SS Legacy UDP relay 入口。
+/// 有损投递：UDP 分发 channel 满即丢（对齐 tuic/hysteria 的 `try_send` 先例）。
 ///
+/// 共享 recv 循环里 `send().await` 会队头阻塞：一个（已认证）客户端刷包即可让
+/// 全体会话停摆（bd p56lk）。UDP 事件有损优于全站阻塞。返回 `true` = 会话已
+/// 关闭（relay task 退出），调用方应移除该 entry 让下一包重建。
+fn udp_try_dispatch<T>(tx: &tokio::sync::mpsc::Sender<T>, item: T, dropped: &mut u64) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => false,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            *dropped = dropped.saturating_add(1);
+            if *dropped == 1 || *dropped % 1024 == 0 {
+                tracing::warn!(dropped = *dropped, "udp session queue full, packet dropped");
+            }
+            false
+        },
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
+    }
+}
+
+/// SS Legacy UDP relay 入口。
 /// 对应 Go `proxy/shadowsocks/server.go::handleUDPPayload`：recv_from →
 /// decode_udp_packet（匹配用户 + 解出目标/payload）→ 按客户端源地址分发到
 /// per-client [`UdpDispatchSession`]（Go `udp.Dispatcher` cone 会话模型）。
@@ -2346,6 +2366,7 @@ pub async fn serve_ss_udp(
     tracing::info!(addr = %udp.local_addr()?, "ss udp relay listening");
     let mut buf = vec![0u8; 65_536];
     let mut clients: HashMap<SocketAddr, tokio::sync::mpsc::Sender<SsUdpItem>> = HashMap::new();
+    let mut dropped: u64 = 0;
     loop {
         let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -2380,7 +2401,7 @@ pub async fn serve_ss_udp(
                 .expect("arm FxScope is never closed");
             tx
         });
-        if tx.send(item).await.is_err() {
+        if udp_try_dispatch(tx, item, &mut dropped) {
             // relay task 已退出（空闲淘汰）：丢弃 entry，该 client 下一包重建会话
             clients.remove(&client);
         }
@@ -2488,6 +2509,7 @@ pub async fn serve_ss2022_udp(
     let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
     let mut server_sessions: HashMap<u64, (Arc<ServerUdpSession2022>, std::time::Instant)> =
         HashMap::new();
+    let mut dropped: u64 = 0;
     loop {
         let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -2576,7 +2598,7 @@ pub async fn serve_ss2022_udp(
                 .expect("arm FxScope is never closed");
             tx
         });
-        if tx.send((dest, payload, client)).await.is_err() {
+        if udp_try_dispatch(tx, (dest, payload, client), &mut dropped) {
             // relay task 已退出（空闲淘汰）：丢弃 entry，该 session 下一包重建
             sessions.remove(&sid);
         }
@@ -2599,6 +2621,7 @@ pub async fn serve_ss2022_relay_udp(
     let mut buf = vec![0u8; 65_536];
     type Item = (Destination, Vec<u8>, SocketAddr);
     let mut sessions: HashMap<u64, tokio::sync::mpsc::Sender<Item>> = HashMap::new();
+    let mut dropped: u64 = 0;
     loop {
         let (n, client) = match udp.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -2634,7 +2657,7 @@ pub async fn serve_ss2022_relay_udp(
                 .expect("arm FxScope is never closed");
             tx
         });
-        if tx.send((dest, frame, client)).await.is_err() {
+        if udp_try_dispatch(tx, (dest, frame, client), &mut dropped) {
             // relay task 已退出（空闲淘汰）：丢弃 entry，该 session 下一包重建
             sessions.remove(&sid);
         }
@@ -3728,7 +3751,7 @@ pub(crate) fn spawn_inbound_serve(
     let arm_anchor = Arc::clone(arm);
     #[allow(
         clippy::disallowed_methods,
-        reason = "监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）+ 停机级联监视（bd a9xgp）同壳承载，serve 任务本体已迁 arm scope"
+        reason = "②豁免（bd kwevg · §3.5.6）：监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）+ 停机级联监视（bd a9xgp）同壳承载，serve 任务本体已迁 arm scope；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         let arm = arm_anchor;
@@ -5230,9 +5253,11 @@ pub(crate) fn build_trojan_users(
 pub(crate) fn build_trojan_fallbacks(
     data: &[u8],
 ) -> std::io::Result<Option<std::sync::Arc<FallbackPolicy>>> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
-        return Ok(None);
-    };
+    // 坏 JSON 一律报错（同 `build_vless_fallbacks`）：旧实现静默返回 None
+    // ⇒ fallback 整表消失（非本协议 TLS 流量不再回落 dest，直接断链）而启动「成功」
+    // （bd 16uis）。
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("trojan inbound settings JSON: {e}")))?;
     let Some(fbs) = v.get("fallbacks").and_then(|f| f.as_array()) else {
         return Ok(None);
     };
@@ -5427,6 +5452,20 @@ pub(crate) struct DokodemoInboundSettings {
     pub(crate) port_map: HashMap<String, String>,
 }
 
+/// JSON 数值 → 端口（`0..=65535`）。越界**报错**，不用 `as u16` 静默回绕
+/// （`65537 as u16 == 1`、`70000 as u16 == 4464`，bd 16uis）。
+fn json_port(v: Option<&serde_json::Value>, field: &str) -> std::io::Result<Option<u16>> {
+    let Some(n) = v.and_then(serde_json::Value::as_u64) else {
+        return Ok(None);
+    };
+    u16::try_from(n).map(Some).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{field}: {n} is not a valid port (0..=65535)"),
+        )
+    })
+}
+
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
 /// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
 /// `network` 可选（默认 `"tcp"`）；`followRedirect` 可选（默认 `false`）；
@@ -5437,7 +5476,7 @@ pub(crate) fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoIn
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dokodemo inbound settings JSON: {e}")))?;
     let address = v.get("address").and_then(|x| x.as_str()).map(parse_address_str);
-    let port = v.get("port").and_then(|x| x.as_u64()).map(|p| p as u16);
+    let port = json_port(v.get("port"), "dokodemo inbound port")?;
     // network：逗号分隔，默认 tcp。对应 Go allowed_networks。
     let network_str = v.get("network").and_then(|x| x.as_str()).unwrap_or("tcp");
     let allow_tcp = network_str.contains("tcp");
@@ -5630,7 +5669,7 @@ fn parse_ss2022_inbound_config(
             let email = d.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level = d.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let addr_str = d.get("server").and_then(|x| x.as_str()).unwrap_or("127.0.0.1");
-            let port = d.get("server_port").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
+            let port = json_port(d.get("server_port"), "ss2022 relay server_port")?.unwrap_or(0);
             let psk = psk_from_base64(key_b64)
                 .map_err(|e| std::io::Error::other(format!("ss2022 relay PSK: {e}")))?;
             destinations.push(RelayDestination {
@@ -5674,11 +5713,9 @@ fn parse_ss2022_inbound_config(
                     .or_else(|| u.get("server"))
                     .and_then(|x| x.as_str())
                     .unwrap_or("127.0.0.1");
-                let port = u
-                    .get("port")
-                    .or_else(|| u.get("server_port"))
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as u16;
+                let port =
+                    json_port(u.get("port").or_else(|| u.get("server_port")), "ss2022 relay port")?
+                        .unwrap_or(0);
                 let psk = psk_from_base64(key_b64)
                     .map_err(|e| std::io::Error::other(format!("ss2022 relay PSK: {e}")))?;
                 destinations.push(RelayDestination {
@@ -5986,23 +6023,34 @@ pub(crate) fn parse_dns_inbound_config(
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("dns inbound settings JSON: {e}")))?;
     let handler = DnsHandler::init(&DnsConfig::default(), idle_timeout);
-    // 解析上游 DNS 服务器列表
-    let servers: Vec<(std::net::IpAddr, u16)> = v
-        .get("servers")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| {
-                    s.as_str().and_then(|addr| {
-                        let (ip, port) = addr.rsplit_once(':')?;
-                        let ip: std::net::IpAddr = ip.parse().ok()?;
-                        let port: u16 = port.parse().ok()?;
-                        Some((ip, port))
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // 解析上游 DNS 服务器列表。单条失败必须 warn + 计数、全失败必须硬错拒启：
+    // 静默丢弃会让用户配置的上游无声消失，全丢后回落 `new_system` 更是把查询切到
+    // 明文系统解析（泄露 + 绕过用户配置的 DoH/DoT 意图）。空列表（未配置）仍按 Go
+    // 语义走系统解析器。
+    let mut servers: Vec<(std::net::IpAddr, u16)> = Vec::new();
+    let mut dropped = 0usize;
+    for entry in v.get("servers").and_then(|x| x.as_array()).into_iter().flatten() {
+        match entry.as_str().and_then(parse_dns_upstream) {
+            Some(addr) => servers.push(addr),
+            None => {
+                dropped += 1;
+                tracing::warn!(
+                    tag = %tag,
+                    server = ?entry,
+                    "dns inbound: invalid upstream server, skipped (expected \"ip:port\" or \"[ipv6]:port\")"
+                );
+            },
+        }
+    }
+    if servers.is_empty() && dropped > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "dns inbound {tag}: none of the {dropped} upstream server(s) is valid \
+                 (expected \"ip:port\" or \"[ipv6]:port\")"
+            ),
+        ));
+    }
     let outbound = if servers.is_empty() {
         DnsOutbound::new_system(tag)
             .map_err(|e| std::io::Error::other(format!("dns outbound init: {e}")))?
@@ -6011,6 +6059,15 @@ pub(crate) fn parse_dns_inbound_config(
             .map_err(|e| std::io::Error::other(format!("dns outbound init: {e}")))?
     };
     Ok((handler, outbound))
+}
+
+/// `"ip:port"` / `"[ipv6]:port"` → (IP, port)。
+///
+/// 按 Go `net.SplitHostPort` 的括号规则解析：旧的 `rsplit_once(':')` 会把
+/// `[2001:db8::1]:53` 切成 `("[2001:db8:", "1]:53")` ⇒ **所有 IPv6 上游被丢弃**。
+fn parse_dns_upstream(addr: &str) -> Option<(std::net::IpAddr, u16)> {
+    let sa: std::net::SocketAddr = addr.parse().ok()?;
+    Some((sa.ip(), sa.port()))
 }
 
 /// 从 inbound entry.data（JSON）解析 loopback 配置 → inbound_tag。
@@ -6231,17 +6288,24 @@ pub(crate) fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOpti
 ///
 /// JSON 格式：`{"response":{"type":"none"}}` 或 `{"response":{"type":"http"}}`。
 /// 缺省时默认 None。
-pub(crate) fn parse_blackhole_inbound_response(data: &[u8]) -> BlackholeResponseConfig {
+///
+/// # Errors
+/// 坏 JSON → `Err`（旧实现 `unwrap_or_default()` 把写坏的配置静默降级成
+/// `response.type = none`，用户以为配了 HTTP 403 回包，bd 16uis）。
+pub(crate) fn parse_blackhole_inbound_response(
+    data: &[u8],
+) -> std::io::Result<BlackholeResponseConfig> {
     if data.is_empty() {
-        return BlackholeResponseConfig::None;
+        return Ok(BlackholeResponseConfig::None);
     }
-    let v: serde_json::Value = serde_json::from_slice(data).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("blackhole inbound settings JSON: {e}")))?;
     let response_type =
         v.get("response").and_then(|r| r.get("type")).and_then(|t| t.as_str()).unwrap_or("none");
-    match response_type {
+    Ok(match response_type {
         "http" => BlackholeResponseConfig::Http403,
         _ => BlackholeResponseConfig::None,
-    }
+    })
 }
 
 /// 从 inbound entry.data（JSON）解析 freedom inbound 预定义目标地址。
@@ -6254,9 +6318,9 @@ pub(crate) fn parse_freedom_inbound_dest(data: &[u8]) -> std::io::Result<Destina
     let address_str = v.get("address").and_then(|x| x.as_str()).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing address")
     })?;
-    let port = v.get("port").and_then(|x| x.as_u64()).ok_or_else(|| {
+    let port = json_port(v.get("port"), "freedom inbound port")?.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "freedom inbound: missing port")
-    })? as u16;
+    })?;
     let address = if let Ok(v4) = address_str.parse::<std::net::Ipv4Addr>() {
         Address::IPv4(v4)
     } else if let Ok(v6) = address_str.parse::<std::net::Ipv6Addr>() {
@@ -7917,6 +7981,39 @@ mod tests {
                 .unwrap();
         let (_header, data) = decode_udp_packet(ib.validator(), &rbuf[..n]).unwrap();
         assert_eq!(data, b"ss-via-dispatch");
+    }
+
+    /// bd zhjhv：SS 同端口 UDP 必须绑**配置的监听地址**、同端口，且 bind 失败
+    /// 必须上报（装配期拒启）而不是 `warn` 后继续半启动。
+    ///
+    /// Go 基准 `app/proxyman/inbound/worker.go:413`
+    /// `udp.ListenUDP(ctx, w.address, w.port)` + `Start()` 返回 err。
+    #[tokio::test]
+    async fn ss_udp_binds_configured_listen_addr_and_fails_visible() {
+        let sockopt = xray_transport::sockopt::SocketOptions::default();
+
+        let tcp = InboundTcpListener::bind("127.0.0.1:0", sockopt.clone()).await.expect("tcp bind");
+        let tcp_port = tcp.local_addr().expect("tcp local addr").port();
+        let udp = bind_ss_udp(&tcp, None).await.expect("ss udp bind");
+        let bound = udp.local_addr().expect("udp local addr");
+        assert_eq!(
+            bound.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "UDP 必须跟随配置的 listen（旧实现硬编 0.0.0.0 = 全接口暴露）"
+        );
+        assert_eq!(bound.port(), tcp_port, "UDP 与 TCP 同端口");
+        drop(udp);
+
+        // UDP 端口已被占 ⇒ 必须返回 Err（旧实现只 warn，TCP 照常服务）
+        let squat = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.expect("squat udp");
+        let squat_port = squat.local_addr().unwrap().port();
+        let tcp2 = InboundTcpListener::bind(&format!("127.0.0.1:{squat_port}"), sockopt)
+            .await
+            .expect("tcp bind on squatted port（TCP/UDP 端口空间独立）");
+        assert!(
+            bind_ss_udp(&tcp2, None).await.is_err(),
+            "UDP bind 失败必须上抛（fail-visible），不得静默禁用 UDP relay"
+        );
     }
 
     /// parse_reality_config：privateKey/shortIds/dest 双形态/默认值。
@@ -12391,9 +12488,13 @@ mod tests {
         let raw = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let sent = Arc::new(Mutex::new(Vec::new()));
         let recv = Arc::new(Mutex::new(Vec::new()));
+        let addrs = xray_transport::finalmask::ConnAddrs {
+            local: raw.local_addr().ok(),
+            remote: raw.peer_addr().ok(),
+        };
         let tap = WireTap { inner: raw, sent: Arc::clone(&sent), recv: Arc::clone(&recv) };
         let io: Box<dyn AsyncIo> = match &mask {
-            Some(m) => m.wrap_conn_client(Box::new(tap)).expect("client mask"),
+            Some(m) => m.wrap_conn_client(Box::new(tap), addrs).expect("client mask"),
             None => Box::new(tap),
         };
         MaskClient { io, sent, recv }
@@ -12607,6 +12708,41 @@ mod tests {
         }
     }
 
+    /// bd z6mdr：dns inbound 的 `servers` 解析必须 fail-visible。
+    ///
+    /// ① IPv6 字面量上游必须可用（旧实现 `rsplit_once(':')` 把
+    /// `[2001:db8::1]:53` 切成 `("[2001:db8:", "1]:53")` ⇒ 全部 IPv6 上游被丢弃）；
+    /// ② 单条非法只丢弃该条，其余照常生效；③ 全部非法必须硬错拒启——否则
+    /// 静默回落系统解析器 = 明文 DNS + 绕过用户配置的 DoH/DoT 意图。
+    #[test]
+    fn dns_inbound_servers_are_fail_visible() {
+        let idle = std::time::Duration::from_secs(5);
+        // ① IPv6 上游可解析
+        assert!(
+            parse_dns_inbound_config(br#"{"servers":["[2001:db8::1]:53"]}"#, "dns-v6", idle)
+                .is_ok(),
+            "IPv6 上游不得被丢弃"
+        );
+        // ② 混合：非法条目跳过，合法条目生效
+        assert!(
+            parse_dns_inbound_config(
+                br#"{"servers":["8.8.8.8:53","not-an-address","[::1]:5353"]}"#,
+                "dns-mixed",
+                idle,
+            )
+            .is_ok(),
+            "部分非法不得让整个 inbound 失败"
+        );
+        // ③ 全非法 ⇒ 拒启
+        let all_bad = parse_dns_inbound_config(br#"{"servers":["dns.google"]}"#, "dns-bad", idle);
+        let Err(err) = all_bad else {
+            panic!("全部上游非法必须拒启（不得静默回落系统解析器）")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // 未配置 servers ⇒ 系统解析器（Go 语义：空列表不算失败）
+        assert!(parse_dns_inbound_config(b"{}", "dns-empty", idle).is_ok());
+    }
+
     /// TOCTOU 加固：bind(:0)→drop→spawn_one_inbound 之间端口可能被并行测试/
     /// 其他进程抢占（Windows 10048 / Unix EADDRINUSE）——占用时换端口重试至
     /// 多 5 次。返回实际绑定端口与 serve 句柄。
@@ -12680,9 +12816,13 @@ mod tests {
             let raw = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let sent = Arc::new(Mutex::new(Vec::new()));
             let recv = Arc::new(Mutex::new(Vec::new()));
+            let addrs = xray_transport::finalmask::ConnAddrs {
+                local: raw.local_addr().ok(),
+                remote: raw.peer_addr().ok(),
+            };
             let tap = WireTap { inner: raw, sent: Arc::clone(&sent), recv: Arc::clone(&recv) };
             let io: Box<dyn AsyncIo> = match masked.then(|| Arc::clone(&mask)) {
-                Some(m) => m.wrap_conn_client(Box::new(tap)).expect("client mask"),
+                Some(m) => m.wrap_conn_client(Box::new(tap), addrs).expect("client mask"),
                 None => Box::new(tap),
             };
 

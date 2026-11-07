@@ -329,12 +329,23 @@ async fn start_full_dispatched(
     // sessionPolicy 驱动 bridge connIdle/uplinkOnly/downlinkOnly）。非 freedom
     // 出站查 level 0；freedom 按 settings.userLevel 查档位（outbound.rs 内）。
     let pm_opt = instance.get_feature::<xray_app_policy::PolicyFeature>();
-    if let Some(pm) = pm_opt.as_ref() {
-        dispatcher
-            .set_policy_manager(Arc::clone(pm) as Arc<dyn xray_features::policy::PolicyManager>);
-    }
-    let policy_manager: Option<&dyn xray_features::policy::PolicyManager> =
-        pm_opt.as_ref().map(|p| &**p as &dyn xray_features::policy::PolicyManager);
+    // 没有 policy app ⇒ Go `DefaultManager`（features/policy/default.go）等价件：
+    // SessionDefault + **level 1 connIdle 600s**（bd yh01f(a)：此前只有一个与 level
+    // 无关的 `Policy::default()`（300s），level-1 空闲窗比 Go 短一半）。出站 DialBridge
+    // 与 dispatcher 共用同一份 fallback（Go 侧也是同一个 DefaultManager）。
+    let default_pm: Arc<dyn xray_features::policy::PolicyManager> =
+        Arc::new(xray_features::policy::DefaultPolicyFeature);
+    let policy_manager: &dyn xray_features::policy::PolicyManager = match pm_opt.as_ref() {
+        Some(pm) => {
+            dispatcher.set_policy_manager(Arc::clone(pm) as Arc<dyn xray_features::policy::PolicyManager>);
+            &**pm
+        },
+        None => {
+            dispatcher.set_policy_manager(Arc::clone(&default_pm));
+            &*default_pm
+        },
+    };
+    let policy_manager = Some(policy_manager);
     dispatcher.stats = instance
         .get_feature::<crate::register::AppStatsFeature>()
         .map(|f| f as Arc<dyn xray_features::stats::Manager>);

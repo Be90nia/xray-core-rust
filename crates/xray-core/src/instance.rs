@@ -348,6 +348,10 @@ impl Instance {
         // 被全局钉住，跨实例串扰且任务不随实例关闭而止。幂等：重复 close 再摘一次无害。
         xray_app_dns::dial::set_shared_dialer(None);
         xray_transport::system_dialer::clear_dialer_proxy_hook();
+        // bd rvvez：第三个装配期全局槽同上——fakeDns 引擎（`register.rs` 的
+        // `fake_dns_factory` 写入 `set_shared_multi`）。不摘则 fake IP↔域名映射表
+        // 被进程钉住，且热重启的新实例会继承旧实例的池状态（跨实例串扰）。
+        xray_app_dns::fakedns::set_shared_multi(None);
 
         if !self.running {
             return Ok(());
@@ -970,6 +974,69 @@ mod tests {
                 0,
                 "B close 后其 DialerProxy 钩子仍可被拨号触达（全局槽未摘）"
             );
+        }
+    }
+
+    /// bd rvvez：`Instance::close` 必须摘掉第三个装配期全局槽——fakeDns 共享引擎
+    /// （`register.rs::fake_dns_factory` → `set_shared_multi`）。不摘则 fake IP↔域名
+    /// 映射表被进程钉住，热重启的新实例会继承旧实例的池状态（跨实例串扰）。
+    mod global_fakedns_slot {
+        use std::sync::{Arc, atomic::AtomicUsize};
+
+        use xray_app_dns::fakedns::{FakeDnsPool, HolderMulti};
+
+        use super::{CountingFeature, Instance};
+
+        fn holder() -> Arc<HolderMulti> {
+            Arc::new(HolderMulti::new(vec![FakeDnsPool::default_v4()]).expect("fake dns holder"))
+        }
+
+        fn instance_with_one_feature() -> Instance {
+            let mut inst = Instance::new();
+            inst.add_feature(Arc::new(CountingFeature {
+                name: "rvvez",
+                start_count: Arc::new(AtomicUsize::new(0)),
+                close_count: Arc::new(AtomicUsize::new(0)),
+                start_fails: false,
+            }))
+            .expect("add feature");
+            inst
+        }
+
+        #[tokio::test]
+        async fn close_releases_process_global_fakedns_slot() {
+            // 实例 A：模拟装配期写入槽后关闭（生产写点 register.rs fake_dns_factory）。
+            let a_holder = holder();
+            xray_app_dns::fakedns::set_shared_multi(Some(Arc::clone(&a_holder)));
+
+            let mut a = instance_with_one_feature();
+            a.start().expect("instance A starts");
+            a.close().expect("instance A closes");
+            a.close().expect("close 幂等：重复关闭仍 Ok");
+
+            // 用引用身份而非绝对空态：槽是进程级全局，本测试二进制里 fakeDns factory
+            // 测试会在并行线程改写它——他测写入不改变本结论。
+            if let Some(installed) = xray_app_dns::fakedns::shared_multi() {
+                assert!(
+                    !Arc::ptr_eq(&installed, &a_holder),
+                    "A close 后其 fakeDns 引擎仍被全局槽钉住"
+                );
+            }
+
+            // 实例 B：A 摘槽后新建实例装配自己的引擎，close 同样必须摘除。
+            let b_holder = holder();
+            xray_app_dns::fakedns::set_shared_multi(Some(Arc::clone(&b_holder)));
+
+            let mut b = instance_with_one_feature();
+            b.start().expect("instance B starts");
+            b.close().expect("instance B closes");
+
+            if let Some(installed) = xray_app_dns::fakedns::shared_multi() {
+                assert!(
+                    !Arc::ptr_eq(&installed, &b_holder),
+                    "B close 后其 fakeDns 引擎仍被全局槽钉住"
+                );
+            }
         }
     }
 }

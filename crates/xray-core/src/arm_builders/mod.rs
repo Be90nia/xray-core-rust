@@ -246,6 +246,10 @@ pub(crate) static INBOUND_CTORS: &[(&str, InboundCtor)] = &[
     // 使整条入站落到「未支持协议」被静默跳过；两个键都收。
     ("inbound:dokodemo-door", tcp(inbound::dokodemo_entry)),
     ("inbound:dokodemo", tcp(inbound::dokodemo_entry)),
+    // Go 老式别名：`"tunnel"` 与 `"dokodemo-door"` 在 inboundConfigLoader 里指向
+    // 同一个 DokodemoConfig（Go 26.10.17 `infra/conf/xray.go:29-30`）。少这个键
+    // 会让 Go 合法配置在装配期未命中 ⇒ 整配置拒启（o91s4 语义）。
+    ("inbound:tunnel", tcp(inbound::dokodemo_entry)),
     (
         "inbound:shadowsocks",
         ctor(
@@ -286,6 +290,11 @@ pub(crate) static INBOUND_CTORS: &[(&str, InboundCtor)] = &[
 /// 出站构造器**数据源**（纯数据；键格式同 `INBOUND_CTORS`）。
 pub(crate) static OUTBOUND_CTORS: &[(&str, OutboundBuilder)] = &[
     ("outbound:freedom", outbound::freedom_entry),
+    // Go 老式别名：`"direct"` → FreedomConfig、`"block"` → BlackholeConfig
+    // （Go 26.10.17 `infra/conf/xray.go:42-46` outboundConfigLoader）。少这些键会让
+    // Go 合法配置在装配期未命中 ⇒ 整配置拒启（o91s4 语义）。
+    ("outbound:direct", outbound::freedom_entry),
+    ("outbound:block", outbound::blackhole_entry),
     ("outbound:vless", outbound::vless_entry),
     ("outbound:trojan", outbound::trojan_entry),
     ("outbound:blackhole", outbound::blackhole_entry),

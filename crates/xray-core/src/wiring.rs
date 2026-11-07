@@ -166,14 +166,25 @@ impl RouterRoutingContext for BridgeCtx<'_> {
     }
 }
 
-/// 把 router 的 `RouterError` 映射为 dispatcher 的 `DispatcherError`。
+/// 把 router 的 `RouterError` 映射为 dispatcher 的 `DispatcherError`，
+/// **并留可见日志**（trssj 收口点）。
 ///
 /// `NoClue`（无规则命中）映射为 `Other("no route matched")`——dispatch_link 的
-/// 调用方（line ~689）对 `Err(_)` 统一降级到 default handler。
+/// 调用方对 `Err(_)` 统一降级到 default handler。
+/// Go `app/dispatcher/default.go:456-462`：`PickRoute` 失败时只有 `err != ErrNoClue`
+/// 才打日志，随后一律走默认出站。「无规则命中」是正常态（debug）；balancer /
+/// 观测器失败是异常态（warn）——此前两者都被沉默地映射成 `DispatcherError`，
+/// 最坏把流量静默导到默认出站（含 `direct`，即「以为走了代理，实际直连」）。
 fn map_router_err(e: RouterError) -> DispatcherError {
     match e {
-        RouterError::NoClue => DispatcherError::Other("no route matched".into()),
-        other => DispatcherError::Other(format!("router: {other}")),
+        RouterError::NoClue => {
+            tracing::debug!("routing: no rule matched, using default outbound");
+            DispatcherError::Other("no route matched".into())
+        },
+        other => {
+            tracing::warn!(error = %other, "routing failed, using default outbound");
+            DispatcherError::Other(format!("router: {other}"))
+        },
     }
 }
 impl RoutingRouter for RouterAdapter {
@@ -490,7 +501,7 @@ impl MuxCarrierHandler {
         if is_mux_carrier(dest) {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面 mux carrier 连接任务（每 carrier）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面 mux carrier 连接任务（每 carrier）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(crate::inbound::handle_mux_inbound_link(
                 link,
@@ -578,11 +589,16 @@ impl InboundDispatchHandler {
             return None;
         }
         self.dispatcher.stats.as_ref().and_then(|m| {
-            xray_features::stats::get_or_register_counter(
-                m.as_ref(),
-                &format!("inbound>>>{}>>>traffic>>>{direction}", self.tag),
-            )
-            .ok()
+            let name = format!("inbound>>>{}>>>traffic>>>{direction}", self.tag);
+            // 不用 `.ok()` 吞错（bd 441no）：注册失败 = 该 inbound 无计数。
+            // 可见信号在 manager 侧（触顶 warn-once），这里留 debug 轨迹。
+            match xray_features::stats::get_or_register_counter(m.as_ref(), &name) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::debug!("stats counter `{name}` unavailable: {e}");
+                    None
+                },
+            }
         })
     }
 }
@@ -852,23 +868,14 @@ fn parse_routing_json_to_proto_in(
             // Domain 规则：Go 前缀语法（full:/domain:/regexp:/keyword:/geosite:/ext:，
             // 无前缀 = Substr），geosite 条目经 check_file 校验 geodata 资产可用性。
             let mut domains = Vec::new();
-            let domain_list: Vec<&str> = match r.get("domains").and_then(|x| x.as_array()) {
-                // Go router.go:182-188：`domains` 键存在时覆盖 `domain`。
-                // 非字符串项硬错（Go StringList 解码期拒启 / rule_parser.go
-                // 逐条失败即拒），不再 filter_map 静默丢弃。
-                Some(arr) => arr
-                    .iter()
-                    .map(|x| {
-                        x.as_str().ok_or_else(|| {
-                            WiringError::JsonParse(format!(
-                                "routing rule domain entry is not a string: {x}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<&str>, WiringError>>()?,
-                None => json_str_iter(r.get("domain")).collect(),
+            // Go router.go:182-188：`domains` 键存在时覆盖 `domain`；两者都是
+            // `*StringList`（字符串形态按逗号切分，数组元素原样）。
+            let domain_list: Vec<String> = if r.get("domains").is_some() {
+                json_string_list(r.get("domains"))?
+            } else {
+                json_string_list(r.get("domain"))?
             };
-            for d in domain_list {
+            for d in &domain_list {
                 let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
                     d,
                     xray_geodata::geosite::DomainType::Substr,
@@ -879,29 +886,29 @@ fn parse_routing_json_to_proto_in(
                 })?;
                 domains.push(geodata_domain_rule_to_proto(pb_rule));
             }
-            for d in json_str_iter(r.get("domainSuffix")) {
+            for d in json_string_list(r.get("domainSuffix"))? {
                 domains.push(DomainRule {
                     value: Some(DV::Custom(Domain {
                         r#type: DT::Domain as i32,
-                        value: d.to_string(),
+                        value: d.clone(),
                         attribute: vec![],
                     })),
                 });
             }
-            for d in json_str_iter(r.get("domainKeyword")) {
+            for d in json_string_list(r.get("domainKeyword"))? {
                 domains.push(DomainRule {
                     value: Some(DV::Custom(Domain {
                         r#type: DT::Substr as i32,
-                        value: d.to_string(),
+                        value: d.clone(),
                         attribute: vec![],
                     })),
                 });
             }
-            for d in json_str_iter(r.get("domainRegex")) {
+            for d in json_string_list(r.get("domainRegex"))? {
                 domains.push(DomainRule {
                     value: Some(DV::Custom(Domain {
                         r#type: DT::Regex as i32,
-                        value: d.to_string(),
+                        value: d.clone(),
                         attribute: vec![],
                     })),
                 });
@@ -911,11 +918,11 @@ fn parse_routing_json_to_proto_in(
             // `!` 反向）。解析失败硬错——旧实现 geoip:/非法 CIDR 静默跳过（安全
             // 屏蔽规则失效的根因）。
             let mut ips = Vec::new();
-            for p in xray_geodata::rule_parser::parse_ip_rules(
-                &json_string_list(r.get("ip")),
-                datadir,
-            )
-            .map_err(|e| geo_asset_error("routing rule ip".into(), "geoip.dat", datadir, e))?
+            for p in
+                xray_geodata::rule_parser::parse_ip_rules(&json_string_list(r.get("ip"))?, datadir)
+                    .map_err(|e| {
+                        geo_asset_error("routing rule ip".into(), "geoip.dat", datadir, e)
+                    })?
             {
                 ips.push(geodata_ip_rule_to_proto(p));
             }
@@ -924,7 +931,7 @@ fn parse_routing_json_to_proto_in(
             let source_key = if r.get("sourceIP").is_some() { "sourceIP" } else { "source" };
             let mut source_ips = Vec::new();
             for p in xray_geodata::rule_parser::parse_ip_rules(
-                &json_string_list(r.get(source_key)),
+                &json_string_list(r.get(source_key))?,
                 datadir,
             )
             .map_err(|e| {
@@ -936,7 +943,7 @@ fn parse_routing_json_to_proto_in(
             // Go router.go:222-232：localIP / localPort。
             let mut local_ips = Vec::new();
             for p in xray_geodata::rule_parser::parse_ip_rules(
-                &json_string_list(r.get("localIP")),
+                &json_string_list(r.get("localIP"))?,
                 datadir,
             )
             .map_err(|e| geo_asset_error("routing rule localIP".into(), "geoip.dat", datadir, e))?
@@ -957,21 +964,21 @@ fn parse_routing_json_to_proto_in(
                 vless_route_list: parse_port_list(r.get("vlessRoute"))?,
                 networks: parse_networks(r.get("network"))
                     .map_err(|e| WiringError::JsonParse(format!("routing rule network: {e}")))?,
-                user_email: json_string_list(r.get("user")),
+                user_email: json_string_list(r.get("user"))?,
                 // Go NewInboundTagMatcher/NewProtocolMatcher 构造器
                 // （condition.go:207-215/:237-245）过滤空串——空串条目在
                 // Rust 匹配器里前缀恒真，必须剔除。
-                inbound_tag: json_string_list(r.get("inboundTag"))
+                inbound_tag: json_string_list(r.get("inboundTag"))?
                     .into_iter()
                     .filter(|t| !t.is_empty())
                     .collect(),
-                protocol: json_string_list(r.get("protocol"))
+                protocol: json_string_list(r.get("protocol"))?
                     .into_iter()
                     .filter(|p| !p.is_empty())
                     .collect(),
-                process: json_string_list(r.get("process")),
+                process: json_string_list(r.get("process"))?,
                 // Go a12801c1：`localOS` → local_os（匹配 runtime.GOOS）。
-                local_os: json_string_list(r.get("localOS")),
+                local_os: json_string_list(r.get("localOS"))?,
                 // 对齐 Go router.go:147 json 键 `attrs`（`attributes` 仅作
                 // Rust 旧方言别名保留）。
                 attributes: parse_attributes(if r.get("attrs").is_some() {
@@ -1022,7 +1029,7 @@ fn parse_routing_json_to_proto_in(
                     )));
                 },
             }
-            let selectors = json_string_list(b.get("selector"));
+            let selectors = json_string_list(b.get("selector"))?;
             if selectors.is_empty() {
                 // Go router.go:33-35：空 selector 列表拒启。
                 return Err(WiringError::JsonParse("empty selector list".into()));
@@ -1144,9 +1151,34 @@ fn parse_networks(v: Option<&serde_json::Value>) -> Result<Vec<i32>, String> {
         .collect()
 }
 
-/// JSON 字符串数组 → `Vec<String>`。
-fn json_string_list(v: Option<&serde_json::Value>) -> Vec<String> {
-    json_str_iter(v).map(|s| s.to_string()).collect()
+/// JSON 值 → `Vec<String>`，对齐 Go `infra/conf.StringList.UnmarshalJSON`
+/// （cfgcommon/common.go:28-46）：
+///
+/// - `Value::String` → 按 `,` 切分（`"a,b"` → `["a","b"]`）
+/// - `Value::Array` → 元素**原样**（Go 只对字符串形态切分，数组元素内不再切）
+/// - 数组内非字符串条目 → 硬错（Go 反序列化到 `[]string` 失败即拒启； 静默丢会让条件消失、规则变宽
+///   = fail-open）
+/// - 缺失 / null → 空列表
+fn json_string_list(v: Option<&serde_json::Value>) -> Result<Vec<String>, WiringError> {
+    let Some(v) = v else {
+        return Ok(Vec::new());
+    };
+    match v {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(s) => {
+            // Go `strings.Split(rawstr, ",")`：不 trim、不丢空串。
+            Ok(s.split(',').map(str::to_string).collect())
+        },
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|x| {
+                x.as_str().map(str::to_string).ok_or_else(|| {
+                    WiringError::JsonParse(format!("string list entry is not a string: {x}"))
+                })
+            })
+            .collect(),
+        other => Err(WiringError::JsonParse(format!("expected string list, got: {other}"))),
+    }
 }
 
 /// attributes 对象 → `map<string,string>`；非字符串值以 JSON 文本表示。
@@ -1195,13 +1227,6 @@ fn json_str_tokens(v: Option<&serde_json::Value>) -> Vec<String> {
         }
     }
     out
-}
-
-fn json_str_iter<'a>(v: Option<&'a serde_json::Value>) -> Box<dyn Iterator<Item = &'a str> + 'a> {
-    match v.and_then(|x| x.as_array()) {
-        Some(arr) => Box::new(arr.iter().filter_map(|x| x.as_str())),
-        None => Box::new(std::iter::empty()),
-    }
 }
 
 /// `xray_geodata::pb`（crate 自建 proto）→ `xray_proto`（Go 同源 proto）字段级
@@ -2438,7 +2463,7 @@ mod tests {
         assert_eq!(cfg.balancing_rule[0].strategy, "random");
     }
 
-    /// 补票②：rules JSON domain 数组非字符串项硬错（Go StringList 解码期
+    /// 补票②：rules JSON 字符串列表的非字符串项硬错（Go StringList 解码期
     /// 拒启 / rule_parser 逐条失败即拒），不再 filter_map 静默丢弃。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect
@@ -2450,7 +2475,63 @@ mod tests {
         )
         .err()
         .expect("must reject");
-        assert!(err.to_string().contains("domain entry is not a string"), "{err:?}");
+        assert!(err.to_string().contains("string list entry is not a string"), "{err:?}");
+    }
+
+    /// cpy3d 回归：Go `StringList` 的**字符串形态**（逗号切分）必须生效。
+    ///
+    /// 旧实现只认数组 ⇒ `"domain": "example.com"` 在 Go 生效、在 Rust 条件消失
+    /// （规则变宽，屏蔽规则断网面扩大 / 分流规则劫持流量）。
+    #[test]
+    fn routing_string_form_domain_accepted() {
+        let dir = temp_asset_dir("string-form-domain");
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domain":"full:example.com,keyword:ads"}]}"#,
+            &dir,
+        )
+        .expect("字符串形态必须按逗号切分");
+        assert_eq!(cfg.rule.len(), 1);
+        let values: Vec<i32> = cfg.rule[0]
+            .domain
+            .iter()
+            .filter_map(|r| match r.value.as_ref() {
+                Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(d)) => {
+                    Some(d.r#type)
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values.len(), 2, "两个逗号分隔 token 都要落规则");
+    }
+
+    /// cpy3d 回归：字符串形态同样适用于 `ip` / `sourceIP` / `localIP` / `domain`。
+    #[test]
+    fn routing_string_form_ip_accepted() {
+        let dir = temp_asset_dir("string-form-ip");
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","ip":"10.0.0.0/8,192.168.0.0/16"}]}"#,
+            &dir,
+        )
+        .expect("字符串形态 ip 必须按逗号切分");
+        assert_eq!(cfg.rule[0].ip.len(), 2);
+    }
+
+    /// cpy3d 回归：**数组元素不切分**（Go 只对字符串形态做逗号切分）。
+    #[test]
+    fn routing_array_elements_not_comma_split() {
+        let dir = temp_asset_dir("array-no-split");
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domains":["a.example,b.example"]}]}"#,
+            &dir,
+        )
+        .expect("数组形态合法");
+        assert_eq!(cfg.rule[0].domain.len(), 1, "数组元素内的逗号不得再切分");
+        match cfg.rule[0].domain[0].value.as_ref() {
+            Some(xray_proto::xray::common::geodata::domain_rule::Value::Custom(d)) => {
+                assert_eq!(d.value, "a.example,b.example");
+            },
+            other => panic!("unexpected domain rule: {other:?}"),
+        }
     }
 
     /// 票 5std M3：routing 顶层 `script`（Go Lua 路由脚本引擎）非空硬错，

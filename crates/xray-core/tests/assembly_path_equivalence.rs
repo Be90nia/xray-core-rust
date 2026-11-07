@@ -48,7 +48,13 @@ use xray_core::outbound::register_outbounds;
 const KNOWN_PROD_ONLY_OUTBOUND: &[&str] = &["mux", "naive"];
 
 /// ① 覆盖差：同一协议两侧名称不同源（生产出站键, 框架族名）。
-const KNOWN_NAME_ALIASES: &[(&str, &str)] = &[("dokodemo", "dokodemo-door")];
+///
+/// `dokodemo` ↔ `dokodemo-door`：框架族名取 Go 注册名；
+/// `direct`/`block`：Go outbound 老式别名（`infra/conf/xray.go:42-46`），生产构造表
+/// 收（bd pjg6n），框架路的族目录只认规范名 `freedom`/`blackhole` ⇒ 同一条目在
+/// 两条路上名称不同源，属已知差异（框架路对 `direct` 走 warn+skip，生产路正常装配）。
+const KNOWN_NAME_ALIASES: &[(&str, &str)] =
+    &[("dokodemo", "dokodemo-door"), ("direct", "freedom"), ("block", "blackhole")];
 
 /// ③ 框架路额外门：族转换缝不消费的条目级配置面（在场即拒），生产路无此门。
 const KNOWN_FRAMEWORK_GATES: &[&str] = &["DialerProxy", "Mux", "ProxyChainTag", "SendThrough"];

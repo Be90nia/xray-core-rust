@@ -51,11 +51,15 @@ pub async fn start_quic_echo_server() -> Result<SocketAddr> {
 
     let factory = QuinnListenerFactory::new(Arc::new(server_tls));
     let validator: Option<Arc<dyn AuthValidator>> = Some(Arc::new(StaticValidator));
-    let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> =
-        Arc::new(|stream: Arc<InterStreamConn>| {
-            #[allow(clippy::disallowed_methods, reason = "压测：QUIC echo 连接任务")]
+    let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(
+        |stream: Arc<InterStreamConn>| {
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "②豁免（bd kwevg · §3.5.6）：压测：QUIC echo 连接任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            )]
             tokio::spawn(echo_one(stream));
-        });
+        },
+    );
     let mut quic_port = crate::topology::pick_free_port().await;
     let listener = loop {
         match factory
