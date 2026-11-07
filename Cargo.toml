@@ -249,4 +249,9 @@ quinn-proto = { path = "vendor/quinn-proto" }
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+# 线上 panic/abort 回溯必须能符号化（bd u27c7）：strip 只剥二进制内符号表，
+# 行号表按 unpacked 留在旁路文件（Linux/macOS = *.rcgu.dwo，Windows = .pdb），
+# release.yml 逐靶上传 debug-symbols-* 工件。代价：产物体积不变，构建目录多留旁路文件。
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
 

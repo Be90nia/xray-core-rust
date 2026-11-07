@@ -44,10 +44,10 @@ jobs:
             artifact: xray-macos-arm64
             bin: xray
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           targets: ${{ matrix.target }}
       # 兜底（同 ci.yml）：仓库 rust-toolchain.toml 钉 nightly-2026-05-28，实际编译用的
@@ -61,7 +61,7 @@ jobs:
 
       # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
       # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: "v2-gcc22-glibc235"
           key: ${{ env.UDF_HEAD }}
@@ -124,7 +124,7 @@ jobs:
           # GITHUB_PATH 对当前步不生效,下一步才消费
       - name: Install cargo-zigbuild (musl target only)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-zigbuild
       - name: Build release (musl via zigbuild)
@@ -204,10 +204,39 @@ jobs:
             --upstream local \
             --work "$RUNNER_TEMP/interop_release"
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact }}
           path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+      # bd u27c7：发布二进制 strip 掉符号表（体积），线上 panic/abort 回溯符号化靠这些
+      # 旁路文件（Cargo.toml [profile.release] debug=line-tables-only + split-debuginfo=
+      # unpacked）。实测布局（ubuntu + 同代 nightly 验证）：Linux/macOS 的 DWARF 落在
+      # deps/*.rcgu.dwo（不是 .o——cargo 不留 .o），Windows 是链接期 .pdb。
+      # fail-visible：Linux 腿（= 生产 176 台的部署面）产出零符号文件即红，不留空工件。
+      - name: Verify debug symbols produced (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rel="target/${{ matrix.target }}/release"
+          n=$(ls "$rel"/*.dwo "$rel"/*.dwp "$rel"/deps/*.dwo "$rel"/deps/*.dwp 2>/dev/null | wc -l)
+          echo "调试符号旁路文件: $n（$rel）"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::未产出 .dwo/.dwp——debug/split-debuginfo 配置失效，线上 panic 无法符号化"
+            exit 1
+          fi
+      - name: Upload debug symbols (panic 回溯符号化)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: debug-symbols-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/*.pdb
+            target/${{ matrix.target }}/release/*.dwp
+            target/${{ matrix.target }}/release/*.dwo
+            target/${{ matrix.target }}/release/deps/*.dwp
+            target/${{ matrix.target }}/release/deps/*.dwo
+          if-no-files-found: warn
+          retention-days: 90
 
   release:
     name: Create Release
@@ -217,8 +246,8 @@ jobs:
       contents: write
     steps:
       # 随包文档（README.md / LICENSE）来自工作树，故 release job 需要 checkout
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: artifacts
       # 四平台二进制同叫 xray/xray.exe，artifacts/** 直接上传会同名互相覆盖
@@ -244,7 +273,7 @@ jobs:
       - name: Package archives + digests
         run: python3 tools/package_release.py dist
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/**
           generate_release_notes: true

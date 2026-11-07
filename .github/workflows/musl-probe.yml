@@ -23,20 +23,20 @@ jobs:
     name: musl x86_64 build probe
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           targets: x86_64-unknown-linux-musl
       # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
       # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: "musl-probe-v1"
           key: ${{ env.UDF_HEAD }}
       - name: Install cargo-zigbuild (zig as musl cross C/C++ toolchain)
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-zigbuild
       - name: Install zig (cargo-zigbuild 依赖本体;mlugg 镜像服务 404/503 实锤→ziglang.org 官方源 pinned 0.13.0)
@@ -63,7 +63,7 @@ jobs:
       - name: Smoke on runner (musl binary exec)
         run: ./target/x86_64-unknown-linux-musl/release/xray version
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xray-linux-amd64-musl
           path: target/x86_64-unknown-linux-musl/release/xray

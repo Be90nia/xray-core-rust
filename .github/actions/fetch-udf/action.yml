@@ -3,7 +3,8 @@ description: >-
   双向依赖模型（不锁 rev）：克隆 udf-frame main 最新到 crates/udf-frame 并导出
   UDF_HEAD（供 rust-cache 键注入，防旧 udf 产物跨 run 复用造成假绿）；随后按上游
   check-runs 闸门拒绝消费 udf CI 红的 commit；API 不可用/无 check run 时降级为
-  本地 cargo test -p udf-skeleton --lib（PM 拍板双保险）。所有分支打印判定依据。
+  本地 cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace --lib --tests
+  （三层全覆盖，bd ym69a；check-runs 调用带 github.token 提额）。所有分支打印判定依据。
 
 runs:
   using: composite
@@ -29,6 +30,7 @@ runs:
         verdict=degrade
         curl_rc=0
         curl -sS --fail -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ github.token }}" \
             "https://api.github.com/repos/Be90nia/udf-frame/commits/${UDF_HEAD}/check-runs" \
             -o "$gate_json" || curl_rc=$?
         if [ "${curl_rc}" -eq 0 ]; then
@@ -63,6 +65,14 @@ runs:
             ;;
           *)
             echo "降级闸（verdict=${verdict:-空}）: API 不可用/无 check run/输出无法识别，改跑本地快速子集（PM 拍板双保险）"
-            cargo test -p udf-skeleton --lib
+            # 覆盖三层：生产真正消费的是 skeleton-infra（FxScope/ShutdownCoordinator/
+            # logx/memgov/pool::PoolBase）与 std-ext（cache/retry/scheduler），只测
+            # udf-skeleton（契约层）= 门静默变薄（bd ym69a）。cargo 的 -p 选不中非成员，
+            # 故走 udf-frame 自己的 workspace manifest。
+            # 不含 doctest：本仓工具链钉 nightly-2026-05-28（升级排在收工后），
+            # skeleton/src/lint.rs 的 `compile_fail,E0310` 例子在该 toolchain 上报
+            # E0521 → doctest 红，与本闸目的（三层真被测试过）无关；doctest 由 udf
+            # 上游自己的 CI 在它自己的工具链上覆盖。
+            cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace --lib --tests
             ;;
         esac

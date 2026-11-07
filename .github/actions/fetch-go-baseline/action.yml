@@ -22,7 +22,7 @@ runs:
     # 26.10.17 的 go.mod 声明 `go 1.27`：低版本 go 会尝试 GOTOOLCHAIN 自动下载
     # （CI 允许，但多一次网络依赖与失败面），故显式装同代工具链。
     - name: Install Go toolchain
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
       with:
         go-version: '1.27.x'
         cache: false

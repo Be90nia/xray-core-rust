@@ -22,20 +22,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，缺料即红）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           targets: aarch64-linux-android
       # dtolnay/rust-toolchain v2 with.targets 单 target 失效兜底 (与 release.yml / iOS job 同型)
       - name: Ensure target installed (android)
         run: rustup target add aarch64-linux-android
       # boringssl 的 cmake 配置需要 go（生成测试清单/部分源码）
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
-      - uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@aacaf74664d0f8e1b070a865acb47ee25007386d # v1.6.0
         id: ndk
         with:
           ndk-version: r27c
@@ -65,7 +65,7 @@ jobs:
       # 产物留档（bd 2ub2n 缺口二）：此前 Android job 编完即丢，产物既无法取用
       # 也无法与本机/真机做字节级比对；if-no-files-found: error 防「空产物静默通过」。
       - name: Upload android binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xray-aarch64-linux-android
           path: target/aarch64-linux-android/debug/xray
@@ -76,17 +76,17 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，缺料即红）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           targets: aarch64-apple-ios
       # dtolnay/rust-toolchain v2 with.targets 单 target 失效兜底 (CI 38363323289 E0463)
       - name: Ensure target installed (ios)
         run: rustup target add aarch64-apple-ios
       # boringssl cmake 需要 go（macos-14 镜像缺省无 go）
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
       - name: Install protoc

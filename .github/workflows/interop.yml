@@ -36,13 +36,13 @@ jobs:
         # 永久摘除（2026-09-14 实证：公开仓也永远排队）。
         os: [macos-14, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
       # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
       # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ env.UDF_HEAD }}
 
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: interop-logs-${{ matrix.os }}
           path: target/interop_ci/
@@ -126,11 +126,11 @@ jobs:
     timeout-minutes: 90
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需要）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ env.UDF_HEAD }}
       - name: Free up disk space
@@ -178,7 +178,7 @@ jobs:
 
       - name: Upload UDP matrix evidence on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: udp-tunnel-json
           path: ${{ runner.temp }}/udp_tunnel.json
@@ -209,7 +209,7 @@ jobs:
 
       - name: Upload matrix log on failure
         if: failure() && steps.nodes.outputs.present == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: full32-log
           path: ${{ runner.temp }}/full32/f_results.txt

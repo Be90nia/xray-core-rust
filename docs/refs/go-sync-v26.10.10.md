@@ -33,7 +33,7 @@
 | Go 提交 | PR | 修复性质 | 本仓对应 crate | 文件落点 | 严重 |
 |---|---|---|---|---|---|
 | `7da5dae6` | #6871 | **Mux client race** — Dispatch vs SessionManager.Close 写入 input/output 顺序改 Allocate 时机 | `xray-mux/src/{client,session}.rs` | `client.rs::dispatch_worker` | P1 |
-| `836a6fed` | #6822 | **Mux UDP frame 被下一帧覆盖** — `reader.go` 解帧 buf 复用 | `xray-mux/src/reader.rs` | `frame.rs::deframe` | P1 |
+| `836a6fed` | #6822 | **Mux UDP frame 被下一帧覆盖** — `reader.go` 解帧 buf 复用 | `xray-mux/src/reader.rs`〔该文件已于 2026-11-07 按 bd xoc7y 删除（803 行零生产消费死代码），解帧逻辑在 `frame.rs::deframe`；此行列名保留作历史对照〕 | `frame.rs::deframe` | P1 |
 | `9d9a7a1c` | #6877 | **gRPC client redial 用旧 ctx** — `dial.go:130` `ctx` → `gctx` | `xray-transport-grpc/src/dial*.rs` | dialer.rs | P1 |
 | `2a14c507` | #7101 | **Socks inbound UDP stats 零** — wrap `tempUDPConn` 进 `CounterConnection` | `xray-proxy-socks/src/server.rs` | UDP Associate handler | P2 |
 | `08775afd` | #6856 | **WireGuard idle UDP flow 内存高** — gvisor `pkt.Clone().Data()` → `pkt.Data()` | `xray-proxy-tun/src/netstack.rs` (gvisor) | udp_forwarder 入口 | P1 |

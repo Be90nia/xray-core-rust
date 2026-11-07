@@ -22,10 +22,10 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           components: rustfmt
       # 不能用 `cargo fmt --all`：它会把 crates/udf-frame（workspace excluded 的
@@ -44,15 +44,15 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           components: clippy
       # udf 是 path 依赖且不锁 rev、Cargo.lock 无版本记录：不把 UDF_HEAD 注入
       # 缓存键 = 旧 udf 产物跨 run 复用（缓存串味假绿通道，拍板清单 §9 P0-9.4）
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ env.UDF_HEAD }}
       # workspace 依赖图含 xray-proto(prost-build)，构建需要 protoc
@@ -80,17 +80,17 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
       # dtolnay/rust-toolchain v2 with.targets 失效兜底;host runner 默认 target 通常装好,
       # 但显式 add 保持与 release.yml / mobile.yml 一致,防未来 runner 镜像变化
       - name: Ensure target installed
         run: rustup target add ${{ matrix.target }}
       # prefix-key 防 24.04→22.04 跨 OS 缓存污染（2026-10-09 release.yml 实锤：
       # 默认 key 不含 runner OS，旧 OS 的 aws_lc_sys .o 恢复进新 OS 链接必炸）
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: build-v2-2204
           key: ${{ env.UDF_HEAD }}
@@ -136,7 +136,7 @@ jobs:
       # 常态测试流程：CI 绿后从 artifact 下载对应平台二进制测试（发版需用户同意，
       # 测试阶段不打 tag）；同 commit 功能与 release 资产等价
       - name: Upload xray binary (per-platform)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: xray-${{ matrix.target }}
           path: |
@@ -155,11 +155,11 @@ jobs:
     env:
       RUST_MIN_STACK: 16777216
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ env.UDF_HEAD }}
       # workspace 依赖图含 xray-proto(prost-build)，test 构建需要 protoc
@@ -188,12 +188,12 @@ jobs:
     env:
       RUST_MIN_STACK: 16777216
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需 crates/udf-frame 存在，tun 才是测试目标）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
       # 独立 prefix-key：不与 build job 的 build-v2-2204 缓存互串
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: test-win-tun-v1
           key: ${{ env.UDF_HEAD }}
@@ -227,12 +227,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
       # 独立 prefix-key：不与其他 job 缓存互串
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: test-linux-priv-tproxy-v1
           key: ${{ env.UDF_HEAD }}
@@ -275,12 +275,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
       # 独立 prefix-key：不与其他 job 缓存互串；UDF_HEAD 防 udf 产物串味假绿
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: parser-parity-v1
           key: ${{ env.UDF_HEAD }}
@@ -304,7 +304,7 @@ jobs:
           --rust-bin target/debug/xray
       - name: Upload parity evidence on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: parser-parity-logs
           path: target/parser_parity/
@@ -315,10 +315,10 @@ jobs:
     name: Security & License
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料：cargo-deny 需解析 workspace manifest，缺料即红
       - uses: ./.github/actions/fetch-udf
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
       # osv-scanner：GHSA/CVE 基线扫描（gqkk 供应链票，与 cargo-deny 的 RustSec 面
       # 互补）。当前基线含票外命中（hickory-resolver/lru/paste/rsa 等 2026-10-13
       # 扫描记录见 reports/fix-gqkk-vendor.md），故暂为告警级（continue-on-error）；
@@ -336,11 +336,11 @@ jobs:
     name: Docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           key: ${{ env.UDF_HEAD }}
       - name: Install protoc
@@ -359,18 +359,18 @@ jobs:
     timeout-minutes: 45
     if: github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # fuzz 工作区依赖主 workspace 的 manifest（xray-* path 依赖要能解析），
       # 而 crates/xray-common 等已接 udf crate → 缺料即 setup-boringssl 阶段
       # 报 `failed to get udf-skeleton-infra`（2026-10-24 run 40048205742 实证）。
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly 分支头（2026-11-07 解析）
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       # fuzz target 依赖链含 xray-proto(prost-build)，构建需要 protoc
       - name: Install protoc
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           workspaces: |
             fuzz
@@ -394,7 +394,7 @@ jobs:
     name: Proto Drift Gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: python3 tools/check_proto_drift.py --manifest
 
   # 资产门（G-18）：对齐 Go test.yml:10 check-assets，但语义按本仓架构改写——
@@ -405,7 +405,7 @@ jobs:
     name: Asset Gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: python3 tools/check_geo_assets.py
 
   # 框架路编译门（ARCH-01 / bd gjqm7 G1，je3u3 ①）：目标主路（xray-cli
@@ -416,13 +416,13 @@ jobs:
     name: Framework Assembly (clippy + lib test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（workspace manifest 解析需要，与其他 job 同源）
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: fw-assembly-v1
           key: ${{ env.UDF_HEAD }}
@@ -443,10 +443,10 @@ jobs:
     name: Quality Gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: ./.github/actions/fetch-udf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           prefix-key: quality-gates-v1
           key: ${{ env.UDF_HEAD }}
@@ -454,3 +454,13 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
       - uses: ./.github/actions/setup-boringssl
       - run: python3 tools/check_quality_gates.py
+
+  # 生产代码禁裸 UdpSocket::bind / socket2 Type::DGRAM 静态门（bd d597w 的门，bd v2p1x
+  # 补接线：门写了不跑 = 没门）。纯文本扫描，无需 cargo/protoc/btls，秒级。
+  udp-binds:
+    name: UDP Bind Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: python3 tools/check_udp_binds.py --self-test
+      - run: python3 tools/check_udp_binds.py

@@ -17,21 +17,19 @@ allow-git = [
 ]
 
 # ─────────────────────────── advisories ───────────────────────────
-# RUSTSEC-2024-0449 = rustls-pemfile 0.6.0 unmaintained（5 维安全债 DEBT-007 已知）。
-# 现行消除路径 = 迁 rustls-pki-types 0.10 + 全面 rustls 0.23 化（gqkk 已迁大部分）；
-# 残余 0.6.0 调用点单票处置中（独立 bd 票，非本修法范围）。本豁免不掩盖未来新增 advisory。
+# bd 6ts1f（2026-11-07）：2026-10-22 的两条 risk-accept（RUSTSEC-2026-0382
+# rustls-webpki 0.103.15 / RUSTSEC-2026-0381 webpki-roots 1.0.8，「本机 crates.io
+# 不可达」）已删除——锁文件实为修复版 rustls-webpki 0.103.16 + webpki-roots 0.26.11，
+# cargo-deny 实测这两条豁免已空转（advisory-not-detected），恢复阻断保护。
+# block-buffer 0.12.0 的 GHSA-qwgh-2vcv-g2f7（panic 后行内缓冲游标损坏）RustSec 尚未
+# 收录，cargo-deny 面看不见 → 只在本仓 osv 面（.osv-scanner.toml）挂账；RustSec 收录
+# 后转 ignore，并随工具链升级窗口 bump 0.12.0→0.12.1 消除（semver 兼容）。
 [advisories]
 ignore = [
-    "RUSTSEC-2024-0449", # rustls-pemfile 0.6.0 unmaintained
+    "RUSTSEC-2024-0449", # unsafe-libyaml 0.2.11 unmaintained（dtolnay 已停更），serde_yaml→yaml-rust2 迁移跨仓评估中（.osv-scanner.toml 同口径）
     "RUSTSEC-2024-0436", # paste 1.0.15 unmaintained，proc-macro only 无 fix（.osv-scanner.toml 同口径）
-    "RUSTSEC-2023-0071", # rsa 0.9.10 Marvin Attack timing，无 fix，xmc Minecraft 伪装路径（.osv-scanner.toml 同口径）
+    "RUSTSEC-2023-0071", # rsa 0.9.10 底层 num-bigint-dig 大数运算非常数时间（Marvin）；盲化已落地（xmc conn.go 对位 DecryptPKCS1v15(rand.Reader) → decrypt_blinded，bd 2emrf），残余为纯 Rust 实现的时序面，彻底脱离需换 btls。.osv-scanner.toml 同口径
     "RUSTSEC-2025-0134", # rustls-pemfile 2.2.0 unmaintained（rustls/pemfile archived 2025-08），迁 pki-types 单票处置（.osv-scanner.toml 同口径）
-    # 以下两条 2026-10-22 显式 risk-accept（bd srlx，用户拍板）：rustls-webpki 0.103.15 /
-    # webpki-roots 1.0.8「distrusted intermediates」——补丁版本已存在，但本机到
-    # index.crates.io / static.crates.io 不可达（实测 3 次超时），升级无法本地验证编译。
-    # revisit：网络恢复后 `cargo update -p rustls-webpki -p webpki-roots@1.0.8` 并删除本两条。
-    "RUSTSEC-2026-0382", # rustls-webpki 0.103.15 certificate verification may accept distrusted intermediates
-    "RUSTSEC-2026-0381", # webpki-roots 1.0.8 bundled roots allow trust in distrusted emSign intermediates
 ]
 
 # ─────────────────────────── licenses ───────────────────────────

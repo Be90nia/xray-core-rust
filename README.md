@@ -29,7 +29,7 @@
 
 ## 协议清单
 
-**代理协议**（inbound + outbound）：VLESS（Vision / REALITY）、VMess、Shadowsocks（含 2022）、Trojan（含 v2 草案）、SOCKS、HTTP、DNS、Dokodemo-door、Freedom、Blackhole、Loopback、TUN、WireGuard、AnyTLS、TUIC v5、Hysteria2（协议名 `hysteria`/`hysteria2` 双注册）
+**代理协议**（inbound + outbound）：VLESS（Vision / REALITY）、VMess、Shadowsocks（含 2022）、Trojan、SOCKS、HTTP、DNS、Dokodemo-door、Freedom、Blackhole、Loopback、TUN、WireGuard、AnyTLS、TUIC v5、Hysteria2（协议名 `hysteria`/`hysteria2` 双注册）
 
 **传输层**：TCP、mKCP、WebSocket、HTTPUpgrade、gRPC（HTTP/2）、SplitHTTP/XHTTP（含 HTTP/3）、QUIC、Hysteria（QUIC + UDP hop）、NaiveProxy（outbound-only）
 
