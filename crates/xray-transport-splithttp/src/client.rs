@@ -195,6 +195,31 @@ pub type CloseSignal = tokio::sync::oneshot::Receiver<()>;
 /// （流式上传）。两者都 box 成 [`ReqBody`]。
 pub type HyperClient = Client<SplitConnector, ReqBody>;
 
+/// 站点归因 Executor（S3）。**两个消费点**：
+/// ① `DefaultDialerClient::new` → hyper-util legacy Client **内部 spawn** 的
+///    连接任务 + hyper h2 内部 `execute_h2_future`（ConnTask/Pipe/Send 任务，
+///    hyper-util 把本 Executor 透传给 `hyper::client::conn::http2::Builder`）；
+/// ② `dialer::dial_reality_stream_one` → REALITY 直连路径的
+///    `http2::Builder::new(...)`——hyper 1.10 的 h2 client 在 handshake 末尾经
+///    builder executor spawn ConnTask，运行期又 spawn 响应 body Pipe/Send 任务
+///    （proto/h2/client.rs:192/556/566）——传 `TokioExecutor` 则全部落 untagged。
+/// 机制：`execute` 处用 [`alloc_site::scope`] 包住 future（bd a65px：跨 await
+/// 必须 scope）后委托 `TokioExecutor`，spawn 语义不变。
+#[derive(Clone, Default)]
+pub(crate) struct SiteTaskExecutor;
+
+impl<F> hyper::rt::Executor<F> for SiteTaskExecutor
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        TokioExecutor::new().execute(xray_common::alloc_site::scope(
+            xray_common::alloc_site::XHTTP_CLI_H2CONN,
+            fut,
+        ));
+    }
+}
+
 /// 出站 connector（[`TowerService`] for `Uri`）。
 ///
 /// - [`SplitConnector::Rustls`]：hyper-rustls 现有路径（fingerprint 空），TCP 由
@@ -482,7 +507,7 @@ impl DefaultDialerClient {
         // （bd c9oc F-A 流窗 32MB 同步，理由同 dialer.rs；生产 argo xhttp 走本 builder）。
         // 窗组 = 静态保底（RTT 阶梯已撤；探针已删，见 flow_window 模块头）。
         let win = crate::flow_window::client_windows();
-        let client = Client::builder(TokioExecutor::new())
+        let client = Client::builder(SiteTaskExecutor)
             .pool_timer(TokioTimer::new())
             .pool_idle_timeout(Some(Duration::from_secs(90)))
             // 每 host 空闲连接硬上界（bd cgmcj）：缺省 usize::MAX = 无界 fd 积压。

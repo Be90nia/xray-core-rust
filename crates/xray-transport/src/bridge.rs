@@ -501,84 +501,14 @@ fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
         .map_or(Ok(()), Err)
 }
 
-/// 桥字节闸每方向预算（字节）——条目闸（`PIPE_BUF_CAP`=64 条）之上的字节
-/// 背压（u440m）。
+/// 字节闸回退说明（bd u440m）：u440m 曾在条目闸（`PIPE_BUF_CAP`=64 条）之上
+/// 加每方向 2MiB 字节闸（tokio 信号量 + 条目携带许可 + 超预算旁路），真机
+/// A/B 实测**回退**——到节点 RTT 161.6ms ⇒ BDP 2.39–3.56MB 均大于 2MiB 闸预算，
+/// 闸理论上限 ≈ 2MiB/0.162s ≈ 12.9MB/s，A/B 中位比 0.939（−6.1%）超票面自定
+/// 5% 门 ⇒ 按票面规则撤销限流行为，回到纯条目闸；旁路计数器依赖闸存在才有
+/// 意义，随闸一并删除。登记簿口径见
+/// `xray_frame::budget::BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`。
 ///
-/// 依据独立对比台 v3（`reports/audit-2026-11-06/sim-bridge-bytegate.md`，照抄
-/// xray_buf 分层池：5 层/8 分片/每片 1MiB/归还超限丢弃）：旧条目闸 32MiB 在途
-/// 远超池驻留 8MiB（`xray_buf::alloc::POOL_BYTE_BUDGET`）⇒ 归还全部超预算丢弃
-/// ⇒ 池命中率 0%、每次取用新分配；2MiB/方向落在池预算内 ⇒ 命中率 0%→92%、
-/// 在途内存 16× 改善、新分配 12.8× 改善、吞吐持平（0.9974×）。每连接 4MiB
-/// （双方向）= 登记簿 `xray_core::memory_budget::MAX_PER_CONN_BUFFER_BYTES`
-/// 同一每连接份额，不重复计账（登记簿 tests 交叉断言钉住）。r5j96 教训：闸值
-/// 取 2MiB 而非 Go pipe 的 512KiB（4× 余量，不钉死吞吐窗）。
-pub const BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES: usize = 2 * 1024 * 1024;
-
-/// 字节闸许可粒度（字节/许可）：1KiB ⇒ 每方向 2048 许可。
-pub const BRIDGE_BYTE_GATE_PERMIT_BYTES: usize = 1024;
-
-/// 每方向许可总数（2MiB / 1KiB = 2048；`Semaphore::new` 口径 usize）。
-const BRIDGE_BYTE_GATE_PERMITS: usize =
-    BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES / BRIDGE_BYTE_GATE_PERMIT_BYTES;
-
-/// 字节闸旁路条目计数：单条目容量和 > 每方向预算 ⇒ 无许可放行（闸许可总数
-/// 都装不下它，硬等 = 生产者等许可、消费者等条目的死锁；对比台 S6 实测旁路
-/// 放行不死锁）。观测面指标（超预算条目量级，如 h2/h3 大分片），不参与正确性。
-///
-/// 旁路条目的**在途上界**（jcnjb② 评估结论：不另加软上界）：旁路条目与常规
-/// 条目走同一条 mpsc（容量 `PIPE_BUF_CAP` 64/方向）与同一对读写腿 ⇒ 每方向
-/// 在途 ≤ 64（排队）+ 2（读腿手上 1 + 写腿在写 1）= 66 条；字节面最坏 =
-/// 66 × 单条目容量上界（腿定：readv 腿 512KiB / pipe 腿 = policy buffer 档
-/// ≤ 4MiB / 冻结腿 = 传输分片），bridge 不复检传输层帧界。**计数软上界是
-/// 64 条队列闸的真子集（冗余）**；字节软上界需引入第二条归还路径（写完/drop
-/// 各一处），许可泄漏形态 = 旁路要防的死锁本身（泄漏 → 后续超预算条目硬等）；
-/// 时间面由既有 abort/connIdle/半窗收口。超预算字节的真正杠杆是配置面
-/// （bufferSize > 2MiB 会让上行条目常态旁路），装配期预算门已按每连接份额钉住。
-pub static BRIDGE_BYTE_GATE_BYPASS_ITEMS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// 字节闸条目：数据 + 随行许可。许可随条目 drop 自动归还（队列丢弃、桥取消、
-/// 写腿收尾同路），零额外记账；写腿持条目到写完本轮才 drop ⇒ 在途字节
-/// （排队 + 在写）恒 ≤ 每方向预算。
-struct GatedMb {
-    mb: xray_buf::multi::MultiBuffer,
-    /// 随行许可：只为「随条目 drop 归还」的语义而存在，读值无意义。
-    #[allow(dead_code, reason = "许可随条目 drop 自动归还，字段读值无意义")]
-    permits: Option<tokio::sync::OwnedSemaphorePermit>,
-}
-
-/// 条目计费口径 = 条目内各缓冲**容量之和**（readv 升窗形态 8×64KiB =
-/// 512KiB/条目；冻结腿 = 分片 len），不是数据长度，更不是条目数×固定上限。
-fn mb_capacity_bytes(mb: &xray_buf::multi::MultiBuffer) -> usize {
-    mb.iter().map(|b| b.capacity()).sum()
-}
-
-/// 条目容量 → 许可数（1KiB 粒度向上取整）；超过每方向预算返回 `None`（旁路）。
-fn byte_gate_units(capacity_bytes: usize) -> Option<usize> {
-    if capacity_bytes > BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES {
-        None
-    } else {
-        Some(capacity_bytes.div_ceil(BRIDGE_BYTE_GATE_PERMIT_BYTES))
-    }
-}
-
-/// 过闸取许可（须在既有 abort select 分支内 await ⇒ 取消时许可随 future
-/// 丢弃自动归还）；超预算条目旁路计数后无许可放行。许可仅在闸关闭时才缺
-/// （本仓从不 close），`.ok()` 的 None 分支实际不可达，按旁路同语义放行。
-async fn byte_gate_acquire(
-    gate: &std::sync::Arc<tokio::sync::Semaphore>,
-    capacity_bytes: usize,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    match byte_gate_units(capacity_bytes) {
-        // ≤ 每方向预算 ⇒ ≤ BRIDGE_BYTE_GATE_PERMITS(2048)，u32 恒可容。
-        Some(units) => gate.clone().acquire_many_owned(units as u32).await.ok(),
-        None => {
-            BRIDGE_BYTE_GATE_BYPASS_ITEMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            None
-        },
-    }
-}
-
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -586,12 +516,12 @@ async fn byte_gate_acquire(
 /// 终止符）但响应方向仍需续传的场景。
 ///
 /// **8sum 解耦（方案 A）**：每方向 reader（只读）与 writer（只写）拆为独立
-/// async block，经 bounded mpsc（**按条目计**：每方向 64 条 MultiBuffer；条目/
-/// 字节口径见 `PIPE_BUF_CAP` 处注释）解耦背压——writer 写背压时 reader 继续
+/// async block，经 bounded mpsc（**按条目计**：每方向 64 条 MultiBuffer；
+/// 口径见 `PIPE_BUF_CAP` 处注释）解耦背压——writer 写背压时 reader 继续
 /// 排空接收侧（串行泵「读 8KB→写→循环」两腿锁步曾致服务端 TCP 接收窗不增
-/// 长、全链 1 窗/RTT 步进，up 3.1 vs Go 19.8 Mbps）。u440m 起条目闸之上有
-/// **字节闸**（[`BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES`]，2MiB/方向）：在途
-/// 字节（排队+在写）恒 ≤ 2MiB，条目携带许可（drop 即归还），超预算单条目旁路。
+/// 长、全链 1 窗/RTT 步进，up 3.1 vs Go 19.8 Mbps）。条目闸之上的字节闸
+/// （u440m）已回退（见本文件「字节闸回退说明」与下方 `PIPE_BUF_CAP` 处注释；
+/// BDP > 2MiB × 高 RTT 钉吞吐 −6.1% 超票面 5% 门）。
 /// 级联退出：任一 writer 死 →
 /// mpsc rx drop → 对应 reader `send` 失败退出 → done watch 把 half_window
 /// 传给对向腿，无静默半断；写错误只关本向写半部，绝不 shutdown 对向
@@ -656,19 +586,20 @@ where
     //   下行 TLS 腿   = 1 块 × tls_readbuf_size（≤64KiB）；
     //   上行腿 = dispatcher pipe 读端整块交付（≈ policy.buffer.connection，
     //   缺省 512KiB；pipe 判满在 merge 前 ⇒ 可再多出一次写入批量）。
-    // 条目闸只管条目数；在途**字节**由其上的字节闸（u440m）管：每方向
-    // BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES（2MiB，1KiB 许可粒度），条目携带
-    // 许可（drop 即归还），acquire 在既有 abort select 分支内（取消安全）；
-    // 超预算单条目旁路放行 + 计数（硬等 = 死锁）。池耦合依据见常量 doc
-    // （32MiB 在途 > xray_buf 池驻留 8MiB ⇒ 归还全丢 ⇒ 命中率 0%）。
+    // ⇒ 单方向在途上界 = 64 条 × 512KiB = 32MiB（**不是** 512KiB——512KiB 是
+    //   Go 每连接 pipe 的字节软限，与本闸的条目闸不同量纲）。
     // ⚠️ 冻结腿（h2/h3 body，Bytes 直交）单条 = 一个传输分片，由传输层定，
-    //   不受 512KiB 约束 ⇒ 超预算走旁路，不受条目闸字节数假设约束。
-    // 只影响内存上限、不影响正确性；改容量属行为面变更（bd n580i：只修口径）。
+    //   不受 512KiB 约束 ⇒ 该路径的实际上界更高。
+    // ⚠️ u440m 曾在此之上加每方向 2MiB 字节闸（tokio 信号量 + 条目携带许可），
+    //   真机 A/B 中位比 0.939（−6.1%，BDP 2.39–3.56MB > 2MiB × RTT 161.6ms
+    //   钉吞吐 ≈12.9MB/s）超票面 5% 门 ⇒ 已回退为纯条目闸（bd u440m；见本文件
+    //   「字节闸回退说明」）。只影响内存上限、不影响正确性；改容量属行为面
+    //   变更（bd n580i：只修口径）。
     const PIPE_BUF_CAP: usize = 64;
-    let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<GatedMb>(PIPE_BUF_CAP);
-    let (down_tx, mut down_rx) = tokio::sync::mpsc::channel::<GatedMb>(PIPE_BUF_CAP);
-    let up_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(BRIDGE_BYTE_GATE_PERMITS));
-    let down_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(BRIDGE_BYTE_GATE_PERMITS));
+    let (up_tx, mut up_rx) =
+        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
+    let (down_tx, mut down_rx) =
+        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
 
     // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
     // `defer timer.SetTimeout(...)` 语义）：一方向读侧结束后，另一方向在窗口
@@ -736,24 +667,12 @@ where
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
                         }
                         bytes_done += mb.len() as u64;
-                        // 字节闸（u440m）：acquire 与 abort 同 select（取消安全
-                        // ——放弃在飞批次时许可随 future 丢弃自动归还）；超预算
-                        // 条目旁路放行 + 计数（硬等 = 生产者等许可、消费者等
-                        // 条目的死锁）。
-                        let mb_bytes = mb_capacity_bytes(&mb);
-                        let gated = GatedMb {
-                            permits: tokio::select! {
-                                _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                                p = byte_gate_acquire(&up_gate, mb_bytes) => p,
-                            },
-                            mb,
-                        };
                         // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
                         // send 立即 Err → 本向级联退出，绝不静默吞数据。关闸时
                         // 放弃在飞批次（收尾态，连接已被判死）。
                         let sent = tokio::select! {
                             _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                            r = up_tx.send(gated) => r,
+                            r = up_tx.send(mb) => r,
                         };
                         if sent.is_err() {
                             break LegExit::PeerEnded;
@@ -778,10 +697,10 @@ where
         async move {
             let mut up_bytes: u64 = 0;
             let end = loop {
-                let gated = tokio::select! {
+                let mb = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break end_policy::LegEnd::Aborted,
                     r = up_rx.recv() => match r {
-                        Some(gated) => gated,
+                        Some(mb) => mb,
                         // 读腿已退出：原因由它 store（store 早于 up_tx drop）。
                         None => break end_policy::LegEnd::from_code(
                             up_end.load(std::sync::atomic::Ordering::Acquire),
@@ -789,17 +708,14 @@ where
                     },
                 };
                 if p7lm_trace {
-                    tracing::warn!(target: "p7lm", bytes = gated.mb.len(), phase = "up_write", "");
+                    tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_write", "");
                 }
-                up_bytes += gated.mb.len() as u64;
+                up_bytes += mb.len() as u64;
                 // 关闸时丢弃在飞批次：对端不读 + 连接已被判死，半截写无意义。
-                // 条目（含随行许可）写完本轮才 drop ⇒ 在途字节（排队+在写）恒
-                // ≤ 每方向预算；abort break 时 gated 同轮 drop，许可随条目归还。
                 let wrote = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break end_policy::LegEnd::Aborted,
-                    r = write_all_mb(&mut s_write, &gated.mb) => r,
+                    r = write_all_mb(&mut s_write, &mb) => r,
                 };
-                drop(gated);
                 if wrote.is_err() {
                     break end_policy::LegEnd::WriteError;
                 }
@@ -868,19 +784,9 @@ where
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
                         }
                         bytes_done += mb.len() as u64;
-                        // 字节闸（u440m）：同上行（acquire 与 abort 同 select，
-                        // 取消安全；超预算条目旁路放行 + 计数）。
-                        let mb_bytes = mb_capacity_bytes(&mb);
-                        let gated = GatedMb {
-                            permits: tokio::select! {
-                                _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                                p = byte_gate_acquire(&down_gate, mb_bytes) => p,
-                            },
-                            mb,
-                        };
                         let sent = tokio::select! {
                             _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                            r = down_tx.send(gated) => r,
+                            r = down_tx.send(mb) => r,
                         };
                         if sent.is_err() {
                             break LegExit::PeerEnded;
@@ -901,21 +807,20 @@ where
         async move {
             let mut dw_bytes: u64 = 0;
             loop {
-                let gated = tokio::select! {
+                let mb = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break,
                     r = down_rx.recv() => match r {
-                        Some(gated) => gated,
+                        Some(mb) => mb,
                         None => break,
                     },
                 };
                 if p7lm_trace {
-                    tracing::warn!(target: "p7lm", bytes = gated.mb.len(), phase = "down_write", "");
+                    tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_write", "");
                 }
-                dw_bytes += gated.mb.len() as u64;
-                // mb 移入写管线；随行许可由 gated 持到本轮结束（写完才归还）。
+                dw_bytes += mb.len() as u64;
                 let wrote = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break,
-                    r = writer.write_multi_buffer(gated.mb) => r,
+                    r = writer.write_multi_buffer(mb) => r,
                 };
                 if wrote.is_err() {
                     if p7lm_trace {
@@ -957,7 +862,14 @@ where
     };
 
     // join! 语义：四块被并发轮询（读等待不阻塞写推进），全部完成后返回。
-    let (up_r, up_w, down_r, down_w) = tokio::join!(up_reader, up_writer, down_reader, down_writer);
+    // 站点归因（S3）：三腿整腿 scope（跨 await 必须用 scope，禁 enter——bd a65px）；
+    // 下行读腿已在 read_downlink 内标 BUF_READ，不再叠加。
+    let (up_r, up_w, down_r, down_w) = tokio::join!(
+        xray_common::alloc_site::scope(xray_common::alloc_site::BRIDGE_UP_READ, up_reader),
+        xray_common::alloc_site::scope(xray_common::alloc_site::BRIDGE_UP_WRITE, up_writer),
+        down_reader,
+        xray_common::alloc_site::scope(xray_common::alloc_site::BRIDGE_DOWN_WRITE, down_writer),
+    );
     // 写腿恒 Ok（写错误按 50074b2 语义只收敛本向，见 `bridge_stream_full_
     // up_write_err_keeps_downlink` 回归门）；读腿错误上浮给 dispatcher。
     up_w?;
@@ -1329,11 +1241,7 @@ pub async fn bridge_link_with_link_default(link_a: Link, link_b: Link) -> io::Re
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::SocketAddr,
-        pin::Pin,
-        task::{Context, Poll},
-    };
+    use std::{net::SocketAddr, pin::Pin, task::Poll};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -2282,339 +2190,6 @@ mod tests {
             "downlink_only(1s) 窗口应当兜住收尾, got {:?}",
             start.elapsed()
         );
-    }
-
-    // ---- 字节闸（u440m）：条目闸之上的 2MiB/方向字节背压 ----
-
-    /// 全收 sink：写即收进共享 Vec（Arc 供测试在桥返回后读），读恒 EOF
-    /// （下行腿立即结束，不参与判定）。
-    struct CollectSink {
-        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    }
-    impl tokio::io::AsyncRead for CollectSink {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            // 零填充 = 读到 0 字节 = EOF。
-            Poll::Ready(Ok(()))
-        }
-    }
-    impl tokio::io::AsyncWrite for CollectSink {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            self.buf.lock().expect("sink buf").extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-    impl Connection for CollectSink {
-        fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-            Ok(None)
-        }
-
-        fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-            Ok(None)
-        }
-    }
-
-    /// 读：按序吐队列里的条目（头一条 3MiB 超预算旁路形态；尾一条 64KiB
-    /// 常规条目作**负控**——闸值改小到 64KiB 以下时它也旁路 ⇒ 计数断言红），
-    /// 吐完 EOF。
-    struct BigItemReader {
-        items: std::collections::VecDeque<Vec<u8>>,
-    }
-    impl xray_buf::io::Reader for BigItemReader {
-        fn read_multi_buffer(
-            &mut self,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = xray_buf::io::Result<xray_buf::multi::MultiBuffer>> + Send + '_,
-            >,
-        > {
-            let item = self.items.pop_front();
-            Box::pin(async move {
-                match item {
-                    Some(data) => {
-                        let mut mb = xray_buf::multi::MultiBuffer::new();
-                        mb.merge_bytes(&data);
-                        Ok(mb)
-                    },
-                    None => Ok(xray_buf::multi::MultiBuffer::new()), // EOF（空块）
-                }
-            })
-        }
-    }
-
-    /// 计数读腿源：统计底层拉取次数（单条 64KiB 池化条目）。
-    struct CountingReader {
-        inner: Box<dyn xray_buf::io::Reader>,
-        reads: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    }
-    impl xray_buf::io::Reader for CountingReader {
-        fn read_multi_buffer(
-            &mut self,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = xray_buf::io::Result<xray_buf::multi::MultiBuffer>> + Send + '_,
-            >,
-        > {
-            self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.inner.read_multi_buffer()
-        }
-    }
-
-    /// 字节闸背压上界（u440m 验收①）：64KiB 条目 × 32 = 2MiB 占满全部许可后，
-    /// 读腿第 33 条「读出后卡在 acquire」——源拉取计数恰 33（条目闸 64 条不先
-    /// 触顶 ⇒ 证明是字节闸在背压）；常规条目零旁路；下行读侧 connIdle 关闸后
-    /// 桥按时返回（闸等待不饿死存活判定，兜底③；acquire 与 abort 同 select，
-    /// 取消安全，兜底②）。
-    #[tokio::test]
-    async fn bridge_stream_full_byte_gate_caps_inflight() {
-        use std::{
-            pin::Pin,
-            sync::{
-                Arc,
-                atomic::{AtomicU64, Ordering},
-            },
-            task::{Context, Poll},
-            time::Duration,
-        };
-
-        use xray_features::policy::TimeoutPolicy;
-
-        use crate::link::Link;
-
-        /// 写永不 Ready（对端不读）、读永不就绪（下行不产数据，关闸由下行
-        /// connIdle 给）。同 `bridge_stream_full_abort_gate_releases_stalled_
-        /// uplink_writer` 的 StallConn。
-        struct StallConn;
-        impl tokio::io::AsyncRead for StallConn {
-            fn poll_read(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                _buf: &mut tokio::io::ReadBuf<'_>,
-            ) -> Poll<io::Result<()>> {
-                Poll::Pending
-            }
-        }
-        impl tokio::io::AsyncWrite for StallConn {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _cx: &mut Context<'_>,
-                _buf: &[u8],
-            ) -> Poll<io::Result<usize>> {
-                Poll::Pending
-            }
-
-            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                Poll::Pending
-            }
-
-            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-                Poll::Pending
-            }
-        }
-        impl Connection for StallConn {
-            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-                Ok(None)
-            }
-
-            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-                Ok(None)
-            }
-        }
-
-        let reads = Arc::new(AtomicU64::new(0));
-        // 4MiB 源 ÷ 64KiB 条目 = 64 条；字节闸 2048 许可 ÷ 64 许可/条 = 32 条。
-        let up_src = CountingReader {
-            inner: xray_buf::io::new_reader_with_capacity(
-                std::io::Cursor::new(vec![0u8; 4 * 1024 * 1024]),
-                64 * 1024,
-            ),
-            reads: reads.clone(),
-        };
-        let (dn_r, dn_w) = xray_buf::pipe::new();
-        let link = Link::new(Box::new(up_src), Box::new(dn_w));
-
-        let policy =
-            TimeoutPolicy { connection_idle: Duration::from_millis(100), ..Default::default() };
-        let res = tokio::time::timeout(
-            Duration::from_secs(6),
-            bridge_link_with_stream_full(link, StallConn, &policy),
-        )
-        .await
-        .expect("byte-gated bridge must return via abort gate, not pin");
-        assert!(res.is_ok());
-        // 读腿拉取数 = 32（闸内）+ 1（手上一条待许可）：许可账面恰好 32×64KiB
-        // = 2MiB = 每方向预算。条目闸（64 条）若先触顶，此值为 65 ⇒ 红；闸值
-        // 改大同理红；闸值改小到条目超预算 ⇒ 全部旁路 ⇒ 拉到条目闸顶/源尽 ⇒ 红。
-        // （旁路计数断言在 bypasses 用例——本用例不产超预算条目，全局计数器
-        // 会被并行用例污染，禁在此比对。）
-        let pulled = reads.load(Ordering::Relaxed);
-        assert_eq!(pulled, 33, "字节闸必须把在途钉在 32×64KiB + 手上一条；got {pulled} 条");
-        let _ = dn_r;
-    }
-
-    /// 字节闸旁路（u440m 验收②/兜底①）：单条目 3MiB（容量和 > 2MiB 预算）
-    /// 必须无许可放行 + 计数 +1，数据完好到达下游（不死锁；对比台 S6 形态）。
-    #[tokio::test]
-    async fn bridge_stream_full_byte_gate_bypasses_oversized_item() {
-        use std::time::Duration;
-
-        use xray_features::policy::TimeoutPolicy;
-
-        use crate::link::Link;
-
-        const ITEM_BYTES: usize = 3 * 1024 * 1024;
-        const SMALL_ITEM_BYTES: usize = 64 * 1024;
-        let up_src = BigItemReader {
-            items: std::collections::VecDeque::from(vec![
-                vec![0xA5u8; ITEM_BYTES],       // > 2MiB 预算 ⇒ 旁路
-                vec![0x5Au8; SMALL_ITEM_BYTES], // 常规条目 ⇒ 正常占许可（负控）
-            ]),
-        };
-        let (_dn_r, dn_w) = xray_buf::pipe::new();
-        let link = Link::new(Box::new(up_src), Box::new(dn_w));
-
-        let bypass_before =
-            BRIDGE_BYTE_GATE_BYPASS_ITEMS.load(std::sync::atomic::Ordering::Relaxed);
-        let sink_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let res = tokio::time::timeout(
-            Duration::from_secs(10),
-            bridge_link_with_stream_full(
-                link,
-                CollectSink { buf: std::sync::Arc::clone(&sink_buf) },
-                &TimeoutPolicy::default(),
-            ),
-        )
-        .await
-        .expect("bypassed oversized item must flow, not deadlock");
-        assert!(res.is_ok());
-        // 旁路恰好 +1（头条旁路，尾条负控不得旁路；并行跑的其它测试不走旁路；
-        // 闸值改小到 < 64KiB 时负控条目也旁路 ⇒ 本断言红）。
-        assert_eq!(
-            BRIDGE_BYTE_GATE_BYPASS_ITEMS.load(std::sync::atomic::Ordering::Relaxed)
-                - bypass_before,
-            1,
-            "超预算单条目必须旁路放行并计数 +1；常规条目（负控）不得旁路"
-        );
-        let buf = sink_buf.lock().expect("sink buf");
-        assert_eq!(
-            buf.len(),
-            ITEM_BYTES + SMALL_ITEM_BYTES,
-            "旁路条目 + 常规条目数据必须完好到达下游"
-        );
-        assert!(buf[..ITEM_BYTES].iter().all(|&b| b == 0xA5), "旁路条目内容必须无损");
-        assert!(buf[ITEM_BYTES..].iter().all(|&b| b == 0x5A), "常规条目内容必须无损");
-    }
-
-    /// 字节闸许可循环（u440m 验收③）：4MiB = 64 条 × 64KiB 过 2MiB 闸，许可
-    /// 必须循环复用（在途 > 预算 ⇒ 不归还即卡死）。连续多轮全量搬运成功
-    /// ⇒ 取消/收尾路径无许可泄漏（任一泄漏 = 后续轮次停摆 = 超时红）。
-    #[tokio::test]
-    async fn bridge_stream_full_byte_gate_permits_circulate() {
-        use std::time::Duration;
-
-        use xray_features::policy::TimeoutPolicy;
-
-        use crate::link::Link;
-
-        const TOTAL_BYTES: usize = 4 * 1024 * 1024;
-        for round in 0..3 {
-            let up_src = xray_buf::io::new_reader_with_capacity(
-                std::io::Cursor::new(vec![0u8; TOTAL_BYTES]),
-                64 * 1024,
-            );
-            let (_dn_r, dn_w) = xray_buf::pipe::new();
-            let link = Link::new(up_src, Box::new(dn_w));
-            let sink_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let res = tokio::time::timeout(
-                Duration::from_secs(15),
-                bridge_link_with_stream_full(
-                    link,
-                    CollectSink { buf: std::sync::Arc::clone(&sink_buf) },
-                    &TimeoutPolicy::default(),
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("round {round}: 许可泄漏会钉死搬运，不允许超时"));
-            assert!(res.is_ok());
-            assert_eq!(
-                sink_buf.lock().expect("sink buf").len(),
-                TOTAL_BYTES,
-                "round {round}: 全量数据必须过闸到达（许可循环复用的可观察证据）"
-            );
-        }
-    }
-
-    /// 字节闸取消安全机制（u440m 验收③「可用许可回到初值」）：满仓 acquire
-    /// 被 0 时限取消（= 读腿 abort 分支打断 acquire 的形态，对比台 S8）后，
-    /// 许可全额归还；acquire 成功 → 条目 drop 归还。64 轮无漂移。
-    #[tokio::test]
-    async fn byte_gate_acquire_cancel_returns_permits() {
-        use std::time::Duration;
-        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(BRIDGE_BYTE_GATE_PERMITS));
-        for round in 0..64 {
-            // 写腿持全部分许可在写（满仓）。
-            let holder =
-                gate.clone().acquire_many_owned(BRIDGE_BYTE_GATE_PERMITS as u32).await.unwrap();
-            assert_eq!(gate.available_permits(), 0);
-            // 读腿 acquire 必等（Pending）——0 时限 = 立即取消（abort 打断形态）。
-            assert!(
-                tokio::time::timeout(
-                    Duration::ZERO,
-                    gate.clone().acquire_many_owned(
-                        byte_gate_units(512 * 1024).expect("readv 条目必在预算内") as u32
-                    ),
-                )
-                .await
-                .is_err(),
-                "round {round}: 满仓 acquire 必须等（Pending）"
-            );
-            // 取消不得凭空吐许可。
-            assert_eq!(gate.available_permits(), 0, "round {round}: 取消不得泄漏许可");
-            // 写腿写完：条目（含许可）drop ⇒ 全额归还。
-            drop(holder);
-            assert_eq!(
-                gate.available_permits(),
-                BRIDGE_BYTE_GATE_PERMITS,
-                "round {round}: 取消+收尾后可用许可必须回到初值（无泄漏）"
-            );
-        }
-    }
-
-    /// 条目计费边界（1KiB 粒度向上取整；超预算 = 旁路）。
-    #[test]
-    fn byte_gate_units_boundaries() {
-        assert_eq!(byte_gate_units(1), Some(1), "1KiB 粒度向上取整");
-        assert_eq!(
-            byte_gate_units(512 * 1024),
-            Some(512),
-            "readv 条目 8×64KiB = 512 许可（容量口径）"
-        );
-        assert_eq!(
-            byte_gate_units(BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES),
-            Some(BRIDGE_BYTE_GATE_PERMITS),
-            "恰满预算 = 占满全部许可（不旁路）"
-        );
-        assert_eq!(
-            byte_gate_units(BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES + 1),
-            None,
-            "超预算 1 字节 = 旁路"
-        );
-        assert_eq!(byte_gate_units(4 * 1024 * 1024), None, "h2 大分片走旁路");
     }
 
     /// bridge_connections 池化路径：两端双向 8KB 流量必须无丢失、按时返回。

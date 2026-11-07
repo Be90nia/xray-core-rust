@@ -545,44 +545,50 @@ where
     // 活跃传输（含 >30s 长流）持续续期，不受硬杀。
     // builder 由 async move 块持有：serve_connection 借用 &self，装箱 future
     // 生命周期超出本函数栈帧。
-    let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
-        // 窗组 = 静态保底（RTT 阶梯已撤；服务端 accept 计时随之删除，lf51l）。
-        let win = crate::flow_window::server_windows();
-        let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-        builder
-            .http1()
-            .timer(hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(READ_HEADER_TIMEOUT);
-        // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
-        // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
-        // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
-        builder
-            .http2()
-            .timer(hyper_util::rt::TokioTimer::new())
-            // h2 连接级 keep-alive PING（Go ChromeH2KeepAlivePeriod=45s 同值）：
-            // 双向对抗 NAT/中间盒空闲回收——CDN 100s idle 切断（#6554 场景）时，
-            // 45s 周期 PING 维持连接活跃度。keep_alive_timeout 取 hyper 默认 20s。
-            .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
-            // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
-            // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
-            // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
-            // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
-            // Go 服务端无此上限（仅受客户端窗口约束）。
-            .max_send_buf_size(win.max_send_buf)
-            // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
-            // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
-            // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
-            // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
-            // bd rjzw2：值 = 静态保底 16MB/32MB（RTT 阶梯已撤）。
-            .initial_stream_window_size(win.stream_window)
-            .initial_connection_window_size(win.connection_window)
-            // 票 2xgln：对端并发流上限（Go net/http h2 缺省 250）。h2 侧据此
-            // 发 SETTINGS，并对越限的 HEADERS 回 RST_STREAM(REFUSED_STREAM)。
-            .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
-        // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
-        // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
-        let _ = builder.serve_connection(io, svc).await;
-    });
+    let serve: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(
+        // 站点归因（S3）：整个 serve future 标 xhttp_srv_h2conn——hyper server
+        // 的 h2 帧解析/HPACK/流控/发送缓冲全在此 future 的 poll 段内；跨 await
+        // 必须 scope（bd a65px），svc/handler 内层已有更细站点（xhttp_srv_send
+        // 等）按嵌套覆盖。
+        xray_common::alloc_site::scope(xray_common::alloc_site::XHTTP_SRV_H2CONN, async move {
+            // 窗组 = 静态保底（RTT 阶梯已撤；服务端 accept 计时随之删除，lf51l）。
+            let win = crate::flow_window::server_windows();
+            let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(READ_HEADER_TIMEOUT);
+            // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
+            // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
+            // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
+            builder
+                .http2()
+                .timer(hyper_util::rt::TokioTimer::new())
+                // h2 连接级 keep-alive PING（Go ChromeH2KeepAlivePeriod=45s 同值）：
+                // 双向对抗 NAT/中间盒空闲回收——CDN 100s idle 切断（#6554 场景）时，
+                // 45s 周期 PING 维持连接活跃度。keep_alive_timeout 取 hyper 默认 20s。
+                .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
+                // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
+                // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
+                // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
+                // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
+                // Go 服务端无此上限（仅受客户端窗口约束）。
+                .max_send_buf_size(win.max_send_buf)
+                // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
+                // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab
+                // U-A 组）。显式 16MB 流窗 + 32MB 连接窗 → U-B 组 210.7MB/s（12.2×）。窗=
+                // SETTINGS 计数器零预分配，单连接聚合上限=32MB 连接窗。
+                // bd rjzw2：值 = 静态保底 16MB/32MB（RTT 阶梯已撤）。
+                .initial_stream_window_size(win.stream_window)
+                .initial_connection_window_size(win.connection_window)
+                // 票 2xgln：对端并发流上限（Go net/http h2 缺省 250）。h2 侧据此
+                // 发 SETTINGS，并对越限的 HEADERS 回 RST_STREAM(REFUSED_STREAM)。
+                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+            // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
+            // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
+            let _ = builder.serve_connection(io, svc).await;
+        }),
+    );
     drive_serve_guarded(serve, &last_progress, SERVE_IDLE_TIMEOUT).await;
 }
 

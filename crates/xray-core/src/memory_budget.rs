@@ -19,20 +19,19 @@
 
 // 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
 pub use xray_frame::budget::{
-    BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES, BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES,
-    DNS_CACHE_ESTIMATE_BYTES, DNS_CACHE_MAX_ENTRIES, DNS_PENDING_EST_BYTES,
-    DNS_PENDING_MAX_ENTRIES, DNS_SINGLEFLIGHT_UNBOUNDED_NOTE, DOH3_SESSION_SOCKET_BOOKED_BYTES,
-    FINALMASK_XMC_POOL_MAX_BYTES, H2_MAX_SEND_BUF_PER_CONN_BYTES, HANDSHAKE_INFLIGHT_MAX,
-    HANDSHAKE_TASK_EST_BYTES, HYPER_IDLE_CONN_EST_BYTES, HYPER_MAX_IDLE_PER_HOST_CONNECTIONS,
-    HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES, MAX_EXPLICIT_SOCKET_BUFFER_BYTES,
-    MAX_PER_CONN_BUFFER_BYTES, MIN_VIABLE_CONCURRENCY, NEW_POOLS_TOTAL_MAX_BYTES,
-    QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES,
-    RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR, SPLITHTTP_ENDPOINT_BOOKED_BYTES,
-    SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES, SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES,
-    SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES, TLS_SESSION_CACHE_ESTIMATE_BYTES,
-    TLS_SESSION_CACHE_MAX_ENTRIES, WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES,
-    XRAY_BUDGET_BYTES, XRAY_BUF_POOL_TOTAL_MAX_BYTES, startup_fixed_floor_bytes,
-    startup_fixed_floor_bytes_for,
+    BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES, DNS_CACHE_ESTIMATE_BYTES, DNS_CACHE_MAX_ENTRIES,
+    DNS_PENDING_EST_BYTES, DNS_PENDING_MAX_ENTRIES, DNS_SINGLEFLIGHT_UNBOUNDED_NOTE,
+    DOH3_SESSION_SOCKET_BOOKED_BYTES, FINALMASK_XMC_POOL_MAX_BYTES, H2_MAX_SEND_BUF_PER_CONN_BYTES,
+    HANDSHAKE_INFLIGHT_MAX, HANDSHAKE_TASK_EST_BYTES, HYPER_IDLE_CONN_EST_BYTES,
+    HYPER_MAX_IDLE_PER_HOST_CONNECTIONS, HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES,
+    MAX_EXPLICIT_SOCKET_BUFFER_BYTES, MAX_PER_CONN_BUFFER_BYTES, MIN_VIABLE_CONCURRENCY,
+    NEW_POOLS_TOTAL_MAX_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+    QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES, RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR,
+    SPLITHTTP_ENDPOINT_BOOKED_BYTES, SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
+    SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES, SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
+    TLS_SESSION_CACHE_ESTIMATE_BYTES, TLS_SESSION_CACHE_MAX_ENTRIES,
+    WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES, XRAY_BUDGET_BYTES,
+    XRAY_BUF_POOL_TOTAL_MAX_BYTES, startup_fixed_floor_bytes, startup_fixed_floor_bytes_for,
 };
 
 /// 单项每连接缓冲预算校验（字节；`origin` 指明值的来源，进错误文案）。
@@ -75,12 +74,14 @@ fn stream_network(
 ///    档 × 2 方向，合计超 [`XRAY_BUDGET_BYTES`]
 ///    即拒——「配置合法但实际占用超预算」的组合同样过不了门。
 ///
-/// **桥在途不入门（jcnjb③ 决策，登记≠入账口径）**：桥字节闸把在途钉在
-/// [`BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`]（4MiB/连接），但它是**满载瞬态**
-/// （写端堵塞 + 读端持续产的瞬态形态，装配期零连接 ⇒ 占用 0，连接数本身装配期
-/// 不可判定），且与 pipe 同一份 4MiB 每连接份额（**不重复计账**）⇒ 不并入
-/// 「连接数 × 档位」扫描；总实算（固定面 + 8 连接 × (pipe 双向 + 桥 4MiB) ≤ 96MiB）
-/// 钉在 tests `ledger_total_with_bridge_gate_stays_within_budget`——份额常量漂移即红。
+/// **桥在途不入门（jcnjb③ 决策，登记≠入账口径）**：桥在途上界登记在
+/// [`BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`]（条目闸口径 66MiB/连接缺省档；
+/// u440m 字节闸曾钉 4MiB，真机 A/B 中位比 0.939 −6.1% 超票面 5% 门已回退——
+/// 与 pipe 的 4MiB 每连接份额**不再是同一份额**，登记簿 doc 有回退记录），
+/// 但它是**满载瞬态**（写端堵塞 + 读端持续产的瞬态形态，装配期零连接 ⇒ 占用 0，
+/// 连接数本身装配期不可判定）⇒ 不并入「连接数 × 档位」扫描，也不进总实算
+/// 断言乘积（同 xdns frag 口径）；总实算（固定面 + 8 连接 × pipe 双向 ≤ 96MiB）
+/// 钉在 tests `ledger_total_stays_within_budget`——份额常量漂移即红。
 pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String> {
     let mut violations = Vec::new();
 
@@ -129,8 +130,9 @@ pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String
         + splithttp_endpoints * SPLITHTTP_ENDPOINT_BOOKED_BYTES;
     // 每连接 pipe 占用按两方向计（上/下行各一条 policy pipe，见 MAX_PER_CONN_BUFFER_BYTES doc）。
     let per_conn_pipe = max_pipe_bytes * 2;
-    // 桥在途 4MiB/连接不入门：满载瞬态（装配期零连接）+ 与 pipe 同一份每连接
-    // 份额不重复计账（jcnjb③；总实算钉在 tests ledger_total_with_bridge_gate_…）。
+    // 桥在途不入门：满载瞬态（装配期零连接，连接数不可判定；jcnjb③；总实算
+    // 钉在 tests ledger_total_stays_within_budget）。条目闸口径上界见登记簿
+    // BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES（u440m 字节闸已回退）。
     let projected = fixed + endpoint_booked + MIN_VIABLE_CONCURRENCY * per_conn_pipe;
     if projected > XRAY_BUDGET_BYTES {
         violations.push(format!(
@@ -371,9 +373,9 @@ mod tests {
     /// hysteria udphop 进程级共享块池与实现**同一算式**（bd ccy5d）：
     /// 簿值 = `POOL_IDLE_CAP`（128 块）× `UDP_BUFFER_SIZE`（1500B）= 192_000B。
     /// **改任一实现值即红**（块数或块大小变了 ⇒ 账本与 96MB 分账必须同步重审）。
-    /// 同时钉「总实算」口径：固定面（含本项）+ 8 连接 ×（pipe 双向 + 桥在途）
-    /// 的既有总账测试（`ledger_total_with_bridge_gate_stays_within_budget`）
-    /// 随底数抬升自动复算，仍 ≤ 96 MiB。
+    /// 同时钉「总实算」口径：固定面（含本项）+ 8 连接 × pipe 双向的既有总账
+    /// 测试（`ledger_total_stays_within_budget`；u440m 字节闸回退后桥在途为
+    /// 登记项不进乘积）随底数抬升自动复算，仍 ≤ 96 MiB。
     #[test]
     fn hysteria_udphop_pool_ledger_matches_impl() {
         use xray_transport_hysteria::udphop as hop;
@@ -539,30 +541,33 @@ mod tests {
         );
     }
 
-    /// 桥字节闸与实现**同一常量**（u440m）：改任一实现值即红。
+    /// 桥在途登记簿与**条目闸口径**一致（u440m 字节闸回退后）。
+    ///
+    /// 算式（登记簿 doc 同源）：每方向 mpsc 64 条 + 读/写腿手上各 1 = 66 条 ×
+    /// 单条顶格 512KiB × 双方向 = 66 MiB。改任一因子（条目容量/腿形态/口径）
+    /// 须同步改本断言与登记簿 doc，否则红——行为面另由
+    /// `crates/xray-transport/tests/bridge_backpressure_entry_cap.rs` 钉住
+    /// （拉取数 65..66）。
+    ///
+    /// 回退记录（bd u440m）：曾断言 `BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES
+    /// == bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES == 2MiB`（字节闸交叉断言）
+    /// 与「桥每连接份额 = pipe 4MiB 同份额不重复计账」——字节闸因高 RTT binding
+    /// 回退（RTT 161.6ms ⇒ BDP 2.39–3.56MB > 2MiB ⇒ 闸上限 ≈12.9MB/s，A/B 中位
+    /// 比 0.939 −6.1% 超票面 5% 门），两断言随之删除：闸没了，登记它 = 造假。
     #[test]
-    fn bridge_byte_gate_ledger_matches_impl() {
-        use xray_transport::bridge;
-        assert_eq!(
-            bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES,
-            BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES,
-            "桥字节闸每方向预算与本登记簿不一致：两处同步改（u440m）"
-        );
-        assert_eq!(
-            bridge::BRIDGE_BYTE_GATE_PERMIT_BYTES,
-            1024,
-            "许可粒度 1KiB（登记簿口径；改粒度须重算许可数并同步）"
-        );
-        assert_eq!(
-            bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES / bridge::BRIDGE_BYTE_GATE_PERMIT_BYTES,
-            2048,
-            "每方向许可总数 = 2048（2MiB / 1KiB）"
-        );
-        // 每连接 = 双方向，恰等于 pipe 每连接份额（不重复计账的口径锚）。
+    fn bridge_backpressure_ledger_matches_impl() {
         assert_eq!(
             BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
+            66 * 512 * 1024 * 2,
+            "桥在途满载上界（条目闸口径 66 条 × 512KiB × 双方向）与登记簿不一致：\
+             两处同步改（bd u440m 回退后口径）"
+        );
+        // 回退后与 pipe 每连接份额（4MiB）**不再相等**——防「同份额不重复计账」
+        // 的旧断言悄悄复活（字节闸已删，桥上界是条目闸口径的独立登记项）。
+        assert_ne!(
+            BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
             usize::try_from(MAX_PER_CONN_BUFFER_BYTES).expect("4 MiB 恒正"),
-            "桥每连接在途份额必须 = pipe 每连接份额（4 MiB 同份额不重复计账）"
+            "字节闸已回退：桥上界不得再断言 = pipe 4MiB 份额（bd u440m）"
         );
     }
 
@@ -587,23 +592,27 @@ mod tests {
         );
     }
 
-    /// 桥字节闸入簿后的**总实算** ≤ 96 MiB（u440m 验收④）：固定面 + 最小并发
-    /// ×（pipe 双向 + 桥在途 4MiB）不超总预算。pipe 按 env 缺省档折算
+    /// 登记簿**总实算** ≤ 96 MiB：固定面 + 最小并发 × pipe 双向不超总预算
+    /// （bd sgdwm/wpa3o-b/u440m 口径延续）。pipe 按 env 缺省档折算
     /// （`BufferPolicy::default().connection`，**字节口径**——check_startup_budget
     /// 的 env 档同源）；8 核参考机（铁律①）。
+    ///
+    /// **桥在途不进乘积**（u440m 回退后口径）：桥上界是满载瞬态（装配期不可
+    /// 判定），只登记不保证（同 xdns frag 口径）——回退前字节闸时代曾以
+    /// `+ BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`（4MiB）入乘积；回退后上界
+    /// = 66MiB（条目闸口径，见登记簿 doc 回退记录），继续入乘积 = 造假
+    /// （8 × (pipe + 66MiB) ≫ 96MiB，而瞬态本就不该按常驻算）。
     #[test]
-    fn ledger_total_with_bridge_gate_stays_within_budget() {
+    fn ledger_total_stays_within_budget() {
         let pipe_bytes =
             i64::from(xray_features::policy::BufferPolicy::default().connection).max(0);
         let pipe_per_conn = (pipe_bytes * 2) as usize; // 双方向
-        let total = startup_fixed_floor_bytes_for(8)
-            + MIN_VIABLE_CONCURRENCY * (pipe_per_conn + BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES);
+        let total = startup_fixed_floor_bytes_for(8) + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
         assert!(
             total <= XRAY_BUDGET_BYTES,
-            "总实算 {total}B（固定面 + {} 连接 × (pipe 双向 {pipe_per_conn}B + 桥在途 \
-             {}B)）超预算 {}B：分账须重审，禁自行放宽总额（u440m）",
+            "总实算 {total}B（固定面 + {} 连接 × pipe 双向 {pipe_per_conn}B）超预算 {}B：\
+             分账须重审，禁自行放宽总额",
             MIN_VIABLE_CONCURRENCY,
-            BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
             XRAY_BUDGET_BYTES
         );
     }

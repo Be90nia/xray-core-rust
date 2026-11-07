@@ -7,7 +7,6 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use futures_util::TryStreamExt;
 use http::StatusCode;
 use hyper::client::conn::http2;
-use hyper_util::rt::TokioExecutor;
 use tokio::{
     io::{AsyncRead as AsyncReadTrait, AsyncReadExt, AsyncWrite as AsyncWriteTrait, DuplexStream},
     sync::Semaphore,
@@ -15,7 +14,7 @@ use tokio::{
 };
 
 use crate::{
-    client::{DefaultDialerClient, ReqBody, hyper_err_to_io, make_stream_body},
+    client::{DefaultDialerClient, ReqBody, SiteTaskExecutor, hyper_err_to_io, make_stream_body},
     config::{Config, RangeConfig},
     connection::{DownloadBody, SplitConn},
     error::{Result, SplitHttpError},
@@ -771,8 +770,10 @@ where
 /// 把已握手的 TLS 流传入。本函数负责：
 ///
 /// 1. `TokioIo::new(tls_stream)` 适配 AsyncRead/AsyncWrite → hyper IO
-/// 2. `hyper::client::conn::http2::handshake(TokioExecutor, io)` 拿 `SendRequest`
-/// 3. spawn conn driver（后台驱动 h2 连接）
+/// 2. `http2::Builder::new(SiteTaskExecutor).handshake(io)` 拿 `SendRequest` （builder executor 归
+///    `alloc_site::XHTTP_CLI_H2CONN` 站点——hyper 1.10 在 handshake 末尾经它 spawn ConnTask，运行期
+///    spawn body Pipe/Send 任务）
+/// 3. spawn conn driver（后台驱动 h2 连接，同站点 scope）
 /// 4. 构造 POST streaming body（upload pipe）+ `send_request`
 /// 5. 返回 [`PacketUpConn`]（reader=响应流，writer=pipe 写端）
 ///
@@ -817,7 +818,11 @@ where
     // argo 族下行 38.5MB/s@260ms；32MB 抬平台）——连接窗不低于流窗即不另成钉；
     // 上行 1MB→16MB 与服务端对称（bd wz2b：服务端收窗放大后 send buf 成次级钉，
     // 4MB/RTT@169ms≈23.7MB/s < 25 判据）。
-    let mut builder = http2::Builder::new(TokioExecutor::new());
+    // 站点归因（S3）：builder executor 用 SiteTaskExecutor——hyper 1.10 h2 client
+    // 的 ConnTask 在 handshake 末尾经此 executor spawn，运行期响应 body Pipe/Send
+    // 任务也经它 spawn（hyper proto/h2/client.rs:192/556/566）；传 TokioExecutor
+    // 则整个 h2 数据面落 untagged。窗组见 flow_window。
+    let mut builder = http2::Builder::new(SiteTaskExecutor);
     // 窗组 = 静态保底（RTT 阶梯已撤；探针已删，见 flow_window 模块头）。
     let win = crate::flow_window::client_windows();
     builder
@@ -834,12 +839,18 @@ where
         clippy::disallowed_methods,
         reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
     )]
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            // h2 连接驱动异常退出 = 该连接整体失效，一次性留痕（u0pe2）。
-            crate::hot_log!(tracing::Level::WARN, "error={e} h2 connection driver ended");
-        }
-    });
+    // 站点归因（S3）：REALITY 直连路径的 h2 驱动任务在此 spawn（不走
+    // DefaultDialerClient 的 Executor 缝），DATA 帧解析/流控/发送缓冲全在该任务
+    // poll 段内——scope 随 future 走（bd a65px：跨 await 禁 enter）。
+    tokio::spawn(xray_common::alloc_site::scope(
+        xray_common::alloc_site::XHTTP_CLI_H2CONN,
+        async move {
+            if let Err(e) = conn.await {
+                // h2 连接驱动异常退出 = 该连接整体失效，一次性留痕（u0pe2）。
+                crate::hot_log!(tracing::Level::WARN, "error={e} h2 connection driver ended");
+            }
+        },
+    ));
 
     // 创建上传 pipe。
     // ponytail: 不要 pre-seed 任何字节进 pipe——Go dialer.go stream-one 分支没有

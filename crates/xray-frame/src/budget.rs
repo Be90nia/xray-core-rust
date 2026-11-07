@@ -20,9 +20,11 @@
 //! 改任一实现值即红；实现常量私有/未落地/属另一票的只声明口径，并在 doc 明示
 //! 「仅登记不保证」。
 //!
-//! 登记 ≠ 入账：桥在途（u440m 起字节闸钉在 4MiB/连接，旧口径 64MiB 作废）是
-//! **满载瞬态上界**（写端堵塞 + 读端持续产的瞬态形态），装配期不可判定 ⇒ 登记
-//! 为运维判据，不进预算门算式（见该常量 doc）。
+//! 登记 ≠ 入账：桥在途（条目闸口径满载上界
+//! [`BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`]；u440m 字节闸曾钉 4MiB/连接，
+//! 真机 A/B 中位比 0.939（−6.1%，BDP 2.39–3.56MB > 2MiB × RTT 161.6ms）超票面
+//! 5% 门已回退）是**满载瞬态上界**（写端堵塞 + 读端持续产的瞬态形态），装配
+//! 期不可判定 ⇒ 登记为运维判据，不进预算门算式（见该常量 doc）。
 //! 二进制 + Rust 运行时 ~25-30MB 属 RSS 实测面（MEMORY-BUDGET-256MB §1「待实测
 //! 锚定」），同样不进门，上线由 PM 亲核 RSS。
 
@@ -229,26 +231,27 @@ pub const WS_PER_CONN_BUFFER_BOOKED_BYTES: usize = 64 * 1024;
 /// 本簿按复用后口径登记）。账面常量与 QUIC 同源（交叉断言钉住）。
 pub const DOH3_SESSION_SOCKET_BOOKED_BYTES: usize = QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES;
 
-/// 桥字节闸**每方向**预算（字节）——**已落地**（u440m）：
-/// `xray_transport::bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES` = 2MiB，
-/// 交叉断言钉住。条目闸（64 条/方向）之上的字节背压：在途字节（排队+在写）
-/// 每方向 ≤ 本值；条目携带许可（drop 即归还），acquire 在既有 abort select
-/// 分支内（取消安全），超预算单条目（h2/h3 大分片）旁路放行 + 计数
-/// （`xray_transport::bridge::BRIDGE_BYTE_GATE_BYPASS_ITEMS`）。
-/// 依据（sim-bridge-bytegate.md v3）：旧条目闸 32MiB 在途 > xray_buf 池驻留
-/// 8MiB ⇒ 归还全丢 ⇒ 池命中率 0%；2MiB/方向落在池预算内 ⇒ 命中率 92%、
-/// 吞吐持平。r5j96 教训：取 2MiB 而非 Go pipe 的 512KiB（4× 余量不钉死窗）。
-pub const BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES: usize = 2 * 1024 * 1024;
-
-/// 桥在途满载上界（字节/连接）= 字节闸每方向 ×2 = 4MiB（u440m 起）。
-/// 旧口径「64 条 × 512KiB × 双方向 = 64MiB」作废——条目闸（64 条/方向）仍在
-/// （防无界条目数），字节闸把在途字节钉在 4MiB/连接 = [`MAX_PER_CONN_BUFFER_BYTES`]
-/// 同一每连接份额（pipe/socket/bridge 不重复计账）。旁路条目（单条 > 2MiB）
-/// 超此账面，量级由 BYPASS 计数器观测。仅登记不保证——旁路面与连接数装配期
-/// 不可判定 ⇒ 不进预算门算式（运维判据：64MiB 时代「同时满载 ≤1 连接」
-/// 收窄为「8 连接满载仅 32MiB」）。
-pub const BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES: usize =
-    2 * BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES;
+/// 桥在途满载上界（字节/连接，**条目闸口径**）= 每方向 mpsc 64 条 + 读/写腿
+/// 手上各 1 = 66 条 × 单条顶格 512KiB × 双方向 = 66 MiB（缺省档）。
+///
+/// 单条字节由**生产侧**决定（`xray-transport/src/bridge.rs` `PIPE_BUF_CAP` 处
+/// 注释）：readv 腿顶格 8×64KiB = 512KiB；TLS 腿 ≤64KiB；pipe 腿 ≈ policy
+/// bufferSize（缺省 512KiB，受 [`MAX_PER_CONN_BUFFER_BYTES`] 4MiB/方向钳制，
+/// 配大时本上界按 66 × 档位 × 双方向线性放大）；冻结腿（h2/h3 Bytes 直交）
+/// 单条 = 传输分片可超——闸只管条数不复检字节。
+///
+/// **字节闸回退记录（bd u440m）**：u440m 曾加每方向 2MiB 字节闸把本值钉在
+/// 4MiB/连接（`BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES` 常量随之删除——
+/// 闸没了，登记它 = 造假）。回退依据 = 票面自定 5% 门实测触发：到节点 RTT
+/// 161.6ms ⇒ BDP @14.8MB/s = 2.39MB、@22.0MB/s = 3.56MB，均 > 2MiB 闸预算
+/// ⇒ 闸理论上限 2MiB ÷ 0.162s ≈ 12.9MB/s，真机 A/B 中位比 0.939（−6.1%）
+/// ⇒ 撤销限流行为，回到纯条目闸（旁路计数器依赖闸存在才有意义，一并删除）。
+///
+/// 满载瞬态（写端堵塞 + 读端持续产的瞬态形态，装配期零连接 ⇒ 占用 0，连接数
+/// 装配期不可判定）⇒ **登记为运维判据，不进预算门算式**（同 xdns frag 口径）；
+/// 条目闸行为由 `crates/xray-transport/tests/bridge_backpressure_entry_cap.rs`
+/// 行为级钉住（64 条 mpsc 封顶后拉取数 65..66，改条目容量即红）。
+pub const BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES: usize = 66 * 512 * 1024 * 2;
 
 /// DNS singleflight 表（`xray_app_dns::cache_controller::SfMap`）**无显式条目上界**
 /// ——已知无上界容器，如实登记（PM-08）：上界 = 同时在飞的不同 key 数（由客户端

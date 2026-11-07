@@ -59,10 +59,41 @@ pub const TLS_READ: u8 = 4;
 /// 本模块。站点覆盖一次 `read_multi_buffer`（读缓冲 + MultiBuffer 包装），
 /// 比单标分配行略宽——读缓冲容量远大于包装开销，不干扰判读。
 pub const BUF_READ: u8 = 5;
+/// 桥层上行读腿（S3 归因：`bridge_link_with_stream_full` up_reader——读 inbound
+/// 侧 link.reader 的整轮 `read_multi_buffer`）。cli = socks/CONNECT 客户端读；
+/// srv = vless inbound 解码读。覆盖该 poll 段内全部分配（含协议解码）。
+pub const BRIDGE_UP_READ: u8 = 6;
+/// 桥层上行写腿（S3 归因：up_writer——`write_all_mb` 到 outbound 侧）。cli =
+/// vless 编码 + duplex + h2 上传链；srv = freedom 出站写。
+pub const BRIDGE_UP_WRITE: u8 = 7;
+/// 桥层下行写腿（S3 归因：down_writer——`write_multi_buffer` 到 inbound 侧）。
+/// cli = socks 客户端响应写；srv = vless inbound 响应编码 + xhttp 下行链。
+pub const BRIDGE_DOWN_WRITE: u8 = 8;
+/// xhttp/h2 服务端连接驱动（S3 归因：hyper server `serve_connection` 整个
+/// serve future——srv 侧 h2 帧解析/HPACK/流控/发送缓冲全在此 future 内轮询）。
+pub const XHTTP_SRV_H2CONN: u8 = 9;
+/// xhttp/h2 客户端连接驱动（S3 归因）。**两条路径都要挂**：① REALITY 直连
+/// stream-one 的 h2 驱动任务在 `dialer::dial_reality_stream_one` 的 spawn 点
+/// `scope`（不走 DefaultDialerClient）；② 非 REALITY xhttp 走 hyper-util legacy
+/// Client **内部 spawn** 的驱动任务，唯一可达挂点 = 注入 Executor（`client.rs`
+/// `SiteTaskExecutor`，execute 处 `scope` 后委托 `TokioExecutor`）。cli 侧 h2
+/// DATA/流控/HPACK/上传泵全在这两处任务内。
+pub const XHTTP_CLI_H2CONN: u8 = 10;
 
 /// 站点目录（索引 = 站点 id；新站点只能追加，禁重编号——dump 行与归集脚本按名对齐）。
-pub const SITE_NAMES: [&str; 6] =
-    ["(none)", "tls_write", "xhttp_srv_send", "vless_enc_seal", "tls_read", "buf_read"];
+pub const SITE_NAMES: [&str; 11] = [
+    "(none)",
+    "tls_write",
+    "xhttp_srv_send",
+    "vless_enc_seal",
+    "tls_read",
+    "buf_read",
+    "bridge_up_read",
+    "bridge_up_write",
+    "bridge_down_write",
+    "xhttp_srv_h2conn",
+    "xhttp_cli_h2conn",
+];
 
 // 内容留仓，机制已上浮 udf（bd 24a5k / udf-frame#6）：以下只是站点清单的
 // 具名登记（名字 = dump 行与归集脚本的契约），计数/开关/查表机制在 udf。
@@ -72,6 +103,11 @@ static SITE_XHTTP_SRV_SEND: AllocSite = AllocSite::new("xhttp_srv_send");
 static SITE_VLESS_ENC_SEAL: AllocSite = AllocSite::new("vless_enc_seal");
 static SITE_TLS_READ: AllocSite = AllocSite::new("tls_read");
 static SITE_BUF_READ: AllocSite = AllocSite::new("buf_read");
+static SITE_BRIDGE_UP_READ: AllocSite = AllocSite::new("bridge_up_read");
+static SITE_BRIDGE_UP_WRITE: AllocSite = AllocSite::new("bridge_up_write");
+static SITE_BRIDGE_DOWN_WRITE: AllocSite = AllocSite::new("bridge_down_write");
+static SITE_XHTTP_SRV_H2CONN: AllocSite = AllocSite::new("xhttp_srv_h2conn");
+static SITE_XHTTP_CLI_H2CONN: AllocSite = AllocSite::new("xhttp_cli_h2conn");
 
 /// 站点目录表（枚举序 = 站点 id 序）：名 → 站点查表口 = udf
 /// `skeleton_infra::alloc_site::find(SITE_TABLE, name)`（零堆分配）。
@@ -82,6 +118,11 @@ pub static SITE_TABLE: &[&AllocSite] = &[
     &SITE_VLESS_ENC_SEAL,
     &SITE_TLS_READ,
     &SITE_BUF_READ,
+    &SITE_BRIDGE_UP_READ,
+    &SITE_BRIDGE_UP_WRITE,
+    &SITE_BRIDGE_DOWN_WRITE,
+    &SITE_XHTTP_SRV_H2CONN,
+    &SITE_XHTTP_CLI_H2CONN,
 ];
 
 /// 各站点累计字节（Relaxed 同 alloc_stats 无同步语义需求）。
@@ -376,6 +417,13 @@ mod tests {
                 "site=vless_enc_seal alloc_n=1 alloc_bytes=512",
                 "site=tls_read alloc_n=4 alloc_bytes=8192",
                 "site=buf_read alloc_n=5 alloc_bytes=2048",
+                // S3 归因闭环追加站点（u8zss）：本测试只记录既有 5 站点，追加
+                // 站点行为 dump 契约的一部分——按名对齐 + 本测试增量恒 0。
+                "site=bridge_up_read alloc_n=0 alloc_bytes=0",
+                "site=bridge_up_write alloc_n=0 alloc_bytes=0",
+                "site=bridge_down_write alloc_n=0 alloc_bytes=0",
+                "site=xhttp_srv_h2conn alloc_n=0 alloc_bytes=0",
+                "site=xhttp_cli_h2conn alloc_n=0 alloc_bytes=0",
             ]
         );
     }

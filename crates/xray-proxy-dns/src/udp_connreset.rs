@@ -6,14 +6,18 @@
 //! 「bind + Windows 两条 ioctl」的最小面；语义正本（WARN 兜底口径、recv 侧
 //! 错误分类）仍在 xray-transport。若未来依赖图允许直调，删本文件换 helper。
 
-use std::{io, sync::LazyLock};
+use std::io;
+#[cfg(windows)]
+use std::sync::LazyLock;
 
 use tokio::net::UdpSocket;
+#[cfg(windows)]
 use xray_frame::LogFacade;
 
 /// ioctl 失败诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本 crate
 /// `disallowed_macros` 对 proc-macro 不认任何 allow；域 = "dns"。只在 WSAIoctl
 /// 失败分支发射（bind 冷路径，且 fail-open 继续服务）。
+#[cfg(windows)]
 static CONNRESET_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("dns", vec![]));
 
 /// 绑定 UDP socket 并在 Windows 上关掉 ICMP-unreachable 上报
