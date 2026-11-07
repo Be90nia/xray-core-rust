@@ -93,6 +93,14 @@ const TUN_RECV_BUF_SIZE: usize = 65535;
 /// smoltcp poll 定时器间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// 连续 TUN 读错误上限（票 yq6gv e）：20 × [`RECV_ERROR_BACKOFF`] ≈ 1s 仍读不到包
+/// 即判定设备不可用并退出驱动循环。旧实现按 50ms **无限**重试，坏设备永远不退出、
+/// 只留 20Hz 错误日志。
+const RECV_ERROR_LIMIT: u32 = 20;
+
+/// 单次读错误后的退避。
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 /// duplex 缓冲大小。
 const DUPLEX_BUF: usize = 64 * 1024;
 
@@ -395,7 +403,7 @@ impl InboundHandler for TunInboundHandler {
         let dispatch = Arc::clone(&self.dispatch);
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         let handle = tokio::spawn(async move {
             tun_driver_loop(dev, netstack, dispatch).await;
@@ -665,12 +673,16 @@ async fn tun_driver_loop(
 
     crate::TUN_LOG.debug("tun driver main loop started");
 
+    // 连续读错误计数（票 yq6gv e）：成功后清零；触顶即退出循环（见 RECV_ERROR_LIMIT）。
+    let mut consecutive_read_errors = 0u32;
+
     loop {
         tokio::select! {
             // 从 TUN 设备读取 IP 包（Linux：一次 syscall 读一批 GRO 拆分段）
             result = rx.recv(&device) => {
                 match result {
                     Ok(count) => {
+                        consecutive_read_errors = 0;
                         // 票 fnlv：UDP 无锁预分流（bypass 语义不变），TCP 包收切片
                         // 进单次临界区——批量读的 syscall 摊销不再被逐包锁拆碎。
                         // 票 6dfy：owned 物化（alloc+memcpy）在临界区外完成，
@@ -709,9 +721,24 @@ async fn tun_driver_loop(
                         write_tx_back(&device, tx_pkts).await;
                     }
                     Err(e) => {
-                        crate::TUN_LOG.error(format!("tun recv error error={e}"));
-                        // ponytail: 不退出循环——设备可能临时错误
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            // 设备已关闭：再读只会空转，退出驱动循环（票 yq6gv e）。
+                            crate::TUN_LOG
+                                .warn(format!("tun device closed, driver loop stops error={e}"));
+                            break;
+                        }
+                        consecutive_read_errors += 1;
+                        crate::TUN_LOG.error(format!(
+                            "tun recv error consecutive={consecutive_read_errors} error={e}"
+                        ));
+                        if consecutive_read_errors >= RECV_ERROR_LIMIT {
+                            crate::TUN_LOG.error(format!(
+                                "tun recv failed {RECV_ERROR_LIMIT} times in a row; device \
+                                 unusable, driver loop stops"
+                            ));
+                            break;
+                        }
+                        tokio::time::sleep(RECV_ERROR_BACKOFF).await;
                     }
                 }
             }
@@ -722,6 +749,9 @@ async fn tun_driver_loop(
                     stack.poll(smoltcp::time::Instant::now());
                     // 处理 ICMP echo request 并自动回复
                     stack.process_icmp_echo();
+                    // bd 2e47r：老化未完成握手的惰性 listen 条目（Established 不动，
+                    // 故必须先于 check_tcp_accepts 也不丢连接——两处都跳过 Established）。
+                    stack.sweep_tcp_listens(now_nanos());
                     // 只收集 accept 事件，建桥 spawn 在锁外进行
                     (stack.check_tcp_accepts(), stack.drain_tx())
                 };
@@ -768,7 +798,11 @@ impl RxPackets {
         }
     }
 
-    /// 读一批包，返回包数（非 Linux 恒 0 或 1）。
+    /// 读一批包，返回包数（非 Linux 恒 1）。
+    ///
+    /// 非 Linux 设备读回 0 字节 = 设备已关闭（[`TunDevice::recv`] 语义），转成
+    /// `UnexpectedEof` 上报——旧实现把它当「这批 0 个包」继续下一轮，关闭的设备
+    /// 立刻再返回 0 ⇒ 空转热旋（票 yq6gv e）。
     async fn recv(&mut self, device: &TunDevice) -> std::io::Result<usize> {
         #[cfg(target_os = "linux")]
         {
@@ -777,8 +811,14 @@ impl RxPackets {
         #[cfg(not(target_os = "linux"))]
         {
             let n = device.recv(&mut self.buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "tun device closed (recv returned 0)",
+                ));
+            }
             self.len = n;
-            Ok(usize::from(n != 0))
+            Ok(1)
         }
     }
 
@@ -887,8 +927,9 @@ fn handle_udp_packet(
 }
 
 /// 当前 wall-clock 纳秒（UNIX_EPOCH 偏移，i64 截断饱和）。用作
-/// session 最后活跃时间戳（p14e）与 UDP 冷却窗计时。
-fn now_nanos() -> i64 {
+/// session 最后活跃时间戳（p14e）与 UDP 冷却窗计时；netstack 的 TCP 惰性监听
+/// 老化（票 2e47r）复用同一时钟源。
+pub(crate) fn now_nanos() -> i64 {
     xray_frame::compat::clock()
         .now_system()
         .duration_since(UNIX_EPOCH)
@@ -901,7 +942,7 @@ fn now_nanos() -> i64 {
 /// 后台 spawn，无关主 driver loop。
 #[allow(
     clippy::disallowed_methods,
-    reason = "存量债：未接 PluginContext 托管句柄（tail 表达式位无法就地登记），接线归 P1 插件装配（B3 T3.1）"
+    reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄（tail 表达式位无法就地登记），接线归 P1 插件装配（B3 T3.1）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
 )]
 fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -987,7 +1028,7 @@ fn spawn_udp_session_task(
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_CAP);
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     let session = tokio::spawn(run_udp_session(
         dispatch,
@@ -1001,7 +1042,7 @@ fn spawn_udp_session_task(
     ));
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         while let Some(reply) = reply_rx.recv().await {
@@ -1202,7 +1243,7 @@ async fn accept_tcp_connection(
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(relay.run());
 
@@ -1210,7 +1251,7 @@ async fn accept_tcp_connection(
     let dispatch = Arc::clone(dispatch);
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         dispatch.dispatch(&dest, link).await;

@@ -271,12 +271,17 @@ impl<'v> ServerSession<'v> {
             return Err(VmessError::ReadPaddingFailed);
         }
 
-        let expected_auth = authenticate(&payload[..payload.len() - 4]);
+        // Go `server.go:225-232`：FNV1a 覆盖 `buffer.BytesTo(-4)` = **已解析的
+        // header 段**（38B base + addr + padding），checksum 紧随其后；同一 AEAD
+        // 明文块里 header 之后的多余字节不参与校验。旧实现用 `payload.len()-4`
+        // 当边界，带尾部字节时与 Go 结论相反（互通隐患，bd e4ct8a）。
+        let auth_end = base_len - 4;
+        let expected_auth = authenticate(&payload[..auth_end]);
         let actual_auth = u32::from_be_bytes([
-            payload[payload.len() - 4],
-            payload[payload.len() - 3],
-            payload[payload.len() - 2],
-            payload[payload.len() - 1],
+            payload[auth_end],
+            payload[auth_end + 1],
+            payload[auth_end + 2],
+            payload[auth_end + 3],
         ]);
         if expected_auth != actual_auth {
             return Err(VmessError::InvalidAuth);
@@ -930,6 +935,50 @@ mod tests {
         // 已在 decode 层读且不在 cursor 内：bytes_read = 26 + payload_enc
         // = sealed.len() - 16。
         assert_eq!(bytes_read, sealed.len() - 16);
+    }
+
+    /// bd e4ct8a：FNV1a 只覆盖 header 段（38B base + addr + padding + checksum 在前）；
+    /// header 之后同块内的尾部字节不参与校验（Go `server.go:225-232`
+    /// `buffer.BytesTo(-4)`）。旧实现以 `payload.len()-4` 为边界 ⇒ 带尾部字节时
+    /// 与 Go 结论相反。
+    #[test]
+    fn header_auth_covers_header_segment_only() {
+        let uuid = sample_uuid();
+        let account = crate::account::MemoryAccount::new(uuid);
+        let user = crate::validator::MemoryUser::new("alice@example.com", account);
+        let (validator, _cmd_key) = sample_validator_with_user();
+        let history = SessionHistory::new();
+        let mut server = ServerSession::new(&validator, &history);
+
+        // 38B base：version + body_iv(16) + body_key(16) + resp_hdr + option
+        // + (pad_len<<4|security) + reserved + command
+        let mut payload = Vec::new();
+        payload.push(crate::encoding::VERSION);
+        payload.extend_from_slice(&[7u8; 16]);
+        payload.extend_from_slice(&[9u8; 16]);
+        payload.push(0); // response header
+        payload.push(0); // option
+        payload.push(SecurityType::Aes128Gcm.as_u8()); // padding_len = 0
+        payload.push(0); // reserved
+        payload.push(crate::VmessCommand::from(Command::Tcp).as_u8());
+        crate::encoding::write_address_port(
+            &mut payload,
+            &Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            53,
+        );
+        let auth = authenticate(&payload);
+        payload.extend_from_slice(&auth.to_be_bytes());
+        let header_segment_len = payload.len();
+        assert_eq!(header_segment_len, 38 + 7 + 4, "38B base + IPv4 addr/port + FNV1a");
+
+        // header 之后的多余字节：Go 不覆盖，Rust 修复后同样不覆盖
+        payload.extend_from_slice(&[0xFF; 10]);
+
+        let header = server
+            .parse_decoded_header_payload(&payload, &user)
+            .expect("header-段校验必须通过（尾部字节不参与 FNV1a）");
+        assert_eq!(header.command, Command::Tcp);
+        assert_eq!(header.security, SecurityType::Aes128Gcm);
     }
 
     #[test]

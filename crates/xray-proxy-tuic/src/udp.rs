@@ -87,7 +87,7 @@ impl UniRespRouter {
         let w = Arc::clone(&waiters);
         #[allow(
             clippy::disallowed_methods,
-            reason = "热路径豁免（B6 t975）：每帧泵——per-connection uni-stream 响应路由（accept_uni 循环），数据面热路径零改动（坑约束 12）；托管接线归 P1 插件装配"
+            reason = "②豁免（bd kwevg · §3.5.6）：热路径豁免（B6 t975）：每帧泵——per-connection uni-stream 响应路由（accept_uni 循环），数据面热路径零改动（坑约束 12）；托管接线归 P1 插件装配；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             let log = &*UDP_LOG;

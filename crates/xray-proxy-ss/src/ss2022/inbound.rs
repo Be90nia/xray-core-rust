@@ -21,7 +21,6 @@
 
 use std::{io, sync::Arc, time::UNIX_EPOCH};
 
-use parking_lot::Mutex;
 use tokio::{io::AsyncReadExt, net::TcpStream};
 use xray_common::net::address::Address;
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, Aes256Gcm, ChaCha20Poly1305Aead};
@@ -153,7 +152,10 @@ impl Ss2022Inbound {
 /// 对应 Go `MultiUserInbound` struct（`proxy/shadowsocks_2022/inbound_multi.go`）。
 ///
 /// 多用户表共享句柄：(user, psk_identity(user.psk)) 预计算 identity。
-type UserTable = Arc<Mutex<Vec<(Ss2022User, [u8; 16])>>>;
+///
+/// 写时复制快照：读侧只 `Arc::clone`（O(1)，bd x1ldn），写侧（gRPC 增删用户，
+/// 罕见）`Arc::make_mut` 重建整表。
+type UserTable = Arc<parking_lot::RwLock<Arc<Vec<(Ss2022User, [u8; 16])>>>>;
 
 /// TCP 多用户识别：EIH（identity header）= AES-ECB(identitySubkey(iPSK, salt))，
 /// 解密得 `psk_identity(uPSK)` 查用户表；session key 由命中的 uPSK 派生。
@@ -161,7 +163,7 @@ pub struct MultiUserInbound {
     /// 服务端主 PSK。
     psk: Vec<u8>,
     kind: CipherKind2022,
-    /// 用户列表（`Arc<Mutex>` 支持动态增删）。
+    /// 用户列表（写时复制快照，`Arc<RwLock<Arc<Vec<..>>>>` 支持动态增删）。
     ///
     /// 每项 = (user, psk_identity(user.psk))：identity 在用户装载/添加时
     /// 预计算一次（blake3），EIH 匹配退化为 16B memcmp，消除每连接 ×
@@ -194,7 +196,7 @@ impl MultiUserInbound {
         Ok(Self {
             psk,
             kind,
-            users: Arc::new(Mutex::new(users)),
+            users: Arc::new(parking_lot::RwLock::new(Arc::new(users))),
             timestamp_tolerance: TIMESTAMP_TOLERANCE_SECS as u64,
             replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
@@ -211,12 +213,15 @@ impl MultiUserInbound {
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
-        let users = self.users.lock().clone();
+        // bd x1ldn：只取 Arc 快照（O(1)）。旧实现 `lock().clone()` 每连接深拷贝
+        // 整张用户表（含各用户 PSK），且发生在读 salt/EIH **之前**的未认证路径
+        // ⇒ N 用户节点上未认证流量即可驱动 N 倍分配放大。
+        let users = Arc::clone(&self.users.read());
         read_ss2022_request_multi(
             conn,
             &self.psk,
             self.kind,
-            &users,
+            users.as_slice(),
             self.timestamp_tolerance,
             &self.replay,
         )
@@ -235,7 +240,8 @@ impl MultiUserInbound {
         }
         let psk = derive_psk(&user.psk, self.kind)?;
         let identity = psk_identity(&psk);
-        let mut users = self.users.lock();
+        let mut table = self.users.write();
+        let users = Arc::make_mut(&mut *table);
         if users.iter().any(|(u, _)| u.email == user.email) {
             return Err(SsError::UserNotFoundByEmail(format!(
                 "User {} already exists",
@@ -251,7 +257,8 @@ impl MultiUserInbound {
     /// # Errors
     /// - [`SsError::UserNotFoundByEmail`]：email 不存在。
     pub fn remove_user(&self, email: &str) -> Result<()> {
-        let mut users = self.users.lock();
+        let mut table = self.users.write();
+        let users = Arc::make_mut(&mut *table);
         let len_before = users.len();
         users.retain(|(u, _)| u.email != email);
         if users.len() == len_before {
@@ -275,20 +282,20 @@ impl MultiUserInbound {
     /// 返回用户 (identity, psk) 表快照（UDP relay 的 EIH 用户识别）。
     #[must_use]
     pub fn udp_user_table(&self) -> Vec<([u8; 16], Vec<u8>)> {
-        self.users.lock().iter().map(|(u, identity)| (*identity, u.psk.clone())).collect()
+        self.users.read().iter().map(|(u, identity)| (*identity, u.psk.clone())).collect()
     }
 
     /// 当前用户数。
     #[must_use]
     pub fn users_count(&self) -> usize {
-        self.users.lock().len()
+        self.users.read().len()
     }
 
     /// 用户 (email, level) 快照（GetInboundUsers 的列表面，Go `GetUsers` 同语义；
     /// PSK 不回吐——凭据不经管理面外泄）。
     #[must_use]
     pub fn user_emails(&self) -> Vec<(String, u32)> {
-        self.users.lock().iter().map(|(u, _)| (u.email.clone(), u.level)).collect()
+        self.users.read().iter().map(|(u, _)| (u.email.clone(), u.level)).collect()
     }
 }
 

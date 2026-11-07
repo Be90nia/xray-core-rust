@@ -101,6 +101,8 @@ pub fn install_with_luid(
 /// 打开动态会话引擎（Go `openWFPEngine`，:222）。
 fn open_engine() -> Result<HANDLE, String> {
     let name = wide("Xray TUN");
+    // SAFETY: FWPM_SESSION0 全字段为整数/指针 POD（含 FWPM_DISPLAY_DATA0），全零位模式
+    // 即合法默认值（sessionKey 全零 = 内核生成，flags 0 = 非动态）；随后逐字段赋有效值。
     let mut session: wfp::FWPM_SESSION0 = unsafe { std::mem::zeroed() };
     session.displayData =
         wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };
@@ -148,6 +150,8 @@ fn install_specs(specs: &[super::spec::FilterSpec]) -> Result<LeakFilterGuard, S
 /// 新建子层（Go :260-268）。
 fn add_sublayer(engine: HANDLE, sublayer_key: GUID) -> Result<(), String> {
     let name = wide("Xray TUN");
+    // SAFETY: FWPM_SUBLAYER0 全字段为整数/指针 POD，全零位模式合法（subLayerKey/providerKey
+    // 全零 → 由内核分配/无提供者，weight 随后赋 0xffff）；零值不会留下悬垂指针。
     let mut sublayer: wfp::FWPM_SUBLAYER0 = unsafe { std::mem::zeroed() };
     sublayer.subLayerKey = sublayer_key;
     sublayer.displayData =
@@ -171,6 +175,8 @@ fn add_filter(
     let mut arena = CondArena::default();
     let mut conditions = build_conditions(&spec.conditions, &mut arena);
 
+    // SAFETY: FWPM_FILTER0 全字段为整数/指针 POD，全零位模式合法（filterKey/providerKey 全零
+    // = 内核分配/无提供者；filterCondition 零长指针随后按 conditions 覆写）。
     let mut filter: wfp::FWPM_FILTER0 = unsafe { std::mem::zeroed() };
     filter.displayData =
         wfp::FWPM_DISPLAY_DATA0 { name: name.as_ptr() as PWSTR, description: ptr::null_mut() };

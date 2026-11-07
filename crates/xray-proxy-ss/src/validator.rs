@@ -98,12 +98,35 @@ struct ValidatorInner {
     behavior_seed: u64,
     behavior_fused: bool,
     /// 已见 IV 表（按 email 分用户；容量封顶见 [`SEEN_IVS_CAP`]）。
-    seen_ivs: std::collections::HashMap<String, std::collections::HashSet<Vec<u8>>>,
+    seen_ivs: std::collections::HashMap<String, SeenIvs>,
 }
 
+/// 单用户 seen-IV 表：`(去重集合, 插入序队列)`——触顶按 FIFO 逐出最旧一条。
+type SeenIvs = (std::collections::HashSet<Vec<u8>>, std::collections::VecDeque<Vec<u8>>);
+
 /// 每用户 seen-IV 表容量上限（洪泛防护；Go `iv_check` 未实现检查，此为
-/// Rust 加强项的内存硬顶，触顶清空该用户集合）。
+/// Rust 加强项的内存硬顶）。触顶**逐出最旧一条**，不是清空整表——清空等于
+/// 把重放窗口整体重置（已见 IV 全部重新可重放，bd w9c0v）。
 const SEEN_IVS_CAP: usize = 65536;
+
+/// 记录一个已见 IV；已存在返回 `false`（重放）。
+///
+/// 触顶时按 FIFO 逐出**最旧一条**再插入：内存有界且保留重放窗口（bd w9c0v
+/// 修的是旧实现触顶 `clear()` 整表 = 窗口整体重置）。
+fn record_seen_iv(table: &mut SeenIvs, iv: Vec<u8>) -> bool {
+    let (seen, order) = table;
+    if seen.contains(&iv) {
+        return false;
+    }
+    if seen.len() >= SEEN_IVS_CAP {
+        if let Some(oldest) = order.pop_front() {
+            seen.remove(&oldest);
+        }
+    }
+    seen.insert(iv.clone());
+    order.push_back(iv);
+    true
+}
 
 impl Default for Validator {
     fn default() -> Self {
@@ -252,13 +275,8 @@ impl Validator {
             let iv_len_us = iv_len as usize;
             if iv_len_us <= bs.len() {
                 let iv = bs[..iv_len_us].to_vec();
-                let seen = inner.seen_ivs.entry(user.email.clone()).or_default();
-                // 容量封顶（Go 无 iv_check 实现，此为 Rust 加强项）：洪泛下
-                // 65536×16B≈1MB/用户硬上限，触顶清空重开而非 OOM。
-                if seen.len() >= SEEN_IVS_CAP {
-                    seen.clear();
-                }
-                if !seen.insert(iv) {
+                let table = inner.seen_ivs.entry(user.email.clone()).or_default();
+                if !record_seen_iv(table, iv) {
                     return Err(SsError::IvNotUnique);
                 }
             }
@@ -484,6 +502,28 @@ mod tests {
             iv_check: true,
         };
         MemoryUser::new(email, MemoryAccount::from_proto(&p).expect("account"))
+    }
+
+    /// bd w9c0v：seen-IV 表触顶必须**逐出最旧一条**，不得清空整表
+    /// （清空 = 重放窗口整体重置，已见 IV 全部重新可重放）。
+    #[test]
+    fn seen_iv_cap_evicts_oldest_not_whole_table() {
+        let mut table: SeenIvs = Default::default();
+        for i in 0..SEEN_IVS_CAP as u64 {
+            assert!(record_seen_iv(&mut table, i.to_be_bytes().to_vec()), "unique iv {i}");
+        }
+        assert_eq!(table.0.len(), SEEN_IVS_CAP);
+
+        assert!(record_seen_iv(&mut table, u64::MAX.to_be_bytes().to_vec()), "new iv at cap");
+        assert_eq!(table.0.len(), SEEN_IVS_CAP, "容量保持封顶");
+        assert!(!table.0.contains(0u64.to_be_bytes().as_slice()), "最旧一条被逐出");
+        assert!(
+            table.0.contains(1u64.to_be_bytes().as_slice()),
+            "其余条目必须保留（旧实现触顶 clear 整表）"
+        );
+        assert!(table.0.contains(u64::MAX.to_be_bytes().as_slice()), "新条目入表");
+
+        assert!(!record_seen_iv(&mut table, 1u64.to_be_bytes().to_vec()), "重复 IV 仍判重放");
     }
 
     #[test]

@@ -258,7 +258,20 @@ async fn handle_bi_frame(
     recv_bi: quinn::RecvStream,
     fx: &Arc<FxScope>,
 ) {
-    match read_frame_from_recv(recv_bi, 256).await {
+    // bd irtg9：同 [`handle_incoming_uni`]——本函数在 connection 级 select! 的 arm body
+    // 内联 await，Connect 帧读必须有硬超时，否则半开 bi 流冻结整连接。
+    let frame = match tokio::time::timeout(FRAME_READ_TIMEOUT, read_frame_from_recv(recv_bi, 256))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            SERVER_LOG.debug(format!(
+                "tuic server: bi Connect frame read timeout ({FRAME_READ_TIMEOUT:?}), dropping stream"
+            ));
+            return;
+        },
+    };
+    match frame {
         Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
             let Some(target) = addr_to_socket_addr(&addr) else {
                 SERVER_LOG.warn(format!("tuic server: addr not ip literal: {addr:?}"));
@@ -351,7 +364,20 @@ pub(crate) async fn handle_incoming_uni(
     udp_table: &mut UdpAssocTable,
     ctx: &str,
 ) {
-    match read_uni_frame(&mut uni).await {
+    // bd irtg9：本函数在 connection 级 `select!` 的 arm body 里**内联 await**（未 spawn），
+    // 而 `read_uni_frame` 的首个 `read_exact` 原无超时 ⇒ 认证后的客户端只要开一条 uni
+    // stream 发 1 字节就停，读永久 park，整条 QUIC 连接的 TCP 中继与 datagram 一起冻结。
+    // 给帧读套硬超时：半开流最多占住连接 [`FRAME_READ_TIMEOUT`]。
+    let frame = match tokio::time::timeout(FRAME_READ_TIMEOUT, read_uni_frame(&mut uni)).await {
+        Ok(r) => r,
+        Err(_) => {
+            SERVER_LOG.debug(format!(
+                "{ctx}: uni stream frame read timeout ({FRAME_READ_TIMEOUT:?}), dropping stream"
+            ));
+            return;
+        },
+    };
+    match frame {
         Ok(UniFrame::Command(Command::Heartbeat)) => {},
         Ok(UniFrame::Command(Command::Dissociate { assoc_id })) => {
             udp_table.dissociate(assoc_id);
@@ -422,6 +448,20 @@ pub(crate) async fn read_frame_from_recv(
 
 /// UDP assoc 会话空闲淘汰（对齐 Go `CancelAfterInactivity(1min)` 与 SS inbound 样板）。
 const UDP_ASSOC_IDLE: Duration = Duration::from_secs(60);
+
+/// 分片重组表上限（assoc 数，bd 039nq）。
+///
+/// 每 assoc 最坏 ≈ `MAX_FRAG_TOTAL(16) × 32B` 槽位 + struct ≈ 1KB ⇒ 1024 assoc ≈ 1MiB
+/// 上界（旧实现无上限：65536 assoc × 255 槽 ≈ 510MiB，单连接即可按住）。
+const MAX_FRAG_ASSOCS: usize = 1024;
+/// 分片缓存的静默期（bd 039nq）：超过即被 [`UdpAssocTable::sweep_frags`] 清掉。
+const FRAG_IDLE: Duration = Duration::from_secs(60);
+
+/// 帧读硬超时（bd irtg9）：uni/bi 流的首帧（Heartbeat/Dissociate/Packet/Connect）
+/// 在一个 `read_exact` 内读取，而这两条路径都在 connection 级 `select!` 的 arm body
+/// 里内联 await（未 spawn）⇒ 无超时则一条半开流冻结整连接的 TCP 中继与 datagram。
+/// 取 10s：正常客户端开流即写帧（毫秒级），留足慢链路余量。
+pub(crate) const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 会话上行项：(目标, 负载, 回写目标, 请求 pkt_id——响应帧原样回显，
 /// 客户端 quic 模式按 (assoc_id, pkt_id) 配对)。
@@ -496,8 +536,8 @@ impl ReplySink {
 pub(crate) struct UdpAssocTable {
     dispatcher: Option<Arc<dyn DispatchHandler>>,
     sessions: HashMap<u16, tokio::sync::mpsc::Sender<UdpAssocItem>>,
-    /// per-assoc 分片重组器（bd 2x5 分片实装）。
-    frags: HashMap<u16, crate::protocol::FragmentAssembler>,
+    /// per-assoc 分片重组器 + 最近活动时刻（bd 2x5 分片实装；bd 039nq 加上界 + TTL）。
+    frags: HashMap<u16, (crate::protocol::FragmentAssembler, std::time::Instant)>,
     /// 组件自持托管 scope（B6，bd t975）：per-assoc 会话任务经此 spawn。
     fx: Arc<FxScope>,
 }
@@ -512,13 +552,31 @@ impl UdpAssocTable {
     /// 分片包走 per-assoc [`FragmentAssembler`] 重组：
     /// 全部到齐后才路由；中间片静默缓存；非法 frag_total/frag_id 警告丢包。
     /// 通道满时丢包（UDP 有损语义）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "分片表老化计时是 relay 内部实现细节，不走业务 Clock 注入（TTL 由 FRAG_IDLE 常量决定，可测性不受影响）"
+    )]
     pub(crate) fn handle_packet(&mut self, pkt: Packet, sink: ReplySink) {
         // ponytail: 收包时顺带清扫已退出（空闲淘汰/出错）会话的残留 sender
         self.sessions.retain(|_, tx| !tx.is_closed());
+        // bd 039nq：分片表同样必须自清——原实现只有 Dissociate 一处移除，且
+        // `frag_total` 上界 255 ⇒ 65536 个 assoc_id × 8KB ≈ 510MiB 可被单连接常驻。
+        self.sweep_frags();
         // 分片路径：喂给该 assoc 的 assembler，未到齐则缓存
         if pkt.frag_total > 1 {
             let assoc = pkt.assoc_id;
-            let assembler = self.frags.entry(assoc).or_default();
+            if !self.frags.contains_key(&assoc) && self.frags.len() >= MAX_FRAG_ASSOCS {
+                SERVER_LOG.debug(format!(
+                    "tuic udp relay: fragment assoc table full (max {MAX_FRAG_ASSOCS}), dropping assoc={assoc}"
+                ));
+                return;
+            }
+            let now = std::time::Instant::now();
+            let (assembler, last_seen) = self
+                .frags
+                .entry(assoc)
+                .or_insert_with(|| (crate::protocol::FragmentAssembler::new(), now));
+            *last_seen = now;
             match assembler.feed(pkt) {
                 Ok(Some(complete)) => {
                     // 重组成功 → 走常规路由
@@ -536,6 +594,16 @@ impl UdpAssocTable {
             return;
         }
         self.route_packet(pkt, sink);
+    }
+
+    /// 清掉静默超过 [`FRAG_IDLE`] 的分片缓存（bd 039nq：无 GC 时单连接可常驻 ~510MiB）。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "分片表老化计时是 relay 内部实现细节，不走业务 Clock 注入（见 handle_packet 同款理由）"
+    )]
+    fn sweep_frags(&mut self) {
+        let now = std::time::Instant::now();
+        self.frags.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < FRAG_IDLE);
     }
 
     /// 内部：把（完整）Packet 投递到 assoc 会话。

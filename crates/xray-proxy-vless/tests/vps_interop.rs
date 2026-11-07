@@ -27,7 +27,7 @@ const VLESS_VERSION: u8 = 0;
 /// 集成 VisionConn padding exchange：encode VLESS header 后用 VisionConn
 /// 包装 TLS conn，发 HTTP GET（自动 Vision padding，首块带 uuid）。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 sg.yzswgroup.top 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn vless_tcp_tls_vps_interop() {
     use xray_proxy_vless::encryption::vision_conn::VisionConn;
 
@@ -114,7 +114,7 @@ async fn vless_tcp_tls_vps_interop() {
 /// 此配置无 flow=xtls-rprx-vision，服务端不期望 Vision padding。
 /// 测试 VLESS header + WebSocket 传输层与 Go 的互通。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 cdn_sg.yzswgroup.top WS 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn vless_ws_tls_vps_interop() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

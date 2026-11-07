@@ -26,7 +26,7 @@ fn increment_nonce(nonce: &mut [u8]) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 sg.yzswgroup.top 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn ss2022_tcp_vps_interop() {
     let cipher = "2022-blake3-aes-256-gcm";
     let psk_b64 = "swzPBNUUnCN6/Ply/V90cKtGbQdNf/UK6v1UjIRAsdQ=";

@@ -23,7 +23,7 @@
 use std::sync::{Arc, LazyLock};
 
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::TcpStream,
 };
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
@@ -143,7 +143,7 @@ pub async fn serve_vless(
         let local = listener.local_addr()?;
         #[allow(
             clippy::disallowed_methods,
-            reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let result = if let Some(acc) = tls {
@@ -487,8 +487,8 @@ fn validate_flow(
         }
     } else if flow.is_empty() {
         // Go inbound.go:591-595：空 flow + XRV 账号 + TCP 拒（TLS-in-TLS 特征暴露）。
-        // ponytail: Go 的 isMuxAndNotXUDP mux 分支未实现——仅覆盖 command==TCP，
-        // mux 维持放行防误伤 XUDP-mux 合法流；mux 首帧解析落地时补齐。
+        // mux 臂（`isMuxAndNotXUDP`）需要连接首字节，落在
+        // [`finish_vless_dispatch`] 的 0b 探测闸（Go inbound.go:178-190）。
         if account_flow == crate::FLOW_XRV && command == crate::encoding::VlessCommand::Tcp {
             return Err(std::io::Error::other(
                 "account is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.",
@@ -524,6 +524,76 @@ fn vision_uuid_bytes(
 ///   装饰器）
 /// - Rvs：响应头 → [`handle_reverse_relay`] 反向代理派发
 async fn finish_vless_dispatch<R, W>(
+    mut reader: R,
+    write_half: W,
+    decoded: crate::encoding::server::DecodedRequest,
+    handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    options: Option<VlessInboundOptions>,
+    raw_tcp: Option<TcpStream>,
+    access: xray_app_dispatcher::AccessContext,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    use crate::encoding::VlessCommand;
+
+    // 0a. Go inbound.go:540-542：reverse（portal）账号只许发 Rvs 命令。否则持
+    // portal UUID 者可直接把它当任意出网的正向代理（Go 原文 "for safety reasons"）。
+    if let Some(user) = decoded.user.as_ref() {
+        if user.account.reverse.is_some() && decoded.command != VlessCommand::Rvs {
+            return Err(std::io::Error::other(format!(
+                "for safety reasons, user {} is not allowed to use forward proxy",
+                user.account.id.uuid(),
+            )));
+        }
+    }
+
+    // 0b. Go inbound.go:178-190 `isMuxAndNotXUDP`：XRV 账号 + 空 flow 的 Mux
+    // 命令只放过 XUDP 形态（首帧 sessionID 高/低字节 = 0、network = UDP），其余
+    // 与 TCP 同为 TLS-in-TLS 特征 → 拒（Go inbound.go:584）。判据要连接首字节，
+    // 故此处探测后**原样放回**再交分派（拒绝仍发生在响应头之前）。
+    let probe_mux = decoded.command == VlessCommand::Mux
+        && decoded.addons.flow.is_empty()
+        && decoded.user.as_ref().is_some_and(|u| u.account.flow == crate::FLOW_XRV);
+    if probe_mux {
+        let mut first = [0u8; 7];
+        // Go 的判据来自「与请求头同批到达的首块」（`first.ReadFrom` 单次读，解码
+        // 消耗掉头后剩下的才是 mux 帧）。Rust 在解码后读，客户端若只发头再等
+        // 响应头就会互等 ⇒ 加 1s 探测窗：超时按「首块不足 7B」处理，与 Go 对
+        // 「头后无帧」一律拒的结论一致（`read` 是 cancel-safe，超时不吞字节）。
+        let n =
+            match tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut first))
+                .await
+            {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => 0,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => 0, // 探测窗内无后续字节 ⇒ 非 XUDP
+            };
+        // mux 帧布局：len(2) session(2) status(1) opt(1) network(1) —— 与 Go 的
+        // `firstBytes[2]/[3]/[6]` 同偏移。
+        let is_xudp = n >= 7 && first[2] == 0 && first[3] == 0 && first[6] == 2;
+        if !is_xudp {
+            return Err(std::io::Error::other(
+                "account is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters.",
+            ));
+        }
+        let restored = AsyncReadExt::chain(std::io::Cursor::new(first[..n].to_vec()), reader);
+        return finish_vless_command(
+            restored, write_half, decoded, handler, options, raw_tcp, access,
+        )
+        .await;
+    }
+
+    finish_vless_command(reader, write_half, decoded, handler, options, raw_tcp, access).await
+}
+
+/// [`finish_vless_dispatch`] 的后半段：flow 五臂校验 → 响应头 → 按 command 分派。
+///
+/// 单独成函数只因 mux 探测路径要先读连接首字节再放回，reader 变成
+/// `Chain<Cursor<..>, R>`，与常规路径不是同一类型实例。
+async fn finish_vless_command<R, W>(
     reader: R,
     mut write_half: W,
     decoded: crate::encoding::server::DecodedRequest,
@@ -670,7 +740,7 @@ where
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     #[allow(
         clippy::disallowed_methods,
-        reason = "存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     let uplink = tokio::spawn(async move {
         // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
@@ -907,6 +977,28 @@ mod tests {
                 id: uuid.to_string(),
                 flow: flow.to_string(),
                 testseed: testseed.to_vec(),
+                ..Default::default()
+            })
+            .unwrap(),
+        };
+        let v = MemoryValidator::new();
+        v.add(user).unwrap();
+        (uuid, Arc::new(v))
+    }
+
+    /// 带 reverse（portal）配置的用户 validator：`account.reverse` 非空 ⇒
+    /// Go inbound.go:540-542 只许 Rvs 命令（9mpov 反例测试用）。
+    fn make_validator_with_reverse_user() -> (UUID, Arc<dyn Validator>) {
+        let uuid = UUID::new();
+        let user = MemoryUser {
+            level: 0,
+            email: "portal@example.com".to_string(),
+            account: MemoryAccount::from_proto_account(&xray_proto::xray::proxy::vless::Account {
+                id: uuid.to_string(),
+                reverse: Some(xray_proto::xray::proxy::vless::Reverse {
+                    tag: "portal-tag".to_string(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             })
             .unwrap(),
@@ -1886,6 +1978,104 @@ mod tests {
         assert_eq!(&*payload.lock(), new_frame, "New frame bytes must pass through verbatim");
     }
 
+    /// bd 0bygf：Go inbound.go:178-190 `isMuxAndNotXUDP` —— XRV 账号 + **空 flow**
+    /// 的 Mux 命令只放过 XUDP 形态（首帧 sessionID = 0/0 且 network = UDP）；其余
+    /// 形态与 TCP 命令同为 TLS-in-TLS 特征 ⇒ 拒（Go inbound.go:584）。
+    #[tokio::test]
+    async fn vless_inbound_xrv_account_mux_requires_xudp() {
+        /// 起一个 XRV 账号（客户端 flow=""）的 serve_vless；返回 (地址, uuid, 捕获)。
+        #[allow(clippy::type_complexity, reason = "测试局部helper返回夹具元组")]
+        async fn spawn_xrv_mux(
+            tag: &'static str,
+        ) -> (
+            std::net::SocketAddr,
+            UUID,
+            Arc<parking_lot::Mutex<Vec<u8>>>,
+            Arc<parking_lot::Mutex<u32>>,
+        ) {
+            let capture = FrameCapture::new();
+            let payload = std::sync::Arc::clone(&capture.payload);
+            let called = std::sync::Arc::clone(&capture.called);
+            let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture;
+            let ohm = Arc::new(SimpleOhm::new());
+            ohm.set_default(handler);
+            let (uuid, validator) = make_validator_with_user_flow(crate::FLOW_XRV, &[]);
+            let listener = InboundTcpListener::bind(
+                "127.0.0.1:0",
+                xray_transport::sockopt::SocketOptions::default(),
+            )
+            .await
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            xray_common::testing::spawn(tag, async move {
+                let _ = serve_vless(listener, ohm, validator, None, None, None).await;
+            });
+            (addr, uuid, payload, called)
+        }
+
+        // ① 非 XUDP（network = TCP）⇒ 拒绝，且不发响应头
+        let (addr, uuid, _payload, called) = spawn_xrv_mux("vless-xrv-mux-non-xudp").await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Mux,
+            None,
+            None,
+            &empty_addons(),
+        )
+        .await
+        .unwrap();
+        client.write_all(&[0x00, 0x0C, 0x00, 0x01, 0x01, 0x00, 0x01]).await.unwrap();
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut probe))
+            .await
+            .expect("server must close promptly for mux under XRV account without XUDP")
+        {
+            Ok(0) => {},
+            Ok(n) => {
+                panic!("server sent {n} bytes before closing: response header must not be sent")
+            },
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {},
+            Err(e) => panic!("unexpected io error: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*called.lock(), 0, "非 XUDP 的 mux 不得触达 dispatch");
+
+        // ② XUDP 形态（session = 0/0 + network = UDP）⇒ 放行，探测字节原样回填
+        let (addr, uuid, payload, called) = spawn_xrv_mux("vless-xrv-mux-xudp").await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Mux,
+            None,
+            None,
+            &empty_addons(),
+        )
+        .await
+        .unwrap();
+        // 首块与请求头同批写出（真实 mux client 形态；Go 的 `first` 也来自同一批）
+        let xudp_frame: &[u8] = &[0x00, 0x20, 0x00, 0x00, 0x01, 0x00, 0x02];
+        client.write_all(xudp_frame).await.unwrap();
+        let _resp = decode_response_header(&mut client, VERSION).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while payload.lock().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("XUDP mux 帧应在 3s 内到达 dispatch");
+        assert_eq!(&*payload.lock(), xudp_frame, "探测读出的首字节必须原样放回");
+        assert_eq!(*called.lock(), 1, "XUDP mux 必须正常 dispatch");
+    }
+
     /// VLESS Rvs command + enable_reverse=false：维持原 warn+close 行为，
     /// dispatch 不应被调用。
     #[tokio::test]
@@ -2118,6 +2308,60 @@ mod tests {
     #[tokio::test]
     async fn vless_inbound_rejects_xrv_without_outer_tls13() {
         assert_flow_rejected(crate::FLOW_XRV, VlessCommand::Tcp, false, crate::FLOW_XRV).await;
+    }
+
+    /// 越权闸门（Go inbound.go:540-542，9mpov）：持 portal 反向账号 UUID 者
+    /// 发正向 TCP 请求必拒，且拒绝发生在响应头之前、不触达 dispatch。
+    #[tokio::test]
+    async fn vless_inbound_rejects_forward_proxy_from_reverse_account() {
+        let (uuid, validator) = make_validator_with_reverse_user();
+        let capture = FrameCapture::new();
+        let called = std::sync::Arc::clone(&capture.called);
+        let ohm = Arc::new(SimpleOhm::new());
+        let capture_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = capture.clone();
+        ohm.set_default(capture_handler);
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        xray_common::testing::spawn("vless-reverse-forward-proxy-rejected", async move {
+            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Tcp,
+            Some(&Address::from_ipv4_bytes([127, 0, 0, 1])),
+            Some(80),
+            &empty_addons(),
+        )
+        .await
+        .unwrap();
+
+        let mut probe = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut probe))
+            .await
+            .expect("server must close promptly for forward proxy from reverse account")
+        {
+            Ok(0) => {},
+            Ok(n) => {
+                panic!("server sent {n} bytes before closing: response header must not be sent")
+            },
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {},
+            Err(e) => panic!("unexpected io error: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*called.lock(), 0, "reverse account must not reach dispatch");
     }
 
     // ------------------------------------------------------------------

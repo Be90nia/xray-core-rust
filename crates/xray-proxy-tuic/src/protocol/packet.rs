@@ -157,6 +157,10 @@ impl Packet {
 ///
 /// spec：客户端将 >MTU 的 UDP 包拆成 `frag_total` 个分片（同 `pkt_id`），
 /// 每个分片带 `frag_id`（0-based）和 `size`（本片字节数）。
+/// 单包最大分片数（bd 039nq）：线路字段是 u8（上界 255），但真实 MTU 分片 ≤~16。
+/// 放宽只是给内存放大留口子（单 assoc 槽位 = frag_total × 32B）。
+pub const MAX_FRAG_TOTAL: u8 = 16;
+
 /// 接收端缓存分片直到全部到达，按 `frag_id` 升序拼接为完整 UDP 负载。
 ///
 /// ## 行为
@@ -202,6 +206,15 @@ impl FragmentAssembler {
             return Ok(Some(pkt));
         }
         if pkt.frag_total == 0 || pkt.frag_id >= pkt.frag_total {
+            return Err(TuicError::UnsupportedFragment {
+                frag_total: pkt.frag_total,
+                frag_id: pkt.frag_id,
+            });
+        }
+        // bd 039nq：线路 frag_total 是 u8（上界 255）⇒ 单 assoc 光槽位就 255×32B ≈ 8KB，
+        // 乘 65536 个 assoc_id 可常驻 ~510MiB。真实客户端分片数 ≤~16（MTU 分片），
+        // 超出的按非法分片拒绝（fail-visible，调用方会记日志丢包）。
+        if pkt.frag_total > MAX_FRAG_TOTAL {
             return Err(TuicError::UnsupportedFragment {
                 frag_total: pkt.frag_total,
                 frag_id: pkt.frag_id,

@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Weak,
+        Arc, LazyLock, Weak,
         atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use std::{
 
 use skeleton_infra::fx::{FxScope, Spawned};
 use tokio::sync::{Mutex, RwLock, watch};
-use tracing::debug;
+use tracing::{debug, warn};
 use xray_buf::{io::Writer as _, reader::BufferedReader, writer::BufferedWriter};
 
 // ========== 传输类型 ==========
@@ -452,6 +452,23 @@ impl XUDP {
 
 // ========== SessionManager ==========
 
+/// 从 `start` 起找一个未被占用的会话 ID（最多试探 `sessions.len() + 1` 个位置）。
+///
+/// Go `SessionManager.Allocate` 用 `m.sessions[s.ID] = s` 直接覆盖同名条目；Rust
+/// 侧不覆盖（覆盖会顶掉仍在位的会话，旧会话 close 时 `remove(id)` 又摘掉新条目
+/// ⇒ size 漂移 + 两条连接串流，bd gg862），改为顺延到空位。u16 空间只有 65536 个
+/// ID，全被占用时返回 `None`（调用方 fail-visible 拒新会话）。
+fn next_free_session_id(sessions: &HashMap<u16, Arc<Session>>, start: u16) -> Option<u16> {
+    let mut id = start;
+    for _ in 0..=sessions.len() {
+        if !sessions.contains_key(&id) {
+            return Some(id);
+        }
+        id = id.wrapping_add(1);
+    }
+    None
+}
+
 /// 会话管理器。
 ///
 /// 对应 Go 版本 `SessionManager`，管理所有 Mux 会话的生命周期。
@@ -520,7 +537,8 @@ impl SessionManager {
     /// - 若当前并发数超过 `max_concurrency`，返回 `None`
     /// - 若累计连接数超过 `max_connection`，返回 `None`
     ///
-    /// 新会话自动添加到管理器，ID 递增分配。
+    /// 新会话自动添加到管理器，ID 递增分配（u16 回绕；回绕到的 ID 仍存活时顺延
+    /// 到下一个空位，全占满则 `warn!` + 返回 `None`）。
     pub async fn allocate(&self, strategy: &ClientStrategy) -> Option<Arc<Session>> {
         let mut inner = self.shared.inner.write().await;
 
@@ -538,10 +556,18 @@ impl SessionManager {
             return None;
         }
 
-        inner.count = inner.count.saturating_add(1);
+        // Go session.go:65 `m.count++`（uint16 回绕复用）：旧版 `saturating_add`
+        // 饱和在 65535 ⇒ 第 65536 次分配起恒取同一 ID，insert 顶掉仍在位的会话、
+        // 旧会话 close 又摘掉新条目（bd gg862 / 08wkx-b）。回绕到的 ID 仍存活时
+        // 顺延到下一个空位。
+        inner.count = inner.count.wrapping_add(1);
         self.shared.count.store(inner.count, Ordering::Release);
+        let Some(id) = next_free_session_id(&inner.sessions, inner.count) else {
+            warn!("mux session id space exhausted (all 65536 ids live), refusing new session");
+            return None;
+        };
 
-        let mut session = Session::new(inner.count, TransferType::Stream);
+        let mut session = Session::new(id, TransferType::Stream);
         session.set_parent(Arc::downgrade(&self.shared));
         let session = Arc::new(session);
         inner.sessions.insert(session.id, Arc::clone(&session));
@@ -567,7 +593,9 @@ impl SessionManager {
             return None;
         }
 
-        inner.count = inner.count.saturating_add(1);
+        // Go session.go:85 `m.count++`：uint16 回绕（非饱和，bd gg862）。服务端
+        // 会话 ID 取自对端 New 帧，count 仅作分配计数/空闲判据，故不参与 ID 生成。
+        inner.count = inner.count.wrapping_add(1);
         self.shared.count.store(inner.count, Ordering::Release);
 
         session.set_parent(Arc::downgrade(&self.shared));
@@ -808,6 +836,26 @@ impl Default for XUDPManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 进程级 XUDP 管理器（Go `common/mux/session.go` 包级 `XUDPManager` 变量 +
+/// `init()` 里那条常驻清理 goroutine）。
+///
+/// XUDP 的 cone NAT 语义要求**跨 carrier** 命中同一上游：同一 GlobalID 在 60s
+/// Expiring 窗口内换 carrier（mux 重连 / 多路连接）后必须能重建同一个上游 UDP
+/// socket，否则对端看到源端口变化 ⇒ full-cone 降级成 symmetric（打洞 / 游戏 /
+/// UDP 长连接失败，bd ikwxy）。per-worker 一份会把映射绑死在单条 carrier 上。
+///
+/// 首次调用需处于 tokio runtime 内（清理任务在此启动；生产首次触碰点是
+/// inbound 装配期）。
+#[must_use]
+pub fn global_xudp_manager() -> Arc<XUDPManager> {
+    static GLOBAL: LazyLock<Arc<XUDPManager>> = LazyLock::new(|| {
+        let mut manager = XUDPManager::new();
+        manager.start_cleanup();
+        Arc::new(manager)
+    });
+    Arc::clone(&GLOBAL)
 }
 
 impl Drop for XUDPManager {
@@ -1201,6 +1249,58 @@ mod tests {
         let result = manager.close_if_no_session_and_idle(0, 0).await;
         assert!(!result);
         assert!(!manager.is_closed());
+    }
+
+    /// bd gg862 / 08wkx-b：会话 ID 计数对齐 Go `m.count++` 的 uint16 **回绕**
+    /// （旧版 `saturating_add` 饱和在 65535 ⇒ 第 65536 次分配起恒取同一 ID）。
+    #[tokio::test]
+    async fn allocate_wraps_session_id_at_u16_max() {
+        let manager = SessionManager::new();
+        let strategy = ClientStrategy::default();
+
+        // 逼近上限：下一次分配必然回绕到 0
+        manager.shared.inner.write().await.count = u16::MAX;
+
+        let s = manager.allocate(&strategy).await.expect("wrap must allocate");
+        assert_eq!(s.id(), 0, "65535+1 必须回绕到 0（Go uint16++）");
+        assert_eq!(manager.count(), 0);
+        assert_eq!(manager.size().await, 1);
+    }
+
+    /// 回绕命中的 ID 仍存活时必须顺延到下一个空位，而不是覆盖在位会话
+    /// （覆盖会顶掉旧会话：旧会话 close 时 `remove(id)` 摘掉新条目、size 漂移、
+    /// 两条连接串流）。
+    #[tokio::test]
+    async fn allocate_skips_live_id_after_wrap() {
+        let manager = SessionManager::new();
+        let strategy = ClientStrategy::default();
+
+        let first = manager.allocate(&strategy).await.expect("first");
+        assert_eq!(first.id(), 1);
+
+        // 让下一次分配回绕到已被占用的 1
+        manager.shared.inner.write().await.count = 0;
+
+        let second = manager.allocate(&strategy).await.expect("second");
+        assert_eq!(second.id(), 2, "回绕命中的 id=1 存活 ⇒ 顺延到 2");
+        assert_eq!(manager.count(), 1, "count 仍是回绕后的计数值（Go uint16++）");
+        assert_eq!(manager.size().await, 2, "两条会话都必须留在表内");
+
+        manager.remove(second.id()).await;
+        assert!(manager.get(1).await.is_some(), "旧会话仍在位");
+        assert!(manager.get(2).await.is_none());
+        assert_eq!(manager.size().await, 1);
+    }
+
+    /// 服务端 `add` 的 count 同样回绕（Go session.go:85），不饱和。
+    #[tokio::test]
+    async fn add_wraps_count_at_u16_max() {
+        let manager = SessionManager::new();
+        manager.shared.inner.write().await.count = u16::MAX;
+
+        let added = manager.add(Session::new(7, TransferType::Stream)).await.expect("add");
+        assert_eq!(added.id(), 7);
+        assert_eq!(manager.count(), 0, "count++ 回绕到 0");
     }
 
     // ========== XUDP 测试 ==========

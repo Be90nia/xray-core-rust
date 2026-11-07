@@ -112,7 +112,7 @@ impl Client {
     {
         let mut stream = self.connect_tcp_on(conn).await?;
         let mut first_frame = Vec::new();
-        write_address_port_ss(&mut first_frame, target_addr, target_port);
+        write_address_port_ss(&mut first_frame, target_addr, target_port)?;
         stream.write_chunk(&first_frame).await?;
         stream.flush().await?;
         Ok(stream)

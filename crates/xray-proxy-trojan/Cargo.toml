@@ -33,7 +33,6 @@ hmac = "0.12"
 # - crc：CRC64-ECMA behaviorSeed（与 SS 一致，drainer 用）
 crc = "2"
 # - rand：随机 nonce / session id
-md-5 = "0.10"
 rand = { workspace = true }
 # P2 批次 B 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
 # 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环，

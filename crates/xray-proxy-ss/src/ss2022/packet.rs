@@ -189,15 +189,21 @@ fn padding_len_for(port: u16, payload_len: usize) -> usize {
 }
 
 /// 构造 client 帧明文区：type || ts || padLen || padding || addr || payload（追加写入 `out`）。
-fn build_client_plaintext_into(addr: &Address, port: u16, payload: &[u8], out: &mut Vec<u8>) {
+fn build_client_plaintext_into(
+    addr: &Address,
+    port: u16,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let pad = padding_len_for(port, payload.len());
     out.reserve(MIN_PLAINTEXT + pad + payload.len() + 4);
     out.push(HEADER_TYPE_CLIENT);
     out.extend_from_slice(&now_unix().to_be_bytes());
     out.extend_from_slice(&(pad as u16).to_be_bytes());
     out.resize(out.len() + pad, 0);
-    write_address_port_ss(out, addr, port);
+    write_address_port_ss(out, addr, port)?;
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 /// 构造 server 帧明文区：type || ts || clientSessionId || padLen || padding || addr || payload
@@ -208,14 +214,15 @@ fn build_server_plaintext_into(
     port: u16,
     payload: &[u8],
     out: &mut Vec<u8>,
-) {
+) -> Result<()> {
     out.reserve(MIN_PLAINTEXT + 8 + payload.len() + 4);
     out.push(HEADER_TYPE_SERVER);
     out.extend_from_slice(&now_unix().to_be_bytes());
     out.extend_from_slice(&client_session_id.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
-    write_address_port_ss(out, addr, port);
+    write_address_port_ss(out, addr, port)?;
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 /// 解析 client 帧明文区（server 侧）：type/ts/pad/addr/payload；payload 写入 `payload_out`。
@@ -398,7 +405,7 @@ impl ClientUdpSession2022 {
             let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
             out.extend_from_slice(&nonce);
             plain.extend_from_slice(&hdr);
-            build_client_plaintext_into(addr, port, payload, plain);
+            build_client_plaintext_into(addr, port, payload, plain)?;
             return self
                 .cipher
                 .seal_into(&nonce, b"", plain, out)
@@ -416,7 +423,7 @@ impl ClientUdpSession2022 {
             }
             out.extend_from_slice(&ecb_block(self.kind, &self.psk_list[i], &pt, true)?);
         }
-        build_client_plaintext_into(addr, port, payload, plain);
+        build_client_plaintext_into(addr, port, payload, plain)?;
         // AEAD 密文体
         self.cipher
             .seal_into(&hdr[4..16], b"", plain, out)
@@ -849,7 +856,7 @@ impl ServerUdpSession2022 {
             let nonce: [u8; UDP_CHACHA_NONCE_SIZE] = rand::random();
             out.extend_from_slice(&nonce);
             plain.extend_from_slice(&hdr);
-            build_server_plaintext_into(self.client_session_id, addr, port, payload, plain);
+            build_server_plaintext_into(self.client_session_id, addr, port, payload, plain)?;
             return self
                 .cipher
                 .seal_into(&nonce, b"", plain, out)
@@ -858,7 +865,7 @@ impl ServerUdpSession2022 {
 
         // 包头 ECB 加密在最前（nonce 用明文头）
         out.extend_from_slice(&ecb_block(self.kind, &self.psk, &hdr, true)?);
-        build_server_plaintext_into(self.client_session_id, addr, port, payload, plain);
+        build_server_plaintext_into(self.client_session_id, addr, port, payload, plain)?;
         self.cipher
             .seal_into(&hdr[4..16], b"", plain, out)
             .map_err(|e| SsError::AeadSeal(e.to_string()))

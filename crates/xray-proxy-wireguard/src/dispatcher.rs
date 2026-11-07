@@ -125,9 +125,13 @@ impl TcpRelay {
         // 消掉首次立即触发
         timer.tick().await;
 
+        // 上/下行 scratch 缓冲在循环外复用（bd m6pkl-N6：曾每轮 `vec![0u8;8192]`，
+        // tick 5ms ⇒ 空转期每连接 200 次/s 分配；内容每次被覆盖，无需清零）。
+        let mut user_buf = vec![0u8; 8192];
+        let mut down_buf = vec![0u8; 8192];
+
         loop {
             // select! 上 duplex 可读 + 定时器
-            let mut user_buf = vec![0u8; 8192];
             tokio::select! {
                 // 用户数据到达（从 WireguardConnection 写入 → from_client 可读）
                 result = tokio::io::AsyncReadExt::read(&mut self.from_client, &mut user_buf) => {
@@ -138,8 +142,7 @@ impl TcpRelay {
                             return;
                         }
                         Ok(n) => {
-                            user_buf.truncate(n);
-                            self.send_to_smoltcp(&user_buf).await;
+                            self.send_to_smoltcp(&user_buf[..n]).await;
                         }
                         Err(_) => {
                             self.close_socket().await;
@@ -152,7 +155,7 @@ impl TcpRelay {
             }
 
             // 每次循环都尝试从 smoltcp 接收数据
-            let should_close = self.recv_from_smoltcp().await;
+            let should_close = self.recv_from_smoltcp(&mut down_buf).await;
             if should_close {
                 let _ = tokio::io::AsyncWriteExt::shutdown(&mut self.to_client).await;
                 return;
@@ -190,27 +193,29 @@ impl TcpRelay {
 
     /// 从 smoltcp TCP socket 接收数据，写入 duplex。
     /// 返回 true 表示 socket 已关闭。
-    async fn recv_from_smoltcp(&mut self) -> bool {
-        let recv_data = {
+    ///
+    /// `scratch` 由调用方循环外复用（bd m6pkl-N6）；本函数只写 `scratch[..n]`，
+    /// 零分配把数据交给 `write_all`。
+    async fn recv_from_smoltcp(&mut self, scratch: &mut [u8]) -> bool {
+        let (recv_len, closed) = {
             let mut stack = self.netstack.lock().await;
             stack.poll(smoltcp::time::Instant::now());
-            let (data, closed) = stack.with_tcp_socket(self.handle, |s| {
-                let mut buf = vec![0u8; 8192];
-                let n = s.recv_slice(&mut buf).unwrap_or(0);
-                buf.truncate(n);
-                (buf, !s.is_active())
+            let r = stack.with_tcp_socket(self.handle, |s| {
+                let n = s.recv_slice(scratch).unwrap_or(0);
+                (n, !s.is_active())
             });
             stack.poll(smoltcp::time::Instant::now());
-            (data, closed)
+            r
         };
 
-        if !recv_data.0.is_empty() {
+        if recv_len > 0 {
             // 数据已从 smoltcp recv 缓冲 dequeue，半途 partial write = 丢数据；
             // write_all 阻塞即背压（duplex 满 → smoltcp recv 窗口收窄 → 对端节流），
             // 对应 Go io.Copy 全量转发语义
-            let _ = tokio::io::AsyncWriteExt::write_all(&mut self.to_client, &recv_data.0).await;
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut self.to_client, &scratch[..recv_len])
+                .await;
         }
-        recv_data.1
+        closed
     }
 
     async fn close_socket(&self) {
@@ -246,8 +251,11 @@ impl UdpRelay {
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await;
 
+        // 上/下行 scratch 缓冲在循环外复用（bd m6pkl-N6，同 TcpRelay）。
+        let mut user_buf = vec![0u8; 8192];
+        let mut down_buf = vec![0u8; 65535];
+
         loop {
-            let mut user_buf = vec![0u8; 8192];
             tokio::select! {
                 result = tokio::io::AsyncReadExt::read(&mut self.from_client, &mut user_buf) => {
                     match result {
@@ -257,11 +265,10 @@ impl UdpRelay {
                             return;
                         }
                         Ok(n) => {
-                            user_buf.truncate(n);
                             pump_client_to_udp(
                                 &self.netstack,
                                 self.handle,
-                                &user_buf,
+                                &user_buf[..n],
                                 &self.dest,
                                 &mut self.acc,
                             )
@@ -272,7 +279,9 @@ impl UdpRelay {
                 _ = timer.tick() => {}
             }
 
-            if let Some(frame) = pump_udp_to_client(&self.netstack, self.handle, &self.dest).await {
+            if let Some(frame) =
+                pump_udp_to_client(&self.netstack, self.handle, &self.dest, &mut down_buf).await
+            {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut self.to_client, &frame).await;
             }
         }
@@ -336,30 +345,31 @@ pub(crate) async fn pump_client_to_udp(
 ///
 /// 返回 `None` 表示无数据。帧 target = 回包源地址（Go `udpConnClient.ReadMultiBuffer`
 /// 的 `b.UDP = addr` 语义）。
+///
+/// `scratch` 由调用方循环外复用（bd m6pkl-N6：曾每次调用 `vec![0u8;65535]`，
+/// tick 5ms ⇒ 空转期每连接 200 次/s 分配）。
 pub(crate) async fn pump_udp_to_client(
     netstack: &Arc<AsyncMutex<WgNetStack>>,
     handle: smoltcp::iface::SocketHandle,
     default_dest: &Destination,
+    scratch: &mut [u8],
 ) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
         let received = {
             let mut stack = netstack.lock().await;
             stack.poll(smoltcp::time::Instant::now());
-            let mut buf = vec![0u8; 65535];
-            stack.with_udp_socket(handle, |sock| match sock.recv_slice(&mut buf) {
-                Ok((n, meta)) => {
-                    buf.truncate(n);
-                    Some((buf, meta.endpoint))
-                },
+            stack.with_udp_socket(handle, |sock| match sock.recv_slice(scratch) {
+                Ok((n, meta)) => Some((n, meta.endpoint)),
                 Err(_) => None,
             })
         };
-        let Some((payload, remote)) = received else { break };
+        let Some((n, remote)) = received else { break };
         let target = endpoint_to_destination(&remote).unwrap_or_else(|| default_dest.clone());
-        // ponytail: 每帧独立 writer（New 帧）——读端 New/Keep 均接受，语义等价
+        // ponytail: 每帧独立 writer（New 帧）——读端 New/Keep 均接受，语义等价。
+        // 数据直接从 scratch 装帧，不再经中转 Vec（bd m6pkl-N6）。
         let mut writer = PacketWriter::new(Vec::new(), default_dest.clone(), [0u8; 8]);
-        let _ = writer.write_packet_with_udp_target(&payload, &target);
+        let _ = writer.write_packet_with_udp_target(&scratch[..n], &target);
         out.extend_from_slice(&writer.into_inner());
     }
     (!out.is_empty()).then_some(out)
@@ -1357,7 +1367,8 @@ mod tests {
             s.poll(smoltcp::time::Instant::now());
         }
 
-        let out = pump_udp_to_client(&netstack, handle, &udp_dest(53)).await;
+        let mut down_buf = vec![0u8; 65535];
+        let out = pump_udp_to_client(&netstack, handle, &udp_dest(53), &mut down_buf).await;
         let out = out.expect("frame emitted");
         // 读端解帧：payload + 回包源地址
         let pkt = xray_xudp::packet::PacketReader::new(std::io::Cursor::new(&out))

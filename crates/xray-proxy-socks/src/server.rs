@@ -515,10 +515,9 @@ where
     let mut password = vec![0u8; plen];
     stream.read_exact(&mut password).await?;
 
-    let username_str = String::from_utf8_lossy(&username);
-    let password_str = String::from_utf8_lossy(&password);
-
-    let success = config.has_account(&username_str, &password_str);
+    // 按**原始字节**比较（Go `HasAccount(string, string)` = 字节序列）。
+    // 旧的 `from_utf8_lossy` 会把任意非法 UTF-8 折叠成 U+FFFD ⇒ 碰撞面（bd e4ct8b）。
+    let success = config.has_account_bytes(&username, &password);
     // 回 [VER=1, STATUS=0(success)/0xFF(failure)]（Go protocol.go:130）
     stream.write_all(&[0x01, if success { 0x00 } else { 0xFF }]).await?;
 

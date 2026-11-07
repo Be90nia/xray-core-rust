@@ -21,7 +21,9 @@ use xray_common::net::{destination::Destination, network::Network};
 use crate::{
     client::{Link, MUX_COOL_ADDRESS},
     frame::{FrameMetadata, MAX_METADATA_LEN, SessionStatus},
-    session::{Session, SessionManager, TransferType, XUDP, XUDPManager, XudpStatus},
+    session::{
+        Session, SessionManager, TransferType, XUDP, XUDPManager, XudpStatus, global_xudp_manager,
+    },
     writer::MuxWriter,
 };
 
@@ -88,7 +90,7 @@ impl Dispatcher for DispatchHandlerAdapter {
         let dest_clone = dest.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（每连接 dispatch 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（每连接 dispatch 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             handler.dispatch(&dest_clone, dispatch_link).await;
@@ -141,21 +143,29 @@ pub struct ServerWorker {
 impl ServerWorker {
     pub fn new(dispatcher: Arc<dyn Dispatcher>) -> Self {
         let (done_tx, done_rx) = watch::channel(false);
-        // bd lahx：接线常驻清理（Go common/mux/session.go:235-252 init goroutine
-        // 每分钟清 Expiring 条目并 Interrupt）。task 句柄由 XUDPManager 持有，
-        // Drop（worker 释放）时 abort——不泄漏。
-        let mut xudp_manager = XUDPManager::new();
-        xudp_manager.start_cleanup();
+        // bd lahx / ikwxy：XUDP 表是**进程级**的（Go 包级 `XUDPManager` 变量 +
+        // `init()` 那条常驻清理 goroutine），不按 carrier 各持一份——cone NAT 要求
+        // 同一 GlobalID 跨 carrier（重连/多路连接）命中同一上游。清理任务随进程
+        // 常驻，不再每 worker 起一条。
         Self {
             dispatcher,
             session_manager: Arc::new(SessionManager::new()),
-            xudp_manager: Arc::new(xudp_manager),
+            xudp_manager: global_xudp_manager(),
             closed: Arc::new(AtomicBool::new(false)),
             done_tx,
             done_rx,
             read_source_and_local: false,
             allowed_network: None,
         }
+    }
+
+    /// 注入 XUDP 管理器（缺省为进程级 [`global_xudp_manager`]）。
+    ///
+    /// 仅供需要隔离场景（并行测试、同进程多实例）使用；生产形态是进程全局单表。
+    #[must_use]
+    pub fn with_xudp_manager(mut self, manager: Arc<XUDPManager>) -> Self {
+        self.xudp_manager = manager;
+        self
     }
 
     #[must_use]
@@ -211,7 +221,7 @@ impl ServerWorker {
         let closed = Arc::clone(&self.closed);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（JoinHandle 返回给调用方托管）+ interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改写 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（JoinHandle 返回给调用方托管）+ interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改写 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
@@ -311,7 +321,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -418,7 +428,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -477,7 +487,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面会话输出泵（每连接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -621,7 +631,7 @@ impl ServerWorker {
                     self.handle_normal_new(&meta, data, link_writer).await?;
                 }
             },
-            SessionStatus::Keep => self.handle_status_keep(&meta, data).await?,
+            SessionStatus::Keep => self.handle_status_keep(&meta, data, link_writer).await?,
             SessionStatus::End => self.handle_status_end(&meta).await?,
             SessionStatus::KeepAlive => {}, // data 已读出丢弃
         }
@@ -630,26 +640,53 @@ impl ServerWorker {
 
     /// 处理 Keep 帧：把 data 写到对应 session.output（转发到上游 dispatcher 目标）。
     ///
-    /// 未知 session_id 静默丢弃（对端可能已 End）。
+    /// 未知 session_id：回 End 帧通知对端关闭再丢弃数据（Go `server.go:304-315`
+    /// `NewResponseWriter(...).Close()`）——不回 End 会让对端子流挂到应用层超时
+    /// （bd 9hl0s）；发 Keep 的正是不知道会话已死的一方，这句 End 就是给它收尸的。
+    /// 写上游失败：记日志并关闭会话（Go :316-320 log + `s.Close(false)`）。
     pub async fn handle_status_keep(
         &self,
         meta: &FrameMetadata,
         data: Buffer,
+        link_writer: &Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
     ) -> Result<(), ServerError> {
-        if data.is_empty() {
+        if !meta.has_data() {
             return Ok(());
         }
-        let data_len = data.len() as u64;
-        let session = match self.session_manager.get(meta.session_id()).await {
-            Some(s) => s,
-            None => return Ok(()),
+        let Some(session) = self.session_manager.get(meta.session_id()).await else {
+            let mut closing = MuxWriter::new_response_writer(
+                meta.session_id(),
+                Box::new(crate::writer::SharedWriter::new(Arc::clone(link_writer))),
+                TransferType::Stream,
+            );
+            // Go 忽略 Close() 的写错误（:307）：载体已死时数据本来也送不出去。
+            if let Err(e) = closing.close().await {
+                warn!(
+                    session = meta.session_id(),
+                    error = %e,
+                    "failed to notify peer of closed session"
+                );
+            }
+            return Ok(());
         };
         // 更新流量统计
-        session.add_uplink_bytes(data_len);
-        let mut guard = session.output().await;
-        if let Some(writer) = guard.as_mut() {
-            let mb = MultiBuffer::from_buffer(data);
-            let _ = writer.write_multi_buffer_impl(mb).await;
+        session.add_uplink_bytes(data.len() as u64);
+        let write_failed = {
+            let mut guard = session.output().await;
+            match guard.as_mut() {
+                Some(writer) => {
+                    let mb = MultiBuffer::from_buffer(data);
+                    writer.write_multi_buffer_impl(mb).await.is_err()
+                },
+                None => false,
+            }
+        };
+        if write_failed {
+            warn!(
+                session = meta.session_id(),
+                "failed to write to downstream writer, closing session"
+            );
+            session.close().await;
         }
         Ok(())
     }
@@ -841,6 +878,94 @@ mod tests {
         );
     }
 
+    /// Keep 帧测试用的 UDP 目标（gate_tests 内有同名私有 helper，作用域不同）。
+    fn udp_dest() -> Destination {
+        Destination::new(
+            Address::ipv4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
+            Port::new(53),
+            Network::UDP,
+        )
+    }
+
+    /// bd 9hl0s：服务端收到未知 session 的 Keep（带数据）必须回 End 帧通知对端
+    /// 关闭（Go server.go:304-315），而不是静默丢弃让对端子流挂到应用层超时。
+    #[tokio::test]
+    async fn keep_for_unknown_session_replies_end_frame() {
+        let worker = ServerWorker::new(Arc::new(MockDispatcher));
+        let (r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+
+        // Keep + OPTION_DATA（Go 只在带数据时才回 End）
+        let meta = FrameMetadata::keep_with_udp_target(42, udp_dest());
+        worker
+            .handle_status_keep(&meta, Buffer::from_vec(b"orphan".to_vec()), &link_writer)
+            .await
+            .expect("unknown-session keep must not fail the carrier");
+
+        let mut reader = BufferedReader::new(Box::new(r));
+        let mut head = [0u8; 2];
+        let mut off = 0;
+        while off < head.len() {
+            let n = reader.read(&mut head[off..]).await;
+            assert!(n > 0, "End frame header must be written");
+            off += n;
+        }
+        let meta_len = u16::from_be_bytes(head) as usize;
+        let mut buf = vec![0u8; 2 + meta_len];
+        buf[..2].copy_from_slice(&head);
+        let mut off = 0;
+        while off < meta_len {
+            let n = reader.read(&mut buf[2 + off..]).await;
+            assert!(n > 0, "End frame meta must be written");
+            off += n;
+        }
+        let (parsed, _) = FrameMetadata::read_from_bytes(&buf).expect("parse End frame");
+        assert_eq!(parsed.session_status(), SessionStatus::End);
+        assert_eq!(parsed.session_id(), 42);
+        assert!(!parsed.has_data(), "End 帧不带 body");
+    }
+
+    /// 08wkx-a：Keep 数据写 session.output 失败 ⇒ 记日志并关闭会话（Go
+    /// server.go:316-320 `log + s.Close(false)`）。旧实现 `let _ =` 吞错，会话
+    /// 以僵尸态留驻 manager 直到输出泵自行退出。
+    #[tokio::test]
+    async fn keep_write_failure_closes_session() {
+        use std::{future::Future, pin::Pin};
+
+        struct FailingWriter;
+        impl Writer for FailingWriter {
+            fn write_multi_buffer(
+                &mut self,
+                _mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+                Box::pin(async { Err(xray_buf::io::Error::WriteError("boom".to_string())) })
+            }
+        }
+
+        let worker = ServerWorker::new(Arc::new(MockDispatcher));
+        let session = Session::new(5, TransferType::Stream);
+        let mut output = BufferedWriter::new(Box::new(FailingWriter));
+        output.set_buffered(false);
+        session.set_output(output).await;
+        let session = worker.session_manager.add(session).await.expect("add session");
+
+        let (_r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+        worker
+            .handle_status_keep(
+                &FrameMetadata::keep_with_udp_target(5, udp_dest()),
+                Buffer::from_vec(b"x".to_vec()),
+                &link_writer,
+            )
+            .await
+            .expect("keep must not error the carrier");
+
+        assert!(session.is_closed(), "写失败必须关闭会话");
+        assert!(worker.session_manager.get(5).await.is_none(), "会话应从管理器摘除");
+    }
+
     #[tokio::test]
     async fn test_server_worker_new() {
         let worker = ServerWorker::new(Arc::new(MockDispatcher));
@@ -854,7 +979,13 @@ mod tests {
     // 赋值表达式语句位挂属性在本工具链 E0658（无 stmt_expr_attributes），故挂 fn 位。
     #[allow(clippy::disallowed_methods, reason = "测试：过期条目构造（1 处 Instant::now）")]
     async fn server_worker_wires_xudp_periodic_cleanup() {
-        let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
+        // 生产用进程级单表（bd ikwxy），并行测试共享会互相污染 ⇒ 注入独立 manager，
+        // 清理任务归属仍由 XUDPManager 持有（与生产同形）。
+        let mut manager = XUDPManager::new();
+        manager.start_cleanup();
+        let worker = Arc::new(
+            ServerWorker::new(Arc::new(MockDispatcher)).with_xudp_manager(Arc::new(manager)),
+        );
         let mut xudp = crate::session::XUDP::new([9u8; 8]);
         xudp.status = crate::session::XudpStatus::Expiring;
         xudp.expire = std::time::Instant::now() - Duration::from_secs(1);
@@ -1243,7 +1374,12 @@ mod tests {
                 ClientStrategy::default(),
             );
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let server = Arc::new(ServerWorker::new(Arc::new(UdpCaptureDispatcher { tx })));
+            // 生产是进程级单表（bd ikwxy）；并行用例里相同 GlobalID 会互相命中
+            // （hit-rebind 语义），故每条拓扑注入隔离实例。
+            let server = Arc::new(
+                ServerWorker::new(Arc::new(UdpCaptureDispatcher { tx }))
+                    .with_xudp_manager(Arc::new(XUDPManager::new())),
+            );
             let mut reader = BufferedReader::new(Box::new(s_read));
             let link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
@@ -1425,8 +1561,16 @@ mod tests {
                 "rebound session must be registered under new ID (bd zv9l)"
             );
             let keep_meta = FrameMetadata::new_session(101, udp_target());
+            // 会话在位 ⇒ 不需要 carrier 写端；给个空载体写端占位（本路径不写它）。
+            let (_keep_r, keep_w) = pipe::new();
+            let keep_link_writer: Arc<AsyncMutex<Option<Box<dyn Writer>>>> =
+                Arc::new(AsyncMutex::new(Some(Box::new(keep_w))));
             server
-                .handle_status_keep(&keep_meta, Buffer::from_vec(b"keep-data".to_vec()))
+                .handle_status_keep(
+                    &keep_meta,
+                    Buffer::from_vec(b"keep-data".to_vec()),
+                    &keep_link_writer,
+                )
                 .await
                 .expect("keep frame processed");
             let tail = read_all(&mut up_r).await;

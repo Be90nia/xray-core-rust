@@ -295,7 +295,13 @@ async fn wg_accept_loop(
                 tick.tick().await;
                 let now = nanos_now();
                 let idle = (WG_UDP_SESSION_IDLE_SECS as i64) * 1_000_000_000;
-                sweep_netstack.lock().await.sweep_udp(now, idle);
+                {
+                    let mut stack = sweep_netstack.lock().await;
+                    stack.sweep_udp(now, idle);
+                    // bd uuw3l：TCP 监听槽位同款老化——否则 512 只不完成握手的 SYN
+                    // 永久占位，该 inbound 的 TCP 再也不通（只能重启）。
+                    stack.sweep_listens(now, idle);
+                }
                 let mut map = sweep_sessions.lock();
                 let expired: Vec<IpEndpoint> = map
                     .iter()
@@ -619,8 +625,12 @@ impl WgTcpRelay {
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         timer.tick().await; // 消掉首次立即触发
 
+        // 上/下行 scratch 缓冲在循环外复用（bd m6pkl-N6：曾每轮 `vec![0u8;8192]`，
+        // tick 5ms ⇒ 空转期每连接 200 次/s 分配；内容每次被覆盖，无需清零）。
+        let mut user_buf = vec![0u8; 8192];
+        let mut down_buf = vec![0u8; 8192];
+
         loop {
-            let mut user_buf = vec![0u8; 8192];
             tokio::select! {
                 // down: dispatcher 写 link.writer 的响应数据 → smoltcp socket send → WG client
                 result = self.from_client.read(&mut user_buf) => {
@@ -630,15 +640,14 @@ impl WgTcpRelay {
                             return;
                         }
                         Ok(n) => {
-                            user_buf.truncate(n);
-                            self.send_to_smoltcp(&user_buf).await;
+                            self.send_to_smoltcp(&user_buf[..n]).await;
                         }
                     }
                 }
                 _ = timer.tick() => {}
             }
             // up: smoltcp socket recv（WG client 请求）→ link.reader 供 dispatcher 读取
-            if self.recv_from_smoltcp().await {
+            if self.recv_from_smoltcp(&mut down_buf).await {
                 let _ = self.to_client.shutdown().await;
                 self.finish().await;
                 return;
@@ -676,21 +685,21 @@ impl WgTcpRelay {
     }
 
     /// 从 smoltcp TCP socket 接收数据写入 to_client。返回 true 表示 socket 已关闭。
-    async fn recv_from_smoltcp(&mut self) -> bool {
-        let (data, closed) = {
+    ///
+    /// `scratch` 由调用方循环外复用（bd m6pkl-N6）；本函数只写 `scratch[..n]`。
+    async fn recv_from_smoltcp(&mut self, scratch: &mut [u8]) -> bool {
+        let (recv_len, closed) = {
             let mut stack = self.netstack.lock().await;
             stack.poll(smoltcp::time::Instant::now());
             let r = stack.with_tcp_socket(self.handle, |s| {
-                let mut buf = vec![0u8; 8192];
-                let n = s.recv_slice(&mut buf).unwrap_or(0);
-                buf.truncate(n);
-                (buf, !s.is_active())
+                let n = s.recv_slice(scratch).unwrap_or(0);
+                (n, !s.is_active())
             });
             stack.poll(smoltcp::time::Instant::now());
             r
         };
-        if !data.is_empty() {
-            let _ = self.to_client.write_all(&data).await;
+        if recv_len > 0 {
+            let _ = self.to_client.write_all(&scratch[..recv_len]).await;
         }
         closed
     }

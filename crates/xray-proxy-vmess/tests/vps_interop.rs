@@ -24,7 +24,7 @@ use xray_transport::connection::TcpConnection;
 ///
 /// 测试 VMess AEAD header + body chunk 加密与 Go 服务端互通。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 home.begonia92.top 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn vmess_ws_tls_vps_interop() {
     let tcp_addr = "home.begonia92.top:2083";
     let ws_host = "cdn_sg.yzswgroup.top";

@@ -3,12 +3,11 @@
 //! 对应 Go 版本 `proxy/vmess/account.go`。`MemoryAccount` 是运行时账户形式，
 //! `Account` 是 proto 序列化形式（用于配置传递）。
 //!
-//! # cmd_key 实现说明
+//! # cmd_key 说明
 //!
-//! VMess 协议要求 `cmd_key = MD5(UUID.String())`，与 Go 端字节级对齐。
-//! 但 `xray-common` 的 `UUID::cmd_key` 当前是 XOR 折叠占位实现（详见其 TODO），
-//! 不能用于 VMess 协议。因此本 crate 内部使用 [`cmd_key_of`] 直接计算 MD5，
-//! 不依赖 `protocol::ID::cmd_key()`。
+//! VMess 协议要求 `cmd_key = MD5(UUID.Bytes() || "c48619fe-…-edf763e17e21")`，
+//! 与 Go `common/protocol/id.go` 的 `NewID` 字节级对齐。公式的唯一实现是
+//! `xray_common::uuid::UUID::cmd_key`；[`cmd_key_of`] 只是本 crate 的转调入口。
 
 use prost::Message;
 use xray_common::{
@@ -166,18 +165,13 @@ impl MemoryAccount {
 
 /// 计算 VMess cmd_key = MD5(UUID.Bytes() || magic_uuid)。
 ///
-/// 与 Go 端 `NewID` 字节级对齐：Go 用 `md5(uuid.Bytes() +
-/// "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。
+/// Go 端 `common/protocol/id.go` 的 `NewID` 用 `md5(uuid.Bytes() +
+/// "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。公式的唯一实现在
+/// [`UUID::cmd_key`]，本函数只是 VMess 侧的兼容入口（bd gv7gk：曾经是
+/// 第二份手写实现）。
 #[must_use]
 pub fn cmd_key_of(uuid: &UUID) -> [u8; 16] {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(uuid.as_bytes());
-    hasher.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
-    let result = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&result);
-    out
+    uuid.cmd_key()
 }
 
 #[cfg(test)]
@@ -305,5 +299,21 @@ mod tests {
         let a = MemoryAccount::new(sample_uuid());
         let b = MemoryAccount::new(sample_uuid());
         assert_eq!(a.cmd_key(), b.cmd_key());
+    }
+
+    #[test]
+    fn cmd_key_matches_go_newid_vector() {
+        // Go common/protocol/id.go NewID：md5(uuid.Bytes() || salt)。
+        // 向量按同一公式独立复算，锁死线上值（bd gv7gk 双实现收口）。
+        assert_eq!(
+            cmd_key_of(&sample_uuid()),
+            [
+                0x81, 0x75, 0x7e, 0x37, 0xf9, 0x66, 0x8a, 0x8e, 0x77, 0x00, 0xd1, 0x1e, 0xe8, 0x34,
+                0xed, 0xe0,
+            ]
+        );
+        // MemoryAccount 与 protocol::ID 必须同源。
+        let acc = MemoryAccount::new(sample_uuid());
+        assert_eq!(acc.cmd_key(), acc.id.cmd_key().to_owned());
     }
 }

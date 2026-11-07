@@ -14,7 +14,10 @@
 //! 单线程驱动：inbound handler task 在持锁期间依次执行 ingest_rx → poll → drain_tx。
 //! smoltcp Interface 不是 Sync，必须由 driver task 单点驱动。
 
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use smoltcp::{
     iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet},
@@ -33,6 +36,20 @@ const POLL_RX_BUDGET: usize = 64;
 /// TCP/UDP socket 缓冲大小。
 const SOCKET_BUF_SIZE: usize = 64 * 1024;
 
+/// 惰性 TCP listen 缓存硬顶（bd 2e47r）。
+///
+/// 修复前无任何上限：TUN 面上任意未认证 SYN 都能让 [`TunNetStack::tcp_listens`]
+/// 与 socket 集合单调增长（每槽 64K×2 = 128KiB）直至 OOM。512 与 wireguard netstack
+/// 对齐，最坏常驻 ~64MiB；触顶即拒并记账（fail-visible）。
+const MAX_TCP_LISTENS: usize = 512;
+
+/// 未完成握手的 listen 条目老化阈值：建立后超过该时长仍非 Established 即视为
+/// 扫描/半开堆积，由 [`TunNetStack::sweep_tcp_listens`] 回收（与 UDP 会话空闲同档）。
+const TCP_LISTEN_IDLE_NANOS: i64 = 60 * 1_000_000_000;
+
+/// 触顶被拒的 SYN 累计数（fail-visible 记账，`MAX_TCP_LISTENS` 命中即递增）。
+static TCP_LISTEN_REJECTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// UDP socket metadata 槽位数。
 const UDP_META_SLOTS: usize = 32;
 
@@ -41,6 +58,13 @@ const ICMP_META_SLOTS: usize = 16;
 
 /// ICMP socket 缓冲大小。
 const ICMP_BUF_SIZE: usize = 16 * 1024;
+
+/// 惰性 TCP listen 缓存条目（票 2e47r）：socket 句柄 + 建立时刻（老化判据）。
+struct TcpListen {
+    handle: SocketHandle,
+    /// 建听时刻（wall-clock 纳秒），供 [`TunNetStack::sweep_tcp_listens`] 老化。
+    created_nanos: i64,
+}
 
 /// TUN 用的 smoltcp 网络栈。
 ///
@@ -56,7 +80,9 @@ pub struct TunNetStack {
     ///
     /// smoltcp 无通配端口监听（`listen(0)==Err(Unaddressable)`），须按实际包 dst
     /// 逐个注册。accept 后条目即摘除（socket 已转为连接 socket），下个 SYN 重建。
-    tcp_listens: HashMap<IpEndpoint, SocketHandle>,
+    /// 容量受 `MAX_TCP_LISTENS` 约束、空闲条目由 [`Self::sweep_tcp_listens`] 回收
+    /// （票 2e47r：修复前无上限也无老化，任意未认证 SYN 即可无界增长到 OOM）。
+    tcp_listens: HashMap<IpEndpoint, TcpListen>,
 }
 
 impl TunNetStack {
@@ -280,11 +306,16 @@ impl TunNetStack {
     /// 并入缓存。accept（[`Self::check_tcp_accepts`]）后条目摘除，同 dst 的新
     /// SYN 自动重建。
     ///
+    /// 容量硬顶 `MAX_TCP_LISTENS`：触顶即拒（`Err` + 计数 + error 日志，绝不静默
+    /// 丢），空闲条目由 [`Self::sweep_tcp_listens`] 老化回收（票 2e47r）。
+    ///
     /// # 错误
     ///
-    /// - `TunError::TcpListenFailed`：port=0（smoltcp 拒绝）或 socket 状态非法
+    /// - `TunError::TcpListenFailed`：port=0（smoltcp 拒绝）、socket 状态非法， 或监听表已达
+    ///   `MAX_TCP_LISTENS`
     pub fn ensure_tcp_listen(&mut self, dst: IpEndpoint) -> Result<(), crate::error::TunError> {
-        if let Some(&handle) = self.tcp_listens.get(&dst) {
+        if let Some(entry) = self.tcp_listens.get(&dst) {
+            let handle = entry.handle;
             let state = self.sockets.get_mut::<tcp::Socket<'static>>(handle).state();
             if state == tcp::State::Listen {
                 return Ok(());
@@ -292,13 +323,48 @@ impl TunNetStack {
             // 占用（已 accept）或已失效：摘除后重建
             self.tcp_listens.remove(&dst);
         }
+        if self.tcp_listens.len() >= MAX_TCP_LISTENS {
+            TCP_LISTEN_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Err(crate::error::TunError::TcpListenFailed(format!(
+                "lazy tcp listen cache full ({MAX_TCP_LISTENS}), rejecting SYN dst={dst:?}"
+            )));
+        }
         let handle = self.add_tcp_socket();
         let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
         socket
             .listen(dst)
             .map_err(|e| crate::error::TunError::TcpListenFailed(format!("{e:?}")))?;
-        self.tcp_listens.insert(dst, handle);
+        self.tcp_listens
+            .insert(dst, TcpListen { handle, created_nanos: crate::inbound::now_nanos() });
         Ok(())
+    }
+
+    /// 淘汰建立后超过 `TCP_LISTEN_IDLE_NANOS` 仍未完成握手的 listen 条目
+    /// （票 2e47r 的老化回收；与 `sweep_udp_sessions` 同档阈值）。
+    ///
+    /// Established 条目不动——它已交付或即将交付 accept 收集，回收会丢真实连接。
+    /// 条目摘除时 socket 一并从 SocketSet 移除（否则 socket 泄漏，缓冲照占）。
+    /// 返回淘汰数。
+    pub fn sweep_tcp_listens(&mut self, now_nanos: i64) -> usize {
+        let expired: Vec<IpEndpoint> = self
+            .tcp_listens
+            .iter()
+            .filter(|(_, e)| now_nanos.saturating_sub(e.created_nanos) > TCP_LISTEN_IDLE_NANOS)
+            .filter(|(_, e)| {
+                self.sockets.get::<tcp::Socket<'static>>(e.handle).state()
+                    != tcp::State::Established
+            })
+            .map(|(k, _)| *k)
+            .collect();
+        for dst in &expired {
+            if let Some(entry) = self.tcp_listens.remove(dst) {
+                self.sockets.remove(entry.handle);
+            }
+        }
+        if !expired.is_empty() {
+            crate::TUN_LOG.debug(format!("tun lazy tcp listens swept count={}", expired.len()));
+        }
+        expired.len()
     }
 
     /// UDP 绑定（server side）。对应 Go `udp.NewForwarder` 的 bind 语义。
@@ -335,7 +401,7 @@ impl TunNetStack {
     #[must_use]
     pub fn check_tcp_accepts(&mut self) -> Vec<TcpAcceptEvent> {
         let mut events = Vec::new();
-        let handles: Vec<SocketHandle> = self.tcp_listens.values().copied().collect();
+        let handles: Vec<SocketHandle> = self.tcp_listens.values().map(|e| e.handle).collect();
         for handle in handles {
             let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
             if socket.state() != tcp::State::Established {
@@ -346,7 +412,7 @@ impl TunNetStack {
                 continue;
             };
             // accept 完成：从 listen 缓存摘除（同 dst 的下一个 SYN 会重建 listen）
-            self.tcp_listens.retain(|_, h| *h != handle);
+            self.tcp_listens.retain(|_, e| e.handle != handle);
             events.push(TcpAcceptEvent { handle, local, remote });
         }
         events
@@ -972,10 +1038,10 @@ mod tests {
         let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(93, 184, 216, 34)), 443);
         stack.ensure_tcp_listen(dst).expect("first ensure creates listen");
         assert_eq!(stack.tcp_listens.len(), 1, "one cached listen");
-        let first = stack.tcp_listens[&dst];
+        let first = stack.tcp_listens[&dst].handle;
         stack.ensure_tcp_listen(dst).expect("second ensure reuses");
         assert_eq!(stack.tcp_listens.len(), 1, "still one cached listen");
-        assert_eq!(stack.tcp_listens[&dst], first, "same handle reused");
+        assert_eq!(stack.tcp_listens[&dst].handle, first, "same handle reused");
     }
 
     #[test]
@@ -986,6 +1052,105 @@ mod tests {
         let result = stack.ensure_tcp_listen(dst);
         assert!(result.is_err(), "port 0 must be rejected");
         assert!(stack.tcp_listens.is_empty(), "failed ensure must not cache");
+    }
+
+    /// 构造 IPv4 + TCP 定长头包（无 payload）；校验和留 0——RX 不校验。
+    fn make_tcp_packet(
+        src: ([u8; 4], u16),
+        dst: ([u8; 4], u16),
+        flags: u8,
+        seq: u32,
+        ack: u32,
+    ) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x45; // version=4, IHL=5
+        pkt[2..4].copy_from_slice(&40u16.to_be_bytes()); // total length
+        pkt[8] = 64; // TTL
+        pkt[9] = 6; // protocol = TCP
+        pkt[12..16].copy_from_slice(&src.0);
+        pkt[16..20].copy_from_slice(&dst.0);
+        pkt[20..22].copy_from_slice(&src.1.to_be_bytes());
+        pkt[22..24].copy_from_slice(&dst.1.to_be_bytes());
+        pkt[24..28].copy_from_slice(&seq.to_be_bytes());
+        pkt[28..32].copy_from_slice(&ack.to_be_bytes());
+        pkt[32] = 0x50; // data offset = 5 words
+        pkt[33] = flags;
+        pkt[34..36].copy_from_slice(&65535u16.to_be_bytes());
+        pkt
+    }
+
+    /// 从 IPv4+TCP 响应（IHL=5）里取 seq——SYN-ACK 的 ISN。
+    fn tcp_seq(pkt: &[u8]) -> Option<u32> {
+        (pkt.len() >= 40 && pkt[9] == 6)
+            .then(|| u32::from_be_bytes([pkt[24], pkt[25], pkt[26], pkt[27]]))
+    }
+
+    const TCP_SYN: u8 = 0x02;
+    const TCP_ACK: u8 = 0x10;
+
+    /// 票 2e47r 契约：硬顶触顶即拒（fail-visible + 计数），不再无界增长。
+    #[test]
+    fn ensure_tcp_listen_rejects_when_cache_full() {
+        let mut stack = make_stack();
+        let before = TCP_LISTEN_REJECTED_TOTAL.load(Ordering::Relaxed);
+        for port in 1..=MAX_TCP_LISTENS as u16 {
+            let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), port);
+            stack.ensure_tcp_listen(dst).expect("within cap");
+        }
+        assert_eq!(stack.tcp_listens.len(), MAX_TCP_LISTENS);
+
+        let overflow = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(5, 6, 7, 8)), 443);
+        let err = stack
+            .ensure_tcp_listen(overflow)
+            .expect_err("full cache must reject, not silently drop");
+        assert!(err.to_string().contains("cache full"), "须显式表明触顶：{err}");
+        assert_eq!(stack.tcp_listens.len(), MAX_TCP_LISTENS, "触顶后不得再增长");
+        assert!(!stack.tcp_listens.contains_key(&overflow));
+        assert_eq!(TCP_LISTEN_REJECTED_TOTAL.load(Ordering::Relaxed), before + 1, "丢弃计数须递增");
+    }
+
+    /// 票 2e47r：未完成握手的条目按建立时刻老化回收（socket 一并释放）。
+    #[test]
+    fn sweep_tcp_listens_reclaims_idle_entries() {
+        let mut stack = make_stack();
+        for port in [443u16, 8443, 2053] {
+            let dst = IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::new(1, 2, 3, 4)), port);
+            stack.ensure_tcp_listen(dst).expect("listen");
+        }
+        // 未到期：不淘汰。
+        assert_eq!(stack.sweep_tcp_listens(crate::inbound::now_nanos()), 0);
+        assert_eq!(stack.tcp_listens.len(), 3);
+        // 全部过期：清空（含 socket）。
+        let future = crate::inbound::now_nanos() + TCP_LISTEN_IDLE_NANOS + 1;
+        assert_eq!(stack.sweep_tcp_listens(future), 3);
+        assert!(stack.tcp_listens.is_empty());
+    }
+
+    /// 票 2e47r：已完成握手的条目不得被老化回收（否则丢真实连接）——它与
+    /// `check_tcp_accepts` 在同一个 100ms 定时臂里相邻执行。
+    #[test]
+    fn sweep_tcp_listens_skips_established_entries() {
+        let mut stack = make_stack();
+        let src = ([10, 0, 0, 2], 5555u16);
+        let dst_addr = [93, 184, 216, 34];
+        let dst = IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::new(dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3])),
+            443,
+        );
+        stack.ensure_tcp_listen(dst).expect("listen");
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, 443), TCP_SYN, 1000, 0));
+        stack.poll(Instant::now());
+        let syn_ack_seq =
+            stack.drain_tx().iter().find_map(|p| tcp_seq(p)).expect("SYN-ACK with seq");
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, 443), TCP_ACK, 1001, syn_ack_seq + 1));
+        stack.poll(Instant::now());
+
+        // 强制过期：Established 条目仍在表内（等 check_tcp_accepts 收走）。
+        let future = crate::inbound::now_nanos() + TCP_LISTEN_IDLE_NANOS + 1;
+        assert_eq!(stack.sweep_tcp_listens(future), 0, "Established 不得被老化回收");
+        assert_eq!(stack.tcp_listens.len(), 1);
+        assert_eq!(stack.check_tcp_accepts().len(), 1, "连接必须照常交付 accept");
+        assert!(stack.tcp_listens.is_empty(), "accept 后条目摘除");
     }
 
     #[test]

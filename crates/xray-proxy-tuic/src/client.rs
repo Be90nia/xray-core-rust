@@ -555,12 +555,15 @@ mod tests {
     }
 
     /// s8ti 契约 1：hysteria CC 配置 → TransportConfig 预装共享槽并预载算法。
+    ///
+    /// bd hfb94：hysteria_bbr 现在装 **quinn 内建 BBR**（走槽位 fallback 通道），
+    /// 故用 `is_bbr()` 探针；brutal 仍是 hysteria active 算法（`has_active()`）。
     #[test]
     fn hysteria_cc_preloads_swappable_slot() {
         let mut t = quinn::TransportConfig::default();
         let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBbr, 0)
             .expect("hysteria_bbr must install the swappable slot");
-        assert!(slot.has_active(), "BBR must be preloaded before connect");
+        assert!(slot.is_bbr(), "BBR must be preloaded before connect");
 
         let mut t = quinn::TransportConfig::default();
         let slot =
@@ -569,14 +572,14 @@ mod tests {
         assert!(slot.has_active(), "Brutal must be preloaded before connect");
     }
 
-    /// s8ti 契约 1b：Brutal 未配置带宽（0）→ 预载回落为 BBR（仍有 active），
+    /// s8ti 契约 1b：Brutal 未配置带宽（0）→ 预载回落为 BBR（quinn 内建），
     /// 对齐 hysteria min(up, down)=0 语义。
     #[test]
     fn hysteria_brutal_without_bandwidth_falls_back_to_bbr() {
         let mut t = quinn::TransportConfig::default();
         let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBrutal, 0)
             .expect("slot must be installed even when falling back");
-        assert!(slot.has_active());
+        assert!(slot.is_bbr());
     }
 
     /// s8ti 契约 2：未配置路径不变性——既有三臂走 quinn 内建工厂，

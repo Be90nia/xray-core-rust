@@ -496,7 +496,7 @@ const ADAPTER_PROPS_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 /// 结构化 args 直接传进程（无 shell 解析），接口名含空格也安全，不加引号
 /// （与 [`executor`] 的 netsh 渲染约定一致）。
 #[cfg(target_os = "windows")]
-pub(crate) fn adapter_props_cmds(interface: &str) -> Vec<executor::Cmd> {
+pub(crate) fn adapter_props_cmds(interface: &str) -> Vec<Cmd> {
     vec![executor::Cmd::new(
         "netsh",
         vec![
@@ -587,11 +587,14 @@ pub fn apply_changes(
     commands
 }
 
-/// 启动侧**真实执行**：路由先于 DNS；任一命令失败即停并上抛。计划存在而执行器
-/// 缺失（平台未支持）→ 显式报错，绝不静默跳过。
+/// 启动侧**真实执行**：路由先于 DNS。路由阶段失败时其自身已按条回滚
+/// （[`RouteExecutor::apply_exec`]）；DNS 阶段失败则撤销**已下发的全部路由**——
+/// 否则设备关闭后这些网段永久指向已关闭的 TUN（黑洞）。计划存在而执行器缺失
+/// （平台未支持）→ 显式报错，绝不静默跳过。
 ///
 /// # Errors
 /// 任一命令 spawn 失败或非零退出（[`Cmd::run`]）；或对应平台无执行器。
+/// 回滚动作自身的失败与原错误合并上报（不静默）。
 pub fn apply_changes_exec(
     applied: &AppliedSystemChanges,
     routes: Option<&dyn RouteExecutor>,
@@ -613,9 +616,26 @@ pub fn apply_changes_exec(
                 plan.platform
             )));
         };
-        dx.apply_exec(plan)?;
+        if let Err(e) = dx.apply_exec(plan) {
+            return Err(rollback_routes_after_failure(&applied.routes, routes, e));
+        }
     }
     Ok(())
+}
+
+/// DNS 接管失败后撤销已下发的路由，失败与原错误合并（不静默）。
+fn rollback_routes_after_failure(
+    routes_plan: &Option<RoutePlan>,
+    routes: Option<&dyn RouteExecutor>,
+    cause: std::io::Error,
+) -> std::io::Error {
+    let mut messages = vec![format!("dns apply failed after routes were installed: {cause}")];
+    if let (Some(plan), Some(rx)) = (routes_plan, routes) {
+        if let Err(e) = rx.rollback_exec(plan) {
+            messages.push(format!("route rollback failed: {e}"));
+        }
+    }
+    std::io::Error::other(messages.join("; "))
 }
 
 /// 关闭侧渲染（审计面）：DNS 先于路由（对齐 Go Close：`unsetSystemDNS` → `unsetSystemRoutes`）。
@@ -636,32 +656,41 @@ pub fn revert_changes(
 
 /// 关闭侧**真实执行**（[`revert_changes`] 的逆序执行）。
 ///
+/// **两阶段都跑**：DNS 回滚失败不得连带跳过路由回滚（旧实现首错即返回，残留路由
+/// 指向已关闭设备 = 黑洞）。错误逐条收集后合并上报。
+///
 /// # Errors
-/// 任一命令 spawn 失败或非零退出；或对应平台无执行器。
+/// 任一命令 spawn 失败或非零退出；或对应平台无执行器。多错合并为一条消息。
 pub fn revert_changes_exec(
     applied: &AppliedSystemChanges,
     routes: Option<&dyn RouteExecutor>,
     dns: Option<&dyn DnsExecutor>,
 ) -> std::io::Result<()> {
+    let mut errors = Vec::new();
     if let Some(plan) = &applied.dns {
-        let Some(dx) = dns else {
-            return Err(std::io::Error::other(format!(
-                "no dns executor for platform {:?}",
-                plan.platform
-            )));
-        };
-        dx.rollback_exec(plan)?;
+        match dns {
+            Some(dx) => {
+                if let Err(e) = dx.rollback_exec(plan) {
+                    errors.push(format!("dns rollback: {e}"));
+                }
+            },
+            None => errors.push(format!("no dns executor for platform {:?}", plan.platform)),
+        }
     }
     if let Some(plan) = &applied.routes {
-        let Some(rx) = routes else {
-            return Err(std::io::Error::other(format!(
-                "no route executor for platform {:?}",
-                plan.platform
-            )));
-        };
-        rx.rollback_exec(plan)?;
+        match routes {
+            Some(rx) => {
+                if let Err(e) = rx.rollback_exec(plan) {
+                    errors.push(format!("route rollback: {e}"));
+                }
+            },
+            None => errors.push(format!("no route executor for platform {:?}", plan.platform)),
+        }
     }
-    Ok(())
+    if errors.is_empty() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(errors.join("; ")))
 }
 
 /// 关闭侧接线（[`prepare`] 的逆操作）。回滚失败显式 `TUN_LOG.error` 上报
@@ -982,8 +1011,8 @@ mod tests {
         assert_eq!(
             render(&removed),
             vec![
-                "netsh interface ipv6 delete route 2001:db8::/32 interface=xray0 metric=0",
-                "route delete 0.0.0.0 mask 0.0.0.0 metric 0 if 24",
+                "netsh interface ipv6 delete route 2001:db8::/32 interface=xray0",
+                "route delete 0.0.0.0 mask 0.0.0.0 if 24",
             ]
         );
     }
@@ -1343,5 +1372,100 @@ mod tests {
             target: DnsTarget::WindowsAdapterServers { servers: vec!["1.1.1.1".parse().unwrap()] },
         };
         verify_dns_plan("tun-in", &plan, None).expect("windows plan skips verification");
+    }
+
+    // ===== bd mjbbg：部分应用必须可回滚（跨阶段）=====
+
+    /// 必然失败的命令：程序不存在 ⇒ spawn 即 Err；名字带 tag ⇒ 可从错误消息辨别
+    /// 「哪条命令真的跑过」（与 executor 测试面同一手法，绕开平台 shell 差异）。
+    fn missing_cmd(tag: &str) -> Cmd {
+        Cmd::new(format!("xray-sysrollback-missing-{tag}"), Vec::new())
+    }
+
+    /// 路由「成功」、DNS「必败」：路由撤销必须被执行（设备关闭后否则成黑洞）。
+    struct OkRoutesBadDns;
+
+    impl RouteExecutor for OkRoutesBadDns {
+        fn apply(&self, _plan: &RoutePlan) -> Vec<Cmd> {
+            Vec::new()
+        }
+
+        fn rollback(&self, _plan: &RoutePlan) -> Vec<Cmd> {
+            vec![missing_cmd("route-rollback")]
+        }
+    }
+
+    impl DnsExecutor for OkRoutesBadDns {
+        fn apply(&self, _plan: &DnsPlan) -> Vec<Cmd> {
+            vec![missing_cmd("dns-apply")]
+        }
+
+        fn rollback(&self, _plan: &DnsPlan) -> Vec<Cmd> {
+            Vec::new()
+        }
+    }
+
+    fn both_plans() -> AppliedSystemChanges {
+        AppliedSystemChanges {
+            routes: Some(RoutePlan {
+                platform: Platform::current(),
+                interface: "xray0".into(),
+                interface_index: 7,
+                add: Vec::new(),
+                outbound_interface: None,
+            }),
+            dns: Some(linux_takeover_plan()),
+        }
+    }
+
+    #[test]
+    fn dns_failure_after_routes_rolls_routes_back() {
+        let applied = both_plans();
+        let ex = OkRoutesBadDns;
+        let err = apply_changes_exec(&applied, Some(&ex), Some(&ex))
+            .expect_err("dns apply must fail")
+            .to_string();
+        assert!(
+            err.contains("dns apply failed after routes were installed"),
+            "原错误必须上报：{err}"
+        );
+        assert!(
+            err.contains("xray-sysrollback-missing-route-rollback"),
+            "DNS 失败后已下发路由必须撤销：{err}"
+        );
+    }
+
+    /// 两阶段回滚都要跑：DNS 回滚失败不得连带跳过路由回滚。
+    struct BothRollbacksBad;
+
+    impl RouteExecutor for BothRollbacksBad {
+        fn apply(&self, _plan: &RoutePlan) -> Vec<Cmd> {
+            Vec::new()
+        }
+
+        fn rollback(&self, _plan: &RoutePlan) -> Vec<Cmd> {
+            vec![missing_cmd("route-rollback")]
+        }
+    }
+
+    impl DnsExecutor for BothRollbacksBad {
+        fn apply(&self, _plan: &DnsPlan) -> Vec<Cmd> {
+            Vec::new()
+        }
+
+        fn rollback(&self, _plan: &DnsPlan) -> Vec<Cmd> {
+            vec![missing_cmd("dns-rollback")]
+        }
+    }
+
+    #[test]
+    fn revert_runs_route_rollback_even_when_dns_rollback_fails() {
+        let ex = BothRollbacksBad;
+        let err = revert_changes_exec(&both_plans(), Some(&ex), Some(&ex))
+            .expect_err("both rollbacks fail")
+            .to_string();
+        assert!(err.contains("dns rollback:"), "{err}");
+        assert!(err.contains("route rollback:"), "DNS 首错不得跳过路由回滚：{err}");
+        assert!(err.contains("xray-sysrollback-missing-route-rollback"), "{err}");
     }
 }

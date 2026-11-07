@@ -423,7 +423,24 @@ async fn handle_bi_frame(
     dispatch: Option<Arc<dyn xray_app_dispatcher::DispatchHandler>>,
     fx: &Arc<FxScope>,
 ) {
-    match read_frame_from_recv(recv_bi, 256).await {
+    // bd irtg9：arm body 内联 await，Connect 帧读必须有硬超时（否则半开 bi 流冻结
+    // 整条 QUIC 连接的全部中继与 datagram）。
+    let frame = match tokio::time::timeout(
+        crate::server::FRAME_READ_TIMEOUT,
+        read_frame_from_recv(recv_bi, 256),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            INBOUND_LOG.debug(format!(
+                "tuic inbound: bi Connect frame read timeout ({:?}), dropping stream",
+                crate::server::FRAME_READ_TIMEOUT
+            ));
+            return;
+        },
+    };
+    match frame {
         Ok((Command::Connect(addr), recv_bi, initial_bytes)) => {
             if let Some(handler) = dispatch {
                 // 生产路径：构造 Destination + Link → dispatcher/router 分发。
@@ -549,8 +566,9 @@ mod cc_tests {
         .unwrap()
     }
 
-    /// 票 7ykg 契约：服务端预装走共享槽——Hysteria* 算法 slot.has_active()
-    /// （预装即最终算法，TUIC 无 auth 后热切换事件）；quinn 内建三臂返回 None。
+    /// 票 7ykg 契约：服务端预装走共享槽——Hysteria* 算法 slot 有算法
+    /// （hysteria_bbr = quinn 内建 BBR 走 fallback 通道，bd hfb94；hysteria_brutal =
+    /// hysteria active 算法）；quinn 内建三臂返回 None。
     /// apply 层契约与 outbound 侧同源（同一 pub(crate) 函数）。
     #[test]
     fn inbound_congestion_preload_contract() {
@@ -559,7 +577,7 @@ mod cc_tests {
         let mut t = quinn::TransportConfig::default();
         let slot = apply_congestion_to_transport(&mut t, CongestionControl::HysteriaBbr, 0)
             .expect("server-side hysteria_bbr must install the swappable slot");
-        assert!(slot.has_active(), "BBR must be preloaded before accept");
+        assert!(slot.is_bbr(), "BBR must be preloaded before accept");
 
         let mut t = quinn::TransportConfig::default();
         let slot =

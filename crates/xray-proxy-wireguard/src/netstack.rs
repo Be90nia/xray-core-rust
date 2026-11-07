@@ -62,14 +62,17 @@ pub struct WgNetStack {
     /// # ponytail: 顺序分配 32768..=60767，绕回前不重用；同远端旧连接仍开着的
     /// 精确 tuple 复用需 28000 并发连接，超出代理场景——瓶颈出现再做空闲端口扫描。
     next_ephemeral: u16,
-    /// SYN 驱动的惰性 listen socket (handle, 监听 tuple)。
+    /// SYN 驱动的惰性 listen socket (handle, 监听 tuple, 建立 nanos)。
     ///
     /// smoltcp `listen` 对 port 0 恒报 Unaddressable，无通配监听语义；Go gVisor 用
     /// `tcp.NewForwarder` 对每个 SYN 走 per-request accept。Rust 等价物：`ingest_rx`
     /// 嗅探隧道内 TCP SYN，按目标 (addr, port) 惰性建听；accept 后同 tuple 补位
     /// （[`Self::drain_accepted`]）。不变量：同 tuple 至多 [`MAX_LISTENS_PER_TUPLE`]
     /// 个 pending 监听（bd n07t F5：同目标并发 SYN 各占一槽排队，替代旧单槽位）。
-    listening: Vec<(SocketHandle, IpEndpoint)>,
+    ///
+    /// 建立时刻供 [`Self::sweep_listens`] 老化（bd uuw3l：只发 SYN 不完成握手的槽位
+    /// 会永久占位，512 只即把该 inbound 的 TCP 打死——有界不等于可用）。
+    listening: Vec<(SocketHandle, IpEndpoint, i64)>,
     /// 已受理 SYN 的 4 元组 (源, 目标)——重传/同 4 元组重复 SYN 不再建槽。
     ///
     /// 同步于建槽动作更新（不等 poll），与 `listening` 条目同生命周期：建槽成功
@@ -255,13 +258,18 @@ impl WgNetStack {
     /// "the stack takes every connection ... for any address"）；不可转发的 dst 已被
     /// `not_forwardable`（ingest_rx 入口过滤）挡掉。跳过条件：目标端口 0、该 SYN 的
     /// 4 元组已受理（重传/握手在途/已建立——[`Self::syn_seen`]）、同 tuple pending
-    /// 已达 [`MAX_LISTENS_PER_TUPLE`]、或监听表已达 [`MAX_PENDING_LISTENS`]。
+    /// 已达 [`MAX_LISTENS_PER_TUPLE`]、或监听表已满且无可逐出的非 Established 槽位。
+    ///
+    /// 表满（≥ [`MAX_PENDING_LISTENS`]）时先逐出最老的非 Established 槽位（bd uuw3l：
+    /// 旧实现直接 return，512 只不完成握手的 SYN 就把该 inbound 的 TCP 永久打死）。
     fn ensure_listen(&mut self, src: IpEndpoint, dst: IpEndpoint) {
         if dst.port == 0
             || self.syn_seen.contains(&(src, dst))
             || self.tuple_pending(dst) >= MAX_LISTENS_PER_TUPLE
-            || self.listening.len() >= MAX_PENDING_LISTENS
         {
+            return;
+        }
+        if self.listening.len() >= MAX_PENDING_LISTENS && !self.evict_oldest_pending() {
             return;
         }
         if self.open_listen(dst) {
@@ -271,7 +279,7 @@ impl WgNetStack {
 
     /// 同 tuple 的 pending 监听数（握手在途 + 待 accept 连接 + 空闲补位）。
     fn tuple_pending(&self, dst: IpEndpoint) -> usize {
-        self.listening.iter().filter(|(_, ep)| *ep == dst).count()
+        self.listening.iter().filter(|(_, ep, _)| *ep == dst).count()
     }
 
     /// 创建并注册一个 listen socket；返回是否注册成功（失败已回收 socket）。
@@ -283,7 +291,7 @@ impl WgNetStack {
         });
         match result {
             Ok(()) => {
-                self.listening.push((handle, local));
+                self.listening.push((handle, local, nanos_now()));
                 true
             },
             Err(e) => {
@@ -294,6 +302,63 @@ impl WgNetStack {
         }
     }
 
+    /// 摘除第 `idx` 个 listening 槽位（socket + 该 tuple 的全部 4 元组受理记录）。
+    ///
+    /// `syn_seen` 必须同清：残留键会让该 tuple 的后续 SYN 永远被当「已受理」跳过，
+    /// 逐出的槽位再也建不回来。
+    fn drop_listen_at(&mut self, idx: usize) {
+        let (handle, local, _) = self.listening.swap_remove(idx);
+        self.syn_seen.retain(|(_, dst)| *dst != local);
+        self.remove_socket(handle);
+    }
+
+    /// 表满时逐出最老的非 Established 槽位；全部槽位都在 Established（等
+    /// [`Self::drain_accepted`] 收走）时返回 false。
+    fn evict_oldest_pending(&mut self) -> bool {
+        let mut oldest: Option<(usize, i64)> = None;
+        for (i, (handle, _, created)) in self.listening.iter().enumerate() {
+            if self.sockets.get::<tcp::Socket<'static>>(*handle).state() == tcp::State::Established
+            {
+                continue;
+            }
+            if oldest.is_none_or(|(_, t)| *created < t) {
+                oldest = Some((i, *created));
+            }
+        }
+        let Some((idx, _)) = oldest else {
+            return false;
+        };
+        self.drop_listen_at(idx);
+        crate::WG_LOG.warn(format!(
+            "wg lazy tcp listen table full ({MAX_PENDING_LISTENS}), evicted oldest pending slot"
+        ));
+        true
+    }
+
+    /// 淘汰建立后超过 `idle_nanos` 仍未完成握手的监听槽位（bd uuw3l 的老化回收）。
+    ///
+    /// Established 槽位不动——它已交付或即将交付 accept loop，清扫它会丢真实连接。
+    /// 返回淘汰数。
+    pub fn sweep_listens(&mut self, now: i64, idle_nanos: i64) -> usize {
+        let mut removed = 0usize;
+        let mut i = 0;
+        while i < self.listening.len() {
+            let (handle, _, created) = self.listening[i];
+            let established =
+                self.sockets.get::<tcp::Socket<'static>>(handle).state() == tcp::State::Established;
+            if !established && now.saturating_sub(created) > idle_nanos {
+                self.drop_listen_at(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if removed > 0 {
+            crate::WG_LOG.debug(format!("wg lazy tcp listens swept count={removed}"));
+        }
+        removed
+    }
+
     /// 取出全部已 accept（监听 → Established）的连接，并为同 tuple 立即补位新监听。
     ///
     /// accept loop 每 tick 调用一次。补位让下一条到同端口的连接无需等 SYN 重传。
@@ -302,7 +367,7 @@ impl WgNetStack {
         let mut events = Vec::new();
         let mut i = 0;
         while i < self.listening.len() {
-            let (handle, local) = self.listening[i];
+            let (handle, local, _) = self.listening[i];
             let socket = self.sockets.get_mut::<tcp::Socket<'static>>(handle);
             if socket.state() != tcp::State::Established {
                 i += 1;
@@ -1052,5 +1117,102 @@ mod tests {
             tx.iter().all(|p| !matches!(tcp_flags(p), Some((_, _, true)))),
             "不得对并发 SYN 回 RST"
         );
+    }
+
+    // ===== bd uuw3l：监听槽位回收（旧实现 512 个不握手 SYN 即永久打死 TCP 面）=====
+
+    /// IPv4+TCP 包的源端口（IHL=5）；非 TCP 返回 None。
+    fn tcp_src_port(pkt: &[u8]) -> Option<u16> {
+        (pkt.len() >= 40 && pkt[9] == 6).then(|| u16::from_be_bytes([pkt[20], pkt[21]]))
+    }
+
+    const IDLE_NANOS: i64 = 60 * 1_000_000_000;
+
+    /// 空闲淘汰：建立后超过阈值仍未完成握手的槽位被回收，4 元组受理记录同清
+    /// （否则同 tuple 再也建不回槽）。
+    #[test]
+    fn sweep_listens_reclaims_idle_pending_slots() {
+        use crate::netstack::test_packets::{TCP_SYN, make_tcp_packet};
+
+        let mut stack = make_stack();
+        for port in [443u16, 8443, 2053] {
+            stack.ingest_rx(make_tcp_packet(
+                ([10, 0, 0, 1], 5555),
+                ([10, 0, 0, 2], port),
+                TCP_SYN,
+                1000,
+                0,
+            ));
+        }
+        assert_eq!(stack.listening.len(), 3);
+
+        let now = nanos_now();
+        assert_eq!(stack.sweep_listens(now, IDLE_NANOS), 0, "未到期不得淘汰");
+        assert_eq!(stack.listening.len(), 3);
+        assert_eq!(stack.sweep_listens(now + IDLE_NANOS + 1, IDLE_NANOS), 3, "过期全部回收");
+        assert!(stack.listening.is_empty());
+        assert!(stack.syn_seen.is_empty(), "4 元组受理记录须随槽位同清");
+    }
+
+    /// Established 槽位不得被老化回收（它已交付或即将交付 accept loop）。
+    #[test]
+    fn sweep_listens_skips_established_slots() {
+        use crate::netstack::test_packets::{TCP_ACK, TCP_SYN, make_tcp_packet, tcp_seq_number};
+
+        let mut stack = make_stack();
+        let src = ([10, 0, 0, 1], 5555u16);
+        let dst = ([10, 0, 0, 2], 443u16);
+        stack.ingest_rx(make_tcp_packet(src, dst, TCP_SYN, 1000, 0));
+        stack.poll(Instant::now());
+        let server_seq =
+            stack.drain_tx().iter().find_map(|p| tcp_seq_number(p)).expect("SYN-ACK seq");
+        stack.ingest_rx(make_tcp_packet(src, dst, TCP_ACK, 1001, server_seq + 1));
+        stack.poll(Instant::now());
+
+        let now = nanos_now();
+        assert_eq!(
+            stack.sweep_listens(now + IDLE_NANOS + 1, IDLE_NANOS),
+            0,
+            "Established 槽位不得回收"
+        );
+        assert_eq!(stack.drain_accepted().len(), 1, "连接必须照常交付 accept");
+    }
+
+    /// 票 uuw3l 验收：512 个不完成握手的 SYN 把表打满后，正常 dst 仍能建听并
+    /// 完成握手（旧实现 `listening.len() >= MAX` 直接 return ⇒ 永久拒收）。
+    #[test]
+    fn full_listen_table_evicts_and_still_accepts() {
+        use crate::netstack::test_packets::{TCP_ACK, TCP_SYN, make_tcp_packet, tcp_seq_number};
+
+        let mut stack = make_stack();
+        let src = ([10, 0, 0, 1], 5555u16);
+        let dst_addr = [10, 0, 0, 2];
+        // 512 只不握手 SYN（dst 端口互不相同 ⇒ 各占一槽，避开 443）。
+        for port in 1000..1000 + MAX_PENDING_LISTENS as u16 {
+            stack.ingest_rx(make_tcp_packet(src, (dst_addr, port), TCP_SYN, 1000, 0));
+        }
+        assert_eq!(stack.listening.len(), MAX_PENDING_LISTENS);
+
+        let new_port: u16 = 443;
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, new_port), TCP_SYN, 1000, 0));
+        assert_eq!(stack.listening.len(), MAX_PENDING_LISTENS, "逐出最老槽位后仍守上限");
+        assert!(
+            stack.listening.iter().any(|(_, ep, _)| ep.port == new_port),
+            "表满时正常 dst 必须仍能建听"
+        );
+
+        stack.poll(Instant::now());
+        let server_seq = stack
+            .drain_tx()
+            .iter()
+            .find(|p| tcp_src_port(p) == Some(new_port))
+            .and_then(|p| tcp_seq_number(p))
+            .expect("新 dst 的 SYN-ACK");
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, new_port), TCP_ACK, 1001, server_seq + 1));
+        stack.poll(Instant::now());
+
+        let events = stack.drain_accepted();
+        assert_eq!(events.len(), 1, "被打满后仍必须能 accept");
+        assert_eq!(events[0].local.expect("local").port, new_port);
     }
 }

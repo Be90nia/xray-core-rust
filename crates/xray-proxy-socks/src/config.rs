@@ -98,10 +98,23 @@ impl ServerConfig {
     /// `accounts` 为空时返回 `false`（与 Go 一致）。
     #[must_use]
     pub fn has_account(&self, username: &str, password: &str) -> bool {
+        self.has_account_bytes(username.as_bytes(), password.as_bytes())
+    }
+
+    /// 按**原始字节**校验用户名/密码（Go `HasAccount` 收 string = 字节序列）。
+    ///
+    /// 旧 socket 路径先 `String::from_utf8_lossy` 再比较：任意非法 UTF-8 都折叠成
+    /// U+FFFD ⇒ 不同非法字节序列（或与含 U+FFFD 的口令）可碰撞（bd e4ct8b）。
+    /// 用户名非法 UTF-8 一律不匹配——配置键来自 JSON，恒为合法 UTF-8。
+    #[must_use]
+    pub fn has_account_bytes(&self, username: &[u8], password: &[u8]) -> bool {
         if self.accounts.is_empty() {
             return false;
         }
-        self.accounts.get(username).is_some_and(|p| p == password)
+        let Ok(name) = std::str::from_utf8(username) else {
+            return false;
+        };
+        self.accounts.get(name).is_some_and(|p| p.as_bytes() == password)
     }
 
     /// 是否需要认证。
@@ -182,6 +195,19 @@ mod tests {
         assert!(cfg.has_account("u", "p"));
         assert!(!cfg.has_account("u", "wrong"));
         assert!(!cfg.has_account("x", "p"));
+    }
+
+    /// bd e4ct8b：凭据按原始字节比较——非法 UTF-8 不得经 U+FFFD 折叠后误命中。
+    #[test]
+    fn has_account_bytes_rejects_invalid_utf8() {
+        let mut accounts = HashMap::new();
+        accounts.insert("u".to_string(), "p".to_string());
+        let cfg = ServerConfig { accounts, ..Default::default() };
+
+        assert!(cfg.has_account_bytes(b"u", b"p"));
+        assert!(!cfg.has_account_bytes(b"u", b"\xff"), "非法 UTF-8 口令不得命中");
+        assert!(!cfg.has_account_bytes(b"\xff", b"p"), "非法 UTF-8 用户名不得命中");
+        assert!(!cfg.has_account_bytes(b"u", b"P"));
     }
 
     #[test]

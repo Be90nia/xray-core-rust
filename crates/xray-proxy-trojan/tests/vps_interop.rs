@@ -25,7 +25,7 @@ use xray_transport::connection::TcpConnection;
 ///
 /// 默认参数从用户 VPS 配置提取，可通过环境变量覆盖。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 sg.yzswgroup.top 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn trojan_tcp_tls_vps_interop() {
     let host = std::env::var("VPS_HOST").unwrap_or_else(|_| "sg.yzswgroup.top".into());
     let port: u16 =
@@ -79,7 +79,7 @@ async fn trojan_tcp_tls_vps_interop() {
 ///
 /// 验证 Trojan 隧道可以转发非 HTTP 流量。
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 sg.yzswgroup.top 端点 + 公网 DNS），CI 无对端；手动 --ignored"]
 async fn trojan_vps_dns_through_tunnel() {
     let host = std::env::var("VPS_HOST").unwrap_or_else(|_| "sg.yzswgroup.top".into());
     let port: u16 =
@@ -147,7 +147,7 @@ async fn trojan_vps_dns_through_tunnel() {
 ///
 /// 配置: home.begonia92.top:2096 / WS path=/3dba3e56aa3a6ca5-tw / SNI=cdn_sg.yzswgroup.top
 #[tokio::test]
-#[ignore]
+#[ignore = "真机 VPS 互通（外部 cdn_sg.yzswgroup.top WS 端点 + 公网），CI 无对端；手动 --ignored"]
 async fn trojan_ws_tls_vps_interop() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;

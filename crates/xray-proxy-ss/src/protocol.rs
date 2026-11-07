@@ -49,18 +49,24 @@ fn parse_addr_type(b: u8) -> u8 {
 /// 把地址 + 端口写入 `out`（addr_first: type + addr_data + port_BE）。
 ///
 /// 对应 Go `addrParser.WriteAddressPort`。
-pub fn write_address_port_ss(out: &mut Vec<u8>, addr: &Address, port: u16) {
+///
+/// # Errors
+/// 域名长度 > 255 字节 → [`SsError::WriteAddress`]（Go 同位置拒绝；旧实现
+/// `u8::try_from(..).unwrap_or(255)` 静默截断 ⇒ 线上发出与目标不符的地址）。
+pub fn write_address_port_ss(out: &mut Vec<u8>, addr: &Address, port: u16) -> Result<()> {
     match addr {
         Address::IPv4(v4) => {
             out.push(addr_type::IPV4);
             out.extend_from_slice(&v4.octets());
         },
         Address::Domain(domain) => {
-            out.push(addr_type::DOMAIN);
             let bytes = domain.as_bytes();
-            let len = u8::try_from(bytes.len()).unwrap_or(255);
+            let len = u8::try_from(bytes.len()).map_err(|_| {
+                SsError::WriteAddress(format!("domain length {} exceeds 255", bytes.len()))
+            })?;
+            out.push(addr_type::DOMAIN);
             out.push(len);
-            out.extend_from_slice(&bytes[..len as usize]);
+            out.extend_from_slice(bytes);
         },
         Address::IPv6(v6) => {
             out.push(addr_type::IPV6);
@@ -68,6 +74,7 @@ pub fn write_address_port_ss(out: &mut Vec<u8>, addr: &Address, port: u16) {
         },
     }
     out.extend_from_slice(&port.to_be_bytes());
+    Ok(())
 }
 
 /// 从字节切片读取地址 + 端口。
@@ -200,7 +207,7 @@ pub fn encode_udp_packet_into(
         }
         out.extend_from_slice(&iv[..iv_size]);
     }
-    write_address_port_ss(out, address, port);
+    write_address_port_ss(out, address, port)?;
     out.extend_from_slice(payload);
 
     account.cipher.encode_packet(&account.key, out)
@@ -329,7 +336,7 @@ pub fn encode_tcp_request_header(
 
     // 3. 准备 addr+port 明文（SS 自有地址格式）
     let mut header_buf = Vec::new();
-    write_address_port_ss(&mut header_buf, address, port);
+    write_address_port_ss(&mut header_buf, address, port)?;
 
     // 4. seal size chunk：plaintext = BE(data_len + tag_size)，nonce=[0;n]
     let plain_size = u16::try_from(header_buf.len() + tag_size)
@@ -432,11 +439,31 @@ mod tests {
 
     // ---- write_address_port_ss / read_address_port_ss roundtrip ----
 
+    /// bd w9c0v：域名 > 255 字节必须报错（Go `WriteAddressPort` 同位置拒收），
+    /// 旧实现 `u8::try_from(..).unwrap_or(255)` 静默截断 ⇒ 线上发出错地址。
+    #[test]
+    fn write_domain_over_255_rejected() {
+        let mut buf = Vec::new();
+        let long = Address::Domain("a".repeat(256));
+        let err = write_address_port_ss(&mut buf, &long, 80).unwrap_err();
+        assert!(matches!(err, SsError::WriteAddress(_)), "got {err:?}");
+        assert!(buf.is_empty(), "失败不得留下半截字节");
+
+        // 255 字节边界仍可写（长度 1 字节最大 255）
+        let mut ok = Vec::new();
+        write_address_port_ss(&mut ok, &Address::Domain("a".repeat(255)), 80).expect("255 ok");
+        assert_eq!(ok[0], addr_type::DOMAIN);
+        assert_eq!(ok[1], 255);
+        let (a, p, _) = read_address_port_ss(&ok).expect("parse");
+        assert_eq!(p, 80);
+        assert!(matches!(a, Address::Domain(d) if d.len() == 255));
+    }
+
     #[test]
     fn write_read_ipv4_roundtrip() {
         let addr = Address::IPv4(std::net::Ipv4Addr::new(192, 168, 1, 1));
         let mut buf = Vec::new();
-        write_address_port_ss(&mut buf, &addr, 8080);
+        write_address_port_ss(&mut buf, &addr, 8080).expect("encode address");
         // type(1) + 4 + port(2) = 7
         assert_eq!(buf.len(), 7);
         let (a, p, consumed) = read_address_port_ss(&buf).expect("parse");
@@ -449,7 +476,7 @@ mod tests {
     fn write_read_domain_roundtrip() {
         let addr = Address::Domain("example.com".to_string());
         let mut buf = Vec::new();
-        write_address_port_ss(&mut buf, &addr, 443);
+        write_address_port_ss(&mut buf, &addr, 443).expect("encode address");
         let (a, p, consumed) = read_address_port_ss(&buf).expect("parse");
         assert_eq!(a, addr);
         assert_eq!(p, 443);
@@ -460,7 +487,7 @@ mod tests {
     fn write_read_ipv6_roundtrip() {
         let addr = Address::IPv6(std::net::Ipv6Addr::LOCALHOST);
         let mut buf = Vec::new();
-        write_address_port_ss(&mut buf, &addr, 443);
+        write_address_port_ss(&mut buf, &addr, 443).expect("encode address");
         // type(1) + 16 + port(2) = 19
         assert_eq!(buf.len(), 19);
         let (a, p, _) = read_address_port_ss(&buf).expect("parse");
@@ -472,17 +499,17 @@ mod tests {
     fn ss_addr_type_byte_correctness() {
         let addr = Address::IPv4(std::net::Ipv4Addr::new(1, 2, 3, 4));
         let mut buf = Vec::new();
-        write_address_port_ss(&mut buf, &addr, 80);
+        write_address_port_ss(&mut buf, &addr, 80).expect("encode address");
         assert_eq!(buf[0], 0x01); // SS IPv4 = 0x01
 
         let addr6 = Address::IPv6(std::net::Ipv6Addr::LOCALHOST);
         let mut buf6 = Vec::new();
-        write_address_port_ss(&mut buf6, &addr6, 80);
+        write_address_port_ss(&mut buf6, &addr6, 80).expect("encode address");
         assert_eq!(buf6[0], 0x04); // SS IPv6 = 0x04
 
         let domain = Address::Domain("x.com".to_string());
         let mut bufd = Vec::new();
-        write_address_port_ss(&mut bufd, &domain, 80);
+        write_address_port_ss(&mut bufd, &domain, 80).expect("encode address");
         assert_eq!(bufd[0], 0x03); // SS Domain = 0x03
     }
 
