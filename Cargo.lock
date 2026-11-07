@@ -5688,6 +5688,7 @@ version = "0.1.0"
 dependencies = [
  "parking_lot",
  "prost",
+ "rcgen 0.13.2",
  "rustls",
  "rustls-pki-types",
  "thiserror 2.0.18",
@@ -6466,7 +6467,6 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
- "md-5",
  "parking_lot",
  "prost",
  "rand 0.9.4",
