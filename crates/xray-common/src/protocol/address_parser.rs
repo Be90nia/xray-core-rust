@@ -10,7 +10,10 @@
 
 use xray_buf::buffer::Buffer;
 
-use crate::net::{address::Address, port::Port};
+use crate::net::{
+    address::{Address, ip_literal},
+    port::Port,
+};
 
 /// 地址类型标识符。
 const ADDR_TYPE_IPV4: u8 = 1;
@@ -68,7 +71,11 @@ impl AddressSerializer {
             Address::Domain(domain) => {
                 push_byte(buf, ADDR_TYPE_DOMAIN);
                 let domain_bytes = domain.as_bytes();
-                let len = domain_bytes.len() as u8;
+                // 长度位是 u8：截断会让对端按错误长度解析（帧后续整体错位）。
+                // >255 只可能来自调用方手工构造的 Address（线上解析受长度位钳制、
+                // DNS 名上限 253），故与 write_all 同款 fail-visible。
+                let len = u8::try_from(domain_bytes.len())
+                    .expect("域名超过 255 字节：线格式长度位容不下");
                 push_byte(buf, len);
                 write_all(buf, domain_bytes);
             },
@@ -78,6 +85,30 @@ impl AddressSerializer {
             },
         }
     }
+}
+
+/// 域名分支的两道闸（Go `readAddress` Domain 分支，`common/protocol/address.go:210-222`）：
+///
+/// 1. IP 字面量归一：`maybeIPPrefix`（`[` 或数字开头）→ `net.ParseAddress`，命中 IP 即返回 IP（否则
+///    routing `ip` 规则永不命中，屏蔽/分流被绕过）；
+/// 2. `isValidDomain` 字符集校验：仅 `0-9 a-z A-Z - . _`，空域名拒绝（Go 对 LEN=0 取 `domain[0]`
+///    越界前先被 `BytesFrom(0)` quirk 判 `invalid domain name`）。
+///
+/// 两道闸都只收紧非法输入，不改合法域名的解析结果。
+fn parse_domain_field(domain: &str) -> Option<Address> {
+    if let Some(ip) = ip_literal(domain) {
+        return Some(Address::from(ip));
+    }
+    if !is_valid_domain(domain) {
+        return None;
+    }
+    Some(Address::new_domain(domain))
+}
+
+/// 域名合法性（字符集 + 非空），对齐 Go `isValidDomain`。
+fn is_valid_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'.' || c == b'_')
 }
 
 /// 地址解析器：从字节切片读取地址和端口。
@@ -110,7 +141,7 @@ impl AddressParser {
                     return None;
                 }
                 let domain_str = std::str::from_utf8(&data[2..2 + domain_len]).ok()?;
-                Some((Address::new_domain(domain_str), 2 + domain_len))
+                Some((parse_domain_field(domain_str)?, 2 + domain_len))
             },
             ADDR_TYPE_IPV6 => {
                 if data.len() < 1 + 16 {
@@ -337,5 +368,49 @@ mod tests {
         let (a, p, _) = AddressParser::parse_address_port(buf.bytes()).expect("parse");
         assert_eq!(a, addr);
         assert_eq!(p, port);
+    }
+
+    /// 域名分支闸 1：`[::1]` 形态必须归一化成 IPv6（Go `maybeIPPrefix` +
+    /// `ParseAddress`，否则 routing `ip` 规则永不命中）。
+    #[test]
+    fn test_read_address_normalizes_bracketed_ipv6_domain() {
+        let mut data = vec![ADDR_TYPE_DOMAIN, 5];
+        data.extend_from_slice(b"[::1]");
+        let (addr, consumed) = AddressParser::read_address(&data).expect("parse");
+        assert_eq!(addr, Address::ipv6(Ipv6Addr::LOCALHOST));
+        assert_eq!(consumed, data.len());
+    }
+
+    /// 域名分支闸 1：`"1.2.3.4"` 形态归一化成 IPv4。
+    #[test]
+    fn test_read_address_normalizes_ipv4_domain() {
+        let mut data = vec![ADDR_TYPE_DOMAIN, 7];
+        data.extend_from_slice(b"1.2.3.4");
+        let (addr, _) = AddressParser::read_address(&data).expect("parse");
+        assert_eq!(addr, Address::ipv4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    /// 域名分支闸 2：字符集非法（`/`）必须拒（Go `isValidDomain`）。
+    #[test]
+    fn test_read_address_rejects_invalid_domain_charset() {
+        let mut data = vec![ADDR_TYPE_DOMAIN, 7];
+        data.extend_from_slice(b"a/b.com");
+        assert!(AddressParser::read_address(&data).is_none());
+    }
+
+    /// 空域名必须拒（Go 对 LEN=0 走 `invalid domain name`）。
+    #[test]
+    fn test_read_address_rejects_empty_domain() {
+        assert!(AddressParser::read_address(&[ADDR_TYPE_DOMAIN, 0]).is_none());
+    }
+
+    /// 写侧：>255 字节域名必须显式失败，不得 `as u8` 静默截断（截断后对端按
+    /// 错误长度解析 ⇒ 帧后续整体错位）。
+    #[test]
+    #[should_panic(expected = "域名超过 255 字节")]
+    fn test_write_address_rejects_overlong_domain() {
+        let mut buf = Buffer::with_capacity(512);
+        let addr = Address::new_domain("a".repeat(256));
+        AddressSerializer::write_address_port(&mut buf, &addr, Port::new(443));
     }
 }

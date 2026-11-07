@@ -93,7 +93,7 @@ static SPAWN_COUNTERS: [AtomicU64; SITES.len()] = [const { AtomicU64::new(0) }; 
 /// 次计数（观测面）。
 #[allow(
     clippy::disallowed_methods,
-    reason = "红线受控逃逸口：站点穷举登记于 SITES（CI 门核对调用集合）；主仓改调本函数即不命中其 crate 级 tokio::spawn 禁用条目"
+    reason = "②豁免（bd kwevg · §3.5.6）：红线受控逃逸口：站点穷举登记于 SITES（CI 门核对调用集合）；主仓改调本函数即不命中其 crate 级 tokio::spawn 禁用条目；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
 )]
 pub fn spawn_unchecked<T>(
     site: RedlineSite,

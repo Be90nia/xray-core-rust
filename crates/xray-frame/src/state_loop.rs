@@ -87,6 +87,12 @@ pub enum Phase {
     Started,
     /// 已停机。
     Stopped,
+    /// 结果缺失（本轮启动结果未覆盖到它：未参与 / 解释器未产出）。
+    ///
+    /// fail-closed：缺结果**不得**当成功（bd euw4o）。此相位同时表示「中断在它
+    /// 之前的插件」与「它不是失败点」——失败点与原因在 `LifecycleSlice::failure`
+    /// 与账本 `PluginFailed` 行里。
+    Unknown,
 }
 
 /// 生命周期动作（纯数据；父动作的组成部分）。
@@ -388,11 +394,27 @@ impl Reducer for LifecycleReducer {
                         entry.phase = Phase::Started;
                     }
                 }
+                // 结果没覆盖到的插件 → `Unknown`（fail-closed）。缺结果最典型的
+                // 成因是解释器压根没产出 `StartOutcome`（`take()` 落空 ⇒ 空结果），
+                // 那种情况下列表全空、相位若仍记 `Running` 就是静默降级（bd euw4o）。
+                let mut unreported = Vec::new();
+                for entry in &mut next.plugins {
+                    if entry.phase == Phase::Pending {
+                        entry.phase = Phase::Unknown;
+                        unreported.push(entry.name.clone());
+                    }
+                }
                 next.started = started;
-                next.phase =
-                    if failed.is_some() { AssemblyPhase::Failed } else { AssemblyPhase::Running };
+                next.phase = if failed.is_some() || !unreported.is_empty() {
+                    AssemblyPhase::Failed
+                } else {
+                    AssemblyPhase::Running
+                };
                 if let Some((_, reason)) = failed {
                     next.failure = Some(reason);
+                } else if !unreported.is_empty() {
+                    next.failure =
+                        Some(format!("start outcome incomplete: no result for {unreported:?}"));
                 }
             },
             LifecycleAction::Stop => {
@@ -526,6 +548,8 @@ impl Reducer for AssemblyRoot {
 pub struct AssemblyLoop {
     store: SyncStore<AssemblyState, AssemblyAction, AssemblyOp>,
     journal: Mutex<Option<AssemblyJournal>>,
+    /// 停机协调器（停机编排 + 启动结果未能回灌时的就地回滚，bd rznvx）。
+    coordinator: Arc<ShutdownCoordinator>,
     /// 解释器产出的失败（原始 `PluginError`，保 source 链）。
     failure: Arc<Mutex<Option<PluginError>>>,
     /// 解释器产出的启动批次结果。
@@ -561,6 +585,7 @@ impl AssemblyLoop {
         Self {
             store: SyncStore::new(reducer, fx),
             journal: Mutex::new(journal),
+            coordinator,
             failure,
             outcome,
             report,
@@ -595,6 +620,13 @@ impl AssemblyLoop {
     /// 启动一批（注册 → 依赖序带起 → 结果回灌）。
     ///
     /// 结果回灌走驱动层（解释器只写共享槽位）：回灌链深度恒为 0。
+    ///
+    /// 失败语义：
+    /// - 解释器报失败 → 由解释器自回滚，本层透传 `Err`；
+    /// - 回灌本身失败（账本写盘 / 转移被拒）→ 相位停在 `Starting`，`stop()` 不会
+    ///   受理，故**就地**执行协调器停机（bd rznvx：装配失败后不得残留运行中的组件）；
+    /// - 结果缺失（`take()` 落空 / 覆盖不全）→ reducer 记 `Unknown` + `Failed`， 本层把它升级为
+    ///   `Err`（fail-closed，bd euw4o）。
     pub fn start(&self, names: &[&'static str]) -> Result<(), PluginError> {
         for name in names {
             self.dispatch(LifecycleAction::Register { name: (*name).to_string() })?;
@@ -605,17 +637,51 @@ impl AssemblyLoop {
                 format!("start rejected while phase {:?}", self.phase()).into(),
             ));
         }
+        // `None` = 解释器没产出结果（例如 `FinishStart` 未跑）⇒ 空结果，走
+        // reducer 的 fail-closed 分支（全 `Unknown` → `Failed`），不得默认成功。
         let outcome = lock(&self.outcome).take().unwrap_or_default();
         let failed = outcome.failed.clone();
-        self.dispatch(LifecycleAction::StartOutcome {
+        if let Err(err) = self.dispatch(LifecycleAction::StartOutcome {
             init_ok: outcome.init_ok,
             started: outcome.started,
             failed,
-        })?;
+        }) {
+            self.abort_started(&err);
+            return Err(err);
+        }
         if let Some(err) = lock(&self.failure).take() {
             return Err(err);
         }
+        if self.phase() != AssemblyPhase::Running {
+            let reason = self
+                .store
+                .snapshot()
+                .lifecycle
+                .failure
+                .clone()
+                .unwrap_or_else(|| format!("start incomplete while phase {:?}", self.phase()));
+            return Err(PluginError::Other(reason.into()));
+        }
         Ok(())
+    }
+
+    /// 启动结果未能回灌时的就地回滚：协调器按逆启动序停掉已登记组件。
+    ///
+    /// 只对「已登记 stop 闭包」的组件有效——正常路径下 `FinishStart` 已把每个
+    /// 启动成功的插件登记进协调器，回滚后协调器转入 Done，后续 `stop()` 直接
+    /// 复用同一报告（不重复执行闭包）。
+    fn abort_started(&self, cause: &PluginError) {
+        let log = LogFacade::new("assembly", vec![]);
+        log.error(format!("assembly start outcome not applied, stopping started plugins: {cause}"));
+        let report = self.coordinator.shutdown();
+        for component in &report.per_component {
+            if !matches!(&component.kind, OutcomeKind::Stopped) {
+                log.error(format!(
+                    "assembly rollback: plugin {} not stopped cleanly: {:?}",
+                    component.name, component.kind
+                ));
+            }
+        }
     }
 
     /// 停机（协调器按逆启动序执行 stop 闭包）。
@@ -1180,6 +1246,26 @@ mod tests {
         assert_eq!(loop_.phase(), AssemblyPhase::Running, "停机未被受理 → 相位不动");
     }
 
+    /// 用例⑬-b（bd rznvx）：`StartOutcome` 落盘失败 → 已启动插件必须被就地停掉。
+    ///
+    /// 修前：相位停在 `Starting`（`stop()` 不受理）且无人调协调器 ⇒ 插件残留
+    /// 运行（进程不退出即泄漏，退出则与别的清理路径竞态）。
+    #[test]
+    fn start_outcome_journal_failure_stops_started_plugins() {
+        let probe = Probe::default();
+        // append 序：1=Register 2=Start 3=StartOutcome ⇒ 第 3 条起失败。
+        let loop_ = one_plugin_loop(
+            &probe,
+            BrokenJournal { fail_append_at: 2, fail_snapshot: false, appends: 0 },
+        );
+        let err = loop_.start(&["A"]).expect_err("结果回灌失败必须启动即失败");
+        assert!(err.to_string().contains("version mismatch"), "{err}");
+        assert_eq!(loop_.phase(), AssemblyPhase::Starting, "未 apply 即相位不动");
+        let events = probe.events();
+        assert!(events.contains(&"A:start".to_string()), "A 确实启动过：{events:?}");
+        assert!(events.contains(&"A:stop".to_string()), "已启动插件必须被停：{events:?}");
+    }
+
     /// 用例⑭：停机快照失败并入报告（`is_clean()` 覆盖持久化面）。
     #[test]
     fn journal_snapshot_failure_taints_report() {
@@ -1304,6 +1390,52 @@ mod tests {
                 (AuditKind::PluginStopped, Some("B".to_string())),
                 (AuditKind::PluginStopped, Some("A".to_string())),
             ]
+        );
+    }
+
+    /// 用例⑯-b（bd euw4o）：结果缺失 → 插件记 `Unknown`、装配相位 `Failed`。
+    ///
+    /// 修前：解释器没产出结果时 `take().unwrap_or_default()` 给出空结果，reducer
+    /// 见 `failed == None` 就记 `Running` ⇒ 聚合视图显示「全部成功」，停机/回滚
+    /// 决策据此误判（静默降级家族 c0p71/k2tq1/trssj）。
+    #[test]
+    fn missing_start_outcome_is_fail_closed() {
+        let probe = Probe::default();
+        let registry = registry_of(vec![fake("A", NO_DEPS, &probe), fake("B", DEP_A, &probe)]);
+        let plan = Arc::new(Plan::from_registry(&registry).expect("plan"));
+        let mut store = TestStore::new(AssemblyRoot::new(plan));
+
+        for name in ["A", "B"] {
+            store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Register {
+                name: name.into(),
+            }));
+        }
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::Start));
+        for (id, op) in [
+            (0, AssemblyOp::BringUp { name: "A".into() }),
+            (1, AssemblyOp::BringUp { name: "B".into() }),
+            (2, AssemblyOp::FinishStart),
+        ] {
+            store.receive(ExpectedEffect::Run { id: Some(EffectId::new(id)), op });
+        }
+        // 空结果 = 解释器没产出（`take()` 落空）。
+        store.dispatch(AssemblyAction::Lifecycle(LifecycleAction::StartOutcome {
+            init_ok: Vec::new(),
+            started: Vec::new(),
+            failed: None,
+        }));
+
+        let lifecycle = &store.state().lifecycle;
+        assert_eq!(lifecycle.phase, AssemblyPhase::Failed, "缺结果不得记 Running");
+        assert!(
+            lifecycle.plugins.iter().all(|p| p.phase == Phase::Unknown),
+            "缺结果的插件记 Unknown：{:?}",
+            lifecycle.plugins
+        );
+        assert!(
+            lifecycle.failure.as_deref().expect("reason").contains("incomplete"),
+            "缺结果必须有可读原因：{:?}",
+            lifecycle.failure
         );
     }
 

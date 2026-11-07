@@ -31,24 +31,27 @@ impl EnvFlag {
 
     /// 获取标志值，首次访问时从环境变量读取。
     ///
-    /// 返回环境变量的字符串值引用，未设置时返回 `None`。
+    /// 返回环境变量的字符串值引用，未设置时返回 `None`。**已设置但为空串**时返回
+    /// `Some("")`——对齐 Go `GetValue`（`platform.go:38-50` 用 `os.LookupEnv`，
+    /// 命中即返回，不过滤空串；bd 3317m(c)）。调用方若要把空串当「未设置」自行
+    /// 处理（如 `Option::filter(|v| !v.is_empty())`）。
     pub fn get_value(&self) -> Option<&str> {
         self.value
             .get_or_init(|| {
-                std::env::var(&self.name)
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .or_else(|| std::env::var(&self.alt_name).ok().filter(|v| !v.is_empty()))
+                std::env::var(&self.name).ok().or_else(|| std::env::var(&self.alt_name).ok())
             })
             .as_deref()
     }
 
     /// 获取标志值的布尔形式，默认为 `false`。
     ///
-    /// 以下值（不区分大小写）视为 `true`：`"1"`、`"true"`、`"yes"`、`"on"`。
+    /// **只有字面量 `"true"` 视为真**（大小写敏感，无 trim）——Go 侧没有
+    /// `GetValueAsBool`，实际写法是 `GetValue(默认 "") == "true"`
+    /// （`core/xray.go:195-196` cone 判定即此形）。故 `"1"`/`"yes"`/`"on"`/`""`
+    /// 一律为假（bd 3317m(c)：旧实现接受 `"1"`，让 `xray.cone.disabled=1`
+    /// 在 Rust 侧真的关掉 cone，而 Go 侧保持开启 = 语义反向）。
     pub fn get_value_as_bool(&self) -> bool {
-        self.get_value()
-            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        self.get_value() == Some("true")
     }
 
     /// 获取标志值的整数形式。
@@ -75,9 +78,11 @@ pub fn use_readv() -> bool {
 ///
 /// 对应 Go `platform.UseFreedomSplice`（common/platform/platform.go:17）+
 /// `reloadEnvSettings`（proxy/freedom/freedom.go:41-51）。语义见
-/// [`parse_enabled_env`]。刻意不走 [`EnvFlag`]：其 `get_value` 把空串过滤为
-/// 未设置，而 Go 对 `xray.buf.splice=""` 的语义是禁用（LookupEnv 命中空串 →
-/// switch 落空）。
+/// [`parse_enabled_env`]。刻意不走 [`EnvFlag`]：`parse_enabled_env` 需要
+/// 「未设置（None）」与「设置为空串（Some("")）」两态可分，而
+/// `EnvFlag::get_value` 也返回 `Some("")`（bd 3317m(c) 起对齐 Go LookupEnv），
+/// 但它的布尔助手只认字面量 `"true"`——与 Go `switch` 三态语义不同（Go 对
+/// `xray.buf.splice=""` 判**禁用**）。两者混用必错，故此处直读 `var_os`。
 ///
 /// 缓存语义（bd 1n90/xag3②）：LazyLock 首调解析一次，热路径只做 atomic
 /// load（零 env 查询/零分配）。环境变更需显式 [`reload_env_settings`] 刷新，
@@ -180,20 +185,11 @@ pub fn cone_disabled() -> bool {
     FLAG.get_value_as_bool()
 }
 
-/// `xray.browser.dialer`（alt `XRAY_BROWSER_DIALER`）— browser dialer 后端地址。
-///
-/// 对应 Go `platform.BrowserDialerAddress`（transport/internet/browser_dialer/
-/// dialer.go:46）。原始字符串由调用方解析（典型值：`ws://127.0.0.1:4321`）。
-#[must_use]
-pub fn browser_dialer_address() -> Option<String> {
-    static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.browser.dialer"));
-    FLAG.get_value().map(str::to_owned)
-}
-
 /// `xray.tun.fd`（alt `XRAY_TUN_FD`）— Tun Fd 整数字符串。
 ///
 /// 对应 Go `platform.TunFdKey`（proxy/tun/tun_android.go:27 / tun_darwin.go:54）。
-/// 未经设置返回 `None`；调用方负责 `str::from_str::<i32>()` 解析。
+/// 未经设置返回 `None`（**设置为空串返回 `Some("")`**，对齐 Go `os.LookupEnv`
+/// 命中语义——空串天然解析失败，由调用方的 `str::from_str::<i32>()` 拒掉）。
 #[must_use]
 pub fn tun_fd_raw() -> Option<String> {
     static FLAG: LazyLock<EnvFlag> = LazyLock::new(|| EnvFlag::new("xray.tun.fd"));
@@ -258,6 +254,43 @@ mod tests {
         let v1 = flag.get_value();
         let v2 = flag.get_value();
         assert_eq!(v1, v2);
+    }
+
+    /// bd 3317m(c)：`EnvFlag` 的空串与布尔语义对齐 Go。
+    ///
+    /// Go `platform.go:38-50` 用 `os.LookupEnv` ⇒ **设置为空串 = 命中 = 返回 ""**；
+    /// `core/xray.go:195` 的 cone 判定是 `GetValue(默认 "") != "true"` ⇒ 只有字面量
+    /// `"true"` 才翻转。旧实现：空串当未设置 + 布尔接受 `"1"|"yes"|"on"` ⇒
+    /// `xray.cone.disabled=1` 在 Rust 侧关掉 cone、Go 侧保持开启（语义反向）。
+    #[test]
+    fn env_flag_matches_go_empty_and_bool_semantics() {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _g = LOCK.lock();
+
+        let name = "xray.test.3317m.flag";
+        // 每次用新 EnvFlag（内部 OnceLock 缓存，跨断言不可复用）。
+        let with = |value: Option<&str>| {
+            // SAFETY: 测试持全局锁串行化 env 访问（进程内无并发读者）。
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+            let flag = EnvFlag::new(name);
+            let got = (flag.get_value().map(str::to_owned), flag.get_value_as_bool());
+            // SAFETY: 同上；恢复干净态，不把测试值泄漏给同进程其它测试。
+            unsafe { std::env::remove_var(name) };
+            got
+        };
+
+        assert_eq!(with(None), (None, false), "未设置 ⇒ None/false");
+        assert_eq!(with(Some("")), (Some(String::new()), false), "空串 = 命中（Go LookupEnv）");
+        assert_eq!(with(Some("true")), (Some("true".into()), true), "字面量 true ⇒ 真");
+        // Go 侧这四个都不翻转（旧实现认 "1"/"yes"/"on"）。
+        for off in ["1", "yes", "on", "TRUE", " true"] {
+            assert_eq!(with(Some(off)), (Some(off.into()), false), "env={off:?} 必须为假");
+        }
     }
 
     #[test]
@@ -361,11 +394,6 @@ mod tests {
     #[test]
     fn test_cone_disabled_returns_bool() {
         let _val: bool = cone_disabled();
-    }
-
-    #[test]
-    fn test_browser_dialer_address_returns_option() {
-        let _val: Option<String> = browser_dialer_address();
     }
 
     #[test]

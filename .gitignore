@@ -84,6 +84,10 @@ docs/*
 !docs/benchmarks/
 # 例外: docs/audit-*.md 立项级审计(5 维+9 票+综合+立项级 共 6 份, 治理资产, 与 docs/refs/ 治理输入同级) 2026-10-12; PM 拍板入仓
 !docs/audit-*.md
+# 例外: docs/architecture/ 架构治理资产(ADR 目录 + 插件模型/udf 功能域全景/深度融合战役计划/masque 任务书/池化蓝图 + STABLE·RELEASE 门禁 + API 台账), 均被 CLAUDE.md §3 文档地图直接引用 2026-11-07; bd wio1d
+!docs/architecture/
+# 例外: docs/research/xray-frame-*.md 盘点底料(主仓能力盘点/udf 机制差距/池化归 udf/DNS 面/inbound-outbound 面), 被 CLAUDE.md §3 引用 2026-11-07; bd wio1d
+!docs/research/
 
 # 临时调试产物(应走 tools/logs/ 归档, 不入仓) 2026-10-12
 build-debug.log

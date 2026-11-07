@@ -303,11 +303,22 @@ impl PluginContext {
     /// 组合源装配：插件段优先、环境回落，喂给插件的 `ConfigPort`
     /// （`ConfigPort::load(&self, env: &dyn EnvSource)`，skeleton/src/config.rs）。
     /// 段的键值面取 outbound/inbound 元素的 `settings` 子对象（xray 既有布局）；
-    /// 元素无 `settings` 时退化用元素本体（P0 期自持 fixture）。
+    /// 元素**无** `settings` 键时退化用元素本体（P0 期自持 fixture）。
+    ///
+    /// `settings` **存在但非对象**（字符串/数组/数字）⇒ `Err`：旧实现 `and_then`
+    /// 落空后回退到整段，把 `protocol`/`tag`/`port` 当键值面 ⇒ 缺键静默走默认值，
+    /// 配置写错却启动成功（bd 3317m(d)；Go `infra/conf` 对类型不匹配直接报错）。
     pub fn load_config<T: ConfigPort>(&self, port: T) -> Result<T::Config, PluginError> {
         let section = self.section()?;
-        let kv =
-            section.get("settings").and_then(|s| s.as_object()).or_else(|| section.as_object());
+        let kv = match section.get("settings") {
+            None => section.as_object(),
+            Some(settings) => Some(settings.as_object().ok_or_else(|| {
+                PluginError::Config(ConfigError::Invalid {
+                    key: format!("{}: settings", self.plugin_name),
+                    reason: "must be a JSON object".into(),
+                })
+            })?),
+        };
         let combined = SectionEnv { plugin: self.plugin_name, section: kv, fallback: &*self.env };
         port.load(&combined).map_err(PluginError::Config)
     }
@@ -480,6 +491,40 @@ mod tests {
             ctx.load_config(KeyProbe("web.port")).expect("load"),
             None,
             "裸 web.port 不回落"
+        );
+    }
+
+    /// bd 3317m(d)：`settings` 存在但**非对象**必须报错，不许退化用整段。
+    ///
+    /// 旧实现 `settings.and_then(as_object).or_else(|| section.as_object())`：
+    /// 类型写错时把 `protocol`/`tag` 当键值面 ⇒ 键全缺 ⇒ 插件静默走默认值，
+    /// 启动「成功」但配置没生效（Go `infra/conf` 对类型不匹配直接报错）。
+    #[test]
+    fn non_object_settings_is_rejected() {
+        let ctx = ctx_with_env("vmess-in", json!("not-an-object"), MockEnv::new());
+        let err = ctx.load_config(KeyProbe("PORT")).expect_err("settings 非对象必须拒");
+        let msg = err.to_string();
+        assert!(msg.contains("settings"), "错误必须点名 settings：{msg}");
+        assert!(msg.contains("JSON object"), "错误必须说清期望类型：{msg}");
+    }
+
+    /// 缺 `settings` 键仍退化用段本体（P0 期自持 fixture 依赖），行为不变。
+    #[test]
+    fn missing_settings_falls_back_to_section_body() {
+        let ctx = PluginContext::new(
+            "vmess-in",
+            ArmScope::new(),
+            Arc::new(SystemClock),
+            derive_fingerprint(Some(FIXED_ADDR)),
+            Arc::new(MockEnv::new()),
+            json!({ "inbounds": [{ "protocol": "vmess-in", "PORT": "1080" }] }),
+            LogFacade::new("vmess-in", vec![]),
+            Arc::new(AuditHandle::new(crate::audit::DEFAULT_AUDIT_RING_CAP)),
+        );
+        assert_eq!(
+            ctx.load_config(KeyProbe("PORT")).expect("load").as_deref(),
+            Some("1080"),
+            "无 settings 键 ⇒ 用段本体（旧 fixture 形态）"
         );
     }
 

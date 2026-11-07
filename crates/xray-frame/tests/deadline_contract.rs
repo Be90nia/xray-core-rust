@@ -60,25 +60,22 @@ async fn short_deadline_timeout_costs_no_real_waiting() {
     assert!(t0.elapsed() < Duration::from_millis(100), "零真实等待（实测 {:?}）", t0.elapsed());
 }
 
-/// ⑤ 构造零值 fail-fast：任一时限为 0 → panic（catch_unwind 断言）。
+/// ⑤ 构造零值 fail-fast：时限为 0 → panic（catch_unwind 断言）。
+///
+/// bd 3317m(b)：`HandshakeDeadline` 曾带零消费的 `idle_limit`（守卫只用总时限），
+/// 已删除——空闲面由 [`IdleDeadline`] 独立承接，其零值仍 fail-fast。
 #[test]
 fn zero_limits_are_fail_fast_panics() {
     assert!(
-        std::panic::catch_unwind(|| HandshakeDeadline::new(Duration::ZERO, Duration::from_secs(5)))
-            .is_err(),
+        std::panic::catch_unwind(|| HandshakeDeadline::new(Duration::ZERO)).is_err(),
         "limit=0 必须 panic"
-    );
-    assert!(
-        std::panic::catch_unwind(|| HandshakeDeadline::new(Duration::from_secs(5), Duration::ZERO))
-            .is_err(),
-        "idle_limit=0 必须 panic"
     );
     assert!(
         std::panic::catch_unwind(|| IdleDeadline::new(Duration::ZERO)).is_err(),
         "IdleDeadline limit=0 必须 panic"
     );
     // 正常构造不受影响。
-    let _ = HandshakeDeadline::new(Duration::from_secs(1), Duration::from_secs(2));
+    let _ = HandshakeDeadline::new(Duration::from_secs(1));
 }
 
 /// 默认档：5s（PM 拍板 2026-10-23：与停机超时同档减少魔数）。
@@ -86,13 +83,14 @@ fn zero_limits_are_fail_fast_panics() {
 fn default_handshake_deadline_is_five_seconds() {
     let hd = HandshakeDeadline::default();
     assert_eq!(hd.limit, Duration::from_secs(5));
-    assert_eq!(hd.idle_limit, Duration::from_secs(5));
+    // 空闲面同档：IdleDeadline 无 Default，按 DEFAULT_LIMIT 构造（零值会 panic）。
+    let _ = IdleDeadline::new(xray_frame::deadline::DEFAULT_LIMIT);
 }
 
 /// guard 接线冒烟：HandshakeDeadline 按总时限判负；IdleDeadline 期限内放行。
 #[tokio::test]
 async fn guards_wire_through_with_deadline() {
-    let hd = HandshakeDeadline::new(Duration::from_millis(1), Duration::from_secs(5));
+    let hd = HandshakeDeadline::new(Duration::from_millis(1));
     let r: Result<(), Elapsed> = hd.guard(clock(), std::future::pending()).await;
     assert!(r.is_err(), "handshake guard 应按总时限判负");
     let idle = IdleDeadline::new(Duration::from_secs(5));

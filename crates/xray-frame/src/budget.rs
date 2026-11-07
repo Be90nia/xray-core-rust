@@ -82,8 +82,12 @@ pub const SOCKET_KERNEL_BOOKKEEPING_FACTOR: usize = 2;
 
 /// QUIC/UDP 缺省接收缓冲的**账面**口径（字节/socket）= 8 MiB × 2 = 16 MiB。
 ///
-/// 256 MB 机型判据：QUIC 端点数 × 本值必须落在 [`XRAY_BUDGET_BYTES`] 内
-/// （预算门已强制：`固定占用 + 端点账面 + 最小并发 × pipe` ≤ 96 MiB）。
+/// **记账归属（bd 258qt(c)/nlhht，两栏口径）**：
+/// - **显式** `socketSettings.receiveBufferSize`（运维亲手指定）⇒ 按显式值 ×2 计入
+///   预算门**硬账**（bind 即真实分配；8 端点 × 64 MiB × 2 = 1 GiB 必须能被拦下）。
+/// - **缺省**（本常量）⇒ 只进门的**上限面**（caps 栏 + 启动日志），不进硬账： Linux
+///   `net.core.rmem_max` 缺省（stock ≈208 KiB）会把设定值钳死，按 16 MiB/端点
+///   预约会**误杀合法配置**（5 端点 = 107.6 MiB > 96 MiB 拒启，本轮实测形态）。
 pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES: usize =
     QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR;
 
@@ -91,13 +95,22 @@ pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES: usize =
 ///
 /// **64**——与实现 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES` 同一
 /// 值（交叉断言钉住；bd sgdwm 修正旧登记 128 的漂移，PM-04）。
-/// 64 × ~6KiB/任务（[`HANDSHAKE_TASK_EST_BYTES`]）≈ 375KiB。**执行点在
-/// ws/httpupgrade accept 接线**；超限 fail-fast 丢弃不排队。
+/// **每监听一份**（`HandshakeGate` 由各 accept 循环各自构造），故预算门按
+/// 「监听数 × 64 × [`HANDSHAKE_TASK_EST_BYTES`]」入账（bd 258qt(a)：旧簿按进程
+/// 记 1 份，7 监听真额 24MiB 只记了 384KiB）。超限 fail-fast 丢弃不排队。
 pub const HANDSHAKE_INFLIGHT_MAX: usize = 64;
 
-/// 单条握手在途任务估占（字节）：任务栈 + handshake 状态 ≈ 6KiB
-/// （MEMORY-BUDGET-256MB §1「128 × ~6KB」口径，随条数缩放）。
-pub const HANDSHAKE_TASK_EST_BYTES: usize = 6 * 1024;
+/// 单条握手在途任务估占（字节）= **55KiB**。
+///
+/// 依据（实现侧实测，`xray-transport::handshake_gate` 的
+/// `MAX_INFLIGHT_HANDSHAKES` doc）：线性斜率 **54,975B/连接**——裸 socket 双方
+/// 仅 ~0.9KiB，其余为 ws 握手态 / 任务 future（tungstenite 内部按需分配，本层
+/// 不预分配）。取整上沿 55KiB（= 56,320B）作账面。
+///
+/// bd 258qt(a)：旧簿写 6KiB（MEMORY-BUDGET-256MB §1「128 × ~6KB」口径），比
+/// 实现自陈的 55KiB 低 9×；改实现值或复测斜率时本值须同步（交叉断言钉在
+/// `xray-core::memory_budget` 的 `handshake_task_est_matches_impl_doc`）。
+pub const HANDSHAKE_TASK_EST_BYTES: usize = 55 * 1024;
 
 /// DNS pending map **条数**上界（512 条）——与实现
 /// `xray_app_dns::nameserver::udp::MAX_PENDING_QUERIES` 同一值（交叉断言钉住）。
@@ -149,8 +162,10 @@ pub const FINALMASK_XMC_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// （同桥在途口径，运维判据）；多 server 实例按份叠加。
 ///
 /// **总实算**（bd wpa3o-b 验收：入簿后固定底数 + 本项 ≤ 总额）：
-/// `startup_fixed_floor_bytes_for(8)` 20,316,160 + 43,155,456 = 63,471,616
-/// ≈ 60.5MiB ≤ [`XRAY_BUDGET_BYTES`]（96MiB）✓（断言住 `xray-core::memory_budget`）。
+/// `startup_fixed_floor_bytes_for(8, 1)` 23,719,424 + 43,155,456 = 66,874,880
+/// ≈ 63.8MiB ≤ [`XRAY_BUDGET_BYTES`]（96MiB）✓（断言住 `xray-core::memory_budget`）。
+/// 固定底数含**每监听握手在途**（bd 258qt(a)：监听越多本式越大，见
+/// [`startup_fixed_floor_bytes_for`]）。
 pub const XDNS_FRAG_WORST_CASE_BYTES: usize = 43_155_456;
 
 /// hyper 每 host **空闲连接数**上界（**已落地**：
@@ -166,14 +181,18 @@ pub const HYPER_MAX_IDLE_PER_HOST_CONNECTIONS: usize = 4;
 /// （client.rs doc 口径）。预算门 xhttp 端点占用用本值 × 空闲连接数。
 pub const HYPER_IDLE_CONN_EST_BYTES: usize = 100 * 1024;
 
-/// 小池档合计硬顶（4MB，**条款已重写**——bd sgdwm 修正 PM-04「宪法破」）。
+/// 小池档合计硬顶（4MB，**条款已重写**——bd sgdwm 修正 PM-04「宪法破」，
+/// bd 258qt(a) 再收口成员面）。
 ///
-/// 旧条款自称「全部池/缓存合计 ≤4MB」，被 xray-buf 8MiB 单项破掉。新条款：
-/// 本档只覆盖**小池/缓存**四成员（握手在途 + DNS pending + TLS session cache +
-/// hyper idle，交叉断言验合计 ≤4MiB）；进程级两大池（xray-buf
+/// 旧条款自称「全部池/缓存合计 ≤4MB」，被 xray-buf 8MiB 单项破掉。第二条旧条款
+/// 把**握手在途**算进本档——那是**每监听**在途任务（64 × 55KiB = 3.4MiB/监听，
+/// 随监听数线性），不是进程级池/缓存，塞进固定 4MiB 档必然自相矛盾。
+/// 现成员 = **进程级小池/缓存三件**（DNS pending + TLS session cache + hyper
+/// idle，合计 ~3.4MiB ≤ 4MiB，交叉断言钉住）；握手在途随固定底数分账
+/// （[`startup_fixed_floor_bytes_for`]），大池（xray-buf
 /// [`XRAY_BUF_POOL_TOTAL_MAX_BYTES`] 8MiB、splithttp 块池
-/// [`SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES`] 2MiB）、DNS 解析缓存、finalmask xmc
-/// 池**单列分账，不入本条款**。
+/// [`SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES`] 2MiB）、DNS 解析缓存、finalmask
+/// xmc 池**单列分账，不入本条款**。
 pub const NEW_POOLS_TOTAL_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// xray-buf 分层池**进程级**字节预算（**已落地**：`xray_buf::alloc::POOL_BYTE_BUDGET`
@@ -207,6 +226,13 @@ pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 128 * 1500;
 ///
 /// 与 SETTINGS 流窗/连窗（信用计数器，零预分配）不同——本值是 hyper 真会堆积的
 /// 发送缓冲 ⇒ 每条满载 splithttp 连接最多 16MiB。bd sgdwm 入簿（PM-05）。
+///
+/// **记账归属（bd pyka7 / NEW-S2，两栏口径）**：hyper 只在背压时惰性分配，
+/// 装配期零连接 ⇒ 不进硬账；按「上限 ≠ 预约」进门的**上限面**（caps 栏 +
+/// 启动日志）。**96 MiB 不是运行期硬上界**：xhttp 侧的聚合上界 =
+/// `并发连接数 × 本值`，而连接数由配置/负载决定（`MAX_IDLE_PER_HOST` 只限
+/// **空闲**连接）。运行期聚合闸需在 hyper 发送缓冲外侧记账，属 transport 侧
+/// 后续票（本簿只登记 + 打印，禁假称已强制）。
 pub const H2_MAX_SEND_BUF_PER_CONN_BYTES: usize = 16 * 1024 * 1024;
 
 /// splithttp **客户端** h2 SETTINGS 流窗 = 连窗（字节）。**非内存账面**：SETTINGS
@@ -229,6 +255,11 @@ pub const WS_PER_CONN_BUFFER_BOOKED_BYTES: usize = 64 * 1024;
 /// ⇒ 与 QUIC 端点同款 8MiB 下限（Go quic-go wrapConn parity）；bd 0x4tl/lf69h 起
 /// 会话按端点复用（1 端点 1 socket，无每查询 churn——PM-02 的 churn 面已收口，
 /// 本簿按复用后口径登记）。账面常量与 QUIC 同源（交叉断言钉住）。
+///
+/// **预算门消费方（bd 258qt(d)）**：DoH3 resolver 由 dns app 运行期按 server 创建，
+/// 装配期 `BuiltConfig` 里数不出端点数 ⇒ 与本值同口径地进门的**上限面**（caps 栏
+/// 打印「每 DoH3 resolver 一份」），不进硬账。旧状：常量在簿里但门内零消费方
+/// （README 式登记），现在至少是可见的运维判据。
 pub const DOH3_SESSION_SOCKET_BOOKED_BYTES: usize = QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES;
 
 /// 桥在途满载上界（字节/连接，**条目闸口径**）= 每方向 mpsc 64 条 + 读/写腿
@@ -279,18 +310,20 @@ pub const RESERVE_MARGIN_MIN_BYTES: usize = 50 * 1024 * 1024;
 pub const SPLITHTTP_ENDPOINT_BOOKED_BYTES: usize = H2_MAX_SEND_BUF_PER_CONN_BYTES
     + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES;
 
-/// 装配期**固定占用**下限（字节）：进程级池/缓存合计（不含连接面、爆队上界与
-/// 二进制/运行时 RSS 面）。PM-07 公式口径：xray-buf 池 + 核数 × 128KiB
-/// thread_local；其余成员见各常量 doc。预算门用它做「实际占用面」的底数。
+/// 装配期**固定占用**下限（字节）：进程级池/缓存合计 + 每监听握手在途。
+///
+/// `listeners` = 配置里真正 listen 的入站数（`BuiltInbound::port.is_some()`）——
+/// 握手闸每个 accept 循环各一份（bd 258qt(a)），故该项随监听数线性增长。
+/// 不含连接面、爆队上界与二进制/运行时 RSS 面（PM-07 公式口径的其余成员见各常量 doc）。
 #[must_use]
-pub fn startup_fixed_floor_bytes() -> usize {
+pub fn startup_fixed_floor_bytes(listeners: usize) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
-    startup_fixed_floor_bytes_for(cores)
+    startup_fixed_floor_bytes_for(cores, listeners)
 }
 
-/// 同上，核数显式注入（测试确定性用——换机器断言不随核数漂移，铁律①）。
+/// 同上，核数与监听数显式注入（测试确定性用——换机器断言不随核数漂移，铁律①）。
 #[must_use]
-pub fn startup_fixed_floor_bytes_for(cores: usize) -> usize {
+pub fn startup_fixed_floor_bytes_for(cores: usize, listeners: usize) -> usize {
     XRAY_BUF_POOL_TOTAL_MAX_BYTES
         + cores * xray_buf::alloc::TLS_BYTE_BUDGET
         + SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES
@@ -298,7 +331,7 @@ pub fn startup_fixed_floor_bytes_for(cores: usize) -> usize {
         + DNS_CACHE_ESTIMATE_BYTES
         + DNS_PENDING_EST_BYTES
         + TLS_SESSION_CACHE_ESTIMATE_BYTES
-        + HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
+        + listeners * HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
 }
 
 #[cfg(test)]
@@ -310,7 +343,13 @@ mod tests {
     /// bd ccy5d 起含 hysteria 共享块池 192_000B：20_316_160 + 192_000 = 20_508_160。
     #[test]
     fn floor_moves_without_drift() {
-        assert_eq!(startup_fixed_floor_bytes_for(8), 20_508_160);
+        // 8 核参考机 + 1 监听：20_114_944（池/缓存）+ 64 × 55KiB（握手在途）= 23_719_424。
+        assert_eq!(startup_fixed_floor_bytes_for(8, 1), 23_719_424);
+        // 每监听一份（bd 258qt(a)）：多一个监听多 64 × 55KiB。
+        assert_eq!(
+            startup_fixed_floor_bytes_for(8, 2) - startup_fixed_floor_bytes_for(8, 1),
+            HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
+        );
         assert_eq!(XRAY_BUDGET_BYTES, 96 * 1024 * 1024);
         assert_eq!(DNS_CACHE_MAX_ENTRIES, 16_384);
     }

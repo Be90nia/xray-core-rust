@@ -387,6 +387,14 @@ pub struct SharedPoolRegistry {
     pools: Mutex<HashMap<usize, Arc<ObjectPool<Vec<u8>>>>>,
 }
 
+/// 共享表现存 class 数上限（bd 3317m(e)）。
+///
+/// 表只增不减，且 `budget.rs` 只登记**生产两个 class**（splithttp `UPLINK_CHUNK`
+/// = 64 KiB、hysteria 1500 B）。若某消费方把配置/对端可控的尺寸当 class key
+/// 传入，每个新 class 最多驻留 `idle_cap` 块，96 MB 分账当场失真 ⇒ 显式封顶并
+/// fail-fast（本文件同款「构造期恒非法 = bug → panic」纪律）。
+pub const MAX_POOL_CLASSES: usize = 8;
+
 impl SharedPoolRegistry {
     /// 进程级单例。
     #[must_use]
@@ -400,12 +408,26 @@ impl SharedPoolRegistry {
     ///
     /// `build` 只在该 class **首次**取池时执行；闭包内的池参数（max/idle_cap/
     /// factory/reset）即该 class 的进程级预算承诺，登记面见 `crate::budget`。
+    ///
+    /// # Panics
+    ///
+    /// 新 class 且已满 [`MAX_POOL_CLASSES`] → panic（fail-visible：class key 应
+    /// 是编译期常量集合，动态尺寸意味着有人在传可控值）。
     pub fn get_or_init(
         &self,
         block_size: usize,
         build: impl FnOnce() -> Arc<ObjectPool<Vec<u8>>>,
     ) -> Arc<ObjectPool<Vec<u8>>> {
         let mut pools = self.pools.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pools.contains_key(&block_size) && pools.len() >= MAX_POOL_CLASSES {
+            let mut existing: Vec<usize> = pools.keys().copied().collect();
+            existing.sort_unstable();
+            panic!(
+                "SharedPoolRegistry class cap {MAX_POOL_CLASSES} reached (existing classes \
+                 {existing:?}); block_size={block_size} must be a compile-time constant — \
+                 dynamic class keys make the 96MiB ledger meaningless (bd 3317m)"
+            );
+        }
         pools.entry(block_size).or_insert_with(build).clone()
     }
 }
@@ -692,6 +714,34 @@ mod tests {
         let s1 = SharedPoolRegistry::shared().get_or_init(7777, build);
         let s2 = SharedPoolRegistry::shared().get_or_init(7777, build);
         assert!(Arc::ptr_eq(&s1, &s2), "进程单例：同尺寸 class 全进程唯一一份");
+    }
+
+    /// bd 3317m(e)：class 数封顶。表只增不减 + `budget.rs` 只登记两个 class ⇒
+    /// 动态尺寸当 key 会让 96MB 分账失真，故第 `MAX_POOL_CLASSES + 1` 个新 class
+    /// fail-fast。
+    #[test]
+    #[should_panic(expected = "class cap")]
+    fn shared_registry_caps_class_count() {
+        let registry = SharedPoolRegistry { pools: Mutex::new(HashMap::new()) };
+        let build = || Arc::new(ObjectPool::new(4, 4, Vec::<u8>::new));
+        for class in 0..MAX_POOL_CLASSES {
+            let _ = registry.get_or_init(10_000 + class, build);
+        }
+        // 第 9 个**新** class → panic。
+        let _ = registry.get_or_init(99_999, build);
+    }
+
+    /// 上限只数**新** class：已存在的 class 重复取池照旧命中（回归面）。
+    #[test]
+    fn existing_class_unaffected_by_cap() {
+        let registry = SharedPoolRegistry { pools: Mutex::new(HashMap::new()) };
+        let build = || Arc::new(ObjectPool::new(4, 4, Vec::<u8>::new));
+        for class in 0..MAX_POOL_CLASSES {
+            let _ = registry.get_or_init(20_000 + class, build);
+        }
+        let a = registry.get_or_init(20_000, build);
+        let b = registry.get_or_init(20_000, build);
+        assert!(Arc::ptr_eq(&a, &b), "满额后已存在 class 仍复用同一份池");
     }
 
     /// 毒化防护（bd ccy5d 验收）：一个 class 里的膨胀块（异形块）只落回自己的

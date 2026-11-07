@@ -119,9 +119,13 @@ pub fn channels() -> &'static ChannelRegistry {
 static SECRETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 /// 装载密钥掩码表（替换语义，与 udf `ChannelRegistry::set_secrets` 一致）：
-/// 同时写 udf 通道表（通道 emit 路径）与本模块快照（tracing 路径）。
+/// 一次写三处——udf 通道表（通道 emit 路径）、本模块快照（裸 tracing 路径）、
+/// `xray_frame::logging` 的进程级表（`LogFacade::emit` 路径）。第三处是
+/// bd zb34d：生产 60+ 处以 `LogFacade::new(domain, vec![])` 构造门面，
+/// 门面自持表恒空 ⇒ 不共享同一份表时「密钥必须掩码」在门面路径上等于不存在。
 pub fn set_secrets(secrets: Vec<String>) {
     CHANNELS.set_secrets(secrets.clone());
+    xray_frame::logging::set_global_secrets(secrets.clone());
     *SECRETS.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = secrets;
 }
 

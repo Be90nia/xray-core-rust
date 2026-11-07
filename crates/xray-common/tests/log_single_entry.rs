@@ -235,3 +235,31 @@ fn registry_drop_accounting_on_write_failure() {
     assert_eq!(dropped.load(Relaxed), 1, "写失败恰丢一行");
     assert_eq!(registry.dropped_total(), 1, "dropped_total 可观测面");
 }
+
+/// bd zb34d：生产 60+ 处 `LogFacade::new(domain, vec![])`（门面自持表恒空）
+/// ⇒ 掩码必须来自 `set_secrets` 灌入的进程级表。本测试走生产路径
+/// （`xlog::set_secrets` → `LogFacade::emit`），不是夹具自持表。
+#[test]
+fn facade_masks_with_table_from_set_secrets() {
+    const SECRET: &str = "Zb34d-s3cret";
+    let _guard = LOCK.lock();
+
+    let buf = SharedBuf::default();
+    let writer_buf = buf.clone();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer_buf.clone())
+            .finish(),
+    );
+
+    xlog::set_secrets(vec![SECRET.to_string()]);
+    xray_frame::logging::LogFacade::new("zb34d", Vec::new()).warn("token=Zb34d-s3cret end");
+    xlog::set_secrets(Vec::new());
+    drop(guard);
+
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(!out.contains(SECRET), "门面路径明文落样: {out}");
+    assert!(out.contains("token=*** end"), "门面掩码未生效: {out}");
+}

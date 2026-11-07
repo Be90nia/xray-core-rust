@@ -71,31 +71,29 @@ pub async fn with_deadline<F: Future>(
     }
 }
 
-/// 握手限时配置：首包/握手统一时限面（Go `signal.CancelAfterInactivity`
-/// 等价面）。
+/// 握手限时配置：握手总的时限面（Go `signal.CancelAfterInactivity` 等价面）。
 ///
 /// [`guard`](Self::guard) 把握手整体包进总时限；首包空闲面（读侧无进展即
-/// 超时）由 [`IdleDeadline`] 承接，两者默认档同为 [`DEFAULT_LIMIT`]。
+/// 超时）由 [`IdleDeadline`] 承接，默认档同为 [`DEFAULT_LIMIT`]。
+///
+/// bd 3317m(b)：本件曾有 `idle_limit` 字段——`guard` 只用 `limit`，字段从不
+/// 参与任何判定（全仓只命中定义、断言与一处读值断言），调用方按「首包空闲 N
+/// 秒」传入却毫无效果。空闲面既已由 [`IdleDeadline`] 独立承接，该字段删除
+/// （死键不注释保留）。
 #[derive(Debug, Clone, Copy)]
 pub struct HandshakeDeadline {
     /// 握手总时限。
     pub limit: Duration,
-    /// 首包空闲时限（读侧无进展即超时）。
-    pub idle_limit: Duration,
 }
 
 impl HandshakeDeadline {
-    /// 构造期校验：两时限必须 > 0（恒非法 = bug → fail-fast panic）。
-    pub fn new(limit: Duration, idle_limit: Duration) -> Self {
+    /// 构造期校验：时限必须 > 0（恒非法 = bug → fail-fast panic）。
+    pub fn new(limit: Duration) -> Self {
         assert!(
             !limit.is_zero(),
             "HandshakeDeadline 握手总时限必须 > 0（恒非法 = bug，fail-fast）"
         );
-        assert!(
-            !idle_limit.is_zero(),
-            "HandshakeDeadline 首包空闲时限必须 > 0（恒非法 = bug，fail-fast）"
-        );
-        Self { limit, idle_limit }
+        Self { limit }
     }
 
     /// 把握手整体包进总时限（内部走 [`with_deadline`] 唯一入口）。
@@ -109,9 +107,9 @@ impl HandshakeDeadline {
 }
 
 impl Default for HandshakeDeadline {
-    /// 默认档：limit = idle_limit = [`DEFAULT_LIMIT`]（5s，PM 拍板 2026-10-23）。
+    /// 默认档：limit = [`DEFAULT_LIMIT`]（5s，PM 拍板 2026-10-23）。
     fn default() -> Self {
-        Self { limit: DEFAULT_LIMIT, idle_limit: DEFAULT_LIMIT }
+        Self { limit: DEFAULT_LIMIT }
     }
 }
 

@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+/// cmd_key KDF 盐。Go `common/protocol/id.go` 的 `NewID` 里内联的字符串常量。
+const CMD_KEY_SALT: &[u8; 36] = b"c48619fe-8f02-49e0-b9e9-edf763e17e21";
+
 /// 自定义 UUID 类型，基于 16 字节数组存储。
 ///
 /// 对应 Go 版本的 `uuid.UUID`，支持 v4 随机生成和标准格式解析。
@@ -92,16 +95,22 @@ impl UUID {
         Some(Self(u))
     }
 
-    /// 派生命令密钥。
+    /// 派生命令密钥（cmd_key）。
     ///
-    /// 对应 Go `(*UUID).CmdKey() []byte`：`md5(UUID.String())` 返回 16 字节。
+    /// 对应 Go `common/protocol/id.go` 的 `NewID`：
+    /// `md5(uuid.Bytes() || "c48619fe-8f02-49e0-b9e9-edf763e17e21")`。
     /// 与 VMess/VLESS protocol cmd_key 保持 1:1 与 Go 版互通。
+    ///
+    /// 注意：Go `common/uuid` 包里**没有** `CmdKey` 方法，公式只存在于
+    /// `protocol.NewID`；此处是同一公式的唯一实现，禁用「md5(带横线字符串)」变体
+    /// （bd gv7gk：那会让 `protocol::ID::cmd_key` 与 VMess 线上值不符）。
     #[must_use]
     pub fn cmd_key(&self) -> [u8; 16] {
         use md5::{Digest, Md5};
-        let uuid_str = self.to_string();
-        let digest = Md5::digest(uuid_str.as_bytes());
-        digest.into()
+        let mut hasher = Md5::new();
+        hasher.update(self.0);
+        hasher.update(CMD_KEY_SALT);
+        hasher.finalize().into()
     }
 }
 
@@ -254,17 +263,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cmd_key_matches_go_md5_semantics() {
-        // Go (*UUID).CmdKey() = md5(UUID.String())
-        // 用 VLESS 项目常用的 UUID 验证：b831381d-6324-4d53-ad4f-8cda48b30811
-        // MD5("b831381d-6324-4d53-ad4f-8cda48b30811") = 9df864028743e438755a322953475266
+    fn test_cmd_key_matches_go_newid_formula() {
+        // Go common/protocol/id.go NewID：
+        // md5(uuid.Bytes() || "c48619fe-8f02-49e0-b9e9-edf763e17e21")
+        // 向量由 Go 公式独立复算：b831381d-6324-4d53-ad4f-8cda48b30811
         let uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
         let key = uuid.cmd_key();
         let expected: [u8; 16] = [
-            0x9d, 0xf8, 0x64, 0x02, 0x87, 0x43, 0xe4, 0x38, 0x75, 0x5a, 0x32, 0x29, 0x53, 0x47,
-            0x52, 0x66,
+            0xb5, 0x0d, 0x91, 0x6a, 0xc0, 0xce, 0xc0, 0x67, 0x98, 0x1a, 0xf8, 0xe5, 0xf3, 0x8a,
+            0x75, 0x8f,
         ];
-        assert_eq!(key, expected, "cmd_key must match md5(uuid_string) for Go interop");
+        assert_eq!(key, expected, "cmd_key must match Go NewID(md5(bytes||salt))");
     }
 
     #[test]

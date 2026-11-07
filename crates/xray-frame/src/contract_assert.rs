@@ -282,7 +282,7 @@ where
     );
 
     // 正向②：HandshakeDeadline::guard 入口同构。
-    let guard = HandshakeDeadline::new(d, d);
+    let guard = HandshakeDeadline::new(d);
     assert!(
         guard.guard(Arc::clone(&clock), work()).await.is_ok(),
         "[deadline:{name}] guard 入口期限内未完成：d={d:?}"

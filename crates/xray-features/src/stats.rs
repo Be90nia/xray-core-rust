@@ -246,6 +246,14 @@ pub enum ManagerError {
     /// 误判为能力缺失。改为独立变体，携带底层原因。
     #[error("channel start failed: {0}")]
     ChannelStart(String),
+
+    /// 注册表触及装配方显式设定的条目上界（bd 441no）。
+    ///
+    /// 此前超限复用 [`ManagerError::AlreadyRegistered`]（语义错：这里不是重名），
+    /// 调用方 `.ok()` 一吞 ⇒ 计数永久静默。独立变体让「触顶」可被分类识别；
+    /// Go 无条目上界，本变体只在装配方显式封顶时出现。
+    #[error("{kind} registry full (limit {limit}): entry rejected")]
+    CapacityExceeded { kind: &'static str, limit: usize },
 }
 
 // ---------------------------------------------------------------------------

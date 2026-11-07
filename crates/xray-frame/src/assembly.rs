@@ -156,9 +156,17 @@ impl Framework {
         // fail-visible 且并入报告末行（T1.3：is_clean() 覆盖 fx 面；插件闭包
         // 超时档 = coordinator 默认档，P0-8：`FrameworkOptions.shutdown_timeout`
         // 透传见 `FrameworkBuilder::new`）。
-        if self.fx.shutdown_timeout(self.shutdown_timeout).await.timed_out > 0 {
-            LogFacade::new("assembly", vec![])
-                .warn("framework shutdown: fx drain timed out; residual tasks force-aborted");
+        //
+        // 排空期收割到的任务 panic 逐条上报（bd 3317m(a)：这里曾经只读
+        // `timed_out` 就把 `panicked` 整包丢掉，与同仓 `compat::ManagedScope`
+        // 的上报口径相反 —— 同一项目两套口径）。
+        let drain = self.fx.shutdown_timeout(self.shutdown_timeout).await;
+        let log = LogFacade::new("assembly", Vec::new());
+        for msg in &drain.panicked {
+            log.error(format!("framework shutdown: background task panicked: {msg}"));
+        }
+        if drain.timed_out > 0 {
+            log.warn("framework shutdown: fx drain timed out; residual tasks force-aborted");
             report
                 .per_component
                 .push(ComponentOutcome { name: "fx_drain".into(), kind: OutcomeKind::TimedOut });

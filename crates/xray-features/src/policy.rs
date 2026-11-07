@@ -245,8 +245,19 @@ impl Feature for DefaultPolicyFeature {
 }
 
 impl PolicyManager for DefaultPolicyFeature {
-    fn policy_for_level(&self, _level: u32) -> Policy {
-        Policy::default()
+    /// 对应 Go `features/policy/default.go:12-18` 的 `DefaultManager.ForLevel`：
+    /// `SessionDefault()`，且 **level 1 的 `ConnectionIdle` = 600s**。
+    ///
+    /// 只在**完全没有 policy 配置**时生效（有配置走 `xray_app_policy::Manager`，
+    /// 它不改写 level 1 —— Go `app/policy.(*Instance).ForLevel` 同样不改）。
+    /// bd yh01f(a)：此前这里返回 `Policy::default()`（connIdle 300s），
+    /// 未配 policy 时 level-1 空闲窗比 Go 短一半。
+    fn policy_for_level(&self, level: u32) -> Policy {
+        let mut policy = Policy::default();
+        if level == 1 {
+            policy.timeout.connection_idle = Duration::from_secs(600);
+        }
+        policy
     }
 
     fn for_system(&self) -> SystemStats {

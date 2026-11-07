@@ -26,13 +26,38 @@ use std::{
     convert::Infallible,
     fmt,
     sync::{
-        Arc, LazyLock, Mutex, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock, RwLock,
         atomic::{AtomicU8, Ordering},
     },
 };
 
 use skeleton::Store as _;
 use skeleton_infra::{audit::AuditTicket, logx::mask_secrets, runtime::SyncStore};
+
+/// 进程级掩码表。
+///
+/// 生产 60+ 处以 `LogFacade::new(domain, vec![])` 构造门面（secrets 恒空），
+/// 门面自持表在那些站点等于不存在（bd zb34d：坑约束 11 形同虚设）。故掩码表
+/// 由装配期 `xray_common::log::set_secrets` 灌进这里（一次写三处：udf 通道表 /
+/// 裸 tracing 快照 / 本表），`emit` 把它与门面自持表**合并**后套用。
+///
+/// 纪律：只在装配期写，进程生命期读；替换语义与 udf 一致。
+static GLOBAL_SECRETS: RwLock<Vec<Arc<str>>> = RwLock::new(Vec::new());
+
+/// 装载进程级掩码表（替换语义）。
+///
+/// 由 `xray_common::log::set_secrets` 调用（装配期一次，插件层禁调）；
+/// 空表 = 不打码（与 udf `ChannelRegistry::set_secrets` 同义）。
+pub fn set_global_secrets(secrets: Vec<String>) {
+    let mut guard = GLOBAL_SECRETS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = secrets.into_iter().map(Arc::from).collect();
+}
+
+/// 当前进程级掩码表的只读快照（`emit` 每事件取一次，条目数 = 凭据族数）。
+#[must_use]
+pub fn global_secrets() -> Vec<Arc<str>> {
+    GLOBAL_SECRETS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
 
 /// 日志装配审计轨（bd bb1dn）：store 常驻进程，桥随 store 生命周期存在。
 static LOG_AUDIT: LazyLock<LogAuditBus> = LazyLock::new(LogAuditBus::new);
@@ -141,9 +166,11 @@ impl LogFacade {
     }
 
     /// 唯一输出面：message 先过 `mask_secrets` 再发射，target 强制覆写。
+    ///
+    /// 掩码表 = 门面自持表 ∪ 进程级表（[`set_global_secrets`]），因为生产站点
+    /// 普遍以 `vec![]` 构造门面（bd zb34d）。
     pub fn emit(&self, level: tracing::Level, message: impl fmt::Display) {
-        let secret_refs: Vec<&str> = self.secrets.iter().map(|s| s.as_ref()).collect();
-        let masked = mask_secrets(&message.to_string(), &secret_refs);
+        let masked = mask_with_facade_secrets(&self.secrets, &message.to_string());
         let metadata = self.metadata_for(level);
         let message_field =
             metadata.fields().field("message").expect("message field declared in emit metadata");
@@ -169,6 +196,18 @@ impl LogFacade {
     pub fn debug(&self, message: impl fmt::Display) {
         self.emit(tracing::Level::DEBUG, message);
     }
+}
+
+/// 掩码套用：门面自持表 ∪ 进程级表。两张都空 ⇒ 原样返回（不打码即无额外开销）。
+fn mask_with_facade_secrets(facade: &[Arc<str>], text: &str) -> String {
+    let global = GLOBAL_SECRETS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if facade.is_empty() && global.is_empty() {
+        return text.to_owned();
+    }
+    let mut refs: Vec<&str> = Vec::with_capacity(facade.len() + global.len());
+    refs.extend(facade.iter().map(AsRef::as_ref));
+    refs.extend(global.iter().map(AsRef::as_ref));
+    mask_secrets(text, &refs)
 }
 
 /// 装配层 init（插件层禁调——udf 纪律「装配层一次 init，插件层禁」）。
