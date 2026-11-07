@@ -75,7 +75,10 @@ impl NatPmpStub {
         let peers = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let froms = Arc::clone(&peers);
-        #[allow(clippy::disallowed_methods, reason = "测试：NAT-PMP stub 收包泵")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "②豁免（bd kwevg · §3.5.6）：测试：NAT-PMP stub 收包泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        )]
         tokio::spawn(async move {
             let mut buf = [0u8; 64];
             while let Ok((n, peer)) = sock.recv_from(&mut buf).await {
@@ -134,7 +137,10 @@ impl HttpStub {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let respond = Arc::new(respond);
-        #[allow(clippy::disallowed_methods, reason = "测试：HTTP stub accept 泵")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "②豁免（bd kwevg · §3.5.6）：测试：HTTP stub accept 泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        )]
         tokio::spawn(async move {
             loop {
                 let Ok((sock, _peer)) = listener.accept().await else {
@@ -142,7 +148,10 @@ impl HttpStub {
                 };
                 let seen = Arc::clone(&seen);
                 let respond = Arc::clone(&respond);
-                #[allow(clippy::disallowed_methods, reason = "测试：HTTP stub 每连接泵")]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "②豁免（bd kwevg · §3.5.6）：测试：HTTP stub 每连接泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+                )]
                 tokio::spawn(async move { serve_connection(sock, seen, respond).await });
             }
         });
@@ -243,7 +252,10 @@ impl SsdpStub {
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
-        #[allow(clippy::disallowed_methods, reason = "测试：SSDP stub 收包泵")]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "②豁免（bd kwevg · §3.5.6）：测试：SSDP stub 收包泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        )]
         tokio::spawn(async move {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nEXT:\r\nLOCATION: {location}\r\n\

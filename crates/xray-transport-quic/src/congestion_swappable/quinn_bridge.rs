@@ -7,8 +7,8 @@
 //! - `QuinnCCFactory` 预装进 TransportConfig，每连接 build 出 `QuinnCCAdapter`；
 //! - 初始委托 quinn 内建 CUBIC（对应 Go 未切换前的 quic-go 默认）；
 //! - auth 握手后调 [`apply_negotiated`]（对应 Go dialer.go:229-243 / hub.go:75-86 的 congestion
-//!   switch），把 BrutalSender/BbrSender 装进 [`HysteriaCCSlot`]， `QuinnCCAdapter`
-//!   即刻切到真实算法。
+//!   switch），把 BrutalSender / **quinn 内建 BBR** 装上，`QuinnCCAdapter` 即刻切到真实算法（bd
+//!   hfb94：BBR 不再用本仓桩版实现）。
 //!
 //! ## 与 Go 的差异
 //!
@@ -24,12 +24,12 @@ use parking_lot::Mutex;
 use quinn_proto::congestion::Controller;
 
 use super::{
-    bbr::{BbrSender, Clock as _, DefaultClock, Profile},
+    bbr::{Clock as _, DefaultClock, Profile},
     brutal::BrutalSender,
     error::{CongestionError, Result},
     types::{
-        AckedPacketInfo, ByteCount, CongestionControl, INITIAL_PACKET_SIZE, LostPacketInfo,
-        MonoTime, PacketNumber, RttStatsProvider,
+        AckedPacketInfo, ByteCount, CongestionControl, LostPacketInfo, MonoTime, PacketNumber,
+        RttStatsProvider,
     },
     utils::CongestionSetter,
 };
@@ -183,10 +183,29 @@ impl SentBook {
     }
 }
 
-/// 每连接 CC 状态：auth 前 fallback（quinn CUBIC），auth 后 active（hysteria 算法）。
+/// fallback 通道要装的算法（bd hfb94：`apply_bbr` 在 factory build **之前**
+/// （splithttp H3）或**之后**（hysteria auth 协商）都可能被调用，故须记住请求，
+/// build 时按此构造而不是无条件装 CUBIC）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallbackKind {
+    /// factory 尚未 build（fallback 仍是占位 Controller）。
+    Unbuilt,
+    /// quinn 内建 CUBIC（quinn 缺省 = 未切换前的算法）。
+    Cubic,
+    /// quinn 内建 BBR（真实 cwnd/pacing 更新）。
+    Bbr,
+}
+
+/// 每连接 CC 状态：auth 前 fallback（quinn CUBIC/BBR），auth 后 active（hysteria 算法）。
 struct CCState {
     active: Option<Box<dyn CongestionControl>>,
     fallback: Box<dyn Controller>,
+    /// fallback 通道当前/待装的算法（见 [`FallbackKind`]）。
+    fallback_kind: FallbackKind,
+    /// 最近已知 MTU（factory build / `on_mtu_update` 更新；`apply_bbr` 就地重建用）。
+    mtu: u16,
+    /// 已确认的最大包号（供 fallback 的 `on_end_acks` 判定轮次边界）。
+    max_acked_pn: Option<u64>,
     /// 近似 in-flight 字节（on_sent 累加 / ack·loss 扣减），供 hysteria 事件用。
     in_flight: ByteCount,
     /// 未确认包簿（pv70）：真实 pn 冲销聚合 ack/loss 字节。
@@ -222,6 +241,13 @@ impl HysteriaCCSlot {
     pub fn has_active(&self) -> bool {
         self.state.lock().active.is_some()
     }
+
+    /// 是否已请求 quinn 内建 BBR（bd hfb94：BBR 走 fallback 通道以拿全保真 quinn
+    /// 事件，故 [`HysteriaCCSlot::has_active`] 为 false——消费方探针用本方法）。
+    #[must_use]
+    pub fn is_bbr(&self) -> bool {
+        self.state.lock().fallback_kind == FallbackKind::Bbr
+    }
 }
 
 impl Default for HysteriaCCSlot {
@@ -242,9 +268,14 @@ impl CCState {
     fn empty() -> Self {
         Self {
             active: None,
-            // build 前占位；factory build 时替换为真 CUBIC。empty 期间 window() 给
+            // build 前占位；factory build 时替换为真 CUBIC/BBR。empty 期间 window() 给
             // 固定值，真实连接必然先经 factory build，不会出现在数据路径上。
             fallback: Box::new(PlaceholderController),
+            fallback_kind: FallbackKind::Unbuilt,
+            // 1200 = quinn BASE_DATAGRAM_SIZE（未暴露为 pub const，与
+            // `types::INITIAL_PACKET_SIZE` 同值）。
+            mtu: 1200,
+            max_acked_pn: None,
             in_flight: 0,
             book: SentBook::new(),
         }
@@ -288,24 +319,41 @@ impl CongestionSetter for HysteriaCCSlot {
     }
 }
 
-/// quinn ControllerFactory：为每条连接构造 [`QuinnCCAdapter`]，fallback 换成真 CUBIC。
+/// quinn ControllerFactory：为每条连接构造 [`QuinnCCAdapter`]，fallback 换成真正的
+/// quinn 控制器（按 [`FallbackKind`]：CUBIC 缺省 / 预装 BBR）。
 struct QuinnCCFactory {
     slot: Arc<HysteriaCCSlot>,
 }
 
+/// 构造 quinn 内建 BBR（bd hfb94：真实 cwnd/min_rtt/pacing 更新）。
+fn make_bbr(mtu: u16) -> Box<dyn Controller> {
+    Box::new(quinn_proto::congestion::Bbr::new(
+        Arc::new(quinn_proto::congestion::BbrConfig::default()),
+        mtu,
+    ))
+}
+
 impl quinn_proto::congestion::ControllerFactory for QuinnCCFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        let cubic = quinn_proto::congestion::Cubic::new(
-            Arc::new(quinn_proto::congestion::CubicConfig::default()),
-            now,
-            current_mtu,
-        );
-        self.slot.state.lock().fallback = Box::new(cubic);
+        let mut st = self.slot.state.lock();
+        st.mtu = current_mtu;
+        st.fallback = match st.fallback_kind {
+            FallbackKind::Bbr => make_bbr(current_mtu),
+            FallbackKind::Unbuilt | FallbackKind::Cubic => {
+                st.fallback_kind = FallbackKind::Cubic;
+                Box::new(quinn_proto::congestion::Cubic::new(
+                    Arc::new(quinn_proto::congestion::CubicConfig::default()),
+                    now,
+                    current_mtu,
+                ))
+            },
+        };
+        drop(st);
         Box::new(QuinnCCAdapter { slot: Arc::clone(&self.slot) })
     }
 }
 
-/// quinn Controller 实现：事件委托给 active（hysteria）或 fallback（CUBIC）。
+/// quinn Controller 实现：事件委托给 active（hysteria）或 fallback（quinn 内建）。
 struct QuinnCCAdapter {
     slot: Arc<HysteriaCCSlot>,
 }
@@ -346,9 +394,40 @@ impl Controller for QuinnCCAdapter {
         let t = mono_of(now);
         // 聚合 ack 字节 → 真实 pn 列表（pv70）；fallback 期也冲销，保持簿对齐。
         let acked = st.book.drain_ack(bytes as ByteCount, t);
+        // fallback 的 `on_end_acks` 需要「本批最大已确认包号」（quinn BBR 据此判轮次）。
+        for p in &acked {
+            let pn = u64::try_from(p.packet_number).unwrap_or(0);
+            let newer = match st.max_acked_pn {
+                Some(prev) => pn > prev,
+                None => true,
+            };
+            if newer {
+                st.max_acked_pn = Some(pn);
+            }
+        }
         match &mut st.active {
             Some(cc) => cc.on_congestion_event_ex(prior, t, &acked, &[]),
             None => st.fallback.on_ack(now, sent, bytes, app_limited, rtt),
+        }
+    }
+
+    /// bd hfb94：quinn BBR 的 cwnd / pacing_rate 只在 `on_end_acks` 里推进
+    /// （`calculate_cwnd`），而 active（hysteria 算法）没有对应钩子 ⇒ 缺这条转发时
+    /// 即使装的是真 BBR，窗口也会钉在初始值（与装桩版无区别）。
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        let mut st = self.slot.state.lock();
+        let largest = match (st.max_acked_pn, largest_packet_num_acked) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if st.active.is_none() {
+            st.fallback.on_end_acks(now, in_flight, app_limited, largest);
         }
     }
 
@@ -375,6 +454,9 @@ impl Controller for QuinnCCAdapter {
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
         let mut st = self.slot.state.lock();
+        // bd 9wipb：MTU 可能**变小**（PMTU 黑洞探测后的正常回调，下限 1200）——
+        // 记下当前值供 apply_bbr 就地重建；两侧算法都必须接受缩小（不得 panic）。
+        st.mtu = new_mtu;
         match &mut st.active {
             Some(cc) => cc.set_max_datagram_size(i64::from(new_mtu)),
             None => st.fallback.on_mtu_update(new_mtu),
@@ -421,10 +503,28 @@ impl RttStatsProvider for SharedRttHandle {
 }
 
 /// 应用 BBR（对应 Go `UseBBR`）。
-pub fn apply_bbr(slot: &HysteriaCCSlot, profile: Profile) {
-    let mut sender = BbrSender::new(Arc::new(DefaultClock::new()), INITIAL_PACKET_SIZE, profile);
-    sender.set_rtt_stats_provider(Box::new(SharedRttHandle(Arc::clone(&slot.rtt))));
-    slot.set_congestion_control(Box::new(sender));
+///
+/// bd hfb94：装 **quinn 内建 BBR**，不再装本仓 hysteria 侧 `BbrSender` 桩——后者
+/// `on_congestion_event_ex` 只更新 bytes_in_flight/sampler，从不更新 cwnd/min_rtt/
+/// pacing_rate，`congestion_window()` 恒为 32×MTU（169ms RTT 下 ≈1.8Mbps，比 Go 差
+/// 一个数量级）。走 fallback 通道是为了拿 quinn 的**全保真**事件
+/// （`on_sent` / `on_ack(rtt, app_limited)` / `on_end_acks` / `on_congestion_event` /
+/// `on_mtu_update`）；hysteria 的 `CongestionControl` trait 只有聚合后的 ack/loss 列表，
+/// 无法喂养真 BBR。
+///
+/// 与 Go 的差异：quinn BBR 无 `bbrProfile` 三档 gain（conservative/standard/
+/// aggressive），`profile` 仅由调用方做配置合法性校验（`Profile::parse`），算法语义
+/// 统一为 standard——与 `xray-transport::finalmask::xdns::doh3` 同口径。
+pub fn apply_bbr(slot: &HysteriaCCSlot, _profile: Profile) {
+    let mut st = slot.state.lock();
+    // 真 BBR 走 fallback：清掉可能存在的 hysteria active（否则 active 优先，仍走桩）。
+    st.active = None;
+    let built = st.fallback_kind != FallbackKind::Unbuilt;
+    st.fallback_kind = FallbackKind::Bbr;
+    // factory build 之后调用（hysteria auth 后协商）需就地重建；build 之前只登记。
+    if built {
+        st.fallback = make_bbr(st.mtu);
+    }
 }
 
 /// 应用 Brutal（对应 Go `UseBrutal(conn, tx, disableLossCompensation)`）。
@@ -523,12 +623,20 @@ mod tests {
         assert_eq!(slot.current_window(), 20_000);
     }
 
+    /// 模拟 quinn 建连：factory build 一次（fallback 由占位换成真控制器）。
+    fn build_factory(slot: &Arc<HysteriaCCSlot>) -> Box<dyn Controller> {
+        let factory: Arc<QuinnCCFactory> = Arc::new(QuinnCCFactory { slot: Arc::clone(slot) });
+        #[allow(clippy::disallowed_methods, reason = "测试：CC factory build 时刻入参")]
+        quinn_proto::congestion::ControllerFactory::build(factory, Instant::now(), 1200)
+    }
+
     #[test]
     fn apply_negotiated_matches_go_switch() {
-        // bbr：active 存在。
+        // bbr：装 quinn 内建 BBR（走 fallback 通道，bd hfb94）。
         let slot = HysteriaCCSlot::new();
         apply_negotiated(&slot, "bbr", "standard", 0, 0, false).unwrap();
-        assert!(slot.state.lock().active.is_some());
+        assert!(slot.is_bbr());
+        assert!(!slot.has_active(), "BBR 不再走 hysteria active 通道");
 
         // reno：不切换。
         let slot = HysteriaCCSlot::new();
@@ -546,10 +654,12 @@ mod tests {
         slot.rtt.update(RTT10S, RTT10S);
         assert_eq!(slot.current_window(), 10_000, "min(up=500, down=800) = 500");
 
-        // up=0 → BBR：初始窗口 38400。
-        let slot = HysteriaCCSlot::new();
+        // up=0 → BBR（quinn 内建；build 后初始窗口 = BbrConfig 缺省 200×1200B）。
+        let slot = Arc::new(HysteriaCCSlot::new());
         apply_negotiated(&slot, "brutal", "standard", 0, 800, false).unwrap();
-        assert_eq!(slot.current_window(), 38_400, "up=0 must fall back to BBR");
+        assert!(slot.is_bbr(), "up=0 must fall back to BBR");
+        build_factory(&slot);
+        assert_eq!(slot.current_window(), 240_000, "quinn BBR 缺省初始窗口");
 
         // force-brutal：直接 up=1234，不看 down：10s RTT → 2×1234×10 = 24680。
         let slot = HysteriaCCSlot::new();
@@ -704,5 +814,97 @@ mod tests {
         let slot = install_swappable_cc(&mut t);
         apply_brutal(&slot, 42, false);
         assert!(slot.state.lock().active.is_some());
+    }
+
+    /// bd hfb94 契约 1：缺省装配（`install_swappable_cc` + `apply_bbr`）装的是
+    /// **quinn 内建 BBR**，不是桩版——桩版窗口恒 32×MTU=38400、quinn CUBIC 12000，
+    /// quinn BBR 缺省 200×1200=240000，三者可区分。
+    #[test]
+    fn default_assembly_installs_real_quinn_bbr() {
+        // 装配顺序与 splithttp/h3_client.rs 一致：先装槽位，再 apply_bbr（build 之前）。
+        let mut t = quinn::TransportConfig::default();
+        let slot = install_swappable_cc(&mut t);
+        apply_bbr(&slot, Profile::Standard);
+        let adapter = build_factory(&slot);
+
+        assert!(slot.is_bbr());
+        assert_eq!(adapter.window(), 240_000, "quinn BBR 初始窗口（桩版会是 38400）");
+        assert_eq!(adapter.initial_window(), 240_000);
+    }
+
+    /// bd hfb94 契约 2：cwnd 随 ACK 增长。
+    ///
+    /// 桩版 `on_congestion_event_ex` 只更新 bytes_in_flight/sampler，从不更新 cwnd，
+    /// `congestion_window()` 恒为 32×MTU ⇒ 169ms RTT 下吞吐钉死 ~1.8Mbps。本测试经
+    /// `QuinnCCAdapter` 喂 sent/ack/end_acks 并断言窗口**严格增长**，同时钉住
+    /// `on_end_acks` 转发（quinn BBR 只在那个钩子里算 cwnd/pacing_rate）。
+    #[test]
+    fn bbr_cwnd_grows_with_acked_bytes() {
+        let mut t = quinn::TransportConfig::default();
+        let slot = install_swappable_cc(&mut t);
+        apply_bbr(&slot, Profile::Standard);
+        let mut adapter = build_factory(&slot);
+        let initial = adapter.window();
+
+        // SAFETY: quinn 未提供 `RttEstimator` 的公开构造器。该类型的全部字段是
+        // Duration / Option<Duration>（整数字段），全零位型合法：latest=0s、
+        // smoothed=None（tag 0）、min=0s。本测试只用它跑 cwnd 增长数学。
+        let rtt: quinn_proto::RttEstimator = unsafe { std::mem::zeroed() };
+        #[allow(clippy::disallowed_methods, reason = "测试：CC 事件时间戳构造")]
+        let sent_at = Instant::now();
+
+        // 第 1 轮：BBR 首轮必进 ProbeRtt（尚无 min_rtt 样本；该模式下不涨窗口），
+        // 200ms 后的一次 round start 会回 Startup——用可控事件时间直接跳过。
+        adapter.on_end_acks(sent_at, 0, false, None);
+        let later = sent_at + std::time::Duration::from_millis(300);
+        let acked_at = later + std::time::Duration::from_millis(10);
+
+        for pn in 1..=64u64 {
+            adapter.on_sent(later, 1200, pn);
+        }
+        for _ in 1..=64u64 {
+            adapter.on_ack(acked_at, later, 1200, false, &rtt);
+        }
+        adapter.on_end_acks(acked_at, 0, false, Some(64));
+
+        let grown = adapter.window();
+        assert!(grown > initial, "cwnd 必须随 ACK 增长：initial={initial} grown={grown}");
+    }
+
+    /// bd hfb94 契约 3：factory 已 build 后才 `apply_bbr`（hysteria auth 后协商路径）
+    /// 必须就地换成真 BBR，而不是留在 quinn 缺省 CUBIC。
+    #[test]
+    fn apply_bbr_after_build_replaces_cubic() {
+        let mut t = quinn::TransportConfig::default();
+        let slot = install_swappable_cc(&mut t);
+        let adapter = build_factory(&slot);
+        assert_eq!(adapter.window(), 12_000, "quinn CUBIC 初始窗口");
+
+        apply_bbr(&slot, Profile::Standard);
+        assert!(slot.is_bbr());
+        assert_eq!(adapter.window(), 240_000, "auth 后协商 BBR 必须换成真 BBR");
+    }
+
+    /// bd 9wipb 契约：PMTU 黑洞探测成功后 quinn 会用**更小** MTU 回调（正常事件）。
+    /// adapter 两条通道（fallback=BBR / active=Brutal）都必须接受缩小且不 panic——
+    /// 旧桩版在这里 `assert!(size >= max_datagram_size)` panic，落在 quinn 连接驱动
+    /// task 内 ⇒ 该 endpoint 全部连接静默失效。
+    #[test]
+    fn mtu_decrease_never_panics() {
+        let mut t = quinn::TransportConfig::default();
+        let slot = install_swappable_cc(&mut t);
+        apply_bbr(&slot, Profile::Standard);
+        let mut adapter = build_factory(&slot);
+        adapter.on_mtu_update(1500);
+        adapter.on_mtu_update(1200); // PMTU 黑洞下限
+        assert!(adapter.window() >= 4 * 1200, "缩 MTU 后窗口不得低于新 min");
+
+        // active 通道（Brutal）同样必须接受缩小。
+        let slot2 = Arc::new(HysteriaCCSlot::new());
+        apply_brutal(&slot2, 1_000_000, false);
+        let mut adapter2 = QuinnCCAdapter { slot: Arc::clone(&slot2) };
+        adapter2.on_mtu_update(1500);
+        adapter2.on_mtu_update(1200);
+        assert_eq!(slot2.state.lock().mtu, 1200);
     }
 }

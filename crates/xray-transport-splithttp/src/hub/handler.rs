@@ -156,6 +156,12 @@ where
         return status_response(StatusCode::BAD_REQUEST);
     }
 
+    // 4b. Go hub.go:152-158 第一道 mode 闸（"stream-one mode is not allowed"）：
+    // 无 session id ⇒ 客户端按 stream-one 形态发；配置钉死 packet-up 时其它形态必须 400。
+    if meta.session_id.is_empty() && !mode_allows(&ctx.config.mode, &["stream-one", "stream-up"]) {
+        return status_response(StatusCode::BAD_REQUEST);
+    }
+
     // 5. Padding 提取 + 校验（Go hub.go:141-148 + xpadding.go IsPaddingValid： 缺失/空/超长一律
     //    400，无豁免分支——H3b 修复）。
     let padding_value = extract_padding_value(&req, ctx);
@@ -181,8 +187,16 @@ where
 
     if is_uplink && !meta.session_id.is_empty() {
         if meta.seq_str.is_empty() {
+            // 4c. Go hub.go:198-203 第二道 mode 闸（"stream-up mode is not allowed"）。
+            if !mode_allows(&ctx.config.mode, &["stream-up"]) {
+                return status_response(StatusCode::BAD_REQUEST);
+            }
             handle_stream_up(req, &meta.session_id, ctx, has_referer, obfs_padding_accepted).await
         } else {
+            // 4d. Go hub.go:241-245 第三道 mode 闸（"packet-up mode is not allowed"）。
+            if !mode_allows(&ctx.config.mode, &["packet-up"]) {
+                return status_response(StatusCode::BAD_REQUEST);
+            }
             handle_packet_up(req, &meta.session_id, &meta.seq_str, ctx).await
         }
     } else if req.method() == Method::GET || meta.session_id.is_empty() {
@@ -346,7 +360,7 @@ where
     // 后台任务：把 request body 切片为有序 packet，push 到 UploadQueue
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-up body 切片推送任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-up body 切片推送任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         use futures_util::TryStreamExt;
@@ -402,7 +416,7 @@ where
         let sid = session_id.to_string();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-down UploadQueue→上行管道转发任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-down UploadQueue→上行管道转发任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             forward_queue_to_writer(queue, upload_tx).await;
@@ -412,7 +426,7 @@ where
         // stream-one: request body → upload_tx
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-one body→上行管道任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-one body→上行管道任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             use futures_util::TryStreamExt;
@@ -483,7 +497,7 @@ fn spawn_x_padding_stream(
         let range = ctx.config.get_normalized_x_padding_bytes();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；X 填充 keepalive 流任务（Go hub.go:219-232）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；X 填充 keepalive 流任务（Go hub.go:219-232）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             loop {
@@ -543,7 +557,7 @@ impl Drop for SessionDropGuard {
         let sid = std::mem::take(&mut self.sid);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；SessionMap 是 tokio Mutex 故 Drop 内只能 spawn 异步删除会话；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；SessionMap 是 tokio Mutex 故 Drop 内只能 spawn 异步删除会话；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             sessions.remove(&sid).await;
@@ -791,6 +805,16 @@ fn base64url_decode(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+/// Go hub.go 的三处 mode 闸（bd hjn8x）：
+/// `Mode != "" && Mode != "auto" && Mode != <该形态>` ⇒ 400。
+///
+/// 配置钉死某形态后，其它形态的请求必须 400——这是 GOAWAY 之外的**指纹面**：
+/// 同配置下 Go 回 400、Rust 回 200 会被主动探测区分。此前 Rust hub 完全不消费
+/// `mode` 配置（零命中），三闸全缺。
+fn mode_allows(configured: &str, allowed: &[&str]) -> bool {
+    configured.is_empty() || configured == "auto" || allowed.contains(&configured)
+}
+
 /// 构造空 body 状态响应。
 fn status_response(status: StatusCode) -> Response<BoxBody<Bytes, io::Error>> {
     Response::builder().status(status).body(empty_body()).expect("fixed status + empty body")
@@ -1007,7 +1031,10 @@ mod tests {
         HandlerContext {
             config: Arc::new(Config::default()),
             host: host.into(),
-            base_path: String::new(),
+            // 生产恒为 `Config::normalized_path()`（首尾都带 `/`，缺省 "/"）。
+            // 空串会让 path placement 的首个 split 段变成空串（Go 同样如此），
+            // 使 session/seq 错位——测试必须与生产同口径（bd imhvg）。
+            base_path: "/".into(),
             local_addr: "127.0.0.1:1".parse().unwrap(),
             sessions: Arc::new(SessionMap::new()),
             conn_handler: Arc::new(NoopConnHandler),
@@ -1371,5 +1398,48 @@ mod tests {
         let resp =
             dispatch_request(padded_post("/sess-a/1"), "127.0.0.1:2".parse().unwrap(), &ctx).await;
         assert_eq!(resp.status(), StatusCode::OK, "已有 id 不受上限影响");
+    }
+
+    /// bd hjn8x：Go hub.go 三处 mode 闸的 **3 形态 × 5 mode** 矩阵。
+    ///
+    /// 放行口径（Go 原文）：`Mode == "" || Mode == "auto"` 恒放行；否则只放行该形态
+    /// 自身，且无 session id 的 stream-one 形态额外放行 `"stream-up"`（Go 第一闸的
+    /// 白名单是 `Mode != "" && Mode != "auto" && Mode != "stream-one" && Mode != "stream-up"`）。
+    #[tokio::test]
+    async fn mode_gates_match_go_matrix() {
+        for form in ["stream-one", "stream-up", "packet-up"] {
+            for configured in ["", "auto", "stream-one", "stream-up", "packet-up"] {
+                let ctx =
+                    make_ctx_with_config(Config { mode: configured.into(), ..Config::default() });
+                let req = match form {
+                    "stream-one" => plain_request(
+                        Method::GET,
+                        &format!("/?x_padding={}", "X".repeat(200)),
+                        "h",
+                        None,
+                    ),
+                    "stream-up" => padded_post("/sess-a"),
+                    _ => padded_post("/sess-a/0"),
+                };
+                let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+                let allowed = configured.is_empty()
+                    || configured == "auto"
+                    || configured == form
+                    || (form == "stream-one" && configured == "stream-up");
+                if allowed {
+                    assert_ne!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST,
+                        "form={form} mode={configured:?} 应放行（Go 同配置放行）"
+                    );
+                } else {
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::BAD_REQUEST,
+                        "form={form} mode={configured:?} 必须 400（Go hub.go mode 闸）"
+                    );
+                }
+            }
+        }
     }
 }

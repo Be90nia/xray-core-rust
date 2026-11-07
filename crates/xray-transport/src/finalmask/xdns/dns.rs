@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     io::{self, Read, Seek, SeekFrom},
+    sync::Arc,
 };
 
 // ============================================================================
@@ -43,10 +44,39 @@ pub const EXTENDED_RCODE_BAD_VERS: u16 = 16;
 
 /// 域名：一系列标签（每个 ≤63 字节）。
 ///
-/// 对应 Go `type Name [][]byte`。空 Vec 表示根域名 "."。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 对应 Go `type Name [][]byte`。空表示根域名 "."。
+///
+/// 存储为**未压缩 wire 形态**的紧凑字节（逐 label `1 字节长度 + 内容`，不存末尾
+/// 0），并以 `Arc<[u8]>` 共享。Go 侧 `Name{Data [255]byte}` 定长内联、零堆分配；
+/// 逐 label `Vec<Vec<u8>>` 则把「2 字节压缩指针 → 255 字节展开」再乘上 label 数
+/// （bd rbu2k：4KB 报文 978× 放大 / 8.4 万次分配）。扁平 + `Arc` 让同一报文内
+/// 同偏移的展开只分配一次，`clone` 退化为引用计数自增。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Name {
-    pub labels: Vec<Vec<u8>>,
+    data: Arc<[u8]>,
+}
+
+impl Default for Name {
+    fn default() -> Self {
+        // Arc 无零长特例（空名仍要分配头部）；根域名/空名极少，可接受。
+        Self { data: Arc::from(Vec::new()) }
+    }
+}
+
+/// `Name` 的标签迭代器（`Name` 内部是紧凑 flat，索引用迭代替代 `Vec` 下标）。
+pub(crate) struct Labels<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Labels<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let (&len, rest) = self.rest.split_first()?;
+        let (label, rest) = rest.split_at(usize::from(len).min(rest.len()));
+        self.rest = rest;
+        Some(label)
+    }
 }
 
 impl Name {
@@ -54,6 +84,8 @@ impl Name {
     ///
     /// 对应 Go `NewName`。
     pub fn new(labels: Vec<Vec<u8>>) -> io::Result<Self> {
+        let mut flat = [0u8; 255];
+        let mut len = 0usize;
         for label in &labels {
             if label.is_empty() {
                 return Err(invalid_data("name contains a zero-length label"));
@@ -61,16 +93,56 @@ impl Name {
             if label.len() > 63 {
                 return Err(invalid_data("name contains a label longer than 63 octets"));
             }
+            // 每 label 一个长度字节 + 数据 + 末尾 0 字节
+            if len + 1 + label.len() + 1 > 255 {
+                return Err(invalid_data("name is longer than 255 octets"));
+            }
+            flat[len] = label.len() as u8;
+            len += 1;
+            flat[len..len + label.len()].copy_from_slice(label);
+            len += label.len();
         }
-        // 检查总长：每 label 一个长度字节 + 数据 + 末尾 0 字节
-        let mut total: usize = 1;
-        for label in &labels {
-            total += 1 + label.len();
+        Ok(Self::from_flat(&flat[..len]))
+    }
+
+    /// 已是未压缩 wire 形态的 flat 字节（逐 label `len + 数据`，无末尾 0）。
+    /// 调用方保证形态合法（`new`/`read_name`/`name_from_wire` 都已校验）。
+    pub(crate) fn from_flat(flat: &[u8]) -> Self {
+        Self { data: Arc::from(flat) }
+    }
+
+    /// 未压缩 wire 形态字节（逐 label `len + 数据`，不含末尾 0）。
+    pub(crate) fn flat(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// wire 长度：flat 字节 + 末尾 0（对齐 Go `Name.Length`）。
+    pub(crate) fn wire_len(&self) -> usize {
+        self.data.len() + 1
+    }
+
+    /// 标签迭代器（按出现顺序）。
+    pub(crate) fn labels(&self) -> Labels<'_> {
+        Labels { rest: &self.data }
+    }
+
+    /// 标签数。
+    pub(crate) fn label_count(&self) -> usize {
+        self.labels().count()
+    }
+
+    /// 第 `i` 个标签（越界返回空片）。
+    pub(crate) fn label(&self, i: usize) -> &[u8] {
+        self.labels().nth(i).unwrap_or(&[])
+    }
+
+    /// 前 `count` 个标签的 flat 前缀。
+    fn flat_prefix(&self, count: usize) -> &[u8] {
+        let mut pos = 0usize;
+        for label in self.labels().take(count) {
+            pos += 1 + label.len();
         }
-        if total > 255 {
-            return Err(invalid_data("name is longer than 255 octets"));
-        }
-        Ok(Self { labels })
+        &self.data[..pos.min(self.data.len())]
     }
 
     /// 从点号分隔的字符串解析（末尾单个点被忽略）。
@@ -91,11 +163,8 @@ impl Name {
     /// 对应 Go `Name.String`。
     #[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
     pub fn to_string_repr(&self) -> String {
-        if self.labels.is_empty() {
-            return ".".to_string();
-        }
         let mut buf = String::new();
-        for (i, label) in self.labels.iter().enumerate() {
+        for (i, label) in self.labels().enumerate() {
             if i > 0 {
                 buf.push('.');
             }
@@ -107,6 +176,9 @@ impl Name {
                 }
             }
         }
+        if buf.is_empty() {
+            return ".".to_string();
+        }
         buf
     }
 
@@ -116,17 +188,20 @@ impl Name {
     /// 对应 Go `Name.TrimSuffix`。
     #[allow(dead_code)] // RFC1035 codec 完整面（dns 单测覆盖；xdns 旧路径消费）
     pub fn trim_suffix(&self, suffix: &Self) -> (Self, bool) {
-        if self.labels.len() < suffix.labels.len() {
+        let n = self.label_count();
+        let m = suffix.label_count();
+        if n < m {
             return (Self::default(), false);
         }
-        let split = self.labels.len() - suffix.labels.len();
-        for i in 0..suffix.labels.len() {
-            if !eq_ascii_ci(&self.labels[split + i], &suffix.labels[i]) {
-                return (Self::default(), false);
+        let split = n - m;
+        let mut mine = self.labels().skip(split);
+        for theirs in suffix.labels() {
+            match mine.next() {
+                Some(label) if eq_ascii_ci(label, theirs) => {},
+                _ => return (Self::default(), false),
             }
         }
-        let fore = self.labels[..split].to_vec();
-        (Self { labels: fore }, true)
+        (Self::from_flat(self.flat_prefix(split)), true)
     }
 }
 
@@ -232,28 +307,42 @@ fn read_message<R: Read + Seek>(r: &mut R) -> io::Result<Message> {
     let ns_count = u16::from_be_bytes([header[8], header[9]]);
     let ar_count = u16::from_be_bytes([header[10], header[11]]);
 
+    // 全报文 Name 展开预算：输入长度即本函数可用的展开上界基准
+    let mut budget = NameBudget::new(HEADER_LEN + remaining_bytes(r)?);
+
     // Question section
+    reserve_section(&mut message.question, qd_count, remaining_bytes(r)?, MIN_QUESTION_BYTES);
     for _ in 0..qd_count {
-        message.question.push(read_question(r)?);
+        message.question.push(read_question(r, &mut budget)?);
     }
     // Answer / Authority / Additional
+    reserve_section(&mut message.answer, an_count, remaining_bytes(r)?, MIN_RR_BYTES);
     for _ in 0..an_count {
-        message.answer.push(read_rr(r)?);
+        message.answer.push(read_rr(r, &mut budget)?);
     }
+    reserve_section(&mut message.authority, ns_count, remaining_bytes(r)?, MIN_RR_BYTES);
     for _ in 0..ns_count {
-        message.authority.push(read_rr(r)?);
+        message.authority.push(read_rr(r, &mut budget)?);
     }
+    reserve_section(&mut message.additional, ar_count, remaining_bytes(r)?, MIN_RR_BYTES);
     for _ in 0..ar_count {
-        message.additional.push(read_rr(r)?);
+        message.additional.push(read_rr(r, &mut budget)?);
     }
     Ok(message)
+}
+
+/// 段预分配：`count` 来自报文头（未认证可控），按 count 直接分配就是「声明即
+/// 预约」（bd oavzu 同族）；用剩余字节推出的上界裁一次，count 再大也不先付内存。
+fn reserve_section<T>(v: &mut Vec<T>, count: u16, remaining: u64, min_unit: u64) {
+    let fits = usize::try_from(remaining / min_unit.max(1)).unwrap_or(usize::MAX);
+    v.reserve_exact(usize::from(count).min(fits));
 }
 
 /// 读取 Question 段一条。
 ///
 /// 对应 Go `readQuestion`。
-fn read_question<R: Read + Seek>(r: &mut R) -> io::Result<Question> {
-    let name = read_name(r)?;
+fn read_question<R: Read + Seek>(r: &mut R, budget: &mut NameBudget) -> io::Result<Question> {
+    let name = read_name(r, budget)?;
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     Ok(Question {
@@ -267,8 +356,8 @@ fn read_question<R: Read + Seek>(r: &mut R) -> io::Result<Question> {
 ///
 /// 对应 Go `readRR`。CNAME rdata 归一化为未压缩 wire name（Go dnsmessage
 /// 解析嵌套名时会跟随压缩指针；xdns Resp.Decode 依赖该语义）。
-fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
-    let name = read_name(r)?;
+fn read_rr<R: Read + Seek>(r: &mut R, budget: &mut NameBudget) -> io::Result<RR> {
+    let name = read_name(r, budget)?;
     let mut head = [0u8; 8];
     r.read_exact(&mut head)?;
     let rtype = u16::from_be_bytes([head[0], head[1]]);
@@ -291,17 +380,14 @@ fn read_rr<R: Read + Seek>(r: &mut R) -> io::Result<RR> {
     // 回退到 rdata 起始解嵌套名；失败则保留原始字节（resp 侧跳过）
     let after_data = r.stream_position()?;
     r.seek(SeekFrom::Current(-(rd_length as i64)))?;
-    let nested = read_name(r);
+    let nested = read_name(r, budget);
     // 无条件复位到 rdata 之后：read_name 只在跟随过压缩指针时复位游标，未压缩的
     // 嵌套名会停在 rdata 中部 ⇒ 成功分支若不复位，后续所有 RR 从错位置读。
     r.seek(SeekFrom::Start(after_data))?;
     match nested {
         Ok(cname) => {
-            let mut norm = Vec::new();
-            for label in &cname.labels {
-                norm.push(label.len() as u8);
-                norm.extend_from_slice(label);
-            }
+            // 归一化为未压缩 wire name：flat 形态 + 根 0 字节
+            let mut norm = cname.flat().to_vec();
             norm.push(0);
             Ok(RR { data: norm, ..rr })
         },
@@ -317,18 +403,58 @@ fn remaining_bytes<R: Read + Seek>(r: &mut R) -> io::Result<u64> {
     Ok(end.saturating_sub(cur))
 }
 
+/// 报文头长度（字节）。
+const HEADER_LEN: u64 = 12;
+/// 一条 question 的最小 wire 长度：名至少 1 字节（根）+ type/class 4 字节。
+const MIN_QUESTION_BYTES: u64 = 5;
+/// 一条 RR 的最小 wire 长度：名 1 字节 + type/class/ttl/rd_length 10 字节。
+const MIN_RR_BYTES: u64 = 11;
+/// 全报文未共享的 name 展开总量上界（相对输入字节）。互不相同的名字必须自己出现
+/// 在报文里，正常报文远低于此；只有压缩别名构造能逼近。
+const MAX_NAME_EXPAND_FACTOR: usize = 8;
+
+/// 全报文 Name 展开预算（bd rbu2k）。
+///
+/// `read_name` 的单名 255 上界只限「一条名」，多条名共享同一 label run 仍是乘性
+/// 放大（4KB 报文实测 978× / 8.4 万次分配）。两道闸：
+/// - `cache`：同一偏移的展开结果在报文内共享（wire 解析期不变 ⇒ 同偏移必同结果），
+///   命中既不计账也不重新分配——正常报文的 answer 段正是「共用同一个 question 名」。
+/// - `left`：未共享展开的字节总量 ≤ [`MAX_NAME_EXPAND_FACTOR`] × 输入字节， 挡住「同一 run
+///   换不同入口偏移」这种绕过共享的构造。
+struct NameBudget {
+    left: usize,
+    cache: HashMap<u16, Name>,
+}
+
+impl NameBudget {
+    fn new(input_len: u64) -> Self {
+        let factor = u64::try_from(MAX_NAME_EXPAND_FACTOR).unwrap_or(u64::MAX);
+        let left = usize::try_from(input_len.saturating_mul(factor)).unwrap_or(usize::MAX);
+        Self { left, cache: HashMap::new() }
+    }
+
+    /// 记一次新展开；超额即拒绝（未认证输入）。
+    fn charge(&mut self, octets: usize) -> io::Result<()> {
+        self.left = self
+            .left
+            .checked_sub(octets)
+            .ok_or_else(|| invalid_data("message name expansion exceeds budget"))?;
+        Ok(())
+    }
+}
+
 /// 读取 Name，支持压缩指针（0xC0 前缀）。
 ///
 /// 对应 Go `readName`。最多跟随 10 个压缩指针。
-pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
-    let mut labels: Vec<Vec<u8>> = Vec::new();
+fn read_name<R: Read + Seek>(r: &mut R, budget: &mut NameBudget) -> io::Result<Name> {
+    // 展开结果先落定长栈缓冲（对应 Go `Name.Data [255]byte`）：单名 ≤255 在循环里
+    // 就拒绝，故不会溢出，且拒绝发生在任何堆分配之前。
+    let mut flat = [0u8; 255];
+    let mut len = 0usize;
     let mut num_pointers = 0u8;
     let mut seek_to: Option<u64> = None;
-    // 边读边累计编码后总长（首字节 + 每 label 的 1 长度字节 + 末尾 0）。
-    // 压缩指针可回跳到同一区域重复展开，指针上限只限跳数不限累积量 ⇒ 若等
-    // Name::new 在循环结束后才校验，峰值先于拒绝发生（未认证远程可达的放大面）。
-    // 过程中拒绝与 Name::new 的接受集合一致（对齐 Go 的 errNameTooLong 时机）。
-    let mut total: usize = 1;
+    // 名以指针开头时，整条名等价于该偏移的展开 ⇒ 可缓存复用。
+    let mut first_target: Option<u16> = None;
 
     loop {
         let mut label_type_buf = [0u8; 1];
@@ -347,28 +473,49 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
                 if length == 0 {
                     break;
                 }
-                total += 1 + length;
-                if total > 255 {
+                // 过程内拒绝与 Name::new 的接受集合一致（对齐 Go 的 errNameTooLong 时机）
+                if len + 1 + length > 255 {
                     return Err(invalid_data("name is longer than 255 octets"));
                 }
-                let mut label = vec![0u8; length];
-                r.read_exact(&mut label)?;
-                labels.push(label);
+                flat[len] = label_type;
+                len += 1;
+                r.read_exact(&mut flat[len..len + length])?;
+                len += length;
             },
             0xc0 => {
                 // 压缩指针
                 let mut lower = [0u8; 1];
                 r.read_exact(&mut lower)?;
-                let upper = label_type & 0x3f;
-                let offset = (u16::from(upper) << 8) | u16::from(lower[0]);
+                let offset = (u16::from(label_type & 0x3f) << 8) | u16::from(lower[0]);
 
                 if num_pointers == 0 {
                     // 记录当前游标位置以便后续恢复
                     seek_to = Some(r.stream_position()?);
+                    if len == 0 {
+                        first_target = Some(offset);
+                    }
                 }
                 num_pointers += 1;
                 if num_pointers > COMPRESSION_POINTER_LIMIT {
                     return Err(invalid_data("too many compression pointers"));
+                }
+                // 命中共享展开：整条名就是该偏移的展开时直接复用（零分配）；带前缀
+                // 时把尾巴拷进栈缓冲，随后只分配一次。
+                if let Some(cached) = budget.cache.get(&offset) {
+                    let tail = cached.flat();
+                    if len + tail.len() > 255 {
+                        return Err(invalid_data("name is longer than 255 octets"));
+                    }
+                    if len == 0 {
+                        let name = cached.clone();
+                        if let Some(pos) = seek_to {
+                            r.seek(SeekFrom::Start(pos))?;
+                        }
+                        return Ok(name);
+                    }
+                    flat[len..len + tail.len()].copy_from_slice(tail);
+                    len += tail.len();
+                    break;
                 }
                 r.seek(SeekFrom::Start(u64::from(offset)))?;
             },
@@ -384,7 +531,14 @@ pub(crate) fn read_name<R: Read + Seek>(r: &mut R) -> io::Result<Name> {
             r.seek(SeekFrom::Start(pos))?;
         }
     }
-    Name::new(labels)
+    // 先记账再分配：超额时一个字节都不分配。（纯缓存命中在上面已提前返回，
+    // 走到这里的都是要新组装一条 name 的路径——含「前缀 + 缓存尾巴」。）
+    budget.charge(len)?;
+    let name = Name::from_flat(&flat[..len]);
+    if let Some(offset) = first_target {
+        budget.cache.insert(offset, name.clone());
+    }
+    Ok(name)
 }
 
 // ============================================================================
@@ -410,7 +564,8 @@ impl MessageBuilder {
 
     /// 写一个 Name，必要时使用压缩指针（指向之前写过的同 suffix）。
     pub(crate) fn write_name(&mut self, name: &Name) {
-        for i in 0..name.labels.len() {
+        let count = name.label_count();
+        for i in 0..count {
             // 检查从 i 开始的 suffix 是否已缓存
             let suffix = suffix_str(name, i);
             if let Some(&ptr) = self.name_cache.get(&suffix) {
@@ -423,9 +578,8 @@ impl MessageBuilder {
             // 未缓存：写完整 label 并记录位置
             let pos = self.w.len();
             self.name_cache.insert(suffix, pos);
-            let label = &name.labels[i];
-            let length = label.len();
-            self.w.push(length as u8);
+            let label = name.label(i);
+            self.w.push(label.len() as u8);
             self.w.extend_from_slice(label);
         }
         self.w.push(0);
@@ -474,11 +628,8 @@ impl MessageBuilder {
 
 /// 构造从 index i 开始的 suffix 字符串（用于 name_cache key，避免分配 Name 子切片）。
 fn suffix_str(name: &Name, i: usize) -> String {
-    if i >= name.labels.len() {
-        return ".".to_string();
-    }
     let mut buf = String::new();
-    for (j, label) in name.labels[i..].iter().enumerate() {
+    for (j, label) in name.labels().skip(i).enumerate() {
         if j > 0 {
             buf.push('.');
         }
@@ -489,6 +640,9 @@ fn suffix_str(name: &Name, i: usize) -> String {
                 buf.push_str(&format!("\\x{b:02x}"));
             }
         }
+    }
+    if buf.is_empty() {
+        buf.push('.');
     }
     buf
 }
@@ -564,6 +718,11 @@ mod tests {
         b.to_vec()
     }
 
+    /// `Name` 的标签列表（扁平表示下用迭代器还原，供断言比对）。
+    fn labels_of(n: &Name) -> Vec<Vec<u8>> {
+        n.labels().map(<[u8]>::to_vec).collect()
+    }
+
     #[test]
     fn new_name_validates_labels() {
         // 空标签报错
@@ -582,16 +741,18 @@ mod tests {
     fn parse_name_roundtrip() {
         // 空字符串 → 空 labels
         let n = Name::parse("").unwrap();
-        assert!(n.labels.is_empty());
+        assert_eq!(n.label_count(), 0);
         // 单 dot → 空 labels
         let n = Name::parse(".").unwrap();
-        assert!(n.labels.is_empty());
+        assert_eq!(n.label_count(), 0);
         // 简单域名
         let n = Name::parse("example.com").unwrap();
-        assert_eq!(n.labels, vec![lbl(b"example"), lbl(b"com")]);
+        assert_eq!(labels_of(&n), vec![lbl(b"example"), lbl(b"com")]);
         // 末尾 dot
         let n = Name::parse("example.com.").unwrap();
-        assert_eq!(n.labels, vec![lbl(b"example"), lbl(b"com")]);
+        assert_eq!(labels_of(&n), vec![lbl(b"example"), lbl(b"com")]);
+        // flat 形态即未压缩 wire name（末尾 0 之前的部分）
+        assert_eq!(n.flat(), b"\x07example\x03com");
     }
 
     #[test]
@@ -612,7 +773,7 @@ mod tests {
         let s = Name::parse("COM").unwrap();
         let (fore, ok) = n.trim_suffix(&s);
         assert!(ok);
-        assert_eq!(fore.labels, vec![lbl(b"example")]);
+        assert_eq!(labels_of(&fore), vec![lbl(b"example")]);
 
         // 不匹配
         let s = Name::parse("net").unwrap();
@@ -625,7 +786,7 @@ mod tests {
         let s = Name::parse("example.com").unwrap();
         let (fore, ok) = n.trim_suffix(&s);
         assert!(ok);
-        assert!(fore.labels.is_empty());
+        assert_eq!(fore.label_count(), 0);
     }
 
     #[test]
@@ -642,8 +803,9 @@ mod tests {
         let mut cursor = io::Cursor::new(&buf[..]);
         // 从 offset 9 起读 Name
         cursor.set_position(9);
-        let name = read_name(&mut cursor).unwrap();
-        assert_eq!(name.labels, vec![lbl(b"example")]);
+        let mut budget = NameBudget::new(buf.len() as u64);
+        let name = read_name(&mut cursor, &mut budget).unwrap();
+        assert_eq!(labels_of(&name), vec![lbl(b"example")]);
         // 跟随过指针后游标应回到指针字节之后（offset 11）
         assert_eq!(cursor.position(), 11);
     }
@@ -739,7 +901,7 @@ mod tests {
         assert_eq!(parsed.flags, 0x0100);
         assert_eq!(parsed.question.len(), 1);
         assert_eq!(parsed.question[0].qtype, RR_TYPE_A);
-        assert_eq!(parsed.question[0].name.labels, vec![lbl(b"example"), lbl(b"com")]);
+        assert_eq!(parsed.question[0].name.flat(), b"\x07example\x03com");
     }
 
     #[test]
@@ -772,7 +934,8 @@ mod tests {
         // 构造一个无限循环的压缩指针：0xc0 0x00 指向自己
         let buf = [0xc0, 0x00];
         let mut cursor = io::Cursor::new(&buf[..]);
-        let result = read_name(&mut cursor);
+        let mut budget = NameBudget::new(buf.len() as u64);
+        let result = read_name(&mut cursor, &mut budget);
         // 应该在第 11 个指针时报错（COMPRESSION_POINTER_LIMIT=10）
         assert!(result.is_err());
     }
@@ -820,6 +983,138 @@ mod tests {
         assert_eq!(err.to_string(), "name is longer than 255 octets");
         assert!(c.allocs < 500, "allocs={} 未压到有界（上限 500）", c.allocs);
         assert!(c.peak < 64 * 1024, "peak={}B 未压到 64KB 内", c.peak);
+    }
+
+    /// qd 段最坏形态：偏移 12 处一条 126 label 的 run，其余 question 只用 2 字节
+    /// 压缩指针引用它（每条 question 6 字节 = 指针 2 + qtype/qclass 4）。
+    fn shared_run_query(limit: usize) -> (Vec<u8>, u16) {
+        let mut m = hdr(0, 0);
+        let run = m.len();
+        for _ in 0..126 {
+            m.extend_from_slice(&[0x01, b'a']);
+        }
+        m.push(0x00);
+        m.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // 首条 question 的 qtype/qclass
+        let mut qd = 1u16;
+        while m.len() + 6 <= limit {
+            m.push(0xc0);
+            m.push(run as u8);
+            m.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            qd += 1;
+        }
+        m[4..6].copy_from_slice(&qd.to_be_bytes());
+        (m, qd)
+    }
+
+    /// bd rbu2k（NEW-S1）：多条 2 字节压缩名共享**同一** label run —— 单名 255
+    /// 上界挡不住「名字条数 × 展开量」的乘性放大（修复前 4091B 报文 978× /
+    /// 8.4 万次分配 / 4.6ms）。同偏移的展开只做一次，其余命中共享缓存 ⇒
+    /// 分配量与输入同阶。
+    #[test]
+    fn shared_compression_run_amplification_is_bounded() {
+        let (msg, qd) = shared_run_query(4096);
+        let (res, c) = alloc_probe::measure(|| message_from_wire_format(&msg));
+        let m = res.expect("共享 run 的报文必须解析成功（形态本身合法）");
+        assert_eq!(m.question.len(), usize::from(qd));
+        assert!(
+            c.bytes < 10 * msg.len(),
+            "in={}B alloc_bytes={} 放大 {:.1}x 仍超 10x（共享展开未复用）",
+            msg.len(),
+            c.bytes,
+            c.bytes as f64 / msg.len() as f64
+        );
+        assert!(c.allocs < msg.len() / 4, "allocs={} 未压到输入同阶", c.allocs);
+    }
+
+    /// 合法形态不误伤：真实 xdns 响应 = 1 条 question + N 条 answer，answer 名全
+    /// 部是同一个 question 名的压缩指针（展开量可达输入的数倍至十几倍）。共享缓存
+    /// 让它们零重复分配，且不计入展开预算。
+    #[test]
+    fn shared_answer_names_stay_cheap() {
+        let mut msg = hdr(1, 0);
+        let name_at = msg.len();
+        for _ in 0..3 {
+            msg.push(63);
+            msg.extend_from_slice(&[b'a'; 63]);
+        }
+        msg.push(61); // 3×64 + 62 = 254 flat 字节 ⇒ wire 255
+        msg.extend_from_slice(&[b'a'; 61]);
+        msg.push(0x00);
+        msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        let mut an = 0u16;
+        while msg.len() + 12 <= 4096 {
+            msg.push(0xc0);
+            msg.push(name_at as u8);
+            msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x00]);
+            an += 1;
+        }
+        msg[6..8].copy_from_slice(&an.to_be_bytes());
+
+        let (res, c) = alloc_probe::measure(|| message_from_wire_format(&msg));
+        let m = res.expect("合法报文必须解析（预算只计未共享的展开）");
+        assert_eq!(m.answer.len(), usize::from(an));
+        assert!(
+            c.bytes < 8 * msg.len(),
+            "in={}B alloc_bytes={}：共享名仍在逐条重复分配",
+            msg.len(),
+            c.bytes
+        );
+    }
+
+    /// 绕过共享缓存的形态：每条名 = 1 字节 label + 指向共享 run 的指针（首条
+    /// question 内联 run 建立缓存后，每条 8 字节线上换 254 字节展开）。共享命中
+    /// 只省重读、不省组装 ⇒ 由全报文预算拒绝。
+    #[test]
+    fn prefixed_pointer_names_are_budget_bounded() {
+        // 首条 question 的名就是内联的 run（与 qd 段最坏形态同布局），其后每条
+        // question = [1B label][2B 指针][qtype/qclass]。
+        let mut msg = hdr(0, 0);
+        let run = msg.len() as u8;
+        for _ in 0..126 {
+            msg.extend_from_slice(&[0x01, b'a']);
+        }
+        msg.push(0x00);
+        msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // 首条 question 的 qtype/qclass
+        let mut qd = 1u16;
+        while msg.len() + 8 <= 4096 {
+            msg.push(0x01);
+            msg.push(b'x'); // 前缀 label
+            msg.push(0xc0);
+            msg.push(run);
+            msg.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            qd += 1;
+        }
+        msg[4..6].copy_from_slice(&qd.to_be_bytes());
+
+        let (res, c) = alloc_probe::measure(|| message_from_wire_format(&msg));
+        let err = res.expect_err("前缀 + 共享尾巴的乘性放大必须被预算拒绝");
+        assert_eq!(err.to_string(), "message name expansion exceeds budget");
+        // 上界 = 预算 8×输入（name 字节）+ 段条目结构开销（每条 question 24B，
+        // 按剩余字节预分配 ≈ 输入/5×24 ≈ 4.8×）。被拒报文的总分配必须是**输入的
+        // 常数倍**（修复前该形态是 ~500×）。
+        assert!(
+            c.bytes < 16 * msg.len(),
+            "in={}B alloc_bytes={} 放大 {:.1}x 超上界（预算或段预分配失效）",
+            msg.len(),
+            c.bytes,
+            c.bytes as f64 / msg.len() as f64
+        );
+    }
+
+    /// 预算闸：未共享展开超过 `MAX_NAME_EXPAND_FACTOR × 输入字节` 即拒绝
+    /// （「同一 run 换不同入口偏移」这类绕过共享缓存的构造由它兜底）。
+    #[test]
+    fn name_expansion_budget_rejects_oversized_expansion() {
+        let (msg, _) = shared_run_query(4096);
+        // 第 2 条 question 的指针字节：头 12 + run 252 + 根 1 + qtype/qclass 4
+        let second_question = 12 + 126 * 2 + 1 + 4;
+        let mut cursor = io::Cursor::new(&msg[..]);
+        cursor.set_position(second_question as u64);
+        // 预算 100B < 该 run 展开的 253B
+        let mut budget = NameBudget { left: 100, cache: HashMap::new() };
+        let err = read_name(&mut cursor, &mut budget).expect_err("预算耗尽必须拒绝");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "message name expansion exceeds budget");
     }
 
     /// bd oavzu：rd_length 必须按剩余字节先校验再分配（Go unpack 的顺序）。

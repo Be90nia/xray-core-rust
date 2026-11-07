@@ -251,46 +251,40 @@ fn frag_count(data_len: usize, unit: usize) -> isize {
 
 /// Name → 未压缩 wire name 字节（len 前缀 labels + 根 0）。
 fn name_to_rdata(name: &Name) -> Vec<u8> {
-    let mut out = Vec::new();
-    for label in &name.labels {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label);
-    }
+    let mut out = name.flat().to_vec();
     out.push(0);
     out
 }
 
 /// 从 wire name 字节（未压缩形态）解析 Name；CNAME rdata 由 dns 层归一化为此形态。
 pub(crate) fn name_from_wire(buf: &[u8]) -> io::Result<Name> {
-    let mut labels = Vec::new();
     let mut pos = 0usize;
     loop {
         let Some(&len) = buf.get(pos) else {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "name eof"));
         };
-        pos += 1;
         if len == 0 {
             break;
         }
         if len & 0xC0 != 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed name"));
         }
-        let Some(label) = buf.get(pos..pos + len as usize) else {
+        if buf.len() < pos + 1 + len as usize {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "label eof"));
-        };
-        labels.push(label.to_vec());
-        pos += len as usize;
+        }
+        pos += 1 + len as usize;
     }
-    Name::new(labels)
+    // flat 形态 = 去掉末尾 0 的同一段字节；单名 wire 上界 255（含末尾 0）与
+    // `Name::new` 的接受集合一致。
+    if pos + 1 > 255 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "name is longer than 255 octets"));
+    }
+    Ok(Name::from_flat(&buf[..pos]))
 }
 
 /// Name 的 wire 长度（len 前缀逐 label + 根 0 字节），对齐 Go `name.Length`。
 pub(crate) fn name_wire_len(name: &Name) -> usize {
-    let mut total = 1;
-    for label in &name.labels {
-        total += 1 + label.len();
-    }
-    total
+    name.wire_len()
 }
 
 /// 待发响应包队列（对应 Go `SendManager`/`SendInfo`）。

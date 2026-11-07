@@ -681,7 +681,7 @@ impl DohResolver {
             let cooldown = cooldown.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "DoH worker（数据面 DoH 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随所属 xdns client（bd hj3jf 同款裁定）"
+                reason = "②豁免（bd kwevg · §3.5.6）：DoH worker（数据面 DoH 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
             )]
             tokio::spawn(async move {
                 let mut dropped = 0u64;

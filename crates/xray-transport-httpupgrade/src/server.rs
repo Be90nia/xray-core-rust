@@ -66,17 +66,21 @@ impl HttpUpgradeServer {
         // 1. 读请求直到 \r\n\r\n（用 1KB chunk 读，能正确捕获后续 payload）。
         // H14：整段握手读 4s 超时（Go hub.go:39-41 SetReadDeadline(+4s) +
         // LimitReader(12288)——慢速/半开连接不再无限占用 accept 并发）。
+        // bd x0v47：每次读都按剩余配额**硬钳**（Go `io.LimitReader` 语义）——
+        // 旧实现只在读前检查 `buf.len()`，单次 1KB 读可越界到 13311 字节。
         let mut buf: Vec<u8> = Vec::with_capacity(READ_INITIAL_CAPACITY);
         let mut chunk = [0u8; 1024];
         let read_all = tokio::time::timeout(std::time::Duration::from_secs(4), async {
             loop {
-                if buf.len() >= READ_MAX_CAPACITY {
+                let remaining = READ_MAX_CAPACITY - buf.len();
+                if remaining == 0 {
                     return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(format!(
                         "request header exceeds max {} bytes",
                         READ_MAX_CAPACITY
                     )));
                 }
-                let n = io.read(&mut chunk).await?;
+                let want = remaining.min(chunk.len());
+                let n = io.read(&mut chunk[..want]).await?;
                 if n == 0 {
                     return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
                         "EOF before \\r\\n\\r\\n terminator".into(),

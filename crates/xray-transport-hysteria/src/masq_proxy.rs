@@ -276,7 +276,7 @@ impl ProxyMasqHandler {
             .map_err(|e| format!("upstream handshake: {e}"))?;
         #[allow(
             clippy::disallowed_methods,
-            reason = "上游 HTTP/1.1 连接驱动任务（hyper conn）：随上游响应/错误结束即退出，生命周期短于本 handler；本 crate 无 PluginContext 托管面（xray-frame 仅 dev-dependency），显式脱管：句柄无需持有"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：上游 HTTP/1.1 连接驱动任务（hyper conn）：随上游响应/错误结束即退出，生命周期短于本 handler；本 crate 无 PluginContext 托管面（xray-frame 仅 dev-dependency），显式脱管：句柄无需持有；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let _ = conn.await;

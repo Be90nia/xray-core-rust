@@ -132,11 +132,42 @@ fn shared_buf_pool() -> Arc<ObjectPool<Vec<u8>>> {
     xray_frame::pool::SharedPoolRegistry::shared().get_or_init(UDP_BUFFER_SIZE, build_buf_pool)
 }
 
+/// 进程级 idle 老化（bd m6pkl N5）：共享池的 idle 块原来只由**连接级** pruner 回收，
+/// 最后一条连接关闭后其 scope 随之停 ⇒ 残余 idle（≤ `POOL_IDLE_CAP` × 1500B）常驻到
+/// 进程结束，空闲连接不再有任何回收面。这里在**首次**建共享池时装一个进程生命周期的
+/// pruner（坑约束 ⑥ **② 类豁免**：进程级后台任务必须活得比任何组件久）。
+/// 连接级 pruner 保留（`prune_idle` 幂等，多 pruner 无冲突）。
+fn ensure_process_pruner(pool: &Arc<ObjectPool<Vec<u8>>>) {
+    use std::sync::{LazyLock, OnceLock};
+    /// 进程级托管 scope（初值已知 ⇒ LazyLock）。
+    static SCOPE: LazyLock<ManagedScope> = LazyLock::new(|| {
+        ManagedScope::new("xray_frame::transport::hysteria::udphop::process-pruner")
+    });
+    /// 一次性装载闸（运行期输入 ⇒ OnceLock）。
+    static ARMED: OnceLock<()> = OnceLock::new();
+    if ARMED.set(()).is_err() {
+        return;
+    }
+    if xray_frame::pool::spawn_idle_pruner(
+        SCOPE.fx_scope(),
+        Arc::clone(pool),
+        xray_frame::compat::clock(),
+        POOL_PRUNE_INTERVAL,
+        POOL_IDLE_AGE,
+    )
+    .is_err()
+    {
+        // scope 恒不关（进程级），失败路径实际不可达；托管口自身已 warn 留痕。
+    }
+}
+
 impl BufPool {
     /// 生产构造：进程级共享池（bd ccy5d）——同尺寸块（1500B）全进程唯一一份，
     /// 全部连接复用；预算账本 `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`。
     fn new() -> Self {
-        Self { inner: shared_buf_pool() }
+        let inner = shared_buf_pool();
+        ensure_process_pruner(&inner);
+        Self { inner }
     }
 
     /// 注入缝：测试面隔离（独立池的 metrics 读数不被共享池上并行测试污染）；
@@ -369,7 +400,7 @@ impl UdpHopPacketConn {
         let pool_for_recv = Arc::clone(&pool);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（UDP hop recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），句柄登记于 recv_handles，close/Drop 统一 abort（bd 9utc3）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（UDP hop recv 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let recv_handle = tokio::spawn(async move {
             recv_loop(conn_for_recv, recv_tx_clone, pool_for_recv).await;
@@ -384,7 +415,7 @@ impl UdpHopPacketConn {
         let recv_handles_for_hop = Arc::clone(&recv_handles);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（UDP hop 换口循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），句柄已持有（hop_handle 字段），close/Drop 统一 abort（bd 9utc3）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（UDP hop 换口循环）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         let hop_handle = tokio::spawn(async move {
             hop_loop(hop_inner, hop_recv_tx, pool_for_hop, recv_handles_for_hop).await;
@@ -658,12 +689,18 @@ async fn hop_once(
     let pool_for_recv = Arc::clone(pool);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（换口后新 recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），句柄登记于 recv_handles，close/Drop 统一 abort（bd 9utc3）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（换口后新 recv 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let recv_handle = tokio::spawn(async move {
         recv_loop(conn_for_recv, tx, pool_for_recv).await;
     });
-    recv_handles.lock().await.push(recv_handle);
+    {
+        let mut handles = recv_handles.lock().await;
+        // bd n6jqu F3：句柄表原只增不减（每次换口 5-30s 一条 ⇒ 长命连接 ~2.9k/天）。
+        // 已结束的 recv 任务无需 abort，先收割再追加。
+        handles.retain(|h| !h.is_finished());
+        handles.push(recv_handle);
+    }
 
     let _ = new_addr_index;
     true

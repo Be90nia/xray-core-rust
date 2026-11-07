@@ -94,8 +94,16 @@ pub type TransportDialFn = Arc<
 pub struct StreamSettings {
     /// 传输协议名（`"tcp"` / `"websocket"` / `"grpc"` / `"httpupgrade"` / `"splithttp"` / ...）。
     /// 空字符串视为 `"tcp"`。
+    ///
+    /// **不变量（bd vwhnw）**：经 [`StreamSettings::from_json`] 构造时恒为小写
+    /// （归一化真源）。程序化构造须自行给规范值——下游按精确匹配 / 注册表键
+    /// （[`get_transport_dialer`] 大小写敏感）消费。
     pub protocol: String,
     /// 安全层名（`"none"` / `"tls"` / `"reality"`）。空或 `"none"` 表示无 TLS。
+    ///
+    /// **不变量（bd vwhnw）**：同 [`Self::protocol`]，经 [`StreamSettings::from_json`]
+    /// 构造时恒为小写；[`Self::is_tls`] 与 [`Self::validate_security`] 另做一次
+    /// 忽略大小写的防御（程序化构造面）。
     pub security: String,
     /// 传输层配置 JSON（对应 Go `ProtocolSettings`）。各协议 crate 自行 `serde_json::from_value`。
     pub transport_json: Option<serde_json::Value>,
@@ -138,13 +146,24 @@ impl StreamSettings {
         for w in removed_feature_warnings(v) {
             xray_common::log::warning(w);
         }
+        // 归一化真源（bd vwhnw）：`protocol` 与 `security` 在此**统一转小写**，下游
+        // 所有精确匹配（`protocol == "tcp"`、`security == "reality"`、
+        // `get_transport_dialer(protocol)` 的 HashMap 键）因此天然安全。
+        // 形态选 `to_ascii_lowercase`：两字段的合法值全是 ASCII 字面量
+        // （Go `network`/`security` 枚举），ASCII 折叠与其 `strings.ToLower`
+        // 在这些值上等同，且不查 Unicode 表。
         let protocol = v
             .get("method")
             .or_else(|| v.get("network"))
             .and_then(|n| n.as_str())
             .unwrap_or("tcp")
-            .to_string();
-        let security = v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            .to_ascii_lowercase();
+        // Go `infra/conf/transport_internet.go` 对 `security` 做 `strings.ToLower`
+        // 归一（TLS 两端也已归一）。此处**一处归到底**：下游 `xray-transport-tcp`
+        // 的 register 用 `== "reality"` 精确匹配，`security:"REALITY"` 曾因此落到
+        // 普通 TLS 分支（握手失败但不落明文）——本行修掉全部下游精确匹配点。
+        let security =
+            v.get("security").and_then(|s| s.as_str()).unwrap_or("").to_ascii_lowercase();
         // 协议特定配置：尝试 `<protocol>Settings`（如 `wsSettings`/`grpcSettings`/`tcpSettings`）。
         // Go JSON 解析器约定 `network` 值与 settings 字段名对应（`tcp`→`tcpSettings`,
         // `ws`→`wsSettings`, ...）。 ponytail: Go JSON 字段名约定 `<proto>Settings`，但 Go
@@ -185,17 +204,25 @@ impl StreamSettings {
 
     /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`，大小写不敏感
     /// ——对齐 Go `strings.ToLower(c.Security)`）。
+    ///
+    /// 形态选 `eq_ignore_ascii_case`：候选值全是 ASCII 字面量，ASCII 折叠与 Go
+    /// `ToLower` 在它们上等同；比 `to_lowercase()` 少一次分配，也不做 Unicode
+    /// 折叠（`"ＴＬＳ"` 在 Go 里同样判否）。方向性防御：`from_json` 已归一，
+    /// 这里兜程序化构造。
     #[must_use]
     pub fn is_tls(&self) -> bool {
-        matches!(self.security.to_lowercase().as_str(), "tls" | "reality")
+        self.security.eq_ignore_ascii_case("tls") || self.security.eq_ignore_ascii_case("reality")
     }
 
     /// security 值启动/拨号期校验（对齐 Go `infra/conf/transport_internet.go:100-132`
     /// Build 语义，大小写归一同 Go ToLower）：`""`/`none`/`tls`/`reality` 合法；
     /// `xtls` 是已移除特性硬错；其他未知值硬错。此前未知值（含 `xtls`、拼写错误）
     /// 经 `is_tls()==false` 静默裸连。
+    ///
+    /// 归一形态同 [`Self::is_tls`]：合法值全是 ASCII 字面量 ⇒ `to_ascii_lowercase`
+    /// 与 Go `ToLower` 等值（错误文案回显原始 `other`，不改写用户输入）。
     pub fn validate_security(&self) -> io::Result<()> {
-        match self.security.to_lowercase().as_str() {
+        match self.security.to_ascii_lowercase().as_str() {
             "" | "none" | "tls" | "reality" => Ok(()),
             "xtls" => Err(io::Error::other(
                 "Legacy XTLS has been removed, please use xtls-rprx-vision with TLS or REALITY",
@@ -738,6 +765,33 @@ mod transport_cache_tests {
         let bogus = StreamSettings { security: "tlss".into(), ..StreamSettings::tcp() };
         let err = bogus.validate_security().unwrap_err().to_string();
         assert!(err.contains("Unknown security"), "got: {err}");
+    }
+
+    /// bd vwhnw：`from_json` 是 `security` / `protocol` 的归一化真源。上游 Go
+    /// `transport_internet.go:98` 是 `switch strings.ToLower(c.Security)`，
+    /// `TransportProtocol.Build` 亦 `strings.ToLower` ⇒ 大写变体是真 TLS/真协议。
+    /// 归一后下游全部精确匹配（`== "reality"`、`== "tcp"`、dialer 注册表键）才成立。
+    #[test]
+    fn from_json_normalizes_protocol_and_security() {
+        let s = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "WS",
+            "security": "TLS"
+        })));
+        assert_eq!(s.protocol, "ws", "protocol 须归一小写才能命中注册表键");
+        assert_eq!(s.security, "tls");
+        assert!(s.is_tls());
+
+        let r = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "TCP",
+            "security": "REALITY"
+        })));
+        assert_eq!(r.protocol, "tcp");
+        assert_eq!(r.security, "reality", "`== \"reality\"` 分支（入站/传输）依赖此不变量");
+        assert!(r.is_tls());
+
+        // 缺省不变
+        let d = StreamSettings::from_json(Some(&serde_json::json!({})));
+        assert_eq!((d.protocol.as_str(), d.security.as_str()), ("tcp", ""));
     }
 
     #[test]

@@ -502,12 +502,17 @@ where
     let enc_shared = protocol::read_bytes(&mut cursor)?;
     let enc_verify = protocol::read_bytes(&mut cursor)?;
 
-    // 5. RSA 解密 + verifyToken 校验（明文流上，与 Go 顺序一致）
+    // 5. RSA 解密 + verifyToken 校验（明文流上，与 Go 顺序一致）。
+    //
+    // 走带 rng 的盲化解密（bd 2emrf）：Go 是 `rsa.DecryptPKCS1v15(rand.Reader, ...)`，
+    // 那个 `rand.Reader` 就是盲化源；`RsaPrivateKey::decrypt` 的 `Option::None` 路径
+    // 无盲化 ⇒ 私钥由口令派生，直接把口令暴露在时序侧信道下。这里两步都必须在
+    // token/口令校验**之前**完成（与 Go 同序），因此盲化是这两次运算唯一的防护。
     let shared_secret = rsa_private_key
-        .decrypt(rsa::Pkcs1v15Encrypt, &enc_shared)
+        .decrypt_blinded(&mut rsa::rand_core::OsRng, rsa::Pkcs1v15Encrypt, &enc_shared)
         .map_err(|e| io::Error::other(format!("rsa decrypt shared: {e}")))?;
     let decrypted_verify = rsa_private_key
-        .decrypt(rsa::Pkcs1v15Encrypt, &enc_verify)
+        .decrypt_blinded(&mut rsa::rand_core::OsRng, rsa::Pkcs1v15Encrypt, &enc_verify)
         .map_err(|e| io::Error::other(format!("rsa decrypt verify: {e}")))?;
 
     if decrypted_verify.len() < 4 || decrypted_verify[..4] != verify_token {
@@ -682,7 +687,7 @@ pub(super) async fn tcp_bridge(
     // 唯一写者任务：明文 MC 包字节 → CFB8 加密 → raw（对应 Go cryptoStream 写侧）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（xmc 加密写泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（xmc 加密写泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         let mut ww = ww;
@@ -713,7 +718,7 @@ pub(super) async fn tcp_bridge(
     let tx_ka = tx.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（pipe→raw 分块编码泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（pipe→raw 分块编码泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         run_encode_pump(pipe_r, tx_data, local_cp_id).await;
@@ -725,7 +730,7 @@ pub(super) async fn tcp_bridge(
     let tx_read = tx;
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（raw→pipe 解密读泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw→pipe 解密读泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         let tx = tx_read;
@@ -777,7 +782,7 @@ pub(super) async fn tcp_bridge(
     if !is_client {
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（xmc server keepalive 循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（xmc server keepalive 循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             let tx = tx_ka;

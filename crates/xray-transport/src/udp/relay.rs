@@ -192,7 +192,10 @@ fn spawn_session(
     // reader: 持续 recv，recv 出错 → 退出；每次成功 recv 刷新 last_refresh。
     // reader 退出时不主动改 map——交给 timer task 统一回收（避免并发删除）。
     // 数据面泵热路径豁免（约束⑫）：recv→channel 转发循环不加托管口。
-    #[allow(clippy::disallowed_methods, reason = "数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵")]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    )]
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];
         loop {

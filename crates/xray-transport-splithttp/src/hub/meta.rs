@@ -70,11 +70,16 @@ pub fn extract_meta<B>(req: &Request<B>, config: &Config, base_path: &str) -> Re
     let headers = req.headers();
 
     // path placement 需要拆分 URL path 的子段。
+    //
+    // bd imhvg(a)：**不过滤空段**——Go `config.go:393`
+    // `subpath = strings.Split(req.URL.Path[len(path):], "/")` 保留空串并按位置取下标。
+    // 旧实现 filter 掉空段 ⇒ `/base//5` 在 Go 得到 session=""/seq="5"，在本实现得到
+    // session="5"/seq=""（双斜杠 URL 的分发形态与 Go 分歧）。
     let subpath: Vec<&str> =
         if session_placement == PLACEMENT_PATH || seq_placement == PLACEMENT_PATH {
             let full_path = req.uri().path();
             let after_base = full_path.strip_prefix(base_path).unwrap_or(full_path);
-            after_base.split('/').filter(|s| !s.is_empty()).collect()
+            after_base.split('/').collect()
         } else {
             Vec::new()
         };

@@ -23,6 +23,7 @@ use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
+    ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -45,8 +46,8 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_httpupgrade(&dest, &sockopt, &settings).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_dialer("httpupgrade", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`）。
+    ignore_already_exists(register_transport_dialer("httpupgrade", dialer))?;
     Ok(())
 }
 
@@ -61,7 +62,7 @@ pub fn register_listener() -> io::Result<()> {
         let sockopt = sockopt.clone();
         Box::pin(async move { listen_httpupgrade(addr, &settings, &sockopt, handler).await })
     });
-    let _ = register_transport_listener("httpupgrade", listen_fn);
+    ignore_already_exists(register_transport_listener("httpupgrade", listen_fn))?;
     Ok(())
 }
 
@@ -78,8 +79,7 @@ pub fn register_unix_listener() -> io::Result<()> {
     let listen_fn: UnixTransportListenFn = Arc::new(move |path, settings, sockopt, handler| {
         Box::pin(async move { listen_unix_httpupgrade(path, settings, sockopt, handler).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_unix_listener("httpupgrade", listen_fn);
+    ignore_already_exists(register_transport_unix_listener("httpupgrade", listen_fn))?;
     Ok(())
 }
 
@@ -323,7 +323,7 @@ async fn listen_httpupgrade(
     });
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（httpupgrade accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（httpupgrade accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -354,7 +354,7 @@ async fn listen_httpupgrade(
     // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（accept 循环意外退出监控）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade",
@@ -412,7 +412,7 @@ async fn listen_unix_httpupgrade(
     });
     #[allow(
         clippy::disallowed_methods,
-        reason = "unix accept 泵（httpupgrade）；显式脱管：托管无收益（ctx 不可达），寿命随 listener close（句柄存 abort 由 listener 终结），cfg(unix) 本机不可编译故无逐点复核（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：unix accept 泵（httpupgrade）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -436,7 +436,7 @@ async fn listen_unix_httpupgrade(
     let abort = accept_task.abort_handle();
     #[allow(
         clippy::disallowed_methods,
-        reason = "unix accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：unix accept 循环意外退出监控（panic 留痕）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "httpupgrade-unix",

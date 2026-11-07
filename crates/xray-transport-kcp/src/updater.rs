@@ -82,7 +82,7 @@ impl TokioUpdater {
         let this = Arc::clone(self);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻 updater tick 任务（kcp keepalive/update 循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：常驻 updater tick 任务（kcp keepalive/update 循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             if (this.should_terminate)() {

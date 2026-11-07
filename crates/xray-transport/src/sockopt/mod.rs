@@ -1387,7 +1387,8 @@ pub(crate) fn try_set_mptcp(socket: &Socket) -> std::io::Result<()> {
 /// 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
 /// 对应 Go `transport/internet/sockopt_linux.go::GetOriginalDest`。
 ///
-/// 仅在 Linux 上有效。其他平台返回 `Unsupported` 错误。
+/// Linux：双栈（level 按连接族选 `IPPROTO_IP` / `IPPROTO_IPV6`，实现见 `sockopt/linux.rs`
+/// 的 `get_original_dst`）。其他平台返回 `Unsupported` 错误。
 /// 需要 root 或 CAP_NET_ADMIN。
 pub fn get_original_dst(_fd: i32) -> std::io::Result<std::net::SocketAddr> {
     #[cfg(target_os = "linux")]

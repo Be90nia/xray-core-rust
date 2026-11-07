@@ -26,7 +26,6 @@ use std::{
 
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream, VarInt};
-use tokio::sync::Mutex;
 
 use crate::{
     conn::{QuicConn, QuicStream},
@@ -42,7 +41,9 @@ use crate::{
 /// 我们组合起来对应 hysteria 的单一 `QuicStream` 抽象。
 pub struct QuinnQuicStream {
     send: parking_lot::Mutex<SendStream>,
-    recv: Mutex<RecvStream>,
+    /// 同步锁（bd w06sd(a)）：`read` 只在 poll 内短暂持锁、**不跨 await**——否则读泵
+    /// parked 期间锁被占住，`cancel_read` 的 stop 永远抢不到锁（close 唤不醒在飞读）。
+    recv: parking_lot::Mutex<RecvStream>,
     local: SocketAddr,
     remote: SocketAddr,
 }
@@ -60,7 +61,12 @@ impl QuinnQuicStream {
     /// 构造。地址字段由调用方从 [`quinn::Connection`] 取后传入。
     #[must_use]
     pub fn new(send: SendStream, recv: RecvStream, local: SocketAddr, remote: SocketAddr) -> Self {
-        Self { send: parking_lot::Mutex::new(send), recv: Mutex::new(recv), local, remote }
+        Self {
+            send: parking_lot::Mutex::new(send),
+            recv: parking_lot::Mutex::new(recv),
+            local,
+            remote,
+        }
     }
 }
 
@@ -69,18 +75,31 @@ impl QuicStream for QuinnQuicStream {
         &'a self,
         buf: &'a mut [u8],
     ) -> Pin<Box<dyn std::future::Future<Output = io::Result<usize>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut recv = self.recv.lock().await;
-            match recv.read(buf).await {
-                Ok(Some(n)) => Ok(n),
-                Ok(None) => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream ended")),
-                Err(quinn::ReadError::Reset(code)) => Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    format!("stream reset: {code}"),
-                )),
-                Err(e) => Err(io::Error::other(format!("quinn read: {e}"))),
+        // bd w06sd(a)：与 `write` 同款——锁只在 poll 内短暂持有，**不跨 Pending**。
+        // 旧实现 `self.recv.lock().await; recv.read(buf).await` 在读泵 parked 时把锁
+        // 占死 ⇒ `cancel_read` 的 stop 抢不到锁 ⇒ 关闭唤不醒在飞读（relay 任务滞留到
+        // 连接死亡）。改 poll 形式后 stop 必定生效（`RecvStream::poll_read` 立即返回错误）。
+        Box::pin(std::future::poll_fn(move |cx| {
+            let mut recv = self.recv.lock();
+            match recv.poll_read(cx, buf) {
+                // quinn `poll_read` 返回 Ok(0) = 流结束（旧 async 版的 `Ok(None)`）。
+                std::task::Poll::Ready(Ok(0)) => std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stream ended",
+                ))),
+                std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
+                std::task::Poll::Ready(Err(quinn::ReadError::Reset(code))) => {
+                    std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("stream reset: {code}"),
+                    )))
+                },
+                std::task::Poll::Ready(Err(e)) => {
+                    std::task::Poll::Ready(Err(io::Error::other(format!("quinn read: {e}"))))
+                },
+                std::task::Poll::Pending => std::task::Poll::Pending,
             }
-        })
+        }))
     }
 
     fn write<'a>(
@@ -114,10 +133,10 @@ impl QuicStream for QuinnQuicStream {
     fn cancel_read(&self, code: u64) {
         // quinn reset code 是 VarInt，u64 可能溢出——按 quinn 约定截断。
         let code = VarInt::try_from(code).unwrap_or(VarInt::MAX);
-        // ponytail: try_lock 在已锁状态返回 Err，cancel 是尽力语义——跳过即可
-        if let Ok(mut recv) = self.recv.try_lock() {
-            let _ = recv.stop(code);
-        }
+        // bd w06sd(a)：锁现在只在 `read` 的 poll 内短暂持有（不跨 Pending），故这里
+        // 直接 `lock()` 必定能拿到并 stop —— 关闭会立即唤醒在飞读（旧 try_lock 在
+        // 读泵 parked 时必失败 = no-op，relay 任务滞留到连接死亡）。
+        let _ = self.recv.lock().stop(code);
     }
 
     fn close(&self) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>> {
@@ -443,12 +462,12 @@ fn spawn_supervised_accept_loop(
 ) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面 QUIC accept 泵（hysteria listener）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 listener close，句柄仅作监控入参（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面 QUIC accept 泵（hysteria listener）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(body);
     #[allow(
         clippy::disallowed_methods,
-        reason = "accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：accept 循环意外退出监控（panic 留痕）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria-quic",
@@ -601,7 +620,7 @@ fn spawn_gated_hysteria_accept(
             server_config.transport_config(Arc::new(tc));
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每 QUIC conn 认证+服务）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每 QUIC conn 认证+服务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 match incoming.accept_with(Arc::new(server_config)) {
@@ -886,9 +905,42 @@ async fn h3_auth(
         }};
     }
     loop {
-        match h3_server.accept().await {
+        // bd ral6w：**认证阶段无超时**（Go 同样缺，属加固而非 parity）——未认证连接
+        // 可开一条 h3 请求后不发完 HEADERS 就挂住，长期占用本 task 与其流。
+        // 只约束「等请求头」这段（`accept` + `resolve_request`），真实客户端毫秒级。
+        let accepted = match tokio::time::timeout(
+            crate::config::AUTH_READ_TIMEOUT,
+            h3_server.accept(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                crate::LOG.debug(format!(
+                    "hysteria h3 auth: request header not received within {:?}, dropping connection",
+                    crate::config::AUTH_READ_TIMEOUT
+                ));
+                bail!();
+            },
+        };
+        match accepted {
             Ok(Some(resolver)) => {
-                let (req, mut stream) = match resolver.resolve_request().await {
+                let resolved = match tokio::time::timeout(
+                    crate::config::AUTH_READ_TIMEOUT,
+                    resolver.resolve_request(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        crate::LOG.debug(format!(
+                            "hysteria h3 auth: request resolve timeout ({:?})",
+                            crate::config::AUTH_READ_TIMEOUT
+                        ));
+                        bail!();
+                    },
+                };
+                let (req, mut stream) = match resolved {
                     Ok(v) => v,
                     Err(_) => bail!(),
                 };
@@ -965,7 +1017,7 @@ async fn h3_auth(
                     let hold_conn = conn.clone();
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
                     )]
                     tokio::spawn(async move {
                         let _held = h3_server;
@@ -977,16 +1029,40 @@ async fn h3_auth(
 
                 // masquerade（Go hub.go:112-117：AuthHTTP false → masqHandler.ServeHTTP）
                 // 反代面需要 body（Go `r.Body`）→ 汇总 h3 数据帧（bd 4zcki）。
+                //
+                // bd nm37b：这里是**预认证**阶段，原实现在无上限地全量聚合
+                // （~8MiB/流 × 并发即可放大内存）。加 [`MAX_MASQ_BODY_BYTES`] 上界：
+                // 超出回 413 并结束该请求（Go 是流式转发，本栈因 body 类型是
+                // `Vec<u8>` 只能聚合，故用上界兜底）。
                 let mut body = Vec::new();
+                let mut too_large = false;
                 {
                     use bytes::Buf as _;
                     while let Ok(Some(mut chunk)) = stream.recv_data().await {
                         while chunk.has_remaining() {
                             let part = chunk.chunk();
+                            if body.len() + part.len() > crate::config::MAX_MASQ_BODY_BYTES {
+                                too_large = true;
+                                break;
+                            }
                             body.extend_from_slice(part);
                             chunk.advance(part.len());
                         }
+                        if too_large {
+                            break;
+                        }
                     }
+                }
+                if too_large {
+                    crate::LOG.debug(format!(
+                        "masq: h3 request body exceeded {} bytes, replying 413",
+                        crate::config::MAX_MASQ_BODY_BYTES
+                    ));
+                    if let Ok(r) = http::Response::builder().status(413u16).body(()) {
+                        let _ = stream.send_response(r).await;
+                    }
+                    let _ = stream.finish().await;
+                    continue;
                 }
                 let masq_req = crate::hub::MasqRequest {
                     method: method.clone(),
@@ -1066,7 +1142,7 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                         let h = handler.clone();
                         #[allow(
                             clippy::disallowed_methods,
-                            reason = "数据面连接任务（h3 请求 resolver 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h3 请求 resolver 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
                         )]
                         tokio::spawn(async move {
                             let (req, mut stream) = match resolver.resolve_request().await {

@@ -1124,6 +1124,9 @@ mod win_loopback_fast_fail {
             };
             // RtlGetVersion 是唯一不受兼容性 shim 影响的版本查询（GetVersionEx 会按
             // manifest 撒谎）。
+            // SAFETY: `info` 是已初始化的栈上 OSVERSIONINFOW，size 字段预置为本地结构体
+            // 大小（RtlGetVersion 按此写入，绝不超过本结构体）；指针在本块内独占有效，
+            // 返回后不再保留。函数无其他前置条件（不取句柄、不关资源）。
             let status = unsafe { RtlGetVersion(&mut info) };
             status == 0 && info.major >= 10 && info.build >= 16299
         });
@@ -1159,6 +1162,10 @@ mod win_loopback_fast_fail {
         let params =
             InitialRtoParameters { rtt: UNSPECIFIED_RTT, max_syn_retransmissions: max_syn };
         let mut out = 0u32;
+        // SAFETY: socket 由调用方持有的有效 socket2::Socket（本块内不关闭）；输入缓冲
+        // `params` 为栈上 POD 且长度按 size_of 精确传入，WSAIoctl 只读该长度；输出缓冲
+        // 传空指针 + 长度 0，故 out 仅作 4 字节占位（不出参）；最后一个参数是事件句柄，
+        // 传空 = 同步调用，无生命周期要求。
         let _ = unsafe {
             WSAIoctl(
                 socket.as_raw_socket() as SOCKET,

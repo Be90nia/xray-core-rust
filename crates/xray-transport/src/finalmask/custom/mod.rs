@@ -98,29 +98,52 @@ impl Default for Config {
     }
 }
 
-impl Tcpmask for Config {
-    fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
+impl Config {
+    /// 起一条 bridge 任务并返回 pipe 的应用侧端点。
+    ///
+    /// `addrs` 进 `EvalContext` 的 metadata 面（`local_port` / `remote_ip4_u32` 等表达式），
+    /// 与 UDP 面同源（bd qsk77）。
+    fn spawn_bridge(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        is_client: bool,
+        addrs: crate::finalmask::ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
         let (client, server) = tokio::io::duplex(crate::finalmask::UDP_SIZE * 2);
         let tcp_cfg = self.tcp.clone().unwrap_or_default();
         let state = Arc::new(state::StateStore::new(self.state_ttl));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（tcpmask client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（tcpmask bridge）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
-        tokio::spawn(tcp::bridge(raw, server, true, tcp_cfg, state));
+        tokio::spawn(tcp::bridge(raw, server, is_client, tcp_cfg, state, addrs));
         Ok(Box::new(client))
+    }
+}
+
+impl Tcpmask for Config {
+    fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
+        self.spawn_bridge(raw, true, crate::finalmask::ConnAddrs::default())
     }
 
     fn wrap_conn_server(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
-        let (client, server) = tokio::io::duplex(crate::finalmask::UDP_SIZE * 2);
-        let tcp_cfg = self.tcp.clone().unwrap_or_default();
-        let state = Arc::new(state::StateStore::new(self.state_ttl));
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "数据面连接任务（tcpmask server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
-        )]
-        tokio::spawn(tcp::bridge(raw, server, false, tcp_cfg, state));
-        Ok(Box::new(client))
+        self.spawn_bridge(raw, false, crate::finalmask::ConnAddrs::default())
+    }
+
+    fn wrap_conn_client_with_addrs(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: crate::finalmask::ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
+        self.spawn_bridge(raw, true, addrs)
+    }
+
+    fn wrap_conn_server_with_addrs(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: crate::finalmask::ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
+        self.spawn_bridge(raw, false, addrs)
     }
 }
 

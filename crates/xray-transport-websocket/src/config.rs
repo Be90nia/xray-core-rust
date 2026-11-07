@@ -61,6 +61,8 @@ impl Default for Config {
             // Bug-B（bd cqyj）：心跳缺省 30s 对齐 Go dialer NewConnection——
             // 缺位时 NAT/CDN 静默切断（60-180s 窗口）→ 半开死链 → 全协议假死 000。
             // JSON 显式 heartbeatPeriod:0 仍可关闭（register.rs parse 路径）。
+            // bd x0v47(a) 复核后**刻意保留**：Go 缺省 0（不发 ping），但 ping 在 ws
+            // 无对端惩罚（gorilla/CF 自动回 pong），而 Bug-B 是用户报的 P1 根因。
             heartbeat_period: 30,
             // bd s8eio 复议（2026-11-02）：默认 12 = 开池。实测缺省 0 关池时，
             // 经 Cloudflare 的 ws 节点 TTFB 慢 33%（4489ms vs 3001ms），且一批

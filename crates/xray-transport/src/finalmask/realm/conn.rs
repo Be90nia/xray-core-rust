@@ -11,7 +11,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -79,21 +79,26 @@ struct Shared {
     data_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     cancel: Arc<AtomicBool>,
     /// B6（bd t975）：dispatcher/init/punch/heartbeat 后台任务唯一托管口
-    /// （坑约束 5）。scope 归 Client/Server conn 持有，conn drop 兜底 abort；
+    /// （坑约束 5）。scope 由 Client/Server conn **强持有**，这里只存 `Weak`：
+    /// 任务经 `spawn` 捕获 `Arc<Shared>`，若 Shared 再强持 scope，就成
+    /// 「任务 → Arc<Shared> → Arc<FxScope> → JoinSet(任务)」的环 ⇒ Shared 永不 drop、
+    /// scope 永不 drop、兜底 abort 永不可达、任务与 UDP socket 全泄漏（bd npw6b）。
+    /// Weak 化后 conn drop ⇒ scope drop ⇒ 在飞任务 abort ⇒ 任务释放 Arc<Shared>。
     /// 协作停机仍走 `cancel`。
-    fx: Arc<FxScope>,
+    fx: Weak<FxScope>,
 }
 
 impl Shared {
-    /// 托管 spawn 唯一口：内部 scope 无 close 调用（fail-visible 不可达分支）。
+    /// 托管 spawn 唯一口。scope 已随 conn 消失（upgrade 失败）时返回 `None`：
+    /// 此时该 conn 的全部任务已被 abort，没有可以挂靠的生命周期。
     /// 每次 spawn 前先收割（bd 86i4h 阶段2）：punch 会话数增长不滞留条目。
-    fn spawn<F, T>(&self, fut: F) -> skeleton_infra::fx::Spawned<T>
+    fn spawn<F, T>(&self, fut: F) -> Option<skeleton_infra::fx::Spawned<T>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        xray_frame::compat::spawn_reaping(&self.fx, &xray_frame::compat::log(), "realm task", fut)
-            .expect("internal FxScope is never closed")
+        let fx = self.fx.upgrade()?;
+        xray_frame::compat::spawn_reaping(&fx, &xray_frame::compat::log(), "realm task", fut).ok()
     }
 
     /// dispatcher 是否应退出。
@@ -108,6 +113,9 @@ pub struct RealmConnClient {
     data_rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
     peer: Arc<tokio::sync::OnceCell<SocketAddr>>,
     cancel: Arc<AtomicBool>,
+    /// 后台任务托管 scope 的**唯一强引用**（bd npw6b）：本 conn drop ⇒ scope drop
+    /// ⇒ dispatcher/init/punch/portmap 任务 abort。任务侧只看得到 `Weak`。
+    _fx: Arc<FxScope>,
 }
 
 impl RealmConnClient {
@@ -122,13 +130,14 @@ impl RealmConnClient {
         let peer = Arc::new(tokio::sync::OnceCell::new());
         let cancel = Arc::new(AtomicBool::new(false));
 
+        let fx = Arc::new(FxScope::new());
         let shared = Arc::new(Shared {
             raw: Arc::clone(&raw),
             stun_tx,
             punch_channels: Mutex::new(HashMap::new()),
             data_tx,
             cancel: Arc::clone(&cancel),
-            fx: Arc::new(FxScope::new()),
+            fx: Arc::downgrade(&fx),
         });
 
         shared.spawn(dispatcher_loop(Arc::clone(&shared)));
@@ -141,7 +150,7 @@ impl RealmConnClient {
             // init 失败：peer 保持 None；send_to 后续返回 NotConnected
         });
 
-        Ok(Self { raw, data_rx: Mutex::new(data_rx), peer, cancel })
+        Ok(Self { raw, data_rx: Mutex::new(data_rx), peer, cancel, _fx: fx })
     }
 }
 
@@ -189,6 +198,8 @@ pub struct RealmConnServer {
     raw: Arc<dyn UdpIo>,
     data_rx: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
     cancel: Arc<AtomicBool>,
+    /// 后台任务托管 scope 的**唯一强引用**（bd npw6b，理由同 `RealmConnClient`）。
+    _fx: Arc<FxScope>,
 }
 
 impl RealmConnServer {
@@ -199,13 +210,14 @@ impl RealmConnServer {
         let (stun_tx, stun_rx) = mpsc::channel(CHANNEL_BUFFER);
         let cancel = Arc::new(AtomicBool::new(false));
 
+        let fx = Arc::new(FxScope::new());
         let shared = Arc::new(Shared {
             raw: Arc::clone(&raw),
             stun_tx,
             punch_channels: Mutex::new(HashMap::new()),
             data_tx,
             cancel: Arc::clone(&cancel),
-            fx: Arc::new(FxScope::new()),
+            fx: Arc::downgrade(&fx),
         });
 
         shared.spawn(dispatcher_loop(Arc::clone(&shared)));
@@ -217,7 +229,7 @@ impl RealmConnServer {
             server_loop(shared_init, stun_rx, config_init, cancel_clone).await;
         });
 
-        Ok(Self { raw, data_rx: Mutex::new(data_rx), cancel })
+        Ok(Self { raw, data_rx: Mutex::new(data_rx), cancel, _fx: fx })
     }
 }
 
@@ -424,6 +436,9 @@ async fn client_punch_loop(
             }
         }
     }
+    // 会话结束出表（bd ft7jw-c）：只 insert 不 remove 会让长连接上的
+    // `punch_channels` 随 punch 会话数单调增长（dispatcher 每包都要扫这张表）。
+    shared.punch_channels.lock().await.remove(&meta);
     if peer.get().is_some()
         && let Some(port_mapping) = port_mapping
         && port_mapping.enabled
@@ -679,6 +694,62 @@ mod tests {
         let server = RealmConnServer::new(&config, raw).expect("construct");
         // 简单验证：drop 不 panic
         drop(server);
+    }
+
+    /// bd npw6b：conn drop 必须真的把后台任务 abort 掉（FxScope 兜底可达），
+    /// 不能因「任务 → `Arc<Shared>` → `Arc<FxScope>` → JoinSet(任务)」引用环而泄漏
+    /// 任务与 UDP socket。观测口径：mock `UdpIo` 实例数归零（任务释放 `Arc<Shared>`
+    /// 后 Shared 里的 `Arc<dyn UdpIo>` 才会 drop）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_releases_background_tasks() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingUdp {
+            sock: tokio::net::UdpSocket,
+            alive: Arc<AtomicUsize>,
+        }
+
+        impl Drop for CountingUdp {
+            fn drop(&mut self) {
+                self.alive.fetch_sub(1, Ordering::Release);
+            }
+        }
+
+        #[async_trait]
+        impl UdpIo for CountingUdp {
+            async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+                self.sock.send_to(buf, addr).await
+            }
+
+            async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+                self.sock.recv_from(buf).await
+            }
+
+            fn local_addr(&self) -> io::Result<SocketAddr> {
+                self.sock.local_addr()
+            }
+        }
+
+        let alive = Arc::new(AtomicUsize::new(1));
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let raw: Box<dyn UdpIo> = Box::new(CountingUdp { sock, alive: Arc::clone(&alive) });
+        let client = RealmConnClient::new(&RealmConfig::default(), raw).expect("construct");
+        // 让 dispatcher/init 起来并挂住（init 无 STUN server ⇒ 立即失败退出）。
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(alive.load(Ordering::Acquire), 1, "构造后任务应仍活（否则本用例无区分力）");
+
+        drop(client);
+        for _ in 0..100 {
+            if alive.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            alive.load(Ordering::Acquire),
+            0,
+            "conn drop 后后台任务仍持连接 ⇒ FxScope 兜底 abort 未生效（引用环复活）"
+        );
     }
 
     #[test]

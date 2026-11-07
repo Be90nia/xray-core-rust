@@ -51,7 +51,9 @@ pub struct QuicConfig {
     pub keep_alive_period_ms: u64,
     /// true 禁用 PMTUD（Go 默认非 Linux/Win/Mac = true）。
     pub disable_path_mtu_discovery: bool,
-    /// 最大并发入站双向流（-1 = 不设上限 → quinn::VarInt::MAX）。
+    /// 最大并发入站双向流。`0` = 不设（对齐 Go `MaxIncomingStreams > 0` 才下发的语义；
+    /// bd rsjoq：此前 0 被原样下发 = SETTINGS 宣告不许开流 = 对端一开流即被拒「自断流」）；
+    /// 负数 = 不设上限 → `quinn::VarInt::MAX`（本仓扩展语义）。
     pub max_incoming_streams: i64,
     /// true 禁用 UDP 发送 GSO（Go `QuicParams.disableGSO`，默认 false = 启用）。
     pub disable_gso: bool,
@@ -203,9 +205,13 @@ impl QuicConfig {
         if self.disable_path_mtu_discovery {
             t.mtu_discovery_config(None);
         }
-        // 最大并发入站双向流
-        if self.max_incoming_streams >= 0 {
-            if let Ok(v) = quinn::VarInt::try_from(self.max_incoming_streams as u64) {
+        // 最大并发入站双向流。
+        // bd rsjoq：`0` 在 Go `QuicParams`（infra/conf/transport_internet.go）里不是「零流」，
+        // 而是「不设」——Go 只在 `MaxIncomingStreams > 0` 时才下发。此前本处判 `>= 0`
+        // 把 `0` 原样交给 quinn ⇒ 服务端 SETTINGS 宣告「不许开流」= 自断流（对端一开流
+        // 即被拒，且我方无日志）。语义收敛到 [`max_bidi_streams_override`]（可单测）。
+        if let Some(v) = max_bidi_streams_override(self.max_incoming_streams) {
+            if let Ok(v) = quinn::VarInt::try_from(v) {
                 t.max_concurrent_bidi_streams(v);
             } else {
                 t.max_concurrent_bidi_streams(quinn::VarInt::MAX);
@@ -243,6 +249,27 @@ impl QuicConfig {
     }
 }
 
+/// `quicSettings.maxIncomingStreams` → quinn 下发值（None = 不设，沿用 quinn 缺省）。
+///
+/// bd rsjoq：Go `QuicParams`（infra/conf/transport_internet.go）只在
+/// `MaxIncomingStreams > 0` 时下发；`0` 表示「不设」而非「零流」。本仓扩展 `-1`
+/// （负数）= 显式不限 → `VarInt::MAX`。此前 `0` 被原样下发 ⇒ SETTINGS 宣告不许
+/// 开流 ⇒ 对端一开流即被拒（自断流，且无日志）。
+fn max_bidi_streams_override(raw: i64) -> Option<u64> {
+    match raw {
+        r if r > 0 => {
+            let v = u64::try_from(r).unwrap_or(quinn::VarInt::MAX.into_inner());
+            if quinn::VarInt::try_from(v).is_ok() {
+                Some(v)
+            } else {
+                Some(quinn::VarInt::MAX.into_inner())
+            }
+        },
+        r if r < 0 => Some(quinn::VarInt::MAX.into_inner()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +280,20 @@ mod tests {
         assert_eq!(cfg, QuicConfig::default());
         assert!(!cfg.keep_alive);
         assert!(cfg.congestion.is_empty());
+    }
+
+    /// bd rsjoq：`maxIncomingStreams: 0` = 不设（Go 同义），**不得**下发成 0
+    /// （此前下发 0 = SETTINGS 宣告不许开流 = 自断流）。
+    #[test]
+    fn max_incoming_streams_zero_means_unset() {
+        assert_eq!(max_bidi_streams_override(0), None, "0 = 不设，沿用 quinn 缺省");
+        assert_eq!(max_bidi_streams_override(100), Some(100));
+        assert_eq!(max_bidi_streams_override(-1), Some(quinn::VarInt::MAX.into_inner()));
+        assert_eq!(
+            max_bidi_streams_override(i64::MAX),
+            Some(quinn::VarInt::MAX.into_inner()),
+            "超 VarInt 上界的正数一律钳到 MAX（原 else 分支语义）"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::{
 use xray_transport::{
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     finalmask::{CodecChain, parse_finalmask_udp_chain},
+    ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -70,9 +71,9 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_kcp(&dest, &settings).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册
-    let _ = register_transport_dialer(PROTOCOL_NAME, dialer.clone());
-    let _ = register_transport_dialer("kcp", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`）。
+    ignore_already_exists(register_transport_dialer(PROTOCOL_NAME, dialer.clone()))?;
+    ignore_already_exists(register_transport_dialer("kcp", dialer))?;
     Ok(())
 }
 
@@ -91,9 +92,8 @@ pub fn register_listener() -> io::Result<()> {
     let listen_fn: TransportListenFn = Arc::new(|addr, settings, _sockopt, handler| {
         Box::pin(async move { listen_kcp(addr, settings, handler).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册
-    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn.clone());
-    let _ = register_transport_listener("kcp", listen_fn);
+    ignore_already_exists(register_transport_listener(PROTOCOL_NAME, listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("kcp", listen_fn))?;
     Ok(())
 }
 

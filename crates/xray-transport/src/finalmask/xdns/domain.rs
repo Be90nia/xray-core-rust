@@ -55,11 +55,7 @@ fn encoded_len(n: usize) -> usize {
 
 /// Name 的 wire 长度（len 前缀逐 label + 根 0 字节），对齐 Go `name.Length`。
 fn name_wire_len(name: &Name) -> usize {
-    let mut total = 1;
-    for label in &name.labels {
-        total += 1 + label.len();
-    }
-    total
+    name.wire_len()
 }
 
 /// 伪装域名（对应 Go `Domain`）。
@@ -134,13 +130,16 @@ impl Domain {
 
     /// name 是否以本域名为后缀（大小写不敏感且严格更长），对齐 Go `IsDomain`。
     pub(crate) fn is_domain(&self, name: &Name) -> bool {
-        if self.name.labels.len() >= name.labels.len() {
+        let n = name.label_count();
+        let m = self.name.label_count();
+        if m >= n {
             return false;
         }
-        let split = name.labels.len() - self.name.labels.len();
-        for i in 0..self.name.labels.len() {
-            if !eq_ascii_ci(&name.labels[split + i], &self.name.labels[i]) {
-                return false;
+        let mut mine = name.labels().skip(n - m);
+        for theirs in self.name.labels() {
+            match mine.next() {
+                Some(label) if eq_ascii_ci(label, theirs) => {},
+                _ => return false,
             }
         }
         true
@@ -182,7 +181,7 @@ impl Domain {
             labels.push(rest[..size].to_vec());
             rest = &rest[size..];
         }
-        labels.extend(self.name.labels.iter().cloned());
+        labels.extend(self.name.labels().map(<[u8]>::to_vec));
         Name::new(labels)
     }
 
@@ -191,9 +190,9 @@ impl Domain {
         if !self.is_domain(name) {
             return Vec::new();
         }
-        let suffix_len = self.name.labels.len();
+        let suffix_len = self.name.label_count();
         let mut b1: Vec<u8> = Vec::new();
-        for label in &name.labels[..name.labels.len() - suffix_len] {
+        for label in name.labels().take(name.label_count() - suffix_len) {
             b1.extend_from_slice(label);
         }
         b1.iter_mut().for_each(|b| b.make_ascii_uppercase());

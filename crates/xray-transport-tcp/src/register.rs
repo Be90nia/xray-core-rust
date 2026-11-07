@@ -11,6 +11,7 @@ use xray_tls::client_config::build_client_config;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
     sockopt::SocketOptions,
 };
 
@@ -27,15 +28,18 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_tcp(&dest, &sockopt, &settings).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_dialer("tcp", dialer.clone());
-    let _ = register_transport_dialer("raw", dialer);
+    // 幂等放行 `AlreadyExists`（并发/多入口重复注册），其余失败上抛——禁 `let _ =`
+    // （bd k2tq1：注册静默失败 ⇒ `dial_with_settings` 走裸 TCP fallback，安全层被跳过）。
+    ignore_already_exists(register_transport_dialer("tcp", dialer.clone()))?;
+    ignore_already_exists(register_transport_dialer("raw", dialer))?;
     Ok(())
 }
 
-/// 实际拨号：`dial_system` 建裸 TCP → 按 `security` 包装 TLS → 按 `header` 包装伪装。
+/// 实际拨号：`dial_system` 建裸 TCP → 按 finalmask 包装 → 按 `security` 包装 TLS
+/// → 按 `header` 包装伪装。
 ///
-/// 对应 Go `tcp/dialer.go::Dial`：`internet.DialSystem` 后 `tls` 包装（line 36-102），
+/// 对应 Go `tcp/dialer.go::Dial`：mask 取代 `internet.DialSystem`（line 26-32，
+/// 即 mask 在安全层**之内**），再 `tls` 包装（line 36-102），
 /// 再 `HeaderSettings` → `ConnectionAuthenticator.Client(conn)`（line 104-115）。
 async fn dial_tcp(
     dest: &Destination,
@@ -43,20 +47,11 @@ async fn dial_tcp(
     settings: &StreamSettings,
 ) -> io::Result<Box<dyn Connection>> {
     let conn = xray_transport::system_dialer::dial_system(dest, sockopt).await?;
-    // 记录对齐读钳制（bd VISIONMAC）：TLS/REALITY 层 deframer 贪婪 recv 会在
-    // vision DIRECT 切换窗口把「DIRECT 帧 + 对端 raw 字节」一并拉进 TLS 层
-    // （半条记录滞留 opaque 缓冲 → 切 raw 后字节永久不可达 → 下游停滞）。
-    // framer 让安全层每次 recv 恰好消费一条完整记录，DIRECT 帧后的 socket
-    // 游标精确停在记录边界，raw 克隆天然续读完整裸流（等价 Go readFromUntil
-    // + UnwrapRawConn 反射回收组合，无需 unsafe）。
-    let conn: Box<dyn Connection> = if settings.is_tls() {
-        Box::new(xray_transport::record_framer::RecordFramer::new(conn))
-    } else {
-        conn
-    };
-    let conn = wrap_security(conn, settings, dest).await?;
-    // Tcpmask 装配（Go tcp/dialer.go:28 WrapConnClient）：finalmask_json.tcp[] 每条 mask
-    // 链式 WrapConnClient；无 mask / 空数组 → 跳过（向后兼容）。
+    // Tcpmask 装配（Go tcp/dialer.go:26-32：`FinalMask.DialTCP` **取代**
+    // `DialSystem`）⇒ mask 包住裸 socket，TLS/REALITY 跑在 mask **之上**，握手
+    // 字节也过 mask。服务端同侧：hub.rs `WrapConnServer` 在 accept 即解包、TLS 在其上
+    // （Go hub.go `FinalMask.Listen` 取代 `ListenSystem`）。次序反了（mask 在安全层
+    // 外 = 吃明文、服务端吃密文）⇒ 首帧即不匹配，tcp+finalmask+tls 组合不可用（bd 1jt9v）。
     let mgr = xray_transport::finalmask::build_tcpmask_manager_from_json(
         settings.finalmask_json.as_ref(),
     )?;
@@ -65,6 +60,19 @@ async fn dial_tcp(
     } else {
         conn
     };
+    // 记录对齐读钳制（bd VISIONMAC）：TLS/REALITY 层 deframer 贪婪 recv 会在
+    // vision DIRECT 切换窗口把「DIRECT 帧 + 对端 raw 字节」一并拉进 TLS 层
+    // （半条记录滞留 opaque 缓冲 → 切 raw 后字节永久不可达 → 下游停滞）。
+    // framer 让安全层每次 recv 恰好消费一条完整记录，DIRECT 帧后的 socket
+    // 游标精确停在记录边界，raw 克隆天然续读完整裸流（等价 Go readFromUntil
+    // + UnwrapRawConn 反射回收组合，无需 unsafe）。位置：mask 之上、安全层之下
+    // ——它钳制的是 mask 解包后的 TLS 记录流。
+    let conn: Box<dyn Connection> = if settings.is_tls() {
+        Box::new(xray_transport::record_framer::RecordFramer::new(conn))
+    } else {
+        conn
+    };
+    let conn = wrap_security(conn, settings, dest).await?;
     // header 伪装装配（Go tcp/dialer.go:105-115，TLS 之后）：
     // `tcpSettings.header.type = "http"` → client 包装；`"none"`/缺失 → 不包装。
     if let Some(auth) =

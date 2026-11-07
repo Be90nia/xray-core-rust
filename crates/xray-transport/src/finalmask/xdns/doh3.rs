@@ -430,7 +430,7 @@ impl Doh3Endpoint {
             .map_err(|e| io::Error::other(format!("xdns: DoH h3 handshake: {e}")))?;
         #[allow(
             clippy::disallowed_methods,
-            reason = "DoH h3 连接 driver（数据面）；寿命绑定复用会话，无托管收益（同 doh.rs h2 driver 与 splithttp h3 driver，bd hj3jf）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：DoH h3 连接 driver（数据面）；寿命绑定复用会话，无托管收益（同 doh.rs h2 driver 与 splithttp h3 driver，bd hj3jf）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -622,16 +622,12 @@ mod tests {
         let msg = crate::finalmask::xdns::dns::message_from_wire_format(&DNS_REPLY)
             .expect("fixture 必须是合法 DNS 报文（an 数与 answer 段一致）");
         assert_eq!(msg.question.len(), 1);
-        assert_eq!(
-            msg.question[0].name.labels,
-            vec![b"x".to_vec(), b"example".to_vec()],
-            "question name = x.example."
-        );
+        assert_eq!(msg.question[0].name.flat(), b"\x01x\x07example", "question name = x.example.");
         assert_eq!(msg.question[0].qtype, 1); // A
         assert_eq!(msg.question[0].qclass, 1); // IN
         assert_eq!(msg.answer.len(), 1, "ANCOUNT=1 ⇒ answer 段必须有完整 RR");
         let rr = &msg.answer[0];
-        assert_eq!(rr.name.labels, vec![b"x".to_vec(), b"example".to_vec()]);
+        assert_eq!(rr.name.flat(), b"\x01x\x07example");
         assert_eq!(rr.rtype, 1); // A
         assert_eq!(rr.rclass, 1); // IN
         assert_eq!(rr.ttl, 60);

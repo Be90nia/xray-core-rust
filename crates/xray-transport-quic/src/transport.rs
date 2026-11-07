@@ -103,13 +103,10 @@ pub async fn dial(
     // 4. Endpoint + connect（外层 timeout 覆盖 DNS+握手+鉴权整段）。
     // GSO 默认开（quinn-udp 构造期探测 UDP_SEGMENT，内核不支持自动回退单段）；
     // disableGSO=true 时经 NoGsoSocket 钳单段（见 udp_gso 模块 doc）。
-    let endpoint = crate::udp_gso::make_endpoint(
-        None,
-        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-        qc.disable_gso,
-        sockopt,
-    )
-    .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
+    // bd jzwib：endpoint 按 (GSO, 缓冲) 进程内复用——每连接新 bind 会让 socket 账面
+    // 严重低估真实内核占用（见 [`shared_client_endpoint`]）。
+    let endpoint = shared_client_endpoint(qc.disable_gso, sockopt)
+        .map_err(|e| io::Error::other(format!("quinn bind: {e}")))?;
     let connecting = endpoint
         .connect_with(client_config, socket_addr, &sni)
         .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
@@ -128,6 +125,40 @@ pub async fn dial(
     // endpoint 必须保持存活——否则连接立即关闭。放进桥接任务里持有。
     let (send, recv) = conn.open_bi().await.map_err(io_err)?;
     Ok(Box::new(QuicConn::new(send, recv, local, Some(remote), endpoint)))
+}
+
+/// 进程级客户端 QUIC endpoint 复用（bd jzwib）。
+///
+/// 原实现每条出站连接各自 `make_endpoint` 新 bind 一个 UDP socket：QUIC 系 socket 缺省
+/// 抬到 8 MiB 内核缓冲（[`xray_transport::sockopt::bind_udp_endpoint`]，×2 内核记账
+/// = 16 MiB/端点账面），而内存账本按「**QUIC 端点数**」入算 ⇒ 6 条并发就吃掉 96 MiB
+/// 预算却只记 1 份（审计 2026-11-07 perf-memory N1）。
+///
+/// quinn `Endpoint` 天生承载多条连接（同 hysteria/TUIC 出站按配置复用的口径），故按
+/// `(disableGSO, receiveBufferSize, sendBufferSize)` 复用同一 endpoint：
+/// 每个 socket 配置最终只有 1 个 socket，账面「端点数」成为真实上界（只多记不少记）。
+fn shared_client_endpoint(
+    disable_gso: bool,
+    sockopt: &SocketOptions,
+) -> io::Result<quinn::Endpoint> {
+    type Key = (bool, i32, i32);
+    static ENDPOINTS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<Key, quinn::Endpoint>>,
+    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+    let key = (disable_gso, sockopt.receive_buffer_size, sockopt.send_buffer_size);
+    let mut map = ENDPOINTS.lock();
+    if let Some(ep) = map.get(&key) {
+        return Ok(ep.clone());
+    }
+    let ep = crate::udp_gso::make_endpoint(
+        None,
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+        disable_gso,
+        sockopt,
+    )?;
+    map.insert(key, ep.clone());
+    Ok(ep)
 }
 
 /// 监听 QUIC 入站连接。对应 Go `quic::Listen`。
@@ -191,7 +222,7 @@ fn make_server_endpoint(
 fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handler: ConnHandler) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（QUIC accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（QUIC accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         loop {
@@ -208,7 +239,7 @@ fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handle
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每连接握手+stream 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（每连接握手+stream 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
             )]
             tokio::spawn(async move {
                 let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
@@ -260,7 +291,7 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面桥接 copy 泵（quinn↔DuplexStream）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面桥接 copy 泵（quinn↔DuplexStream）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);
@@ -382,6 +413,28 @@ mod tests {
         ONCE.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
+    }
+
+    /// bd jzwib 契约：同 `(GSO, 收/发缓冲)` 配置的客户端 endpoint 必须**复用同一个
+    /// UDP socket**。每连接新 bind 会让内存账本（按 QUIC 端点数 × 16MiB 入算）严重
+    /// 低估真实内核占用（6 条并发 = 96MiB 却只记 1 份）。
+    #[tokio::test]
+    async fn client_endpoint_is_shared_per_config() {
+        let a = shared_client_endpoint(false, &SocketOptions::default()).unwrap();
+        let b = shared_client_endpoint(false, &SocketOptions::default()).unwrap();
+        assert_eq!(
+            a.local_addr().unwrap(),
+            b.local_addr().unwrap(),
+            "同配置两次取 endpoint 必须是同一 socket（复用）"
+        );
+
+        // 缓冲配置不同的 key 各自独立（不能把语义不同的 socket 混用）。
+        let c = shared_client_endpoint(
+            false,
+            &SocketOptions { send_buffer_size: 1 << 20, ..Default::default() },
+        )
+        .unwrap();
+        assert_ne!(a.local_addr().unwrap(), c.local_addr().unwrap());
     }
 
     /// 服务端 StreamSettings：显式配一张自签证书。

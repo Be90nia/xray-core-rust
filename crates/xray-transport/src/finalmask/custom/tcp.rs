@@ -167,8 +167,11 @@ pub(super) async fn bridge(
     is_client: bool,
     config: TCPConfig,
     state: Arc<StateStore>,
+    addrs: crate::finalmask::ConnAddrs,
 ) {
-    let mut ctx = EvalContext::new();
+    // 与 UDP 面同源注入本端/对端地址（Go `tcp.go:68/157` `newEvalContextWithAddrs`）：
+    // 缺了它，表达式里的 `local_port`/`remote_ip4_u32` 等 metadata 恒 unknown（bd qsk77）。
+    let mut ctx = EvalContext::with_addrs(addrs.local, addrs.remote);
     if let Some(initial) = state.get("") {
         ctx.vars = initial;
     }
@@ -189,7 +192,7 @@ pub(super) async fn bridge(
     // 不传染写方向（bd hjkf：单 task `select!` + 分支体内 await 会整体饿死写方向）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（raw↔pipe 回程拷贝）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw↔pipe 回程拷贝）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let back = tokio::spawn(async move {
         // 读侧结束/出错 → 关掉 pipe 写侧，让对端读到 EOF（错误按流结束传播）。
@@ -363,6 +366,78 @@ mod tests {
             drop(app);
             let _ = echo.await;
         }
+    }
+
+    /// bd qsk77：TCP 面必须注入连接地址，否则 `local_port`/`remote_ip4_u32` 类
+    /// 表达式恒 unknown（Go `tcp.go:68/157` 两侧都 `newEvalContextWithAddrs`）。
+    ///
+    /// 客户端写 `be16(remote_port)`、服务端写 `be16(local_port)`，两端握手序列里的
+    /// 字面量都必须等于 0x1234（4660）——地址没注入就写不出这两个字节，握手失败。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_expr_sees_connection_addrs() {
+        use crate::finalmask::{
+            ConnAddrs,
+            custom::evaluator::{Expr, ExprArg},
+        };
+
+        fn port_expr(meta: &str) -> Option<Expr> {
+            Some(Expr { op: "be16".into(), args: vec![ExprArg::Metadata(meta.into())] })
+        }
+        fn item_expr(expr: Option<Expr>) -> TCPItem {
+            TCPItem { expr, ..item_packet(b"") }
+        }
+
+        let client_cfg = super::super::Config {
+            tcp: Some(TCPConfig {
+                clients: vec![seq(vec![item_expr(port_expr("remote_port"))])],
+                servers: vec![seq(vec![item_packet(&[0x12, 0x34])])],
+                errors: vec![],
+            }),
+            udp: None,
+            udp_standalone: None,
+            state_ttl: Duration::from_secs(5),
+        };
+        let server_cfg = super::super::Config {
+            tcp: Some(TCPConfig {
+                clients: vec![seq(vec![item_packet(&[0x12, 0x34])])],
+                servers: vec![seq(vec![item_expr(port_expr("local_port"))])],
+                errors: vec![],
+            }),
+            udp: None,
+            udp_standalone: None,
+            state_ttl: Duration::from_secs(5),
+        };
+
+        let addrs_client = ConnAddrs {
+            local: Some("127.0.0.1:1111".parse().unwrap()),
+            remote: Some("127.0.0.1:4660".parse().unwrap()),
+        };
+        let addrs_server = ConnAddrs {
+            local: Some("127.0.0.1:4660".parse().unwrap()),
+            remote: Some("127.0.0.1:1111".parse().unwrap()),
+        };
+
+        let (client_raw, server_raw) = tokio::io::duplex(crate::finalmask::UDP_SIZE * 4);
+        let wrapped_client =
+            client_cfg.wrap_conn_client_with_addrs(Box::new(client_raw), addrs_client).unwrap();
+        let wrapped_server =
+            server_cfg.wrap_conn_server_with_addrs(Box::new(server_raw), addrs_server).unwrap();
+
+        use tokio::io::split;
+        let (_cr, mut cw) = split(wrapped_client);
+        let (mut sr, _sw) = split(wrapped_server);
+
+        let msg = b"addrs wired";
+        let write_fut = async {
+            cw.write_all(msg).await.unwrap();
+            cw.shutdown().await.ok();
+        };
+        let read_fut = async {
+            let mut got = Vec::new();
+            sr.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, msg, "握手失败 ⇒ 地址 metadata 没注入");
+        };
+        tokio::join!(write_fut, read_fut);
     }
 
     #[test]

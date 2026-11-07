@@ -99,6 +99,22 @@ pub mod udp;
 // 顶层 re-export。
 pub use bridge::{bridge_connections, bridge_connections_with_splice, copy_one_way};
 pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
+
+/// 注册类 API 的幂等口（bd k2tq1）：`AlreadyExists`（并发/多入口重复注册，见
+/// `register_transport_dialer` 等）视为成功；其余错误原样上抛。
+///
+/// 为什么必须上抛：注册表静默失败的后果是拨号期才 `NotFound`——`dial_with_settings`
+/// 的 `tcp`/`raw` 兜底会**裸拨明文**，TLS/REALITY 层被静默跳过（Go 基准
+/// `common.Must(...)` 直接 panic，进程不进「半可用」）。故各 transport 的
+/// `register_dialer()` / `register_listener()` 一律用本函数收敛错误，
+/// 禁 `let _ =`。
+pub fn ignore_already_exists(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        other => other,
+    }
+}
+
 /// Re-exported so proxy crates can inspect negotiated TLS parameters (e.g.
 /// `ServerConnection::protocol_version` for VLESS XRV outer-TLS1.3 gating)
 /// without a direct `rustls` dependency.

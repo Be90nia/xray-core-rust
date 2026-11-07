@@ -218,14 +218,23 @@ impl HysteriaClient {
         }
     }
 
-    /// 当前状态（对应 Go `client.status()`）。
+    /// 当前状态（对应 Go `client.status()` 的 `<-conn.Context().Done()` 判活）。
+    ///
+    /// bd uc63p：判活改为 quinn `Connection` 自身状态——`close_reason()` 非 None 表示
+    /// 连接已关闭（对端 close / idle 超时 / 传输错误）。原实现直接返回手写 `status` 位
+    /// （只在 dial 时置 Active、手动 close 置 Inactive）⇒ 死连接仍报 Active，后续拨号
+    /// 一直复用它直到应用层失败，**永不自动重拨**（Go 在 conn context 结束时即重拨）。
     pub fn status(&self) -> Status {
         let g = self.conn.lock();
-        if g.is_none() {
+        let Some(conn) = g.as_ref() else {
             return Status::Null;
+        };
+        match conn.as_quinn_connection() {
+            Some(q) if q.close_reason().is_none() => Status::Active,
+            Some(_) => Status::Inactive,
+            // 非 quinn 实现（测试替身）无判活来源，退回手写位。
+            None => *self.status.lock(),
         }
-        // ponytail: Go 端通过 `<-conn.Context().Done()` 判断；Rust 端简化为 Active。
-        *self.status.lock()
     }
 
     /// 关闭（对应 Go `client.close()`）。

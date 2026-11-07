@@ -8,6 +8,7 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -39,8 +40,9 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_hysteria(&dest, &settings, &sockopt).await })
     });
-    let _ = register_transport_dialer(PROTOCOL_NAME, dial_fn.clone());
-    let _ = register_transport_dialer("hysteria2", dial_fn);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`）。
+    ignore_already_exists(register_transport_dialer(PROTOCOL_NAME, dial_fn.clone()))?;
+    ignore_already_exists(register_transport_dialer("hysteria2", dial_fn))?;
     Ok(())
 }
 
@@ -58,8 +60,8 @@ pub fn register_listener() -> io::Result<()> {
         let sockopt = sockopt.clone();
         Box::pin(async move { listen_hysteria(addr, settings, sockopt, handler).await })
     });
-    let _ = register_transport_listener(PROTOCOL_NAME, listen_fn.clone());
-    let _ = register_transport_listener("hysteria2", listen_fn);
+    ignore_already_exists(register_transport_listener(PROTOCOL_NAME, listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("hysteria2", listen_fn))?;
     Ok(())
 }
 
@@ -121,7 +123,7 @@ async fn listen_hysteria(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（hysteria accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（hysteria accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
@@ -150,7 +152,7 @@ async fn listen_hysteria(
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（每 QUIC conn 桥接）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每 QUIC conn 桥接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 accept_hysteria_conn(conn, h).await;
@@ -162,7 +164,7 @@ async fn listen_hysteria(
     // error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（accept 循环意外退出监控）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria",
@@ -229,7 +231,7 @@ impl TransportListener for HysteriaTransportListener {
         let l = self.listener.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "停机桥接任务（同步 close 桥 async ep.close）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：停机桥接任务（同步 close 桥 async ep.close）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let _ = l.close().await;

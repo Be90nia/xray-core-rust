@@ -27,7 +27,7 @@ use std::io;
 use crate::error::Result;
 
 /// gRPC 配置。对应 proto `xray.transport.internet.grpc.encoding.Config`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     /// HTTP/2 `:authority` 伪 header。空时用 dest 地址或 TLS ServerName。
     pub authority: String,
@@ -36,8 +36,14 @@ pub struct Config {
     pub service_name: String,
     /// 是否启用 multi-stream 模式（每连接多路 gRPC stream，提升吞吐）。
     pub multi_mode: bool,
-    /// 空闲超时（秒）。对应 gRPC keepalive `Time`。缺省 30（Bug-B：h2 PING
-    /// 检测死链防 NAT/CDN 静默切断假死；JSON 显式 0 = 关闭）。
+    /// 空闲超时（秒）。对应 gRPC keepalive `Time`。缺省 **0 = 不发 keepalive**
+    /// （Go `hub.go:86-93`/`dial.go:166-172`：两者都只在 >0 时才装 keepalive 参数）。
+    ///
+    /// 曾缺省 30（Bug-B bd cqyj 防死链假死），已回退为 Go 缺省（bd x0v47）：
+    /// grpc-go 服务端默认 `EnforcementPolicy.MinTime=5min`，客户端 30s 一次的
+    /// PING 会累到 `maxPingStrikes=2` 后被 GOAWAY(`too_many_pings`)
+    /// （`internal/transport/http2_server.go:906-932`）⇒ 静默期 ~90s 即断链。
+    /// 需要死链检测时显式配 `idleTimeout`（对齐 grpc-go 建议 ≥300）。
     pub idle_timeout: i32,
     /// 健康检查超时（秒）。对应 gRPC keepalive `Timeout`。
     pub health_check_timeout: i32,
@@ -51,21 +57,6 @@ pub struct Config {
     /// User-Agent。支持预设别名：`"chrome"` / `"firefox"` / `"edge"` / `"golang"`。
     /// 空串等同 `"chrome"`。
     pub user_agent: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            authority: String::new(),
-            service_name: String::new(),
-            multi_mode: false,
-            idle_timeout: 30,
-            health_check_timeout: 0,
-            permit_without_stream: false,
-            initial_windows_size: 0,
-            user_agent: String::new(),
-        }
-    }
 }
 
 /// 从 `grpcSettings` JSON 解析为强类型 [`Config`]。
@@ -104,13 +95,14 @@ pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<
         obj.get(camel).or_else(|| obj.get(snake)).and_then(|x| x.as_i64()).unwrap_or(0) as i32
     };
 
-    // Bug-B（bd cqyj）：idle_timeout 缺省 30s（h2 PING 检测死链）；显式 0 = 关闭。
+    // 缺省 0 = 不发 keepalive（Go `dial.go:166-172` 只在 >0 时装参数）；缺省 30 会被
+    // grpc-go 服务端 `too_many_pings` GOAWAY（bd x0v47，见 `Config::idle_timeout` doc）。
     let idle_timeout = obj
         .get("idleTimeout")
         .or_else(|| obj.get("idle_timeout"))
         .and_then(|x| x.as_i64())
         .map(|v| v as i32)
-        .unwrap_or(30);
+        .unwrap_or(0);
 
     Ok(Config {
         authority: get_str("authority", "authority"),
@@ -127,24 +119,20 @@ pub(crate) fn parse_grpc_config(json: Option<&serde_json::Value>) -> io::Result<
 impl Config {
     /// 解析 `service_name` 为 gRPC 服务名（已 `path_escape`）。
     ///
-    /// 对应 Go `Config.getServiceName()`。逻辑：
+    /// 对应 Go `Config.getServiceName()`（transport/internet/grpc/config.go:17-36）：
     ///
-    /// - 无 `/` 前缀：`path_escape(service_name)`
-    /// - 有 `/` 前缀：取首/尾 `/` 之间的部分，按 `/` 分段逐段 escape，用 `/` 重组
+    /// - 无 `/` 前缀：`path_escape(service_name)`（老式配置，:19-21 提前返回）
+    /// - 有 `/` 前缀：`LastIndex("/")` 定右界，`LastIndex < 1` 钳到 1，取 `name[1..idx]` 再按 `/`
+    ///   分段逐段 escape。**单段绝对路径因此得空串**——`/foo` → `""`、 `/` → `""`（Go 官方
+    ///   `config_test.go` 同形断言），这是 Go 的既有行为， 不是本实现的退化（bd yzl0n）。
     #[must_use]
     pub fn service_name(&self) -> String {
         let name = &self.service_name;
         if !name.starts_with('/') {
             return path_escape(name);
         }
-        // 自定义路径：找最后一个 '/' 的位置
-        let last_slash = name.rfind('/').unwrap_or(1);
-        let start = 1;
-        let end = last_slash.max(1);
-        let raw_service = if end > start { &name[start..end] } else { "" };
-        if raw_service.is_empty() {
-            return String::new();
-        }
+        let last_index = name.rfind('/').unwrap_or(1).max(1);
+        let raw_service = name.get(1..last_index).unwrap_or("");
         raw_service.split('/').map(path_escape).collect::<Vec<_>>().join("/")
     }
 
@@ -336,6 +324,27 @@ mod tests {
         assert_eq!(cfg.service_name(), "A/B");
     }
 
+    /// bd yzl0n：Go `config_test.go` 的退化语义——`LastIndex < 1` 钳到 1 ⇒ 单段
+    /// 绝对路径得**空**服务名（`/foo` → 路径 `//foo`，`/` → 空）。这是 Go 行为，
+    /// 必须钉住；老式无前缀配置不受影响（见下一条）。
+    #[test]
+    fn service_name_go_degenerate_single_segment_is_empty() {
+        for name in ["/foo", "/"] {
+            let cfg = Config { service_name: name.into(), ..Default::default() };
+            assert_eq!(cfg.service_name(), "", "Go config.go:29-32 对 `{name}` 返回空服务名");
+        }
+    }
+
+    /// bd yzl0n：老式配置（无 `/` 前缀）在 Go `config.go:19-21` 提前返回原值，
+    /// **永不**进 LastIndex 分支——不许把它按退化路径处理。
+    #[test]
+    fn service_name_old_school_config_keeps_value() {
+        for name in ["hello", "GunService", "a/b"] {
+            let cfg = Config { service_name: name.into(), ..Default::default() };
+            assert_eq!(cfg.service_name(), path_escape(name), "老式配置 `{name}` 必须原值");
+        }
+    }
+
     #[test]
     fn service_name_custom_path_with_escape() {
         let cfg = Config { service_name: "/A B/Tun".into(), ..Default::default() };
@@ -407,8 +416,8 @@ mod tests {
         assert!(cfg.authority.is_empty());
         assert!(cfg.service_name.is_empty());
         assert!(!cfg.multi_mode);
-        // Bug-B：idle_timeout 缺省 30s（keepalive 防死链假死）。
-        assert_eq!(cfg.idle_timeout, 30);
+        // Go 缺省：不装 keepalive（bd x0v47）。
+        assert_eq!(cfg.idle_timeout, 0);
     }
 
     #[test]

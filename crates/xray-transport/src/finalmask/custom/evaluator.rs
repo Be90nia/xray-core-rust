@@ -202,12 +202,12 @@ pub(crate) fn measure_expr(expr: &Expr, sizes: &HashMap<String, usize>) -> io::R
             }
             Ok(total)
         },
-        "slice" => expect_u64_literal_arg(&expr.args, 3, "slice length must be u64"),
+        "slice" => expect_u64_literal_arg(&expr.args, 3, 2, "slice length must be u64"),
         "be16" | "le16" => Ok(2),
         "be32" | "le32" => Ok(4),
         "le64" => Ok(8),
-        "pad" => expect_u64_literal_arg(&expr.args, 3, "pad length must be u64"),
-        "truncate" => expect_u64_literal_arg(&expr.args, 2, "truncate length must be u64"),
+        "pad" => expect_u64_literal_arg(&expr.args, 3, 1, "pad length must be u64"),
+        "truncate" => expect_u64_literal_arg(&expr.args, 2, 1, "truncate length must be u64"),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("expr size is not bytes for op: {other}"),
@@ -534,12 +534,20 @@ fn evaluate_xor(
     Ok(EvalValue::from_u64((left ^ right) & mask))
 }
 
-/// 取第 idx 个 arg 为 U64 字面量（measure 用）。
-fn expect_u64_literal_arg(args: &[ExprArg], expected: usize, err: &str) -> io::Result<usize> {
+/// 取第 `idx` 个 arg 为 U64 字面量（measure 用）。
+///
+/// 长度参数**不是**统一在末位：`slice` 在 args[2]、`pad`/`truncate` 在 args[1]
+/// （对齐 Go `evaluator.go:503-520`，bd 6g86j）。
+fn expect_u64_literal_arg(
+    args: &[ExprArg],
+    expected: usize,
+    idx: usize,
+    err: &str,
+) -> io::Result<usize> {
     if args.len() != expected {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("expects {expected} args")));
     }
-    match &args[expected - 1] {
+    match &args[idx] {
         ExprArg::U64(v) => Ok(*v as usize),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, err)),
     }
@@ -671,6 +679,24 @@ mod tests {
         let mut ctx = EvalContext::new();
         let v = evaluate_expr(&e, &mut ctx).unwrap();
         assert_eq!(v.as_bytes().unwrap(), b"hel");
+    }
+
+    /// bd 6g86j：pad 的长度是 args[1]（Go `evaluator.go:503-511`），args[2] 是填充内容；
+    /// 旧实现按「末位」读 ⇒ 读到 Bytes 直接报错，pad 实际不可用。
+    #[test]
+    fn measure_pad_reads_target_not_fill() {
+        let e = expr("pad", vec![bytes(b"abc"), u64_arg(6), bytes(b"XY")]);
+        assert_eq!(measure_expr(&e, &HashMap::new()).unwrap(), 6);
+    }
+
+    /// 长度参数位不统一：truncate 在 args[1]、slice 在 args[2]。
+    #[test]
+    fn measure_length_arg_positions() {
+        let sizes = HashMap::new();
+        let t = expr("truncate", vec![bytes(b"hello"), u64_arg(3)]);
+        assert_eq!(measure_expr(&t, &sizes).unwrap(), 3);
+        let s = expr("slice", vec![bytes(b"hello"), u64_arg(1), u64_arg(3)]);
+        assert_eq!(measure_expr(&s, &sizes).unwrap(), 3);
     }
 
     #[test]

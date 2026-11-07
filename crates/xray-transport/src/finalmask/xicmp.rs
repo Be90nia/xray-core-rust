@@ -381,7 +381,7 @@ fn spawn_recv_task(
     let (tx, rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(RECV_CHANNEL_CAP);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（raw ICMP socket recv 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw ICMP socket recv 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let task = tokio::spawn(async move {
         loop {
@@ -438,7 +438,7 @@ fn spawn_clean_task_with(
 ) -> JoinHandle<()> {
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（xicmp 记录 TTL 清理循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（xicmp 记录 TTL 清理循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         // Delay：错过 tick 顺延，不补发（Go time.Ticker 丢错过 tick 同语义）

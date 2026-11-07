@@ -610,7 +610,7 @@ impl HandshakeTemplate {
             // 2026-10-15 生产实锤）。Go goroutine 模型即后台并发处理。
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h2 拒绝服务，防串行 accept 钉死）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(WsListener::serve_h2_reject(tls_stream, self.configs.clone()));
             return Err(WsError::HandshakeFailed("http/2 request rejected".into()));

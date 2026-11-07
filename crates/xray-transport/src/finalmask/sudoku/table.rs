@@ -17,7 +17,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use rand::{SeedableRng, seq::SliceRandom};
 use ring::digest;
 
 /// 4×4 数独网格（16 格，值为 1-4）。
@@ -501,8 +500,10 @@ fn build_table(password: &str, layout: Layout) -> Result<Table, String> {
     let hash_ref = hash.as_ref();
     let seed = i64::from_be_bytes(hash_ref[..8].try_into().expect("sha256 digest is 32 bytes"));
     let mut order: Vec<usize> = (0..patterns.len()).collect();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed as u64);
-    order.shuffle(&mut rng);
+    // 必须用 Go `math/rand` v1 的源与洗牌：换 `rand` crate（StdRng + SliceRandom）会
+    // 在**同一 seed 下给出不同 order** ⇒ byte↔grid 映射两侧不同 ⇒ 与 Go 节点静默
+    // 不互通（bd izfz9）。
+    super::go_rand::GoRand::new(seed).shuffle(&mut order);
 
     let mut t =
         Table { encode: vec![Vec::new(); 256], decode: HashMap::with_capacity(1 << 16), layout };

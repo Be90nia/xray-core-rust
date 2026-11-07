@@ -168,7 +168,7 @@ impl InboundHandler for NaiveInboundHandler {
         let dispatch = self.dispatch.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（naive accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（naive accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let accept_task = tokio::spawn(async move {
             loop {
@@ -179,7 +179,7 @@ impl InboundHandler for NaiveInboundHandler {
                         let dispatch = dispatch.clone();
                         #[allow(
                             clippy::disallowed_methods,
-                            reason = "数据面连接任务（每连接 TLS/处理）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每连接 TLS/处理）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
                         )]
                         tokio::spawn(async move {
                             let tls =
@@ -296,7 +296,7 @@ async fn handle_request(
         Some(dispatch) => {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（h2 tunnel dispatch）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h2 tunnel dispatch）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 let upgraded = match upgrade.await {
@@ -317,7 +317,7 @@ async fn handle_request(
         None => {
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面连接任务（无 dispatch 时 mock relay）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（无 dispatch 时 mock relay）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(relay_mock_direct(host.clone(), port, upgrade, padded));
         },

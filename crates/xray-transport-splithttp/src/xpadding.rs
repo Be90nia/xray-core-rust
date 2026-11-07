@@ -46,28 +46,29 @@ const TOKENISH_MAX_ITER: usize = 150;
 /// 'X' (88) 和 'Z' (90) 都是 8 bits，HPACK 不会压缩全 X/Z 字符串，对应 Go 注释：
 /// "'X' and 'Z' are assigned an 8 bit code, so HPACK compression won't change
 /// actual padding length on the wire"。
-// w1s7：按 RFC 7541 Appendix B 脚本化对拍（256 项逐字节），之前手抄版错
-// 144 处（含 15 个 base62 字符 e/g/h/i/j/k/m/o/q/r/s/t/u/y/z 等），导致
-// tokenish padding 长度系统性偏差 ~15%；Go 服务端 IsPaddingValid 容差仅 ±2 必拒。
-// 与 Go `golang.org/x/net/http2/hpack.HuffmanEncodeLength` 等价。
-// 'X' (88) 和 'Z' (90) 都是 8 bits：HPACK 不压缩全 X/Z 串，'padding 长度' == '字节长度'。
+// bd g90ft：整表按 **RFC 7541 Appendix B** 重生成（此前"手抄/脚本对拍"版有 131/256
+// 处错值：X=7 应 8、A=10 应 6、0xb0-0xff 段全拍平成 23 等）。校验来源为**被测系统
+// 之外**的两份独立实现——Go `x/net@v0.61.0 http2/hpack` huffmanCodeLen 与 Rust
+// `h2 0.4.20` ENCODE_CODE_LENGTHS——逐项 diff 256/256 完全一致，且满足 Kraft
+// 等式（见 tests::huffman_table_satisfies_kraft_equality）。旧测试内嵌的"RFC 真值"
+// 与坏表同源同错（自证循环），已换成独立断言。
 const HUFFMAN_BITS: [u8; 256] = [
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, // 00-0f
     28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28, // 10-1f
     6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, // 20-2f
     5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10, // 30-3f
-    13, 10, 13, 23, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // 40-4f
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, // 50-5f
-    14, 6, 15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, // 60-6f
-    6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 11, 11, 14, // 70-7f
-    13, 28, 20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, // 80-8f
-    24, 23, 24, 24, 24, 24, 24, 23, 24, 24, 24, 23, 24, 24, 24, 24, // 90-9f
-    21, 22, 22, 22, 22, 21, 22, 22, 23, 23, 24, 23, 23, 23, 23, 23, // a0-af
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, // b0-bf
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, // c0-cf
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, // d0-df
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, // e0-ef
-    23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, // f0-ff
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, // 40-4f
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, // 50-5f
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, // 60-6f
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28, // 70-7f
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, // 80-8f
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24, // 90-9f
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23, // a0-af
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23, // b0-bf
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25, // c0-cf
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27, // d0-df
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23, // e0-ef
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26, // f0-ff
 ];
 
 /// HPACK Huffman 编码后字节数。等价 Go `hpack.HuffmanEncodeLength`。
@@ -259,47 +260,61 @@ mod tests {
     use super::*;
     use crate::config::PLACEMENT_QUERY;
 
-    /// w1s7：X=7 bits（RFC 7541 修正）。X 单字符 = 7 bits → 1 byte；Z=8 bits。
-    /// 16 个 X = 16 × 7 = 112 bits → ceil(112/8) = 14 bytes。
-    /// 8 个 Z = 8 × 8 = 64 bits → 8 bytes。
+    /// w1s7 → bd g90ft：X/Z 在 RFC 7541 Appendix B 里都是 **8 bit** 码 ⇒ HPACK 不压缩
+    /// 全 X/Z 串（这正是 `repeat-x` 填充长度 == 字节长度的依据）。旧注释写成 7 bits 并
+    /// 与错表自洽，已随整表重生成更正。
     #[test]
     fn huffman_length_x_and_z_are_8_bits() {
+        assert_eq!(HUFFMAN_BITS[usize::from(b'X')], 8);
+        assert_eq!(HUFFMAN_BITS[usize::from(b'Z')], 8);
         assert_eq!(huffman_encode_length("X"), 1);
         assert_eq!(huffman_encode_length("Z"), 1);
-        assert_eq!(huffman_encode_length("XX"), 2); // 14 bits → 2 bytes
-        assert_eq!(huffman_encode_length("ZZZZ"), 4); // 32 bits → 4 bytes
+        // 16 个 X = 128 bits → 16 bytes（旧错表给 7 bits ⇒ 14 bytes，恰出 Go
+        // IsPaddingValid 的 ±2 容差 ⇒ 生产上传被拒）。
+        assert_eq!(huffman_encode_length(&"X".repeat(16)), 16);
+        assert_eq!(huffman_encode_length(&"Z".repeat(16)), 16);
     }
 
-    #[allow(clippy::doc_lazy_continuation)] // 存量清零批次
-    /// w1s7：HUFFMAN_BITS 完整 256 项逐字节对照 RFC 7541 Appendix B 真值。
-    /// 之前手抄版 144 项错（base62 字符 e/g/h/i/j/k/m/o/q/r/s/t/u/y/z 全错位
-    /// + 0x80-0xff 段多位偏差），tokenish padding 长度系统性偏离 ~15% → Go
-    /// 服务端 IsPaddingValid 容差 ±2 必拒收（B 类节点 fail）。本测试用真值数组
-    /// 一次性兜底防回归——任何单字节写错都会被这条测试捕获。
+    /// bd g90ft：**独立**校验（不内嵌第二份长度表——旧测试的真值数组抄自实现，
+    /// 同源同错 ⇒ 永远绿）。
+    ///
+    /// Kraft 等式：Huffman 码集（256 字节 + EOS）的 `Σ 2^-len` 必须**恰好等于 1**。
+    /// 该等式只依赖长度表本身与信息论，任何单字节错值都会破坏它（除非另一处恰好补偿，
+    /// 概率极低），且不需要任何外部真值副本。整数化：所有 len ≤ 30 ⇒ 逐项算
+    /// `2^(30-len)` 求和，应等于 `2^30`（EOS 的 len=30 贡献 1）。
     #[test]
-    fn huffman_table_matches_rfc7541_for_all_256_bytes() {
-        // RFC 7541 Appendix B 完整 Huffman code 长度表（256 项）。
-        const RFC: [u8; 256] = [
-            13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28,
-            30, 28, 28, 28, 28, 28, 28, 28, 28, 28, 6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8,
-            6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10, 13, 10, 13, 23, 7, 7, 7, 7,
-            7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6, 15,
-            5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 11, 11,
-            14, 13, 28, 20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 24, 24, 24,
-            24, 24, 23, 24, 24, 24, 23, 24, 24, 24, 24, 21, 22, 22, 22, 22, 21, 22, 22, 23, 23, 24,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-            23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23, 23,
-        ];
-        for (i, (&got, &want)) in HUFFMAN_BITS.iter().zip(RFC.iter()).enumerate() {
-            assert_eq!(
-                got,
-                want,
-                "byte {i:#04x} ({}): rust={got} rfc={want}",
-                if (32..127).contains(&i) { char::from(i as u8) } else { '?' }
-            );
-        }
+    fn huffman_table_satisfies_kraft_equality() {
+        const SCALE: u64 = 1 << 30;
+        let sum: u64 = HUFFMAN_BITS.iter().map(|&l| 1u64 << (30 - u32::from(l))).sum();
+        let with_eos = sum + 1; // EOS 码长 30 bits（RFC 7541 Appendix B 末项）
+        assert_eq!(with_eos, SCALE, "Huffman 长度表不满足 Kraft 等式（码表被写错）");
+    }
+
+    /// bd g90ft：RFC 7541 §C.4 示例串的 Huffman 编码长度（附录 C 的三个请求/响应示例
+    /// 给出的 hex 载荷字节数），作为与长度表**不同源**的权威对拍点。
+    #[test]
+    fn huffman_encode_length_matches_rfc7541_appendix_c() {
+        // C.4.1 "www.example.com" → 12 字节（f1e3 c2e5 f23a 6ba0 ab90 f4ff）
+        assert_eq!(huffman_encode_length("www.example.com"), 12);
+        // C.4.2 cache-control: no-cache → "no-cache" 6 字节（a8eb 1064 9cbf）
+        assert_eq!(huffman_encode_length("no-cache"), 6);
+        // C.4.3 custom-key / custom-value → 8 / 9 字节
+        assert_eq!(huffman_encode_length("custom-key"), 8);
+        assert_eq!(huffman_encode_length("custom-value"), 9);
+    }
+
+    /// bd g90ft：base62 字母表的平均压缩率必须与代码里声明的
+    /// `AVG_HUFFMAN_BYTES_PER_CHAR_BASE62` 一致（tokenish 目标长度估算的锚）。
+    /// 错表（0xb0-0xff 段被拍平成 23、多个小写字母错位）会把均值拉偏。
+    #[test]
+    fn base62_average_huffman_ratio_matches_declared_constant() {
+        let total_bits: u32 =
+            CHARSET_BASE62.iter().map(|&c| u32::from(HUFFMAN_BITS[usize::from(c)])).sum();
+        let avg = f64::from(total_bits) / CHARSET_BASE62.len() as f64 / 8.0;
+        assert!(
+            (avg - AVG_HUFFMAN_BYTES_PER_CHAR_BASE62).abs() < 0.01,
+            "base62 平均 {avg:.4} B/char 偏离声明常量 {AVG_HUFFMAN_BYTES_PER_CHAR_BASE62}"
+        );
     }
 
     #[test]
@@ -321,23 +336,25 @@ mod tests {
         assert_eq!(huffman_encode_length(""), 0);
     }
 
-    /// w1s7：HUFFMAN_BITS 表已按 RFC 7541 Appendix B 修正。"Ab0" = A(10)+b(15)+0(5) =
-    /// 30 bits → ceil(30/8) = 4 bytes。注：原手抄表把 A 写成 6 bits → 误判 3 bytes。
+    /// bd g90ft：按 RFC 7541 Appendix B，`"Ab0"` = A(6)+b(6)+0(5) = 17 bits →
+    /// ceil(17/8) = 3 bytes。（旧坏表把 A 写成 10 / b 写成 15 ⇒ 误判 4 bytes——
+    /// 这是同一张错表自洽出的一族错误期望。）
     #[test]
     fn huffman_length_mixed_base62_rounding() {
-        assert_eq!(huffman_encode_length("Ab0"), 4);
+        assert_eq!(HUFFMAN_BITS[usize::from(b'A')], 6);
+        assert_eq!(HUFFMAN_BITS[usize::from(b'b')], 6);
+        assert_eq!(huffman_encode_length("Ab0"), 3);
     }
 
-    /// w1s7：'X' = 7 bits（RFC 7541 修正），非 8 bits。10 × 7 = 70 bits → 9 bytes。
-    /// 注意：手抄表把 X 错成 8 bits 时生成的 'XXXXXX...' padding 会比 Go 端
-    /// `hpack.HuffmanEncodeLength` 算长，导致 xPaddingMethod=repeat-x 场景
-    /// 与 Go 服务端 IsPaddingValid 校验错位。
+    /// bd g90ft：`repeat-x` 的 'X' 是 **8 bit** 码 ⇒ padding 长度 == HPACK 编码长度
+    /// （Go 注释原话是 "'X' and 'Z' are assigned an 8 bit code, so HPACK compression
+    /// won't change actual padding length"）。旧测试按 7 bits 断言 9 bytes，与错表自洽。
     #[test]
     fn generate_padding_repeat_x() {
         let s = generate_padding(PADDING_METHOD_REPEAT_X, 10);
         assert_eq!(s.len(), 10);
         assert_eq!(s, "XXXXXXXXXX");
-        assert_eq!(huffman_encode_length(&s), 9); // 10 chars × 7 bits = 70 bits = 9 bytes
+        assert_eq!(huffman_encode_length(&s), 10); // 10 chars × 8 bits = 80 bits = 10 bytes
     }
     #[test]
     fn generate_padding_zero_or_negative_returns_empty() {

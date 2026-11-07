@@ -189,6 +189,10 @@ impl HubListener {
     ///
     /// 返回条件：listener 被关闭（IO 错误）。
     pub async fn serve(self) -> Result<()> {
+        // bd imhvg(b)：`serverMaxHeaderBytes` → h1 head 缓冲上限 + h2
+        // SETTINGS_MAX_HEADER_LIST_SIZE（与 TLS 路径 serve_http_conn 同源）。
+        // 在 `self.config` 移入 HandlerContext 之前取值。
+        let max_head_bytes = self.config.normalized_server_max_header_bytes().max(8192) as usize;
         let ctx = Arc::new(handler::HandlerContext {
             config: Arc::clone(&self.config),
             host: self.config.host.clone(),
@@ -208,7 +212,7 @@ impl HubListener {
             let ctx = Arc::clone(&ctx);
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；每 TCP 连接一个 hyper http1/h2 服务任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；每 TCP 连接一个 hyper http1/h2 服务任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 use hyper::service::service_fn;
@@ -231,9 +235,11 @@ impl HubListener {
                 // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
                 // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES`）与 serve_http_conn 同源生效。
                 let win = crate::flow_window::server_windows();
+                builder.http1().max_buf_size(max_head_bytes);
                 builder
                     .http2()
                     .timer(hyper_util::rt::TokioTimer::new())
+                    .max_header_list_size(max_head_bytes as u32)
                     .max_send_buf_size(win.max_send_buf)
                     .initial_stream_window_size(win.stream_window)
                     .initial_connection_window_size(win.connection_window);

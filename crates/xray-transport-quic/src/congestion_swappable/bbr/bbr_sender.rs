@@ -446,7 +446,10 @@ impl CongestionControl for BbrSender {
 
     fn set_max_datagram_size(&mut self, size: ByteCount) {
         let mut inner = self.inner.lock();
-        assert!(size >= inner.max_datagram_size, "BBR cannot decrease max datagram size");
+        // bd 9wipb：PMTU 黑洞探测成功后 quinn 会回灌**更小** MTU（quinn
+        // `connection/mod.rs` on_mtu_update，下限 1200）——正常网络事件，不是异常。
+        // 断言会让 panic 落在 quinn 连接驱动 task 内，静默打死整个 endpoint 的所有连接
+        // （远程可诱导：丢 UDP / 过滤 ICMP）。缩小时按比例反向缩放并钳到新 min。
         let old_mds = inner.max_datagram_size;
         let old_min_cwnd = inner.min_congestion_window;
         let old_initial_cwnd = inner.initial_congestion_window;
@@ -566,11 +569,18 @@ mod tests {
         assert_eq!(inner.max_datagram_size, 1400);
     }
 
+    /// bd 9wipb 契约：MTU 缩小（PMTU 黑洞后的正常回调）必须**不 panic**，且窗口按
+    /// 比例缩放并钳到新 min（quinn 会在连接驱动 task 内调用，panic = endpoint 静默死）。
     #[test]
-    #[should_panic(expected = "BBR cannot decrease")]
-    fn set_max_datagram_size_decreasing_panics() {
+    fn set_max_datagram_size_decrease_scales_without_panic() {
         let mut s = make_sender();
-        s.set_max_datagram_size(500); // < INITIAL_PACKET_SIZE
+        s.set_max_datagram_size(900);
+        let inner = s.inner.lock();
+        assert_eq!(inner.max_datagram_size, 900);
+        assert_eq!(inner.min_congestion_window, 4 * 900);
+        assert_eq!(inner.initial_congestion_window, 32 * 900);
+        assert_eq!(inner.congestion_window, 32 * 900, "初始窗口按比例缩到 32×新 MTU");
+        assert!(inner.congestion_window >= inner.min_congestion_window);
     }
 
     #[test]

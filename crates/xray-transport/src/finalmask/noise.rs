@@ -191,19 +191,28 @@ impl NoiseConn {
 #[async_trait]
 impl UdpIo for NoiseConn {
     async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        // 判断是否需要注入噪声（对应 Go `t.IsZero() || (ResetMax > 0 && now.After(t))`）
+        // 判断是否需要注入噪声（逐字对位 Go `conn.go:WriteTo`：
+        // `t := c.m[addr]` 零值 = 该 addr 从未注入；`t.IsZero() || (ResetMax > 0 &&
+        // now.After(t))`）。
+        //
+        // 旧实现的 `*expire <= now` 把「刚插入的 now」判成已过期：`reset_max <= 0`
+        // （缺省形态）下 ttl=0 ⇒ 每个包都重放整套握手（流量放大 + 逐包 sleep +
+        // 与 Go 线缆行为静默分歧，bd yc42y）。Go 语义是「每 addr 只注入一次」：
+        // reset_max == 0 时写入的 t 恒为 now、且 `ResetMax > 0` 为假 ⇒ 永不重注。
         let need_inject = {
             let mut map = self.last_expire.lock();
             let now = xray_frame::compat::clock().now_instant();
-            let expire = map.entry(addr.to_string()).or_insert(now);
-            let expired = *expire <= now;
-            let ttl_secs = if self.config.reset_max > 0 {
-                rand_between(self.config.reset_min, self.config.reset_max).max(0) as u64
-            } else {
-                0
+            let due = match map.get(&addr.to_string()).copied() {
+                None => true,
+                Some(t) => self.config.reset_max > 0 && now > t,
             };
-            *expire = now + Duration::from_secs(ttl_secs);
-            expired
+            // Go `RandBetween(ResetMin, ResetMax)` 是半开区间 [min, max) ⇒ 闭区间助记
+            // `rand_between` 传 max-1；reset_max<=0 时两侧都得 0。
+            let ttl_secs =
+                rand_between(self.config.reset_min, self.config.reset_max.saturating_sub(1)).max(0)
+                    as u64;
+            map.insert(addr.to_string(), now + Duration::from_secs(ttl_secs));
+            due
         };
 
         if need_inject {
@@ -442,6 +451,43 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].0.len(), 5); // 噪声
         assert_eq!(sent[1].0, b"real"); // 真实
+    }
+
+    /// bd yc42y：`reset_max == 0`（缺省形态）时每 addr **只注入一次**噪声，
+    /// 不能每包重放整套握手。Go `WriteTo` 的 `t.IsZero()` 只看「首次」。
+    #[tokio::test]
+    async fn noise_injects_once_per_addr_when_reset_max_is_zero() {
+        let packets: PacketQueue = Arc::new(Mutex::new(vec![]));
+        let mock = MockUdpIo { packets: Arc::clone(&packets) };
+        let config = NoiseConfig {
+            reset_max: 0,
+            items: vec![NoiseItem { packet: vec![0xAAu8; 3], ..Default::default() }],
+            ..Default::default()
+        };
+        let conn = NoiseConn::new(config, Box::new(mock));
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        for _ in 0..3 {
+            conn.send_to(b"real", addr).await.unwrap();
+        }
+        // 块作用域收窄 guard 生命周期（clippy::await_holding_lock：parking_lot 非重入，
+        // 继续发送会再锁同一把 ⇒ guard 必须在后续 await 前明确释放）。
+        {
+            let sent = packets.lock();
+            let noise: Vec<_> = sent.iter().filter(|(p, _)| p == &[0xAA, 0xAA, 0xAA]).collect();
+            assert_eq!(
+                noise.len(),
+                1,
+                "缺省 reset_max=0 必须只注入一次噪声，实际 {} 次",
+                noise.len()
+            );
+            assert_eq!(sent.len(), 4, "1 次噪声 + 3 次真实包");
+        }
+
+        // 另一个 addr 是独立计数（Go 按 addr.String() 分桶）。
+        let addr2: SocketAddr = "127.0.0.1:10000".parse().unwrap();
+        conn.send_to(b"real", addr2).await.unwrap();
+        assert_eq!(packets.lock().len(), 6, "新 addr 首次仍应注入一次噪声");
     }
 
     // --- Mock UdpIo（Arc 共享状态，测试直接检查发送记录）---

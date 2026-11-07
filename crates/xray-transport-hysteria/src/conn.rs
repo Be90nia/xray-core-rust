@@ -803,7 +803,15 @@ struct UdpSessionInner {
     udp_idle_timeout: Duration,
     /// QUIC conn 引用（server feed 路径建 session 时注入 write_fn，回包链用）。
     conn: Option<Arc<dyn QuicConn>>,
+    /// 超上限丢弃的新 session id 计数（bd n6jqu F4：可见的丢包账）。
+    dropped_over_cap: u64,
 }
+
+/// 单连接 UDP 会话数上限（bd n6jqu F4，对齐 `MAX_UDP_SESSIONS=4096` 口径）。
+///
+/// 原实现只靠 idle 超时回收、无条数上限：对端拿随机 4 字节 id 就能按包建 session
+/// （每 session 一个 InterConn + 队列 + 出口），单连接可按住无界内存。
+pub const MAX_UDP_SESSIONS: usize = 4096;
 
 impl std::fmt::Debug for UdpSessionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -824,6 +832,7 @@ impl UdpSessionManager {
             on_new_session,
             udp_idle_timeout,
             conn: None,
+            dropped_over_cap: 0,
         }));
         Arc::new(Self {
             inner,
@@ -851,7 +860,7 @@ impl UdpSessionManager {
         let clean_inner = Arc::clone(&self.inner);
         #[allow(
             clippy::disallowed_methods,
-            reason = "常驻监控任务（UDP idle 会话清理循环）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（UDP idle 会话清理循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let clean_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
@@ -895,7 +904,7 @@ impl UdpSessionManager {
         let run_remote = remote;
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（QUIC datagram 接收泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（QUIC datagram 接收泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let run_handle = tokio::spawn(async move {
             loop {
@@ -909,7 +918,15 @@ impl UdpSessionManager {
                 let id = u32::from_be_bytes([datagram[0], datagram[1], datagram[2], datagram[3]]);
                 run_inner.lock().await.feed(id, datagram, run_local, run_remote);
             }
-            run_inner.lock().await.close_all().await;
+            // bd w06sd(d)：锁内只 drain，逐个 close 在锁外做（原实现持锁跨 N 次 await）。
+            let sessions: Vec<_> = {
+                let mut g = run_inner.lock().await;
+                g.closed = true;
+                g.sessions.drain().map(|(_, v)| v).collect()
+            };
+            for s in sessions {
+                let _ = s.close().await;
+            }
         });
         *self.clean_handle.lock().await = Some(clean_handle);
         *self.run_handle.lock().await = Some(run_handle);
@@ -950,8 +967,18 @@ impl UdpSessionManager {
     }
 
     /// 关闭所有 session + 标记 closed（对应 Go `udpSessionManager.run()` 末尾）。
+    ///
+    /// bd w06sd(d)：原实现持会话表锁跨 N 次 `close().await` ⇒ 与 feed/create 串行化。
+    /// 现在锁内只 drain（`closed` 置位 + 取出列表），逐个 close 在锁外做。
     pub async fn close_all(&self) {
-        self.inner.lock().await.close_all().await;
+        let sessions: Vec<_> = {
+            let mut g = self.inner.lock().await;
+            g.closed = true;
+            g.sessions.drain().map(|(_, v)| v).collect()
+        };
+        for s in sessions {
+            let _ = s.close().await;
+        }
     }
 
     /// 当前活跃 session 数。
@@ -969,6 +996,20 @@ impl UdpSessionInner {
         }
         // 新 id（server 路径）：创建 InterConn 并 on_new_session。
         // write_fn/close_fn 对齐 client 的 create_session——回包经 conn.send_datagram 出去。
+        //
+        // bd n6jqu F4：会话表无条数上限（只有 idle 超时）⇒ 对端拿随机 id 按包建
+        // session 即可按住无界内存。超限丢包并计数（有损语义，绝不静默扩表）。
+        if self.sessions.len() >= MAX_UDP_SESSIONS {
+            self.dropped_over_cap = self.dropped_over_cap.saturating_add(1);
+            // 首次与 2 的幂次留痕（洪水下不刷屏），计数本身可观测。
+            if self.dropped_over_cap.is_power_of_two() {
+                crate::LOG.warn(format!(
+                    "udp session table full (max {MAX_UDP_SESSIONS}): dropping new session id={id} (total dropped={})",
+                    self.dropped_over_cap
+                ));
+            }
+            return;
+        }
         let on_new = self.on_new_session.clone();
         let sess = Arc::new(InterConn::new(local, remote, id, UDP_MESSAGE_CHAN_SIZE));
         if let Some(conn) = &self.conn {
@@ -982,14 +1023,6 @@ impl UdpSessionInner {
         self.sessions.insert(id, Arc::clone(&sess));
         if let Some(f) = on_new {
             f(sess);
-        }
-    }
-
-    async fn close_all(&mut self) {
-        self.closed = true;
-        let sessions: Vec<_> = self.sessions.drain().map(|(_, v)| v).collect();
-        for s in sessions {
-            let _ = s.close().await;
         }
     }
 }

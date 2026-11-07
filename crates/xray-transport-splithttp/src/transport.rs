@@ -57,9 +57,11 @@ const SERVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 客户端对齐 Go `common/net/net.go:20` `ChromeH2KeepAlivePeriod = 45s`
 /// （http2.Transport ReadIdleTimeout 缺省，dialer.go http2 分支）；服务端 Go
 /// http.Server 无对应配置，hyper server http2 Builder 显式取同值。连接层 PING
-/// 是对抗 NAT/中间盒空闲回收的官方手段（librarian 调研
-/// reports/research-go-xhttp-padding-20261016.md），in-band body 填充方案已被
-/// 上游两次拒绝（#6422/#6755），勿再引入。
+/// 是对抗 NAT/中间盒空闲回收的官方手段；in-band body 填充方案已被上游两次拒绝
+/// （xray-core PR #6422/#6755），勿再引入。
+/// <!-- bd z4sks(b)：此处原引 `reports/research-go-xhttp-padding-20261016.md`，
+///      该文件在本仓历史里从未存在（git log --all 无记录）⇒ 出处不可核验，改引
+///      上游 PR 号。 -->
 pub(crate) const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 
 /// bd wz2b C2 + bd c9oc F-A h2 窗钉修复常量（commit 8780187e，防回档）：
@@ -117,7 +119,13 @@ pub async fn listen_splithttp(
 
     if is_h3 {
         let tls = tls_cfg.expect("is_h3 implies Some");
-        listen_h3(addr, tls, &config, sockopt, handler).await
+        // bd 4bd2i：Go hub.go:480-514 的服务端也消费 `streamSettings.QuicParams`
+        // （窗口 / idle / MaxIncomingStreams / PMTU）。此前 Rust 监听端**零
+        // TransportConfig** ⇒ quinn 缺省 receive_window=VarInt::MAX（连接级无上限）。
+        let quic_params = xray_transport::memory_settings::parse_quic_params_config(
+            settings.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
+        )?;
+        listen_h3(addr, tls, &config, quic_params.as_ref(), sockopt, handler).await
     } else {
         // Tcpmask（Go splithttp/hub.go:547-549：`!isH3 && TcpmaskManager != nil`
         // 才 WrapListener——H3/QUIC 分支不接 Tcpmask）。空 manager = 恒等。
@@ -272,7 +280,7 @@ async fn listen_tcp(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -296,7 +304,7 @@ async fn listen_tcp(
     // 意外退出监控：循环只应经 close() 的 abort 句柄退出；panic 会静默杀掉监听。
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp",
@@ -371,7 +379,7 @@ pub async fn listen_unix_splithttp(
     let log_ident = path.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -392,7 +400,7 @@ pub async fn listen_unix_splithttp(
     let abort = accept_task.abort_handle();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-unix",
@@ -536,6 +544,10 @@ where
     )]
     let last_progress = Arc::new(ProgressClock::new(Instant::now()));
     let io = TokioIo::new(ProgressIo { inner: stream, last_progress: Arc::clone(&last_progress) });
+    // bd imhvg(b)：Go hub.go:562-563 把 `GetNormalizedServerMaxHeaderBytes()`（缺省 8192）
+    // 装进 `http.Server.MaxHeaderBytes` —— 此前本栈该键零消费者（解析/归一化/单测俱全但
+    // 没接线），Go 的 8KiB 头上界形同虚设。在 ctx 移入 svc 闭包前取值。
+    let max_head_bytes = ctx.config.normalized_server_max_header_bytes().max(8192);
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
         async move { Ok::<_, std::convert::Infallible>(handler::handle_request(req, peer, &ctx).await) }
@@ -553,11 +565,14 @@ where
         xray_common::alloc_site::scope(xray_common::alloc_site::XHTTP_SRV_H2CONN, async move {
             // 窗组 = 静态保底（RTT 阶梯已撤；服务端 accept 计时随之删除，lf51l）。
             let win = crate::flow_window::server_windows();
+            // hyper 对应 Go 的 MaxHeaderBytes：h1 head 缓冲上限
+            // （协议下限 8192，已在上面钳住）+ h2 `SETTINGS_MAX_HEADER_LIST_SIZE`。
             let mut builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
             builder
                 .http1()
                 .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(READ_HEADER_TIMEOUT);
+                .header_read_timeout(READ_HEADER_TIMEOUT)
+                .max_buf_size(max_head_bytes as usize);
             // r2lq：默认 ALPN=["h2","http/1.1"]（xray-tls server_config.rs:246）时协商
             // 走 h2；无显式 .http2() 时 h2 路径落默认 Builder（Time::Empty），依赖 timer
             // 的路径 panic / 行为不完整。Go hub.go:564-578 同一 http.Server 启 h1+h2。
@@ -583,9 +598,10 @@ where
                 .initial_connection_window_size(win.connection_window)
                 // 票 2xgln：对端并发流上限（Go net/http h2 缺省 250）。h2 侧据此
                 // 发 SETTINGS，并对越限的 HEADERS 回 RST_STREAM(REFUSED_STREAM)。
-                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
-            // ponytail: Go hub.go:571 MaxHeaderBytes（GetNormalizedServerMaxHeaderBytes）无
-            // hyper 字节级对应（仅 max_headers 条数），默认值即 Go 默认 1MiB 量级，未接入。
+                .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+                // bd imhvg(b)：`serverMaxHeaderBytes` → SETTINGS_MAX_HEADER_LIST_SIZE
+                // （Go 把同一值给 http.Server.MaxHeaderBytes，h2 侧同样生效）。
+                .max_header_list_size(max_head_bytes as u32);
             let _ = builder.serve_connection(io, svc).await;
         }),
     );
@@ -835,22 +851,78 @@ fn base64_url_decode(s: &str) -> io::Result<Vec<u8>> {
 
 // ===== H3（Go hub.go:481-535：UDP + QUIC + http3.Server） =====
 
+/// 服务端 H3 的 quinn `TransportConfig`（bd 4bd2i）。
+///
+/// 与客户端 [`crate::h3_client`] 的窗口口径同源（bd wz2b W4 的 16MB 流窗 / 32MB
+/// 连接窗，`Max*` 优先），区别：
+/// - **必须显式设 `receive_window`**：quinn 缺省 `VarInt::MAX`（连接级无上限）， 配合
+///   `max_incoming_streams=100`（各 1.25MB 流窗）⇒ 单条**未认证**连接可被推入 上百 MB
+///   接收缓冲（QUIC 握手完成后、任何应用层认证之前）。显式 32MB 把它压回 有界（对齐 Go
+///   hub.go:498-514 的 `InitialConnectionReceiveWindow`）。
+/// - idle 超时只在显式配置时设（Go 服务端传 `quicParams.MaxIdleTimeout`，0 = quic-go 缺省
+///   30s；不抬到客户端的 300s——服务端长空闲连接是资源面）。
+fn build_h3_server_transport_config(
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
+) -> io::Result<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    let mut stream_win = crate::h3_client::DEFAULT_H3_STREAM_RECEIVE_WINDOW;
+    let mut conn_win = crate::h3_client::DEFAULT_H3_CONNECTION_RECEIVE_WINDOW;
+    if let Some(qp) = quic_params {
+        if qp.init_stream_receive_window > 0 {
+            stream_win = qp.init_stream_receive_window;
+        }
+        if qp.max_stream_receive_window > 0 {
+            stream_win = qp.max_stream_receive_window;
+        }
+        if qp.init_connection_receive_window > 0 {
+            conn_win = qp.init_connection_receive_window;
+        }
+        if qp.max_connection_receive_window > 0 {
+            conn_win = qp.max_connection_receive_window;
+        }
+        if qp.max_idle_timeout > 0 {
+            let secs = u64::try_from(qp.max_idle_timeout).unwrap_or(u64::MAX);
+            if let Ok(v) = quinn::VarInt::from_u64(secs.saturating_mul(1000)) {
+                tc.max_idle_timeout(Some(quinn::IdleTimeout::from(v)));
+            }
+        }
+        if qp.max_incoming_streams > 0 {
+            if let Ok(v) = quinn::VarInt::from_u64(qp.max_incoming_streams.unsigned_abs()) {
+                tc.max_concurrent_bidi_streams(v);
+            }
+        }
+        if qp.disable_path_mtu_discovery {
+            tc.mtu_discovery_config(None);
+        }
+    }
+    tc.stream_receive_window(
+        quinn::VarInt::from_u64(stream_win)
+            .map_err(|e| io::Error::other(format!("h3 server streamWindow VarInt: {e}")))?,
+    );
+    tc.receive_window(
+        quinn::VarInt::from_u64(conn_win)
+            .map_err(|e| io::Error::other(format!("h3 server connWindow VarInt: {e}")))?,
+    );
+    Ok(tc)
+}
+
 /// H3 监听：UDP socket + QUIC endpoint + h3 server accept 循环。
 ///
 /// `quinn::Endpoint::server` 等价 Go `ListenSystemPacket` + `quic.ListenEarly` 的组合。
-/// ponytail: Go QuicParams（hub.go:498-514 InitStreamReceiveWindow/BBR 等）未在 Rust
-/// 配置层建模，用 quinn 默认 TransportConfig；接入时在此覆盖 transport_config。
-/// ListenEarly 的 0-RTT 接受同样依赖 rustls max_early_data_size，未启用。
+/// ListenEarly 的 0-RTT 接受依赖 rustls max_early_data_size，未启用。
 async fn listen_h3(
     addr: SocketAddr,
     tls: Arc<rustls::ServerConfig>,
     config: &Arc<Config>,
+    quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
     sockopt: &SocketOptions,
     handler: ConnHandler,
 ) -> io::Result<Box<dyn TransportListener>> {
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from((*tls).clone())
         .map_err(|e| io::Error::other(format!("rustls→quic server: {e}")))?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    // bd 4bd2i：显式窗口，勿用 quinn 缺省（conn 级 VarInt::MAX = 无上限）。
+    server_config.transport_config(Arc::new(build_h3_server_transport_config(quic_params)?));
     let std_sock = xray_transport::sockopt::bind_udp_endpoint(addr, sockopt)?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -882,12 +954,12 @@ async fn listen_h3(
 fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> + Send + 'static) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面 QUIC accept 泵（splithttp h3 listener）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 endpoint close，句柄仅作监控入参（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面 QUIC accept 泵（splithttp h3 listener）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(body);
     #[allow(
         clippy::disallowed_methods,
-        reason = "accept 循环意外退出监控（panic 留痕）；显式脱管：寿命随被监控的 accept 任务（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：accept 循环意外退出监控（panic 留痕）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-h3",
@@ -924,7 +996,7 @@ fn spawn_h3_accept(
             let g = Arc::clone(&gate);
             #[allow(
                 clippy::disallowed_methods,
-                reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
             )]
             tokio::spawn(async move {
                 let conn = match tokio::time::timeout(
@@ -962,7 +1034,7 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
         let peer = conn.remote_address();
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
@@ -1083,7 +1155,7 @@ impl HubConnHandler for ConnHandlerAdapter {
         (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let ServerConn { reader: mut up, writer: mut down, .. } = conn;
@@ -1968,5 +2040,52 @@ mod tests {
             last.lock().elapsed() < Duration::from_secs(30),
             "write progress must refresh the clock"
         );
+    }
+
+    /// bd 4bd2i 契约：H3 **监听端**必须显式设流/连接接收窗。
+    ///
+    /// 回归前：`quinn::ServerConfig::with_crypto` 走缺省 TransportConfig ⇒
+    /// `receive_window = VarInt::MAX`（连接级无上限）+ 流窗 1.25MB +
+    /// `max_incoming_streams=100` ⇒ 单条**未认证**连接可被推入上百 MB。
+    /// `quinn::TransportConfig` 无 getter，用 Debug 回读字段（同 quic crate 手法）。
+    #[test]
+    fn h3_server_transport_config_bounds_receive_window() {
+        let tc = build_h3_server_transport_config(None).expect("default server transport config");
+        let dbg = format!("{tc:?}");
+        assert!(
+            dbg.contains(&format!(
+                "receive_window: {}",
+                crate::h3_client::DEFAULT_H3_CONNECTION_RECEIVE_WINDOW
+            )),
+            "连接接收窗必须显式有界：{dbg}"
+        );
+        assert!(
+            dbg.contains(&format!(
+                "stream_receive_window: {}",
+                crate::h3_client::DEFAULT_H3_STREAM_RECEIVE_WINDOW
+            )),
+            "流接收窗必须显式：{dbg}"
+        );
+        // VarInt::MAX = 2^62-1：quinn 缺省值，绝不允许出现在监听端。
+        assert!(!dbg.contains("receive_window: 4611686018427387903"), "{dbg}");
+    }
+
+    /// bd 4bd2i：`quicParams` 显式值优先（与客户端 h3_client 同源口径），
+    /// 且 `maxIncomingStreams` / `maxIdleTimeout` 在服务端同样生效。
+    #[test]
+    fn h3_server_transport_config_honours_quic_params() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"maxStreamReceiveWindow":1048576,"maxConnectionReceiveWindow":2097152,
+                "maxIncomingStreams":8,"maxIdleTimeout":42}"#,
+        )
+        .unwrap();
+        let qp = xray_transport::memory_settings::parse_quic_params_config(Some(&v))
+            .expect("parse")
+            .expect("present");
+        let dbg = format!("{:?}", build_h3_server_transport_config(Some(&qp)).expect("build"));
+        assert!(dbg.contains("stream_receive_window: 1048576"), "{dbg}");
+        assert!(dbg.contains("receive_window: 2097152"), "{dbg}");
+        assert!(dbg.contains("max_concurrent_bidi_streams: 8"), "{dbg}");
+        assert!(dbg.contains("max_idle_timeout: Some(42000)"), "{dbg}");
     }
 }

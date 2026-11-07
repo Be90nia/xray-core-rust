@@ -12,6 +12,7 @@ use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
     listener_registry::{TransportListenFn, register_transport_listener},
     sockopt::SocketOptions,
     system_dialer::dial_system,
@@ -33,8 +34,8 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { dial_splithttp(&dest, &sockopt, &settings).await })
     });
-    let _ = register_transport_dialer("splithttp", dial_fn.clone());
-    let _ = register_transport_dialer("xhttp", dial_fn);
+    ignore_already_exists(register_transport_dialer("splithttp", dial_fn.clone()))?;
+    ignore_already_exists(register_transport_dialer("xhttp", dial_fn))?;
     Ok(())
 }
 
@@ -46,8 +47,8 @@ pub fn register_listener() -> io::Result<()> {
         let handler = handler.clone();
         Box::pin(async move { listen_splithttp(addr, &settings, &sockopt, handler).await })
     });
-    let _ = register_transport_listener("splithttp", listen_fn.clone());
-    let _ = register_transport_listener("xhttp", listen_fn);
+    ignore_already_exists(register_transport_listener("splithttp", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("xhttp", listen_fn))?;
     Ok(())
 }
 
@@ -67,9 +68,8 @@ pub fn register_unix_listener() -> io::Result<()> {
             crate::transport::listen_unix_splithttp(path, settings, sockopt, handler).await
         })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_unix_listener("splithttp", listen_fn.clone());
-    let _ = register_transport_unix_listener("xhttp", listen_fn);
+    ignore_already_exists(register_transport_unix_listener("splithttp", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_unix_listener("xhttp", listen_fn))?;
     Ok(())
 }
 

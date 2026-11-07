@@ -312,7 +312,7 @@ where
         let write = Arc::clone(&self.write);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（ws 心跳 ping 循环，对齐 Go heartbeatPeriod goroutine）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（ws 心跳 ping 循环，对齐 Go heartbeatPeriod goroutine）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(period);

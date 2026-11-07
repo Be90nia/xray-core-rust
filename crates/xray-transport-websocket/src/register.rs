@@ -25,6 +25,7 @@ use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
+    ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -52,9 +53,9 @@ pub fn register_dialer() -> io::Result<()> {
         // bd w5jhf：socketSettings（含显式 receiveBufferSize）随拨号下发。
         Box::pin(async move { dial_ws(&dest, &sockopt, &settings).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_dialer("ws", dialer.clone());
-    let _ = register_transport_dialer("websocket", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`）。
+    ignore_already_exists(register_transport_dialer("ws", dialer.clone()))?;
+    ignore_already_exists(register_transport_dialer("websocket", dialer))?;
     Ok(())
 }
 
@@ -73,9 +74,8 @@ pub fn register_listener() -> io::Result<()> {
         let trusted = sockopt.trusted_x_forwarded_for.clone();
         Box::pin(async move { listen_ws(addr, &settings, &handler, trusted).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_listener("ws", listen_fn.clone());
-    let _ = register_transport_listener("websocket", listen_fn);
+    ignore_already_exists(register_transport_listener("ws", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("websocket", listen_fn))?;
     Ok(())
 }
 
@@ -93,9 +93,8 @@ pub fn register_unix_listener() -> io::Result<()> {
     let listen_fn: UnixTransportListenFn = Arc::new(move |path, settings, sockopt, handler| {
         Box::pin(async move { listen_unix_ws(path, settings, sockopt, handler).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_unix_listener("ws", listen_fn.clone());
-    let _ = register_transport_unix_listener("websocket", listen_fn);
+    ignore_already_exists(register_transport_unix_listener("ws", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_unix_listener("websocket", listen_fn))?;
     Ok(())
 }
 
@@ -212,7 +211,7 @@ fn spawn_ws_accept_loop(
     let loop_scope = scope.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（ws accept 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（ws accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_loop_handle = tokio::spawn(async move {
         // Arc<str>：每连接任务都要日志标识，克隆不分配。
@@ -296,7 +295,7 @@ fn spawn_ws_accept_loop(
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "常驻监控任务（accept 循环意外退出监控）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（accept 循环意外退出监控）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 
@@ -461,7 +460,7 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
     let key = key.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面连接任务（池预连接补拨）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（池预连接补拨）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         if !pool.begin_preconnect(&key).await {
@@ -1484,7 +1483,7 @@ mod tests {
     /// --lib dial_ws_finalmask_large_payload_roundtrip -- --ignored --nocapture`
     /// （`REPRO_FM=none` / `xmc` 作对照；`REPRO_CHUNK` 调上行分块大小）。
     #[tokio::test]
-    #[ignore]
+    #[ignore = "人工复现床（REPRO_FM/REPRO_LEN/REPRO_CHUNK 驱动、逐块进度诊断输出）；默认大载荷回归见 dial_ws_finalmask_large_payload_regression"]
     #[allow(clippy::print_stderr)] // 复现工具：进度/停点诊断输出是本测试的功能
     async fn dial_ws_finalmask_large_payload_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1585,6 +1584,76 @@ mod tests {
             got.extend_from_slice(&buf[..n]);
         }
         assert_eq!(got.len(), payload.len());
+    }
+
+    /// bd mvw2 / bd xuaa 回归：fragment mask 下 ws 双端层序的大 payload 必须完整
+    /// 往返（断流阈值曾卡在 16 KB，修后到 64 KB 以上）。上一条是带诊断输出的
+    /// 人工复现床；本条是默认套件里的确定性回归（128 KiB，无诊断输出、无 env 依赖）。
+    #[tokio::test]
+    async fn dial_ws_finalmask_large_payload_regression() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use xray_common::net::{address::Address, network::Network, port::Port};
+
+        let settings = StreamSettings {
+            protocol: "websocket".to_string(),
+            transport_json: Some(serde_json::json!({"path": "/ws"})),
+            finalmask_json: Some(serde_json::json!({
+                "tcp": [{"type": "fragment", "settings": {
+                    "packets_from": 1, "packets_to": 2,
+                    "length": {"from": 8, "to": 16}, "interval": {"from": 0, "to": 0}
+                }}]
+            })),
+            ..Default::default()
+        };
+        let handler: ConnHandler = Arc::new(|conn| {
+            #[allow(clippy::disallowed_methods, reason = "测试：echo handler 任务")]
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let mut buf = vec![0u8; 16384];
+                loop {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if conn.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
+        });
+        let listener = listen_ws("127.0.0.1:0".parse().unwrap(), &settings, &handler, Vec::new())
+            .await
+            .expect("listen_ws");
+        let port = listener.local_addr().expect("local_addr").port();
+        let dest =
+            Destination::new(Address::new_domain("127.0.0.1"), Port::new(port), Network::TCP);
+
+        let mut conn =
+            dial_ws(&dest, &Default::default(), &settings).await.expect("dial_ws with finalmask");
+        let payload: Vec<u8> = (0..128 * 1024).map(|i| (i & 0xFF) as u8).collect();
+        let mut sent = 0usize;
+        while sent < payload.len() {
+            let chunk = &payload[sent..(sent + 16384).min(payload.len())];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), conn.write(chunk))
+                .await
+                .unwrap_or_else(|_| panic!("UPSTREAM STALL: write blocked at {sent} bytes"))
+                .expect("write");
+            sent += n;
+        }
+        let mut got = Vec::with_capacity(payload.len());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while got.len() < payload.len() {
+            let mut buf = vec![0u8; 16384];
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let n = tokio::time::timeout(budget, conn.read(&mut buf))
+                .await
+                .expect("echo timeout (payload stall)")
+                .expect("read");
+            assert!(n > 0, "echo closed early at {}/{} bytes", got.len(), payload.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload, "large payload roundtrip must be byte-identical");
     }
 }
 

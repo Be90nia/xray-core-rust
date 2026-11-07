@@ -352,62 +352,85 @@ impl Client {
 /// 解析 HTTP 错误响应（对应 Go `decodeStatusError`）。
 ///
 /// body 限制 `MAX_ERROR_BODY_SIZE` 字节，失败时返回空 [`ErrorResponse`]。
-pub async fn decode_status_error(resp: reqwest::Response) -> StatusError {
+pub async fn decode_status_error(mut resp: reqwest::Response) -> StatusError {
     let status_code = resp.status().as_u16();
-    // 取前 MAX_ERROR_BODY_SIZE 字节
-    let bytes = match resp.bytes().await {
-        Ok(b) if b.len() <= MAX_ERROR_BODY_SIZE => b.to_vec(),
-        Ok(b) => b.slice(..MAX_ERROR_BODY_SIZE).to_vec(),
-        Err(_) => Vec::new(),
-    };
+    // 边读边截（对位 Go `io.LimitReader(resp.Body, maxErrorBodySize)`）：先整包
+    // `bytes()` 再截断，恶意/异常服务端回巨大 body 时内存峰值在截断前就已经发生，
+    // 所谓「防 OOM」不成立（bd eec69）。读错误按 Go 语义吞掉（用已读部分解码）。
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY_SIZE {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = MAX_ERROR_BODY_SIZE - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            },
+            Ok(None) | Err(_) => break,
+        }
+    }
     let response: ErrorResponse = serde_json::from_slice(&bytes).unwrap_or_default();
     StatusError { status_code, response }
 }
+
+/// SSE 单行上限（对位 Go `newEventStream` 的 `scanner.Buffer(make([]byte, 1024),
+/// 1024*1024)`）：未收满一行就超限 = 流损坏，报错而不是让 `buf` 无界增长（bd ft7jw-b）。
+const MAX_SSE_LINE: usize = 1024 * 1024;
 
 /// SSE 事件流（对应 Go `EventStream`）。
 pub struct EventStream {
     response: reqwest::Response,
     buf: Vec<u8>,
+    /// 跨行累积状态：一个 SSE 事件由 `event:` / `data:` 行 + 空行收尾组成，
+    /// 状态必须跨行持有。逐行新建 `SseState` 会让事件永远凑不齐（bd ft7jw-a）。
+    state: SseState,
 }
 
 impl EventStream {
     fn new(response: reqwest::Response) -> Self {
-        Self { response, buf: Vec::with_capacity(4096) }
+        Self { response, buf: Vec::with_capacity(4096), state: SseState::default() }
     }
 
     /// 关闭底层响应体。
+    ///
+    /// 对位 Go `Close()` = `resp.Body.Close()`：丢弃响应即关闭连接。**不能**在这里
+    /// `bytes()`——SSE 是开放流，整包读会一直等到 EOF（无界阻塞 + 无界内存）。
     pub async fn close(self) {
-        let _ = self.response.bytes().await;
+        // 丢弃 `self` 即等价 Go `Body.Close()`（`reqwest::Response` Drop 释放/归还连接）。
     }
 
     /// 阻塞读取下一个 `punch` 事件；返回 `Ok(None)` 表示流结束。
     pub async fn next_event(&mut self) -> io::Result<Option<PunchEvent>> {
         loop {
-            // 尝试从 buffer 中按行解析
-            while let Some(line_end) = self.buf.iter().position(|b| *b == b'\n') {
-                let line_bytes: Vec<u8> = self.buf.drain(..=line_end).collect();
-                let line = String::from_utf8_lossy(&line_bytes);
-                let line = line.trim_end_matches('\r');
-                if let Some(result) = process_sse_line(line, &mut SseState::default())? {
-                    return Ok(Some(result));
-                }
+            if let Some(ev) = feed_lines(&mut self.buf, &mut self.state)? {
+                return Ok(Some(ev));
+            }
+            if self.buf.len() > MAX_SSE_LINE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "sse line too long"));
             }
             // 拉取下一块
             match self.response.chunk().await {
                 Ok(Some(chunk)) => self.buf.extend_from_slice(&chunk),
-                Ok(None) => {
-                    // EOF；检查 buffer 尾部是否有未触发事件
-                    let last = String::from_utf8_lossy(&self.buf);
-                    let last = last.trim_end_matches('\r');
-                    let _ = last;
-                    return Ok(None);
-                },
-                Err(e) => {
-                    return Err(io::Error::other(e));
-                },
+                // EOF：与 Go 一致，尾部未以空行收尾的半截事件丢弃。
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(io::Error::other(e)),
             }
         }
     }
+}
+
+/// 咀嚼 buffer 里所有已完整收尾的行（不拉网络）；返回解析出的 `punch` 事件。
+///
+/// 状态跨行/跨 chunk 累积是语义要求（见 [`EventStream::state`]），拆成独立函数
+/// 才能用字节流直接回归这条路径（bd ft7jw-a）。
+fn feed_lines(buf: &mut Vec<u8>, state: &mut SseState) -> io::Result<Option<PunchEvent>> {
+    while let Some(line_end) = buf.iter().position(|b| *b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=line_end).collect();
+        let line = String::from_utf8_lossy(&line_bytes);
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(ev) = process_sse_line(line, state)? {
+            return Ok(Some(ev));
+        }
+    }
+    Ok(None)
 }
 
 /// SSE 解析状态机（每行处理时维护）。
@@ -645,5 +668,25 @@ mod tests {
     fn sse_empty_input_returns_none() {
         let ev = parse_sse_event_from_lines(&[]).unwrap();
         assert!(ev.is_none());
+    }
+
+    /// bd ft7jw-a：事件由多行组成，状态必须跨行/跨 chunk 累积。
+    /// 旧实现每行 `SseState::default()` ⇒ 永远凑不出完整事件（功能 latent 坏）。
+    #[test]
+    fn sse_stream_accumulates_across_chunks() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut state = SseState::default();
+
+        // 块 1：只到了事件名（无换行收尾，仍在 buffer）
+        buf.extend_from_slice(b"event: punch\r\nda");
+        assert!(feed_lines(&mut buf, &mut state).unwrap().is_none());
+        // 块 2：data 行收尾，但缺空行 ⇒ 还不算完整事件
+        buf.extend_from_slice(b"ta: {\"addresses\":[],\"nonce\":\"n1\",\"obfs\":\"o1\"}\r\n");
+        assert!(feed_lines(&mut buf, &mut state).unwrap().is_none());
+        // 块 3：空行收尾 ⇒ 事件出现
+        buf.extend_from_slice(b"\r\n");
+        let ev = feed_lines(&mut buf, &mut state).unwrap().expect("跨 chunk 累积后应解析出事件");
+        assert_eq!(ev.metadata.nonce, "n1");
+        assert!(buf.is_empty(), "完整行应被 drain 掉，buffer 不留残渣");
     }
 }

@@ -686,7 +686,13 @@ impl InboundTcpListener {
     ) -> io::Result<(crate::finalmask::MaybeTcpMaskConn<tokio::net::TcpStream>, SocketAddr)> {
         let (stream, peer) = self.accept().await?;
         match self.tcpmask.as_deref() {
-            Some(mgr) => Ok((crate::finalmask::maybe_mask_server(mgr, stream)?, peer)),
+            Some(mgr) => {
+                let addrs = crate::finalmask::ConnAddrs {
+                    local: stream.local_addr().ok(),
+                    remote: Some(peer),
+                };
+                Ok((crate::finalmask::maybe_mask_server(mgr, stream, addrs)?, peer))
+            },
             None => Ok((crate::finalmask::MaybeTcpMaskConn::Plain(stream), peer)),
         }
     }
@@ -1853,8 +1859,12 @@ mod tcpmask_tests {
 
         // 客户端侧同一 mask 链（xray-transport-tcp dialer 同款 client 包装）。
         let raw = TcpStream::connect(addr).await.expect("connect");
+        let addrs = crate::finalmask::ConnAddrs {
+            local: raw.local_addr().ok(),
+            remote: raw.peer_addr().ok(),
+        };
         let raw: Box<dyn AsyncIo> = Box::new(raw);
-        let mut client = mask.wrap_conn_client(raw).expect("client mask");
+        let mut client = mask.wrap_conn_client(raw, addrs).expect("client mask");
         client.write_all(&data).await.expect("client write");
         let mut got = vec![0u8; data.len()];
         client.read_exact(&mut got).await.expect("client read");

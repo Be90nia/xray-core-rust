@@ -29,6 +29,7 @@ use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
     },
@@ -49,10 +50,11 @@ pub fn register_dialer() -> io::Result<()> {
         // bd w5jhf：socketSettings（含显式 receiveBufferSize）随拨号下发。
         Box::pin(async move { dial_grpc(&dest, &sockopt, &settings).await })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_dialer("grpc", dialer.clone());
-    let _ = register_transport_dialer("h2", dialer.clone());
-    let _ = register_transport_dialer("http", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`，注册静默失败
+    // ⇒ 拨号期 `NotFound`/明文 fallback）。
+    ignore_already_exists(register_transport_dialer("grpc", dialer.clone()))?;
+    ignore_already_exists(register_transport_dialer("h2", dialer.clone()))?;
+    ignore_already_exists(register_transport_dialer("http", dialer))?;
     Ok(())
 }
 
@@ -72,9 +74,9 @@ pub fn register_listener() -> io::Result<()> {
         let trusted = sockopt.trusted_x_forwarded_for.clone();
         Box::pin(async move { listen_grpc(addr, &settings, handler, trusted).await })
     });
-    let _ = register_transport_listener("grpc", listen_fn.clone());
-    let _ = register_transport_listener("h2", listen_fn.clone());
-    let _ = register_transport_listener("http", listen_fn);
+    ignore_already_exists(register_transport_listener("grpc", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("h2", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_listener("http", listen_fn))?;
     Ok(())
 }
 
@@ -96,10 +98,9 @@ pub fn register_unix_listener() -> io::Result<()> {
             crate::transport::listen_unix(path, settings, sockopt, handler, trusted).await
         })
     });
-    // ponytail: 重复注册忽略——主代理与测试可能并发触发注册。
-    let _ = register_transport_unix_listener("grpc", listen_fn.clone());
-    let _ = register_transport_unix_listener("h2", listen_fn.clone());
-    let _ = register_transport_unix_listener("http", listen_fn);
+    ignore_already_exists(register_transport_unix_listener("grpc", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_unix_listener("h2", listen_fn.clone()))?;
+    ignore_already_exists(register_transport_unix_listener("http", listen_fn))?;
     Ok(())
 }
 
@@ -141,8 +142,8 @@ mod tests {
         assert!(cfg.service_name.is_empty());
         assert!(cfg.authority.is_empty());
         assert!(!cfg.multi_mode);
-        // Bug-B：缺省 30s keepalive。
-        assert_eq!(cfg.idle_timeout, 30);
+        // Go 缺省：不装 keepalive（bd x0v47）。
+        assert_eq!(cfg.idle_timeout, 0);
         assert_eq!(cfg.user_agent, "");
     }
 
@@ -211,8 +212,8 @@ mod tests {
         let cfg = parse_grpc_config(Some(&v)).unwrap();
         assert!(cfg.service_name.is_empty());
         assert!(!cfg.multi_mode);
-        // Bug-B：缺省 30s keepalive（显式 0 才关闭）。
-        assert_eq!(cfg.idle_timeout, 30);
+        // Go 缺省：不装 keepalive（bd x0v47，显式配 idle_timeout 才启用）。
+        assert_eq!(cfg.idle_timeout, 0);
     }
 
     #[test]

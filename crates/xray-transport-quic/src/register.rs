@@ -12,6 +12,7 @@ use std::{io, sync::Arc};
 
 use xray_transport::{
     dialer::{TransportDialFn, register_transport_dialer},
+    ignore_already_exists,
     listener_registry::{TransportListenFn, register_transport_listener},
 };
 
@@ -25,7 +26,8 @@ pub fn register_dialer() -> io::Result<()> {
         let settings = settings.clone();
         Box::pin(async move { crate::transport::dial(&dest, &settings, &sockopt).await })
     });
-    let _ = register_transport_dialer("quic", dialer);
+    // 幂等放行 `AlreadyExists`，其余失败上抛（bd k2tq1：禁 `let _ =`）。
+    ignore_already_exists(register_transport_dialer("quic", dialer))?;
     Ok(())
 }
 
@@ -39,7 +41,7 @@ pub fn register_listener() -> io::Result<()> {
         let handler = handler.clone();
         Box::pin(async move { crate::transport::listen(addr, &settings, &sockopt, handler).await })
     });
-    let _ = register_transport_listener("quic", listen_fn);
+    ignore_already_exists(register_transport_listener("quic", listen_fn))?;
     Ok(())
 }
 

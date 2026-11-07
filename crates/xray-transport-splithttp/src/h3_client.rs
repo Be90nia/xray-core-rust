@@ -274,6 +274,13 @@ const DEFAULT_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// H3 dialer `dialer.go:177-183` 在 quicParams 与 xmux 都未给值时兜底此值）。
 const DEFAULT_KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(10);
 
+/// H3 缺省流接收窗（bd wz2b W4：quinn 缺省流收窗 1.25MB，高 BDP 下速率被钉成
+/// 1.25MB/RTT@169ms≈7.4MB/s；本常量取 16MiB 覆盖它）。客户端与服务端（bd 4bd2i）同口径。
+pub(crate) const DEFAULT_H3_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+/// H3 缺省连接接收窗（与 h2 族同值）。服务端必须显式设——quinn 缺省
+/// `receive_window = VarInt::MAX`（连接级无上限）。
+pub(crate) const DEFAULT_H3_CONNECTION_RECEIVE_WINDOW: u64 = 32 * 1024 * 1024;
+
 /// H3 QUIC 0-RTT 开关环境变量（bd fgzb）：设为 `0`/`false`/`off`/`no` 禁用，
 /// 未设或其他值 = 开启（对齐 Go `dialer.go:243` `tr.DialEarly`）。
 const ZERO_RTT_ENV: &str = "XRAY_H3_ZERO_RTT";
@@ -343,7 +350,8 @@ fn build_h3_transport_config(
     // bd x0f0r W2：Go `dialer.go:165-170` 同时消费 `Max*Window`（quic-go 的窗口
     // 动态增长**上限**，Initial 只是起点）。quinn 的 `stream_receive_window` /
     // `receive_window` 语义正是「上限」，故 Max>0 时优先 Max，其次 Initial。
-    let (mut stream_win, mut conn_win) = (16u64 * 1024 * 1024, 32u64 * 1024 * 1024);
+    let (mut stream_win, mut conn_win) =
+        (DEFAULT_H3_STREAM_RECEIVE_WINDOW, DEFAULT_H3_CONNECTION_RECEIVE_WINDOW);
     if let Some(qp) = quic_params {
         if qp.init_stream_receive_window > 0 {
             stream_win = qp.init_stream_receive_window;
@@ -583,7 +591,7 @@ impl H3Conn {
                     let server_name = server_name.to_string();
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；QUIC 0-RTT 结果观察任务（仅记日志）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+                        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；QUIC 0-RTT 结果观察任务（仅记日志）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
                     )]
                     tokio::spawn(async move {
                         let accepted = accepted.await;
@@ -609,7 +617,7 @@ impl H3Conn {
 
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；h3 连接 driver 关闭任务（驱动 poll_close）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；h3 连接 driver 关闭任务（驱动 poll_close）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -834,7 +842,7 @@ impl H3Conn {
         let me_for_closed = Arc::downgrade(&this);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 上行 body 发送任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 上行 body 发送任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let mut body_stream = Box::pin(body_stream);
@@ -869,7 +877,7 @@ impl H3Conn {
         let me_for_closed = Arc::downgrade(&this);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行响应读取任务；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行响应读取任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             // 响应头校验（对齐 DefaultDialerClient：非 200 → mark_closed + EOF）
@@ -933,7 +941,7 @@ where
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行接收任务（send_data/recv_data 均需 &mut self 故必须单 task）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行接收任务（send_data/recv_data 均需 &mut self 故必须单 task）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         loop {
@@ -986,7 +994,7 @@ where
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 懒读任务（收响应头 + 数据循环）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 懒读任务（收响应头 + 数据循环）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     tokio::spawn(async move {
         tokio::select! {
@@ -1063,11 +1071,14 @@ mod tests {
     }
 
     /// Go dialer.go:161-164：quicParams 缺省 → 兜底 standard profile + 空 congestion → BBR。
+    ///
+    /// bd hfb94：BBR 装的是 **quinn 内建 BBR**（走槽位 fallback 通道以拿全保真事件），
+    /// 故探针用 `is_bbr()` 而非 `has_active()`（后者只表示 hysteria active 算法）。
     #[test]
     fn splithttp_cc_none_defaults_to_bbr() {
         let slot = HysteriaCCSlot::new();
         apply_splithttp_cc(&slot, None).unwrap();
-        assert!(slot.has_active(), "quicParams None must install BBR (PR #5711)");
+        assert!(slot.is_bbr(), "quicParams None must install BBR (PR #5711)");
     }
 
     /// Go dialer.go:240 `case "", "bbr"`：两臂都装 BBR。
@@ -1077,7 +1088,8 @@ mod tests {
             let slot = HysteriaCCSlot::new();
             let qp = qp_from_json(congestion, r#","bbrProfile":"aggressive""#);
             apply_splithttp_cc(&slot, Some(&qp)).unwrap();
-            assert!(slot.has_active(), "congestion={congestion:?} must install BBR");
+            assert!(slot.is_bbr(), "congestion={congestion:?} must install BBR");
+            assert!(!slot.has_active(), "BBR 不走 hysteria active 通道（bd hfb94）");
         }
     }
 

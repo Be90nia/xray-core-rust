@@ -16,6 +16,21 @@ pub const CLOSE_ERR_CODE_OK: u64 = 0x100;
 #[allow(non_upper_case_globals)] // 对齐 Go 协议字面命名
 pub const CLOSE_ERR_CODE_PROTOCOL_ERROR: u64 = 0x101;
 
+// ===== 服务端有界性常量（bd ral6w / nm37b） =====
+
+/// 入站 h3 认证阶段的读超时（bd ral6w，**加固**：Go 侧同样无 deadline）。
+///
+/// 未认证连接可开一条 h3 请求后不发完 HEADERS 即挂住，长期占用 server task 与流；
+/// 取 10s：真实客户端毫秒级送达请求头，慢链路余量充足。
+pub const AUTH_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 反代（masq）面**预认证**阶段的请求体聚合上限（bd nm37b）。
+///
+/// Go 把 `r.Body` 直接流式交给反代；本栈 h3 路径需先把数据帧汇总成 `Vec<u8>`
+/// （`MasqueradeHandler::serve_request` 的 body 是 `Vec<u8>`），原实现无上限 ⇒
+/// 恶意客户端可用大 body × 并发放大约 8MiB/流。超限回 413 并停止读流。
+pub const MAX_MASQ_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 // ===== HTTP 头部常量 =====
 
 /// HTTP Host（对应 Go `URLHost = "hysteria"`）。

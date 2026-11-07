@@ -10,6 +10,7 @@
 //! - **TCP packed**：6-bit group 编码（下行优化、服务端写、客户端读）
 
 mod codec;
+mod go_rand;
 mod table;
 
 use std::{io, sync::Arc};
@@ -87,7 +88,7 @@ impl Tcpmask for SudokuConfig {
         // Client：pipe→inner 走 pure 编码，inner→pipe 走 packed 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（sudoku client bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（sudoku client bridge）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, true));
         Ok(Box::new(client))
@@ -99,7 +100,7 @@ impl Tcpmask for SudokuConfig {
         // Server：pipe→inner 走 packed 编码，inner→pipe 走 pure 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面连接任务（sudoku server bridge）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（sudoku server bridge）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, false));
         Ok(Box::new(client))
@@ -121,7 +122,11 @@ async fn tcp_bridge(
 
     let tables = match get_tables(&config.password, &config.ascii, &config.custom_tables) {
         Ok(t) => t,
-        Err(_) => return,
+        Err(e) => {
+            // 静默 return 会让 mask 完全不通且无痕（bd 08wkx-e）。
+            crate::hot_log!(tracing::Level::ERROR, "error={e} sudoku: table build failed");
+            return;
+        },
     };
     let (p_min, p_max) = normalized_padding(&config);
 
@@ -134,7 +139,7 @@ async fn tcp_bridge(
     let layouts: Vec<Layout> = tables.iter().map(|t| t.layout.clone()).collect();
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面泵任务（inner→pipe 解码方向）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（inner→pipe 解码方向）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let back = tokio::spawn(async move {
         let mut packed_dec = PackedDecoder::default();
@@ -168,7 +173,13 @@ async fn tcp_bridge(
                                 break;
                             }
                         },
-                        Err(_) => break,
+                        Err(e) => {
+                            crate::hot_log!(
+                                tracing::Level::ERROR,
+                                "error={e} sudoku: decode failed, closing tcp mask bridge"
+                            );
+                            break;
+                        },
                     }
                 },
             }
@@ -193,7 +204,13 @@ async fn tcp_bridge(
                             break;
                         }
                     },
-                    Err(_) => break,
+                    Err(e) => {
+                        crate::hot_log!(
+                            tracing::Level::ERROR,
+                            "error={e} sudoku: encode failed, closing tcp mask bridge"
+                        );
+                        break;
+                    },
                 }
             },
         }
@@ -231,9 +248,16 @@ impl UdpIo for SudokuUdpConn {
     async fn send_to(&self, buf: &[u8], addr: std::net::SocketAddr) -> io::Result<usize> {
         // UDP 编码每个 datagram 都从头开始（Go conn_udp.go 同语义）
         let mut codec = Codec::new(self.tables.clone(), self.p_min, self.p_max);
-        let encoded =
-            codec.encode(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // 编码失败时静默 drop（Go 同样返回 0, nil）
+        let encoded = codec.encode(buf).map_err(|e| {
+            // Go `conn_udp.go:78` 在编码失败时 LogError 后丢包；这里保留 Err 返回但先可见
+            // （bd 08wkx-e：静默失败在这条路径上排查成本最高）。
+            crate::hot_log!(
+                tracing::Level::ERROR,
+                "error={e} addr={addr} size={} sudoku: drop packet (encode failed)",
+                buf.len()
+            );
+            io::Error::new(io::ErrorKind::InvalidData, e)
+        })?;
         self.inner.send_to(&encoded, addr).await
     }
 
@@ -252,13 +276,26 @@ impl UdpIo for SudokuUdpConn {
             ) {
                 Ok((hint_buf, decoded)) => {
                     if !hint_buf.is_empty() || decoded.len() > buf.len() {
-                        // 不完整或超长，drop（Go 同样 continue）
+                        // 不完整或超长，drop（Go 同样 continue，但会 LogError，bd 08wkx-e）
+                        crate::hot_log!(
+                            tracing::Level::ERROR,
+                            "addr={addr} size={n} hints={} decoded={} sudoku: drop packet (incomplete or oversize)",
+                            hint_buf.len(),
+                            decoded.len()
+                        );
                         continue;
                     }
                     buf[..decoded.len()].copy_from_slice(&decoded);
                     return Ok((decoded.len(), addr));
                 },
-                Err(_) => continue, // 解码错误，drop packet
+                Err(e) => {
+                    // 解码错误（Go `conn_udp.go:54-56` LogErrorInner 后 continue）
+                    crate::hot_log!(
+                        tracing::Level::ERROR,
+                        "error={e} addr={addr} size={n} sudoku: drop packet (decode failed)"
+                    );
+                    continue;
+                },
             }
         }
     }

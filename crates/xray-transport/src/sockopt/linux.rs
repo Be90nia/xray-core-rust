@@ -297,34 +297,84 @@ const IP_RECVORIGDSTADDR: i32 = 20;
 /// 通过 SO_ORIGINAL_DST 获取被 iptables REDIRECT 的 TCP 连接的原始目标地址。
 /// 对应 Go `transport/internet/sockopt_linux.go::GetOriginalDest`。
 ///
+/// 双栈：level 按**连接族**选（v4 `IPPROTO_IP` / v6 `IPPROTO_IPV6`），option 号两族
+/// 相同（Go `sockopt_linux.go:29-41`）。旧实现恒用 `IPPROTO_IP` + `sockaddr_in`
+/// ⇒ v6 连接（ip6tables REDIRECT/TPROXY）永远 Err，dokodemo `followRedirect`
+/// 静默降级到 predefined_address（bd axccl）。
+///
 /// 仅在 Linux 上有效，需要 root 或 CAP_NET_ADMIN。
 /// 返回原始目标 `SocketAddr`（被 iptables REDIRECT 前的地址）。
 pub fn get_original_dst(fd: i32) -> io::Result<std::net::SocketAddr> {
+    let (level, is_v6) = original_dst_level(fd)?;
+    // 缓冲取 sockaddr_storage：两族共用同一 option 号，内核按 level 填 v4/v6 结构
+    // （Go 用 `GetsockoptIPv6MTUInfo` 也是借更大缓冲容纳两族）。
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut addr_len: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     // SAFETY: getsockopt 读取内核存储的原始目标地址，不修改 fd 状态。
     // SO_ORIGINAL_DST 是只读选项，内核填充 sockaddr 结构后返回。
-    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     unsafe {
         let ret = libc::getsockopt(
             fd,
-            libc::SOL_IP,
+            level,
             SO_ORIGINAL_DST,
-            &mut addr as *mut libc::sockaddr_in as *mut libc::c_void,
+            &mut addr as *mut libc::sockaddr_storage as *mut libc::c_void,
             &mut addr_len,
         );
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
     }
-    if addr.sin_family != libc::AF_INET as u16 {
+    if is_v6 {
+        if addr.ss_family != libc::AF_INET6 as u16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SO_ORIGINAL_DST returned non-IPv6 address",
+            ));
+        }
+        // SAFETY: level=IPPROTO_IPV6 ⇒ 内核填 sockaddr_in6，头部与 sockaddr_storage 同址对齐。
+        let v6 = unsafe { &*std::ptr::from_ref(&addr).cast::<libc::sockaddr_in6>() };
+        let port = u16::from_be(v6.sin6_port);
+        let ip = std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr);
+        return Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+            ip,
+            port,
+            0,
+            v6.sin6_scope_id,
+        )));
+    }
+    if addr.ss_family != libc::AF_INET as u16 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SO_ORIGINAL_DST returned non-IPv4 address",
         ));
     }
-    let port = u16::from_be(addr.sin_port);
-    let ip = std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+    // SAFETY: level=IPPROTO_IP ⇒ 内核填 sockaddr_in，头部与 sockaddr_storage 同址对齐。
+    let v4 = unsafe { &*std::ptr::from_ref(&addr).cast::<libc::sockaddr_in>() };
+    let port = u16::from_be(v4.sin_port);
+    let ip = std::net::Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes());
     Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+}
+
+/// 按连接族选 SO_ORIGINAL_DST 的 level（Go `sockopt_linux.go:29-32` 按远端地址族选）。
+///
+/// Go 用 `conn.RemoteAddr().String()[0] == '['` 判 v6；Rust 侧只有 raw fd，
+/// 用 `getpeername` 取对端族（同一判据、免字符串解析）。
+fn original_dst_level(fd: i32) -> io::Result<(i32, bool)> {
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: getpeername 只读，把对端地址写入调用方缓冲。
+    let ret = unsafe {
+        libc::getpeername(fd, std::ptr::from_mut(&mut peer).cast::<libc::sockaddr>(), &mut len)
+    };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(if peer.ss_family == libc::AF_INET6 as u16 {
+        (libc::IPPROTO_IPV6, true)
+    } else {
+        (libc::IPPROTO_IP, false)
+    })
 }
 
 /// 启用 IP_RECVORIGDSTADDR，用于 UDP TProxy 获取原始目标地址。
@@ -349,4 +399,28 @@ pub fn set_ip_recvorigdstaddr(fd: i32) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream},
+        os::fd::AsRawFd,
+    };
+
+    /// bd axccl：level 必须按连接族选（v6 连接用 `IPPROTO_IP` 恒 Err ⇒ dokodemo
+    /// `followRedirect` 静默降级到 predefined_address）。
+    #[test]
+    fn original_dst_level_follows_connection_family() {
+        let l4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let c4 = TcpStream::connect(l4.local_addr().unwrap()).unwrap();
+        let _4 = l4.accept().unwrap();
+        assert_eq!(super::original_dst_level(c4.as_raw_fd()).unwrap(), (libc::IPPROTO_IP, false));
+
+        // 无 IPv6 的环境（容器关 v6）跳过该半段，不算失败。
+        let Ok(l6) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else { return };
+        let c6 = TcpStream::connect(l6.local_addr().unwrap()).unwrap();
+        let _6 = l6.accept().unwrap();
+        assert_eq!(super::original_dst_level(c6.as_raw_fd()).unwrap(), (libc::IPPROTO_IPV6, true));
+    }
 }

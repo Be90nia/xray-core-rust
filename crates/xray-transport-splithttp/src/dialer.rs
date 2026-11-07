@@ -164,7 +164,7 @@ pub async fn dial_packet_up(
     let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面上传泵（packet-up pipe→并发 POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（packet-up pipe→并发 POST）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -555,12 +555,12 @@ where
     let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面上传泵（H3 packet-up pipe→POST）；显式脱管：ctx 不可达（transport 层无 PluginContext）+ 寿命随 client 关闭 pipe 写端（bd hj3jf）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（H3 packet-up pipe→POST）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        // 池化语义单缓冲：split().freeze() 摘出整块所有权转移给 POST body，
-        // 容量跨 chunk 复用（免逐 chunk to_vec 分配+拷贝）
+        // 单缓冲：split().freeze() 把整块所有权转给 POST body，之后每轮 reserve 重新
+        // 要一份容量（容量不跨 chunk 复用——见下方 split 语义注释，bd yqyi6）
         let mut read_buf = bytes::BytesMut::with_capacity(sc_max_each_post_bytes);
         let mut last_write = std::time::Instant::now();
         loop {
@@ -573,8 +573,13 @@ where
                     break;
                 },
             };
+            // bd yqyi6：`split()` 把**整块容量**随 payload 转移走（split_to(len) 后
+            // 剩余容量 = 0），下一轮 `read_buf()` 见 `has_remaining_mut()==false`
+            // 立刻返回 Ok(0) ⇒ 循环 break、上行泵静默死亡（只能发出第一块）。
+            // 必须重新预留容量（同 xray-transport-quic/src/transport.rs 的 loop 内 reserve）。
             let payload = read_buf.split().freeze();
             debug_assert_eq!(n, payload.len());
+            read_buf.reserve(sc_max_each_post_bytes);
             let seq_str = seq.to_string();
             seq += 1;
 
@@ -837,7 +842,7 @@ where
     // spawn conn driver（必须，否则 h2 连接不动）
     #[allow(
         clippy::disallowed_methods,
-        reason = "数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动）；显式脱管：托管无收益（ctx 不可达），寿命随其所属连接/会话对象，句柄无需持有（bd hj3jf 裁定）"
+        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
     )]
     // 站点归因（S3）：REALITY 直连路径的 h2 驱动任务在此 spawn（不走
     // DefaultDialerClient 的 Executor 缝），DATA 帧解析/流控/发送缓冲全在该任务
@@ -1167,5 +1172,36 @@ mod tests {
             gap < std::time::Duration::from_millis(200),
             "DATA frame should arrive within 200ms of HEADERS (first packet written by caller), got {gap:?}"
         );
+    }
+
+    /// bd yqyi6 契约：`dial_h3_packet_up` 上行泵的缓冲语义——`BytesMut::split()`
+    /// 把整块容量随 payload 转走（剩余容量 0 ⇒ tokio `read_buf` 直接 `Ok(0)`），
+    /// 所以每轮 split 后必须 `reserve`。这里用 duplex 钉住该不变式：缺 reserve 时
+    /// 第二轮读必返回 0，泵只发第一块（生产行为静默丢上传）。
+    #[tokio::test]
+    async fn upload_pump_buffer_survives_split() {
+        use tokio::io::{AsyncWriteExt as _, duplex};
+
+        const CHUNK: usize = 16;
+        let (mut w, mut r) = duplex(64);
+        w.write_all(&[b'A'; CHUNK]).await.unwrap();
+        w.write_all(&[b'B'; CHUNK]).await.unwrap();
+        drop(w);
+
+        let mut read_buf = bytes::BytesMut::with_capacity(CHUNK);
+        let mut payloads = Vec::new();
+        loop {
+            let n = r.read_buf(&mut read_buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let payload = read_buf.split().freeze();
+            // 生产行同款（dialer.rs `dial_h3_packet_up` 泵内）。
+            read_buf.reserve(CHUNK);
+            payloads.push(payload);
+        }
+        assert_eq!(payloads.len(), 2, "两块数据都必须到达（split 后不 reserve 只到一块）");
+        assert_eq!(&payloads[0][..], &[b'A'; CHUNK]);
+        assert_eq!(&payloads[1][..], &[b'B'; CHUNK]);
     }
 }

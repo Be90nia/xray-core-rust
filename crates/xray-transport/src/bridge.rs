@@ -318,6 +318,114 @@ fn p7lm_trace() -> bool {
     *P7LM_TRACE
 }
 
+// ── 内存自适应的在途字节闸 + 连接数上限（bd sfqlu，2026-11-07 用户拍板）──
+//
+// 分工：**单连接窗口不压缩**（BDP 是吞吐命脉，u440m 砍到 2MiB 即 −6.1%），
+// 内存靠**连接数上限**（`总预算 / 每连接规划上界`）控制。字节闸只在「生产者远快于
+// 消费者」的满载瞬态兜底，闸值恒 ≥ 实测 BDP 上沿（3.56MB）⇒ 正常链路不 binding。
+
+/// 每方向在途字节闸。
+///
+/// 闸值 = [`xray_common::mem_probe::MemoryPlan::bridge_gate`]（四档 5/12/24/32 MiB）。
+/// 为什么不是 u440m 的固定 2MiB：RTT 161.6ms 下 BDP 2.39–3.56MB > 2MiB ⇒ 闸把吞吐
+/// 钉在 ≈12.9MB/s（A/B 中位比 0.939，超 5% 门已回退）。闸的用途只是把「64 条目 ×
+/// 512KiB = 32MiB/方向」的满载瞬态收成有限值。
+struct ByteGate {
+    cap: usize,
+    inflight: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+/// 在途字节许可（随块 move 到写腿，写完 drop 即归还）。
+struct GatePermit {
+    gate: std::sync::Arc<ByteGate>,
+    bytes: usize,
+}
+
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        self.gate.inflight.fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.gate.notify.notify_one();
+    }
+}
+
+impl ByteGate {
+    fn new(cap: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cap,
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// 取 `bytes` 字节在途许可；未超闸时**零等待**（一次原子读 + 一次原子加）。
+    async fn acquire(self: &std::sync::Arc<Self>, bytes: usize) -> GatePermit {
+        loop {
+            let inflight = self.inflight.load(std::sync::atomic::Ordering::Acquire);
+            // 单个超闸块永不阻塞（闸是软上界，堵死 = 连接挂死）：只在闸内叠加时等。
+            // 并发下两个块可能同时通过判定而超闸少量——软上界，不追精确。
+            if inflight == 0 || inflight + bytes <= self.cap {
+                self.inflight.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+                return GatePermit { gate: std::sync::Arc::clone(self), bytes };
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// 进程内在跑的双向桥数（= 代理连接数）。
+static ACTIVE_BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 连接名额（drop 即归还）。触顶 = [`ConnSlot::try_acquire`] 返 `None`。
+struct ConnSlot;
+
+impl ConnSlot {
+    /// 取一个连接名额；已达本机档位上限 → `None`（调用方 fail-visible 拒绝）。
+    fn try_acquire() -> Option<Self> {
+        let limit = xray_common::mem_probe::MemoryPlan::cached().max_conns;
+        try_take_slot(&ACTIVE_BRIDGES, limit).then_some(Self)
+    }
+}
+
+/// 原子占名额（`fetch_update` 保证「判定 + 自增」不可分割，不会超发）。
+fn try_take_slot(active: &std::sync::atomic::AtomicUsize, limit: usize) -> bool {
+    active
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |cur| (cur < limit).then_some(cur + 1),
+        )
+        .is_ok()
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        ACTIVE_BRIDGES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// 连接数触顶的 fail-visible 拒绝（日志 + `Err`）：绝不静默降级、绝不放任 OOM。
+fn connection_limit_error() -> io::Error {
+    let plan = xray_common::mem_probe::MemoryPlan::cached();
+    tracing::error!(
+        target: "xray_frame::bridge",
+        limit = plan.max_conns,
+        tier = plan.tier.as_str(),
+        budget = plan.total_budget,
+        "已达本机内存档位上限 {} 条连接（tier {} / 预算 {}B），拒绝新连接",
+        plan.max_conns,
+        plan.tier.as_str(),
+        plan.total_budget
+    );
+    io::Error::other(format!(
+        "connection limit reached: 已达本机内存档位上限 {} 条（tier {} / 预算 {}B；\
+         可用 XRAY_MAX_CONNS 覆盖）",
+        plan.max_conns,
+        plan.tier.as_str(),
+        plan.total_budget
+    ))
+}
+
 /// 下行读一轮，把这轮分配归到 [`xray_common::alloc_site::BUF_READ`] 站点
 /// （票 4y9ns Phase 0：读缓冲归因）。
 ///
@@ -509,6 +617,12 @@ fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
 /// 意义，随闸一并删除。登记簿口径见
 /// `xray_frame::budget::BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`。
 ///
+/// **bd sfqlu 重新引入（口径已修正）**：字节闸回来了，但值不再是拍定的 2MiB，
+/// 而是按本机内存档位派生（`ByteGate`，四档 5/12/24/32 MiB/方向）——下限
+/// 4MiB 即「≥ 实测 BDP 上沿 3.56MB」，正常链路不 binding；内存上界改由
+/// **连接数上限**（`ConnSlot`）兜，不再靠压单连接窗口。u440m 的教训因此保留：
+/// 闸值低于 BDP = 直接砍吞吐。
+///
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
 ///
 /// 与 [`bridge_link_with_stream`] 区别：两个方向独立运行到都完成，任一方向
@@ -540,6 +654,10 @@ where
 {
     use tokio::{io::AsyncWriteExt, time::timeout};
     use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader_whole};
+
+    // bd sfqlu：连接数上限 = 总预算 / 每连接规划上界（四档 13/32/64/170 条）。
+    // 触顶 fail-visible 拒绝（日志 + Err，连接随 drop 关闭），静默降级/自作 OOM 都不允许。
+    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
@@ -596,10 +714,18 @@ where
     //   「字节闸回退说明」）。只影响内存上限、不影响正确性；改容量属行为面
     //   变更（bd n580i：只修口径）。
     const PIPE_BUF_CAP: usize = 64;
+    // bd sfqlu：条目闸之上再加每方向**在途字节**闸（档位派生，恒 ≥ 实测 BDP 上沿）。
+    // 与 u440m 的区别在闸值来源：那边拍死 2MiB（< BDP ⇒ 砍吞吐），这边随本机内存
+    // 档位派生且恒 ≥ 4MiB。两者叠加 = 「条数 + 字节」双上界。
+    // 条目闸管「多少批在排队」，字节闸管「一共压了多少内存」——单批可达 512KiB，
+    // 64 条满载 = 32MiB/方向，小内存机器上这才是真上界。
+    let gate_bytes = xray_common::mem_probe::MemoryPlan::cached().bridge_gate;
+    let up_gate = ByteGate::new(gate_bytes);
+    let down_gate = ByteGate::new(gate_bytes);
     let (up_tx, mut up_rx) =
-        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
+        tokio::sync::mpsc::channel::<(xray_buf::multi::MultiBuffer, GatePermit)>(PIPE_BUF_CAP);
     let (down_tx, mut down_rx) =
-        tokio::sync::mpsc::channel::<xray_buf::multi::MultiBuffer>(PIPE_BUF_CAP);
+        tokio::sync::mpsc::channel::<(xray_buf::multi::MultiBuffer, GatePermit)>(PIPE_BUF_CAP);
 
     // 半关闭限窗（对应 Go policy Timeout.UplinkOnly/DownlinkOnly，proxy 层
     // `defer timer.SetTimeout(...)` 语义）：一方向读侧结束后，另一方向在窗口
@@ -667,12 +793,17 @@ where
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "up_read", "");
                         }
                         bytes_done += mb.len() as u64;
+                        // 字节闸：许可随块 move 到写腿，写完才归还（drop）。
+                        let permit = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
+                            p = up_gate.acquire(mb.len()) => p,
+                        };
                         // channel 满阻塞在此（不抢对向时间片）；writer task 已死时
                         // send 立即 Err → 本向级联退出，绝不静默吞数据。关闸时
                         // 放弃在飞批次（收尾态，连接已被判死）。
                         let sent = tokio::select! {
                             _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                            r = up_tx.send(mb) => r,
+                            r = up_tx.send((mb, permit)) => r,
                         };
                         if sent.is_err() {
                             break LegExit::PeerEnded;
@@ -697,10 +828,10 @@ where
         async move {
             let mut up_bytes: u64 = 0;
             let end = loop {
-                let mb = tokio::select! {
+                let (mb, _permit) = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break end_policy::LegEnd::Aborted,
                     r = up_rx.recv() => match r {
-                        Some(mb) => mb,
+                        Some(item) => item,
                         // 读腿已退出：原因由它 store（store 早于 up_tx drop）。
                         None => break end_policy::LegEnd::from_code(
                             up_end.load(std::sync::atomic::Ordering::Acquire),
@@ -784,9 +915,14 @@ where
                             tracing::warn!(target: "p7lm", bytes = mb.len(), phase = "down_read", "");
                         }
                         bytes_done += mb.len() as u64;
+                        // 字节闸（bd sfqlu）：同上行，许可随块走。
+                        let permit = tokio::select! {
+                            _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
+                            p = down_gate.acquire(mb.len()) => p,
+                        };
                         let sent = tokio::select! {
                             _ = wait_abort(&mut abort_rx) => break LegExit::Aborted,
-                            r = down_tx.send(mb) => r,
+                            r = down_tx.send((mb, permit)) => r,
                         };
                         if sent.is_err() {
                             break LegExit::PeerEnded;
@@ -807,10 +943,10 @@ where
         async move {
             let mut dw_bytes: u64 = 0;
             loop {
-                let mb = tokio::select! {
+                let (mb, _permit) = tokio::select! {
                     _ = wait_abort(&mut abort_rx) => break,
                     r = down_rx.recv() => match r {
-                        Some(mb) => mb,
+                        Some(item) => item,
                         None => break,
                     },
                 };
@@ -842,20 +978,29 @@ where
             }
             let flush_res =
                 timeout(std::time::Duration::from_secs(3), writer.shutdown_flush()).await;
-            if p7lm_trace {
-                match &flush_res {
-                    Ok(Ok(())) => {
+            // 三态**判据恒可见**（bd cj8g7）：超时/出错是真收尾风险（滞留尾巴静默
+            // 蒸发 ⇒ 对端 deframer 卡半条记录），不能只在 XRAY_P7LM_TRACE 门内报；
+            // 成功态是纯诊断（每连接一条 warn 的税没必要），仍归 trace 开关。
+            match &flush_res {
+                Ok(Ok(())) => {
+                    if p7lm_trace {
                         tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_ok", "")
-                    },
-                    Ok(Err(e)) => {
-                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_err", err = %e)
-                    },
-                    Err(_) => {
-                        tracing::warn!(target: "p7lm", total = dw_bytes, phase = "shutdown_flush_timeout_3s", "")
-                    },
-                }
+                    }
+                },
+                Ok(Err(e)) => tracing::warn!(
+                    target: "xray_frame::bridge",
+                    leg = "down_write",
+                    total = dw_bytes,
+                    err = %e,
+                    "bridge shutdown_flush failed (buffered tail may be lost)"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "xray_frame::bridge",
+                    leg = "down_write",
+                    total = dw_bytes,
+                    "bridge shutdown_flush timed out after 3s (buffered tail may be lost)"
+                ),
             }
-            let _ = flush_res;
             // CloseWrite+排空。3s 上限防极端积压下收尾挂死（连接本就在收尾）。
             io::Result::Ok(())
         }
@@ -921,6 +1066,9 @@ where
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
+
+    // bd sfqlu：连接数上限（同 bridge_link_with_stream_full，触顶 fail-visible 拒绝）。
+    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
 
     // 准入已要求出站 raw；克隆失败（理论不可达）时下行退化为立即结束，
     // 上行照常泵完（连接可用性不受影响）。
@@ -1068,6 +1216,9 @@ pub async fn bridge_link_with_link(
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
+
+    // bd sfqlu：连接数上限（同 bridge_link_with_stream_full，触顶 fail-visible 拒绝）。
+    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
 
     let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
     let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
@@ -1250,6 +1401,84 @@ mod tests {
 
     use super::*;
     use crate::connection::TcpConnection;
+
+    /// bd sfqlu：字节闸在未超闸时零等待、超闸时阻塞到写腿归还；单个超闸块永不
+    /// 阻塞（否则单块 > 闸即连接挂死）。
+    #[tokio::test]
+    async fn byte_gate_blocks_only_when_over_cap() {
+        let gate = ByteGate::new(4 * 1024 * 1024);
+        let first = gate.acquire(3 * 1024 * 1024).await;
+
+        // 未超闸（3MiB + 1MiB = 4MiB ≤ cap）：立即返回。
+        let second = gate.acquire(1024 * 1024).await;
+
+        // 再要 1 字节即超闸：必须等第一块归还。
+        let blocked = tokio::spawn({
+            let gate = std::sync::Arc::clone(&gate);
+            async move { gate.acquire(1).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!blocked.is_finished(), "超闸后不得放行（否则字节闸形同虚设）");
+
+        // 归还 3MiB ⇒ 闸内剩 1MiB，1 字节请求立即可过。
+        drop(first);
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("归还后必须放行")
+            .expect("join");
+        drop(third);
+        drop(second);
+    }
+
+    /// 单块 > 闸**不阻塞**（闸是软上界）：否则 cap < 单批 512KiB 时连接直接挂死。
+    #[tokio::test]
+    async fn byte_gate_allows_single_oversize_block() {
+        let gate = ByteGate::new(1024);
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire(4096))
+            .await
+            .expect("超闸单块必须放行（堵死 = 连接挂死）");
+    }
+
+    /// 连接名额的「判定 + 自增」必须原子且不超发；触顶返 false（fail-visible 拒绝）。
+    ///
+    /// 用独立计数器测（不碰全局 `ACTIVE_BRIDGES`：同进程其它桥测试会并发读写它）。
+    #[test]
+    fn conn_slot_limit_is_atomic_and_rejects_past_cap() {
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        assert!(try_take_slot(&active, 2));
+        assert!(try_take_slot(&active, 2));
+        assert!(!try_take_slot(&active, 2), "已达上限必须拒绝（不静默放行）");
+        assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 2, "拒绝时不得自增");
+        assert!(try_take_slot(&active, 3), "上限提高后可再取（覆盖 XRAY_MAX_CONNS）");
+
+        // 并发下不超发：8 个任务抢 3 个名额，恰好 3 个成功。
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ok = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let active = std::sync::Arc::clone(&active);
+                let ok = std::sync::Arc::clone(&ok);
+                scope.spawn(move || {
+                    if try_take_slot(&active, 3) {
+                        ok.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                });
+            }
+        });
+        assert_eq!(ok.load(std::sync::atomic::Ordering::Acquire), 3, "名额不得超发");
+    }
+
+    /// 触顶错误必须点名「本机内存档位上限 + 条数」（日志/Err 双可见）。
+    #[test]
+    fn connection_limit_error_names_tier_limit() {
+        let err = connection_limit_error();
+        let text = err.to_string();
+        let plan = xray_common::mem_probe::MemoryPlan::cached();
+        assert!(text.contains("connection limit reached"), "{text}");
+        assert!(text.contains(&plan.max_conns.to_string()), "必须点名条数：{text}");
+        assert!(text.contains(plan.tier.as_str()), "必须点名档位：{text}");
+        assert!(text.contains("XRAY_MAX_CONNS"), "必须告知覆盖手段：{text}");
+    }
 
     /// bd 7p1m：`XRAY_P7LM_TRACE=0` 必须视为关闭（旧 `.is_ok()` 语义会误开埋点，
     /// 曾把 F2/F3 优化实测毒化成伪影）。

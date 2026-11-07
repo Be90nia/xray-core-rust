@@ -98,6 +98,11 @@ pub async fn dial(
     // gRPC path：`/{service}/{stream}`（Go grpc URI 契约；无前导 '/' 的裸服务名
     // 是非法 h2 URI → RST_STREAM）。防御性规整：service/stream 段为空或缺前导 '/'
     // 时补默认（Go `TunCustomName` 等价但上游 service_name 对 "/foo" 返回空串）。
+    //
+    // **已知且有意的偏离**（bd yzl0n）：`service_name()` 已按 Go `config.go:29-32`
+    // 返回空串（单段绝对路径 `/foo` / `/`），但这里把空服务名补成 `GunService` 而
+    // 不是 Go 的 `//foo`——空段路径在 h2 上是非法 URI。触发面仅「serviceName 恰写
+    // 单段绝对路径」，普通配置（`GunService` / `/A/B/Tun`）与 Go 逐字一致。
     let path = normalize_grpc_path(&cfg);
 
     // Go dial.go:147-153 authority 三级判定（0tnw：grpc_authority）。
@@ -379,7 +384,17 @@ where
                     match tokio::time::timeout(pong_timeout, pinger.ping(h2::Ping::opaque())).await {
                         Ok(Ok(_)) => {}
                         // PONG 超时 / PING 失败 → break 后 drop 连接 task 断链。
-                        _ => break,
+                        // bd x0v47：断链留痕（此前静默 break，线上零痕迹）。
+                        Ok(Err(e)) => {
+                            crate::LOG.warn(format!("grpc keepalive PING 失败，关闭连接: {e}"));
+                            break;
+                        },
+                        Err(_) => {
+                            crate::LOG.warn(format!(
+                                "grpc keepalive PONG 超时（{pong_timeout:?}），关闭连接"
+                            ));
+                            break;
+                        },
                     }
                 }
                 res = &mut h2_conn => {
@@ -501,11 +516,11 @@ pub async fn listen(
     trusted: Vec<String>,
 ) -> io::Result<Box<dyn TransportListener>> {
     let cfg = parse_config(settings)?;
-    // serviceName 校验（Go gRPC 框架按注册 path 路由，未知 method 404）：
-    // 非空 serviceName → 请求 path 必须等于 normalize_grpc_path，否则 404；
+    // serviceName 校验（Go `RegisterGRPCServiceServerX` 同时注册 Tun + TunMulti 两条
+    // stream ⇒ 两条 path 都接受，帧格式由命中 path 决定，见 `server_stream_paths`）；
     // 空 serviceName 保持现状全放行（兼容既有部署）。
     let expected_path =
-        if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
+        if cfg.service_name.is_empty() { None } else { Some(server_stream_paths(&cfg)) };
     let multi_mode = cfg.multi_mode;
     let listener = xray_transport::system_listener::bind_tcp_listener(
         addr,
@@ -671,7 +686,7 @@ async fn serve_grpc_conn(
     stream: Box<dyn Connection>,
     h: ConnHandler,
     tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>,
-    ep: Option<String>,
+    ep: Option<(String, String)>,
     mm: bool,
     peer: SocketAddr,
     tr: Arc<Vec<String>>,
@@ -719,7 +734,7 @@ pub async fn listen_unix(
     }
     let cfg = parse_config(&settings)?;
     let expected_path =
-        if cfg.service_name.is_empty() { None } else { Some(normalize_grpc_path(&cfg)) };
+        if cfg.service_name.is_empty() { None } else { Some(server_stream_paths(&cfg)) };
     let multi_mode = cfg.multi_mode;
     let listener =
         xray_transport::system_listener::UnixListener::bind(&path, sockopt.clone()).await?;
@@ -796,7 +811,7 @@ pub async fn listen_unix(
 async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     conn: T,
     handler: ConnHandler,
-    expected_path: Option<String>,
+    expected_path: Option<(String, String)>,
     multi_mode: bool,
     peer: SocketAddr,
     trusted: &[String],
@@ -840,13 +855,15 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                 tick.tick().await; // 首跳立即返回
                 loop {
                     tick.tick().await;
-                    if tokio::time::timeout(
-                        std::time::Duration::from_secs(ka_timeout.max(1)),
-                        pinger.ping(h2::Ping::opaque()),
-                    )
-                    .await
-                    .is_err()
+                    let pong_timeout = std::time::Duration::from_secs(ka_timeout.max(1));
+                    if tokio::time::timeout(pong_timeout, pinger.ping(h2::Ping::opaque()))
+                        .await
+                        .is_err()
                     {
+                        // bd x0v47：断链留痕（此前静默 break，线上零痕迹）。
+                        crate::LOG.warn(format!(
+                            "grpc keepalive PONG 超时（{pong_timeout:?}），关闭连接"
+                        ));
                         break; // PONG 超时 → task 退出（PingPong drop，连接由 accept 循环终结）
                     }
                 }
@@ -882,8 +899,14 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
         // H13：源地址信任门控（Go encoding/remoteaddr.go:13-40
         // remoteAddrFromContext：XFF 存在且名单 header 命中才采纳首段 IP）。
         let remote_addr = extract_trusted_remote(req.headers(), peer, trusted);
-        if let Some(expected) = &expected_path {
-            if req.uri().path() != expected {
+        // Go 同时注册 Tun + TunMulti 两条 stream（bd dlzd5）：命中哪条 path 决定帧格式，
+        // 与自身 multiMode 配置无关。自定义名无 `|` 时两条 path 同名（Go 同样歧义），
+        // 由自身 multiMode 兜底。
+        let multi_mode = match &expected_path {
+            Some((single, multi)) if single == multi => multi_mode,
+            Some((_, multi)) if req.uri().path() == multi => true,
+            Some((single, _)) if req.uri().path() == single => false,
+            Some(_) => {
                 // H13：未知路径回 gRPC Trailers-Only 响应（:status 200 +
                 // grpc-status 12 Unimplemented），对齐 grpc-go WriteStatus
                 // 语义——此前裸 404 与合法 gRPC 探测可区分。
@@ -896,8 +919,9 @@ async fn accept_h2<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
                     .expect("fixed trailers-only response");
                 let _ = respond.send_response(r, true);
                 continue;
-            }
-        }
+            },
+            None => multi_mode,
+        };
         let mut recv_body = req.into_body();
         let mut send_resp = match respond.send_response(
             http::Response::builder()
@@ -1173,6 +1197,22 @@ pub(crate) fn normalize_grpc_path(cfg: &Config) -> String {
         format!("/{raw_stream}")
     };
     format!("{service}{stream}")
+}
+
+/// 服务端接受的两条 stream path：`(Tun, TunMulti)`。
+///
+/// Go `RegisterGRPCServiceServerX` 把 **两条** stream handler 同时注册进同一
+/// ServiceDesc（`encoding/customSeviceName.go:9-30`：`StreamName: tun` +
+/// `StreamName: tunMulti`），帧格式由**命中的 stream** 决定，与自身 `multiMode`
+/// 配置无关（`hub.go` 的 `Tun`/`TunMulti` 两个 handler）。Rust 旧实现按自身
+/// multiMode 只认一条 ⇒ 客户端 multiMode 与服务端不一致即 Unimplemented（bd dlzd5）。
+///
+/// 自定义名无 `|` 时 Go 的 `getTunMultiStreamName()` 与 `getTunStreamName()` 返回
+/// **同一串**（路径本身歧义）——此时由服务端自身 `multiMode` 兜底决定帧格式。
+fn server_stream_paths(cfg: &Config) -> (String, String) {
+    let single = normalize_grpc_path(&Config { multi_mode: false, ..cfg.clone() });
+    let multi = normalize_grpc_path(&Config { multi_mode: true, ..cfg.clone() });
+    (single, multi)
 }
 
 /// Go dial.go:190-202 的 userAgent 预设映射。
@@ -1564,6 +1604,59 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|v| !v.is_empty())).await;
         let got = rx.borrow().clone();
         assert_eq!(got, b"alphabetagamma", "multi-element MultiHunk must not truncate");
+    }
+
+    /// bd dlzd5：服务端 `multiMode=false` 也必须接受 `/{svc}/TunMulti`（Go
+    /// `RegisterGRPCServiceServerX` 同时注册 Tun + TunMulti 两条 stream），帧格式按
+    /// **命中 path** 解——此前服务端只认自身 multiMode 那条，跨配置即 Unimplemented。
+    #[tokio::test]
+    async fn listen_single_mode_accepts_multi_mode_client() {
+        let settings = StreamSettings {
+            protocol: "grpc".to_string(),
+            // multiMode 缺省 false：服务端自身是单流模式。
+            transport_json: Some(serde_json::json!({"serviceName": "MySvc"})),
+            ..StreamSettings::tcp()
+        };
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::new());
+        let handler: ConnHandler = Arc::new(move |conn| {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut conn = conn;
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 64];
+                let n = conn.read(&mut buf).await.unwrap_or(0);
+                let _ = tx.send(buf[..n].to_vec());
+            });
+        });
+        let listener = listen("127.0.0.1:0".parse().unwrap(), &settings, handler, Vec::new())
+            .await
+            .expect("listen");
+        let addr = listener.local_addr().unwrap();
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut send_req, conn) = client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/MySvc/TunMulti")
+            .header("content-type", "application/grpc")
+            .body(())
+            .unwrap();
+        let (resp_fut, mut stream) = send_req.send_request(req, false).unwrap();
+        tokio::spawn(async move {
+            let _ = resp_fut.await;
+        });
+        stream
+            .send_data(
+                Bytes::from(crate::encoding::encode_multi_hunk_frame(&[b"alpha", b"beta"])),
+                true,
+            )
+            .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|v| !v.is_empty())).await;
+        assert_eq!(rx.borrow().clone(), b"alphabeta", "单流模式服务端必须按 path=Multi 解帧");
     }
 
     #[test]

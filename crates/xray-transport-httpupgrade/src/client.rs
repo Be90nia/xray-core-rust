@@ -23,6 +23,11 @@ use crate::{
 const READ_INITIAL_CAPACITY: usize = 1024;
 /// HTTP/1.1 响应头读取缓冲上限（防恶意服务端发送超大 header）。
 const READ_MAX_CAPACITY: usize = 64 * 1024;
+/// 读 101 响应的超时窗（bd x0v47：对端不回 101 时此前无限挂起）。
+///
+/// 取 8s 与 ws 客户端 `HANDSHAKE_TIMEOUT` 同值（Go httpupgrade dialer 无此超时，
+/// 靠 TCP 兜底——但 Rust 侧不能在拨号期无限占用连接，同 crate 服务端亦有 4s 窗）。
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// HTTPUpgrade 客户端，持配置 + 主机名。
 ///
@@ -73,26 +78,36 @@ impl HttpUpgradeClient {
         // 注：ed > 0 的 0-RTT 场景由 `dial_over_io_deferred` 处理（延迟读 101），
         // 本方法始终立即读响应。
 
-        // 2. 读响应直到 \r\n\r\n
+        // 2. 读响应直到 \r\n\r\n（8s 窗：对端不回 101 时不无限挂起，bd x0v47）
         let mut buf: Vec<u8> = Vec::with_capacity(READ_INITIAL_CAPACITY);
         let mut chunk = [0u8; 1024];
-        loop {
-            if buf.len() >= READ_MAX_CAPACITY {
-                return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(format!(
-                    "response header exceeds max {} bytes",
-                    READ_MAX_CAPACITY
-                )));
+        let read_resp = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+            loop {
+                if buf.len() >= READ_MAX_CAPACITY {
+                    return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(format!(
+                        "response header exceeds max {} bytes",
+                        READ_MAX_CAPACITY
+                    )));
+                }
+                let n = io.read(&mut chunk).await?;
+                if n == 0 {
+                    return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
+                        "EOF before \\r\\n\\r\\n terminator".into(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if find_header_end(&buf).is_some() {
+                    return Ok(());
+                }
             }
-            let n = io.read(&mut chunk).await?;
-            if n == 0 {
+        });
+        match read_resp.await {
+            Ok(r) => r?,
+            Err(_) => {
                 return Err(crate::error::HttpUpgradeError::InvalidHttpFormat(
-                    "EOF before \\r\\n\\r\\n terminator".into(),
+                    "101 response read timeout (8s)".into(),
                 ));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            if find_header_end(&buf).is_some() {
-                break;
-            }
+            },
         }
 
         // 3. 校验响应

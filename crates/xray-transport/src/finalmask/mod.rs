@@ -126,11 +126,47 @@ pub trait Udpmask: Send + Sync {
     ) -> io::Result<Box<dyn UdpIo>>;
 }
 
+/// 连接两端地址（mask 侧 `local_*` / `remote_*` metadata 的来源）。
+///
+/// 对应 Go `net.Conn.LocalAddr()/RemoteAddr()`——Go 的 mask 直接从 `net.Conn` 取，
+/// Rust 这边 [`AsyncIo`] 是没有地址面的 marker trait，只能由连接来源（`Connection`
+/// 或 accept 返回值）显式带下来（bd qsk77）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConnAddrs {
+    pub local: Option<SocketAddr>,
+    pub remote: Option<SocketAddr>,
+}
+
 /// TCP 伪装接口（对应 Go `Tcpmask`）。
 pub trait Tcpmask: Send + Sync {
     fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>>;
 
     fn wrap_conn_server(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>>;
+
+    /// 带连接地址的 client 侧包装。
+    ///
+    /// 默认丢弃地址转调 [`Self::wrap_conn_client`]：只有会用
+    /// `local_port`/`remote_ip4_u32` 类 metadata 的 mask（`header/custom`）需要
+    /// 覆盖它（bd qsk77）。
+    fn wrap_conn_client_with_addrs(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
+        let _ = addrs;
+        self.wrap_conn_client(raw)
+    }
+
+    /// 带连接地址的 server 侧包装（默认语义同
+    /// [`Self::wrap_conn_client_with_addrs`]）。
+    fn wrap_conn_server_with_addrs(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
+        let _ = addrs;
+        self.wrap_conn_server(raw)
+    }
 }
 
 /// UDP 伪装管理器（对应 Go `UdpmaskManager`）。
@@ -177,18 +213,26 @@ impl TcpmaskManager {
         Self { tcpmasks }
     }
 
-    pub fn wrap_conn_client(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
+    pub fn wrap_conn_client(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
         let mut raw = raw;
         for mask in self.tcpmasks.iter().rev() {
-            raw = mask.wrap_conn_client(raw)?;
+            raw = mask.wrap_conn_client_with_addrs(raw, addrs)?;
         }
         Ok(raw)
     }
 
-    pub fn wrap_conn_server(&self, raw: Box<dyn AsyncIo>) -> io::Result<Box<dyn AsyncIo>> {
+    pub fn wrap_conn_server(
+        &self,
+        raw: Box<dyn AsyncIo>,
+        addrs: ConnAddrs,
+    ) -> io::Result<Box<dyn AsyncIo>> {
         let mut raw = raw;
         for mask in self.tcpmasks.iter().rev() {
-            raw = mask.wrap_conn_server(raw)?;
+            raw = mask.wrap_conn_server_with_addrs(raw, addrs)?;
         }
         Ok(raw)
     }
@@ -200,8 +244,15 @@ impl TcpmaskManager {
 /// （`AsyncIo = AsyncRead + AsyncWrite + Send + Sync + Unpin`），但 Rust 不允许
 /// `Box<dyn Connection>` → `Box<dyn AsyncIo>` 自动 upcast（vtable 顺序不同）。
 /// 用 newtype 包装 + Pin 投影转接 AsyncRead/AsyncWrite forward。
-fn conn_to_asyncio(conn: Box<dyn crate::connection::Connection>) -> Box<dyn AsyncIo> {
-    Box::new(ConnAsAsyncIo(conn))
+fn conn_to_asyncio(conn: Box<dyn crate::connection::Connection>) -> (Box<dyn AsyncIo>, ConnAddrs) {
+    // 地址必须在装箱前取：`AsyncIo` 是 marker trait，装箱后地址面就丢了（bd qsk77）。
+    // `Connection::local_addr/remote_addr` 本身是 `Result<Option<..>>`（Unix 连接无
+    // SocketAddr）⇒ 失败与「没有地址」同样折叠成 `None`。
+    let addrs = ConnAddrs {
+        local: conn.local_addr().ok().flatten(),
+        remote: conn.remote_addr().ok().flatten(),
+    };
+    (Box::new(ConnAsAsyncIo(conn)), addrs)
 }
 
 /// newtype 包装 `Box<dyn Connection>` 为 `Box<dyn AsyncIo>`，forward AsyncRead/AsyncWrite。
@@ -260,8 +311,8 @@ pub fn wrap_conn_client_into_connection(
     if mgr.tcpmasks.is_empty() {
         return Ok(conn);
     }
-    let raw: Box<dyn AsyncIo> = conn_to_asyncio(conn);
-    let wrapped = apply_tcpmasks(&mgr.tcpmasks, raw, true)?;
+    let (raw, addrs) = conn_to_asyncio(conn);
+    let wrapped = apply_tcpmasks(&mgr.tcpmasks, raw, true, addrs)?;
     Ok(Box::new(AsyncIoConn(wrapped)))
 }
 
@@ -273,8 +324,8 @@ pub fn wrap_conn_server_into_connection(
     if mgr.tcpmasks.is_empty() {
         return Ok(conn);
     }
-    let raw: Box<dyn AsyncIo> = conn_to_asyncio(conn);
-    let wrapped = apply_tcpmasks(&mgr.tcpmasks, raw, false)?;
+    let (raw, addrs) = conn_to_asyncio(conn);
+    let wrapped = apply_tcpmasks(&mgr.tcpmasks, raw, false, addrs)?;
     Ok(Box::new(AsyncIoConn(wrapped)))
 }
 
@@ -358,12 +409,13 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for MaybeTcpMaskConn<C> {
 pub fn maybe_mask_server<C: AsyncIo + 'static>(
     mgr: &TcpmaskManager,
     conn: C,
+    addrs: ConnAddrs,
 ) -> io::Result<MaybeTcpMaskConn<C>> {
     if mgr.tcpmasks.is_empty() {
         return Ok(MaybeTcpMaskConn::Plain(conn));
     }
     let raw: Box<dyn AsyncIo> = Box::new(conn);
-    Ok(MaybeTcpMaskConn::Masked(apply_tcpmasks(&mgr.tcpmasks, raw, false)?))
+    Ok(MaybeTcpMaskConn::Masked(apply_tcpmasks(&mgr.tcpmasks, raw, false, addrs)?))
 }
 
 /// 已构建 manager 缓存上界（键 = 配置内容；每条约 <2KiB ⇒ <128KiB）。
@@ -476,9 +528,14 @@ fn apply_tcpmasks(
     masks: &[Box<dyn Tcpmask>],
     mut raw: Box<dyn AsyncIo>,
     is_client: bool,
+    addrs: ConnAddrs,
 ) -> io::Result<Box<dyn AsyncIo>> {
     for mask in masks.iter().rev() {
-        raw = if is_client { mask.wrap_conn_client(raw)? } else { mask.wrap_conn_server(raw)? };
+        raw = if is_client {
+            mask.wrap_conn_client_with_addrs(raw, addrs)?
+        } else {
+            mask.wrap_conn_server_with_addrs(raw, addrs)?
+        };
     }
     Ok(raw)
 }
@@ -588,7 +645,7 @@ impl PacketIoConn {
         let dropped_driver = Arc::clone(&dropped);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（PacketIo recv 有界队列泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（PacketIo recv 有界队列泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let driver = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_SIZE];
@@ -610,7 +667,7 @@ impl PacketIoConn {
         let worker_inner = Arc::clone(&inner);
         #[allow(
             clippy::disallowed_methods,
-            reason = "数据面泵任务（PacketIo send 泵）；显式脱管：托管无收益（本层无 PluginContext 可穿），寿命随其所属连接/会话/进程对象，句柄无需持有（bd hj3jf 裁定）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（PacketIo send 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         let worker = tokio::spawn(async move {
             // 限频计数（首条 + 每 SEND_FAIL_LOG_EVERY 条，不重置：UDP ICMP 风暴
@@ -1026,11 +1083,44 @@ fn build_tcpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Tcpmask>
 
 // ===== JSON settings → 各 mask 模块 Config（对齐 Go `infra/conf/transport_finalmask.go`）=====
 
-/// 构造配置期错误：**不做任何脱敏/清洗**——名字里的 `mask` 指 finalmask 子系统，不是
-/// masking（bd rjcu4）。调用方不得把含凭据的串（`user:pass@`、`?key=…`）塞进 `msg`：
-/// URL 一律先经 `xdns::doh::url_label` 剥到 `scheme://host:port`。
+/// 构造配置期错误：名字里的 `mask` 指 finalmask 子系统（不是 masking），但**确实会**
+/// 对文本里的 URL 做结构剥离——配置里的 URL 常把凭据写在 userinfo
+/// （`realm://token@host:port/id`）或 query（`?key=…`），整串进错误文本等于随
+/// 「配置装配失败」把凭据外送（bd rjcu4 + bd dqxy3）。
+///
+/// 剥离 = 命中 `scheme://` 后只保留 `scheme://host[:port]`（同
+/// `xdns::doh::url_label` 口径）；调用方已自行剥过的位置同样安全（幂等）。
 fn mask_err(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
+    io::Error::new(io::ErrorKind::InvalidInput, redact_urls(&msg.into()))
+}
+
+/// 把文本里每个 `scheme://…` 收敛成 `scheme://host[:port]`，其余字符原样保留。
+fn redact_urls(msg: &str) -> String {
+    fn is_url_char(c: char) -> bool {
+        !(c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';'))
+    }
+
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(idx) = rest.find("://") {
+        // scheme 起点：`://` 前紧邻的 scheme 字符段（缺 scheme 的 `x://` 也算）。
+        let scheme_start = rest[..idx]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+            .map_or(0, |i| i + 1);
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&rest[scheme_start..idx + 3]);
+
+        let tail = &rest[idx + 3..];
+        let end = tail.find(|c: char| !is_url_char(c)).unwrap_or(tail.len());
+        let authority = &tail[..end];
+        // 去 userinfo（含口令/令牌）再截掉 path/query/fragment。
+        let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        let hostport_end = hostport.find(['/', '?', '#']).unwrap_or(hostport.len());
+        out.push_str(&hostport[..hostport_end]);
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
@@ -1571,8 +1661,11 @@ fn build_xicmp_config(settings: &serde_json::Value) -> io::Result<xicmp::XicmpCo
 /// scheme `realm`→https、`realm+http`→http；信令 TLS 为结构化 [`realm::tls::TlsConfig`]）。
 fn build_realm_config(settings: &serde_json::Value) -> io::Result<realm::Config> {
     let url = json_str(settings, "url");
-    let (raw_scheme, rest) =
-        url.split_once("://").ok_or_else(|| mask_err(format!("realm: invalid url {url:?}")))?;
+    // 缺 scheme 时**不回显原串**：畸形串里没有 `://` 可给剥离器定位，原样入错等于
+    // 把 `token@host` 直接写进日志（bd dqxy3）。
+    let (raw_scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| mask_err("realm: invalid url (expected scheme://token@host:port/id)"))?;
     let scheme = match raw_scheme {
         "realm" => "https",
         "realm+http" => "http",
@@ -3135,6 +3228,29 @@ mod tests {
             Ok(_) => panic!("expected unsupported tcp mask type error"),
         };
         assert!(err.contains("unsupported tcp mask type"), "got: {err}");
+    }
+
+    /// bd dqxy3：错误文本里的 URL 必须剥掉 userinfo 与 path/query（凭据不外送）。
+    #[test]
+    fn mask_err_redacts_url_credentials() {
+        let e = mask_err(
+            "realm: invalid url \"realm://s3cr3t-token@example.com:8443/id?key=abc\" rejected",
+        );
+        let msg = e.to_string();
+        assert!(!msg.contains("s3cr3t-token"), "userinfo 泄漏: {msg}");
+        assert!(!msg.contains("key=abc"), "query 泄漏: {msg}");
+        assert!(msg.contains("realm://example.com:8443"), "host 应保留: {msg}");
+        assert!(msg.contains("rejected"), "非 URL 文本应原样保留: {msg}");
+    }
+
+    /// 无 `://` 的文本与已剥过的 URL 都不得被二次加工（幂等 + 不动普通文案）。
+    #[test]
+    fn mask_err_redaction_is_idempotent() {
+        let plain = "unsupported tcp mask type: \"bogus\"";
+        assert_eq!(mask_err(plain).to_string(), plain);
+        let once = mask_err("see https://u:p@h.example:443/p?q=1").to_string();
+        assert_eq!(once, "see https://h.example:443");
+        assert_eq!(mask_err(once.clone()).to_string(), once);
     }
 
     /// 票 b2og：PacketIoConn 发送队列有界——worker 卡死在 send_to（对端黑洞）
