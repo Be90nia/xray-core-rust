@@ -316,6 +316,15 @@ async fn start_full_dispatched(
         }
     }
 
+    // bd ji765c：tun DNS 环路探针用同一 router 句柄（init 按值取走 routing_router）。
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    let routing_router_probe = routing_router.clone();
+
     // DefaultDispatcher 装配（对应 Go dispatcher.Init(ohm, router, pm, sm)）
     let mut dispatcher = DefaultDispatcher::new();
     dispatcher.init(
@@ -433,6 +442,15 @@ async fn start_full_dispatched(
             }
         },
     }
+    // bd ji765c：注册 tun 系统 DNS 接管防环路探针——ohm 已填满、inbound 尚未起监听
+    // （`sysroute::prepare` 在 tun `start()` 内取探针；缺位即 Linux 接管拒启）。
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    crate::dns_probe::install(built, routing_router_probe, Arc::clone(&ohm));
     // soqc：observatory/burst 探测执行体切 RealOutboundProbeExecutor——经
     // dispatcher forced-tag 拨号 + rustls 完整 HTTPS GET（对齐 Go
     // observer.go:130-159 tagged.Dialer + http.Client）。此前 init_dependencies
@@ -1160,15 +1178,23 @@ mod tests {
         assert_eq!(inst.feature_count(), 4); // dns+routing+policy+stats defaults
     }
 
+    /// bd 16uis（S4）：app kind 无 factory = 拒启（Go `core/xray.go:196-210` 对任一
+    /// app 错误即 return err）。旧实现 warn+skip 让「配置写了但静默不生效」成立。
     #[test]
-    fn start_from_built_skips_unregistered_kind() {
+    fn start_from_built_rejects_unregistered_kind() {
         let mut built = xray_conf::BuiltConfig::default();
         built.apps.push(xray_conf::BuiltEntry {
             kind: "xray.test.unregistered.kind".into(),
             data: b"{}".to_vec(),
         });
-        let inst = start_from_built(&built).expect("unregistered kind should be skipped");
-        assert_eq!(inst.feature_count(), 4); // 4 defaults + unregistered skipped
+        let err =
+            start_from_built(&built).err().expect("unregistered kind must reject the instance");
+        match err {
+            CoreFunctionError::InstanceInit(msg) => {
+                assert!(msg.contains("xray.test.unregistered.kind"), "错误必须点名 kind：{msg}")
+            },
+            other => panic!("expected InstanceInit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1191,9 +1217,11 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1, "feature.start should be called once");
     }
 
+    /// bd 16uis（S4）：factory 失败同样拒启——Go `initInstanceWithConfig` 对任一
+    /// app 的工厂错误一律 `return true, err`（旧实现误记为「跳过该 feature，
+    /// 继续启动其余」）。
     #[test]
-    fn start_from_built_factory_error_skipped() {
-        // Go 行为：factory 失败时跳过该 feature，继续启动其余。
+    fn start_from_built_factory_error_is_fatal() {
         let factory: FeatureFactory = Arc::new(|_data: &[u8]| {
             Err(FeatureError::StartFailed {
                 name: "BadFeature",
@@ -1207,10 +1235,13 @@ mod tests {
             kind: "xray.test.bad_factory".into(),
             data: b"{}".to_vec(),
         });
-        // bad_factory 失败被跳过，实例仍成功启动（含 4 个 default features）
-        let inst = start_from_built(&built).expect("bad factory should be skipped");
-        assert!(inst.is_running());
-        assert_eq!(inst.feature_count(), 4); // 4 defaults, bad_factory skipped
+        let err = start_from_built(&built).err().expect("bad factory must reject the instance");
+        match err {
+            CoreFunctionError::InstanceInit(msg) => {
+                assert!(msg.contains("injected failure"), "错误必须透传工厂原因：{msg}")
+            },
+            other => panic!("expected InstanceInit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2909,10 +2940,12 @@ mod tests {
             mux_json: None,
             target_strategy: None,
         });
-        // routing config: IP 规则 → 127.0.0.0/8 走默认（验证 routing 不崩溃）
-        // 注：完整路由测试需要 RouterAdapter + domain sniffing，此处验证 routing JSON 不破坏启动
+        // routing config: IP 规则 → 127.0.0.0/8 走默认
+        // kind 必须是注册名 `routing`（`start_full` 按 `a.kind == "routing"` 建
+        // RouterAdapter）：旧写 `xray.app.router` 是未注册 kind，靠 warn+skip 混过去
+        // ——bd 16uis 改 fail-visible 后未注册 app 直接拒启。
         cfg.apps.push(BuiltEntry {
-            kind: "xray.app.router".into(),
+            kind: "routing".into(),
             data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","ip":["127.0.0.0/8"],"outboundTag":"default"}]}"#.to_vec(),
         });
 
@@ -6258,8 +6291,11 @@ mod tests {
             send_through: None, stream_settings_json: None,
             proxy_settings_json: None, mux_json: None, target_strategy: None,
         });
+        // 同 `integration_routing_selects_correct_outbound`：kind 必须用注册名
+        // `routing`（`a.kind == "routing"` 才建 RouterAdapter）；旧 `xray.app.router`
+        // 是未注册 kind，规则实际从未生效（断言靠 default 直连恰好通过）。
         cfg.apps.push(BuiltEntry {
-            kind: "xray.app.router".into(),
+            kind: "routing".into(),
             data: br#"{"domainStrategy":"AsIs","rules":[{"type":"field","inboundTag":["in-echo"],"outboundTag":"loopback-out"}]}"#.to_vec(),
         });
 

@@ -26,10 +26,11 @@ use super::InboundCtx;
 use crate::{
     arm_registry::{lookup_inbound_builder, lookup_outbound_builder},
     inbound::spawn_one_inbound,
-    outbound::{BuildError, build_protocol_handler},
+    outbound::{BuildError, build_protocol_handler, register_outbounds},
 };
 
-/// 17 个出站协议的最小可构造 settings（与 tests_config_parity 同源形态）。
+/// 17 个出站协议 + 2 个 Go 老式别名（`direct`/`block`）的最小可构造 settings
+/// （与 tests_config_parity 同源形态）。
 /// 元组第三项 = streamSettings（hysteria 构造期硬错要求 security=tls，
 /// 其余协议 None 即可）。
 fn outbound_cases() -> Vec<(&'static str, serde_json::Value, Option<serde_json::Value>)> {
@@ -68,6 +69,10 @@ fn outbound_cases() -> Vec<(&'static str, serde_json::Value, Option<serde_json::
         ("http", json!({"servers":[{"address":"1.2.3.4","port":8080}]}), None),
         ("naive", json!({"server":"1.2.3.4","port":443,"username":"u","password":"p"}), None),
         ("dokodemo", json!({"address":"1.2.3.4","port":443}), None),
+        // Go 老式别名（infra/conf/xray.go:42-46：`direct`→FreedomConfig、
+        // `block`→BlackholeConfig）——生产注册表 + 构造表两级都要命中（bd pjg6n）。
+        ("direct", json!({}), None),
+        ("block", json!({}), None),
     ]
 }
 
@@ -270,5 +275,111 @@ async fn arm_lookup_missing_key_fails_visible() {
         Ok(spawned) => panic!(
             "{UNKNOWN}: inbound table miss must fail-visible (bd vdl95), got Ok({spawned:?})"
         ),
+    }
+}
+
+// ============ bd pjg6n / bd 16uis 回归 ============
+
+fn built_from_json(json: serde_json::Value) -> xray_conf::BuiltConfig {
+    xray_conf::Config::from_json_str(&json.to_string())
+        .expect("config json parses")
+        .build()
+        .expect("config builds")
+}
+
+/// bd pjg6n：Go 老式 outbound 别名 `direct`→freedom、`block`→blackhole 必须走完
+/// **生产注册表**（`register_outbounds`，o91s4 的整配置拒启面）——否则 Go 合法
+/// 配置在装配期未命中即拒启。
+#[tokio::test]
+async fn go_legacy_outbound_aliases_assemble_via_register_outbounds() {
+    let built = built_from_json(json!({
+        "outbounds": [
+            {"tag": "direct", "protocol": "direct"},
+            {"tag": "blocked", "protocol": "block"}
+        ]
+    }));
+    let ohm = SimpleOhm::new();
+    register_outbounds(&built, &ohm, None, None, None)
+        .expect("`direct`/`block` are legal Go protocols, must assemble not reject");
+    let tags = ohm.list_tags();
+    assert!(tags.iter().any(|t| t == "direct"), "direct alias must register: {tags:?}");
+    assert!(tags.iter().any(|t| t == "blocked"), "block alias must register: {tags:?}");
+}
+
+/// bd 16uis（a）：端口越界必须报错，不得 `as u16` 静默回绕（70000 → 4464）。
+#[test]
+fn inbound_port_out_of_range_is_error_not_wraparound() {
+    for (what, result) in [
+        (
+            "dokodemo",
+            crate::inbound::parse_dokodemo_settings(br#"{"address":"1.2.3.4","port":70000}"#)
+                .map(|_| ()),
+        ),
+        (
+            "freedom",
+            crate::inbound::parse_freedom_inbound_dest(br#"{"address":"1.2.3.4","port":70000}"#)
+                .map(|_| ()),
+        ),
+    ] {
+        let err = result.expect_err("port 70000 must be rejected, not wrapped to 4464");
+        assert!(err.to_string().contains("70000"), "{what}: error must name the value: {err}");
+    }
+    // 边界值合法（65535 不报错）。
+    crate::inbound::parse_dokodemo_settings(br#"{"address":"1.2.3.4","port":65535}"#)
+        .expect("65535 is a valid port");
+}
+
+/// bd 16uis（c）：mux `via` 指向不存在的出站必须拒启，不得回落 default
+/// （default 若是 freedom 则用户以为在走代理、实际明文直连）。
+#[tokio::test]
+async fn mux_via_unknown_tag_rejects_config() {
+    let built = built_from_json(json!({
+        "outbounds": [
+            {"tag": "muxed", "protocol": "mux", "settings": {"concurrency": 4, "via": "ghost"}},
+            {"tag": "direct", "protocol": "freedom"}
+        ]
+    }));
+    let err = register_outbounds(&built, &SimpleOhm::new(), None, None, None)
+        .expect_err("mux via `ghost` must reject the config (bd 16uis)");
+    assert!(err.to_string().contains("ghost"), "error must name the via tag: {err}");
+
+    // 正向对照：via 指向在场出站正常装配。
+    let built = built_from_json(json!({
+        "outbounds": [
+            {"tag": "muxed", "protocol": "mux", "settings": {"concurrency": 4, "via": "direct"}},
+            {"tag": "direct", "protocol": "freedom"}
+        ]
+    }));
+    register_outbounds(&built, &SimpleOhm::new(), None, None, None)
+        .expect("mux via pointing at a registered outbound must assemble");
+}
+
+/// bd 16uis（b）：blackhole outbound 坏 settings JSON 必须报错（旧实现静默
+/// `ResponseConfig::None`，用户以为配了 HTTP 403 回包）。
+#[test]
+fn blackhole_outbound_response_bad_json_is_error() {
+    let err = crate::outbound::parse_blackhole_response(b"{not json")
+        .expect_err("bad JSON must not silently degrade to ResponseConfig::None");
+    assert!(err.contains("blackhole outbound settings JSON"), "got: {err}");
+    // 缺省 settings（空字节）仍是 None，不是错——Go `{}` 同义。
+    assert_eq!(
+        crate::outbound::parse_blackhole_response(b"").expect("empty settings is legal"),
+        xray_proxy_blackhole::ResponseConfig::None
+    );
+}
+
+/// bd 16uis（d）：app kind 无 factory 必须拒启（旧实现 warn+skip，app 静默不生效）。
+#[test]
+fn app_kind_without_factory_is_fatal() {
+    let built = xray_conf::BuiltConfig {
+        apps: vec![BuiltEntry { kind: "no-such-app-kind".to_string(), data: b"{}".to_vec() }],
+        ..xray_conf::BuiltConfig::default()
+    };
+    match crate::instance::Instance::new_from_built(&built) {
+        Err(xray_features::FeatureError::NotFound { name }) => {
+            assert_eq!(name, "no-such-app-kind");
+        },
+        Err(other) => panic!("expected NotFound, got {other:?}"),
+        Ok(_) => panic!("unknown app kind must reject the instance, not warn+skip"),
     }
 }

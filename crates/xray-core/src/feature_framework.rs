@@ -139,6 +139,60 @@ fn production_buffer_pool() -> Arc<dyn BufferPool> {
     Arc::new(ManagedBufferPool::new(XrayBufPool::new(MAX, IDLE_CAP), MAX, IDLE_CAP))
 }
 
+/// 缓冲池接线金丝雀（bd vqvn1 NEW-04；与 `xray_cli::framework` 的
+/// `AssemblyProbe::production` 同语义、同失败口径）：build 期借一块立刻归还——
+/// `with_pool` 漏接时 `ctx.pool()` 在装配期就 fail-visible（框架装甲转 `Err`），
+/// 不必等某个 Feature 的运行期才炸在数据面上。
+struct PoolGate;
+
+static POOL_GATE_CONTRACT: PluginContract =
+    PluginContract { clauses: &[], extra: &[], not_applicable: &[] };
+
+impl Plugin for PoolGate {
+    fn name(&self) -> &'static str {
+        "pool-gate"
+    }
+
+    fn version(&self) -> &'static str {
+        "0.1.0"
+    }
+
+    fn contract(&self) -> &PluginContract {
+        &POOL_GATE_CONTRACT
+    }
+
+    fn lifecycle(&self) -> &dyn Lifecycle {
+        &POOL_GATE_LIFECYCLE
+    }
+
+    fn build(&self, ctx: &mut PluginContext) -> std::result::Result<(), PluginError> {
+        drop(
+            ctx.pool()
+                .acquire(4096)
+                .map_err(|e| PluginError::Other(format!("assembly pool: {e:?}").into()))?,
+        );
+        Ok(())
+    }
+}
+
+static POOL_GATE_LIFECYCLE: PoolGateLifecycle = PoolGateLifecycle;
+
+struct PoolGateLifecycle;
+
+impl Lifecycle for PoolGateLifecycle {
+    fn init(&self, _ctx: &PluginContext) -> std::result::Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn start(&self, _ctx: &PluginContext) -> std::result::Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn stop(&self) -> std::result::Result<(), PluginError> {
+        Ok(())
+    }
+}
+
 /// 按注册序把全部 feature 经框架装配启动（[`crate::instance::Instance::start`]
 /// 的 feature-on 路径）。失败 = 已启动者已被框架逆序回滚（stop →
 /// `Feature::close`）。
@@ -149,12 +203,15 @@ pub(super) fn bring_up_features(features: &[Arc<dyn Feature>]) -> Result<()> {
         return Ok(());
     }
     let opts = FrameworkOptions {
-        registry_cap: features.len(),
+        registry_cap: features.len() + 1, // +1 = 缓冲池金丝雀
         id_fingerprint: None,
         shutdown_timeout: None,
     };
-    let mut builder =
-        Framework::builder(opts).map_err(to_feature_err)?.with_pool(production_buffer_pool());
+    let mut builder = Framework::builder(opts)
+        .map_err(to_feature_err)?
+        .with_pool(production_buffer_pool())
+        .register(Arc::new(PoolGate))
+        .map_err(to_feature_err)?;
     let mut seen: HashMap<&'static str, usize> = HashMap::with_capacity(features.len());
     for feat in features {
         let base = feat.feature_name();
@@ -335,5 +392,24 @@ mod tests {
     fn empty_features_start_is_noop() {
         let feats: Vec<Arc<dyn Feature>> = vec![];
         bring_up_features(&feats).expect("空实例启动 = 合法 no-op");
+    }
+
+    /// bd vqvn1 NEW-04 证伪面：同一条金丝雀装到**不注入缓冲池**的装配根上，
+    /// build 期即失败（`ctx.pool()` 的 fail-visible panic 被框架装甲转 `Err`）——
+    /// 与 xray-cli `AssemblyProbe::production` 同口径，证明生产路径上的门不是
+    /// 恒真断言。
+    #[test]
+    fn pool_gate_fails_when_pool_not_injected() {
+        let err = Framework::builder(FrameworkOptions {
+            registry_cap: 1,
+            id_fingerprint: None,
+            shutdown_timeout: None,
+        })
+        .expect("registry cap 1")
+        .register(Arc::new(PoolGate))
+        .expect("register pool-gate")
+        .build()
+        .expect_err("未注入缓冲池必须在装配期 fail-visible");
+        assert!(err.to_string().contains("pool capability not wired"), "{err}");
     }
 }

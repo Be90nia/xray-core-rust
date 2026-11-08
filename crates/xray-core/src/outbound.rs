@@ -355,21 +355,24 @@ pub fn register_outbounds<T: OutboundTable>(
 
     for (bridge, via_tag) in mux_bridges {
         use xray_app_dispatcher::OutboundHandlerManager;
-        let underlying = match via_tag.as_deref().map(|t| ohm.get_handler(t)) {
-            Some(Some(h)) => Some(h),
-            Some(None) => {
-                tracing::warn!(tag = %bridge.tag(), via = ?via_tag, "mux via tag not found, fallback default");
-                ohm.get_default_handler()
-            },
-            None => ohm.get_default_handler(),
+        // bd 16uis：`via` 指向未注册的 tag 不得回落 default——default 若为
+        // freedom 则用户以为在走代理、实际明文直连（o91s4 同型事故）。
+        let underlying = match via_tag.as_deref() {
+            Some(t) => ohm.get_handler(t).ok_or_else(|| {
+                BuildError::Parse(format!(
+                    "outbound `{}` (mux): settings.via `{t}` is not a registered outbound",
+                    bridge.tag()
+                ))
+            })?,
+            None => ohm.get_default_handler().ok_or_else(|| {
+                BuildError::Parse(format!(
+                    "outbound `{}` (mux): no underlying outbound to carry mux sessions",
+                    bridge.tag()
+                ))
+            })?,
         };
-        match underlying {
-            Some(h) => {
-                bridge.set_underlying(h);
-                tracing::debug!(tag = %bridge.tag(), "mux underlying configured");
-            },
-            None => tracing::warn!(tag = %bridge.tag(), "mux outbound has no underlying handler"),
-        }
+        bridge.set_underlying(underlying);
+        tracing::debug!(tag = %bridge.tag(), "mux underlying configured");
     }
 
     Ok(())
@@ -1508,14 +1511,20 @@ pub(crate) fn wrap_dial_with_target_strategy(
 ///   :38-42：base64 标准解码，失败即 Build 硬错）
 ///
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
+///
+/// # Errors
+/// 坏 JSON → `Err`（旧实现静默返回 `None`：用户以为配了 HTTP 403 回包，实际
+/// `response.type` 变成 none，bd 16uis）。
 pub(crate) fn parse_blackhole_response(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_blackhole::ResponseConfig, String> {
     use base64::Engine as _;
     use xray_proxy_blackhole::ResponseConfig;
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) else {
+    if data.is_empty() {
         return Ok(ResponseConfig::None);
-    };
+    }
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| format!("blackhole outbound settings JSON: {e}"))?;
     let Some(resp) = v.get("response") else {
         return Ok(ResponseConfig::None);
     };
@@ -2869,7 +2878,7 @@ static TUIC_ASSOC_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU1
 
 /// TUIC UDP relay 懒连接参数（TCP dial_fn 与 UDP 分支各自持连接；TUIC server
 /// 同端口多连接合法。ponytail: 与 TCP 共享连接池需重构 dial_fn 闭包捕获，
-/// UDP 场景占比低，暂独立）。
+/// UDP 场景占比低，暂独立——但 **UDP 各流之间**必须共用一条，见 `client`）。
 pub(crate) struct TuicUdpParams {
     pub(crate) server_addr: String,
     pub(crate) server_name: String,
@@ -2877,6 +2886,10 @@ pub(crate) struct TuicUdpParams {
     pub(crate) password: String,
     pub(crate) rustls_config: Arc<rustls::ClientConfig>,
     pub(crate) options: xray_proxy_tuic::TuicConnectOptions,
+    /// 全部 UDP 流共用的一条 QUIC 连接（懒建；与 TCP 侧
+    /// `make_tuic_dial_fn_lazy` 的 `OnceCell` 同粒度：每出站一连接，
+    /// 各流只在其上开 assoc_id，不再每流新建 endpoint + 握手 + 心跳）。
+    pub(crate) client: Arc<tokio::sync::OnceCell<Arc<xray_proxy_tuic::TuicClient>>>,
 }
 
 /// TUIC 出站 dispatch bridge：TCP 走 DialBridge，UDP 从 link 读 XUDP 帧 →
@@ -2923,19 +2936,28 @@ async fn pump_tuic_udp(
     link: Link,
     params: Arc<TuicUdpParams>,
 ) -> std::result::Result<(), String> {
-    let client = xray_proxy_tuic::TuicClient::connect_with(
-        params.server_addr.as_str(),
-        &params.server_name,
-        params.uuid,
-        &params.password,
-        Arc::clone(&params.rustls_config),
-        params.options.clone(),
-        xray_proxy_tuic::QuinnConnectionPool::new(),
-    )
-    .await
-    .map_err(|e| format!("tuic udp connect: {e}"))?;
-    let client = Arc::new(client);
-    client.start_heartbeat(params.options.heartbeat);
+    // 连接在出站装配期建一次（对齐 TCP 侧 `make_tuic_dial_fn_lazy`）：UDP 各流
+    // 只在这条 QUIC 连接上开自己的 assoc_id（TUIC v5 SPEC：assoc 是 UDP 关联，
+    // 不是连接；Go sing-quic `udpPacketConn` 同样按 sessionID 复用单连接）。
+    let client = params
+        .client
+        .get_or_try_init(|| async {
+            let client = xray_proxy_tuic::TuicClient::connect_with(
+                params.server_addr.as_str(),
+                &params.server_name,
+                params.uuid,
+                &params.password,
+                Arc::clone(&params.rustls_config),
+                params.options.clone(),
+                xray_proxy_tuic::QuinnConnectionPool::new(),
+            )
+            .await
+            .map_err(|e| format!("tuic udp connect: {e}"))?;
+            let client = Arc::new(client);
+            client.start_heartbeat(params.options.heartbeat);
+            Ok::<Arc<xray_proxy_tuic::TuicClient>, String>(client)
+        })
+        .await?;
     let assoc = client.dial_udp(TUIC_ASSOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let mode = params.options.udp_relay_mode;
 
@@ -7403,6 +7425,124 @@ mod tests {
         let pkt = pr.read_packet().expect("parse resp xudp frame").expect("empty stream");
         let (data, _src) = pkt.into_parts();
         assert_eq!(data, b"tuic-udp-e2e");
+    }
+
+    /// bd w06sd (b)：TUIC UDP 出站**复用同一条 QUIC 连接**——两条并发 UDP 流只建
+    /// 1 条（修前每条流各自 `connect_with` + 新空池 ⇒ 2 条连接 + 2 个 endpoint +
+    /// 2 个心跳任务）。判据 = mock server 的 accept 计数。
+    #[tokio::test]
+    async fn tuic_udp_flows_share_one_quic_connection() {
+        use xray_xudp::packet::{PacketReader, PacketWriter};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let uuid = uuid::Uuid::new_v4();
+        let (server, _cert) = xray_proxy_tuic::TuicMockServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            "localhost",
+            uuid,
+            "udp-share".to_string(),
+        )
+        .await
+        .expect("mock server bind");
+        let server_addr = server.local_addr();
+        let accepted = server.accepted_connections();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
+                    break;
+                };
+                if echo.send_to(&buf[..n], peer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let settings = format!(
+            r#"{{"servers":[{{"address":"{ip}","port":{port},"uuid":"{uuid}","password":"udp-share","insecure":true}}]}}"#,
+            ip = server_addr.ip(),
+            port = server_addr.port(),
+        );
+        let (handler, _, _) = try_build_handler(
+            &make_outbound("tuic", "tuic-udp-share", &settings),
+            None,
+            &mut Vec::new(),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .expect("build tuic outbound");
+
+        let std::net::IpAddr::V4(echo_v4) = echo_addr.ip() else {
+            panic!("expected v4 echo addr");
+        };
+        let dest = Destination::udp(Address::IPv4(echo_v4), Port::new(echo_addr.port()));
+
+        let mut flows = Vec::new();
+        for payload in [&b"flow-a"[..], &b"flow-b"[..]] {
+            let handler = Arc::clone(&handler);
+            let dest = dest.clone();
+            flows.push(tokio::spawn(async move {
+                let (up_r, mut up_w) =
+                    xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+                let (mut dn_r, dn_w) =
+                    xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
+                let fut = handler.dispatch(
+                    &dest,
+                    Link::new(
+                        Box::new(up_r) as Box<dyn xray_buf::io::Reader>,
+                        Box::new(dn_w) as Box<dyn xray_buf::io::Writer>,
+                    ),
+                );
+                tokio::spawn(fut);
+
+                let mut frame = Vec::new();
+                {
+                    let mut pw = PacketWriter::new(&mut frame, dest.clone(), [9u8; 8]);
+                    pw.write_packet(payload).unwrap();
+                }
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.push(xray_buf::buffer::Buffer::from_vec(frame));
+                up_w.write_multi_buffer(mb).await.unwrap();
+
+                let mut resp_bytes = Vec::new();
+                for _ in 0..100 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        dn_r.read_multi_buffer(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(mb2)) if !mb2.is_empty() => {
+                            resp_bytes.extend_from_slice(&mb2.to_vec());
+                            break;
+                        },
+                        Ok(Ok(_)) => continue,
+                        Ok(Err(e)) => panic!("read resp: {e}"),
+                        Err(_) => continue,
+                    }
+                }
+                let mut cursor = std::io::Cursor::new(&resp_bytes[..]);
+                let mut pr = PacketReader::new(&mut cursor);
+                let pkt = pr.read_packet().expect("parse resp xudp frame").expect("empty stream");
+                let (data, _src) = pkt.into_parts();
+                assert_eq!(data, payload);
+            }));
+        }
+        for flow in flows {
+            flow.await.expect("udp flow task");
+        }
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "UDP 各流必须复用同一条 QUIC 连接"
+        );
     }
 }
 

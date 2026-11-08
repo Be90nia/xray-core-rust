@@ -131,10 +131,15 @@ impl Instance {
     ///
     /// # 容错策略
     ///
-    /// - 未注册的 `kind`（`NotFound`）：记 warn 跳过（对应 Go essentialFeatures 默认实现路径）
-    /// - stub 未实现（`StartFailed`）：记 warn 跳过（该 Feature 尚未实现的合法降级）
-    /// - 配置硬错（`ConfigInvalid`）：**致命**，立即返回使 Instance 构造失败 （对齐 Go config Build
-    ///   硬错 → `initInstanceWithConfig` 返回错误，core/xray.go:196-210）
+    /// 与 Go `initInstanceWithConfig` 一致（`core/xray.go:196-210`：任一 app 的
+    /// 创建/工厂错误一律 `return err`）——**任何** app 错误都致命：
+    ///
+    /// - 未注册的 `kind`（`NotFound`）：配置声明了本二进制不认识的 app ⇒ 拒启 （旧实现
+    ///   warn+skip：app 静默不生效，vdl95/o91s4 同族 fail-open，bd 16uis）
+    /// - stub 未实现（`StartFailed`）：同上拒启（stub factory 只挂代理协议 kind 与
+    ///   tun，`built.apps` 由 conf 层 12 个白名单 kind 产出、全部有真实 factory ⇒
+    ///   本条在配置文件主路不可达，保留为防「新 app kind 忘注册」静默）
+    /// - 配置硬错（`ConfigInvalid`）：致命（bd onx4）
     /// - factory 内部错误：立即返回（如 prost decode 失败）
     pub fn new_from_built(built: &xray_conf::BuiltConfig) -> Result<Self> {
         install_panic_hook();
@@ -150,25 +155,22 @@ impl Instance {
                     inst.add_feature_dyn(feat)?;
                 },
                 Err(FeatureError::NotFound { ref name }) => {
-                    tracing::warn!(
-                        kind = %name,
-                        "no FeatureFactory registered for kind, skipping"
-                    );
+                    // bd 16uis（S4）：无 factory = 该 app 无法装配。旧 warn+skip 让
+                    // 「配置写了但静默不生效」成为可能（vdl95/o91s4 同族 fail-open）。
+                    tracing::error!(kind = %name, "no FeatureFactory registered for kind");
+                    return Err(FeatureError::NotFound { name: name.clone() });
                 },
                 Err(FeatureError::ConfigInvalid { ref name, ref message }) => {
                     // 真实配置硬错（bd onx4，对齐 Go：config Build 硬错 →
                     // initInstanceWithConfig 返回错误 → InstanceStart 失败，
-                    // core/xray.go:196-210）。致命，区别于下方 stub 未实现。
+                    // core/xray.go:196-210）。致命。
                     tracing::error!(kind = %name, message = %message, "invalid app config");
                     return Err(FeatureError::ConfigInvalid { name, message: message.clone() });
                 },
                 Err(FeatureError::StartFailed { ref name, ref message }) => {
-                    // Stub factory 返回 StartFailed = 该 Feature 尚未实现，非致命
-                    tracing::warn!(
-                        kind = %name,
-                        message = %message,
-                        "feature not yet implemented (stub factory), skipping"
-                    );
+                    // bd 16uis（S4）：stub 未实现同样拒启——Go 无「app 静默跳过」语义。
+                    tracing::error!(kind = %name, message = %message, "app feature factory failed");
+                    return Err(FeatureError::StartFailed { name, message: message.clone() });
                 },
                 Err(e) => return Err(e),
             }

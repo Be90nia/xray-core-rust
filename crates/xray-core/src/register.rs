@@ -262,8 +262,9 @@ const PROXY_OUTBOUND_KINDS: &[&str] = &[
 ///
 /// - Linux/Android/FreeBSD：stub factory（"not yet implemented"）——真实 inbound/outbound 构建不经
 ///   registry（`spawn_one_inbound` / `try_build_handler` 直连 `xray-proxy-tun`）。
-/// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方 （instance.rs）对
-///   StartFailed 是 warn+跳过，非致命。
+/// - 其他平台（Windows/macOS 等）：明确 platform 错误。registry 消费方（instance.rs） 对
+///   StartFailed 现已**拒启**（bd 16uis）；tun 只出现在 in/outbound 表、不进
+///   `built.apps`，该路径实际不可达。
 fn tun_factory(kind: &'static str) -> FeatureFactory {
     if cfg!(any(
         target_os = "linux",

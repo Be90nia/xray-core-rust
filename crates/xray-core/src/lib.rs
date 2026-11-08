@@ -58,6 +58,15 @@ pub(crate) mod arm_registry;
 pub mod account;
 pub mod config;
 pub mod context;
+// bd ji765c：tun 系统 DNS 接管防环路探针的生产接线（门控与 `xray-proxy-tun`
+// 的 target 条件依赖一致）。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+pub(crate) mod dns_probe;
 // W1-1b：Instance::start 启动编排桥（feature 门 `shutdown-coordinator`，默认开；
 // 关=旧注册序循环）。与 shutdown_bridge 同门：框架编排路径的开/关。
 #[cfg(feature = "shutdown-coordinator")]

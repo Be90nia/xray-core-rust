@@ -524,6 +524,8 @@ pub(crate) fn build_tuic_outbound(
         password: s.password,
         rustls_config,
         options,
+        // UDP 各流共用一条 QUIC 连接（首流懒建；w2tuic b）
+        client: Arc::new(tokio::sync::OnceCell::new()),
     });
     let dispatch =
         TuicUdpDispatch { tag: ob.tag.clone(), tcp: Arc::clone(&tcp_bridge), params: udp_params };

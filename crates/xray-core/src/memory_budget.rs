@@ -44,7 +44,8 @@ pub use xray_frame::budget::{
     SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES, SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
     TLS_SESSION_CACHE_ESTIMATE_BYTES, TLS_SESSION_CACHE_MAX_ENTRIES,
     WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES, XRAY_BUDGET_BYTES,
-    XRAY_BUF_POOL_TOTAL_MAX_BYTES, startup_fixed_floor_bytes, startup_fixed_floor_bytes_for,
+    XRAY_BUF_POOL_TOTAL_MAX_BYTES, set_effective_handshake_inflight, startup_fixed_floor_bytes,
+    startup_fixed_floor_bytes_for, startup_fixed_floor_bytes_for_with_inflight,
 };
 
 /// 单项每连接缓冲预算校验（字节；`origin` 指明值的来源，进错误文案）。
@@ -210,10 +211,27 @@ pub fn budget_report_with(
     // ── 3) 硬账 + 档位降级（bd sfqlu）──
     // 监听数 = 真正 listen 的入站数（握手闸每 accept 循环一份，bd 258qt(a)）。
     let listeners = built.inbounds.iter().filter(|i| i.port.is_some()).count();
-    let fixed = startup_fixed_floor_bytes(listeners);
     // 每连接 pipe 占用按两方向计（上/下行各一条 policy pipe，见 MAX_PER_CONN_BUFFER_BYTES doc）。
     let per_conn_pipe = max_pipe_bytes * 2;
     let budget = plan.total_budget;
+    // 握手在飞额度**由预算反解**，不再按满载上界（64/监听）预占：
+    // 先扣静态面 + 显式 socket + 最小可跑连接面，余额 ÷ 单任务账面 ÷ 监听数
+    // = 每监听可用在飞握手数；握手闸按同一值 fail-fast（超限丢弃，不排队）。
+    // 2026-11-08 真机实证：176（528MB / 26 监听 / tiny 40MiB）在满载口径下被判
+    // 「连 1 条连接都装不下」而拒启；反解后静态面 19MiB + 每监听 ~14 在飞握手即可启动。
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let floor_no_hs = startup_fixed_floor_bytes_for_with_inflight(cores, listeners, 0);
+    // 握手面**至多占预算 1/4**：它是准入并发上限（超限即丢弃），不该把连接面饿死。
+    // 反例（2026-11-08 176 实测）：只按「余额全给握手」反解 ⇒ 26 监听吃走 86.7MiB，
+    // 96MiB 预算仍只剩 9 条连接，等于没解决问题。
+    let hs_avail = budget
+        .saturating_sub(floor_no_hs + quic_explicit_booked + MIN_VIABLE_CONCURRENCY * per_conn_pipe)
+        .min(budget / 4);
+    // `listeners.max(1)`：0 监听时 floor 不含握手项，该值不参与计算，取 1 避免除零。
+    let hs_per_listener =
+        (hs_avail / HANDSHAKE_TASK_EST_BYTES / listeners.max(1)).min(HANDSHAKE_INFLIGHT_MAX);
+    set_effective_handshake_inflight(hs_per_listener);
+    let fixed = startup_fixed_floor_bytes_for(cores, listeners);
     // 固定面与显式 socket 先扣，剩下的才是连接可用额。不足 = 一条满额 pipe 都装不下。
     let for_conns = budget.saturating_sub(fixed + quic_explicit_booked);
     // `bufferSize 0`（Go 合法「不排队」）不占字节 ⇒ 装得下的条数不受限。
@@ -961,7 +979,7 @@ mod tests {
     /// 两者都显式注入 ⇒ 换机器断言不漂移（铁律①）。
     #[test]
     fn fixed_floor_stays_within_quarter_of_budget() {
-        let fixed = startup_fixed_floor_bytes_for(8, 1);
+        let fixed = startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX);
         assert_eq!(
             fixed, 23_719_424,
             "8 核/1 监听参考机固定底数变了：成员或估算须重审（bd sgdwm；bd ccy5d 起 \
@@ -1017,7 +1035,8 @@ mod tests {
         );
         // 总实算：固定底数（8 核参考机）+ frag 最坏 ≤ 96MiB。超限即红
         // （票面纪律：超了停下报 PM，禁自行缩 frag 上限或放宽总额）。
-        let total = startup_fixed_floor_bytes_for(8, 1) + XDNS_FRAG_WORST_CASE_BYTES;
+        let total = startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX)
+            + XDNS_FRAG_WORST_CASE_BYTES;
         assert!(
             total <= XRAY_BUDGET_BYTES,
             "frag 入簿后总实算 {total}B 超预算 {}B：停下报 PM 重裁（bd wpa3o-b）",
@@ -1040,7 +1059,8 @@ mod tests {
         let pipe_bytes =
             i64::from(xray_features::policy::BufferPolicy::default().connection).max(0);
         let pipe_per_conn = (pipe_bytes * 2) as usize; // 双方向
-        let total = startup_fixed_floor_bytes_for(8, 1) + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
+        let total = startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX)
+            + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
         assert!(
             total <= XRAY_BUDGET_BYTES,
             "总实算 {total}B（固定面 + {} 连接 × pipe 双向 {pipe_per_conn}B）超预算 {}B：\

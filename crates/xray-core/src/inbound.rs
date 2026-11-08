@@ -13318,21 +13318,17 @@ mod tests {
         }
         assert!(rt.list().is_empty(), "variant 2 leaves no residue");
 
-        // 变体 3：畸形（非法 JSON）——逐键硬编码期望。
+        // 变体 3：畸形（非法 JSON）——逐键期望一致：解析期即报错。
         for kind in KINDS {
             let tag = format!("t-bad-{kind}");
             let mut ib = xiuvr3a_inbound(kind, &tag, serde_json::json!({}));
             ib.entry.data = b"not json".to_vec();
             let res = rt.start_inbound(&ib).await;
-            if kind == "blackhole" {
-                assert!(res.is_ok(), "blackhole swallows parse errors (Go-compat default)");
-                if let Err(e) = rt.remove_inbound(&tag) {
-                    panic!("blackhole: Ok ⇒ registered, remove failed: {e}");
-                }
-            } else {
-                assert!(res.is_err(), "{kind}: illegal JSON must err at parse");
-                assert!(!rt.contains(&tag), "{kind}: Err ⇒ slot rolled back");
-            }
+            // bd 16uis（S2）：blackhole 此前用 `unwrap_or_default()` 静默吞坏 JSON
+            // （旧断言「blackhole swallows parse errors (Go-compat default)」），
+            // 现在与其余协议一致 —— 非法 JSON 一律解析期报错并回滚槽位。
+            assert!(res.is_err(), "{kind}: illegal JSON must err at parse");
+            assert!(!rt.contains(&tag), "{kind}: Err ⇒ slot rolled back");
         }
         assert!(rt.list().is_empty(), "variant 3 leaves no residue");
 

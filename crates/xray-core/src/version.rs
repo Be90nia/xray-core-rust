@@ -5,17 +5,10 @@
 //! Rust 端用 `option_env!("XRAY_BUILD")` 编译期注入（cargo `-` 风格通过
 //! `XRAY_BUILD=abc1234 cargo build` 设置）。
 
-/// 主版本号。对应 Go `Version_x`。
-pub const VERSION_X: u8 = 26;
-
-/// 次版本号。对应 Go `Version_y`。
-pub const VERSION_Y: u8 = 10;
-
-/// 修订号。对应 Go `Version_z`。
-///
-/// 对拍基准是 Go v26.10.17（CLAUDE.md §0）；写成 11 会让 `"min": "26.10.17"`
-/// 这类 Go 侧合法配置在装配期被自己判为不满足而拒启（bd 5uhaj）。
-pub const VERSION_Z: u8 = 17;
+/// 主/次/修订号（`X.Y.Z`）的字面量唯一定义在 [`xray_common::version`]
+/// （`xray-reality` 的 REALITY 版本头同源，bd 4w092 f），此处 re-export 保持
+/// `crate::VERSION_*` 公开面不变。
+pub use xray_common::version::{VERSION_X, VERSION_Y, VERSION_Z};
 
 /// 内部代号。对应 Go `codename`。
 pub const CODENAME: &str = "Xray, Penetrates Everything.";
@@ -29,7 +22,7 @@ pub const BUILD: &str = match option_env!("XRAY_BUILD") {
     None => "Custom",
 };
 
-/// 返回形如 `"26.7.28"` 的版本字符串。
+/// 返回形如 `"26.10.17"` 的版本字符串（实际值见 [`xray_common::version`]，此处只是形状示例）。
 ///
 /// 对应 Go `Version()`。注意 Go 文档说明常规发布可省略 `.z`，本 Rust 端始终带 z，
 /// 避免下游解析分支。
