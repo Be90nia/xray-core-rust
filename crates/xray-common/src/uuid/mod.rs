@@ -32,14 +32,15 @@ impl Default for UUID {
 impl UUID {
     /// 生成随机 v4 UUID。
     ///
-    /// 委托 [`xray_frame::uuid::Uuid`]（bd h4bl5 派生件 2：udf
-    /// `std_ext::id::RandomId`——OS getrandom CSPRNG、失败 fail-closed、
-    /// ver/var 位面归一），本仓不再有第二套 v4 生成器（audit ARCH-06）。
+    /// 直接委托 udf 基件 [`std_ext::id::RandomId`]（bd h4bl5 派生件 2 的底座——OS getrandom
+    /// CSPRNG、失败 fail-closed、ver/var 位面在基件内装配），本仓不再有第二套 v4
+    /// 生成器（audit ARCH-06），也不经装配层 `xray_frame::uuid`（bd vqvn1 NEW-01：
+    /// 底层工具 crate 不得反向依赖装配层）。
     /// 失败 panic 对齐 Go `uuid.New` 的 `Must` 语义（CSPRNG 不可用 = 环境坏，
     /// 静默降级弱熵禁），本仓既有 `UUID::new` 签名（无 `Result`）保持不变。
     #[must_use]
     pub fn new() -> Self {
-        let id = xray_frame::uuid::Uuid::new()
+        let id = std_ext::id::RandomId::new()
             .expect("uuid: OS CSPRNG unavailable (fail-closed; Go uuid.New Must() parity)");
         Self(id.as_u128().to_be_bytes())
     }

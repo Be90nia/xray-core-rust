@@ -33,8 +33,20 @@ log = "0.4"
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["log", "memgov"] }
 # bd bf92：antireplay MapFilter 时间源走 skeleton::clock（热路径泛型静态分发）。
 udf-skeleton = { path = "../udf-frame/skeleton" }
-# ARCH-06：UUID::new 委托 xray_frame::uuid::Uuid（udf RandomId CSPRNG 派生件），
-# 消除第二套 v4 生成面。xray-frame 零 xray-common 依赖（骨架不感知血肉），无环。
+# bd vqvn1 NEW-01：UUID::new 直调 udf 基件 `std_ext::id::RandomId`（CSPRNG v4
+# 底座，xray_frame::uuid 只是它的薄包装）——底层工具 crate 不为生成 UUID 反向
+# 依赖装配层。getrandom 早已在树内（workspace `uuid` v4 feature 同底座），零新增第三方。
+udf-std-ext = { path = "../udf-frame/std-ext", features = ["random"] }
+# 唯一残留的装配层反向依赖（bd vqvn1 NEW-01 子任务 2，判定 = 保留并登记例外）：
+# `src/log/mod.rs` 的 `set_secrets` 要把掩码表同时写进 xray-frame 的
+# `logging::GLOBAL_SECRETS`（生产 60+ 处以 `LogFacade::new(domain, vec![])` 构造
+# 门面，门面自持表恒空 ⇒ 不共享进程级表则「密钥必掩码」在门面路径上等于不存在，
+# bd zb34d/kyy50）。断开的前置条件（三条同时成立才可删本依赖）：
+# ① udf `ChannelRegistry` 增加掩码表只读 accessor（现仅 `set_secrets`，读面无公开面，
+#    crates/udf-frame/skeleton-infra/src/logx.rs）；
+# ② xray-frame `LogFacade::emit` / 裸 tracing 掩码面改为读该 udf 全局表（而非自持 static）；
+# ③ ①② 走 udf 提炼回路（独立 PR + 三平台 CI 绿 + 主仓换依赖复测 32/32，CLAUDE.md §3.5.3）。
+# `udf-promotion-candidate`：待 udf 提供读面后，本依赖整体删除。
 xray-frame = { path = "../xray-frame" }
 
 [dev-dependencies]

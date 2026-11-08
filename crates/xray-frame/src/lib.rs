@@ -53,6 +53,9 @@ pub mod dispatch;
 pub mod error;
 pub mod lifecycle;
 pub mod logging;
+// 网络 socket 机制件（bd vqvn1 NEW-02）：Windows ICMP-unreachable 上报关闭的唯一
+// 实现（xray-transport 与 xray-proxy-dns 都转调本件，udf 因方向性不收）。
+pub mod net;
 // P1 观测字段模板（坑约束 3/10/11 的字段面，P1-5）。
 pub mod observe;
 pub mod plugin;

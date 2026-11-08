@@ -36,6 +36,7 @@ pub mod signal;
 pub mod testing;
 pub mod text;
 pub mod uuid;
+pub mod version;
 
 /// rustls 进程级 CryptoProvider 唯一生产安装入口（bd jrh7，见
 /// [`crypto_provider::ensure_default_crypto_provider`]）。

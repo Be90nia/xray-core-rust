@@ -37,6 +37,12 @@ log = "0.4"
 bytes = { workspace = true }
 xray-buf = { path = "../xray-buf" }
 
+# net::disable_icmp_unreachable_report（bd vqvn1 NEW-02）：WSAIoctl 关 Windows
+# ICMP-unreachable 上报的唯一实现。WSAIoctl 签名引用 OVERLAPPED ⇒ 该符号在
+# windows-sys 里被 Win32_System_IO 门控（同 xray-proxy-dns 取证口径）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 # 面 3 预算面验收（G2）：`#[tokio::test(start_paused = true)]` + `tokio::time::advance`

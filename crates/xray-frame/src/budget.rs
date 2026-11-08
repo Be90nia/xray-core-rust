@@ -162,9 +162,9 @@ pub const FINALMASK_XMC_POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// （同桥在途口径，运维判据）；多 server 实例按份叠加。
 ///
 /// **总实算**（bd wpa3o-b 验收：入簿后固定底数 + 本项 ≤ 总额）：
-/// `startup_fixed_floor_bytes_for(8, 1)` 23,719,424 + 43,155,456 = 66,874,880
-/// ≈ 63.8MiB ≤ [`XRAY_BUDGET_BYTES`]（96MiB）✓（断言住 `xray-core::memory_budget`）。
-/// 固定底数含**每监听握手在途**（bd 258qt(a)：监听越多本式越大，见
+/// `startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX)` 23,719,424 +
+/// 43,155,456 = 66,874,880 ≈ 63.8MiB ≤ [`XRAY_BUDGET_BYTES`]（96MiB）✓（断言住
+/// `xray-core::memory_budget`）。 固定底数含**每监听握手在途**（bd 258qt(a)：监听越多本式越大，见
 /// [`startup_fixed_floor_bytes_for`]）。
 pub const XDNS_FRAG_WORST_CASE_BYTES: usize = 43_155_456;
 
@@ -324,6 +324,45 @@ pub fn startup_fixed_floor_bytes(listeners: usize) -> usize {
 /// 同上，核数与监听数显式注入（测试确定性用——换机器断言不随核数漂移，铁律①）。
 #[must_use]
 pub fn startup_fixed_floor_bytes_for(cores: usize, listeners: usize) -> usize {
+    startup_fixed_floor_bytes_for_with_inflight(cores, listeners, effective_handshake_inflight())
+}
+
+/// 每监听「在飞握手」有效上限（进程级，唯一事实源）。
+///
+/// 为什么不是纯常量：`HANDSHAKE_INFLIGHT_MAX × 监听数 × [`HANDSHAKE_TASK_EST_BYTES`]`
+/// 是按**满载上界**入账，26 监听 = 93MiB —— 256/512MB 机器上任意多监听配置都会被判
+/// 「连 1 条连接都装不下」而拒启（2026-11-08 176 生产真机实证：528MB / 26 监听 /
+/// tiny 档 40MiB ⇒ 拒启）。
+///
+/// 正确口径：**在飞握手数由预算反推**，握手闸按同一值 fail-fast（超限即丢弃，不排队）。
+/// 装配期由 `xray-core::memory_budget::check_startup_budget` 调
+/// [`set_effective_handshake_inflight`] 写入；未写入时 = 常量上界（原行为）。
+static EFFECTIVE_HANDSHAKE_INFLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(HANDSHAKE_INFLIGHT_MAX);
+
+/// 读当前生效的每监听在飞握手上限（∈ `[1, HANDSHAKE_INFLIGHT_MAX]`）。
+#[must_use]
+pub fn effective_handshake_inflight() -> usize {
+    EFFECTIVE_HANDSHAKE_INFLIGHT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .clamp(1, HANDSHAKE_INFLIGHT_MAX)
+}
+
+/// 写入每监听在飞握手上限（装配期一次性；夹到 `[1, HANDSHAKE_INFLIGHT_MAX]`）。
+pub fn set_effective_handshake_inflight(limit: usize) {
+    EFFECTIVE_HANDSHAKE_INFLIGHT
+        .store(limit.clamp(1, HANDSHAKE_INFLIGHT_MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 不含握手项 / 指定每监听握手数的固定占用底数。
+///
+/// `handshake_inflight_per_listener = 0` ⇒ 只算静态面（预算门拿它反解可用握手额度）。
+#[must_use]
+pub fn startup_fixed_floor_bytes_for_with_inflight(
+    cores: usize,
+    listeners: usize,
+    handshake_inflight_per_listener: usize,
+) -> usize {
     XRAY_BUF_POOL_TOTAL_MAX_BYTES
         + cores * xray_buf::alloc::TLS_BYTE_BUDGET
         + SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES
@@ -331,7 +370,7 @@ pub fn startup_fixed_floor_bytes_for(cores: usize, listeners: usize) -> usize {
         + DNS_CACHE_ESTIMATE_BYTES
         + DNS_PENDING_EST_BYTES
         + TLS_SESSION_CACHE_ESTIMATE_BYTES
-        + listeners * HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
+        + listeners * handshake_inflight_per_listener * HANDSHAKE_TASK_EST_BYTES
 }
 
 #[cfg(test)]
@@ -344,10 +383,14 @@ mod tests {
     #[test]
     fn floor_moves_without_drift() {
         // 8 核参考机 + 1 监听：20_114_944（池/缓存）+ 64 × 55KiB（握手在途）= 23_719_424。
-        assert_eq!(startup_fixed_floor_bytes_for(8, 1), 23_719_424);
+        assert_eq!(
+            startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX),
+            23_719_424
+        );
         // 每监听一份（bd 258qt(a)）：多一个监听多 64 × 55KiB。
         assert_eq!(
-            startup_fixed_floor_bytes_for(8, 2) - startup_fixed_floor_bytes_for(8, 1),
+            startup_fixed_floor_bytes_for_with_inflight(8, 2, HANDSHAKE_INFLIGHT_MAX)
+                - startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX),
             HANDSHAKE_INFLIGHT_MAX * HANDSHAKE_TASK_EST_BYTES
         );
         assert_eq!(XRAY_BUDGET_BYTES, 96 * 1024 * 1024);

@@ -8,6 +8,21 @@
 //! 未注册通道 emit 首次告警一行后静默，写失败计数可观测）。便捷入口（[`debug`]/[`info`]/
 //! [`warning`]/[`error`]）只走 general 通道一路，不再直发 tracing。
 //! Go 级别别名（[`Severity::as_str`]）与消息语义留仓不动。
+//!
+//! # 唯一残留的装配层反向依赖（bd vqvn1 NEW-01 · `udf-promotion-candidate`）
+//!
+//! 本 crate 是最底层工具库，原则不依赖装配层 `xray-frame`；唯一例外是
+//! [`set_secrets`] 里的 `xray_frame::logging::set_global_secrets`——掩码表必须
+//! 同时进 `LogFacade::emit` 的进程级表（生产 60+ 处以 `LogFacade::new(domain,
+//! vec![])` 构造门面，门面自持表恒空，不共享则「密钥必掩码」在门面路径上等于
+//! 不存在；bd zb34d / kyy50）。UUID 生成面已于同一票改直调 udf 基件，不再经
+//! 装配层。
+//!
+//! 断开本依赖的**前置条件**（三条同时成立）：① udf `ChannelRegistry` 需要掩码表
+//! 的只读 accessor（当前只有 `set_secrets`，读面无公开面）；② `LogFacade::emit`
+//! 与裸 tracing 掩码面改读该 udf 全局表；③ ①② 走 udf 提炼回路（独立 PR +
+//! 三平台 CI 绿 + 主仓换依赖复测）。在此之前删掉本调用 = 静默失去门面路径掩码，
+//! 故按「唯一例外 + 举证」保留。
 
 use std::{fmt, sync::Arc};
 
