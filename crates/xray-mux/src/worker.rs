@@ -593,7 +593,9 @@ impl ServerWorker {
             let mut size_buf = [0u8; 2];
             Self::read_exact_slice(reader, &mut size_buf).await?;
             let size = u16::from_be_bytes(size_buf) as usize;
-            let mut payload = Buffer::new();
+            // 按声明长度取池块（bd n6jqu F5）：定长 8 KiB 会让 >8 KiB 帧（Packet
+            // 方向的 32/64 KiB 读块）在此 Err 并拆掉整条 carrier。
+            let mut payload = Buffer::new_pooled(size);
             Self::read_exact_into(reader, &mut payload, size).await?;
             payload
         } else {

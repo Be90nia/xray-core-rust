@@ -783,7 +783,9 @@ async fn read_frame(reader: &mut BufferedReader) -> Result<(FrameMetadata, Buffe
         let mut size_buf = [0u8; 2];
         read_exact(reader, &mut size_buf).await?;
         let size = u16::from_be_bytes(size_buf) as usize;
-        let mut payload = Buffer::new();
+        // 按声明长度取池块（bd n6jqu F5）：定长 8 KiB 会让 >8 KiB 帧（Packet 方向
+        // 的 32/64 KiB 读块）在此 Err 并拆掉整条 carrier；池按层向上取整，常况不变。
+        let mut payload = Buffer::new_pooled(size);
         read_exact_buffer(reader, &mut payload, size).await?;
         payload
     } else {
@@ -1151,6 +1153,37 @@ mod tests {
         fn _assert_link_send(reader: Box<dyn Reader>, writer: Box<dyn Writer>) -> Link {
             Link { reader, writer }
         }
+    }
+
+    /// bd n6jqu F5：Packet 方向的 >8 KiB 数据帧必须被读侧接受。
+    ///
+    /// 反锚点：读侧缓冲定长 8 KiB 时 `read_frame` 在「read 32768 exceeds buffer
+    /// capacity」处失败 ⇒ 整条 carrier 被 Err 拆除（会话输出泵的 32/64 KiB 读块
+    /// 正好走 Packet 帧）。同时锁住写侧形态：Go `writer.go` SplitFirst ⇒ 单 Buffer
+    /// 单帧，不做写侧切分（切分会让对端把一个 UDP 报文当成多个）。
+    #[tokio::test]
+    async fn read_frame_accepts_packet_payload_over_read_buffer_size() {
+        const BIG: usize = 32 * 1024;
+        let (rd, wr) = pipe::new();
+        let dest = Destination::new(
+            xray_common::net::address::Address::new_domain("udp.internal"),
+            xray_common::net::port::Port::new(53),
+            Network::UDP,
+        );
+        let mut mw = MuxWriter::new(7, dest, Box::new(wr), TransferType::Packet, None);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(vec![0x5A; BIG]));
+        mw.write(mb).await.expect("packet frame write");
+        mw.close().await.expect("close");
+
+        let mut reader = BufferedReader::new(Box::new(rd));
+        let (meta, payload) = read_frame(&mut reader).await.expect("read 32 KiB packet frame");
+        assert_eq!(meta.session_id(), 7);
+        assert!(meta.has_data());
+        assert_eq!(payload.len(), BIG, "32 KiB payload must arrive intact");
+        assert!(payload.bytes().iter().all(|&b| b == 0x5A), "payload corrupted");
+        let (end, _) = read_frame(&mut reader).await.expect("End frame");
+        assert!(!end.has_data(), "第二个帧只能是 End（无数据 ⇒ 写侧未切分）");
     }
 
     // ========== E2E：双并发会话 × 单 carrier ==========
