@@ -209,7 +209,7 @@ serena-cli undo                                                        # 改坏�
 | 红线 | 备注 |
 |---|---|
 | `dist/xray.exe` | baseline 二进制 |
-| `xray-transport-tcp/register.rs` | 已知债（4 维不动）|
+| `xray-transport-tcp/register.rs` | 授权触碰区（原「已知债」已解）：2026-11-08 经用户授权 + bd k2tq1 把注册静默失败改 fail-visible（`let _`→`ignore_already_exists(...)?`）；再触碰须 PM 授权 + 件头触碰记录 |
 | `vendor/` | quinn-proto patch |
 | `tests/`、`.github/workflows/`、`.gitignore`、根 `cargo*` 配置 | 验证资产 |
 | `docs/refs/` | 治理裁决（v1/v2/v3 + alloc-audit）|

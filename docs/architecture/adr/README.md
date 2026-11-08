@@ -25,11 +25,14 @@
 |---|---|---|---|
 | [ADR-0001](adr-0001-spawn-idle-pruner-derived-not-promoted.md) | 派生件扩面：`spawn_idle_pruner` 留 xray-frame，不上浮 udf | Accepted | 2026-11-06 |
 | [ADR-0002](adr-0002-memory-budget-ownership-split.md) | 装配面登记簿：常量簿上浮 `xray-frame::budget`，预算门留 xray-core | Accepted | 2026-11-06 |
+| [ADR-0003](adr-0003-frame-net-socket-ioctl-not-promoted.md) | socket ioctl 去重件落 `xray-frame::net`，不上浮 udf、不下沉 transport | Accepted | 2026-11-08 |
 
 ## 附件
 
 - [api-ledger-2026-11-06.md](api-ledger-2026-11-06.md)——批次 `e737e904..HEAD` 新增
   公共 API 逐项记账表（67 项，每项归入 ADR 或给「无需 ADR」理由）。
+- [api-ledger-2026-11-08.md](api-ledger-2026-11-08.md)——批次 `2b2407da..HEAD` 整改波
+  补录表（8 项；同区间其余声明行仍欠账，见该文件头）。
 
 ## 与治理宪法的关系
 

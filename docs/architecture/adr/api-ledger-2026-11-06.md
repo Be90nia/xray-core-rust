@@ -90,3 +90,5 @@ matcher/domain.rs）——DomainType ↔ proto 枚举，wire 语义留主仓。
 - 「无需 ADR」≠「无需遵守纪律」：D/E 类仍受 §3.5.2 查重、§3.5.5 三判据约束，
   只是不产生**新的**归属裁决。
 - 本表为批次快照（`e737e904..HEAD`）；后续批次新增公开 API 另起批次表。
+  批次 B（`2b2407da..HEAD` 整改波，8 项）见
+  [api-ledger-2026-11-08.md](api-ledger-2026-11-08.md)。
