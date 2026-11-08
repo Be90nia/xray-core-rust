@@ -82,6 +82,9 @@ pub struct SessionMap {
     inner: Mutex<HashMap<String, Arc<HttpSession>>>,
     /// 条目数上限（新 id 超出即 [`SessionUpsertError::TooManySessions`]）。
     max_sessions: usize,
+    /// §3.5.6 ①类托管：hub 级托管口（会话 reap 定时器 / 每 TCP 连接服务 /
+    /// keepalive 流共用一本账）。listener `close()` 关闸，句柄丢弃即 abort 在途。
+    scope: xray_frame::compat::ManagedScope,
 }
 
 impl SessionMap {
@@ -92,7 +95,17 @@ impl SessionMap {
 
     /// 构造带自定义上限的空会话表（测试/容量调优用）。
     pub fn with_max_sessions(max_sessions: usize) -> Self {
-        Self { inner: Mutex::new(HashMap::new()), max_sessions: max_sessions.max(1) }
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max_sessions: max_sessions.max(1),
+            scope: xray_frame::compat::ManagedScope::new("splithttp-hub"),
+        }
+    }
+
+    /// hub 级托管口（listener 的每连接任务与 reap 定时器共用同一本账）。
+    #[must_use]
+    pub fn scope(&self) -> &xray_frame::compat::ManagedScope {
+        &self.scope
     }
 
     /// 获取已有会话（不创建）。用于 GET 标记 fully_connected。
@@ -134,25 +147,27 @@ impl SessionMap {
         map.insert(session_id.to_string(), Arc::clone(&session));
         drop(map);
 
-        // spawn reap timer
+        // spawn reap timer（§3.5.6 ①类：归 hub 托管口，listener close 关闸即不上新）
         let self_clone = Arc::clone(self);
         let sid = session_id.to_string();
         let session_clone = Arc::clone(&session);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；会话 30s 未 GET 即 reap 定时任务（Go hub.go:86-88）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = session_clone.wait_fully_connected() => {
-                    // GET arrived, session lives as long as the GET connection.
+        if self
+            .scope
+            .spawn(async move {
+                tokio::select! {
+                    _ = session_clone.wait_fully_connected() => {
+                        // GET arrived, session lives as long as the GET connection.
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                        // 30s without GET → reap（对齐 Go hub.go:86-88：Delete + queue.Close）。
+                        self_clone.remove(&sid).await;
+                    }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    // 30s without GET → reap（对齐 Go hub.go:86-88：Delete + queue.Close）。
-                    self_clone.remove(&sid).await;
-                }
-            }
-        });
+            })
+            .is_err()
+        {
+            crate::LOG.debug("splithttp hub: scope closed at shutdown, session reap not armed");
+        }
 
         Ok(session)
     }

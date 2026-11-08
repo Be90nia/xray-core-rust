@@ -131,8 +131,10 @@ impl QuicStream for QuinnQuicStream {
     }
 
     fn cancel_read(&self, code: u64) {
-        // quinn reset code 是 VarInt，u64 可能溢出——按 quinn 约定截断。
-        let code = VarInt::try_from(code).unwrap_or(VarInt::MAX);
+        // quinn reset code 是 VarInt（≤2^62-1）：越界 u64 钳到 0（连接级保留码），
+        // 禁饱和到 VarInt::MAX——b7vs1 实证该值会让 quinn 握手 100% CPU 自旋，
+        // 不把它留在任何 close/reset 路径上。
+        let code = VarInt::try_from(code).unwrap_or(VarInt::from_u32(0));
         // bd w06sd(a)：锁现在只在 `read` 的 poll 内短暂持有（不跨 Pending），故这里
         // 直接 `lock()` 必定能拿到并 stop —— 关闭会立即唤醒在飞读（旧 try_lock 在
         // 读泵 parked 时必失败 = no-op，relay 任务滞留到连接死亡）。
@@ -245,8 +247,9 @@ impl QuicConn for QuinnQuicConn {
     }
 
     fn close_with_error(&self, code: u64, reason: &str) {
-        // quinn close code 是 VarInt
-        let code = VarInt::try_from(code).unwrap_or(VarInt::MAX);
+        // quinn close code 是 VarInt（≤2^62-1）：越界 u64 钳到 0，禁 VarInt::MAX
+        // （b7vs1：该值触发 quinn 握手 100% CPU 自旋，不留在 close 路径）。
+        let code = VarInt::try_from(code).unwrap_or(VarInt::from_u32(0));
         self.conn.close(code, reason.as_bytes());
     }
 
@@ -374,13 +377,16 @@ use crate::{
 pub struct QuinnQuicListener {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
+    /// §3.5.6 ①类托管：每 QUIC 连接任务账本（accept 泵与 auth 持有任务共用）。
+    /// `close()` 关闸；listener 丢弃即 abort 在途。
+    scope: xray_frame::compat::ManagedScope,
 }
 
 impl QuinnQuicListener {
     #[must_use]
-    pub fn new(endpoint: quinn::Endpoint) -> Option<Self> {
+    pub fn new(endpoint: quinn::Endpoint, scope: xray_frame::compat::ManagedScope) -> Option<Self> {
         let local_addr = endpoint.local_addr().ok()?;
-        Some(Self { endpoint, local_addr })
+        Some(Self { endpoint, local_addr, scope })
     }
 }
 
@@ -407,6 +413,8 @@ impl HysteriaQuicListener for QuinnQuicListener {
 
     fn close(&self) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>> {
         let ep = self.endpoint.clone();
+        // 连接任务账本关闸：停机后拒新任务（在途随 listener 丢弃被 abort）。
+        self.scope.close();
         Box::pin(async move {
             ep.close(VarInt::from_u32(0), b"");
             Ok(())
@@ -558,6 +566,11 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // 见 [`spawn_gated_hysteria_accept`]）。
             let gate =
                 HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
+            // §3.5.6 ①类托管：每 QUIC 连接任务账本（accept 泵内 spawn + auth 持有任务）。
+            let scope = xray_frame::compat::ManagedScope::new(format!(
+                "hysteria-quinn:{}",
+                endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()
+            ));
             let ep = endpoint.clone();
             spawn_gated_hysteria_accept(
                 ep,
@@ -571,9 +584,10 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                 masq_handler,
                 static_auth,
                 udp_idle_timeout,
+                scope.clone(),
             );
 
-            let listener = QuinnQuicListener::new(endpoint).ok_or_else(|| {
+            let listener = QuinnQuicListener::new(endpoint, scope).ok_or_else(|| {
                 crate::error::HysteriaError::Io(io::Error::other("local_addr failed"))
             })?;
             Ok(Arc::new(listener) as Arc<dyn HysteriaQuicListener>)
@@ -603,6 +617,8 @@ fn spawn_gated_hysteria_accept(
     masq_handler: Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: String,
     udp_idle_timeout: Duration,
+    // §3.5.6 ①类托管：每连接任务账本（listener 持有，close 关闸）。
+    scope: xray_frame::compat::ManagedScope,
 ) {
     let local = ep.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
     spawn_supervised_accept_loop(local, async move {
@@ -623,45 +639,50 @@ fn spawn_gated_hysteria_accept(
             let (tc, cc_slot) = build_hysteria_transport_config(&qc);
             let mut server_config = template.clone();
             server_config.transport_config(Arc::new(tc));
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每 QUIC conn 认证+服务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(async move {
-                match incoming.accept_with(Arc::new(server_config)) {
-                    Ok(connecting) => {
-                        match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting).await {
-                            Ok(Ok(conn)) => {
-                                drop(permit); // 握手完成即让位；已建连接活性归 idle 超时管
-                                serve_hysteria_connection(
-                                    conn,
-                                    validator,
-                                    on_new_conn,
-                                    quic_params,
-                                    cc_slot,
-                                    masq_handler,
-                                    static_auth,
-                                    udp_idle_timeout,
-                                    on_new_udp,
-                                )
-                                .await;
-                            },
-                            Ok(Err(e)) => {
-                                crate::LOG
-                                    .debug(format!("error={e:?} hysteria quic handshake failed"));
-                            },
-                            Err(_) => {
-                                // 握手窗超时：Connecting 被 drop = 连接放弃；
-                                // 许可随 task 结束归还（行为断言见 tests）。
-                                g.record_failure("hysteria", &"handshake window timeout");
-                            },
-                        }
-                    },
-                    Err(e) => {
-                        crate::LOG.debug(format!("error={e:?} hysteria quic accept failed"));
-                    },
-                }
-            });
+            let conn_scope = scope.clone();
+            // 闸关（停机中）：连接随 incoming 释放，留可诊断日志（禁静默）。
+            if scope
+                .spawn(async move {
+                    match incoming.accept_with(Arc::new(server_config)) {
+                        Ok(connecting) => {
+                            match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, connecting).await {
+                                Ok(Ok(conn)) => {
+                                    drop(permit); // 握手完成即让位；已建连接活性归 idle 超时管
+                                    serve_hysteria_connection(
+                                        conn,
+                                        validator,
+                                        on_new_conn,
+                                        quic_params,
+                                        cc_slot,
+                                        masq_handler,
+                                        static_auth,
+                                        udp_idle_timeout,
+                                        on_new_udp,
+                                        conn_scope,
+                                    )
+                                    .await;
+                                },
+                                Ok(Err(e)) => {
+                                    crate::LOG.debug(format!(
+                                        "error={e:?} hysteria quic handshake failed"
+                                    ));
+                                },
+                                Err(_) => {
+                                    // 握手窗超时：Connecting 被 drop = 连接放弃；
+                                    // 许可随 task 结束归还（行为断言见 tests）。
+                                    g.record_failure("hysteria", &"handshake window timeout");
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            crate::LOG.debug(format!("error={e:?} hysteria quic accept failed"));
+                        },
+                    }
+                })
+                .is_err()
+            {
+                crate::LOG.debug("hysteria quic: scope closed at shutdown, connection dropped");
+            }
         }
     });
 }
@@ -682,6 +703,8 @@ async fn serve_hysteria_connection(
     static_auth: String,
     udp_idle_timeout: Duration,
     on_new_udp_session: Option<Arc<dyn Fn(Arc<crate::conn::InterConn>) + Send + Sync>>,
+    // §3.5.6 ①类托管：auth 阶段的 detached h3 状态持有任务归本连接所属账本。
+    scope: xray_frame::compat::ManagedScope,
 ) {
     let remote = conn.remote_address();
     let local = conn
@@ -692,14 +715,15 @@ async fn serve_hysteria_connection(
     // Phase 1: h3 /auth 握手（返回客户端 CCRX 供 CC 协商）。
     // 非 auth 请求 / 密码错由 h3_auth 内 masquerade 应答（连接保持，Go hub.go:112-117）；
     // None 仅在 h3 层终结（客户端断开）时返回。
-    let auth_down = match h3_auth(&conn, &validator, &quic_params, &masq, &static_auth).await {
-        Some(down) => down,
-        None => {
-            crate::LOG.debug(format!("{remote} hysteria h3 auth phase ended without auth"));
-            conn.close(VarInt::from_u32(0), b"");
-            return;
-        },
-    };
+    let auth_down =
+        match h3_auth(&conn, &validator, &quic_params, &masq, &static_auth, &scope).await {
+            Some(down) => down,
+            None => {
+                crate::LOG.debug(format!("{remote} hysteria h3 auth phase ended without auth"));
+                conn.close(VarInt::from_u32(0), b"");
+                return;
+            },
+        };
     crate::LOG.info(format!("{remote} hysteria client authenticated"));
 
     // Phase 1.5: CC 协商（Go hub.go:75-86 switch）
@@ -891,6 +915,8 @@ async fn h3_auth(
     quic_params: &QuicParams,
     masq: &Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: &str,
+    // §3.5.6 ①类托管：detached h3 状态持有任务归本连接所属账本。
+    scope: &xray_frame::compat::ManagedScope,
 ) -> Option<u64> {
     let h3_server: h3::server::Connection<AuthH3Conn, bytes::Bytes> =
         match h3::server::Connection::new(AuthH3Conn::new(conn.clone())).await {
@@ -1020,15 +1046,19 @@ async fn h3_auth(
                     // ——替代旧 `mem::forget`：h3 状态生命周期 = 连接生命周期，
                     // 连接 churn 不再累积泄漏。
                     let hold_conn = conn.clone();
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h3 状态 detached 持有，替代 mem::forget）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-                    )]
-                    tokio::spawn(async move {
-                        let _held = h3_server;
-                        let _ = hold_conn.closed().await;
-                        // conn closed：对端不再消费流，此刻 drop 安全
-                    });
+                    // §3.5.6 ①类：持有任务归连接账本（连接终结自然退出；停机随
+                    // scope abort，此时对端连接已一并关闭，drop 安全）。
+                    if scope
+                        .spawn(async move {
+                            let _held = h3_server;
+                            let _ = hold_conn.closed().await;
+                            // conn closed：对端不再消费流，此刻 drop 安全
+                        })
+                        .is_err()
+                    {
+                        crate::LOG
+                            .debug("hysteria h3 auth: scope closed at shutdown, state not held");
+                    }
                     return Some(client_down);
                 }
 
@@ -2688,6 +2718,7 @@ mod tests {
             .build_handler(),
             "test-secret".into(),
             Duration::from_secs(300),
+            xray_frame::compat::ManagedScope::new("hysteria-gate-test"),
         );
 
         // 永挂验证器客户端：占住唯一名额（entered ⇒ 服务器已接纳、许可已被占）。

@@ -83,6 +83,9 @@ impl NaiveInboundConfig {
 
 struct InboundSlot {
     _accept_task: JoinHandle<()>,
+    /// §3.5.6 ①类托管：连接任务（h2 tunnel/mock relay）归本 scope；slot 摘除
+    /// （close/Drop）即 scope Drop 兜底 abort 在途连接。
+    scope: Arc<xray_frame::compat::ManagedScope>,
 }
 
 /// naive 入站 Handler，实现 [`InboundHandler`]。
@@ -166,6 +169,10 @@ impl InboundHandler for NaiveInboundHandler {
         let acceptor = self.tls.clone();
         let auth = Arc::clone(&self.auth);
         let dispatch = self.dispatch.clone();
+        // §3.5.6 ①类托管：连接任务归 handler 自持 scope（Arc 共享进 service 闭包，
+        // slot 摘除即 Drop abort）。
+        let scope = Arc::new(xray_frame::compat::ManagedScope::new("naive-inbound"));
+        let scope_for_slot = Arc::clone(&scope);
         #[allow(
             clippy::disallowed_methods,
             reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（naive accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
@@ -177,11 +184,11 @@ impl InboundHandler for NaiveInboundHandler {
                         let acceptor = acceptor.clone();
                         let auth = Arc::clone(&auth);
                         let dispatch = dispatch.clone();
-                        #[allow(
-                            clippy::disallowed_methods,
-                            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每连接 TLS/处理）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-                        )]
-                        tokio::spawn(async move {
+                        let scope = Arc::clone(&scope);
+                        let conn_scope = Arc::clone(&scope);
+                        // §3.5.6 ①类：每连接 TLS/h2 任务归 handler 自持 scope
+                        // （close/Drop 摘 slot 即 abort）；闸关即拒（留 debug）。
+                        let spawned = scope.spawn(async move {
                             let tls =
                                 match xray_transport::tls_handshake_gate::accept_tls_with_timeout(
                                     &acceptor,
@@ -196,8 +203,14 @@ impl InboundHandler for NaiveInboundHandler {
                                         return;
                                     },
                                 };
+                            let service_scope = Arc::clone(&conn_scope);
                             let service = service_fn(move |req| {
-                                handle_request(req, dispatch.clone(), Arc::clone(&auth))
+                                handle_request(
+                                    req,
+                                    dispatch.clone(),
+                                    Arc::clone(&auth),
+                                    Arc::clone(&service_scope),
+                                )
                             });
                             // bd wz2b N1：hyper server h2 缺省收窗 1MB/1MB + 每流
                             // send 400KB，naiveh2 下行钉 1MB/RTT。16/32MB + send
@@ -213,6 +226,11 @@ impl InboundHandler for NaiveInboundHandler {
                                 crate::LOG.debug(format!("error={e} h2 connection ended"));
                             }
                         });
+                        if spawned.is_err() {
+                            crate::LOG.debug(
+                                "naive inbound: scope closed at shutdown, connection dropped",
+                            );
+                        }
                     },
                     Err(e) => {
                         crate::LOG.debug(format!("error={e} accept failed"));
@@ -221,15 +239,20 @@ impl InboundHandler for NaiveInboundHandler {
                 }
             }
         });
-        *self.lock_slot() = Some(InboundSlot { _accept_task: accept_task });
+        *self.lock_slot() = Some(InboundSlot { _accept_task: accept_task, scope: scope_for_slot });
         crate::LOG
             .info(format!("tag={} addr={} naive inbound listening", self.tag, self.bind_addr));
         Ok(())
     }
 
     async fn close(&self) -> Result<(), InboundError> {
-        if let Some(slot) = self.lock_slot().take() {
+        // 先脱离锁再排空：temporary guard 若留在 if-let scrutinee 会跨 await 持锁。
+        let slot = self.lock_slot().take();
+        if let Some(slot) = slot {
             slot._accept_task.abort();
+            // §3.5.6 ①类收口：关闸 + abort 在途（连接任务全 abortable ⇒ 立即归零）；
+            // 报告（panic 清单 / 未完成数）由托管口自行落日志，此处只吸收值。
+            let _ = slot.scope.shutdown_timeout(std::time::Duration::from_millis(100)).await;
         }
         self.local_port.store(0, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
@@ -249,6 +272,7 @@ async fn handle_request(
     mut req: http::Request<Incoming>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     auth: Arc<NaiveInboundConfig>,
+    scope: Arc<xray_frame::compat::ManagedScope>,
 ) -> Result<http::Response<RespBody>, Infallible> {
     // fallback：非 CONNECT 一律 404 空响应（naiveproxy probe-resistance——
     // 主动探测看到的是普通 404 站点，不暴露代理身份）
@@ -294,11 +318,9 @@ async fn handle_request(
     );
     match dispatch {
         Some(dispatch) => {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h2 tunnel dispatch）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(async move {
+            // §3.5.6 ①类：tunnel dispatch 任务归所属 h2 连接 scope（连接任务
+            // 结束即 abort）；闸关即拒（200 已回，客户端读到断流而非挂住）。
+            let spawned = scope.spawn(async move {
                 let upgraded = match upgrade.await {
                     Ok(u) => u,
                     Err(e) => {
@@ -313,13 +335,16 @@ async fn handle_request(
                 );
                 let _ = dispatch.dispatch(&dest, link).await;
             });
+            if spawned.is_err() {
+                crate::LOG.debug("naive tunnel: scope closed at shutdown, tunnel not dispatched");
+            }
         },
         None => {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（无 dispatch 时 mock relay）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(relay_mock_direct(host.clone(), port, upgrade, padded));
+            // §3.5.6 ①类：mock relay 同归连接 scope。
+            if scope.spawn(relay_mock_direct(host.clone(), port, upgrade, padded)).is_err() {
+                crate::LOG
+                    .debug("naive mock relay: scope closed at shutdown, relay not dispatched");
+            }
         },
     }
 

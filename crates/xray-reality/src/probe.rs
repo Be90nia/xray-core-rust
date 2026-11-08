@@ -315,7 +315,7 @@ pub fn detect_max_useless_records(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（REALITY 探测，后台填充探测表）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+                reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（REALITY 探测，后台填充探测表）；探测表进程级缓存、无组件归属，任务随单次探测 timeout 自终（结果仅落表）；本 crate 无 xray-frame 依赖（真·本层无托管面，接线须先加依赖另票），不迁托管口"
             )]
             tokio::spawn(async move {
                 if let Some(tier) = detect_one(&dest_c, &sni_c, alpn).await {
@@ -460,7 +460,7 @@ pub fn detect_post_handshake_record_lens(
             let sni_c = sni.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（record lens 探测，后台填充）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+                reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（record lens 探测，后台填充探测表）；探测表进程级缓存、无组件归属，任务随单次探测 timeout 自终（结果仅落表）；本 crate 无 xray-frame 依赖（真·本层无托管面，接线须先加依赖另票），不迁托管口"
             )]
             tokio::spawn(async move {
                 let lens = timeout(

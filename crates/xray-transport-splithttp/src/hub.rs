@@ -203,6 +203,9 @@ impl HubListener {
             max_buffered_posts: self.config.normalized_sc_max_buffered_posts() as usize,
             sc_max_each_post_bytes: self.config.normalized_sc_max_each_post_bytes().to as usize,
         });
+        // §3.5.6 ①类：每 TCP 连接的 hyper 服务任务归 hub 托管口（listener close
+        // 关闸，hub 句柄丢弃即 abort 在途连接）。
+        let hub_scope = ctx.sessions.scope().clone();
         loop {
             let (stream, peer_addr) = match self.tcp_listener.accept().await {
                 Ok(conn) => conn,
@@ -210,41 +213,42 @@ impl HubListener {
             };
             let io = hyper_util::rt::TokioIo::new(stream);
             let ctx = Arc::clone(&ctx);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；每 TCP 连接一个 hyper http1/h2 服务任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(async move {
-                use hyper::service::service_fn;
-                let svc = service_fn(move |req| {
-                    let ctx = Arc::clone(&ctx);
-                    async move {
-                        Ok::<_, std::convert::Infallible>(
-                            handler::handle_request(req, peer_addr, &ctx).await,
-                        )
-                    }
-                });
-                // 自动协商 H1/H2：H2 preface 检测，回退到 H1
-                let mut builder = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                );
-                // bd wz2b S2：与 transport.rs serve_http_conn 同款 h2 显式流控——
-                // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
-                // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
-                // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取静态保底
-                // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
-                // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES`）与 serve_http_conn 同源生效。
-                let win = crate::flow_window::server_windows();
-                builder.http1().max_buf_size(max_head_bytes);
-                builder
-                    .http2()
-                    .timer(hyper_util::rt::TokioTimer::new())
-                    .max_header_list_size(max_head_bytes as u32)
-                    .max_send_buf_size(win.max_send_buf)
-                    .initial_stream_window_size(win.stream_window)
-                    .initial_connection_window_size(win.connection_window);
-                let _ = builder.serve_connection(io, svc).await;
-            });
+            if hub_scope
+                .spawn(async move {
+                    use hyper::service::service_fn;
+                    let svc = service_fn(move |req| {
+                        let ctx = Arc::clone(&ctx);
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                handler::handle_request(req, peer_addr, &ctx).await,
+                            )
+                        }
+                    });
+                    // 自动协商 H1/H2：H2 preface 检测，回退到 H1
+                    let mut builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    // bd wz2b S2：与 transport.rs serve_http_conn 同款 h2 显式流控——
+                    // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
+                    // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
+                    // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取静态保底
+                    // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
+                    // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES`）与 serve_http_conn 同源生效。
+                    let win = crate::flow_window::server_windows();
+                    builder.http1().max_buf_size(max_head_bytes);
+                    builder
+                        .http2()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .max_header_list_size(max_head_bytes as u32)
+                        .max_send_buf_size(win.max_send_buf)
+                        .initial_stream_window_size(win.stream_window)
+                        .initial_connection_window_size(win.connection_window);
+                    let _ = builder.serve_connection(io, svc).await;
+                })
+                .is_err()
+            {
+                crate::LOG.debug("splithttp hub: scope closed at shutdown, connection dropped");
+            }
         }
     }
 }

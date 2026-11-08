@@ -291,8 +291,23 @@ where
             // 3. raw_buf 不足，从底层读——直读 raw_buf 余量（免 16KB 栈 memset 与
             // extend 回拼）；余量为空时按单 record 上限扩容（total 可达
             // 5 + TLS_PAYLOAD_MAX = 16645 > 16KiB 初始容量）
-            if this.raw_buf.spare_capacity_mut().is_empty() {
-                this.raw_buf.reserve(TLS_RECORD_HEADER_LEN + TLS_PAYLOAD_MAX as usize);
+            //
+            // 已消费前缀必须回收（bd h10vg）：raw_buf 只在 `raw_pos == len` 时整清，
+            // 而持续成流时尾部几乎总留着半条 record ⇒ 整清永不触发，`raw_pos` 之前
+            // 的死区只增不减；余量一旦耗尽就只能 `reserve` 翻倍，容量随**累计流量**
+            // 无限增长（200 MiB 上行实测常驻 258 MiB 且永不回落）。死区过半时整体
+            // 前移（每次搬 ≤ 半缓冲，摊还 O(1)/byte），容量随即回到「半条 record +
+            // 一次读」量级。
+            let need = TLS_RECORD_HEADER_LEN + TLS_PAYLOAD_MAX as usize;
+            if this.raw_buf.spare_capacity_mut().len() < need {
+                if this.raw_pos > 0 && this.raw_pos * 2 >= this.raw_buf.len() {
+                    this.raw_buf.copy_within(this.raw_pos.., 0);
+                    this.raw_buf.truncate(this.raw_buf.len() - this.raw_pos);
+                    this.raw_pos = 0;
+                }
+                if this.raw_buf.spare_capacity_mut().len() < need {
+                    this.raw_buf.reserve(need);
+                }
             }
             let spare = this.raw_buf.spare_capacity_mut();
             let mut rb = ReadBuf::uninit(spare);
@@ -495,6 +510,60 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         conn_b.read_exact(&mut got).await.unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// bd h10vg 回归：持续成流时 `raw_buf` 的已消费前缀必须回收。
+    ///
+    /// 复现形态 = 生产读块（8 KiB）读一条**连续**记录流：整清条件 `raw_pos == len`
+    /// 因尾部半条 record 而永不成立，若只靠 `reserve` 扩容，容量随累计流量增长
+    /// （200 MiB 上行实测常驻 258 MiB）。判据 = 读完 512 KiB 后容量仍在同一量级。
+    #[tokio::test]
+    async fn raw_buf_capacity_stays_bounded_on_continuous_stream() {
+        const READ_BLOCK: usize = 8 * 1024; // = 生产 SingleReader 缺省读块
+        const TOTAL: usize = 512 * 1024;
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut conn_a = CommonConn::new(
+            client_io,
+            Aead::new(b"ctx", b"k", true),
+            Aead::new(b"ctx", b"k", true),
+            true,
+            b"k".to_vec(),
+        );
+        let mut conn_b = CommonConn::new(
+            server_io,
+            Aead::new(b"ctx", b"k", true),
+            Aead::new(b"ctx", b"k", true),
+            true,
+            b"k".to_vec(),
+        );
+        let capacity_after = conn_b.raw_buf.capacity();
+
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+        let writer = async {
+            conn_a.write_all(&payload).await.unwrap();
+            conn_a.flush().await.unwrap();
+        };
+        let reader = async {
+            let mut got = vec![0u8; TOTAL];
+            let mut off = 0;
+            while off < TOTAL {
+                let end = (off + READ_BLOCK).min(TOTAL);
+                let n = conn_b.read(&mut got[off..end]).await.unwrap();
+                assert!(n > 0, "读到 EOF 但还差 {} 字节", TOTAL - off);
+                off += n;
+            }
+            got
+        };
+        let ((), got) = tokio::join!(writer, reader);
+
+        assert_eq!(got, expect, "载荷必须逐字节一致");
+        let grown = conn_b.raw_buf.capacity();
+        assert!(
+            grown <= capacity_after * 4,
+            "raw_buf 容量随流量增长（已消费前缀未回收）：{capacity_after} → {grown}"
+        );
     }
 
     /// ChaCha20 路径 round-trip（验证非 AES 分支）。

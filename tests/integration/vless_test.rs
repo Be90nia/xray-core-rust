@@ -105,7 +105,16 @@ async fn run_vless_e2e() {
             vless_listener,
             xray_transport::sockopt::SocketOptions::default(),
         );
-        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
+        let _ = serve_vless(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
+        )
+        .await;
     });
 
     // 4. VLESS client：connect → encode header → decode response → echo round-trip
@@ -157,7 +166,16 @@ async fn vless_rejects_unknown_user() {
             vless_listener,
             xray_transport::sockopt::SocketOptions::default(),
         );
-        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
+        let _ = serve_vless(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
+        )
+        .await;
     });
 
     // client 用未注册的随机 UUID

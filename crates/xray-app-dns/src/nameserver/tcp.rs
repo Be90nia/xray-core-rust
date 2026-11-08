@@ -332,11 +332,6 @@ pub fn new_tcp_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>, Dns
     TcpNameServer::from_config(ns)
 }
 
-/// 构造 TCP 本地 nameserver（暂与普通 TCP 一致；Go 版本走 system resolver，留 follow-up）。
-pub fn new_tcp_local_name_server(ns: &NameServerConfig) -> Result<Box<dyn Server>, DnsError> {
-    TcpNameServer::from_config(ns)
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(

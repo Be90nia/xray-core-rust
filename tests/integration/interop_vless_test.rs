@@ -181,7 +181,16 @@ async fn rust_vless_server_go_client() {
             vless_listener,
             xray_transport::sockopt::SocketOptions::default(),
         );
-        let _ = serve_vless(listener, ohm_clone, validator_clone, None, None, None).await;
+        let _ = serve_vless(
+            listener,
+            ohm_clone,
+            validator_clone,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
+        )
+        .await;
     });
 
     // Configure Go xray: SOCKS5 inbound -> VLESS outbound -> Rust server

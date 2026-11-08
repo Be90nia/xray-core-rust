@@ -249,6 +249,9 @@ pub fn register_outbounds<T: OutboundTable>(
     // 非 freedom 出站查 level 0；freedom 按 settings.userLevel 查档位
     // （Go freedom.go:222-225 h.policy()）。None = SessionDefault。
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
+    // §3.5.6 ①类托管：宿主 arm scope 登记表（None = 测试装配，scope 走 Drop 兜底）。
+    // dialerProxy 钩子的 spawn ctx 经此登记进 Instance，停机逆序显式关停。
+    arm_scopes: Option<&Arc<xray_frame::ArmScopeRegistry>>,
 ) -> std::result::Result<(), BuildError> {
     let table = ohm;
     let ohm: &SimpleOhm = table.as_ohm();
@@ -313,6 +316,12 @@ pub fn register_outbounds<T: OutboundTable>(
     // ponytail: 进程级单钩子（最后注册生效）；多 Instance 并存场景待需要时再改 per-instance。
     // bd j7xic：hook 持 **Weak**（生产路径）或安装期快照（借用路径），不再有裸指针逃逸。
     let (dialer_proxy_ohm, hook_keepalive) = ohm_ref_for_hook(table);
+    // §3.5.6 ①类托管：钩子 ctx 的 arm scope 登记进宿主注册表，Instance::close
+    // 逆序关停（停机期拨号 fail-visible：spawn Err → 返回 Err 拒连接）。
+    let dialer_proxy_ctx = Arc::new(xray_frame::PluginContext::for_plugin("dialerproxy"));
+    if let Some(reg) = arm_scopes {
+        reg.register("dialerproxy", Arc::clone(dialer_proxy_ctx.arm_scope()));
+    }
     xray_transport::system_dialer::set_dialer_proxy_hook(Arc::new(
         move |tag: &str, dest: &Destination| {
             // 借用路径：安装期快照的唯一持有者就是本闭包（闭包全局存活 ⇒ 快照跟着活）；
@@ -321,6 +330,7 @@ pub fn register_outbounds<T: OutboundTable>(
             let tag = tag.to_string();
             let dest = dest.clone();
             let ohm = Arc::clone(&dialer_proxy_ohm);
+            let dialer_proxy_ctx = Arc::clone(&dialer_proxy_ctx);
             Box::pin(async move {
                 let Some(handler) = ohm.get_handler(&tag) else {
                     #[allow(clippy::io_other_error)] // 存量清零批次
@@ -340,13 +350,16 @@ pub fn register_outbounds<T: OutboundTable>(
                     xray_buf::io::new_writer(server_w),
                 );
                 let fut = handler.dispatch(&dest, link);
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "①类·脱管债（bd kwevg · §3.5.6）：dialerProxy 代理链拨号的后台投递（Go dispatch goroutine 直译），投递不等结果，寿命随该 dispatch 的 duplex 链路，句柄无需持有；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-                )]
-                tokio::spawn(async move {
-                    let _ = fut.await;
-                });
+                // §3.5.6 ①类：投递任务归 dialerProxy arm scope（装配期登记进
+                // Instance），停机随 scope 取消；闸关即拒（禁静默掉链路）。
+                if dialer_proxy_ctx
+                    .spawn(async move {
+                        let _ = fut.await;
+                    })
+                    .is_err()
+                {
+                    return Err(std::io::Error::other("dialerProxy: shutting down"));
+                }
                 Ok(Box::new(xray_transport::connection::DuplexConnection::new(client))
                     as Box<dyn xray_transport::connection::Connection>)
             })
@@ -1657,6 +1670,8 @@ pub(crate) struct DnsDispatchBridge {
     handler: xray_proxy_dns::Handler,
     /// xray-app-dns 服务：Hijack 动作 lookup_ip + ownLink 判定。
     dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
+    /// §3.5.6 ①类托管：Hijack 应答 spawn 的 ctx（arm scope，停机关闸拒新）。
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 }
 
 impl DnsDispatchBridge {
@@ -1664,8 +1679,9 @@ impl DnsDispatchBridge {
         tag: impl Into<String>,
         handler: xray_proxy_dns::Handler,
         dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
+        plugin_ctx: Arc<xray_frame::PluginContext>,
     ) -> Self {
-        Self { tag: tag.into(), handler, dns_service }
+        Self { tag: tag.into(), handler, dns_service, plugin_ctx }
     }
 
     /// Go `isOwnLink`（dns.go:118-120）：DnsService 实现 ownLinkVerifier。
@@ -1781,8 +1797,12 @@ impl DispatchHandler for DnsDispatchBridge {
     }
 
     fn dispatch(&self, dest: &Destination, link: Link) -> PinFuture<()> {
-        let (tag, handler, dns_service) =
-            (self.tag.clone(), self.handler.clone(), self.dns_service.clone());
+        let (tag, handler, dns_service, plugin_ctx) = (
+            self.tag.clone(),
+            self.handler.clone(),
+            self.dns_service.clone(),
+            self.plugin_ctx.clone(),
+        );
         let upstream = handler.rewrite_dest(dest);
         let timeout = handler.timeout;
         let own_link = self.is_own_link("");
@@ -1795,6 +1815,7 @@ impl DispatchHandler for DnsDispatchBridge {
                 tag,
                 handler,
                 dns_service,
+                plugin_ctx,
                 upstream,
                 timeout,
                 own_link,
@@ -1813,8 +1834,12 @@ impl DispatchHandler for DnsDispatchBridge {
         access: xray_app_dispatcher::default::AccessContext,
     ) -> PinFuture<()> {
         let own_link = self.is_own_link(&access.inbound_tag);
-        let (tag, handler, dns_service) =
-            (self.tag.clone(), self.handler.clone(), self.dns_service.clone());
+        let (tag, handler, dns_service, plugin_ctx) = (
+            self.tag.clone(),
+            self.handler.clone(),
+            self.dns_service.clone(),
+            self.plugin_ctx.clone(),
+        );
         let upstream = handler.rewrite_dest(dest);
         let timeout = handler.timeout;
         let client_is_udp = !dest.is_tcp();
@@ -1823,6 +1848,7 @@ impl DispatchHandler for DnsDispatchBridge {
                 tag,
                 handler,
                 dns_service,
+                plugin_ctx,
                 upstream,
                 timeout,
                 own_link,
@@ -1858,6 +1884,7 @@ async fn dispatch_dns_link(
     tag: String,
     handler: xray_proxy_dns::Handler,
     dns_service: Option<Arc<xray_app_dns::server::DnsService>>,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
     upstream: Destination,
     timeout: std::time::Duration,
     own_link: bool,
@@ -2114,15 +2141,19 @@ async fn dispatch_dns_link(
                         if let Some(svc) = dns_service.clone() {
                             let w = client_tx_for_req.clone();
                             let t = tag.clone();
-                            #[allow(
-                                clippy::disallowed_methods,
-                                reason = "①类·脱管债（bd kwevg · §3.5.6）：单条 DNS IP 查询的异步应答写回，寿命随该查询的客户端帧，句柄无需持有；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-                            )]
-                            tokio::spawn(async move {
+                            // §3.5.6 ①类：应答任务归 DNS outbound 托管 ctx（arm
+                            // scope，停机关闸拒新），拒发留日志（禁静默）。
+                            let spawned = plugin_ctx.spawn(async move {
                                 if let Some(resp) = handle_ip_query(&query, &svc).await {
                                     write_client_frame(&w, &t, &resp);
                                 }
                             });
+                            if spawned.is_err() {
+                                tracing::warn!(
+                                    tag = %tag,
+                                    "dns hijack: scope closed at shutdown, dropping query reply"
+                                );
+                            }
                         }
                     },
                     Err(e) => {
@@ -3694,7 +3725,7 @@ mod tests {
         let mut cfg = BuiltConfig::default();
         cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
         let table = Arc::new(SimpleOhm::new());
-        register_outbounds(&cfg, &table, None, None, None).unwrap();
+        register_outbounds(&cfg, &table, None, None, None, None).unwrap();
         assert!(table.get_handler("direct").is_some(), "前置：表里确有 handler");
 
         // 生产形态：hook 侧拿到的是 Weak 门面。
@@ -3717,7 +3748,7 @@ mod tests {
         let mut cfg = BuiltConfig::default();
         cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
         let table = SimpleOhm::new();
-        register_outbounds(&cfg, &table, None, None, None).unwrap();
+        register_outbounds(&cfg, &table, None, None, None, None).unwrap();
 
         let (manager, keepalive) = ohm_ref_for_hook(&table);
         assert!(keepalive.is_some(), "借用路径必须持有安装期快照");
@@ -3734,7 +3765,7 @@ mod tests {
         cfg.outbounds.push(make_outbound("freedom", "proxy", "{}"));
         cfg.outbounds.push(make_outbound("freedom", "direct", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&cfg, &ohm, None, None, None).unwrap();
+        register_outbounds(&cfg, &ohm, None, None, None, None).unwrap();
         let d = ohm.get_default_handler().expect("default handler set");
         assert_eq!(d.tag(), "proxy", "首个 outbound 应保持为默认出站");
     }
@@ -3791,7 +3822,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         assert!(ohm.get_default_handler().is_some(), "freedom should be default");
         assert!(ohm.get_handler("direct").is_some(), "freedom should be tagged");
@@ -3804,7 +3835,7 @@ mod tests {
         built.outbounds.push(make_outbound("freedom", "direct", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         // 第一个设为 default，"direct" 也设为 default（覆盖）
         assert!(ohm.get_default_handler().is_some());
@@ -3940,7 +3971,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "vless-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         assert!(ohm.get_handler("vless-out").is_some(), "vless should be registered");
     }
@@ -3991,7 +4022,7 @@ mod tests {
         built.outbounds.push(make_outbound("trojan", "trojan-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         assert!(ohm.get_handler("trojan-out").is_some(), "trojan should be registered");
     }
@@ -4003,7 +4034,7 @@ mod tests {
         built.outbounds.push(make_outbound("dokodemo", "dokodemo-out", settings));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         assert!(ohm.get_handler("dokodemo-out").is_some(), "dokodemo should be registered");
     }
@@ -4015,7 +4046,7 @@ mod tests {
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
 
         assert!(ohm.get_handler("tun-out").is_some(), "tun should be registered");
     }
@@ -4030,7 +4061,7 @@ mod tests {
         built.outbounds.push(make_outbound("tun", "tun-out", "{}"));
 
         let ohm = SimpleOhm::new();
-        let err = register_outbounds(&built, &ohm, None, None, None)
+        let err = register_outbounds(&built, &ohm, None, None, None, None)
             .expect_err("tun on unsupported platform must reject the config");
         let msg = err.to_string();
         assert!(msg.contains("only supported on"), "error must state the platform gate: {msg}");
@@ -4051,7 +4082,7 @@ mod tests {
         built.outbounds.push(make_outbound("vless", "bad-vless", settings));
 
         let ohm = SimpleOhm::new();
-        let err = register_outbounds(&built, &ohm, None, None, None)
+        let err = register_outbounds(&built, &ohm, None, None, None, None)
             .expect_err("invalid vless uuid must reject the config");
         let msg = err.to_string();
         assert!(msg.contains("bad-vless"), "error must name the tag: {msg}");
@@ -4062,7 +4093,7 @@ mod tests {
     fn register_empty_outbounds_noop() {
         let built = BuiltConfig::default();
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_default_handler().is_none());
     }
 
@@ -4747,7 +4778,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("bh").is_some(), "blackhole should register");
     }
 
@@ -4759,7 +4790,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("blackhole", "bh-http", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("bh-http").is_some());
     }
 
@@ -4769,7 +4800,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("socks-out").is_some(), "socks outbound should register");
     }
 
@@ -4780,7 +4811,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "socks-auth", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("socks-auth").is_some());
     }
 
@@ -4790,7 +4821,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-out", settings));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("mux-out").is_some(), "mux outbound should register");
     }
 
@@ -4799,7 +4830,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("mux", "mux-default", "{}"));
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, None, None).unwrap();
+        register_outbounds(&built, &ohm, None, None, None, None).unwrap();
         assert!(ohm.get_handler("mux-default").is_some());
     }
 
@@ -5119,7 +5150,7 @@ mod tests {
         let mut built = BuiltConfig::default();
         built.outbounds.push(make_outbound("socks", "bad-socks", "{}"));
         let ohm = SimpleOhm::new();
-        let err = register_outbounds(&built, &ohm, None, None, None)
+        let err = register_outbounds(&built, &ohm, None, None, None, None)
             .expect_err("socks without servers must reject the config");
         assert!(err.to_string().contains("bad-socks"), "error must name the tag: {err}");
     }
@@ -5136,7 +5167,7 @@ mod tests {
         built.outbounds.push(ob);
 
         let ohm = SimpleOhm::new();
-        let err = register_outbounds(&built, &ohm, None, None, None)
+        let err = register_outbounds(&built, &ohm, None, None, None, None)
             .expect_err("proxySettings must reject the config (removed in Go 26.10.17)");
         let msg = err.to_string();
         assert!(msg.contains("proxySettings"), "error must name the key: {msg}");
@@ -5705,7 +5736,7 @@ mod tests {
         let built = cfg.build().unwrap();
 
         let ohm = SimpleOhm::new();
-        register_outbounds(&built, &ohm, None, Some(hosts_dns_service()), None).unwrap();
+        register_outbounds(&built, &ohm, None, Some(hosts_dns_service()), None, None).unwrap();
         let handler = ohm.get_handler("out").expect("outbound registered");
 
         // inbound 侧 link：pipe 双向
@@ -5746,7 +5777,7 @@ mod tests {
         .build()
         .unwrap();
         let ohm2 = SimpleOhm::new();
-        register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service()), None).unwrap();
+        register_outbounds(&plain, &ohm2, None, Some(hosts_dns_service()), None, None).unwrap();
         let h2 = ohm2.get_handler("plain").unwrap();
         let (up_r2, mut up_w2) =
             xray_buf::pipe::new_with_option(xray_buf::pipe::PipeOption::default());
@@ -6034,7 +6065,7 @@ mod tests {
             let built = cfg.build().unwrap();
 
             let ohm = SimpleOhm::new();
-            register_outbounds(&built, &ohm, None, None, None).unwrap();
+            register_outbounds(&built, &ohm, None, None, None, None).unwrap();
             let handler = ohm.get_handler("trojan-out").expect("trojan-out registered");
 
             let (up_r, mut up_w) =
@@ -6131,7 +6162,7 @@ mod tests {
             let built = cfg.build().unwrap();
 
             let ohm = SimpleOhm::new();
-            register_outbounds(&built, &ohm, None, None, None).unwrap();
+            register_outbounds(&built, &ohm, None, None, None, None).unwrap();
             let handler = ohm.get_handler("freedom-out").expect("freedom-out registered");
 
             let (up_r, mut up_w) =
@@ -6682,7 +6713,12 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
@@ -6703,7 +6739,12 @@ mod tests {
         let svc = make_fakedns_service("fake-in");
         let handler =
             parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            Some(svc),
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         // dest 无所谓（Hijack 不转发）。
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
@@ -6985,7 +7026,12 @@ mod tests {
         let svc = make_fakedns_service("self-loop");
         let handler =
             parse_dns_outbound_config(b"{}", std::time::Duration::from_secs(300)).unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            Some(svc),
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest =
             Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(addr.port()));
 
@@ -7012,7 +7058,12 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
 
@@ -7054,7 +7105,12 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest = Destination::udp(
             Address::from_ipv4_bytes([127, 0, 0, 1]),
             Port::new(upstream_addr.port()),
@@ -7086,7 +7142,12 @@ mod tests {
         let svc = make_fakedns_service("fake-idle");
         let handler =
             parse_dns_outbound_config(b"{}", std::time::Duration::from_millis(150)).unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, Some(svc));
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            Some(svc),
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest = Destination::udp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(53));
 
         let mut session = xray_app_dispatcher::UdpDispatchSession::new(Arc::new(bridge));
@@ -7150,7 +7211,12 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .unwrap();
-        let bridge = DnsDispatchBridge::new("dns-out", handler, None);
+        let bridge = DnsDispatchBridge::new(
+            "dns-out",
+            handler,
+            None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
+        );
         let dest =
             Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(upstream_port));
         let (mut up_w, mut dn_r) = spawn_dns_bridge(&bridge, &dest, None);
@@ -7627,6 +7693,7 @@ mod dns_client_writer_queue {
             "uwq9n-stalled".into(),
             respond_handler(idle),
             None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
             stalled_dest(),
             idle,
             false,
@@ -7668,6 +7735,7 @@ mod dns_client_writer_queue {
             "uwq9n-healthy".into(),
             respond_handler(idle),
             None,
+            Arc::new(xray_frame::PluginContext::for_plugin("dns")),
             stalled_dest(),
             idle,
             false,

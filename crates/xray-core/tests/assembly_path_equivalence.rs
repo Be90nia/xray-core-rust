@@ -512,7 +512,7 @@ async fn production_path_rejects_unsupported_outbound() {
     );
 
     let ohm = SimpleOhm::new();
-    let err = register_outbounds(&built, &ohm, None, None, None)
+    let err = register_outbounds(&built, &ohm, None, None, None, None)
         .expect_err("生产路必须对未支持协议拒启（bd o91s4，对齐 Go conf 解码期硬错）");
     assert!(err.to_string().contains("no-such-protocol"), "错误必须点名协议：{err}");
     // 拒启语义：不得留下「部分注册」的假可用表（默认出站前移是本票的原始危害）。

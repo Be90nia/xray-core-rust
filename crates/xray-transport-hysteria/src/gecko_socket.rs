@@ -130,7 +130,7 @@ impl GeckoSocket {
 fn spawn_send_driver(conn: Arc<GeckoConn>, mut send_rx: mpsc::Receiver<(Bytes, SocketAddr)>) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（Gecko 发送 driver）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——Gecko 发送 driver（send_rx 循环）；寿命随所属 UDP 会话/socket 关闭自终，停机不拆在途泵（Go 同构 goroutine），不迁托管口"
     )]
     tokio::spawn(async move {
         while let Some((buf, addr)) = send_rx.recv().await {
@@ -153,7 +153,7 @@ fn spawn_recv_driver(
 ) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（Gecko 接收 driver）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——Gecko 接收 driver（recv 循环）；寿命随所属 UDP 会话/socket 关闭自终，停机不拆在途泵（Go 同构 goroutine），不迁托管口"
     )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];

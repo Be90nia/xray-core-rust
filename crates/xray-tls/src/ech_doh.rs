@@ -249,7 +249,7 @@ where
         .map_err(|e| TlsError::EchApply(format!("ECH DoH h2 handshake: {e}")))?;
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（DoH h2 conn driver）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（DoH h2 conn driver）；conn driver 随连接 drop 退（连接终则驱动退），寿命不越单条连接；本 crate 无 xray-frame 依赖（接线须先加依赖另票），不迁托管口"
     )]
     tokio::spawn(async move {
         let _ = conn.await;
@@ -422,29 +422,40 @@ mod tests {
                         Err(_) => return,
                     };
                     while let Some(Ok((req, mut respond))) = h2_conn.accept().await {
-                        let mut body = req.into_body();
-                        let mut q = Vec::new();
-                        while let Some(chunk) = body.data().await {
-                            q.extend_from_slice(&chunk.unwrap());
-                        }
-                        let query_msg = match Message::from_vec(&q) {
-                            Ok(m) => m,
-                            Err(_) => return,
-                        };
-                        let resp_payload =
-                            https_rr_response(query_msg.metadata.id, &fqdn, ech.clone(), ttl);
-                        let resp = http::Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/dns-message")
-                            .body(())
-                            .unwrap();
-                        let mut send = match respond.send_response(resp, false) {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        };
-                        if send.send_data(Bytes::from(resp_payload), true).is_err() {
-                            return;
-                        }
+                        // 排空+应答放**独立任务**：accept 环是 h2 连接 I/O 的唯一驱动
+                        // 者，环内 `await` `data()` 自堵——DATA 未入缓冲时永久挂起
+                        // （bd ll2hr 同款，Linux 必现）。
+                        let fqdn = fqdn.clone();
+                        let ech = ech.clone();
+                        #[allow(clippy::disallowed_methods, reason = "测试：mock DoH 每请求泵")]
+                        tokio::spawn(async move {
+                            let mut body = req.into_body();
+                            let mut q = Vec::new();
+                            // fail-loud 护栏：读不齐 = 连接驱动被堵（把排空挪回 accept 环即复发）。
+                            let drained = timeout(Duration::from_secs(5), async {
+                                while let Some(chunk) = body.data().await {
+                                    q.extend_from_slice(&chunk.unwrap());
+                                }
+                            })
+                            .await;
+                            assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                            let query_msg = match Message::from_vec(&q) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            let resp_payload =
+                                https_rr_response(query_msg.metadata.id, &fqdn, ech, ttl);
+                            let resp = http::Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/dns-message")
+                                .body(())
+                                .unwrap();
+                            let mut send = match respond.send_response(resp, false) {
+                                Ok(s) => s,
+                                Err(_) => return,
+                            };
+                            let _ = send.send_data(Bytes::from(resp_payload), true);
+                        });
                     }
                 });
             }
@@ -546,33 +557,41 @@ mod tests {
                         Err(_) => return,
                     };
                     while let Some(Ok((req, mut respond))) = h2_conn.accept().await {
-                        let mut body = req.into_body();
-                        let mut q = Vec::new();
-                        while let Some(chunk) = body.data().await {
-                            q.extend_from_slice(&chunk.unwrap());
-                        }
-                        let query_msg = match Message::from_vec(&q) {
-                            Ok(m) => m,
-                            Err(_) => return,
-                        };
-                        let payload = https_rr_response(
-                            query_msg.metadata.id,
-                            "tls-ech.example.com.",
-                            ech_inner.clone(),
-                            300,
-                        );
-                        let resp = http::Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/dns-message")
-                            .body(())
-                            .unwrap();
-                        let mut send = match respond.send_response(resp, false) {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        };
-                        if send.send_data(Bytes::from(payload), true).is_err() {
-                            return;
-                        }
+                        // 排空+应答放**独立任务**：accept 环是 h2 连接 I/O 的唯一驱动
+                        // 者，环内 `await` `data()` 自堵（bd ll2hr 同款）。
+                        let ech_inner = ech_inner.clone();
+                        #[allow(clippy::disallowed_methods, reason = "测试：mock DoH 每请求泵")]
+                        tokio::spawn(async move {
+                            let mut body = req.into_body();
+                            let mut q = Vec::new();
+                            let drained = timeout(Duration::from_secs(5), async {
+                                while let Some(chunk) = body.data().await {
+                                    q.extend_from_slice(&chunk.unwrap());
+                                }
+                            })
+                            .await;
+                            assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                            let query_msg = match Message::from_vec(&q) {
+                                Ok(m) => m,
+                                Err(_) => return,
+                            };
+                            let payload = https_rr_response(
+                                query_msg.metadata.id,
+                                "tls-ech.example.com.",
+                                ech_inner,
+                                300,
+                            );
+                            let resp = http::Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/dns-message")
+                                .body(())
+                                .unwrap();
+                            let mut send = match respond.send_response(resp, false) {
+                                Ok(s) => s,
+                                Err(_) => return,
+                            };
+                            let _ = send.send_data(Bytes::from(payload), true);
+                        });
                     }
                 });
             }

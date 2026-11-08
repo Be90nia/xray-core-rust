@@ -458,11 +458,10 @@ async fn dial_ws(
 fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialParams) {
     let pool = pool.clone();
     let key = key.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（池预连接补拨）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    tokio::spawn(async move {
+    // §3.5.6 托管接线：池为进程级单例（global_pool LazyLock），补拨任务寿命 =
+    // 池 ⇒ 归进程级托管 scope（compat::spawn）；闸关（进程收尾）即不补（尽力
+    // 而为语义，debug 留痕非静默）。
+    if xray_frame::compat::spawn(async move {
         if !pool.begin_preconnect(&key).await {
             return;
         }
@@ -475,7 +474,11 @@ fn spawn_replenish(pool: &Arc<WsConnectionPool>, key: &PoolKey, params: DialPara
                 key.short_label()
             )),
         }
-    });
+    })
+    .is_err()
+    {
+        crate::LOG.debug("ws pool replenish: process scope closed at shutdown, skipped");
+    }
 }
 
 /// 预连接 burst 补拨：一次性发起 `BURST_REPLENISH_FANOUT` 个并行拨号，全部由

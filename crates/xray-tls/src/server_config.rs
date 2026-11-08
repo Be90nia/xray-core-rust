@@ -294,18 +294,16 @@ pub fn build_server_config(
     // 打开失败对齐 Go：warn 后继续（无 keylog），不 fail 配置。生产误用风险：
     // TLS 主密钥落盘，需文档警示。
     match master_key_log {
-        MasterKeyLogSetting::Path(path) => {
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(file) => {
-                    config.key_log = Arc::new(KeyLogFileWriter(parking_lot::Mutex::new(file)));
-                },
-                Err(e) => tracing::warn!(
-                    target: "xray_tls::server_config",
-                    error = %e,
-                    path = %path,
-                    "failed to open masterKeyLog as file; key log disabled"
-                ),
-            }
+        MasterKeyLogSetting::Path(path) => match open_key_log_file(&path) {
+            Ok(file) => {
+                config.key_log = Arc::new(KeyLogFileWriter(parking_lot::Mutex::new(file)));
+            },
+            Err(e) => tracing::warn!(
+                target: "xray_tls::server_config",
+                error = %e,
+                path = %path,
+                "failed to open masterKeyLog as file; key log disabled"
+            ),
         },
         MasterKeyLogSetting::EnvFile => config.key_log = Arc::new(rustls::KeyLogFile::new()),
         MasterKeyLogSetting::Off => {},
@@ -413,6 +411,25 @@ impl KeyLogFileWriter {
     }
 }
 
+/// 打开 masterKeyLog 文件（create/append）。
+///
+/// 内容 = TLS 主密钥材料（NSS keylog 行）：Unix 下收紧 0600——Go `KeyLogWriter`
+/// 同形态为 umask 缺省（通常 0644，多用户主机即明文交出全部会话），本仓按
+/// 安全强化向偏离 Go parity。Windows 无 POSIX 权限位（`mode()` 是 unix-only
+/// API），继承 ACL 缺省。
+pub(crate) fn open_key_log_file<P: AsRef<std::path::Path>>(
+    path: P,
+) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path.as_ref())
+}
+
 /// 为 btls 指纹路径打开 `masterKeyLog` 写入器（bd 4w092 c）。
 ///
 /// 口径与 rustls 路径一致：`Path` 追加打开，`EnvFile`（bool `true` 历史方言）
@@ -435,7 +452,7 @@ pub(crate) fn open_master_key_log(
             },
         },
     };
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match open_key_log_file(std::path::Path::new(&path)) {
         Ok(file) => Some(std::sync::Arc::new(KeyLogFileWriter(parking_lot::Mutex::new(file)))),
         Err(e) => {
             tracing::warn!(

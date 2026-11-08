@@ -679,8 +679,8 @@ mod proc_windows {
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
-            TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+            MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
         },
         System::Threading::{
             OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -704,12 +704,17 @@ mod proc_windows {
 
     fn find_pid_v4(ip: Ipv4Addr, port: u16) -> Option<u32> {
         let buf = tcp_table(AF_INET)?;
-        // SAFETY: buf 由 tcp_table 按 GetExtendedTcpTable 所需 size 分配并刚填充，布局即
-        // MIB_TCPTABLE_OWNER_PID
+        // SAFETY: buf 为 Vec<u32>（align=4 ≥ 表结构对齐），由 tcp_table 按
+        // GetExtendedTcpTable 所需 size 分配并刚填充，布局即 MIB_TCPTABLE_OWNER_PID；
+        // 行数按缓冲容量夹取（dwNumEntries 为内核回填，越界声明不得越缓冲读）。
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-            let rows =
-                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            let max_rows = (buf.len() * std::mem::size_of::<u32>() - std::mem::size_of::<u32>())
+                / std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
+            let rows = std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(max_rows),
+            );
             // dwLocalAddr 为网络字节序；from_be 还原后与 octets 比较。
             let want_addr = u32::from_be_bytes(ip.octets());
             for row in rows {
@@ -723,11 +728,16 @@ mod proc_windows {
 
     fn find_pid_v6(ip: Ipv6Addr, port: u16) -> Option<u32> {
         let buf = tcp_table(AF_INET6)?;
-        // SAFETY: 同 v4 路径：按所需 size 分配且刚填充，布局即 MIB_TCP6TABLE_OWNER_PID
+        // SAFETY: 同 v4 路径：Vec<u32>（align=4）按所需 size 分配且刚填充，布局即
+        // MIB_TCP6TABLE_OWNER_PID；行数按缓冲容量夹取（越界声明不越缓冲读）。
         unsafe {
             let table = &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID);
-            let rows =
-                std::slice::from_raw_parts(table.table.as_ptr(), table.dwNumEntries as usize);
+            let max_rows = (buf.len() * std::mem::size_of::<u32>() - std::mem::size_of::<u32>())
+                / std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>();
+            let rows = std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(max_rows),
+            );
             let octets = ip.octets();
             for row in rows {
                 // ucLocalAddr 已是网络序原始 16 字节，直接比较。
@@ -746,9 +756,18 @@ mod proc_windows {
         u16::from_be((port_field & 0xFFFF) as u16)
     }
 
-    /// 调 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 取整张表字节。
-    fn tcp_table(af: u32) -> Option<Vec<u8>> {
-        // SAFETY: 两段式 Win32 契约：首调 null buf 填 size，二调以该 size 分配的缓冲接收整表
+    /// 调 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 取整张表。
+    ///
+    /// 返回 `Vec<u32>`（align=4）：表结构含 `u32` 字段，`Vec<u8>`（align=1）
+    /// cast 结构体指针是形式对齐 UB（兄弟实现 portmap 同款修法）。
+    fn tcp_table(af: u32) -> Option<Vec<u32>> {
+        let row_bytes = if af == AF_INET {
+            std::mem::size_of::<MIB_TCPROW_OWNER_PID>()
+        } else {
+            std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>()
+        };
+        // SAFETY: 两段式 Win32 契约：首调 null buf 填 size，二调以该 size 分配
+        // 的缓冲接收整表（Vec<u32> 保证对齐；尾部多留一行的 u32 余量）。
         unsafe {
             let mut size: u32 = 0;
             // 第一次取所需大小（返回 ERROR_INSUFFICIENT_BUFFER，size 被填入）。
@@ -756,7 +775,11 @@ mod proc_windows {
             if size == 0 {
                 return None;
             }
-            let mut buf = vec![0u8; size as usize];
+            let mut buf = vec![
+                0u32;
+                size as usize / std::mem::size_of::<u32>()
+                    + row_bytes / std::mem::size_of::<u32>()
+            ];
             let rc = GetExtendedTcpTable(
                 buf.as_mut_ptr() as *mut _,
                 &mut size,

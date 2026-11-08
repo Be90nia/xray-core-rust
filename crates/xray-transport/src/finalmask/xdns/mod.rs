@@ -936,22 +936,35 @@ mod tests {
                             req.headers().get(http::header::ACCEPT).unwrap(),
                             "application/dns-message"
                         );
-                        let mut body = req.into_body();
-                        let mut query = Vec::new();
-                        while let Some(chunk) = body.data().await {
-                            query.extend_from_slice(&chunk.unwrap());
-                        }
-                        // 源地址对 server 无语义（clientID 从 payload 解出）
-                        http_pipe.send_to(&query, doh_addr).await.unwrap();
-                        let mut buf = [0u8; 4096];
-                        let (n, _) = http_pipe.recv_from(&mut buf).await.unwrap();
-                        let resp = http::Response::builder()
-                            .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, "application/dns-message")
-                            .body(())
-                            .unwrap();
-                        let mut send = respond.send_response(resp, false).unwrap();
-                        send.send_data(bytes::Bytes::copy_from_slice(&buf[..n]), true).unwrap();
+                        // 请求体排空 + 回投放**独立任务**：accept 环是 h2 连接 I/O 的
+                        // 唯一驱动者，环内 `await` `data()` 自堵（bd ll2hr 同款）。
+                        let http_pipe = http_pipe.clone();
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "测试用 DoH 假服务器：每请求一任务"
+                        )]
+                        tokio::spawn(async move {
+                            let mut body = req.into_body();
+                            let mut query = Vec::new();
+                            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                                while let Some(chunk) = body.data().await {
+                                    query.extend_from_slice(&chunk.unwrap());
+                                }
+                            })
+                            .await;
+                            assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                            // 源地址对 server 无语义（clientID 从 payload 解出）
+                            http_pipe.send_to(&query, doh_addr).await.unwrap();
+                            let mut buf = [0u8; 4096];
+                            let (n, _) = http_pipe.recv_from(&mut buf).await.unwrap();
+                            let resp = http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .header(http::header::CONTENT_TYPE, "application/dns-message")
+                                .body(())
+                                .unwrap();
+                            let mut send = respond.send_response(resp, false).unwrap();
+                            send.send_data(bytes::Bytes::copy_from_slice(&buf[..n]), true).unwrap();
+                        });
                     }
                 });
             }

@@ -3,6 +3,12 @@
 //! 对应 Go `transport/internet/tcp/dialer.go`：`init()` 注册
 //! `RegisterTransportDialer("tcp", Dial)`。建立裸 TCP 连接后按
 //! `streamSettings.security` 包装 TLS / REALITY（对齐 Go `Dial` line 36-102）。
+//!
+//! **红线触碰记录（2026-11-08）**：本文件属 CLAUDE.md §4 红线表条目，本次改动依据
+//! 用户「修吧」授权 + bd k2tq1 裁定：注册失败由 `let _ =` 静默丢弃改为
+//! `ignore_already_exists(...)?` 上抛（fail-visible——静默失败会让
+//! `dial_with_settings` 落裸 TCP fallback 且跳过安全层）。改动仅 `register_dialer`
+//! 的两处注册调用，拨号路径未动；状态口径见 CLAUDE.md §4 同条。
 
 use std::{io, sync::Arc};
 

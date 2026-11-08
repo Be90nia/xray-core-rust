@@ -42,7 +42,9 @@ impl AddressSerializer {
     /// 格式：port(2 bytes BE) + address(variable)
     ///
     /// # Panics
-    /// 缓冲区剩余空间装不下端口 + 地址（调用方容量算错）时 panic。
+    /// 缓冲区剩余空间装不下端口 + 地址（调用方容量算错）时 panic；
+    /// 或地址为手工构造的 `Domain` 且域名 >255 字节时 panic（线格式 u8 长度位
+    /// 容不下——线上解析路径已被长度位钳制，只有手工构造 `Address` 可达）。
     pub fn write_port_address(buf: &mut Buffer, port: Port, addr: &Address) {
         let port_bytes = port.value().to_be_bytes();
         write_all(buf, &port_bytes);
@@ -54,7 +56,8 @@ impl AddressSerializer {
     /// 格式：address(variable) + port(2 bytes BE)
     ///
     /// # Panics
-    /// 缓冲区剩余空间装不下地址 + 端口（调用方容量算错）时 panic。
+    /// 缓冲区剩余空间装不下地址 + 端口（调用方容量算错）时 panic；
+    /// 或地址为手工构造的 `Domain` 且域名 >255 字节时 panic（同 [`Self::write_port_address`]）。
     pub fn write_address_port(buf: &mut Buffer, addr: &Address, port: Port) {
         Self::write_address(buf, addr);
         let port_bytes = port.value().to_be_bytes();

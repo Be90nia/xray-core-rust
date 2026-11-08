@@ -164,7 +164,11 @@ pub fn read_packet<R: Read>(r: &mut R) -> io::Result<(i32, Vec<u8>)> {
     let packet_length = read_varint(r)?;
     let packet_id = read_varint(r)?;
     let id_size = varint_size(packet_id) as i32;
-    let data_length = packet_length - id_size;
+    // 同步版与异步版（conn.rs）同款 checked_sub：packet_length < id_size 时
+    // i32 减法在 debug 构建会 panic（未认证可得路径禁 panic）。
+    let data_length = packet_length
+        .checked_sub(id_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "xmc packet length underflow"))?;
     if !(0..=PACKET_DATA_MAX).contains(&data_length) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -185,15 +189,6 @@ pub fn write_packet<W: Write>(w: &mut W, packet_id: i32, payload: &[u8]) -> io::
     write_varint(w, total_len as i32)?;
     write_varint(w, packet_id)?;
     w.write_all(payload)
-}
-
-/// 写 Disconnect packet（packet_id=0x00，单 String 字段）。
-// MC 协议 codec 完整面：server 踢客户端场景（Go writeDisconnect 对位）当前
-// 消费链路未接线，保留供 xmc server 面后续批次接线
-pub fn write_disconnect<W: Write>(w: &mut W, reason: &str) -> io::Result<()> {
-    let mut payload = Vec::with_capacity(reason.len() + 5);
-    write_string(&mut payload, reason)?;
-    write_packet(w, 0x00, &payload)
 }
 
 #[cfg(test)]

@@ -1329,11 +1329,12 @@ mod tests {
 
     /// 桥在途登记簿与**条目闸口径**一致（u440m 字节闸回退后）。
     ///
-    /// 算式（登记簿 doc 同源）：每方向 mpsc 64 条 + 读/写腿手上各 1 = 66 条 ×
-    /// 单条顶格 512KiB × 双方向 = 66 MiB。改任一因子（条目容量/腿形态/口径）
-    /// 须同步改本断言与登记簿 doc，否则红——行为面另由
-    /// `crates/xray-transport/tests/bridge_backpressure_entry_cap.rs` 钉住
-    /// （拉取数 65..66）。
+    /// 算式（登记簿 doc 同源）：每方向 mpsc `xray_transport::bridge::PIPE_BUF_CAP`
+    /// 条 + 读/写腿手上各 1 = 66 条 × 单条顶格 512KiB × 双方向 = 66 MiB。
+    /// 条目因子**从实现常量推导**（D-05：禁簿值自证字面量）——改 PIPE_BUF_CAP
+    /// 不改登记簿即红；腿形态/单条顶格口径变更仍须同步改本断言与登记簿 doc。
+    /// 行为面另由 `crates/xray-transport/tests/bridge_backpressure_entry_cap.rs`
+    /// 钉住（拉取数 65..66）。
     ///
     /// 回退记录（bd u440m）：曾断言 `BRIDGE_BYTE_GATE_PER_DIRECTION_BOOKED_BYTES
     /// == bridge::BRIDGE_BYTE_GATE_PER_DIRECTION_BYTES == 2MiB`（字节闸交叉断言）
@@ -1342,11 +1343,14 @@ mod tests {
     /// 比 0.939 −6.1% 超票面 5% 门），两断言随之删除：闸没了，登记它 = 造假。
     #[test]
     fn bridge_backpressure_ledger_matches_impl() {
+        // 66 = PIPE_BUF_CAP(64) + 读/写腿手上各 1；512KiB 为单条顶格（readv 8×64KiB
+        // / pipe 缺省 connection buffer，见 bridge.rs 背压闸口径注释）
+        let entries_per_direction = xray_transport::bridge::PIPE_BUF_CAP + 2;
         assert_eq!(
             BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
-            66 * 512 * 1024 * 2,
-            "桥在途满载上界（条目闸口径 66 条 × 512KiB × 双方向）与登记簿不一致：\
-             两处同步改（bd u440m 回退后口径）"
+            entries_per_direction * 512 * 1024 * 2,
+            "桥在途满载上界（条目闸口径 N 条 × 512KiB × 双方向）与登记簿不一致：\
+             两处同步改（bd u440m 回退后口径；N 从 PIPE_BUF_CAP 推导）"
         );
         // 回退后与 pipe 每连接份额（4MiB）**不再相等**——防「同份额不重复计账」
         // 的旧断言悄悄复活（字节闸已删，桥上界是条目闸口径的独立登记项）。

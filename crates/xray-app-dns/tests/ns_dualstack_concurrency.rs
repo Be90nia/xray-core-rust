@@ -260,17 +260,23 @@ async fn spawn_h2c_doh_server() -> (SocketAddr, Arc<AtomicUsize>) {
                 let Ok(mut h2) = h2::server::handshake(sock).await else { return };
                 while let Some(req) = h2.accept().await {
                     let Ok((req, mut respond)) = req else { return };
-                    let mut body = req.into_body();
-                    let mut buf = Vec::new();
-                    while let Some(chunk) = body.data().await {
-                        let Ok(chunk) = chunk else { return };
-                        buf.extend_from_slice(&chunk);
-                    }
-                    let Ok(query) = Message::from_vec(&buf) else { return };
-                    let payload = make_response(&query, 60);
-                    // 逐请求独立任务：应答延迟不得阻塞 h2 accept 循环（否则同一连接
-                    // 上的并发请求会被夹具自己串行化）。
+                    // 逐请求独立任务：请求体排空与应答都不得阻塞 h2 accept 循环——
+                    // accept 环是连接 I/O 的唯一驱动者，环内 `await` `data()` 自堵
+                    // （DATA 未入缓冲时永久挂起，bd ll2hr 同款）；延迟在环外也保住
+                    // 同连接并发请求不被夹具串行化。
                     xray_common::testing::spawn("dualstack-doh-answer", async move {
+                        let mut body = req.into_body();
+                        let mut buf = Vec::new();
+                        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                            while let Some(chunk) = body.data().await {
+                                let Ok(chunk) = chunk else { return };
+                                buf.extend_from_slice(&chunk);
+                            }
+                        })
+                        .await;
+                        assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                        let Ok(query) = Message::from_vec(&buf) else { return };
+                        let payload = make_response(&query, 60);
                         tokio::time::sleep(MOCK_RTT).await;
                         let resp = http::Response::builder()
                             .status(http::StatusCode::OK)

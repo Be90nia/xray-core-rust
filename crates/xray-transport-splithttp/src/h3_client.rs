@@ -591,7 +591,7 @@ impl H3Conn {
                     let server_name = server_name.to_string();
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；QUIC 0-RTT 结果观察任务（仅记日志）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+                        reason = "②豁免（bd kwevg · §3.5.6）：QUIC 0-RTT 结果观察任务（仅记日志）；一次性观察随 accept 结果自终，无数据面职责，不迁托管口"
                     )]
                     tokio::spawn(async move {
                         let accepted = accepted.await;
@@ -617,7 +617,7 @@ impl H3Conn {
 
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；h3 连接 driver 关闭任务（驱动 poll_close）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：h3 连接 driver 关闭任务（驱动 poll_close）；连接关闭即驱动完成自终（关闭语义本体），不迁托管口"
         )]
         tokio::spawn(async move {
             let _ = futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await;
@@ -842,7 +842,7 @@ impl H3Conn {
         let me_for_closed = Arc::downgrade(&this);
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 上行 body 发送任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——H3 上行 body 发送任务；随 body EOF/连接断开自终，停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(async move {
             let mut body_stream = Box::pin(body_stream);
@@ -877,7 +877,7 @@ impl H3Conn {
         let me_for_closed = Arc::downgrade(&this);
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行响应读取任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——H3 下行响应读取任务；随响应流 EOF/连接断开自终，停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(async move {
             // 响应头校验（对齐 DefaultDialerClient：非 200 → mark_closed + EOF）
@@ -941,7 +941,7 @@ where
     let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 下行接收任务（send_data/recv_data 均需 &mut self 故必须单 task）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——H3 下行接收任务（send_data/recv_data 均需 &mut self 故必须单 task）；随连接断开自终，停机不拆在途泵，不迁托管口"
     )]
     tokio::spawn(async move {
         loop {
@@ -994,7 +994,7 @@ where
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，h3_client 无 PluginContext 注入面；H3 懒读任务（收响应头 + 数据循环）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——H3 懒读任务（收响应头 + 数据循环）；随数据流 EOF/连接断开自终，停机不拆在途泵，不迁托管口"
     )]
     tokio::spawn(async move {
         tokio::select! {

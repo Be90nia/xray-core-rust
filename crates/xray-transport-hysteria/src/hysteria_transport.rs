@@ -294,7 +294,7 @@ async fn authenticate_via_h3(
     // 保活+推进，直到连接关闭（poll_close 返回）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h3 driver 保活）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h3 driver 保活）；driver 句柄在握（driver_task 随宿主 drop/显式 abort 收口），socket 关闭驱动即退，寿命不越所属连接，不迁托管口"
     )]
     let driver_task = tokio::spawn(async move {
         use std::future::poll_fn;

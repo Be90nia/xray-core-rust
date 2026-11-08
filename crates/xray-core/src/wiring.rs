@@ -483,13 +483,19 @@ fn build_ip_excluder(
 /// 首字节判别，真实帧必拒）。
 pub struct MuxCarrierHandler {
     inner: Arc<dyn DispatchHandler>,
+    /// §3.5.6 ①类托管：mux carrier spawn ctx（scope 装配期登记进宿主
+    /// `ArmScopeRegistry`，Instance::close 逆序关停）。
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 }
 
 impl MuxCarrierHandler {
     /// 包装生产 inbound dispatch handler（通常为 [`InboundDispatchHandler`]）。
     #[must_use]
-    pub fn new(inner: Arc<dyn DispatchHandler>) -> Self {
-        Self { inner }
+    pub fn new(
+        inner: Arc<dyn DispatchHandler>,
+        plugin_ctx: Arc<xray_frame::PluginContext>,
+    ) -> Self {
+        Self { inner, plugin_ctx }
     }
 
     fn intercept(
@@ -499,15 +505,19 @@ impl MuxCarrierHandler {
         access: Option<AccessContext>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         if is_mux_carrier(dest) {
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面 mux carrier 连接任务（每 carrier）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(crate::inbound::handle_mux_inbound_link(
+            // §3.5.6 ①类：mux carrier 连接任务归本 inbound 的托管 scope，停机随 scope 取消。
+            let spawned = self.plugin_ctx.spawn(crate::inbound::handle_mux_inbound_link(
                 link,
                 Arc::clone(&self.inner),
                 access.as_ref().and_then(|a| a.allowed_network),
             ));
+            if spawned.is_err() {
+                // 停机闸已关：link 随 drop 断开，留可诊断日志（禁静默丢）。
+                tracing::warn!(
+                    tag = self.inner.tag(),
+                    "mux carrier: scope closed at shutdown, dropping link"
+                );
+            }
             return Box::pin(std::future::ready(()));
         }
         match access {

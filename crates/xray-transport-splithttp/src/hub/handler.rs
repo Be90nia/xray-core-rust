@@ -360,7 +360,7 @@ where
     // 后台任务：把 request body 切片为有序 packet，push 到 UploadQueue
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-up body 切片推送任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——stream-up body 切片推送任务；随请求 body EOF/连接断开自终，停机不拆在途泵，不迁托管口"
     )]
     tokio::spawn(async move {
         use futures_util::TryStreamExt;
@@ -416,7 +416,7 @@ where
         let sid = session_id.to_string();
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-down UploadQueue→上行管道转发任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——stream-down UploadQueue→上行管道转发任务；随队列关闭/连接断开自终，停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(async move {
             forward_queue_to_writer(queue, upload_tx).await;
@@ -426,7 +426,7 @@ where
         // stream-one: request body → upload_tx
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；stream-one body→上行管道任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——stream-one body→上行管道任务；随 body EOF/连接断开自终，停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(async move {
             use futures_util::TryStreamExt;
@@ -495,22 +495,28 @@ fn spawn_x_padding_stream(
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
     if (has_referer || obfs_padding_accepted) && sc_secs.to > 0 {
         let range = ctx.config.get_normalized_x_padding_bytes();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；X 填充 keepalive 流任务（Go hub.go:219-232）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            loop {
-                let n = range.rand().max(0) as usize;
-                if tx.send(Ok(Frame::data(Bytes::from(vec![b'X'; n])))).await.is_err() {
-                    break;
+        // §3.5.6 ①类：keepalive 流归 hub 托管口（流本身随 tx drop 退出；停机
+        // 关闸即不上新）。
+        if ctx
+            .sessions
+            .scope()
+            .spawn(async move {
+                loop {
+                    let n = range.rand().max(0) as usize;
+                    if tx.send(Ok(Frame::data(Bytes::from(vec![b'X'; n])))).await.is_err() {
+                        break;
+                    }
+                    let secs = sc_secs.rand();
+                    if secs > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
+                    }
                 }
-                let secs = sc_secs.rand();
-                if secs > 0 {
-                    tokio::time::sleep(std::time::Duration::from_secs(secs as u64)).await;
-                }
-            }
-        });
+            })
+            .is_err()
+        {
+            crate::LOG
+                .debug("splithttp hub: scope closed at shutdown, x-padding stream not started");
+        }
     }
     tokio_stream::wrappers::ReceiverStream::new(rx)
 }
@@ -557,7 +563,7 @@ impl Drop for SessionDropGuard {
         let sid = std::mem::take(&mut self.sid);
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，hub 无 PluginContext 注入面；SessionMap 是 tokio Mutex 故 Drop 内只能 spawn 异步删除会话；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：SessionMap 是 tokio Mutex 故 Drop 内只能 spawn 异步删除会话；任务为一次性删除消息（删完自终），Drop 无 await 面可挂托管口，不迁托管口"
         )]
         tokio::spawn(async move {
             sessions.remove(&sid).await;

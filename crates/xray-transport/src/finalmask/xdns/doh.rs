@@ -950,18 +950,32 @@ mod tests {
                         let Ok((req, mut respond)) = accepted else { return };
                         let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let (status, retry_after) = script[n.min(script.len() - 1)];
-                        let mut body = req.into_body();
-                        while let Some(Ok(_)) = body.data().await {}
                         let mut resp = http::Response::builder().status(status);
                         if let Some(v) = retry_after {
                             resp = resp.header(http::header::RETRY_AFTER, v);
                         }
                         // 每请求一任务：延迟并行（连接内多流不互相阻塞）。
+                        //
+                        // 请求体也必须在**独立任务**里读：h2 的 `Connection` 只由 accept 环
+                        // 驱动 I/O，在 accept 环里 `await` `data()` 会把驱动者自己堵死——
+                        // 客户端 HEADERS 与 DATA 分两段到达时（Linux 实测）第二问永久挂起
+                        // （bd ll2hr）。accept 环继续轮询才能把 DATA 帧推进来。
+                        let mut body = req.into_body();
                         #[allow(
                             clippy::disallowed_methods,
                             reason = "测试用 DoH 假服务器：每请求一任务"
                         )]
                         tokio::spawn(async move {
+                            // 确定性护栏：请求体读不齐 = 连接驱动被堵（把 drain 挪回
+                            // accept 环即复发），此处 5s 内显式失败，不留 10s 哑挂。
+                            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                                while let Some(Ok(_)) = body.data().await {}
+                            })
+                            .await;
+                            assert!(
+                                drained.is_ok(),
+                                "请求体未在 5s 内收齐：h2 连接驱动被堵（请求体必须在独立任务里读）"
+                            );
                             if !delay.is_zero() {
                                 tokio::time::sleep(delay).await;
                             }

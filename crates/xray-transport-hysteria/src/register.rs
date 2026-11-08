@@ -120,6 +120,10 @@ async fn listen_hysteria(
     // 全部 clone 归零，driver 停、UDP socket 关、端口释放。修复前 close() 仅日志，
     // endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
     let quic_listener = listener.clone();
+    // §3.5.6 ①类托管：每 QUIC 连接的桥接任务归本 listener 的 scope；close() 关闸，
+    // 句柄丢弃即 abort 在途。
+    let scope = xray_frame::compat::ManagedScope::new(format!("hysteria-accept:{local}"));
+    let conn_scope = scope.clone();
 
     #[allow(
         clippy::disallowed_methods,
@@ -150,13 +154,15 @@ async fn listen_hysteria(
                 },
             };
             let h = handler.clone();
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（每 QUIC conn 桥接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(async move {
-                accept_hysteria_conn(conn, h).await;
-            });
+            // 闸关（停机中）：连接随 conn 释放，留可诊断日志（禁静默）。
+            if conn_scope
+                .spawn(async move {
+                    accept_hysteria_conn(conn, h).await;
+                })
+                .is_err()
+            {
+                crate::LOG.debug("hysteria: scope closed at shutdown, connection dropped");
+            }
         }
     });
     let abort = accept_task.abort_handle();
@@ -172,7 +178,7 @@ async fn listen_hysteria(
         accept_task,
     ));
 
-    Ok(Box::new(HysteriaTransportListener { local, listener: quic_listener, abort }))
+    Ok(Box::new(HysteriaTransportListener { local, listener: quic_listener, abort, scope }))
 }
 
 /// 单条 QUIC conn 内的 accept_bi 循环：把 client-initiated bi-stream 桥到 handler。
@@ -216,6 +222,9 @@ struct HysteriaTransportListener {
     local: SocketAddr,
     listener: Arc<dyn HysteriaQuicListener>,
     abort: tokio::task::AbortHandle,
+    /// §3.5.6 ①类托管：每 QUIC 连接桥接任务账本。`close()` 关闸，句柄丢弃即
+    /// abort 在途（连接任务全 abortable）。
+    scope: xray_frame::compat::ManagedScope,
 }
 
 impl TransportListener for HysteriaTransportListener {
@@ -226,12 +235,16 @@ impl TransportListener for HysteriaTransportListener {
     fn close(&self) -> io::Result<()> {
         crate::LOG.info(format!("hysteria listener close addr={}", self.local));
         self.abort.abort();
+        // 连接任务账本关闸：停机后拒新连接任务（在途随 listener 丢弃被 abort）。
+        self.scope.close();
         // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
         // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。
+        // ②豁免：该任务是停机动作本身（关闭 QUIC endpoint），必须跑完才有端口释放，
+        // 不得随 listener 一起 abort。
         let l = self.listener.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：停机桥接任务（同步 close 桥 async ep.close）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：停机动作本身（同步 close 桥 async ep.close）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
         )]
         tokio::spawn(async move {
             let _ = l.close().await;

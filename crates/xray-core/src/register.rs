@@ -3,15 +3,21 @@
 //! Go 用 `init()` 自注册（每个协议/应用在 init 中调用 `common.RegisterConfig`）。
 //! Rust 没有 init，需要程序入口显式调用 [`register_all_features`]。
 //!
-//! 当前阶段：各 `xray-app-*` crate 尚未实现 `Feature` trait，因此注册 stub factory
-//! （返回 `FeatureError::StartFailed` 提示 "not yet implemented"）。
-//! 待各 crate 切片完成后，替换为真实 factory。
+//! 当前状态：App kind（log/routing/dns/policy/api/metrics/stats/fakeDns/
+//! observatory/burstObservatory/version/geodata/reverse）全部是**真实 factory**；
+//! 仅 proxy inbound/outbound kind 仍是 stub factory（返回
+//! `FeatureError::StartFailed`）——proxy 的真实构建走 `arm_builders` 构造表，
+//! 不经本 registry。`Instance` 对 stub 的 `StartFailed` 已拒启（bd 16uis：
+//! 静默跳过会让节点无感消失）。
 
 use std::{path::PathBuf, sync::Arc};
 
 use xray_features::{Feature, FeatureError, FeatureFactory, registry};
 
-/// 注册所有已知 kind 的 FeatureFactory（stub 版本）。
+/// 注册所有已知 kind 的 FeatureFactory。
+///
+/// App kind = 真实 factory；proxy in/outbound kind = stub（返回 `StartFailed`，
+/// 真实构建走 `arm_builders`，不经 registry——见模块头）。
 ///
 /// 必须在 `Instance::new_from_built` 之前调用，否则所有 kind 查找返回 `NotFound`。
 ///

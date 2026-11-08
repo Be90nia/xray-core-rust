@@ -99,6 +99,9 @@ impl Drop for Inner {
 pub struct UdpDispatchSession {
     dispatcher: Arc<dyn DispatchHandler>,
     inner: Option<Inner>,
+    /// §3.5.6 ①类托管：dispatch link 任务归本会话自持 scope——会话 Drop =
+    /// 组件终，scope 兜底 abort 拆任务（无双份账本）。
+    scope: xray_frame::compat::ManagedScope,
     /// 入站 access 上下文（bd kol4a）：`establish` 时经
     /// [`DispatchHandler::dispatch_with_access`] 下传——生产链终点
     /// `MuxBridge::dispatch_with_access` 按它派生 XUDP GlobalID（cone 语义，
@@ -115,7 +118,12 @@ impl UdpDispatchSession {
     /// 创建会话。`dispatcher` 为生产路由 handler 或任意支持 UDP 目标的
     /// [`DispatchHandler`]（outbound 侧须按 XUDP 帧约定消费 link，如 freedom）。
     pub fn new(dispatcher: Arc<dyn DispatchHandler>) -> Self {
-        Self { dispatcher, inner: None, access: parking_lot::Mutex::new(None) }
+        Self {
+            dispatcher,
+            inner: None,
+            access: parking_lot::Mutex::new(None),
+            scope: xray_frame::compat::ManagedScope::new("udp-dispatch"),
+        }
     }
 
     /// 携带入站 access 上下文（客户端源地址 + 入站协议名）。UDP relay 调用方
@@ -257,18 +265,24 @@ impl UdpDispatchSession {
         let udp_dest = Destination::udp(dest.address().clone(), dest.port());
         let dispatcher = Arc::clone(&self.dispatcher);
         let access = self.access.lock().take();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：ctx 不可达：dispatcher 生产依赖图无 PluginContext（xray-frame 仅 dev-dependency）；UDP dispatch 会话任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            // bd kol4a：有源走 dispatch_with_access（GlobalID 派生在出站
-            // MuxBridge 终点），无源保持旧 dispatch（语义不变）。
-            match access {
-                Some(access) => dispatcher.dispatch_with_access(&udp_dest, link, access).await,
-                None => dispatcher.dispatch(&udp_dest, link).await,
-            }
-        });
+        // §3.5.6 ①类托管：dispatch link 任务归本会话自持 scope（会话 Drop 即
+        // abort，随组件停机取消）。闸关不可达（scope 无显式 close），拒发按
+        // fail-visible 计数回滚处理（禁静默）。
+        if self
+            .scope
+            .spawn(async move {
+                // bd kol4a：有源走 dispatch_with_access（GlobalID 派生在出站
+                // MuxBridge 终点），无源保持旧 dispatch（语义不变）。
+                match access {
+                    Some(access) => dispatcher.dispatch_with_access(&udp_dest, link, access).await,
+                    None => dispatcher.dispatch(&udp_dest, link).await,
+                }
+            })
+            .is_err()
+        {
+            LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+            return Err(io::Error::other("udp dispatch scope closed"));
+        }
         self.inner = Some(Inner {
             dest,
             req: req_local,

@@ -740,7 +740,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(conn.heartbeat_handle.is_some(), "heartbeatPeriod>0 → 客户端心跳任务已启动");
+        assert!(conn.heartbeat_abort.is_some(), "heartbeatPeriod>0 → 客户端心跳任务已启动");
 
         // 对照：period=0（显式关闭）不启动。Bug-B 后 Default=30，须显式 0。
         let cfg = Config { heartbeat_period: 0, ..Config::default() };
@@ -757,7 +757,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(conn.heartbeat_handle.is_none());
+        assert!(conn.heartbeat_abort.is_none());
     }
 
     // -------------------------------------------------------------------

@@ -110,6 +110,8 @@ pub async fn serve_vless(
     tls: Option<Arc<xray_transport::TlsAcceptor>>,
     fallbacks: Option<Arc<crate::inbound::handler::FallbackPolicy>>,
     options: Option<VlessInboundOptions>,
+    // §3.5.6 ①类托管：连接任务 spawn 归本 inbound 的 arm ctx（停机随 scope 取消）。
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()> {
     let handler = ohm
         .get_default_handler()
@@ -141,11 +143,12 @@ pub async fn serve_vless(
         let options = options.clone();
         let header = header.clone();
         let local = listener.local_addr()?;
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
+        let plugin_ctx = Arc::clone(&plugin_ctx);
+        // spawn 面与任务体各持一份，避免 borrow-then-move 冲突。
+        let task_ctx = Arc::clone(&plugin_ctx);
+        // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消；
+        // 闸关即拒（连接随 drop 关闭），留可诊断日志（禁静默丢）。
+        let spawned = plugin_ctx.spawn(async move {
             let result = if let Some(acc) = tls {
                 // vision splice：TLS accept 消费 socket 前 dup 裸 TCP 克隆，
                 // END/DIRECT 帧后读写直通（Go UnwrapRawConn 等价路径）。
@@ -181,7 +184,7 @@ pub async fn serve_vless(
                         );
                         handle_connection_with_fallback(
                             io, &handler, &validator, fallbacks, peer, local, name, alpn, options,
-                            raw_tcp,
+                            raw_tcp, &task_ctx,
                         )
                         .await
                     },
@@ -205,6 +208,7 @@ pub async fn serve_vless(
                     String::new(),
                     options,
                     None,
+                    &task_ctx,
                 )
                 .await
             };
@@ -214,6 +218,11 @@ pub async fn serve_vless(
                     .info(format!("vless connection ended with error peer={peer} error={e}"));
             }
         });
+        if spawned.is_err() {
+            INBOUND_LOG.warn(format!(
+                "vless: arm scope closed at shutdown, dropping connection peer={peer}"
+            ));
+        }
     }
 }
 
@@ -296,6 +305,8 @@ pub async fn handle_connection_with_fallback<S>(
     tls_alpn: String,
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
+    // §3.5.6 ①类托管：UDP uplink 拆分任务的 spawn 归 arm ctx。
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -338,7 +349,7 @@ where
     // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
     // handle_connection 内部建立，语义同上）
     let Some(policy) = fallbacks else {
-        return handle_connection(stream, handler, validator, options, raw_tcp).await;
+        return handle_connection(stream, handler, validator, options, raw_tcp, plugin_ctx).await;
     };
 
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -407,7 +418,7 @@ where
             ..Default::default()
         };
         return finish_vless_dispatch(
-            reader, write_half, decoded, handler, options, raw_tcp, access,
+            reader, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
         )
         .await;
     }
@@ -523,6 +534,7 @@ fn vision_uuid_bytes(
 /// - Mux：响应头 → [`handle_mux_relay`] 按请求目的地 dispatch（mux carrier 拦截在 dispatcher
 ///   装饰器）
 /// - Rvs：响应头 → [`handle_reverse_relay`] 反向代理派发
+#[allow(clippy::too_many_arguments)] // 装配层单入口直译（同 handle_connection_with_fallback）；plugin_ctx 为 §3.5.6 托管面
 async fn finish_vless_dispatch<R, W>(
     mut reader: R,
     write_half: W,
@@ -531,6 +543,7 @@ async fn finish_vless_dispatch<R, W>(
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
     access: xray_app_dispatcher::AccessContext,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -581,18 +594,20 @@ where
         }
         let restored = AsyncReadExt::chain(std::io::Cursor::new(first[..n].to_vec()), reader);
         return finish_vless_command(
-            restored, write_half, decoded, handler, options, raw_tcp, access,
+            restored, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
         )
         .await;
     }
 
-    finish_vless_command(reader, write_half, decoded, handler, options, raw_tcp, access).await
+    finish_vless_command(reader, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx)
+        .await
 }
 
 /// [`finish_vless_dispatch`] 的后半段：flow 五臂校验 → 响应头 → 按 command 分派。
 ///
 /// 单独成函数只因 mux 探测路径要先读连接首字节再放回，reader 变成
 /// `Chain<Cursor<..>, R>`，与常规路径不是同一类型实例。
+#[allow(clippy::too_many_arguments)] // 命令分派入口直译；plugin_ctx 为 §3.5.6 托管面
 async fn finish_vless_command<R, W>(
     reader: R,
     mut write_half: W,
@@ -601,6 +616,7 @@ async fn finish_vless_command<R, W>(
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
     access: xray_app_dispatcher::AccessContext,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -639,7 +655,8 @@ where
             finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
         },
         VlessCommand::Udp => {
-            handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout()).await
+            handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout(), plugin_ctx)
+                .await
         },
         VlessCommand::Mux => handle_mux_relay(reader, write_half, &decoded, handler, &access).await,
         VlessCommand::Rvs => {
@@ -718,6 +735,7 @@ async fn handle_udp_relay<R, W>(
     decoded: &crate::encoding::server::DecodedRequest,
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     idle_timeout: std::time::Duration,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -738,18 +756,24 @@ where
     // cancel-safe，不能直接进 select!（对齐 vmess pump 的 up/relay 拆分）。
     // 读到包交 channel；EOF/Err 即退出（客户端方向结束，tx drop 唤醒 relay）。
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    let uplink = tokio::spawn(async move {
+    // §3.5.6 ①类：uplink 拆分任务归本 inbound 的 arm scope，停机随 scope 取消；
+    // 闸关即不拆（up_rx 立即 EOF → 会话自然收尾），留可诊断日志（禁静默）。
+    let uplink = match plugin_ctx.spawn(async move {
         // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
         while let Ok(pkt) = read_length_packet(&mut reader).await {
             if up_tx.send(pkt).await.is_err() {
                 break; // relay 已退出
             }
         }
-    });
+    }) {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            INBOUND_LOG.warn(
+                "vless udp relay: arm scope closed at shutdown, uplink not spawned".to_string(),
+            );
+            None
+        },
+    };
 
     // 双方向并发泵 + 滑动 idle deadline：每轮循环重建 sleep_until，任一方向
     // 来包即重置；到期拆除会话（Go ActivityTimer 同源）。`send_packet` 在
@@ -788,7 +812,9 @@ where
     };
     // 会话已结束：abort uplink 释放客户端读半（否则其阻塞的 read 永久持有
     // socket，idle 拆除场景下反向泄漏）。
-    uplink.abort();
+    if let Some(uplink) = uplink {
+        uplink.abort();
+    }
     result
 }
 
@@ -907,6 +933,8 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     validator: &Arc<dyn Validator>,
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
+    // §3.5.6 ①类托管：UDP uplink 拆分任务的 spawn 归 arm ctx。
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()> {
     let mut stream = stream;
 
@@ -938,7 +966,10 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         ..Default::default()
     };
     let (read_half, write_half) = tokio::io::split(stream);
-    finish_vless_dispatch(read_half, write_half, decoded, handler, options, raw_tcp, access).await
+    finish_vless_dispatch(
+        read_half, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -965,6 +996,12 @@ mod tests {
     /// 构造测试用 validator + 已注册用户的 UUID。
     fn make_validator_with_user() -> (UUID, Arc<dyn Validator>) {
         make_validator_with_user_flow("", &[])
+    }
+
+    /// §3.5.6 ①类接线：serve_vless/handle_udp_relay 的托管 spawn 口测试 ctx
+    /// （自持 scope，Drop 兜底 abort —— 测试体结束即回收）。
+    fn test_plugin_ctx() -> Arc<xray_frame::PluginContext> {
+        Arc::new(xray_frame::PluginContext::for_plugin("vless"))
     }
 
     /// 同上，但账号 `flow` 可指定（lwep 五臂校验测试需要 XRV 账号）。
@@ -1048,7 +1085,16 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("vless-inbound-to-freedom-outbound-e2e-echo", async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+            let _ = serve_vless(
+                vless_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                None,
+                None,
+                test_plugin_ctx(),
+            )
+            .await;
         });
 
         // 4. VLESS client：connect → encode request → decode response → echo round-trip
@@ -1098,7 +1144,16 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("vless-inbound-rejects-unknown-user", async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+            let _ = serve_vless(
+                vless_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                None,
+                None,
+                test_plugin_ctx(),
+            )
+            .await;
         });
 
         // client 用一个随机的（未注册的）UUID
@@ -1195,7 +1250,16 @@ mod tests {
         xray_common::testing::spawn(
             "vless-inbound-authenticates-two-email-less-clients-echo",
             async move {
-                let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+                let _ = serve_vless(
+                    vless_listener,
+                    ohm,
+                    validator,
+                    None,
+                    None,
+                    None,
+                    test_plugin_ctx(),
+                )
+                .await;
             },
         );
 
@@ -1289,6 +1353,7 @@ mod tests {
                 None,
                 None,
                 Some(VlessInboundOptions { outer_tls13, ..Default::default() }),
+                test_plugin_ctx(),
             )
             .await;
         });
@@ -1411,6 +1476,7 @@ mod tests {
                 None,
                 None,
                 Some(VlessInboundOptions::default()),
+                test_plugin_ctx(),
             )
             .await;
         });
@@ -1563,7 +1629,9 @@ mod tests {
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         xray_common::testing::spawn("vless-testpre-preconnect-e2e-roundtrip", async move {
-            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+            let _ =
+                serve_vless(vless_listener, ohm, validator, None, None, None, test_plugin_ctx())
+                    .await;
         });
 
         let cfg = Arc::new(
@@ -1714,7 +1782,16 @@ mod tests {
         let ohm_clone = Arc::clone(&ohm);
         let validator_clone = Arc::clone(&validator);
         xray_common::testing::spawn("vless-inbound-udp-relay-e2e", async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+            let _ = serve_vless(
+                vless_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                None,
+                None,
+                test_plugin_ctx(),
+            )
+            .await;
         });
 
         // 3. VLESS client：connect → encode UDP request → decode response → 发送 1 个长度前缀 UDP
@@ -1813,8 +1890,15 @@ mod tests {
                 let handler_for_task = handler.clone();
                 let validator = validator.clone();
                 async move {
-                    handle_connection(server_stream, &handler_for_task, &validator, None, None)
-                        .await
+                    handle_connection(
+                        server_stream,
+                        &handler_for_task,
+                        &validator,
+                        None,
+                        None,
+                        &test_plugin_ctx(),
+                    )
+                    .await
                 }
             });
 
@@ -1922,8 +2006,16 @@ mod tests {
         xray_common::testing::spawn(
             "vless-inbound-mux-command-dispatches-real-new-frame",
             async move {
-                let _ =
-                    serve_vless(vless_listener, ohm_clone, validator_clone, None, None, None).await;
+                let _ = serve_vless(
+                    vless_listener,
+                    ohm_clone,
+                    validator_clone,
+                    None,
+                    None,
+                    None,
+                    test_plugin_ctx(),
+                )
+                .await;
             },
         );
 
@@ -2008,7 +2100,8 @@ mod tests {
             .unwrap();
             let addr = listener.local_addr().unwrap();
             xray_common::testing::spawn(tag, async move {
-                let _ = serve_vless(listener, ohm, validator, None, None, None).await;
+                let _ = serve_vless(listener, ohm, validator, None, None, None, test_plugin_ctx())
+                    .await;
             });
             (addr, uuid, payload, called)
         }
@@ -2106,8 +2199,16 @@ mod tests {
             allowed_network: None,
         };
         xray_common::testing::spawn("vless-inbound-rvs-disabled-warns-and-skips", async move {
-            let _ = serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
-                .await;
+            let _ = serve_vless(
+                vless_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                None,
+                Some(opts),
+                test_plugin_ctx(),
+            )
+            .await;
         });
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
@@ -2174,9 +2275,16 @@ mod tests {
         xray_common::testing::spawn(
             "vless-inbound-rvs-enabled-with-registry-uses-registr",
             async move {
-                let _ =
-                    serve_vless(vless_listener, ohm_clone, validator_clone, None, None, Some(opts))
-                        .await;
+                let _ = serve_vless(
+                    vless_listener,
+                    ohm_clone,
+                    validator_clone,
+                    None,
+                    None,
+                    Some(opts),
+                    test_plugin_ctx(),
+                )
+                .await;
             },
         );
 
@@ -2328,7 +2436,9 @@ mod tests {
         .unwrap();
         let vless_addr = vless_listener.local_addr().unwrap();
         xray_common::testing::spawn("vless-reverse-forward-proxy-rejected", async move {
-            let _ = serve_vless(vless_listener, ohm, validator, None, None, None).await;
+            let _ =
+                serve_vless(vless_listener, ohm, validator, None, None, None, test_plugin_ctx())
+                    .await;
         });
 
         let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
@@ -2489,7 +2599,14 @@ mod tests {
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            handle_udp_relay(server_read, server_write, &decoded, &handler, udp_idle_timeout()),
+            handle_udp_relay(
+                server_read,
+                server_write,
+                &decoded,
+                &handler,
+                udp_idle_timeout(),
+                &test_plugin_ctx(),
+            ),
         )
         .await
         .expect("session must end on client EOF (hang = WSLEAK regression)");
@@ -2513,7 +2630,14 @@ mod tests {
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            handle_udp_relay(server_read, server_write, &decoded, &handler, udp_idle_timeout()),
+            handle_udp_relay(
+                server_read,
+                server_write,
+                &decoded,
+                &handler,
+                udp_idle_timeout(),
+                &test_plugin_ctx(),
+            ),
         )
         .await
         .expect("idle deadline must fire (hang = WSLEAK regression)");
@@ -2547,6 +2671,7 @@ mod tests {
                 &decoded_for_task,
                 &handler_for_task,
                 udp_idle_timeout(),
+                &test_plugin_ctx(),
             )
             .await
         });

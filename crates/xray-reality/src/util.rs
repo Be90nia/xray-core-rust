@@ -10,7 +10,11 @@ use std::{collections::HashMap, fs::OpenOptions, path::Path};
 ///
 /// 对应 Go `KeyLogWriterFromConfig`。行为：
 /// - `path` 为空或 `"none"` → 返回 `None`（不记录）
-/// - 否则以「创建/读写/追加」模式打开（Go 端 `O_CREATE|O_RDWR|O_APPEND`，权限 0644）
+/// - 否则以「创建/读写/追加」模式打开（Go 端 `O_CREATE|O_RDWR|O_APPEND`）
+///
+/// 权限：文件内容 = TLS 主密钥材料，Unix 收紧 0600（Go 端 umask 缺省通常
+/// 0644 = 多用户主机明文交出会话，属安全强化向偏离 parity）；Windows 无
+/// POSIX 权限位（`mode()` 是 unix-only API），继承 ACL 缺省。
 ///
 /// 与 Go 端一致：打开失败返回 `None`（Go 端仅记日志不传播错误），调用方
 /// 在后续 TLS 握手时仍能正常工作（只是缺少 key log）。
@@ -20,7 +24,14 @@ pub fn open_key_log_writer<P: AsRef<Path>>(path: P) -> Option<std::fs::File> {
     if s.is_empty() || s == "none" {
         return None;
     }
-    OpenOptions::new().create(true).read(true).append(true).open(p).ok()
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(p).ok()
 }
 
 /// spider 模式从路径集合中选一条。

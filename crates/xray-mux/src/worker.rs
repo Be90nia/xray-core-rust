@@ -673,15 +673,27 @@ impl ServerWorker {
         };
         // 更新流量统计
         session.add_uplink_bytes(data.len() as u64);
-        let write_failed = {
-            let mut guard = session.output().await;
-            match guard.as_mut() {
-                Some(writer) => {
-                    let mb = MultiBuffer::from_buffer(data);
-                    writer.write_multi_buffer_impl(mb).await.is_err()
-                },
-                None => false,
-            }
+        // PM-13：output 锁不跨 carrier 写——take 出所有权落盘再原样归还（同
+        // Session::close 的修法）。持锁写会与该会话 close/interrupt 的 take 窗口
+        // 互卡在 carrier 写上；写期间 close 的 take 看到 None 跳过 shutdown 时，
+        // put-back 锁内复查 closed 由本侧补齐（两侧必有其一负责，落盘态不变）。
+        // ⚠️ scrutinee 的花括号是语义件不是样式：块表达式让 output guard 在
+        // take 后立即 drop；裸写 `match session.output().await.take()` 会把
+        // guard 活到 match 结束 = 锁又跨回 carrier 写（keep_write_output_lock_
+        // free_while_carrier_pending 回归红）。blocks_in_conditions 建议勿从。
+        #[allow(clippy::blocks_in_conditions)]
+        let write_failed = match { session.output().await.take() } {
+            Some(mut writer) => {
+                let mb = MultiBuffer::from_buffer(data);
+                let failed = writer.write_multi_buffer_impl(mb).await.is_err();
+                let mut slot = session.output().await;
+                if session.is_closed() {
+                    writer.shutdown();
+                }
+                *slot = Some(writer);
+                failed
+            },
+            None => false,
         };
         if write_failed {
             warn!(
@@ -966,6 +978,75 @@ mod tests {
 
         assert!(session.is_closed(), "写失败必须关闭会话");
         assert!(worker.session_manager.get(5).await.is_none(), "会话应从管理器摘除");
+    }
+
+    /// PM-13（Keep 写路径）：Keep 数据写 session.output 期间 output 锁必须自由
+    /// （take/put-back，同 Session::close 修法）。旧实现持锁跨 carrier 写 ⇒
+    /// 该会话 close/interrupt 在 carrier 停滞时与写路径互卡。放行后写完成、
+    /// 槽位恢复 Some、写成功不关会话。
+    #[allow(clippy::disallowed_methods, reason = "测试：卡死 carrier 的 keep 任务")]
+    #[tokio::test]
+    async fn keep_write_output_lock_free_while_carrier_pending() {
+        use std::{future::Future, pin::Pin};
+
+        struct GatedWriter {
+            gate: Arc<tokio::sync::Notify>,
+        }
+        impl Writer for GatedWriter {
+            fn write_multi_buffer(
+                &mut self,
+                _mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+                let gate = Arc::clone(&self.gate);
+                Box::pin(async move {
+                    gate.notified().await;
+                    Ok(())
+                })
+            }
+        }
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let worker = ServerWorker::new(Arc::new(MockDispatcher));
+        let session = Session::new(7, TransferType::Stream);
+        let mut output = BufferedWriter::new(Box::new(GatedWriter { gate: Arc::clone(&gate) }));
+        output.set_buffered(false);
+        session.set_output(output).await;
+        let session = worker.session_manager.add(session).await.expect("add session");
+
+        let (_r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+        let meta = FrameMetadata::keep_with_udp_target(7, udp_dest());
+        let keeper = tokio::spawn(async move {
+            worker
+                .handle_status_keep(&meta, Buffer::from_vec(b"x".to_vec()), &link_writer)
+                .await
+                .expect("keep must not error the carrier");
+        });
+
+        // carrier 写 Pending 窗口内：output 锁必须自由（探针观察到槽位被 take）
+        let probe_session = Arc::clone(&session);
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            loop {
+                let guard = probe_session.output().await;
+                if guard.is_none() {
+                    break;
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            probe.is_ok(),
+            "Keep 写持 output 锁跨 carrier 写（PM-13 回归：take/put-back 被回退）"
+        );
+
+        gate.notify_one();
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), keeper).await;
+        assert!(done.is_ok(), "放行后 keep 必须完成");
+        assert!(session.output().await.is_some(), "put-back 后槽位必须恢复 Some");
+        assert!(!session.is_closed(), "写成功不得关闭会话");
     }
 
     #[tokio::test]

@@ -3091,6 +3091,7 @@ fn per_inbound_ohm(
     ohm: &Arc<SimpleOhm>,
     dispatcher: Option<&Arc<xray_app_dispatcher::DefaultDispatcher>>,
     ib: &BuiltInbound,
+    arm_scopes: &Arc<xray_frame::ArmScopeRegistry>,
 ) -> std::io::Result<Arc<SimpleOhm>> {
     let Some(d) = dispatcher else {
         return Ok(Arc::clone(ohm));
@@ -3099,7 +3100,11 @@ fn per_inbound_ohm(
     let sniff = crate::wiring::try_sniffing_request_from_json(ib.sniffing_json.as_ref())?;
     let inbound_handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
         Arc::new(crate::wiring::InboundDispatchHandler::new(Arc::clone(d), sniff, &ib.tag));
-    snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler)));
+    // §3.5.6 ①类托管：mux carrier ctx 随 inbound 登记进宿主注册表，
+    // Instance::close 逆序关停（None 接线 = 测试装配，scope 走 Drop 兜底）。
+    let mux_ctx = Arc::new(xray_frame::PluginContext::for_plugin("muxcarrier"));
+    arm_scopes.register(format!("mux:{}", ib.tag), Arc::clone(mux_ctx.arm_scope()));
+    snap.set_default(Arc::new(crate::wiring::MuxCarrierHandler::new(inbound_handler, mux_ctx)));
     Ok(snap)
 }
 
@@ -3546,13 +3551,14 @@ impl InboundRuntime {
                 .map_err(|e| std::io::Error::other(format!("inbound registry full: {e}")))?;
         }
         // sniffing 配置非法在这里拒启（bd vdl95）：pre-spawn 失败须回滚刚插的 slot。
-        let per_ohm = match per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib) {
-            Ok(o) => o,
-            Err(e) => {
-                self.slots.write().remove(ib.tag.as_str());
-                return Err(e);
-            },
-        };
+        let per_ohm =
+            match per_inbound_ohm(&self.ohm, self.dispatcher.as_ref(), ib, &self.arm_scopes) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.slots.write().remove(ib.tag.as_str());
+                    return Err(e);
+                },
+            };
         match spawn_one_inbound(ib, per_ohm, self.policy.clone(), cancel.clone(), Some(self)).await
         {
             Ok(handle) => {
@@ -4093,6 +4099,8 @@ pub(crate) async fn serve_reality_vless(
     validator: Arc<dyn VlessValidator>,
     cfg: RealityInboundConfig,
     options: Option<VlessInboundOptions>,
+    // §3.5.6 ①类托管：VLESS 协议层（UDP uplink 拆分等）的 spawn 归本 inbound 的 arm ctx。
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()> {
     use xray_reality::server::{RealityServerOutcome, fallback_to_dest, server_tls};
 
@@ -4165,6 +4173,8 @@ pub(crate) async fn serve_reality_vless(
         // W4 面 6 步 2 / 面 5：vision 装配任务走受控逃逸口（台账
         // RedlineSite::VisionSpliceSpawn）；spawn 语义逐字等价，红线本体
         //（splice 装配三件套）零改动（坑约束 ⑫）。
+        // §3.5.6 ①类托管：每连接任务各持一份 ctx（loop 内 spawn ⇒ 不可移出循环变量）。
+        let task_ctx = Arc::clone(&plugin_ctx);
         redline::spawn_unchecked(RedlineSite::VisionSpliceSpawn, async move {
             // bd e0ni/39824：vision splice 装配对齐 serve_vless 三件套——①accept
             // 后 dup 裸 TCP；②握手入口垫 RecordFramer（记录对齐读，「DIRECT 帧 +
@@ -4243,6 +4253,7 @@ pub(crate) async fn serve_reality_vless(
                         &validator,
                         options.clone(),
                         raw_tcp,
+                        &task_ctx,
                     )
                     .await
                     {
@@ -8490,7 +8501,15 @@ mod tests {
         let ohm_c = Arc::clone(&ohm);
         let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
         tokio::spawn(async move {
-            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg, None).await;
+            let _ = serve_reality_vless(
+                rl,
+                ohm_c,
+                val_c,
+                reality_cfg,
+                None,
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless-reality-test")),
+            )
+            .await;
         });
 
         // 5. client：tcp+reality dial → VLESS 请求 → echo 回读
@@ -8629,7 +8648,15 @@ mod tests {
         let ohm_c = Arc::clone(&ohm);
         let val_c = Arc::clone(&validator) as Arc<dyn VlessValidator>;
         tokio::spawn(async move {
-            let _ = serve_reality_vless(rl, ohm_c, val_c, reality_cfg, None).await;
+            let _ = serve_reality_vless(
+                rl,
+                ohm_c,
+                val_c,
+                reality_cfg,
+                None,
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless-reality-test")),
+            )
+            .await;
         });
 
         // 5. client：tcp+reality dial → wrap_client（首写前置伪装 GET）→ VLESS 请求 → echo
@@ -8761,6 +8788,7 @@ mod tests {
                 val_c,
                 reality_cfg,
                 Some(xray_proxy_vless::VlessInboundOptions::default()),
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless-reality-test")),
             )
             .await;
         });

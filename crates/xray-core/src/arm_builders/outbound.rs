@@ -603,6 +603,7 @@ pub(crate) fn build_dns_outbound(
     ob: &BuiltOutbound,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
     policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
 ) -> std::result::Result<
     (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
     BuildError,
@@ -612,7 +613,7 @@ pub(crate) fn build_dns_outbound(
     // .Timeouts.ConnectionIdle——超时 policy 驱动，无 manager 显式回退 + warn。
     let dns_idle = dns_idle_timeout_for(policy_manager, cfg.user_level);
     let handler = xray_proxy_dns::Handler::init(&cfg, dns_idle);
-    let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned());
+    let bridge = DnsDispatchBridge::new(ob.tag.clone(), handler, dns.cloned(), plugin_ctx);
     Ok((Arc::new(bridge) as Arc<dyn DispatchHandler>, None, None))
 }
 
@@ -877,7 +878,9 @@ pub(crate) fn wireguard_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResul
 }
 
 pub(crate) fn dns_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
-    build_dns_outbound(ctx.ob, ctx.dns, ctx.policy_manager)
+    let OutboundCtx { ob, dns, policy_manager, plugin_ctx, .. } = ctx;
+    // §3.5.6 ①类托管：Hijack 应答 spawn 面随 ctx 注入（DnsDispatchBridge 持有）。
+    build_dns_outbound(ob, dns, policy_manager, Arc::new(plugin_ctx))
 }
 
 pub(crate) fn loopback_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {

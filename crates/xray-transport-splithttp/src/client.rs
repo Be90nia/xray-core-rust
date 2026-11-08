@@ -810,7 +810,7 @@ pub(crate) fn hyper_err_to_io(e: hyper::Error) -> std::io::Error {
 fn spawn_upload_body_drain(body: hyper::body::Incoming) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；stream-up 上传响应体后台丢弃任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——stream-up 上传响应体后台丢弃任务；随请求体 EOF/连接断开自终，停机不拆在途泵，不迁托管口"
     )]
     tokio::spawn(async move {
         let mut body = body;
@@ -886,7 +886,7 @@ fn spawn_h2_lazy_reader(
     };
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，client 无 PluginContext 注入面；h2 懒读任务（GET 响应头 + body 流转发）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——h2 懒读任务（GET 响应头 + body 流转发）；随 body 流 EOF/连接断开自终，停机不拆在途泵，不迁托管口"
     )]
     tokio::spawn(async move {
         tokio::select! {

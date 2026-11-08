@@ -156,6 +156,10 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let on_stream = Arc::new(on_stream);
+    // §3.5.6 ①类托管：会话任务归 portal accept loop 自持 scope（loop 退 = scope
+    // drop 兜底 abort；子流经同一 scope 派发）。照抄 outbound.rs 的
+    // compat::spawn_reaping 用法（收割账随在途数，无双份账本）。
+    let fx = Arc::new(FxScope::new());
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -167,23 +171,33 @@ where
         tcp.set_nodelay(true).ok();
 
         let cb = Arc::clone(&on_stream);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：portal yamux 服务端会话 accept；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            tracing::debug!(peer = %peer, "portal bridge connected");
-            let conn =
-                yamux::Connection::new(tcp.compat(), yamux::Config::default(), yamux::Mode::Server);
-            drive_portal(conn, cb).await;
-            tracing::debug!(peer = %peer, "portal bridge session done");
-        });
+        let fx_conn = Arc::clone(&fx);
+        // 内部 scope 无 close 调用：闸关不可达，拒发走 spawn_reaping 的 panic
+        // 上报口径；任务寿命 = bridge TCP 连接，随 loop 结束被 abort。
+        let _ = xray_frame::compat::spawn_reaping(
+            &fx,
+            &xray_frame::compat::log(),
+            "portal bridge session",
+            async move {
+                tracing::debug!(peer = %peer, "portal bridge connected");
+                let conn = yamux::Connection::new(
+                    tcp.compat(),
+                    yamux::Config::default(),
+                    yamux::Mode::Server,
+                );
+                drive_portal(conn, cb, fx_conn).await;
+                tracing::debug!(peer = %peer, "portal bridge session done");
+            },
+        );
     }
 }
 
 /// Portal 驱动：在单个 yamux 会话上接受子流，每个子流交给 `on_stream`。
-async fn drive_portal<F, Fut>(mut conn: yamux::Connection<CompatTcp>, on_stream: Arc<F>)
-where
+async fn drive_portal<F, Fut>(
+    mut conn: yamux::Connection<CompatTcp>,
+    on_stream: Arc<F>,
+    fx: Arc<FxScope>,
+) where
     F: Fn(MuxStream) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
@@ -196,13 +210,20 @@ where
             },
             Some(Ok(stream)) => {
                 let cb = Arc::clone(&on_stream);
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "①类·脱管债（bd kwevg · §3.5.6）：portal 子流回调派发（on_stream 回调）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-                )]
-                tokio::spawn(async move {
-                    cb(stream.compat()).await;
-                });
+                // §3.5.6 ①类托管：子流回调随 portal scope（同会话任务），拒发
+                // 留 debug 日志（闸关仅发生在 scope drop 兜底窗口，实际不可达）。
+                if xray_frame::compat::spawn_reaping(
+                    &fx,
+                    &xray_frame::compat::log(),
+                    "portal substream",
+                    async move {
+                        cb(stream.compat()).await;
+                    },
+                )
+                .is_err()
+                {
+                    tracing::debug!("portal scope closed, substream dropped");
+                }
             },
         }
     }
@@ -319,7 +340,7 @@ mod tests {
                 );
                 xray_common::testing::spawn(
                     "portal-streams-share-one-tcp-echo",
-                    drive_portal(conn, Arc::new(echo_fn)),
+                    drive_portal(conn, Arc::new(echo_fn), Arc::new(FxScope::new())),
                 );
             }
         });

@@ -52,6 +52,12 @@ pub(crate) type DgramInbox =
 /// 单 assoc 信箱积压上限（UDP 有损语义：超限丢最旧，读方永不被信箱阻塞）。
 const DGRAM_INBOX_CAP: usize = 64;
 
+/// 全连接信箱**键数**软上界：共享一条 QUIC 连接时对端可伪造任意未注册的
+/// `assoc_id` 制造无主键（条目仅在属主读取时移除 = 无人认领即常驻）。
+/// 4096 满则未命中键的包整包丢弃（UDP 有损语义：退化优于无界增长）；
+/// 已存在的键不受影响（属主仍在读）。
+const DGRAM_INBOX_KEY_CAP: usize = 4096;
+
 /// TUIC 客户端 UDP 关联句柄。
 ///
 /// 由 [`TuicClient::dial_udp`](crate::client::TuicClient::dial_udp) 创建，
@@ -389,12 +395,7 @@ impl TuicUdpAssoc {
 
     /// 把别的 assoc 的回包转投其信箱（超上限丢最旧，UDP 有损语义）。
     fn stash_foreign_packet(&self, pkt: Packet) {
-        let mut inbox = self.inbox.lock();
-        let queue = inbox.entry(pkt.assoc_id).or_default();
-        if queue.len() >= DGRAM_INBOX_CAP {
-            queue.pop_front();
-        }
-        queue.push_back(pkt);
+        stash_foreign_packet_to(&self.inbox, pkt);
     }
 
     /// 检查连接是否支持 DATAGRAM（native 模式可用性）。
@@ -404,6 +405,21 @@ impl TuicUdpAssoc {
         // 协商成功即表示支持；精确容量经 `max_datagram_size()` 探测。
         self.conn.max_datagram_size().is_some()
     }
+}
+
+/// [`TuicUdpAssoc::stash_foreign_packet`] 的纯函数体（可单测）：转投信箱，
+/// 超 [`DGRAM_INBOX_CAP`] 丢最旧；键数满 [`DGRAM_INBOX_KEY_CAP`] 时未命中键
+/// 整包丢弃（软上界退化，UDP 有损语义）。
+fn stash_foreign_packet_to(inbox: &DgramInbox, pkt: Packet) {
+    let mut inbox = inbox.lock();
+    if inbox.len() >= DGRAM_INBOX_KEY_CAP && !inbox.contains_key(&pkt.assoc_id) {
+        return;
+    }
+    let queue = inbox.entry(pkt.assoc_id).or_default();
+    if queue.len() >= DGRAM_INBOX_CAP {
+        queue.pop_front();
+    }
+    queue.push_back(pkt);
 }
 
 /// 按 native datagram 容量切分 Packet 帧（纯函数，可单测；server 响应侧复用）。
@@ -634,5 +650,38 @@ mod tests {
             }
             assert!(!borrowed.is_empty(), "len={len} 至少产出一帧");
         }
+    }
+
+    /// D-04：信箱键数软上界——4096 键满后未命中键整包丢弃（UDP 有损退化），
+    /// 已存在键不受影响（属主在读）；单键积压上限语义不变（丢最旧）。
+    #[test]
+    fn stash_foreign_packet_key_cap_degrades_without_unbounded_keys() {
+        let inbox: DgramInbox = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let pkt =
+            |assoc: u16, id: u16| Packet::new(assoc, id, Address::None, Bytes::from_static(b"x"));
+
+        // 填满 4096 个键（每键 1 包）
+        for assoc in 0..DGRAM_INBOX_KEY_CAP as u16 {
+            stash_foreign_packet_to(&inbox, pkt(assoc, 1));
+        }
+        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP);
+
+        // 未命中新键：整包丢弃（软上界满则退化）
+        stash_foreign_packet_to(&inbox, pkt(u16::MAX, 1));
+        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP, "满后新键不得再占键");
+        assert!(!inbox.lock().contains_key(&u16::MAX));
+
+        // 已存在键：正常入队（键不受上界影响）
+        stash_foreign_packet_to(&inbox, pkt(0, 2));
+        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP);
+        assert_eq!(inbox.lock()[&0].len(), 2, "已有键的包必须照常入队");
+
+        // 单键积压上限（64）语义不变：第 65 包挤出最旧
+        for i in 0..=DGRAM_INBOX_CAP as u16 {
+            stash_foreign_packet_to(&inbox, pkt(1, 10 + i));
+        }
+        let q = &inbox.lock()[&1];
+        assert_eq!(q.len(), DGRAM_INBOX_CAP, "单键积压封顶");
+        assert_eq!(q.front().expect("非空").pkt_id, 11, "最旧的 10 已被挤出");
     }
 }

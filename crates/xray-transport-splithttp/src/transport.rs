@@ -276,11 +276,15 @@ async fn listen_tcp(
             })
         });
     let ctx = build_context(config, local, handler);
+    // §3.5.6 ①类托管：hub 级托管口（ctx 内 SessionMap 持有），每连接任务归它，
+    // listener close 关闸、句柄丢弃即 abort 在途。
+    let hub_scope = ctx.sessions.scope().clone();
+    let listener_scope = hub_scope.clone();
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（TCP accept 循环 + 循环内每连接处理任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（splithttp TCP accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -295,9 +299,15 @@ async fn listen_tcp(
             let tls = tls_cfg.clone();
             let rc = reality.clone();
             let probe = reality_probe.clone();
-            tokio::spawn(async move {
-                handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
-            });
+            // 闸关（停机中）：连接随 stream 释放，留可诊断日志（禁静默）。
+            if hub_scope
+                .spawn(async move {
+                    handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
+                })
+                .is_err()
+            {
+                crate::LOG.debug("splithttp: scope closed at shutdown, connection dropped");
+            }
         }
     });
     let tcp_abort = accept_task.abort_handle();
@@ -311,7 +321,12 @@ async fn listen_tcp(
         local.to_string(),
         accept_task,
     ));
-    Ok(Box::new(SplithttpListener { local, tcp_abort: Some(tcp_abort), h3_endpoint: None }))
+    Ok(Box::new(SplithttpListener {
+        local,
+        tcp_abort: Some(tcp_abort),
+        h3_endpoint: None,
+        scope: listener_scope,
+    }))
 }
 
 /// unix 路径 SplitHTTP 监听（对应 Go splithttp/hub.go:526-531 `port==0` 分支：
@@ -372,6 +387,9 @@ pub async fn listen_unix_splithttp(
             })
         });
     let ctx = build_context(&config, local, handler);
+    // §3.5.6 ①类托管：hub 级托管口（同 TCP 路径）。
+    let hub_scope = ctx.sessions.scope().clone();
+    let listener_scope = hub_scope.clone();
     crate::LOG.info(format!("{path} listening unix for XHTTP"));
 
     // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
@@ -379,7 +397,7 @@ pub async fn listen_unix_splithttp(
     let log_ident = path.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；本 allow 覆盖 2 处（unix accept 循环 + 循环内每连接处理任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（splithttp unix accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -392,9 +410,14 @@ pub async fn listen_unix_splithttp(
             let tls = tls_cfg.clone();
             let rc = reality.clone();
             let probe = reality_probe.clone();
-            tokio::spawn(async move {
-                handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
-            });
+            if hub_scope
+                .spawn(async move {
+                    handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
+                })
+                .is_err()
+            {
+                crate::LOG.debug("splithttp unix: scope closed at shutdown, connection dropped");
+            }
         }
     });
     let abort = accept_task.abort_handle();
@@ -407,7 +430,12 @@ pub async fn listen_unix_splithttp(
         path,
         accept_task,
     ));
-    Ok(Box::new(SplithttpListener { local, tcp_abort: Some(abort), h3_endpoint: None }))
+    Ok(Box::new(SplithttpListener {
+        local,
+        tcp_abort: Some(abort),
+        h3_endpoint: None,
+        scope: listener_scope,
+    }))
 }
 
 /// 单个已 accept 的流：REALITY / TLS 包装 → h1+h2c HTTP 服务。
@@ -933,6 +961,8 @@ async fn listen_h3(
     let local = endpoint.local_addr()?;
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
     let ctx = build_context(config, local, handler);
+    // §3.5.6 ①类托管：hub 级托管口（同 TCP/unix 路径）。
+    let listener_scope = ctx.sessions.scope().clone();
     crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
@@ -943,7 +973,12 @@ async fn listen_h3(
         xray_transport::handshake_gate::effective_inflight_limit(),
     );
     spawn_h3_accept(endpoint, gate, ctx);
-    Ok(Box::new(SplithttpListener { local, tcp_abort: None, h3_endpoint: Some(listener_endpoint) }))
+    Ok(Box::new(SplithttpListener {
+        local,
+        tcp_abort: None,
+        h3_endpoint: Some(listener_endpoint),
+        scope: listener_scope,
+    }))
 }
 
 /// H3 accept 循环 spawn + 意外退出监督（bd x2ywg）。
@@ -984,6 +1019,8 @@ fn spawn_h3_accept(
     ctx: Arc<HandlerContext>,
 ) {
     let local = endpoint.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
+    // §3.5.6 ①类托管：hub 级托管口（每 QUIC 连接的握手+服务任务归它）。
+    let hub_scope = ctx.sessions.scope().clone();
     spawn_supervised_h3_accept(local, async move {
         while let Some(incoming) = endpoint.accept().await {
             // jcnjb⑤：闸满即丢（不排队）；同步决策，超额连接不 spawn 任务。
@@ -994,11 +1031,7 @@ fn spawn_h3_accept(
             };
             let ctx = Arc::clone(&ctx);
             let g = Arc::clone(&gate);
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；QUIC 循环内每连接处理任务；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-            )]
-            tokio::spawn(async move {
+            let spawned = hub_scope.spawn(async move {
                 let conn = match tokio::time::timeout(
                     xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT,
                     incoming,
@@ -1017,6 +1050,9 @@ fn spawn_h3_accept(
                 drop(permit); // 握手完成即让位；已建连接活性归 idle 超时管
                 serve_h3_conn(conn, ctx).await;
             });
+            if spawned.is_err() {
+                crate::LOG.debug("splithttp h3: scope closed at shutdown, connection dropped");
+            }
         }
     });
 }
@@ -1034,7 +1070,7 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
         let peer = conn.remote_address();
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（单条，连接终结取消已并入同 task 的 select!）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：h3 每请求任务（单条）；连接终结取消已并入同 task 的 select!（父任务终则本任务终），独立托管无增益，不迁托管口"
         )]
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
@@ -1188,7 +1224,7 @@ impl HubConnHandler for ConnHandlerAdapter {
         (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；随两端 EOF 自终，停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(async move {
             let ServerConn { reader: mut up, writer: mut down, .. } = conn;
@@ -1277,6 +1313,9 @@ struct SplithttpListener {
     local: SocketAddr,
     tcp_abort: Option<tokio::task::AbortHandle>,
     h3_endpoint: Option<quinn::Endpoint>,
+    /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本）。`close()` 关闸；
+    /// 句柄丢弃时 scope 归零 ⇒ 在途连接任务 abort。
+    scope: xray_frame::compat::ManagedScope,
 }
 
 impl TransportListener for SplithttpListener {
@@ -1292,6 +1331,8 @@ impl TransportListener for SplithttpListener {
         if let Some(ep) = &self.h3_endpoint {
             ep.close(quinn::VarInt::from_u32(0), b"listener closed");
         }
+        // 托管口关闸：停机后拒新连接任务（在途任务随 listener 丢弃被 abort）。
+        self.scope.close();
         Ok(())
     }
 }

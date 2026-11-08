@@ -801,26 +801,37 @@ mod tests {
                     Err(_) => break,
                 };
 
-                // 读 body（DNS query wire format）。
-                let mut body = req.into_body();
-                let mut query_buf = Vec::new();
-                while let Some(chunk) = body.data().await {
-                    query_buf.extend_from_slice(&chunk.unwrap());
-                }
+                // 请求体排空 + 应答必须在**独立任务**里做：accept 环是 h2 连接 I/O 的
+                // 唯一驱动者，环内 `await` `data()` 会把驱动者堵死——DATA 帧未入缓冲
+                // 时永久挂起（bd ll2hr 同款，Linux 必现）。
+                let fqdn = fqdn_owned.clone();
+                let ips = ips.clone();
+                xray_common::testing::spawn("spawn-mock-doh-server-answer", async move {
+                    // 读 body（DNS query wire format）。fail-loud 护栏：读不齐 =
+                    // 连接驱动被堵（把排空挪回 accept 环即复发），不留哑挂。
+                    let mut body = req.into_body();
+                    let mut query_buf = Vec::new();
+                    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                        while let Some(chunk) = body.data().await {
+                            query_buf.extend_from_slice(&chunk.unwrap());
+                        }
+                    })
+                    .await;
+                    assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
 
-                // 解析 query ID，构造响应。
-                let query_msg = Message::from_vec(&query_buf).unwrap();
-                let resp_payload =
-                    make_a_response(query_msg.metadata.id, &fqdn_owned, ips.clone(), ttl);
+                    // 解析 query ID，构造响应。
+                    let query_msg = Message::from_vec(&query_buf).unwrap();
+                    let resp_payload = make_a_response(query_msg.metadata.id, &fqdn, ips, ttl);
 
-                // 发回 HTTP 200 + body。
-                let resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "application/dns-message")
-                    .body(())
-                    .unwrap();
-                let mut send = respond.send_response(resp, false).unwrap();
-                send.send_data(Bytes::from(resp_payload), true).unwrap();
+                    // 发回 HTTP 200 + body。
+                    let resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/dns-message")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).unwrap();
+                    send.send_data(Bytes::from(resp_payload), true).unwrap();
+                });
                 // 循环回 accept → poll 连接刷出数据 → client 关闭后 None 退出
             }
         });
@@ -883,25 +894,34 @@ mod tests {
                         if close_after_first_response && served > 0 {
                             return; // 复用的第二个请求：断开连接（对端关闭语义）
                         }
-                        let mut body = req.into_body();
-                        let mut query_buf = Vec::new();
-                        while let Some(chunk) = body.data().await {
-                            let Ok(chunk) = chunk else { return };
-                            query_buf.extend_from_slice(&chunk);
-                        }
-                        let Ok(query_msg) = Message::from_vec(&query_buf) else { return };
-                        let resp_payload =
-                            make_a_response(query_msg.metadata.id, &fqdn, ips.clone(), ttl);
-                        let resp = Response::builder()
-                            .status(StatusCode::OK)
-                            .header(CONTENT_TYPE, "application/dns-message")
-                            .body(())
-                            .unwrap();
-                        let Ok(mut send) = respond.send_response(resp, false) else { return };
-                        if send.send_data(Bytes::from(resp_payload), true).is_err() {
-                            return;
-                        }
                         served += 1;
+                        // 请求体排空 + 应答放**独立任务**：accept 环是 h2 连接 I/O 的
+                        // 唯一驱动者，环内 `await` `data()` 自堵（bd ll2hr 同款）。
+                        // `served` 在 accept 时即计（顺序客户端下与旧「应答后计」等价）。
+                        let fqdn = fqdn.clone();
+                        let ips = ips.clone();
+                        xray_common::testing::spawn("counting-doh-server-answer", async move {
+                            let mut body = req.into_body();
+                            let mut query_buf = Vec::new();
+                            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                                while let Some(chunk) = body.data().await {
+                                    let Ok(chunk) = chunk else { return };
+                                    query_buf.extend_from_slice(&chunk);
+                                }
+                            })
+                            .await;
+                            assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                            let Ok(query_msg) = Message::from_vec(&query_buf) else { return };
+                            let resp_payload =
+                                make_a_response(query_msg.metadata.id, &fqdn, ips, ttl);
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/dns-message")
+                                .body(())
+                                .unwrap();
+                            let Ok(mut send) = respond.send_response(resp, false) else { return };
+                            let _ = send.send_data(Bytes::from(resp_payload), true);
+                        });
                     }
                 });
             }
@@ -949,25 +969,33 @@ mod tests {
             let mut h2_conn = server::handshake(sock).await.unwrap();
             while let Some(req_result) = h2_conn.accept().await {
                 let Ok((req, mut respond)) = req_result else { break };
-                let mut body = req.into_body();
-                let mut query_buf = Vec::new();
-                while let Some(chunk) = body.data().await {
-                    query_buf.extend_from_slice(&chunk.unwrap());
-                }
-                let query_msg = Message::from_vec(&query_buf).unwrap();
-                let resp_payload = make_a_response(
-                    query_msg.metadata.id,
-                    "h2c.com.",
-                    vec![Ipv4Addr::new(10, 1, 2, 3)],
-                    60,
-                );
-                let resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, "application/dns-message")
-                    .body(())
-                    .unwrap();
-                let mut send = respond.send_response(resp, false).unwrap();
-                send.send_data(Bytes::from(resp_payload), true).unwrap();
+                // 请求体排空 + 应答放**独立任务**：accept 环是 h2 连接 I/O 的唯一驱动
+                // 者，环内 `await` `data()` 自堵（bd ll2hr 同款）。
+                xray_common::testing::spawn("h2c-plain-roundtrip-answer", async move {
+                    let mut body = req.into_body();
+                    let mut query_buf = Vec::new();
+                    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                        while let Some(chunk) = body.data().await {
+                            query_buf.extend_from_slice(&chunk.unwrap());
+                        }
+                    })
+                    .await;
+                    assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                    let query_msg = Message::from_vec(&query_buf).unwrap();
+                    let resp_payload = make_a_response(
+                        query_msg.metadata.id,
+                        "h2c.com.",
+                        vec![Ipv4Addr::new(10, 1, 2, 3)],
+                        60,
+                    );
+                    let resp = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "application/dns-message")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).unwrap();
+                    send.send_data(Bytes::from(resp_payload), true).unwrap();
+                });
             }
         });
 
@@ -1212,12 +1240,21 @@ mod tests {
             let mut hanging_responds = Vec::new();
             while let Some(req) = h2_conn.accept().await {
                 let Ok((req, respond)) = req else { break };
+                // 排空放**独立任务**：accept 环是连接 I/O 的唯一驱动者，环内
+                // `await` `data()` 自堵（bd ll2hr 同款）。挂起语义不变：Responder
+                // 仍由 `hanging_responds` 持有不回。
                 let mut body = req.into_body();
-                while let Some(chunk) = body.data().await {
-                    if chunk.is_err() {
-                        break;
-                    }
-                }
+                xray_common::testing::spawn("hanging-doh-server-drain", async move {
+                    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                        while let Some(chunk) = body.data().await {
+                            if chunk.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                    assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                });
                 hanging_responds.push(respond);
             }
         });

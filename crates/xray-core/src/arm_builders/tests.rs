@@ -299,7 +299,7 @@ async fn go_legacy_outbound_aliases_assemble_via_register_outbounds() {
         ]
     }));
     let ohm = SimpleOhm::new();
-    register_outbounds(&built, &ohm, None, None, None)
+    register_outbounds(&built, &ohm, None, None, None, None)
         .expect("`direct`/`block` are legal Go protocols, must assemble not reject");
     let tags = ohm.list_tags();
     assert!(tags.iter().any(|t| t == "direct"), "direct alias must register: {tags:?}");
@@ -339,7 +339,7 @@ async fn mux_via_unknown_tag_rejects_config() {
             {"tag": "direct", "protocol": "freedom"}
         ]
     }));
-    let err = register_outbounds(&built, &SimpleOhm::new(), None, None, None)
+    let err = register_outbounds(&built, &SimpleOhm::new(), None, None, None, None)
         .expect_err("mux via `ghost` must reject the config (bd 16uis)");
     assert!(err.to_string().contains("ghost"), "error must name the via tag: {err}");
 
@@ -350,7 +350,7 @@ async fn mux_via_unknown_tag_rejects_config() {
             {"tag": "direct", "protocol": "freedom"}
         ]
     }));
-    register_outbounds(&built, &SimpleOhm::new(), None, None, None)
+    register_outbounds(&built, &SimpleOhm::new(), None, None, None, None)
         .expect("mux via pointing at a registered outbound must assemble");
 }
 

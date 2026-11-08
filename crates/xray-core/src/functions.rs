@@ -425,12 +425,14 @@ async fn start_full_dispatched(
         None => {
             // DNS service 同步注入出站（bd bqm）：targetStrategy 域名解析经此生效
             // （对应 Go 全局 internet.dnsClient 由 app/dns 初始化）。
+            let arm_scopes = instance.arm_scopes();
             register_outbounds(
                 built,
                 &ohm,
                 Some(Arc::clone(&loopback_sink)),
                 instance.get_feature::<xray_app_dns::DnsService>(),
                 policy_manager,
+                Some(&arm_scopes),
             )?;
         },
         Some(handlers) => {

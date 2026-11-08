@@ -250,15 +250,13 @@ pub struct UdpHopPacketConn {
     /// 池化 buf（recv_loop 与 read_from 共享；bd ccy5d 起进程级共享池——
     /// 对应 Go `udphop` 包级 `sync.Pool`，全连接复用一份）。
     pool: Arc<BufPool>,
-    /// hop 任务句柄（Drop/close 时 abort）。
-    hop_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// recv 任务句柄登记表（每 hop 启动一个，全部登记——close/Drop 逐一 abort）。
     /// bd 9utc3（F5）：改前只登记首条，换口后的 recv 句柄被丢弃，close 只能
     /// abort 首条；Arc 共享给 hop 任务以便 `hop_once` 追加登记。
     recv_handles: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    /// 池老化任务托管口（`ManagedScope` 内持 `FxScope`）：老化任务经统一托管口
-    /// [`xray_frame::pool::spawn_idle_pruner`] 挂本 scope（bd jovl4），寿命 = 本
-    /// 连接，Drop/close 即 abort（禁裸 spawn，见 CLAUDE.md §3.5.6 ①）。
+    /// 连接级托管口（`ManagedScope` 内持 `FxScope`）：hop 换口循环（§3.5.6 ①类）
+    /// 与池老化任务（bd jovl4，经 [`xray_frame::pool::spawn_idle_pruner`]）共用
+    /// 同一本账，寿命 = 本连接，Drop/close 即 abort（禁裸 spawn）。
     prune_scope: ManagedScope,
 }
 
@@ -381,6 +379,9 @@ impl UdpHopPacketConn {
         }
 
         let (recv_tx, recv_rx) = mpsc::channel(PACKET_QUEUE_SIZE);
+        // §3.5.6 ①类托管：本连接的托管口（hop 换口循环 + 池老化任务共用一本账；
+        // 寿命 = 本连接，close/Drop 即 abort，无孤儿循环）。
+        let prune_scope = ManagedScope::new("xray_frame::transport::hysteria::udphop");
 
         let inner = Arc::new(Mutex::new(UdpHopInner {
             addrs,
@@ -413,13 +414,16 @@ impl UdpHopPacketConn {
         let hop_recv_tx = recv_tx.clone();
         let pool_for_hop = Arc::clone(&pool);
         let recv_handles_for_hop = Arc::clone(&recv_handles);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（UDP hop 换口循环）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        let hop_handle = tokio::spawn(async move {
-            hop_loop(hop_inner, hop_recv_tx, pool_for_hop, recv_handles_for_hop).await;
-        });
+        // §3.5.6 ①类：hop 换口循环归本连接托管口（close/Drop 即 abort）。
+        if prune_scope
+            .spawn(async move {
+                hop_loop(hop_inner, hop_recv_tx, pool_for_hop, recv_handles_for_hop).await;
+            })
+            .is_err()
+        {
+            // 拒发只发生在 scope 已关（构造期不可达）；托管口自身已留痕。
+            return Err(HysteriaError::InvalidUdpHop("udphop scope closed".into()));
+        }
 
         // 池老化（Go 的 `sync.Pool` 靠 GC 回收，Rust 无 GC ⇒ 必须显式修剪）：
         // 统一托管口 `xray_frame::pool::spawn_idle_pruner`（bd jovl4 缺口3）——
@@ -433,7 +437,6 @@ impl UdpHopPacketConn {
         // （prune 幂等，多 pruner 无冲突）；连接全关后 pruner 随 scope 停，残余
         // idle ≤ POOL_IDLE_CAP × 1500B = 192 KB 进程级常驻（账本口径），下次连接
         // 直接复用。
-        let prune_scope = ManagedScope::new("xray_frame::transport::hysteria::udphop");
         if xray_frame::pool::spawn_idle_pruner(
             prune_scope.fx_scope(),
             Arc::clone(&pool.inner),
@@ -451,7 +454,6 @@ impl UdpHopPacketConn {
             recv_rx: tokio::sync::Mutex::new(recv_rx),
             recv_tx,
             pool,
-            hop_handle: tokio::sync::Mutex::new(Some(hop_handle)),
             recv_handles,
             prune_scope,
         }))
@@ -501,19 +503,16 @@ impl UdpHopPacketConn {
     /// 关闭（对应 Go `Close`）。
     #[allow(clippy::await_holding_lock)] // guard 有意存活跨 await（同步锁保护）
     pub async fn close(&self) -> std::io::Result<()> {
-        // abort hop loop
-        if let Some(handle) = self.hop_handle.lock().await.take() {
-            handle.abort();
-        }
+        // 托管口收口（udf 三段：close 闸 → abort 在途 → 等净；任务是 sleep 态 ⇒
+        // 立即 abort，不付满超时）：同时停 hop 换口循环与池老化任务。报告由托管口
+        // 自行落日志，此处无断言面。
+        let _ = self.prune_scope.shutdown_timeout(Duration::from_millis(100)).await;
         // abort recv loops
         let mut handles = self.recv_handles.lock().await;
         for h in handles.drain(..) {
             h.abort();
         }
         drop(handles);
-        // 池老化任务收口（托管口 udf 三段：close 闸 → abort 在途 → 等净；任务是
-        // sleep 态 ⇒ 立即 abort，不付满超时）。报告由托管口自行落日志，此处无断言面。
-        let _ = self.prune_scope.shutdown_timeout(Duration::from_millis(100)).await;
 
         #[allow(clippy::await_holding_lock)] // 测试全局槽位锁刻意跨 await 串行化（无争用场景）
         let mut inner = self.inner.lock();
@@ -563,16 +562,11 @@ impl UdpHopPacketConn {
 ///
 /// sync 上下文约束：tokio Mutex 用 `try_lock`——若锁正被在飞的 `close()` 持有，
 /// close 自会 abort 同一批句柄，此处拿不到锁即无需重复处理；`prune_scope`
-/// （ManagedScope）自带 Drop=abort 语义，无需显式收口。漏网的 recv 任务还会因
-/// `recv_tx` 随本结构体 drop 关闭 channel 而自退（兜底，非泄漏源）。
+/// （ManagedScope，含 hop 换口循环）自带 Drop=abort 语义，无需显式收口。漏网的
+/// recv 任务还会因 `recv_tx` 随本结构体 drop 关闭 channel 而自退（兜底，非泄漏源）。
 impl Drop for UdpHopPacketConn {
     fn drop(&mut self) {
         self.inner.lock().closed = true;
-        if let Ok(mut slot) = self.hop_handle.try_lock() {
-            if let Some(handle) = slot.take() {
-                handle.abort();
-            }
-        }
         if let Ok(mut handles) = self.recv_handles.try_lock() {
             for handle in handles.drain(..) {
                 handle.abort();
@@ -1146,11 +1140,20 @@ mod tests {
         assert_eq!(recv_handles.lock().await.len(), 2, "第二次换口继续追加登记");
     }
 
-    /// bd jovl4：老化任务经统一托管口 [`xray_frame::pool::spawn_idle_pruner`] 挂在
-    /// 连接自有的 ManagedScope/FxScope 上（坑约束 5：禁裸 spawn）——构造后在途恰
-    /// 1（pruner 循环体），close 三段排空后归零。prune **行为**本体由 xray-frame 侧
-    /// `idle_pruner_releases_aged_idle_on_tick`（托管端到端）与本文件
-    /// `prune_idle_releases_aged_blocks`（老化语义）分头钉死，接线测试不重做行为。
+    /// bd jovl4 + bd kwevg（§3.5.6 ①类接管）：本连接独有的 `ManagedScope`
+    /// 恰托管**两项**任务，逐项点名——
+    ///   ① 池老化任务：`assemble` 内 `spawn_idle_pruner(prune_scope.fx_scope(), …)`
+    ///      （udphop.rs:440-446，每连接一个 pruner 同扫进程级共享池）；
+    ///   ② hop 换口循环：`assemble` 内 `prune_scope.spawn(hop_loop(…))`
+    ///      （udphop.rs:419-421，寿命 = 本连接）。
+    ///
+    /// 计数 = 2 是上述**两项之和**：hop 任务并入 `prune_scope` 后（bd kwevg ①类接管），
+    /// 原 `hop_handle` 自持 JoinHandle 双账本已删（§3.5.6 禁双份账本），故比改造前的
+    /// 「恰 1（仅 pruner）」多一项。`FxScope` 不暴露 task 名/TaskId，这里用**精确计数**
+    /// 代替点名：任何第三类任务被塞进本 scope 都会让断言变红，**禁放宽成 `>= 1`**。
+    /// prune **行为**本体由 xray-frame 侧 `idle_pruner_releases_aged_idle_on_tick`
+    /// （托管端到端）与本文件 `prune_idle_releases_aged_blocks`（老化语义）分头钉死，
+    /// 接线测试不重做行为。
     #[tokio::test]
     async fn idle_pruner_is_hosted_by_connection_scope() {
         let addr: SocketAddr = "127.0.0.1:40004".parse().unwrap();
@@ -1167,15 +1170,16 @@ mod tests {
 
         assert_eq!(
             conn.prune_scope.in_flight(),
-            1,
-            "老化任务必须挂连接自有 scope 托管（spawn_idle_pruner 接线）"
+            2,
+            "连接自有 scope 恰托管两项：① 池老化任务（spawn_idle_pruner，udphop.rs:440）\
+             ② hop 换口循环（prune_scope.spawn，udphop.rs:419）；第三项 = 有人往本 scope 塞了别的任务"
         );
 
         conn.close().await.ok();
         assert_eq!(
             conn.prune_scope.in_flight(),
             0,
-            "close 三段排空后老化任务归零（ManagedScope.shutdown_timeout 走 FxScope）"
+            "close 三段排空后老化任务与 hop 循环一并归零（ManagedScope.shutdown_timeout 走 FxScope）"
         );
     }
 }

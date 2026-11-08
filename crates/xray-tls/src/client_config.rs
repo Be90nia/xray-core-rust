@@ -253,7 +253,7 @@ pub fn build_client_config(
     // 对齐 Go：warn 后继续（无 keylog）。
     match master_key_log {
         crate::server_config::MasterKeyLogSetting::Path(path) => {
-            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            match crate::server_config::open_key_log_file(&path) {
                 Ok(file) => {
                     cfg.key_log = Arc::new(crate::server_config::KeyLogFileWriter(
                         parking_lot::Mutex::new(file),

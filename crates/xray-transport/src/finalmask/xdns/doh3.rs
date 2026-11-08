@@ -430,7 +430,7 @@ impl Doh3Endpoint {
             .map_err(|e| io::Error::other(format!("xdns: DoH h3 handshake: {e}")))?;
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：DoH h3 连接 driver（数据面）；寿命绑定复用会话，无托管收益（同 doh.rs h2 driver 与 splithttp h3 driver，bd hj3jf）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：DoH h3 连接 driver（数据面）；寿命绑定复用会话，无托管收益（同 doh.rs h2 driver 与 splithttp h3 driver，bd hj3jf），随连接关闭自终，不迁托管口"
         )]
         tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;

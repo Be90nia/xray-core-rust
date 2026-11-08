@@ -683,12 +683,25 @@ impl ClientWorker {
         }
         session.add_downlink_bytes(data.len() as u64);
         let mb = MultiBuffer::from_buffer(data);
-        let write_failed = {
-            let mut output = session.output().await;
-            match output.as_mut() {
-                Some(w) => w.write_multi_buffer_impl(mb).await.is_err(),
-                None => false,
-            }
+        // PM-13：output 锁不跨 carrier 写——take 出所有权落盘再原样归还（同
+        // Session::close 的修法）。持锁写会与该会话 close/interrupt 的 take 窗口
+        // 互卡在 carrier 写上；写期间 close 的 take 看到 None 跳过 shutdown 时，
+        // put-back 锁内复查 closed 由本侧补齐（两侧必有其一负责，落盘态不变）。
+        // ⚠️ scrutinee 的花括号是语义件不是样式：块表达式让 output guard 在
+        // take 后立即 drop；裸写 `match session.output().await.take()` 会把
+        // guard 活到 match 结束 = 锁又跨回 carrier 写。blocks_in_conditions 建议勿从。
+        #[allow(clippy::blocks_in_conditions)]
+        let write_failed = match { session.output().await.take() } {
+            Some(mut w) => {
+                let failed = w.write_multi_buffer_impl(mb).await.is_err();
+                let mut slot = session.output().await;
+                if session.is_closed() {
+                    w.shutdown();
+                }
+                *slot = Some(w);
+                failed
+            },
+            None => false,
         };
         if write_failed {
             // 写下游失败：关闭 session，剩余数据丢弃（Go :363-367）

@@ -36,7 +36,6 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::Mutex,
-    task::JoinHandle,
 };
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use xray_transport::connection::Connection;
@@ -62,8 +61,9 @@ pub struct WsConnection<S> {
     pub(crate) remote: Option<SocketAddr>,
     /// 本端地址。
     pub(crate) local: Option<SocketAddr>,
-    /// 心跳 ping 任务句柄；`Drop` 时 abort 防泄漏（对应 Go heartbeat goroutine 生命周期）。
-    pub(crate) heartbeat_handle: Option<JoinHandle<()>>,
+    /// 心跳 ping 任务中止器（托管 spawn 句柄的 abort 面）；`Drop` 时 abort 防泄漏
+    /// （对应 Go heartbeat goroutine 生命周期）。
+    pub(crate) heartbeat_abort: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 // 类型别名：让签名可读。tokio-tungstenite::WebSocketStream::split 返回：
@@ -92,7 +92,7 @@ impl<S> WsConnection<S> {
             write_queued: None,
             remote,
             local,
-            heartbeat_handle: None,
+            heartbeat_abort: None,
         }
     }
 
@@ -310,11 +310,9 @@ where
             return;
         }
         let write = Arc::clone(&self.write);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（ws 心跳 ping 循环，对齐 Go heartbeatPeriod goroutine）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        let handle = tokio::spawn(async move {
+        // §3.5.6 ①类托管：心跳循环归进程级托管 scope（compat::spawn）——寿命仍由
+        // 本连接持有 abort 面绑定（Drop 拆任务）；闸关（进程收尾）即不启。
+        match xray_frame::compat::spawn(async move {
             let mut interval = tokio::time::interval(period);
             // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -329,18 +327,24 @@ where
                     break;
                 }
             }
-        });
-        if let Some(old) = self.heartbeat_handle.take() {
-            old.abort();
+        }) {
+            Ok(handle) => {
+                if let Some(old) = self.heartbeat_abort.take() {
+                    old();
+                }
+                self.heartbeat_abort = Some(Box::new(move || handle.abort()));
+            },
+            Err(_) => {
+                crate::LOG.debug("ws heartbeat: process scope closed at shutdown, not started");
+            },
         }
-        self.heartbeat_handle = Some(handle);
     }
 }
 
 impl<S> Drop for WsConnection<S> {
     fn drop(&mut self) {
-        if let Some(h) = self.heartbeat_handle.take() {
-            h.abort();
+        if let Some(abort) = self.heartbeat_abort.take() {
+            abort();
         }
     }
 }

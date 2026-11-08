@@ -64,7 +64,6 @@ use smoltcp::{iface::SocketHandle, wire::IpEndpoint};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, mpsc},
-    task::JoinHandle,
     time::interval,
 };
 use xray_app_dispatcher::{DispatchHandler, UdpDispatchSession};
@@ -173,8 +172,9 @@ pub struct TunInboundHandler {
     started: AtomicBool,
     /// TUN 设备句柄——start() 后填充。
     device: ParkMutex<Option<Arc<TunDevice>>>,
-    /// join handle——close() 用以终止 task。
-    join: ParkMutex<Option<JoinHandle<()>>>,
+    /// 托管口（§3.5.6 ①类）：driver loop 与其派生的全部任务（TCP 中继/dispatch、
+    /// UDP 会话/写回/sweeper）共用一本账；`close()` 三段排空即一并 abort。
+    scope: ParkMutex<Option<xray_frame::compat::ManagedScope>>,
     /// smoltcp 网栈句柄（与 driver task 共享）。
     netstack: Arc<AsyncMutex<TunNetStack>>,
     /// 配置参数（用于构造 TUN 设备和网栈）。
@@ -223,7 +223,7 @@ impl TunInboundHandler {
             tag,
             started: AtomicBool::new(false),
             device: ParkMutex::new(None),
-            join: ParkMutex::new(None),
+            scope: ParkMutex::new(None),
             netstack,
             options,
             dispatch,
@@ -401,15 +401,21 @@ impl InboundHandler for TunInboundHandler {
         let netstack = Arc::clone(&self.netstack);
         let dev = Arc::clone(&device);
         let dispatch = Arc::clone(&self.dispatch);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        let handle = tokio::spawn(async move {
-            tun_driver_loop(dev, netstack, dispatch).await;
-        });
+        // §3.5.6 ①类托管：tun 组件自持托管口（driver loop 及全部派生任务共用一本账）。
+        let scope = xray_frame::compat::ManagedScope::new(format!("tun:{}", self.tag));
+        let driver_scope = scope.clone();
+        if scope
+            .spawn(async move {
+                tun_driver_loop(dev, netstack, dispatch, driver_scope).await;
+            })
+            .is_err()
+        {
+            // 拒发只发生在停机窗口（新建 scope 不可达）；仍按启动失败处理，禁静默。
+            self.rollback_start(&device);
+            return Err(InboundError::ListenError("tun: managed scope closed".into()));
+        }
 
-        *self.join.lock() = Some(handle);
+        *self.scope.lock() = Some(scope);
         crate::TUN_LOG.info(format!("tun inbound started tag={}", self.tag));
         Ok(())
     }
@@ -417,8 +423,12 @@ impl InboundHandler for TunInboundHandler {
     /// 关闭 TUN 设备 + 停止驱动 task。
     async fn close(&self) -> std::result::Result<(), InboundError> {
         self.started.store(false, Ordering::SeqCst);
-        if let Some(handle) = self.join.lock().take() {
-            handle.abort();
+        // 托管口收口（close 闸 → abort 在途 → 等净）：driver loop 与全部派生任务
+        // 一并停（含 TCP 中继/dispatch、UDP 会话/写回/sweeper）。任务全 abortable
+        // ⇒ 立即归零；报告由托管口自行落日志，此处只吸收值。
+        let scope = self.scope.lock().take();
+        if let Some(scope) = scope {
+            let _ = scope.shutdown_timeout(std::time::Duration::from_millis(100)).await;
         }
         // 回滚 A3/A4 系统变更（对齐 Go Close：unsetSystemDNS → unsetSystemRoutes → 设备下线）。
         if let Some(applied) = self.applied_sysroute.lock().take() {
@@ -657,6 +667,7 @@ async fn tun_driver_loop(
     device: Arc<TunDevice>,
     netstack: Arc<AsyncMutex<TunNetStack>>,
     dispatch: Arc<dyn DispatchHandler>,
+    scope: xray_frame::compat::ManagedScope,
 ) {
     let mut timer = interval(POLL_INTERVAL);
     // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
@@ -667,7 +678,7 @@ async fn tun_driver_loop(
     // UDP 走 IP+UDP 头解析路径；TCP 走 SYN 惰性注册路径（票 ipb5，见主循环），
     // 均不预先创建 smoltcp socket。
     let udp_sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
-    let _udp_sweeper = spawn_udp_session_sweeper(Arc::clone(&udp_sessions));
+    spawn_udp_session_sweeper(Arc::clone(&udp_sessions), &scope);
     // 票 ijn7②：relay 失败的目的地址冷却表（防失败目的被立刻重建）。
     let failed_dsts: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
 
@@ -702,6 +713,7 @@ async fn tun_driver_loop(
                                     payload,
                                     Arc::clone(&dispatch),
                                     Arc::clone(&device),
+                                    &scope,
                                 );
                             } else {
                                 tcp_pkts.push(pkt.to_vec());
@@ -717,7 +729,7 @@ async fn tun_driver_loop(
 
                         // 锁外：accept 建桥（tokio::spawn 不再发生在临界区内）+
                         // 批聚合单次写回 TUN。
-                        dispatch_accepted(&netstack, accepted, &dispatch).await;
+                        dispatch_accepted(&netstack, accepted, &dispatch, &scope).await;
                         write_tx_back(&device, tx_pkts).await;
                     }
                     Err(e) => {
@@ -755,7 +767,7 @@ async fn tun_driver_loop(
                     // 只收集 accept 事件，建桥 spawn 在锁外进行
                     (stack.check_tcp_accepts(), stack.drain_tx())
                 };
-                dispatch_accepted(&netstack, accepted, &dispatch).await;
+                dispatch_accepted(&netstack, accepted, &dispatch, &scope).await;
                 write_tx_back(&device, tx_pkts).await;
             }
         }
@@ -864,6 +876,7 @@ fn handle_udp_packet(
     payload: &[u8],
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
+    scope: &xray_frame::compat::ManagedScope,
 ) {
     // 票 ijn7：目的组播/广播不进 relay；relay 刚失败过的目的地址在冷却窗内
     // 也不再新建会话（防「失败 → 立刻重建」的忙循环）。判定与计数在
@@ -904,6 +917,7 @@ fn handle_udp_packet(
                     Arc::clone(sessions),
                     Arc::clone(failed),
                     Arc::downgrade(&entry),
+                    scope.clone(),
                 );
                 map.insert(meta.src, Arc::clone(&entry));
                 entry
@@ -939,23 +953,24 @@ pub(crate) fn now_nanos() -> i64 {
 
 /// p14e：周期性扫描 idle 60s+ 的 UDP session 并从 map 淘汰（票 8gr6 重构：
 /// 无 try_lock 探测——owner task 独占 session，map 移除即可回收）。
-/// 后台 spawn，无关主 driver loop。
-#[allow(
-    clippy::disallowed_methods,
-    reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄（tail 表达式位无法就地登记），接线归 P1 插件装配（B3 T3.1）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-)]
-fn spawn_udp_session_sweeper(sessions: UdpSessions) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
-        // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // 跳过首 tick（首次运行时所有 entry 都很新）
-        tick.tick().await;
-        loop {
+/// 经 tun 组件托管口 spawn（§3.5.6 ①类），无关主 driver loop。
+fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::compat::ManagedScope) {
+    if scope
+        .spawn(async move {
+            let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
+            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 跳过首 tick（首次运行时所有 entry 都很新）
             tick.tick().await;
-            sweep_udp_sessions(&sessions);
-        }
-    })
+            loop {
+                tick.tick().await;
+                sweep_udp_sessions(&sessions);
+            }
+        })
+        .is_err()
+    {
+        crate::TUN_LOG.warn("tun udp sweeper: managed scope closed, sweeper not started");
+    }
 }
 
 /// 单轮 idle 淘汰（票 8gr6）：owner task 独占 session，sweep 只需从 map 移除
@@ -1022,15 +1037,13 @@ fn spawn_udp_session_task(
     sessions: UdpSessions,
     failed: FailedDsts,
     entry: std::sync::Weak<UdpSessionEntry>,
+    scope: xray_frame::compat::ManagedScope,
 ) {
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
     let (reply_tx, mut reply_rx) = mpsc::channel::<Vec<u8>>(UDP_SESSION_QUEUE_CAP);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    let session = tokio::spawn(run_udp_session(
+    // §3.5.6 ①类：会话 task 归 tun 组件托管口（close 三段排空即 abort）。
+    let session = match scope.spawn(run_udp_session(
         dispatch,
         cmd_rx,
         reply_tx,
@@ -1039,21 +1052,30 @@ fn spawn_udp_session_task(
         failed,
         sessions,
         entry,
-    ));
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    tokio::spawn(async move {
-        while let Some(reply) = reply_rx.recv().await {
-            if let Err(e) = device.send(&reply).await {
-                crate::TUN_LOG.warn(format!("udp: write reply to tun failed error={e}"));
-                break;
+    )) {
+        Ok(handle) => handle,
+        Err(_) => {
+            crate::TUN_LOG.warn("tun udp: managed scope closed, session not started");
+            return;
+        },
+    };
+    // 写回 task 同归托管口；写回端退出（device 失败）时显式终止会话 task——
+    // 该句柄是定向 abort 面，不是第二本账。
+    if scope
+        .spawn(async move {
+            while let Some(reply) = reply_rx.recv().await {
+                if let Err(e) = device.send(&reply).await {
+                    crate::TUN_LOG.warn(format!("udp: write reply to tun failed error={e}"));
+                    break;
+                }
             }
-        }
-        // 写回端退出（device 失败或会话结束）——终止会话 task
-        session.abort();
-    });
+            // 写回端退出（device 失败或会话结束）——终止会话 task
+            session.abort();
+        })
+        .is_err()
+    {
+        crate::TUN_LOG.warn("tun udp: managed scope closed, reply writer not started");
+    }
 }
 
 /// UDP 会话主循环（票 8gr6）：channel 驱动 send、`select!` 驱动 recv，
@@ -1197,9 +1219,10 @@ async fn dispatch_accepted(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     events: Vec<TcpAcceptEvent>,
     dispatch: &Arc<dyn DispatchHandler>,
+    scope: &xray_frame::compat::ManagedScope,
 ) {
     for event in events {
-        accept_tcp_connection(netstack, event, dispatch).await;
+        accept_tcp_connection(netstack, event, dispatch, scope).await;
     }
 }
 
@@ -1209,6 +1232,7 @@ async fn accept_tcp_connection(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     event: TcpAcceptEvent,
     dispatch: &Arc<dyn DispatchHandler>,
+    scope: &xray_frame::compat::ManagedScope,
 ) {
     // 从 local endpoint 构建 destination
     let dest = match ip_endpoint_to_destination(&event.local) {
@@ -1241,21 +1265,23 @@ async fn accept_tcp_connection(
         netstack: Arc::clone(netstack),
         handle: event.handle,
     };
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    tokio::spawn(relay.run());
+    // §3.5.6 ①类：中继与 dispatch 任务归 tun 组件托管口（close 三段排空即 abort）。
+    if scope.spawn(relay.run()).is_err() {
+        crate::TUN_LOG.warn("tun tcp: managed scope closed, relay not started");
+        netstack.lock().await.remove_socket(event.handle);
+        return;
+    }
 
     // spawn dispatch（link → outbound）
     let dispatch = Arc::clone(dispatch);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：存量债：未接 PluginContext 托管句柄，接线归 P1 插件装配（B3 T3.1 登记）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-    )]
-    tokio::spawn(async move {
-        dispatch.dispatch(&dest, link).await;
-    });
+    if scope
+        .spawn(async move {
+            dispatch.dispatch(&dest, link).await;
+        })
+        .is_err()
+    {
+        crate::TUN_LOG.warn("tun tcp: managed scope closed, dispatch not started");
+    }
 }
 
 /// smoltcp IpEndpoint → Destination（TCP）。
@@ -1425,6 +1451,14 @@ mod tests {
     fn make_dispatch() -> (Arc<CountingDispatch>, Arc<AtomicU32>) {
         let (d, calls) = CountingDispatch::new("test-out");
         (Arc::new(d), calls)
+    }
+
+    /// §3.5.6 ①类接线：`dispatch_accepted` 的托管口（测试自持，Drop 兜底 abort）。
+    ///
+    /// **必须绑定到局部变量**再传 `&`：写成临时值 `&test_scope()` 会在该语句结束时
+    /// 立即 Drop（= abort 在途任务），spawn 出的 dispatch/relay task 永远不跑。
+    fn test_scope() -> xray_frame::compat::ManagedScope {
+        xray_frame::compat::ManagedScope::new("tun-test")
     }
 
     #[tokio::test]
@@ -1742,6 +1776,10 @@ mod tests {
             0x02, // SYN
         );
 
+        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop（= abort 在途任务，
+        // 托管口 drop 语义），spawn 出的 dispatch task 永远跑不到下面的 sleep。
+        let scope = test_scope();
+
         {
             let mut stack = netstack.lock().await;
             // ① SYN → 惰性注册（与 driver loop 顺序一致：ensure 先于 ingest）
@@ -1775,7 +1813,8 @@ mod tests {
             // ④ accept → dispatch（票 fnlv：锁内收集事件，锁外建桥）
             let accepted = stack.check_tcp_accepts();
             drop(stack);
-            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>)).await;
+            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>), &scope)
+                .await;
         }
 
         // dispatch 在 spawn 的 task 里执行，current-thread runtime 需让出让其跑完
@@ -1803,11 +1842,15 @@ mod tests {
             Arc::new(AsyncMutex::new(TunNetStack::new(&[local], 1500)));
         let (dispatch, calls) = make_dispatch();
 
+        // 托管口持有到测试末尾（同 `tcp_syn_handshake_triggers_dispatch_*`：临时值会 abort）。
+        let scope = test_scope();
+
         {
             let mut stack = netstack.lock().await;
             let accepted = stack.check_tcp_accepts();
             drop(stack);
-            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>)).await;
+            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>), &scope)
+                .await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
     }
@@ -2222,8 +2265,11 @@ mod tests {
         };
         assert_eq!(accepted2.len(), 1, "accept collected once per batch");
 
+        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop（= abort 在途任务），
+        // 锁外 spawn 的 dispatch task 跑不到下面的 sleep。
+        let scope = test_scope();
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
-        dispatch_accepted(&netstack, accepted2, &handler).await;
+        dispatch_accepted(&netstack, accepted2, &handler, &scope).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let dest = captured.lock().clone().expect("dispatch must fire from lock-external bridge");
         assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));

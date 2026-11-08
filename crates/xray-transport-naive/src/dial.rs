@@ -94,7 +94,7 @@ pub async fn dial_naive(
     // h2 连接驱动：hyper 的 conn future 必须被持续 poll（后台任务 1）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h2 conn driver）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h2 conn driver）；driver 随 h2 连接关闭自终（conn.await 退即任务终），寿命不越单条连接，不迁托管口"
     )]
     let driver = tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -124,7 +124,7 @@ pub async fn dial_naive(
     // 优雅关闭整条 h2 连接（graceful GOAWAY 会终止活跃 CONNECT 流）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（h2 SendRequest 保活）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h2 SendRequest 保活）；`_keep_alive = sender` 纯保活句柄（drop 即放行连接关闭），任务体空转随连接退，不迁托管口"
     )]
     tokio::spawn(async move {
         let _keep_alive = sender;

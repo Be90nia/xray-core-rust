@@ -1497,6 +1497,7 @@ mod tests {
                 None,
                 None,
                 Some(opts),
+                std::sync::Arc::new(xray_frame::PluginContext::for_plugin("vless")),
             )
             .await;
         });

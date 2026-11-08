@@ -257,8 +257,12 @@ pub(crate) async fn build_vless_inbound(
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         let reality = parse_reality_config(&settings)?;
         tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), fallback = %reality.fallback_dest, "vless+reality inbound listening");
-        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
-            serve_reality_vless(listener, ohm, validator, reality, Some(options)).await
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+            let task_ctx = Arc::clone(&plugin_ctx);
+            async move {
+                serve_reality_vless(listener, ohm, validator, reality, Some(options), task_ctx)
+                    .await
+            }
         })))
     } else {
         let tls = build_tls_acceptor(ib.stream_settings_json.as_ref())?;
@@ -273,8 +277,12 @@ pub(crate) async fn build_vless_inbound(
             // finalmask.tcp（Go hub.go WrapListener；wire 最外层，TLS 之前）
             .with_tcpmask_manager(inbound_tcpmask(&settings)?);
         tracing::info!(tag = %ib.tag, addr = %addr, users = validator.get_uuid_count(), tls = tls.is_some(), fallbacks = fallbacks.as_ref().map_or(0, |f| f.len()), enc = decryption.is_some(), "vless inbound listening");
-        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
-            serve_vless(listener, ohm, validator, tls, fallbacks, Some(options)).await
+        Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
+            // spawn 面与任务体各持一份，避免 borrow-then-move 冲突。
+            let task_ctx = Arc::clone(&plugin_ctx);
+            async move {
+                serve_vless(listener, ohm, validator, tls, fallbacks, Some(options), task_ctx).await
+            }
         })))
     }
 }
@@ -1029,6 +1037,8 @@ pub(crate) fn vless_transport_on_conn(
         let options = options.clone();
         let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
         // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
+        // spawn 面与任务体各持一份（闭包是 Fn，不可把捕获值移出）。
+        let task_ctx = Arc::clone(&plugin_ctx);
         let spawned = plugin_ctx.spawn(async move {
             // TLS 已在 transport hub 内终结，name/alpn 不可得
             if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
@@ -1042,6 +1052,7 @@ pub(crate) fn vless_transport_on_conn(
                 String::new(),
                 Some(options),
                 None,
+                &task_ctx,
             )
             .await
             {
@@ -1268,7 +1279,6 @@ pub(crate) fn unix_vless_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
             let task_ctx = Arc::clone(&plugin_ctx);
             plugin_ctx
                 .spawn(async move {
-                    let _ctx = task_ctx;
                     let (peer, local) = transport_conn_addrs(conn.as_ref(), uds_fallback_addr());
                     if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
                         conn,
@@ -1281,6 +1291,7 @@ pub(crate) fn unix_vless_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
                         String::new(),
                         Some(options),
                         None,
+                        &task_ctx,
                     )
                     .await
                     {

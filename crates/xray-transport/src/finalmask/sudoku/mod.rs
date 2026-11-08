@@ -88,7 +88,7 @@ impl Tcpmask for SudokuConfig {
         // Client：pipe→inner 走 pure 编码，inner→pipe 走 packed 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（sudoku client bridge）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——sudoku client bridge；寿命随所属连接（raw 端 EOF 即双向桥自终），停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, true));
         Ok(Box::new(client))
@@ -100,7 +100,7 @@ impl Tcpmask for SudokuConfig {
         // Server：pipe→inner 走 packed 编码，inner→pipe 走 pure 解码
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面连接任务（sudoku server bridge）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——sudoku server bridge；寿命随所属连接（raw 端 EOF 即双向桥自终），停机不拆在途泵，不迁托管口"
         )]
         tokio::spawn(tcp_bridge(raw, server, config, false));
         Ok(Box::new(client))

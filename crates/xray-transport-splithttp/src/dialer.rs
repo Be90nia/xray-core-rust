@@ -842,7 +842,7 @@ where
     // spawn conn driver（必须，否则 h2 连接不动）
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，dialer 无 PluginContext 注入面；h2 连接驱动任务（缺此 h2 连接不动）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h2 连接驱动）；缺此任务 h2 连接不动（驱动即连接本体），随连接关闭自终，不迁托管口"
     )]
     // 站点归因（S3）：REALITY 直连路径的 h2 驱动任务在此 spawn（不走
     // DefaultDialerClient 的 Executor 缝），DATA 帧解析/流控/发送缓冲全在该任务
