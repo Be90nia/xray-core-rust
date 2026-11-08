@@ -8,11 +8,11 @@
 //!
 //! # 对齐差异（有意为之）
 //! - **DoH 查询连接的 TLS 栈**（bd 4w092 a）：本函数用 rustls 原生 ClientHello
-//!   （`DEFAULT_DOH_TLS_CONFIG` / [`crate::utls::default_client_config`]），Go 用 uTLS Chrome
-//!   模板（`ech.go:203-225` `utls.UClient(..., HelloChrome_Auto)`） ⇒ 向 DoH
-//!   服务器（Cloudflare/Google，本身是 TLS 指纹检测方）暴露"非浏览器栈"。 改走 btls 指纹需把 h2
-//!   客户端换成 `BtlsConn` 并处理其异步握手/回接验证， 收益仅在 ECH
-//!   场景；当前**显式登记为差异**而非静默。
+//!   （[`crate::utls::default_client_config`]），Go 用 uTLS Chrome 模板 （`ech.go:203-225`
+//!   `utls.UClient(..., HelloChrome_Auto)`）。向 DoH 服务器
+//!   （Cloudflare/Google，本身是指纹检测方）暴露"非浏览器栈"只在配置同时要求 uTLS
+//!   指纹时才是承诺冲突 ⇒ 该组合由 [`crate::client_config::build_client_config`]
+//!   在配置期硬错拒启（不在此静默）； 未配指纹时本路径的 rustls 栈即配置本意，照常查询。
 //! - Go 的 EDNS0(4096)+随机 padding 与 `X-Padding` 头是流量指纹混淆项，不 影响正确性（DoH 无 UDP
 //!   512B 限制，主流 DoH 对无 EDNS 查询正常回答）。 ponytail: 指纹级对齐需要时再加。
 //! - Go `udp://` 经典 UDP 查询：本版明确报错（Go 可成功），待真实需求再补 datagram 路径。

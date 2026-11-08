@@ -152,21 +152,22 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
     let short_id = if short_id_str.is_empty() {
         Vec::new()
     } else {
+        // bd 4w092(e)：Go 客户端解析对 >16 hex 字符（= 8 字节）**硬错**
+        // `too long "shortId"`（infra/conf/transport_security.go:202-208：
+        // `if len(c.ShortId) > 16 { return nil, errors.New(...) }` 紧接
+        // `config.ShortId = make([]byte, 8)`），服务端 shortIds 同口径
+        // （同文件:140-146）。故 >8 字节必须拒启，不得截断——截断会让本端
+        // 接受 Go 直接拒启的配置，且握手期版本头随之错位。
         let raw = hex::decode(short_id_str).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("reality: invalid shortId hex: {e}"))
         })?;
-        // bd 4w092(e)：Go `copy(hello.SessionId[8:], config.ShortId)`
-        // （reality.go:161）只搬前 min(len,24) 字节，服务端也只比 SessionId
-        // 前 8 字节 ⇒ >8 字节 shortId 在 Go 上等价于"截断到 8 字节"可用。
-        // Rust 原先在握手期 `InvalidShortIdLen` 硬错 = 互通差异；此处按 Go 截断。
         if raw.len() > 8 {
-            tracing::warn!(
-                target: "xray_reality::register",
-                len = raw.len(),
-                "reality: shortId longer than 8 bytes; using its first 8 bytes (Go truncates identically)"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("reality: too long \"shortId\": {short_id_str}"),
+            ));
         }
-        raw.into_iter().take(8).collect()
+        raw
     };
     // 257w：mldsa65Verify 配置期校验（Go transport_security.go:209-213，
     // base64 RawURL 解码 + 1952B 公钥），配错即拒启而非静默忽略。
@@ -463,6 +464,24 @@ mod tests {
         // 非法 → None
         assert!(base64_url_decode("!!!not-base64!!!").is_none());
     }
+    /// bd 4w092(e)：Go 对 >16 hex 字符（>8 字节）shortId 硬错
+    /// `too long "shortId"`（infra/conf/transport_security.go:202-208；
+    /// 服务端 shortIds 同口径 :140-146）⇒ 本端同样拒启，不截断。
+    #[test]
+    fn parse_reality_config_rejects_short_id_over_8_bytes() {
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let mk = |short: &str| {
+            serde_json::json!({
+                "serverName": "a.com",
+                "publicKey": pub_b64.clone(),
+                "shortId": short,
+            })
+        };
+        let err = parse_reality_config(Some(&mk(&"00".repeat(9)))).unwrap_err();
+        assert!(err.to_string().contains("too long"), "got: {err}");
+        assert!(parse_reality_config(Some(&mk(&"00".repeat(8)))).is_ok(), "8 字节必须接受");
+    }
+
     /// 257w：password 代 publicKey（Go transport_security.go:190-192）。
     #[test]
     fn parse_reality_config_password_alias() {

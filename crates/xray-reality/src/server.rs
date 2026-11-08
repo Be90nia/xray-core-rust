@@ -1766,10 +1766,13 @@ mod tests {
     }
 
     /// min..max 区间内 → 通过，且 payload.version 原样返回。
+    ///
+    /// fixture 用 `[26,5,0]`（与真实客户端声明版本无关：客户端侧版本头取自
+    /// `xray_common::version`，见 `client::REALITY_VERSION`）。
     #[test]
     fn fs0o_in_range_version_passes() {
-        let payload = ft0g_verify_with_ver([26, 7, 28], &[26, 3, 27], &[26, 9, 9]).unwrap();
-        assert_eq!(payload.version, [26, 7, 28]);
+        let payload = ft0g_verify_with_ver([26, 5, 0], &[26, 3, 27], &[26, 9, 9]).unwrap();
+        assert_eq!(payload.version, [26, 5, 0]);
     }
 
     /// ft0g 回归：门控不再读 legacy_version——TLS1.3 恒 [0x03,0x03]，旧实现下

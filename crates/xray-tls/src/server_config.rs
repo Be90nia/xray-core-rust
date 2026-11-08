@@ -228,17 +228,18 @@ pub fn build_server_config(
 
     // bd 4w092(b)：`echServerKeys` 在本仓**零消费**——btls v0.5.6 未导出
     // `SslEchKeys`/`SslEchKeysBuilder`，服务端握手又走 rustls（无 ECH feature）。
-    // 配了等于没配：客户端 ECH 到该入站解不出内层 SNI。这里 fail-visible 告警
-    // （不硬错：Go 合法配置不得因本仓能力缺口拒启）。同族键 `ocspStapling`
-    // 因属安全语义静默失效而选了硬错，两者取舍不同。
+    // 配了等于没配：客户端 ECH 到该入站解不出内层 SNI，且管理员从日志看不出
+    // 「这条入站的 ECH 承诺是假的」⇒ 与 `certificates[].ocspStapling` 同口径
+    // 拒启（安全/连接语义静默失效一律硬错，不再 warn 放行）。
     if json.get("echServerKeys").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        tracing::warn!(
-            target: "xray_tls::server_config",
-            security = %security,
-            "echServerKeys is set but this build cannot register ECH decryption keys \
-             (server handshake uses rustls, which has no ECH support): clients using ECH \
-             against this inbound will fail ECH and cannot reveal their inner SNI"
-        );
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "echServerKeys is not supported by this build (security: {security}): the server \
+                 handshake stack cannot register ECH decryption keys, so ECH clients would fail \
+                 and their inner SNI could never be recovered; remove the field to start"
+            ),
+        ));
     }
 
     let entries = build_named_cert_keys(&json)?;
@@ -400,6 +401,53 @@ pub(crate) fn parse_master_key_log(json: &serde_json::Value) -> MasterKeyLogSett
 /// Go `KeyLogWriter` 等价：把 NSS key log 行追加写进 `masterKeyLog` 指定文件。
 #[derive(Debug)]
 pub(crate) struct KeyLogFileWriter(pub(crate) parking_lot::Mutex<std::fs::File>);
+
+impl KeyLogFileWriter {
+    /// 追加一行已成型的 NSS 文本（btls 侧回调直接给整行，bd 4w092 c）。
+    pub(crate) fn write_nss_line(&self, line: &str) {
+        use std::io::Write as _;
+        // keylog 是调试设施：写失败（磁盘满/句柄失效）只丢行，不得影响握手。
+        let sink = &mut *self.0.lock();
+        let _ = sink.write_all(line.as_bytes());
+        let _ = sink.write_all(b"\n");
+    }
+}
+
+/// 为 btls 指纹路径打开 `masterKeyLog` 写入器（bd 4w092 c）。
+///
+/// 口径与 rustls 路径一致：`Path` 追加打开，`EnvFile`（bool `true` 历史方言）
+/// 走 `SSLKEYLOGFILE`；打开失败告警后返回 `None`（配置不因调试设施失败而拒启）。
+#[must_use]
+pub(crate) fn open_master_key_log(
+    json: &serde_json::Value,
+) -> Option<std::sync::Arc<KeyLogFileWriter>> {
+    let path = match parse_master_key_log(json) {
+        MasterKeyLogSetting::Off => return None,
+        MasterKeyLogSetting::Path(p) => p,
+        MasterKeyLogSetting::EnvFile => match std::env::var("SSLKEYLOGFILE") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                tracing::warn!(
+                    target: "xray_tls::server_config",
+                    "masterKeyLog=true but SSLKEYLOGFILE is unset; key log disabled"
+                );
+                return None;
+            },
+        },
+    };
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => Some(std::sync::Arc::new(KeyLogFileWriter(parking_lot::Mutex::new(file)))),
+        Err(e) => {
+            tracing::warn!(
+                target: "xray_tls::server_config",
+                error = %e,
+                path = %path,
+                "failed to open masterKeyLog as file; key log disabled"
+            );
+            None
+        },
+    }
+}
 
 impl rustls::KeyLog for KeyLogFileWriter {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
@@ -638,6 +686,20 @@ mod tests {
             Some(&serde_json::json!({ "certificates": [{ "certificate": [1, 2, 3] }] })),
         );
         assert!(config.is_err(), "非法内联数字数组必须报错");
+    }
+
+    /// bd 4w092(b)：`echServerKeys` 在本仓零消费（服务端栈无 ECH 解密键注册面）
+    /// ⇒ 配置期硬错拒启，不再静默 warn 放行。
+    #[test]
+    fn ech_server_keys_fails_loud() {
+        let err = build_server_config("tls", Some(&serde_json::json!({ "echServerKeys": "AAAA" })))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("echServerKeys"), "got: {err}");
+        // 空串 = 未配置（Go proto 零值）⇒ 不拒。
+        assert!(
+            build_server_config("tls", Some(&serde_json::json!({ "echServerKeys": "" }))).is_ok()
+        );
     }
 
     #[test]

@@ -514,19 +514,14 @@ where
     };
     // 清单外指纹在 `connect_with_alpn` 内硬错（InvalidData）——没有 rustls
     // 回退：配置了指纹却静默回退标准 ClientHello 等于伪装失效（批3 裁决）。
-    // bd 4w092(c)：btls 路径不接 `masterKeyLog`（Go `copyConfig` 会把
-    // KeyLogWriter 搬进 utls 配置）。fail-visible 提示，避免排障时以为已落盘。
-    if !matches!(
-        crate::server_config::parse_master_key_log(
-            security_json.unwrap_or(&serde_json::Value::Null)
-        ),
-        crate::server_config::MasterKeyLogSetting::Off
-    ) {
-        tracing::warn!(
-            target: "xray_tls::utls",
-            "masterKeyLog has no effect on the btls fingerprint path (Go writes it via utls.Config.KeyLogWriter): key log will stay empty"
-        );
-    }
+    // bd 4w092(c)：btls 路径按 rustls 同口径接 `masterKeyLog`（Go `copyConfig`
+    // 把 KeyLogWriter 搬进 utls 配置）——装到本次 `SSL_CTX` 的 keylog 回调。
+    let keylog: Option<crate::btls_client::KeylogSink> = crate::server_config::open_master_key_log(
+        security_json.unwrap_or(&serde_json::Value::Null),
+    )
+    .map(|writer| -> crate::btls_client::KeylogSink {
+        std::sync::Arc::new(move |line: &str| writer.write_nss_line(line))
+    });
     let conn = crate::btls_client::BtlsConn::connect_with_alpn(
         stream,
         server_name,
@@ -540,6 +535,7 @@ where
         crate::tls_session_cache::parse_allow_early_data(security_json),
         // bd 9anht：`enableSessionResumption` 真实取值（改前此处写死 None ⇒ 键失效）。
         crate::tls_session_cache::parse_enable_session_resumption(security_json),
+        keylog.as_ref(),
     )
     .await
     .inspect_err(|e| {
@@ -691,6 +687,46 @@ mod tests {
         let mut buf = Vec::new();
         u.read_to_end(&mut buf).await.expect("read ok");
         assert_eq!(buf, b"u-insecure-ok\n");
+    }
+
+    /// bd 4w092(c)：btls 指纹路径的 `masterKeyLog` 真实落盘。
+    ///
+    /// Go `copyConfig` 把 `KeyLogWriter` 搬进 utls 配置；本仓落点是本次
+    /// `SSL_CTX` 的 keylog 回调（`btls` 导出 `SSL_CTX_set_keylog_callback`）。
+    #[tokio::test]
+    async fn u_client_btls_writes_master_key_log() {
+        let (addr, _cert_der) = spawn_test_server(b"keylog-ok\n").await;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "xray_tls_btls_keylog_{}_{}.log",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let json = serde_json::json!({
+            "allowInsecure": true,
+            "masterKeyLog": path.to_string_lossy(),
+        });
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut u = u_client(
+            TcpConnection::new(tcp),
+            "localhost",
+            default_client_config(),
+            Fingerprint::Random,
+            None,
+            Some(&json),
+        )
+        .await
+        .expect("btls handshake with masterKeyLog");
+        let mut buf = Vec::new();
+        u.read_to_end(&mut buf).await.expect("read ok");
+
+        let logged = std::fs::read_to_string(&path).expect("masterKeyLog file must be written");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            logged.contains("CLIENT_HANDSHAKE_TRAFFIC_SECRET"),
+            "expected NSS client handshake secret line, got: {logged:?}"
+        );
     }
 
     /// md5i：websocket_handshake_alpn —— Go `WebsocketHandshakeContext` +

@@ -158,17 +158,17 @@ impl<S: Connection> Connection for RealityTlsStream<S> {
     }
 }
 
-/// REALITY session_id 明文里的协议版本（watfaq 语义 `[1, 8, 1]`，
-/// 与服务端 [`crate::server`] 解码兼容）。
+/// REALITY session_id 明文里的协议版本。
+///
+/// `[x, y, z]` 取自 [`xray_common::version`]（与 `xray_core::VERSION_*` 同一字面量
+/// 来源），对应 Go `core.Version_x/y/z`（`reality.go:168-170`）。
 // REALITY session_id 明文头 3 字节 = 客户端 Xray 版本 (major,minor,patch)。
 // 服务端 (v26.3.27+) 拒绝过低版本客户端 → 必须声明 ≥26.3.27。
-//
-// bd 4w092(f)：Go 用二进制真实版本（`core.Version_x/y/z`，reality.go:145-147），
-// 此处曾是硬编码 [26,7,28]（落后于对拍基准）。取基准 26.10.17 的取值。
-// shortcut: 常量与 xray-core::version 的单一来源未打通——xray-reality 依赖
-// xray-core 会成环，而共享版本常量住在 xray-common（跨槽改动）。升级基准时
-// 必须同步本常量；要根治就在 xray-common 立版本常量并由两处 re-export。
-const REALITY_VERSION: [u8; 3] = [26, 10, 17];
+const REALITY_VERSION: [u8; 3] = [
+    xray_common::version::VERSION_X,
+    xray_common::version::VERSION_Y,
+    xray_common::version::VERSION_Z,
+];
 
 /// btls REALITY 钩子：session_id 注入 + 证书 HMAC 验证。
 ///

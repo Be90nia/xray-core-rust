@@ -365,7 +365,8 @@ pub async fn connect_reality<S>(
 where
     S: Connection + Unpin,
 {
-    let fp_config = connector_for_fingerprint(&fingerprint)?;
+    // REALITY 路径的 `masterKeyLog` 属 tlsSettings（realitySettings 无该键）⇒ 无 sink。
+    let fp_config = connector_for_fingerprint(&fingerprint, None)?;
 
     let mut cfg = fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
     cfg.set_verify_hostname(false);

@@ -209,8 +209,8 @@ mod tests {
 
         // 客户端：Chrome 指纹连接器（与 BtlsConn::connect 同款构建）。
         let fp = crate::fingerprint::Fingerprint::Chrome;
-        let fp_config =
-            crate::btls_client::connector_for_fingerprint(&fp).expect("chrome connector builds");
+        let fp_config = crate::btls_client::connector_for_fingerprint(&fp, None)
+            .expect("chrome connector builds");
         let cfg = fp_config.connector.configure().unwrap();
         let mut ssl = cfg.into_ssl("localhost").unwrap();
         ssl.set_verify(btls::ssl::SslVerifyMode::NONE);

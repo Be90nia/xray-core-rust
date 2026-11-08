@@ -66,6 +66,24 @@ fn install_session_cache_hook(builder: &mut SslContextBuilder) {
     });
 }
 
+/// NSS key log 行 sink（`tlsSettings.masterKeyLog`，bd 4w092 c）。
+///
+/// 调用方从配置打开写入器并包成闭包，本模块把它装成 `SSL_CTX_set_keylog_callback`
+/// ——btls 回调给的是成行 NSS 文本（无行尾换行），闭包负责补换行与落盘。
+pub type KeylogSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+/// `masterKeyLog` 的 btls 实装（bd 4w092 c）：Go `copyConfig` 会把
+/// `KeyLogWriter` 搬进 utls 配置，落点是 `SSL_CTX_set_keylog_callback`
+/// （btls 已在 `btls/src/ssl/mod.rs` 导出）。回调收的是成行的 NSS 文本
+/// （无行尾换行），原样追加即可——与 rustls 路径 `KeyLogFileWriter` 同文件同格式。
+fn install_keylog(builder: &mut SslContextBuilder, keylog: Option<&KeylogSink>) {
+    let Some(sink) = keylog else {
+        return;
+    };
+    let sink = std::sync::Arc::clone(sink);
+    builder.set_keylog_callback(move |_ssl, line| sink(line));
+}
+
 /// 指纹配置：SslConnector + 握手时 per-connection 参数。
 ///
 /// `connector_for_fingerprint()` 返回此结构体，`connect()` 据此配置
@@ -164,17 +182,20 @@ fn chrome_133_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 }
 
 /// 构建带 Chrome 133 指纹的 SslConnector。
-fn chrome_133_connector() -> io::Result<SslConnector> {
-    chrome_133_connector_alpn(CHROME_133_ALPN)
+fn chrome_133_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
+    chrome_133_connector_alpn(CHROME_133_ALPN, keylog)
 }
 
 /// Chrome 133 无 ALPN 变体：uTLS `HelloRandomizedNoALPN` 的就近映射底座
 /// （ALPS 依赖 ALPN 协商，无 ALPN 时由调用方一并置空）。
-fn chrome_133_connector_no_alpn() -> io::Result<SslConnector> {
-    chrome_133_connector_alpn(b"")
+fn chrome_133_connector_no_alpn(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
+    chrome_133_connector_alpn(b"", keylog)
 }
 
-fn chrome_133_connector_alpn(alpn: &'static [u8]) -> io::Result<SslConnector> {
+fn chrome_133_connector_alpn(
+    alpn: &'static [u8],
+    keylog: Option<&KeylogSink>,
+) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -199,6 +220,7 @@ fn chrome_133_connector_alpn(alpn: &'static [u8]) -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -252,7 +274,7 @@ fn chrome_131_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 Chrome 131 指纹的 SslConnector。
 /// 与 Chrome 133 的差异：无 record_size_limit，无 delegated_credentials。
-fn chrome_131_connector() -> io::Result<SslConnector> {
+fn chrome_131_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -270,6 +292,7 @@ fn chrome_131_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -295,8 +318,8 @@ fn chrome_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 Chrome 120 指纹的 SslConnector。
 /// 与 Chrome 131 相同（cipher/sigalgs/ext_perm 一致）。
-fn chrome_120_connector() -> io::Result<SslConnector> {
-    chrome_131_connector()
+fn chrome_120_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
+    chrome_131_connector(keylog)
 }
 
 // ============================================================
@@ -387,7 +410,7 @@ fn firefox_148_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 }
 
 /// 构建带 Firefox 148 指纹的 SslConnector。
-fn firefox_148_connector() -> io::Result<SslConnector> {
+fn firefox_148_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -407,6 +430,7 @@ fn firefox_148_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -442,7 +466,7 @@ fn firefox_120_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 /// 构建带 Firefox 120 指纹的 SslConnector。
 /// 与 Firefox 148 的差异：双 key share (X25519 + P-256)。
 /// cipher/sigalgs/curves/ext_perm 相同。
-fn firefox_120_connector() -> io::Result<SslConnector> {
+fn firefox_120_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -462,6 +486,7 @@ fn firefox_120_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -532,7 +557,7 @@ fn safari_26_3_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 }
 
 /// 构建带 Safari 26.3 指纹的 SslConnector。
-fn safari_26_3_connector() -> io::Result<SslConnector> {
+fn safari_26_3_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -552,6 +577,7 @@ fn safari_26_3_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -637,7 +663,7 @@ fn edge_106_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 Edge 106 指纹的 SslConnector。
 /// Chrome 106 时代：无 record_size_limit，无 delegated_credentials，无 ECH。
-fn edge_106_connector() -> io::Result<SslConnector> {
+fn edge_106_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -655,6 +681,7 @@ fn edge_106_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -706,7 +733,7 @@ fn qihoo_360_11_0_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 360 11.0 指纹的 SslConnector。
 /// Chrome-like 但无 ALPS/ECH/delegated_credentials/record_size_limit。
-fn qihoo_360_11_0_connector() -> io::Result<SslConnector> {
+fn qihoo_360_11_0_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -728,6 +755,7 @@ fn qihoo_360_11_0_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -804,7 +832,7 @@ fn qq_11_1_ext_perm() -> Vec<btls::ssl::ExtensionType> {
 
 /// 构建带 QQ 11.1 指纹的 SslConnector。
 /// Chrome-like，有 ALPS，无 ECH/delegated_credentials/record_size_limit。
-fn qq_11_1_connector() -> io::Result<SslConnector> {
+fn qq_11_1_connector(keylog: Option<&KeylogSink>) -> io::Result<SslConnector> {
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -822,6 +850,7 @@ fn qq_11_1_connector() -> io::Result<SslConnector> {
     // 禁用内置 root 验证（xray 自行管理证书验证）
     builder.set_verify(btls::ssl::SslVerifyMode::NONE);
     install_session_cache_hook(&mut builder);
+    install_keylog(&mut builder, keylog);
 
     Ok(builder.build())
 }
@@ -973,7 +1002,10 @@ pub(crate) mod build_probe {
 /// 清单外指纹硬错 `InvalidData`（不再静默回退标准 rustls）。只想判「指纹是否
 /// 被支持」时**不要**调本函数——用常数时间谓词 [`fingerprint_supported`]，
 /// 否则每次判断白建一个 `SSL_CTX`。
-pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> io::Result<FingerprintConfig> {
+pub(crate) fn connector_for_fingerprint(
+    fp: &Fingerprint,
+    keylog: Option<&KeylogSink>,
+) -> io::Result<FingerprintConfig> {
     let effective = match effective_fingerprint(fp) {
         FingerprintResolution::Native => *fp,
         FingerprintResolution::Degraded { effective } => {
@@ -999,9 +1031,9 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> io::Result<Fingerpr
         },
     };
     #[cfg(not(test))]
-    let built = build_fingerprint_config(fp, &effective);
+    let built = build_fingerprint_config(fp, &effective, keylog);
     #[cfg(test)]
-    let built = build_probe::timed(|| build_fingerprint_config(fp, &effective));
+    let built = build_probe::timed(|| build_fingerprint_config(fp, &effective, keylog));
     built
 }
 
@@ -1010,68 +1042,72 @@ pub(crate) fn connector_for_fingerprint(fp: &Fingerprint) -> io::Result<Fingerpr
 fn build_fingerprint_config(
     configured: &Fingerprint,
     effective: &Fingerprint,
+    keylog: Option<&KeylogSink>,
 ) -> io::Result<FingerprintConfig> {
     // random 族无 ALPN 变体：映射表统一到 Chrome，此处按配置名分流。
     let no_alpn =
         matches!(configured, Fingerprint::RandomizedNoAlpn | Fingerprint::HelloRandomizedNoAlpn);
     match effective {
         Fingerprint::Chrome | Fingerprint::HelloChrome133 => {
-            let connector =
-                if no_alpn { chrome_133_connector_no_alpn() } else { chrome_133_connector() };
+            let connector = if no_alpn {
+                chrome_133_connector_no_alpn(keylog)
+            } else {
+                chrome_133_connector(keylog)
+            };
             connector.map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: CHROME_133_KEY_SHARES,
                 alps: if no_alpn { b"" } else { CHROME_133_ALPS },
             })
         },
-        Fingerprint::HelloChrome131 => chrome_131_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloChrome131 => chrome_131_connector(keylog).map(|c| FingerprintConfig {
             connector: c,
             key_shares: CHROME_131_KEY_SHARES,
             alps: CHROME_131_ALPS,
         }),
-        Fingerprint::HelloChrome120 => chrome_120_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloChrome120 => chrome_120_connector(keylog).map(|c| FingerprintConfig {
             connector: c,
             key_shares: CHROME_120_KEY_SHARES,
             alps: CHROME_120_ALPS,
         }),
         Fingerprint::Firefox | Fingerprint::HelloFirefox148 => {
-            firefox_148_connector().map(|c| FingerprintConfig {
+            firefox_148_connector(keylog).map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: FIREFOX_148_KEY_SHARES,
                 alps: FIREFOX_148_ALPS,
             })
         },
-        Fingerprint::HelloFirefox120 => firefox_120_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloFirefox120 => firefox_120_connector(keylog).map(|c| FingerprintConfig {
             connector: c,
             key_shares: FIREFOX_120_KEY_SHARES,
             alps: FIREFOX_120_ALPS,
         }),
         Fingerprint::Safari | Fingerprint::HelloSafari26_3 => {
-            safari_26_3_connector().map(|c| FingerprintConfig {
+            safari_26_3_connector(keylog).map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: SAFARI_26_3_KEY_SHARES,
                 alps: SAFARI_26_3_ALPS,
             })
         },
-        Fingerprint::HelloIos13 => safari_26_3_connector().map(|c| FingerprintConfig {
+        Fingerprint::HelloIos13 => safari_26_3_connector(keylog).map(|c| FingerprintConfig {
             connector: c,
             key_shares: IOS_13_KEY_SHARES,
             alps: IOS_13_ALPS,
         }),
-        Fingerprint::Ios | Fingerprint::HelloIos14 => safari_26_3_connector().map(|c| {
+        Fingerprint::Ios | Fingerprint::HelloIos14 => safari_26_3_connector(keylog).map(|c| {
             FingerprintConfig { connector: c, key_shares: IOS_14_KEY_SHARES, alps: IOS_14_ALPS }
         }),
-        Fingerprint::Edge | Fingerprint::HelloEdge106 => edge_106_connector().map(|c| {
+        Fingerprint::Edge | Fingerprint::HelloEdge106 => edge_106_connector(keylog).map(|c| {
             FingerprintConfig { connector: c, key_shares: EDGE_106_KEY_SHARES, alps: EDGE_106_ALPS }
         }),
         Fingerprint::Qihoo360 | Fingerprint::Hello360_11_0 => {
-            qihoo_360_11_0_connector().map(|c| FingerprintConfig {
+            qihoo_360_11_0_connector(keylog).map(|c| FingerprintConfig {
                 connector: c,
                 key_shares: QIHOO_360_11_0_KEY_SHARES,
                 alps: QIHOO_360_11_0_ALPS,
             })
         },
-        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => qq_11_1_connector().map(|c| {
+        Fingerprint::Qq | Fingerprint::HelloQq_11_1 => qq_11_1_connector(keylog).map(|c| {
             FingerprintConfig { connector: c, key_shares: QQ_11_1_KEY_SHARES, alps: QQ_11_1_ALPS }
         }),
         // 穷尽性由 effective_fingerprint 保证（测试锁死），此处不可达；
@@ -1273,6 +1309,8 @@ impl<S: Connection + Unpin> BtlsConn<S> {
             false,
             // 遗留 5 参 API：保持历史行为（允许 session 复用）。
             true,
+            // 遗留 5 参 API 不带 tlsSettings ⇒ 无 masterKeyLog。
+            None,
         )
         .await
     }
@@ -1296,6 +1334,9 @@ impl<S: Connection + Unpin> BtlsConn<S> {
     /// （ClientHello 无 `pre_shared_key`）。**Go 基线从不 resume**（uTLS
     /// `copyConfig` 不搬 `ClientSessionCache`，握手恒 full）——要与 Go 的
     /// ClientHello 形态一致，配置显式写 `enableSessionResumption: false`。
+    ///
+    /// `keylog`：`tlsSettings.masterKeyLog` 打开的 NSS key log 写入器（bd 4w092 c：
+    /// 装到本次 `SSL_CTX` 的 keylog 回调；`None` = 不写）。
     #[allow(clippy::too_many_arguments)] // 与 Go utls.Config 字段组对称，参数集不拆结构体（热路径零分配）
     pub async fn connect_with_alpn(
         stream: S,
@@ -1306,11 +1347,12 @@ impl<S: Connection + Unpin> BtlsConn<S> {
         alpn_wire: Option<&[u8]>,
         early_data: bool,
         enable_session_resumption: bool,
+        keylog: Option<&KeylogSink>,
     ) -> io::Result<Self> {
         use crate::ech::ApplyEch;
 
         // 清单外指纹：透传 InvalidData 硬错（不静默降级）
-        let fp_config = connector_for_fingerprint(&fingerprint)?;
+        let fp_config = connector_for_fingerprint(&fingerprint, keylog)?;
 
         let mut cfg =
             fp_config.connector.configure().map_err(|e| io::Error::other(e.to_string()))?;
@@ -1706,7 +1748,7 @@ mod tests {
     fn degraded_fingerprint_warns_with_configured_and_effective() {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let cfg = connector_for_fingerprint(&Fingerprint::HelloChrome58)
+            let cfg = connector_for_fingerprint(&Fingerprint::HelloChrome58, None)
                 .expect("degraded config builds");
             let _ = cfg;
         });
@@ -1731,7 +1773,7 @@ mod tests {
     fn random_fingerprint_warns_fixed_degradation() {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let cfg = connector_for_fingerprint(&Fingerprint::Random)
+            let cfg = connector_for_fingerprint(&Fingerprint::Random, None)
                 .expect("random degraded config builds");
             let _ = cfg;
         });
@@ -1750,7 +1792,7 @@ mod tests {
     fn randomized_no_alpn_degrades_with_warning() {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let cfg = connector_for_fingerprint(&Fingerprint::RandomizedNoAlpn)
+            let cfg = connector_for_fingerprint(&Fingerprint::RandomizedNoAlpn, None)
                 .expect("no-alpn degraded config builds");
             assert!(cfg.alps.is_empty(), "no-ALPN variant must have empty ALPS");
         });
@@ -1768,8 +1810,8 @@ mod tests {
     fn native_fingerprint_emits_no_warning() {
         let capture = WarnCapture::default();
         tracing::subscriber::with_default(capture.clone(), || {
-            let _ = connector_for_fingerprint(&Fingerprint::Chrome).expect("ok");
-            let _ = connector_for_fingerprint(&Fingerprint::HelloIos13).expect("ok");
+            let _ = connector_for_fingerprint(&Fingerprint::Chrome, None).expect("ok");
+            let _ = connector_for_fingerprint(&Fingerprint::HelloIos13, None).expect("ok");
         });
         assert!(capture.0.lock().unwrap().is_empty(), "native fingerprints must not warn");
     }
@@ -1778,7 +1820,7 @@ mod tests {
     #[test]
     fn unsupported_fingerprint_hard_errors() {
         // FingerprintConfig 无 Debug（SslConnector 无 derive），用 match 解构。
-        let err = match connector_for_fingerprint(&Fingerprint::Unsafe) {
+        let err = match connector_for_fingerprint(&Fingerprint::Unsafe, None) {
             Ok(_) => panic!("out-of-list fingerprint must hard-error"),
             Err(e) => e,
         };
@@ -1817,7 +1859,7 @@ mod tests {
         ];
         for name in names.drain(..) {
             let fp = get_fingerprint(name).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let r = connector_for_fingerprint(&fp);
+            let r = connector_for_fingerprint(&fp, None);
             assert!(r.is_ok(), "{name} ({fp:?}) must build a connector: {:?}", r.err());
             assert!(super::fingerprint_supported(&fp), "{name} must be supported");
         }
@@ -1828,7 +1870,7 @@ mod tests {
     #[test]
     fn unsupported_fingerprint_fails_hard_with_invalid_data() {
         let fp = get_fingerprint("unsafe").expect("unsafe must resolve");
-        let err = match connector_for_fingerprint(&fp) {
+        let err = match connector_for_fingerprint(&fp, None) {
             Ok(_) => panic!("out-of-list fingerprint must fail"),
             Err(e) => e,
         };
@@ -1840,10 +1882,10 @@ mod tests {
     #[test]
     fn randomized_no_alpn_skips_alps() {
         let fp = Fingerprint::RandomizedNoAlpn;
-        let cfg = connector_for_fingerprint(&fp).expect("Ok");
+        let cfg = connector_for_fingerprint(&fp, None).expect("Ok");
         assert!(cfg.alps.is_empty());
         // 有 ALPN 变体对照：Chrome 133 携带 h2 ALPS
-        let with = connector_for_fingerprint(&Fingerprint::Chrome).expect("Ok");
+        let with = connector_for_fingerprint(&Fingerprint::Chrome, None).expect("Ok");
         assert!(!with.alps.is_empty());
     }
 
@@ -1928,6 +1970,7 @@ mod tests {
                 None,
                 true,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1954,6 +1997,7 @@ mod tests {
                 None,
                 true,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -1980,6 +2024,7 @@ mod tests {
                 None,
                 true,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2005,12 +2050,12 @@ mod tests {
         use skeleton::clock::{Clock, SystemClock};
 
         for _ in 0..5 {
-            drop(connector_for_fingerprint(&fp)); // warmup（含惰性初始化）
+            drop(connector_for_fingerprint(&fp, None)); // warmup（含惰性初始化）
         }
         let mut samples = Vec::with_capacity(n);
         for _ in 0..n {
             let t0 = SystemClock.now_instant();
-            drop(connector_for_fingerprint(&fp));
+            drop(connector_for_fingerprint(&fp, None));
             samples.push(SystemClock.now_instant().duration_since(t0));
         }
         samples.sort_unstable();
@@ -2034,7 +2079,8 @@ mod tests {
     fn probe_connector_reuse_cost() {
         use skeleton::clock::{Clock, SystemClock};
 
-        let cfg = connector_for_fingerprint(&Fingerprint::Chrome).expect("build chrome connector");
+        let cfg =
+            connector_for_fingerprint(&Fingerprint::Chrome, None).expect("build chrome connector");
         let n = 25;
         for _ in 0..5 {
             drop(cfg.connector.configure()); // warmup
@@ -2130,7 +2176,7 @@ mod tests {
             let _ = build_probe::take(); // 清零：本拨号窗口起点
             if legacy_precheck {
                 // 旧 utls.rs:574 的预检：构造 connector 只为判 Ok，立即丢弃。
-                drop(connector_for_fingerprint(&Fingerprint::Chrome));
+                drop(connector_for_fingerprint(&Fingerprint::Chrome, None));
             }
             let (client_io, server_io) = tokio::io::duplex(256 * 1024);
             let server_fut = btls_accept(server_io, cert_der, key_der);

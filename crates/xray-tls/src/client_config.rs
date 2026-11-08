@@ -110,6 +110,45 @@ pub fn build_client_config(
     let json = security_json.cloned().unwrap_or(serde_json::Value::Null);
     let obj = json.as_object();
 
+    // bd 4w092(a)：ECH 的 DoH 查询由 `ech_doh` 用 rustls 原生 ClientHello 发出，
+    // 不套配置要求的 uTLS 指纹模板（Go `ech.go:203-225` 用 `HelloChrome_Auto`）。
+    // 指纹配置是「ClientHello 必须像浏览器」的承诺——DoH 查询却换另一套栈，
+    // 既打脸该承诺又向 DoH 服务器（Cloudflare/Google 自己就是指纹检测方）暴露
+    // 非浏览器栈 ⇒ 配了指纹就拒启，不再静默降级。
+    let explicit_fingerprint =
+        obj.and_then(|m| m.get("fingerprint")).and_then(|v| v.as_str()).unwrap_or("");
+    let ech_doh_query = obj
+        .and_then(|m| m.get("echConfigList"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.contains("://"));
+    if ech_doh_query && !explicit_fingerprint.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "tlsSettings: echConfigList DNS form (`://`) is queried over this build's rustls \
+                 stack, which cannot carry fingerprint \"{explicit_fingerprint}\" (Go queries with \
+                 uTLS Chrome); drop \"fingerprint\" or supply a base64 ECHConfigList"
+            ),
+        ));
+    }
+
+    // bd 4w092(b)：`echForceQuery` 在本仓只有 `full` 语义（DoH 查询失败 ⇒ 连接
+    // 失败）。`half`/`none` 无实现，静默按 full 跑等于配置撒谎 ⇒ 拒启。顺带把
+    // 非法取值（Go `unknown ECH force query mode`）也在此拦下——此前解析函数
+    // `ech::parse_ech_force_query` 无调用方，键存在等于没校验。
+    match crate::ech::parse_ech_force_query(&json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+    {
+        crate::ech::EchForceQuery::Full => {},
+        crate::ech::EchForceQuery::Half | crate::ech::EchForceQuery::None => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tlsSettings: echForceQuery \"half\"/\"none\" is not implemented (only \"full\": \
+                 a failed ECH DNS query fails the connection)",
+            ));
+        },
+    }
+
     // serverName：缺失时用参数传入的默认值（通常是 dest 地址）。
     // SNI 不进 ClientConfig（rustls 由 connect(server_name) 参数决定），仅保留解析。
     let _sni: String = obj
@@ -171,29 +210,11 @@ pub fn build_client_config(
     // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的 DialSystem 连接 sockopt）。
     // Rust ECH DoH 查询已接线（ech_doh），但查询连接的 sockopt 应用未实现，
     // 此处识别 + 显式忽略提示。
-    if crate::ech::parse_ech_sockopt(&json).is_some()
-        && obj
-            .and_then(|m| m.get("echConfigList"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|s| s.contains("://"))
-    {
+    if crate::ech::parse_ech_sockopt(&json).is_some() && ech_doh_query {
         tracing::warn!(
             target: "xray_tls::client_config",
             "echSockopt is set but sockopt is not applied to the ECH DoH query connection; sockopt ignored"
         );
-    }
-
-    // bd 4w092(b)：`echForceQuery` 只实现 `full` 语义（DoH 查询失败即连接失败，
-    // Go v26.3.27 缺省同义）；`half`/`none` 无消费点，写了等于按 `full` 跑。
-    // fail-visible 告警（不硬错：Go 合法配置不得因本仓能力缺口拒启）。
-    match json.get("echForceQuery").and_then(|v| v.as_str()) {
-        Some(mode) if !mode.eq_ignore_ascii_case("full") => tracing::warn!(
-            target: "xray_tls::client_config",
-            mode,
-            "echForceQuery is only implemented as \"full\" (ECH DoH query failure = connection failure); \
-             \"half\"/\"none\" are silently treated as \"full\""
-        ),
-        _ => {},
     }
 
     // allowInsecure 的 verifier 需要 provider 的签名算法集；builder 会拿走 provider，
@@ -1596,6 +1617,39 @@ mod tests {
         });
         let cfg = build_client_config("tls", Some(&json), "example.com").unwrap().unwrap();
         assert!(format!("{:?}", &*cfg.key_log).contains("NoKeyLog"));
+    }
+
+    /// bd 4w092(a)：ECH DoH（`://` 形态）走 rustls 原生桥，无法承载配置要求的
+    /// uTLS 指纹 ⇒ 该组合配置期硬错；不配指纹时同一份 ECH DoH 配置照常构建。
+    #[test]
+    fn ech_doh_with_utls_fingerprint_fails_loud() {
+        let json = serde_json::json!({
+            "fingerprint": "chrome",
+            "echConfigList": "https://1.1.1.1/dns-query",
+        });
+        let err = build_client_config("tls", Some(&json), "example.com").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("echConfigList"), "got: {err}");
+
+        let no_fp = serde_json::json!({ "echConfigList": "https://1.1.1.1/dns-query" });
+        assert!(build_client_config("tls", Some(&no_fp), "example.com").unwrap().is_some());
+        // 指纹 + base64 ECHConfigList（不做 DoH 查询）不受影响。
+        let b64 = serde_json::json!({ "fingerprint": "chrome", "echConfigList": "aGVsbG8=" });
+        assert!(build_client_config("tls", Some(&b64), "example.com").unwrap().is_some());
+    }
+
+    /// bd 4w092(b)：`echForceQuery` 只实现 `full`；`half`/`none` 与非法值一律拒启
+    /// （此前该键零校验——解析函数无调用方，写了等于没写）。
+    #[test]
+    fn ech_force_query_non_full_fails_loud() {
+        for mode in ["half", "none", "bogus"] {
+            let json = serde_json::json!({ "echForceQuery": mode });
+            let err = build_client_config("tls", Some(&json), "example.com").unwrap_err();
+            assert!(err.to_string().to_lowercase().contains("ech"), "mode={mode} got: {err}");
+        }
+        for ok in [serde_json::json!({ "echForceQuery": "full" }), serde_json::json!({})] {
+            assert!(build_client_config("tls", Some(&ok), "example.com").unwrap().is_some());
+        }
     }
 
     /// `enableSessionResumption=false` → resumption 切换到 disabled（type_name 变化）。
