@@ -154,6 +154,11 @@ jobs:
     # 被杀，非单测失败）。16MB = 8× 余量；代价只是线程栈虚拟预留、按需提交页。
     env:
       RUST_MIN_STACK: 16777216
+      # 2026-11-08 三次实证：`cargo test --workspace --release` 在编译 xray-integration-tests
+      # 期间被 runner SIGTERM(143) 提前终止（job 每次 ~24min；debug 步骤全绿、无 ENOSPC/OOM
+      # 日志、无 job 超时/并发取消）——按峰值内存/链接并发收敛为 2 路编译缓解。
+      # 不放宽任何断言与测试内容（仅编译并发）。
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
