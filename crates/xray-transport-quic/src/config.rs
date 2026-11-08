@@ -28,7 +28,7 @@ const DEFAULT_MAX_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// - `initialConnectionReceiveWindow` / `maxConnectionReceiveWindow`：连接级窗口
 /// - `maxIdleTimeout` / `keepAlivePeriod`：秒（quinn 内部 ms，乘 1000）
 /// - `disablePathMtuDiscovery`：true 禁用 PMTUD
-/// - `maxIncomingStreams`：最大并发入站双向流（-1 = 不设上限）
+/// - `maxIncomingStreams`：最大并发入站双向流（缺省/≤0 = 不设，沿用 quinn 缺省）
 /// - `initialMtu`：初始 MTU（0 = quinn 缺省 1200；bd ut95o B7 试验项）
 /// - `disableSendFairness`：true 关闭同优先级流间发送公平调度（bd ut95o B7 试验项）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -51,9 +51,9 @@ pub struct QuicConfig {
     pub keep_alive_period_ms: u64,
     /// true 禁用 PMTUD（Go 默认非 Linux/Win/Mac = true）。
     pub disable_path_mtu_discovery: bool,
-    /// 最大并发入站双向流。`0` = 不设（对齐 Go `MaxIncomingStreams > 0` 才下发的语义；
-    /// bd rsjoq：此前 0 被原样下发 = SETTINGS 宣告不许开流 = 对端一开流即被拒「自断流」）；
-    /// 负数 = 不设上限 → `quinn::VarInt::MAX`（本仓扩展语义）。
+    /// 最大并发入站双向流。`> 0` 才下发（Go `MaxIncomingStreams > 0` 语义）；缺省 / `0` /
+    /// 负数一律不设，沿用 quinn 缺省（bd rsjoq：0 曾被原样下发 = 宣告不许开流、自断流；
+    /// bd b7vs1：负数曾映射 `VarInt::MAX`，该值让 quinn 握手 100% CPU 永久自旋）。
     pub max_incoming_streams: i64,
     /// true 禁用 UDP 发送 GSO（Go `QuicParams.disableGSO`，默认 false = 启用）。
     pub disable_gso: bool,
@@ -110,7 +110,8 @@ impl QuicConfig {
         // 直接 quicSettings 路径走这里）。两个入口字段名一致。
         // quicSettings 直接路径：用户内联在 quicConfig.settings 内。
         let get_u64 = |k: &str| obj.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-        let get_i64 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).unwrap_or(-1);
+        // 缺省 = 0 = 不设（bd b7vs1：曾缺省成 -1 → VarInt::MAX → 握手自旋）
+        let get_i64 = |k: &str| obj.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
         let get_bool = |k: &str| obj.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
         // 两级窗口取 max（quinn 单固定窗口对齐 Go 稳态）。
         let init_stream = get_u64("initStreamReceiveWindow");
@@ -211,10 +212,10 @@ impl QuicConfig {
         // 把 `0` 原样交给 quinn ⇒ 服务端 SETTINGS 宣告「不许开流」= 自断流（对端一开流
         // 即被拒，且我方无日志）。语义收敛到 [`max_bidi_streams_override`]（可单测）。
         if let Some(v) = max_bidi_streams_override(self.max_incoming_streams) {
+            // 超 VarInt 上界的极端正数同样跳过（bd b7vs1：宁沿用 quinn 缺省，也不要
+            // 让握手撞上任何超大上限——MAX 会自旋）。
             if let Ok(v) = quinn::VarInt::try_from(v) {
                 t.max_concurrent_bidi_streams(v);
-            } else {
-                t.max_concurrent_bidi_streams(quinn::VarInt::MAX);
             }
         }
         // bd ut95o B7：初始 MTU opt-in（0 = 缺省不设，quinn 默认 1200）
@@ -252,22 +253,16 @@ impl QuicConfig {
 /// `quicSettings.maxIncomingStreams` → quinn 下发值（None = 不设，沿用 quinn 缺省）。
 ///
 /// bd rsjoq：Go `QuicParams`（infra/conf/transport_internet.go）只在
-/// `MaxIncomingStreams > 0` 时下发；`0` 表示「不设」而非「零流」。本仓扩展 `-1`
-/// （负数）= 显式不限 → `VarInt::MAX`。此前 `0` 被原样下发 ⇒ SETTINGS 宣告不许
-/// 开流 ⇒ 对端一开流即被拒（自断流，且无日志）。
+/// `MaxIncomingStreams > 0` 时下发；`0` 表示「不设」而非「零流」。此前 `0` 被原样
+/// 下发 ⇒ SETTINGS 宣告不许开流 ⇒ 对端一开流即被拒（自断流，且无日志）。
+///
+/// bd b7vs1：负数（含旧的「-1 = 不限」扩展语义）与超出 `VarInt` 上界的正数**一律不设**。
+/// 曾把这些映射成 `quinn::VarInt::MAX`（2^62-1）——实测该值让 quinn 握手在 100% CPU
+/// 上永久自旋（2026-11-08：`quicSettings:{}` 与显式 `-1` 时 echo 回环永不完成，
+/// `0`/`100`/`1000000` 均 0.03-1.2s 通过）⇒ 任何路径都不得再产出 `VarInt::MAX`。
+#[must_use]
 fn max_bidi_streams_override(raw: i64) -> Option<u64> {
-    match raw {
-        r if r > 0 => {
-            let v = u64::try_from(r).unwrap_or(quinn::VarInt::MAX.into_inner());
-            if quinn::VarInt::try_from(v).is_ok() {
-                Some(v)
-            } else {
-                Some(quinn::VarInt::MAX.into_inner())
-            }
-        },
-        r if r < 0 => Some(quinn::VarInt::MAX.into_inner()),
-        _ => None,
-    }
+    u64::try_from(raw).ok().filter(|v| *v > 0)
 }
 
 #[cfg(test)]
@@ -288,12 +283,31 @@ mod tests {
     fn max_incoming_streams_zero_means_unset() {
         assert_eq!(max_bidi_streams_override(0), None, "0 = 不设，沿用 quinn 缺省");
         assert_eq!(max_bidi_streams_override(100), Some(100));
-        assert_eq!(max_bidi_streams_override(-1), Some(quinn::VarInt::MAX.into_inner()));
+        // bd b7vs1：负数（旧「-1 = 不限」）与超大正数都不得产出 VarInt::MAX（握手会自旋）。
+        assert_eq!(max_bidi_streams_override(-1), None, "负 = 不设");
         assert_eq!(
             max_bidi_streams_override(i64::MAX),
-            Some(quinn::VarInt::MAX.into_inner()),
-            "超 VarInt 上界的正数一律钳到 MAX（原 else 分支语义）"
+            Some(i64::MAX as u64),
+            "正数原样返回，超 VarInt 由调用方跳过"
         );
+    }
+
+    /// bd b7vs1 回归：`quicSettings` 存在但没写 `maxIncomingStreams` 时，**不得**凭空
+    /// 产生流上限覆盖值。旧解析缺省 `-1` → `VarInt::MAX` ⇒ quinn 握手 100% CPU 永久
+    /// 自旋（echo 回环永不完成），即「只要配置里出现 quicSettings 就不可用」。
+    #[test]
+    fn absent_max_incoming_streams_is_unset() {
+        for json in [r#"{}"#, r#"{"disableGSO":true}"#, r#"{"keepAlive":true,"congestion":"bbr"}"#]
+        {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            let cfg = QuicConfig::from_json(Some(&v)).unwrap();
+            assert_eq!(cfg.max_incoming_streams, 0, "{json} 不得产生流上限覆盖");
+            assert_eq!(
+                max_bidi_streams_override(cfg.max_incoming_streams),
+                None,
+                "{json} 不得下发 max_concurrent_bidi_streams"
+            );
+        }
     }
 
     #[test]

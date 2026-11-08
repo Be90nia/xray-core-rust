@@ -319,10 +319,14 @@ pub(crate) fn build_hysteria_transport_config(
         // 拆连——故窗口取「对端单包 payload 物理上限 + 记账开销」，见 config 常量注释。
         t.datagram_receive_buffer_size(Some(qc.max_datagram_frame_size as usize));
     }
-    if qc.max_incoming_streams >= 0 {
-        t.max_concurrent_bidi_streams(
-            quinn::VarInt::try_from(qc.max_incoming_streams as u64).unwrap_or(quinn::VarInt::MAX),
-        );
+    // bd b7vs1：只在 > 0 时下发（Go `MaxIncomingStreams > 0` 语义）。曾判 `>= 0` 把 0
+    // 原样下发（= 宣告不许开流、对端一开流即自断流），且超大值 `unwrap_or(VarInt::MAX)`
+    // ——该值让 quinn 握手 100% CPU 永久自旋。负数/超上界一律不下发。
+    let streams = u64::try_from(qc.max_incoming_streams).unwrap_or(0);
+    if streams > 0 {
+        if let Ok(v) = quinn::VarInt::try_from(streams) {
+            t.max_concurrent_bidi_streams(v);
+        }
     }
     // 流量控制窗口（Go dialer.go:86-89 / hub.go:265-268 Initial*+Max* → quinn 单窗口取 max）
     let (stream_win, conn_win) = receive_windows(qc);

@@ -401,12 +401,36 @@ mod tests {
 
     #[test]
     fn is_padding_valid_tokenish_uses_huffman_length() {
-        // padding 100 bytes target -> huffman length 接近 100
-        let s = generate_tokenish_padding_base62(100);
-        assert!(is_padding_valid(&s, 100, 100, PADDING_METHOD_TOKENISH));
-        // ±2 tolerance 应该通过
-        assert!(is_padding_valid(&s, 102, 102, PADDING_METHOD_TOKENISH));
-        // 远离范围 -> invalid
+        // bd b7vs1 附带：原实现用随机 `generate_tokenish_padding_base62(100)` 去断言
+        // `[102,102]`（= 编码长度 ∈ [100,104]），而生成器只保证「编码长度与 target 差 ≤ 容差」
+        // ⇒ 抽到 97/98/99 即失败（构造性 flaky）。改为确定性串：huffman 长度可算，
+        // 且能区分「用 huffman 字节数」与「用原始字节数」。
+        let s = "a".repeat(100); // 'a' 的 HPACK Huffman 码长 5 bit ⇒ 编码后 ~63B ≠ 100B
+        let enc = huffman_encode_length(&s) as i32;
+        assert!((enc - 100).abs() > VALIDATION_TOLERANCE, "样例须能区分两种口径: enc={enc}");
+
+        // 精确命中编码长度 —— 通过
+        assert!(is_padding_valid(&s, enc, enc, PADDING_METHOD_TOKENISH));
+        // ±容差边界内 —— 通过
+        assert!(is_padding_valid(
+            &s,
+            enc + VALIDATION_TOLERANCE,
+            enc + VALIDATION_TOLERANCE,
+            PADDING_METHOD_TOKENISH
+        ));
+        // 超出容差 —— 不通过
+        assert!(!is_padding_valid(
+            &s,
+            enc + VALIDATION_TOLERANCE + 1,
+            enc + VALIDATION_TOLERANCE + 1,
+            PADDING_METHOD_TOKENISH
+        ));
+        // 按**原始字节数**（100）判定本该通过；tokenish 用 huffman 长度 ⇒ 必须不通过
+        assert!(
+            !is_padding_valid(&s, 100, 100, PADDING_METHOD_TOKENISH),
+            "tokenish 须用 huffman 长度"
+        );
+        // 远离范围 —— 不通过
         assert!(!is_padding_valid(&s, 200, 300, PADDING_METHOD_TOKENISH));
     }
 
