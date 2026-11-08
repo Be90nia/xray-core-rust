@@ -37,6 +37,9 @@ use xray_buf::{buffer::Buffer, multi::MultiBuffer};
 /// 对应 Go `splitConn struct { writer, reader, remoteAddr, localAddr, onClose }`。
 /// 上层 proxy handler 把它当普通 `AsyncRead + AsyncWrite` 连接使用。
 pub struct SplitConn<R, W> {
+    /// 关闭回调（`Drop` 时调用一次）。声明在最前，让回调先于 reader/writer 析构
+    /// （与原 `Drop for SplitConn` 的时序一致）。
+    close: CloseGuard,
     /// 下载流读端（来自 [`crate::client::DefaultDialerClient::open_stream`]
     /// 返回的 `BodyDataStream`）。
     pub reader: R,
@@ -47,12 +50,29 @@ pub struct SplitConn<R, W> {
     pub remote_addr: SocketAddr,
     /// 本地地址（来自 `crate::client::HttpInfo`::`local_addr`）。
     pub local_addr: SocketAddr,
-    /// 关闭回调（packet-up mode 用于 `xmuxClient.OpenUsage -= 1` 等清理）。
-    /// 包在 `Mutex` 内允许 `Drop` 时 take 调用。
-    on_close: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
     /// 下行零拷贝读腿（bd oarfu）：`Connection::frozen_reader` 取走一次。
     /// `Box<dyn Reader>` 只 `Send` 不 `Sync`，故包在 `Mutex` 内保持 `SplitConn: Sync`。
     frozen: Mutex<Option<Box<dyn xray_buf::io::Reader>>>,
+}
+
+/// 关闭回调载体：`SplitConn` 需要 `Drop` 语义，但自持 `Drop` 会禁止安全地搬字段
+/// （原先靠 `ManuallyDrop` + `ptr::read`）——把 `Drop` 落在字段上，`SplitConn`
+/// 即可安全解构（bd 1a2yy）。
+#[derive(Default)]
+struct CloseGuard(Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>);
+
+impl CloseGuard {
+    fn fire(&self) {
+        if let Some(f) = self.0.lock().take() {
+            f();
+        }
+    }
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
 }
 
 impl<R, W> SplitConn<R, W> {
@@ -60,11 +80,11 @@ impl<R, W> SplitConn<R, W> {
     #[must_use]
     pub fn new(reader: R, writer: W, remote: SocketAddr, local: SocketAddr) -> Self {
         Self {
+            close: CloseGuard::default(),
             reader,
             writer,
             remote_addr: remote,
             local_addr: local,
-            on_close: Mutex::new(None),
             frozen: Mutex::new(None),
         }
     }
@@ -79,15 +99,12 @@ impl<R, W> SplitConn<R, W> {
 
     /// 设置关闭回调（ [`Drop`] 时调用一次）。对应 Go `splitConn.onClose` 字段。
     pub fn set_on_close<F: FnOnce() + Send + Sync + 'static>(&self, f: F) {
-        let mut guard = self.on_close.lock();
-        *guard = Some(Box::new(f));
+        *self.close.0.lock() = Some(Box::new(f));
     }
 
     /// 显式触发 on_close（用于手动 drop 之外的清理路径）。
     pub fn fire_on_close(&self) {
-        if let Some(f) = self.on_close.lock().take() {
-            f();
-        }
+        self.close.fire();
     }
 
     /// 把 reader 包装在 [`MutexReader`] 中，使 `SplitConn` 满足 `Sync` bound。
@@ -103,18 +120,15 @@ impl<R, W> SplitConn<R, W> {
     where
         R: Send,
     {
-        // Must prevent Drop from firing on `self` since we're moving fields out.
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: we move every field out and reconstruct on_close before any panic path.
-        // ManuallyDrop ensures the old SplitConn's Drop won't fire.
-        let on_close = this.on_close.lock().take();
+        // `SplitConn` 不自持 `Drop`（回调随 `CloseGuard` 字段析构）⇒ 可直接解构搬字段。
+        let Self { close, reader, writer, remote_addr, local_addr, frozen } = self;
         SplitConn {
-            reader: MutexReader::new(unsafe { std::ptr::read(&this.reader) }),
-            writer: unsafe { std::ptr::read(&this.writer) },
-            remote_addr: this.remote_addr,
-            local_addr: this.local_addr,
-            on_close: Mutex::new(on_close),
-            frozen: Mutex::new(this.frozen.lock().take()),
+            close,
+            reader: MutexReader::new(reader),
+            writer,
+            remote_addr,
+            local_addr,
+            frozen,
         }
     }
 }
@@ -144,14 +158,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitConn<R, W>
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.writer).poll_shutdown(cx)
-    }
-}
-
-impl<R, W> Drop for SplitConn<R, W> {
-    fn drop(&mut self) {
-        if let Some(f) = self.on_close.lock().take() {
-            f();
-        }
     }
 }
 
@@ -469,6 +475,22 @@ mod tests {
         });
         conn.fire_on_close();
         conn.fire_on_close();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn into_sync_reader_keeps_on_close_callback() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c2 = counter.clone();
+        let (client, _server) = duplex(64);
+        let (r, w) = tokio::io::split(client);
+        let conn =
+            SplitConn::new(r, w, "1.2.3.4:80".parse().unwrap(), "127.0.0.1:1234".parse().unwrap());
+        conn.set_on_close(move || {
+            c2.fetch_add(1, Ordering::Relaxed);
+        });
+        // bd 1a2yy(d)：搬家后回调仍在（旧实现 ManuallyDrop+ptr::read 的等价契约）。
+        drop(conn.into_sync_reader());
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 

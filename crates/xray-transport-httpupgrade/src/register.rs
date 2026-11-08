@@ -22,7 +22,7 @@ use xray_frame::compat::ManagedScope;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
-    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
+    handshake_gate::HandshakeGate,
     ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
@@ -307,7 +307,7 @@ async fn listen_httpupgrade(
     // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）；上界核算见
     // `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
-    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
     // 握手任务托管口（CLAUDE.md §3.5.6 ①）：listener 丢弃/关闭 ⇒ scope 归零 ⇒
     // 在途握手任务 abort（不残留 4s 尾巴）。
     let scope = ManagedScope::new(format!("httpupgrade-accept:{local}"));
@@ -398,7 +398,7 @@ async fn listen_unix_httpupgrade(
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for;
     // 日志标识进块（supervise_accept_loop 另需 path 所有权）。
     let log_ident = path.clone();
-    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
     let scope = ManagedScope::new(format!("httpupgrade-unix-accept:{log_ident}"));
     let loop_scope = scope.clone();
     let ctx = Arc::new(HandshakeCtx {

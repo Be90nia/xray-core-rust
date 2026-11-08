@@ -940,7 +940,7 @@ async fn listen_h3(
     // UDP 端口保持绑定但永不 accept——监听的死必须留痕（accept_policy 铁律 3）。
     // jcnjb⑤：每监听握手并发闸 + 应用层握手窗（rd8yj① 同款配方，见 [`spawn_h3_accept`]）。
     let gate = xray_transport::handshake_gate::HandshakeGate::new(
-        xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES,
+        xray_transport::handshake_gate::effective_inflight_limit(),
     );
     spawn_h3_accept(endpoint, gate, ctx);
     Ok(Box::new(SplithttpListener { local, tcp_abort: None, h3_endpoint: Some(listener_endpoint) }))
@@ -1034,30 +1034,42 @@ async fn serve_h3_conn(conn: quinn::Connection, ctx: Arc<HandlerContext>) {
         let peer = conn.remote_address();
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（+ 请求体桥接任务 + 连接终结 abort 任务）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
+            reason = "①类·脱管债（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；h3 每请求任务（单条，连接终结取消已并入同 task 的 select!）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
         )]
         tokio::spawn(async move {
             let Ok((req, stream)) = resolver.resolve_request().await else {
                 return;
             };
-            let task = tokio::spawn(serve_h3_request(req, stream, peer, Arc::clone(&ctx)));
             // 连接终结（客户端断开 / idle / error）必须强制终结该连接上的全部
             // 请求——对齐 Go hub.go:394-398 `request.Context().Done()` 中断
-            // handler + `defer conn.Close()`：abort 触发 response body（含
+            // handler + `defer conn.Close()`：取消触发 response body（含
             // SessionDropGuard）drop，会话删除 + queue.close + ServerConn 上行
             // EOF 级联，hub copy / forward / dispatcher 桥全链解体。否则
             // response body 循环滞留至永久（实测 100%/conn 死锁，s12 泄漏根因）。
-            let closer = conn.clone();
-            tokio::spawn(async move {
-                let _ = closer.closed().await;
-                task.abort();
-            });
+            //
+            // bd 1a2yy：原实现再 spawn 一条 `conn.closed()` watcher 去 abort 请求
+            // task——请求正常结束后 watcher 仍驻留（只在连接关闭时返回），长连接
+            // 下 task 数随请求单调增长。改为同 task 内 race（见 [`race_conn_close`]）。
+            race_conn_close(&conn, serve_h3_request(req, stream, peer, ctx)).await;
         });
+    }
+}
+
+/// 请求 future 与连接关闭 race：连接终结即丢弃请求（等价原 `task.abort()`）。
+///
+/// 请求先完成时 `closed()` future 随 select 一起释放，不留驻留任务（bd 1a2yy）。
+async fn race_conn_close<F: Future<Output = ()>>(conn: &quinn::Connection, req: F) {
+    tokio::select! {
+        _ = req => {},
+        _ = conn.closed() => {},
     }
 }
 
 /// h3 服务端请求流（bidi）。split 后 send/recv 两半分属不同 task。
 type H3ServerStream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
+
+/// h3 服务端响应发送半（`RequestStream::split` 的 send 侧）。
+type H3SendStream = h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>;
 
 /// 单个 h3 请求：请求体桥接为 `ReqBody` 喂给 hub handler，响应帧序列发回。
 ///
@@ -1075,13 +1087,34 @@ async fn serve_h3_request(
 
     let resp = handler::handle_request(req, peer, &ctx).await;
 
-    let (parts, mut body) = resp.into_parts();
+    let (parts, body) = resp.into_parts();
     let mut send = send_half;
     if send.send_response(http::Response::from_parts(parts, ())).await.is_err() {
         return;
     }
+    pump_h3_response_body(&mut send, body).await;
+}
+
+/// 响应体帧泵：body 出错即 WARN 留痕 + RST 该 stream。
+///
+/// 出错不能当正常提前结束（否则客户端拿到 200 + 截短 body 且错误零留痕）；
+/// RST 对齐 Go net/http 的 `Write` 错误终止语义（bd 1a2yy）。
+async fn pump_h3_response_body(
+    send: &mut H3SendStream,
+    mut body: http_body_util::combinators::BoxBody<Bytes, io::Error>,
+) {
     while let Some(frame) = body.frame().await {
-        let Ok(frame) = frame else { break };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                crate::hot_log!(
+                    tracing::Level::WARN,
+                    "error={e} h3 response body frame, resetting stream"
+                );
+                send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                return;
+            },
+        };
         if let Ok(data) = frame.into_data() {
             if send.send_data(data).await.is_err() {
                 return;
@@ -1828,6 +1861,201 @@ mod tests {
         assert_eq!(got, payload, "h3 stream-one must return the full response body");
         assert_eq!(count.load(Ordering::SeqCst), 1, "handler should see 1 conn");
         let _ = conn.shutdown().await;
+    }
+
+    /// bd 1a2yy(a)：连接关闭必须取消在途 h3 请求，且不留 per-request watcher。
+    ///
+    /// 修前给每个请求额外 spawn 一条 `conn.closed()` watcher（请求正常结束后仍驻留，
+    /// 长连接下 task 数随请求单调增长）；现由 [`race_conn_close`] 在同 task 内 race。
+    /// 本用例用**真实 QUIC 连接**钉住 race 语义：关连接 ⇒ 请求 future 被 drop。
+    #[tokio::test]
+    async fn race_conn_close_drops_request_future() {
+        ensure_provider();
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&serde_json::json!({
+            "certificate": cert_pem,
+        }))
+        .unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
+        let (handler, _count) = greeting_handler();
+        let mut settings = plain_settings();
+        settings.security = "tls".into();
+        settings.security_json = Some(serde_json::json!({
+            "alpn": ["h3"],
+            "certificates": [{ "certificate": cert_pem, "key": key_pem }],
+        }));
+        let listener = listen_splithttp(
+            "127.0.0.1:0".parse().unwrap(),
+            &settings,
+            &SocketOptions::default(),
+            handler,
+        )
+        .await
+        .expect("listen h3");
+        let addr = listener.local_addr().unwrap();
+
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": pin,
+                "alpn": ["h3"],
+            })),
+            "localhost",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        )));
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.expect("quic connect");
+
+        // 探针：请求 future 被丢弃时置位。
+        struct DropProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = DropProbe(std::sync::Arc::clone(&dropped));
+        let race_conn = conn.clone();
+        let task = tokio::spawn(async move {
+            race_conn_close(&race_conn, async move {
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            })
+            .await;
+        });
+
+        // 关连接 ⇒ `closed()` 完成 ⇒ 请求 future 被 drop ⇒ race task 退出。
+        conn.close(0u32.into(), b"test close");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("race task must exit on conn close")
+            .expect("race task must not panic");
+        assert!(dropped.load(Ordering::SeqCst), "request future must be dropped on conn close");
+        endpoint.close(0u32.into(), b"test done");
+    }
+
+    /// bd 1a2yy(b)：h3 响应体上游出错 ⇒ RST 该 stream（不留痕地当 EOF 是修前的坑）。
+    ///
+    /// 修前 `let Ok(frame) = frame else { break }` 把错误当正常提前结束：客户端拿到
+    /// 200 + 截短 body，服务端零留痕。本用例用真 QUIC/h3 对端直喂
+    /// [`pump_h3_response_body`] 一个出错 body，断言客户端读到的是 stream 错误
+    /// 而不是干净 EOF。
+    #[tokio::test]
+    async fn h3_response_body_error_resets_stream() {
+        ensure_provider();
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let server_tls = xray_tls::server_config::build_server_config(
+            "tls",
+            Some(&serde_json::json!({
+                "alpn": ["h3"],
+                "certificates": [{ "certificate": cert_pem, "key": key_pem }],
+            })),
+        )
+        .unwrap()
+        .expect("server tls config");
+        let quic_server =
+            quinn::crypto::rustls::QuicServerConfig::try_from((*server_tls).clone()).unwrap();
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(quic_server)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = endpoint.local_addr().unwrap();
+
+        struct ErrBody;
+        impl hyper::body::Body for ErrBody {
+            type Data = Bytes;
+            type Error = io::Error;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, io::Error>>> {
+                Poll::Ready(Some(Err(io::Error::other("upstream body broke"))))
+            }
+        }
+
+        let srv = tokio::spawn(async move {
+            let conn = endpoint.accept().await.expect("accept").await.expect("handshake");
+            let quinn_conn = conn.clone();
+            let mut h3_conn =
+                h3::server::Connection::new(h3_quinn::Connection::new(conn)).await.unwrap();
+            let resolver = h3_conn.accept().await.unwrap().expect("request");
+            let (_req, stream) = resolver.resolve_request().await.unwrap();
+            let (mut send, _recv) = stream.split();
+            send.send_response(http::Response::builder().status(200).body(()).unwrap())
+                .await
+                .unwrap();
+            pump_h3_response_body(&mut send, http_body_util::combinators::BoxBody::new(ErrBody))
+                .await;
+            // 连接必须活到 RST 送达客户端：`h3::server::Connection` drop 会先发
+            // GOAWAY/close，客户端只会看到「连接被关」而非本用例要断言的 stream 错误。
+            let _ = quinn_conn.closed().await;
+        });
+
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&serde_json::json!({
+            "certificate": cert_pem,
+        }))
+        .unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
+        let client_tls = xray_tls::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({
+                "pinnedPeerCertSha256": pin,
+                "alpn": ["h3"],
+            })),
+            "localhost",
+        )
+        .unwrap()
+        .expect("client tls config");
+        let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+        )));
+        let conn = client_ep.connect(addr, "localhost").unwrap().await.expect("quic connect");
+        let (mut driver, mut send_req) =
+            h3::client::new(h3_quinn::Connection::new(conn)).await.unwrap();
+        tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", format!("127.0.0.1:{}", addr.port()))
+            .body(())
+            .unwrap();
+        let mut stream = send_req.send_request(req).await.unwrap();
+        stream.finish().await.unwrap();
+        // 读完整响应：错误体必须让客户端在 headers/body 任一阶段看到 stream 错误
+        // （RST），而不是 200 + 干净 EOF——后者正是修前 `break` 的行为（bd 1a2yy）。
+        let outcome = async {
+            let _resp = stream.recv_response().await?;
+            loop {
+                match stream.recv_data().await? {
+                    Some(_) => continue,
+                    None => return Ok::<(), h3::error::StreamError>(()),
+                }
+            }
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(10), outcome)
+            .await
+            .expect("client must not hang on errored response body");
+        assert!(
+            outcome.is_err(),
+            "errored body must surface as a stream error, not 200 + clean EOF (bd 1a2yy)"
+        );
+        client_ep.close(0u32.into(), b"test done");
+        tokio::time::timeout(Duration::from_secs(5), srv)
+            .await
+            .expect("server task must exit once client closes")
+            .expect("server task must not panic");
     }
 
     /// REALITY listener 创建 + 非 REALITY 流量 fallback：

@@ -751,21 +751,26 @@ impl WgDriver {
             let Some((peer_idx, outputs)) = self.decapsulate_incoming(&pkt, src) else {
                 continue;
             };
-            let mut stack = self.netstack.lock().await;
             let peer_endpoint = self.peer(peer_idx).and_then(|p| p.endpoint());
-            for out in outputs {
-                match out {
-                    Output::Ip(ip) => stack.ingest_rx(ip),
-                    Output::Network(mut wg) => {
-                        let target =
-                            if self.is_multi() { peer_endpoint } else { *self.remote.lock() };
-                        if let Some(t) = target {
-                            self.send_wg(&mut wg, t).await;
-                        }
-                    },
+            let target = if self.is_multi() { peer_endpoint } else { *self.remote.lock() };
+            // 出网包先攒后发：netstack 锁只护 ingest/poll，send_wg 的 socket 写
+            // 在锁外（旧形态持锁跨 UDP 写，一次写慢就堵死全部 decapsulate）。
+            let mut wire: Vec<Vec<u8>> = Vec::new();
+            {
+                let mut stack = self.netstack.lock().await;
+                for out in outputs {
+                    match out {
+                        Output::Ip(ip) => stack.ingest_rx(ip),
+                        Output::Network(wg) => wire.push(wg),
+                    }
+                }
+                stack.poll(smoltcp::time::Instant::now());
+            }
+            if let Some(t) = target {
+                for mut wg in wire {
+                    self.send_wg(&mut wg, t).await;
                 }
             }
-            stack.poll(smoltcp::time::Instant::now());
         }
     }
 }

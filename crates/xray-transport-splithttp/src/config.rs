@@ -21,7 +21,7 @@ use bytes::Bytes;
 use rand::Rng;
 
 use crate::{
-    error::Result,
+    error::{Result, SplitHttpError},
     xpadding::{
         PADDING_METHOD_REPEAT_X, XPaddingConfig, XPaddingPlacement, apply_xpadding_to_request_meta,
     },
@@ -65,6 +65,36 @@ pub const PREDEFINED_SESSION_ID_TABLE: &[(&str, &str)] = &[
 #[must_use]
 pub fn lookup_predefined_session_id_table(name: &str) -> Option<&'static str> {
     PREDEFINED_SESSION_ID_TABLE.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
+}
+
+/// `sessionIDTable` / `sessionIDLength` 校验（镜像 Go `transport_method.go:426-433`
+/// 的 `from > 0` 与 ASCII 两条）。
+///
+/// 供两条配置入口共用（JSON 解析与 [`Config::from_proto`]）：原实现内联在 JSON
+/// 解析里，proto 入口据此旁路校验，非 ASCII 表会让 [`Config::generate_session_id`]
+/// 静默退化成空 session id（bd 1a2yy）。
+///
+/// roomSize 那条（`transport_method.go:421-424`）不在此处：现有 JSON 侧实现方向与
+/// Go 相反（Go 按 Σ table^k 求和、拒「太小」，此处拒「太大」），且已被 bd 281r 的
+/// 测试钉住——保持原状，不以错的规则污染新入口。
+pub(crate) fn validate_session_id(table: &str, length: Option<RangeConfig>) -> std::io::Result<()> {
+    // 预定义名先解析成字面字符集（proto 侧 Go conf 已替换；此处幂等）。
+    let table = lookup_predefined_session_id_table(table).unwrap_or(table);
+    if table.as_bytes().iter().any(|b| *b >= 0x80) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "splithttpSettings.sessionIDTable must contain only ASCII characters",
+        ));
+    }
+    let Some(len_range) = length else { return Ok(()) };
+    // Go transport_method.go:417-419：from <= 0 直接拒绝配置。
+    if len_range.from <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "splithttpSettings.sessionIDLength.from must be greater than 0",
+        ));
+    }
+    Ok(())
 }
 
 // ===== RangeConfig =====
@@ -208,6 +238,9 @@ pub struct Config {
     /// Go `infra/conf/transport_method.go:295`：`DownloadSettings *StreamConfig`——
     /// 嵌套的**完整** StreamConfig（address/port/method/security/tls/reality + 协议段）；
     /// `dialer.go:355-404` 用它**另建**下载侧 HTTP 客户端（独立 dest/tls/host/path）。
+    ///
+    /// 仅 JSON 配置入口承载：[`Config::from_proto`] 遇 proto `downloadSettings` 报错
+    /// （传输层段无 proto→JSON 映射），`to_proto` 不写出该字段。
     pub download_settings: Option<Box<DownloadSettings>>,
     /// 是否启用 X-Padding 混淆模式。
     pub x_padding_obfs_mode: bool,
@@ -469,8 +502,21 @@ impl Config {
     }
 
     /// 从 prost 生成的 proto Config 构造。
+    ///
+    /// `downloadSettings` 不在 proto 入口承载：Go（`dialer.go:337-339`、`:353`）只在
+    /// `DownloadSettings != nil` 时另建下载侧客户端，未配则回落顶层 StreamConfig——
+    /// 本函数返回 `None` 即该回退。而 [`DownloadSettings`] 需要下载侧 StreamConfig 的
+    /// 传输层段（tls/reality/sockopt）JSON，proto→JSON 序列化器尚不存在 ⇒ 配了即
+    /// fail-visible，不静默当未配（bd 1a2yy）。JSON 路径是唯一承载。
     pub fn from_proto(p: xray_proto::xray::transport::internet::splithttp::Config) -> Result<Self> {
-        Ok(Self {
+        if p.download_settings.is_some() {
+            return Err(SplitHttpError::InvalidConfig(
+                "splithttp downloadSettings is only supported via JSON config: the proto entry \
+                 has no StreamConfig transport-section (tls/reality/sockopt) mapping"
+                    .into(),
+            ));
+        }
+        let cfg = Self {
             host: p.host,
             path: p.path,
             mode: p.mode,
@@ -483,7 +529,7 @@ impl Config {
             sc_max_buffered_posts: p.sc_max_buffered_posts,
             sc_stream_up_server_secs: p.sc_stream_up_server_secs.map(range_from_proto),
             xmux: p.xmux.map(xmux_from_proto),
-            download_settings: None, // ponytail: 切片2 接入 StreamConfig 强类型
+            download_settings: None,
             x_padding_obfs_mode: p.x_padding_obfs_mode,
             x_padding_key: p.x_padding_key,
             x_padding_header: p.x_padding_header,
@@ -500,7 +546,9 @@ impl Config {
             server_max_header_bytes: p.server_max_header_bytes,
             session_id_table: p.session_id_table,
             session_id_length: p.session_id_length.map(range_from_proto),
-        })
+        };
+        validate_session_id(&cfg.session_id_table, cfg.session_id_length)?;
+        Ok(cfg)
     }
 
     /// 转换为 prost Config。
@@ -1558,6 +1606,32 @@ mod tests {
         assert_eq!(cfg2.session_id_length, Some(RangeConfig::new(16, 32)));
         // 整 struct round-trip 不要求相等（其他字段非覆盖项不必全一致），仅断言本字段。
     }
+    /// bd 1a2yy(c)：proto 入口不再旁路 sessionIDTable 校验（非 ASCII ⇒ 拒配置）。
+    #[test]
+    fn from_proto_rejects_non_ascii_session_id_table() {
+        let p = xray_proto::xray::transport::internet::splithttp::Config {
+            session_id_table: "abc\u{00ff}".into(),
+            ..Default::default()
+        };
+        let err = Config::from_proto(p).expect_err("non-ASCII sessionIDTable must be rejected");
+        assert!(err.to_string().contains("ASCII"), "{err}");
+    }
+
+    /// bd 1a2yy(c)：proto 承载不了 downloadSettings（传输层段无 proto→JSON 映射）⇒
+    /// fail-visible；未配时 `None` 即 Go 的回落顶层语义（`dialer.go:353`）。
+    #[test]
+    fn from_proto_rejects_download_settings_but_absent_key_ok() {
+        let absent = xray_proto::xray::transport::internet::splithttp::Config::default();
+        assert_eq!(Config::from_proto(absent).expect("absent ok").download_settings, None);
+
+        let present = xray_proto::xray::transport::internet::splithttp::Config {
+            download_settings: Some(Default::default()),
+            ..Default::default()
+        };
+        let err = Config::from_proto(present).expect_err("downloadSettings must not be dropped");
+        assert!(err.to_string().contains("downloadSettings"), "{err}");
+    }
+
     /// yvf8：uplinkDataPlacement 客户端编码。header → `{key}-N` 分块 base64 头 +
     /// 空 body；cookie → `{key}_N`；body/auto → payload 留 body（对齐 Go
     /// config.go:330-350 FillPacketRequest + :64-96 分块编码）。

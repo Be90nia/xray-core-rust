@@ -36,7 +36,7 @@ use xray_common::net::destination::Destination;
 use xray_transport::{
     connection::Connection,
     dialer::StreamSettings,
-    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
+    handshake_gate::HandshakeGate,
     listener_registry::{ConnHandler, TransportListener},
     sockopt::SocketOptions,
 };
@@ -178,7 +178,7 @@ pub async fn listen(
     let listener_endpoint = endpoint.clone();
     // rd8yj①：每监听握手并发闸 + 应用层握手窗（见 [`spawn_quic_accept`]）。
     // 闸容量 = MAX_INFLIGHT_HANDSHAKES，预算依据见其常量注释（handshake_gate 家族口径）。
-    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
     spawn_quic_accept(endpoint, gate, handler);
 
     Ok(Box::new(QuicListener { local, endpoint: listener_endpoint }))

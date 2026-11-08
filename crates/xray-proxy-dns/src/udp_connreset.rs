@@ -1,10 +1,11 @@
-//! Windows ICMP-unreachable 上报关闭（bd d597w）——`xray_transport::udp::
-//! bind_udp_no_connreset` 的**薄转调**。
+//! Windows ICMP-unreachable 上报关闭（bd d597w）——ioctl 正本在
+//! [`xray_frame::net::disable_icmp_unreachable_report`]，本文件只保留 bind 调用点
+//! 的**薄转调**（bd vqvn1 NEW-02 去重：常量/SAFETY 论证/兜底文案不再有第二份）。
 //!
 //! 依赖图依据：xray-proxy-dns 不依赖 xray-transport（P2 插件化拍板：协议 crate
-//! 不引传输栈；为一个函数拉进整个传输依赖面得不偿失）。故本 crate 内复刻
-//! 「bind + Windows 两条 ioctl」的最小面；语义正本（WARN 兜底口径、recv 侧
-//! 错误分类）仍在 xray-transport。若未来依赖图允许直调，删本文件换 helper。
+//! 不引传输栈）。bind 本体必须留本 crate 本文件：静态门
+//! `tools/check_udp_binds.py` 的「bind 机制本体白名单」按文件登记
+//! （`crates/xray-proxy-dns/src/udp_connreset.rs`），挪到未登记文件即门红。
 
 use std::io;
 #[cfg(windows)]
@@ -15,8 +16,7 @@ use tokio::net::UdpSocket;
 use xray_frame::LogFacade;
 
 /// ioctl 失败诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本 crate
-/// `disallowed_macros` 对 proc-macro 不认任何 allow；域 = "dns"。只在 WSAIoctl
-/// 失败分支发射（bind 冷路径，且 fail-open 继续服务）。
+/// `disallowed_macros` 对 proc-macro 不认任何 allow；域 = "dns"）。
 #[cfg(windows)]
 static CONNRESET_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("dns", vec![]));
 
@@ -26,55 +26,10 @@ pub(crate) async fn bind_udp_no_connreset(
     addr: impl tokio::net::ToSocketAddrs,
 ) -> io::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr).await?;
-    disable_icmp_unreachable_report(&sock);
+    #[cfg(windows)]
+    xray_frame::net::disable_icmp_unreachable_report(&sock, &CONNRESET_LOG);
     Ok(sock)
 }
-
-/// Windows：`SIO_UDP_CONNRESET`/`SIO_UDP_NETRESET` 各传一个 u32 的 0 = 关闭
-/// 对应上报（与 `xray_transport::udp` 正本同码）；fail-open：失败仅 debug 一条
-/// 后继续服务（recv 侧错误分类是第二道兜底）。
-#[cfg(windows)]
-fn disable_icmp_unreachable_report(sock: &UdpSocket) {
-    use std::os::windows::io::AsRawSocket;
-
-    use windows_sys::Win32::Networking::WinSock::{SOCKET, WSAIoctl};
-
-    /// `SIO_UDP_CONNRESET = IOC_IN | IOC_VENDOR | 12`（Port Unreachable）。
-    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
-    /// `SIO_UDP_NETRESET = IOC_IN | IOC_VENDOR | 15`（Net Unreachable）。
-    const SIO_UDP_NETRESET: u32 = 0x9800_000F;
-
-    let flag = 0u32; // 入参 = 关闭（与 Go 的 `flag := uint32(0)` 同形）
-    for code in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
-        let mut bytes_returned = 0u32;
-        // SAFETY: 与 xray_transport::udp::disable_icmp_unreachable_report 同一论证：
-        // ① handle 来自存活借用；② 入参指针指向栈上 4 字节，内核只读；
-        // ③ 输出缓冲 null + 长度 0；④ OVERLAPPED/完成例程均 null = 同步调用；
-        // ⑤ 返回码只用于 debug 日志，无所有权/内存后果。
-        let rc = unsafe {
-            WSAIoctl(
-                sock.as_raw_socket() as SOCKET,
-                code,
-                (&raw const flag).cast(),
-                std::mem::size_of::<u32>() as u32,
-                std::ptr::null_mut(),
-                0,
-                &mut bytes_returned,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            CONNRESET_LOG.debug(format!(
-                "udp bind: WSAIoctl({code:#x}) 关闭 ICMP 上报失败，继续服务: {err}"
-            ));
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn disable_icmp_unreachable_report(_sock: &UdpSocket) {}
 
 #[cfg(all(test, windows))]
 mod tests {

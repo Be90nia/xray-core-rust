@@ -58,6 +58,16 @@ use tokio::{
 /// 超出 64 才 **fail-fast 丢弃**（不排队）。
 pub const MAX_INFLIGHT_HANDSHAKES: usize = 64;
 
+/// 当前生效的每监听在飞握手上限（装配期由预算门写入，见
+/// [`xray_frame::budget::effective_handshake_inflight`]）。
+///
+/// 闸容量必须以本值为准（而非 [`MAX_INFLIGHT_HANDSHAKES`]）：内存账按同一个数
+/// 入账，两边对齐才既能启动（小机器多监听）又不超卖（真机 176 实证，bd sfqlu）。
+#[must_use]
+pub fn effective_inflight_limit() -> usize {
+    xray_frame::budget::effective_handshake_inflight()
+}
+
 /// 首字节窗：TCP 建连后首字节必须在此时间内到达。
 ///
 /// 取 1s：探测连接一个字节都不发，1s 内清掉（在途数因此极低，这是"最小内存"
@@ -101,7 +111,7 @@ impl HandshakeGate {
         if n % LOG_EVERY == 1 {
             crate::LOG.warn(format!(
                 "tag={tag} error=handshake concurrency limit reached handshake_gate: 并发握手达上限 {}，已 fail-fast 丢弃 {n} 条连接（不进队列）",
-                MAX_INFLIGHT_HANDSHAKES
+                effective_inflight_limit()
             ));
         }
     }

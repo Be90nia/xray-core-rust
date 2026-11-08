@@ -24,7 +24,7 @@ use xray_transport::{
     accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
-    handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES},
+    handshake_gate::HandshakeGate,
     ignore_already_exists,
     listener_registry::{
         ConnHandler, TransportListenFn, TransportListener, register_transport_listener,
@@ -203,7 +203,7 @@ fn spawn_ws_accept_loop(
     let template = ws_listener.handshake_template(tls_config);
     // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）。生产 256MB 小机场，
     // 上界核算见 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
-    let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+    let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
     // 握手任务托管口（CLAUDE.md §3.5.6 ①「接管类必须托管」）：`ManagedScope` 组合
     // 包装 udf `FxScope`。listener 关闭/丢弃 ⇒ scope 最后一份引用归零 ⇒ 在途握手
     // 任务被 abort（不残留 4s 尾巴）。

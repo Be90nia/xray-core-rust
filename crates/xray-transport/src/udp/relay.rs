@@ -98,44 +98,60 @@ impl UdpRelay {
         payload: &[u8],
         resp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     ) -> std::io::Result<()> {
-        let sock = {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.get(&dest) {
+        let existing = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&dest).map(|s| {
                 *s.last_refresh.lock() = xray_frame::compat::clock().now_instant();
                 Arc::clone(&s.sock)
-            } else {
-                // 预留路径对齐 Go：UDP 出站 socket 也过 DialerController（AI7，
-                // 与 freedom UDP relay 同款，防未来接线时带病上线）。bind 与目标
-                // 同族通配（原 "0.0.0.0:0"/"[::]:0" 语义）。
-                let bind_addr = match dest {
-                    SocketAddr::V4(_) => {
-                        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-                    },
-                    SocketAddr::V6(_) => {
-                        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-                    },
-                };
-                let sock = crate::system_dialer::dial_udp_packet_conn(bind_addr, dest).await?;
-                sock.connect(dest).await?;
-                let sock = Arc::new(sock);
-                let last_refresh =
-                    Arc::new(parking_lot::Mutex::new(xray_frame::compat::clock().now_instant()));
-                let (reader, timer) = spawn_session(
-                    Arc::clone(&sock),
-                    dest,
-                    resp_tx,
-                    Weak::clone(&self.self_weak),
-                    self.idle_timeout,
-                    Arc::clone(&last_refresh),
-                    &self.fx,
-                );
-                sessions
-                    .insert(dest, Session { sock: Arc::clone(&sock), reader, timer, last_refresh });
-                sock
-            }
+            })
+        };
+        let sock = match existing {
+            Some(s) => s,
+            None => self.open_session(dest, resp_tx).await?,
         };
         sock.send(payload).await?;
         Ok(())
+    }
+
+    /// 首建会话：拨号/connect 全在表锁外（旧形态持表锁跨网络 syscall，一慢全阻）。
+    /// 并发同 dest 可能各拨一条，落表时复查——先到者留，后到者复用它。
+    async fn open_session(
+        self: &Arc<Self>,
+        dest: SocketAddr,
+        resp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    ) -> std::io::Result<Arc<UdpSocket>> {
+        // 预留路径对齐 Go：UDP 出站 socket 也过 DialerController（AI7，
+        // 与 freedom UDP relay 同款，防未来接线时带病上线）。bind 与目标
+        // 同族通配（原 "0.0.0.0:0"/"[::]:0" 语义）。
+        let bind_addr = match dest {
+            SocketAddr::V4(_) => {
+                SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            },
+            SocketAddr::V6(_) => {
+                SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+            },
+        };
+        let sock = crate::system_dialer::dial_udp_packet_conn(bind_addr, dest).await?;
+        sock.connect(dest).await?;
+        let sock = Arc::new(sock);
+        let last_refresh =
+            Arc::new(parking_lot::Mutex::new(xray_frame::compat::clock().now_instant()));
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get(&dest) {
+            *s.last_refresh.lock() = xray_frame::compat::clock().now_instant();
+            return Ok(Arc::clone(&s.sock));
+        }
+        let (reader, timer) = spawn_session(
+            Arc::clone(&sock),
+            dest,
+            resp_tx,
+            Weak::clone(&self.self_weak),
+            self.idle_timeout,
+            Arc::clone(&last_refresh),
+            &self.fx,
+        );
+        sessions.insert(dest, Session { sock: Arc::clone(&sock), reader, timer, last_refresh });
+        Ok(sock)
     }
 
     /// 关闭中继：中止所有 reader / timer task、释放全部 socket。

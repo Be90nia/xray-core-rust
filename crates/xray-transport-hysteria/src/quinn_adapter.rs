@@ -358,7 +358,7 @@ pub(crate) fn receive_windows(qc: &QuicConfig) -> (u64, u64) {
 // ===== 切片1b (续): QuinnQuicListener + QuinnListenerFactory =====
 
 use xray_proto::xray::transport::internet::QuicParams;
-use xray_transport::handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES};
+use xray_transport::handshake_gate::HandshakeGate;
 use xray_transport_quic::transport::QUIC_HANDSHAKE_TIMEOUT;
 
 use crate::{
@@ -552,7 +552,8 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             // transport config）。
             // jcnjb⑤：每监听握手并发闸 + 应用层握手窗（rd8yj① 同款配方，
             // 见 [`spawn_gated_hysteria_accept`]）。
-            let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+            let gate =
+                HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
             let ep = endpoint.clone();
             spawn_gated_hysteria_accept(
                 ep,

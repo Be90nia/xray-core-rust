@@ -691,7 +691,7 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         },
     };
 
-    Ok(Config {
+    let config = Config {
         host: get_str("host"),
         path: get_str("path"),
         mode: get_str("mode"),
@@ -718,37 +718,24 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
                 Some(s) => s.to_string(),
                 None => raw,
             };
-            // 镜像 Go transport_method.go:420-424 ASCII + roomSize 校验。
-            // 281r：roomSize = len(table)^length 必须 < 2^30，否则 token 空间
-            // 过小致 entropy 不足被探测区分。len(table) 为 0 单独守——`table^0==1`
-            // 永远 < 2^30 但表示常量 ID 仍有问题，留给上层配置警告。
-            if resolved.as_bytes().iter().any(|b| *b >= 0x80) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "splithttpSettings.sessionIDTable must contain only ASCII characters",
-                ));
-            }
-            // 281r：len(table)^length < 2^30 校验。Go 用 math.Pow(2,30)
-            // 直接乘；此处用 checked_mul 防溢出（O(log n) 累乘即够）。
+            // 281r：roomSize = len(table)^length 必须 < 2^30，否则 token 空间过小致
+            // entropy 不足被探测区分。
+            //
+            // 已知偏离（bd 1a2yy）：Go `transport_method.go:421-424` 的 roomSize 是
+            // Σ_{k=from..to} table^k（`roomSize` 定义见 :521-529）且拒「太小」
+            // （room < 2<<30），方向与聚合都与此处相反（本节拒「太大」）——现状被
+            // bd 281r 测试钉住，按票面契约保持不动；修正需另票并改该测试的期望。
             if let Some(len_range) = obj.get("sessionIDLength").and_then(parse_range) {
                 let table_len = resolved.len() as u64;
-                if table_len > 0 && len_range.to > 0 {
+                if table_len > 1 && len_range.to > 0 {
                     let mut room = 1u64;
-                    let mut overflowed = false;
                     for _ in 0..len_range.to {
-                        if let Some(v) = room.checked_mul(table_len) {
-                            room = v;
-                        } else {
-                            overflowed = true;
-                            break;
-                        }
-                        // 早停：已达阈值即拒绝累乘
+                        room = room.saturating_mul(table_len);
                         if room >= (1u64 << 30) {
-                            overflowed = true;
                             break;
                         }
                     }
-                    if overflowed || room >= (1u64 << 30) {
+                    if room >= (1u64 << 30) {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -762,17 +749,7 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
             }
             resolved
         },
-        session_id_length: match obj.get("sessionIDLength").and_then(parse_range) {
-            Some(r) if r.from > 0 => Some(r),
-            // from <= 0 与 Go transport_method.go:417-419 校验一致：直接拒绝配置。
-            Some(r) if r.from <= 0 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "splithttpSettings.sessionIDLength.from must be greater than 0",
-                ));
-            },
-            _ => None,
-        },
+        session_id_length: obj.get("sessionIDLength").and_then(parse_range),
         no_grpc_header: get_bool("noGRPCHeader"),
         no_sse_header: get_bool("noSSEHeader"),
         // scMaxEachPostBytes（Go transport_method.go:289 Int32Range；票 037f 前只从
@@ -785,7 +762,12 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         server_max_header_bytes: get_i64("serverMaxHeaderBytes") as i32,
         xmux: Some(xmux),
         download_settings,
-    })
+    };
+    // sessionIDTable / sessionIDLength 的 ASCII + from>0 校验在构造点统一执行，与
+    // proto 入口共用（bd 1a2yy：原内联在此处，`from_proto` 旁路）；roomSize 见上方
+    // 内联块（方向待另票修正）。
+    crate::config::validate_session_id(&config.session_id_table, config.session_id_length)?;
+    Ok(config)
 }
 
 /// xHTTP 默认配置（无 splithttpSettings JSON 时套用）。

@@ -985,6 +985,11 @@ impl UdpSessionManager {
     pub async fn session_count(&self) -> usize {
         self.inner.lock().await.sessions.len()
     }
+
+    /// 超会话上限被丢弃的新 session id 累计数（bd n6jqu F4：丢包账的可观测面）。
+    pub async fn dropped_over_cap(&self) -> u64 {
+        self.inner.lock().await.dropped_over_cap
+    }
 }
 
 impl UdpSessionInner {
@@ -1252,6 +1257,46 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], vec![0, 0, 0, 7, 0x11]);
     }
+
+    /// bd n6jqu F4：会话表满 ⇒ 新 id 丢包并计数，已有 session 不受影响。
+    #[tokio::test]
+    async fn feed_drops_new_ids_over_session_cap() {
+        let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let mgr = UdpSessionManager::new(Duration::from_secs(60), None);
+        // 直接填到上限：4096 次真实建 session 只为占位，不参与断言
+        {
+            let mut g = mgr.inner.lock().await;
+            for id in 0..MAX_UDP_SESSIONS as u32 {
+                g.sessions.insert(id, Arc::new(InterConn::new(local, remote, id, 1)));
+            }
+        }
+        assert_eq!(mgr.session_count().await, MAX_UDP_SESSIONS);
+
+        // 超限：新 id 不建 session，丢包计数递增（不得静默扩表）
+        let over_id = MAX_UDP_SESSIONS as u32;
+        {
+            let mut g = mgr.inner.lock().await;
+            for id in over_id..over_id + 2 {
+                g.feed(id, Bytes::from_static(&[0, 0, 0, 0, 0xEE]), local, remote);
+            }
+        }
+        assert_eq!(mgr.session_count().await, MAX_UDP_SESSIONS, "超限不得扩表");
+        assert_eq!(mgr.dropped_over_cap().await, 2, "丢包必须计数");
+
+        // 已有 session 不受影响：同 id 的后续包照常投递，且不计丢包
+        let existing =
+            { mgr.inner.lock().await.sessions.get(&7).cloned().expect("id 7 在表内") };
+        {
+            let mut g = mgr.inner.lock().await;
+            g.feed(7, Bytes::from_static(&[0, 0, 0, 7, 0xAA, 0xBB]), local, remote);
+        }
+        let mut buf = [0u8; 8];
+        let n = existing.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[0xAA, 0xBB]);
+        assert_eq!(mgr.dropped_over_cap().await, 2, "命中已有 session 不计丢包");
+    }
+
     #[test]
     fn inter_conn_touch_updates_last_active() {
         let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
