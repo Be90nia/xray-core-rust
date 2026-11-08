@@ -321,7 +321,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
       # osv-scanner：GHSA/CVE 基线扫描（gqkk 供应链票，与 cargo-deny 的 RustSec 面
       # 互补）。**阻断级**（bd 审计 P2-1）：已知无 fix 的命中逐条登记在
-      # `.osv-scanner.toml` 的 [[IgnoredVulns]]（含 reason），未登记的新命中即红。
+      # `osv-scanner.toml` 的 [[IgnoredVulns]]（含 reason），未登记的新命中即红。
+      # 文件名必须无点前缀：osv-scanner v2 只在 cwd 发现 `osv-scanner.toml`
+      # （manager.go:106），`.osv-scanner.toml` 不会被读取 ⇒ 豁免空转、阻断门假红。
       # 供应链：版本 + SHA256 双钉（原先从 releases/latest 下载后直接执行 = 上游投毒
       # 或传输劫持即可在 CI 跑任意代码）。升级版本时同步改 OSV_VERSION 与 OSV_SHA256
       # （后者取自同版本 release 的 osv-scanner_SHA256SUMS）。
