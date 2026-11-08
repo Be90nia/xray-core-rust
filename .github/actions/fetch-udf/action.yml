@@ -17,7 +17,7 @@ runs:
         echo "UDF_HEAD=${UDF_HEAD}" >> "$GITHUB_ENV"
         {
           echo "### udf-frame 拉料（不锁 rev，消费 main 最新）"
-          echo "- udf HEAD: \`${UDF_HEAD}\`（版本锚 = 本 run 的 Cargo.lock 自然记录）"
+          echo "- udf HEAD: \`${UDF_HEAD}\`（CI 侧锚 = 本 run 的 UDF_HEAD：rust-cache 键 + 本摘要；主仓 \`Cargo.lock\` 只记 \`path\` 不记 commit，\`crates/udf-frame/REV\` 锚测试在 CI 显式跳过——clone 不带 REV，该锚仅本地生效，bd yyoy9）"
           echo "- 本 run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "- udf runs: https://github.com/Be90nia/udf-frame/actions"
         } >> "$GITHUB_STEP_SUMMARY"

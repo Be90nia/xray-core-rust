@@ -5975,6 +5975,7 @@ dependencies = [
  "tracing-subscriber",
  "udf-skeleton",
  "udf-skeleton-infra",
+ "udf-std-ext",
  "uuid",
  "xray-buf",
  "xray-frame",
@@ -6122,6 +6123,7 @@ dependencies = [
  "udf-skeleton",
  "udf-skeleton-infra",
  "udf-std-ext",
+ "windows-sys 0.59.0",
  "xray-buf",
 ]
 
@@ -6271,7 +6273,6 @@ dependencies = [
  "tokio",
  "tracing",
  "udf-skeleton-infra",
- "windows-sys 0.59.0",
  "xray-common",
  "xray-features",
  "xray-frame",
@@ -6550,6 +6551,7 @@ version = "0.1.0"
 dependencies = [
  "aes 0.9.1",
  "aes-gcm",
+ "async-channel",
  "base64",
  "blake3",
  "bytes",
