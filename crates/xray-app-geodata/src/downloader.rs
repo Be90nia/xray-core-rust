@@ -937,6 +937,10 @@ mod tests {
     /// 且必须立即返回。
     #[test]
     fn https_handshake_progresses_to_cert_verification() {
+        // workspace feature unification 可能同时启用 ring + aws-lc-rs 两个
+        // CryptoProvider，rustls 进程级自动裁决会 panic（bd rknm/jrh7）⇒
+        // 测试按全仓惯例显式安装（生产路径走同一入口）。
+        xray_common::ensure_default_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let key_der =
