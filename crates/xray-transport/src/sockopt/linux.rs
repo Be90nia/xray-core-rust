@@ -414,13 +414,15 @@ mod tests {
     fn original_dst_level_follows_connection_family() {
         let l4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let c4 = TcpStream::connect(l4.local_addr().unwrap()).unwrap();
-        let _ = l4.accept().unwrap();
+        // 持有 accepted socket 到作用域末（保连接不被立即 FIN，getsockopt 判据稳定）；
+        // 具名而非 `let _`：通配符会立即 drop（clippy 命名 lint 与语义的取舍）。
+        let _accepted4 = l4.accept().unwrap();
         assert_eq!(super::original_dst_level(c4.as_raw_fd()).unwrap(), (libc::IPPROTO_IP, false));
 
         // 无 IPv6 的环境（容器关 v6）跳过该半段，不算失败。
         let Ok(l6) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) else { return };
         let c6 = TcpStream::connect(l6.local_addr().unwrap()).unwrap();
-        let _ = l6.accept().unwrap();
+        let _accepted6 = l6.accept().unwrap();
         assert_eq!(super::original_dst_level(c6.as_raw_fd()).unwrap(), (libc::IPPROTO_IPV6, true));
     }
 }

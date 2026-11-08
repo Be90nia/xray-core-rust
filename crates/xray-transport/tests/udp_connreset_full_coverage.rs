@@ -18,10 +18,9 @@
 //!
 //! 非 Windows：机制不适用（helper 透传），只留透传冒烟。
 
-use std::{io, time::Duration};
-
 #[cfg(windows)]
 use std::net::SocketAddr;
+use std::{io, time::Duration};
 
 use xray_transport::udp::{bind_std_udp_no_connreset, bind_udp_no_connreset};
 
@@ -163,7 +162,7 @@ fn nonblocking_recv_errors(sock: &std::net::UdpSocket, polls: usize) -> Vec<io::
 #[cfg(windows)]
 #[test]
 fn quic_endpoint_suppresses_connreset() {
-    use xray_transport::sockopt::{SocketOptions, bind_udp_endpoint};
+    use xray_transport::sockopt::{bind_udp_endpoint, SocketOptions};
 
     // 对照组：裸 std socket（阻塞读超时 600ms）必须交回 10054。
     let bare = std::net::UdpSocket::bind("127.0.0.1:0").expect("bare bind");

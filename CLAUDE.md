@@ -237,7 +237,8 @@ serena-cli undo                                                        # 改坏�
 - **实测（vless+tcp+tls + chrome 指纹，`D:/tmp/aj0n3_ab.py`）**：31.6 → **241.2 MB/s**（best 253.0），cli CPU 18.8s → **2.48s**；REALITY 组 33.4 → **241.2**。32/32 + interop 12/12 保持
 - **副作用（正向）**：开汇编后能探测 AES-NI → 协商 **TLS_AES_128_GCM_SHA256**，与 Go `crypto/tls` 偏好一致（Go 也是 AES-NI 硬件支持则优先 AES-GCM）
 - **体检**：`python tools/build_boringssl_asm.py --check`（查 CMakeCache 无 `OPENSSL_NO_ASM` + `CMAKE_ASM_NASM_COMPILER_WORKS=1` + crypto.lib 大小）
-- **未覆盖**：CI 的 Windows 产物仍是 NO_ASM 构建（`.github/workflows/release.yml` 直走 cargo）→ 发给用户的 Windows 版仍是慢的，见 bd `jyipl` 相邻票
+- **交付铁律（三次中招教训，2026-11-08）**：任何 release 构建必带 `BORING_BSSL_PATH=target/boringssl-asm/prebuilt`；交付/换入 v2rayN 前必验（三选一）：①`grep rustc-link-search target/release/build/btls-sys-*/output` 指向 prebuilt ②`--check` 全绿 ③大小启发式 = NO_ASM exe 比汇编版**小 ~47KB**（实测 52,157,952 vs 52,205,056）。非汇编产物禁交付 v2rayN/生产——症状即"xhttp/带指纹卡 30 多 MB/s 上不去"
+- **CI 产物现状（2026-11-08 复核）**：`release.yml` 已接 `setup-boringssl-asm` action 并在发布前硬断言（`BORING_BSSL_PATH` 未导出即 exit 1 + 复跑 `--check`，见 `release.yml:153-157`，bd jyipl/qscjv）⇒ 发布产物带汇编；**风险面收窄为本机手工构建**（绕过 action 直跑 cargo 仍会落 NO_ASM，故上条交付铁律适用于手工交付路径）
 
 ### vision splice 触发逻辑（雷区）
 - **历史**：d8562b56 + a427613b 双 revert

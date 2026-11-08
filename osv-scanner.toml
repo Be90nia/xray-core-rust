@@ -33,3 +33,22 @@ reason = "block-buffer 0.12.0 panic 后行内缓冲游标损坏可越界（0.12.
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0449"
 reason = "unsafe-libyaml 0.2.11 unmaintained (dtolnay 已停更); serde_yaml→yaml-rust2 迁移跨仓评估中"
+
+# bd xwjxl（2026-11-08）：rustls 0.23.45 → 0.23.46 的 4 条（同一升级窗口，逐一登记暴露面）。
+# 阻塞点 = rustls 在 vendor/ 红线树（REALITY 等本地补丁），升级需端口化补丁 + 全量 32/32 + interop。
+# 升级到 0.23.46 后删除以下 4 条。
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0346"
+reason = "rustls 0.23.45 Debug impl 泄露 TLS12 master secret / TLS13 resumption PSK（0.23.46 修）；本仓不适用：仅用内置 ClientSessionMemoryCache（advisory 明示其 Debug 已脱敏），无自定义 ClientSessionStore 实现，无 Debug 格式化会话值路径（bd xwjxl）"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0347"
+reason = "rustls 0.23.45 ECH 拒绝后把握手前缓冲的 app data 发往外层服务器（0.23.46 修）；本仓不适用：rustls 客户端路径未见 EchMode::Enable（ECH 走 btls/Chrome 指纹路径），不满足触发前提（bd xwjxl）"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0348"
+reason = "rustls 0.23.45 brotli 证书解压可致 1GiB 分配（0.23.46 修）；本仓不适用：rustls brotli feature 未启用（vendor/rustls 仅定义该 feature，无消费方开启）（bd xwjxl）"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0349"
+reason = "rustls 0.23.45 ServerHello 预认证记录 key-share 选择 ⇒ 后续连接可被降级为古典密钥交换（0.23.46 修）；本仓**适用**（QUIC/hysteria 0-RTT 共享 session cache 有 resumption），影响 = 后续连接 PQ 机密性丢失（harvest-now），无密钥泄露/无认证绕过，服务端 HRR 可缓解；修复随 rustls 0.23.46 vendor 端口化（bd xwjxl，P2）"
