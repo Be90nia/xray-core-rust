@@ -24,7 +24,7 @@ reason = "rsa 0.9.10 底层 num-bigint-dig 非常数时间大数运算（Marvin�
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0134"
-reason = "rustls-pemfile 2.2.0 unmaintained (rustls/pemfile archived 2025-08); 迁 rustls-pki-types 0.10 跨多调用点，单票治理中"
+reason = "rustls-pemfile 2.2.0 unmaintained (rustls/pemfile archived 2025-08); 迁 rustls-pki-types 1.x 的 pem API 跨多调用点，单票治理中（2026-11-08 安全复核更正：原写 0.10 不存在）"
 
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"
@@ -51,4 +51,4 @@ reason = "rustls 0.23.45 brotli 证书解压可致 1GiB 分配（0.23.46 修）�
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0349"
-reason = "rustls 0.23.45 ServerHello 预认证记录 key-share 选择 ⇒ 后续连接可被降级为古典密钥交换（0.23.46 修）；本仓**适用**（QUIC/hysteria 0-RTT 共享 session cache 有 resumption），影响 = 后续连接 PQ 机密性丢失（harvest-now），无密钥泄露/无认证绕过，服务端 HRR 可缓解；修复随 rustls 0.23.46 vendor 端口化（bd xwjxl，P2）"
+reason = "rustls 0.23.45 ServerHello 预认证记录 key-share 选择 ⇒ 后续连接可被降级为古典密钥交换（0.23.46 修）；**本构建不可达**（features=[ring,…]，PQ 组仅存在于 aws-lc-rs 路径 ⇒ 今日不发 PQ share，无降级可丢）；若后续启用 aws-lc-rs，本项立即变为真实暴露，须先升 0.23.46 再开（bd xwjxl，P2；2026-11-08 安全复核限定）"
