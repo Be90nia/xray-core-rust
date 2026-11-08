@@ -159,6 +159,8 @@ pub struct TuicClient {
     password: String,
     /// quic 模式 UDP 响应路由（per-connection uni-stream pump）。
     router: UniRespRouter,
+    /// native 模式收包信箱（同连接各 assoc 共用；见 `crate::udp::DgramInbox`）。
+    dgram_inbox: crate::udp::DgramInbox,
     /// 组件内自持托管 scope（B6，bd t975）：心跳等后台任务经此 spawn——
     /// 生命周期记账 + client 释放兜底 abort；不接 close，闸关不可达。
     fx: Arc<FxScope>,
@@ -276,7 +278,7 @@ impl TuicClient {
         let multiplexed = MultiplexedConnection::new(pooled);
 
         // quic 模式 UDP 响应 pump：server 每个响应新开 uni stream，
-        // 按 (assoc_id, pkt_id) 配对给等待中的请求（TUIC v5 SPEC uni-stream 模型）
+        // 按 assoc_id 配对给等待中的请求（PKT_ID 只用于分片重组，见 `udp` 模块文档）
         let router = UniRespRouter::spawn(multiplexed.pooled.conn.clone());
 
         Ok(Self {
@@ -286,6 +288,7 @@ impl TuicClient {
             uuid,
             password: password.to_string(),
             router,
+            dgram_inbox: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             fx: Arc::new(FxScope::new()),
         })
     }
@@ -406,7 +409,12 @@ impl TuicClient {
     /// 或 [`TuicUdpAssoc::send_recv_native`]（native datagram 模式）收发 UDP 包。
     #[must_use]
     pub fn dial_udp(&self, assoc_id: u16) -> TuicUdpAssoc {
-        TuicUdpAssoc::new(self.multiplexed.pooled.conn.clone(), assoc_id, self.router.clone())
+        TuicUdpAssoc::new(
+            self.multiplexed.pooled.conn.clone(),
+            assoc_id,
+            self.router.clone(),
+            Arc::clone(&self.dgram_inbox),
+        )
     }
 
     /// 发送 QUIC DATAGRAM（native UDP 模式）。

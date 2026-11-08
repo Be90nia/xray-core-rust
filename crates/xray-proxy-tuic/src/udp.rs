@@ -40,6 +40,18 @@ static UDP_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", ve
 /// 默认 UDP 响应等待时长（mock server 等待 UDP echo）。
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// per-connection native 模式收包信箱（键 = `assoc_id`）。
+///
+/// 共享一条 QUIC 连接时 `read_datagram` 是连接级单点：读方拿到**别的**
+/// `assoc_id` 的包时转投信箱，属主下次读取先取信箱——否则两条并发 UDP 流
+/// 互偷回包（Go sing-quic `handleUDPMessage` 按 `udpConnMap[sessionID]` 分派
+/// 的无泵等价物）。
+pub(crate) type DgramInbox =
+    Arc<parking_lot::Mutex<HashMap<u16, std::collections::VecDeque<Packet>>>>;
+
+/// 单 assoc 信箱积压上限（UDP 有损语义：超限丢最旧，读方永不被信箱阻塞）。
+const DGRAM_INBOX_CAP: usize = 64;
+
 /// TUIC 客户端 UDP 关联句柄。
 ///
 /// 由 [`TuicClient::dial_udp`](crate::client::TuicClient::dial_udp) 创建，
@@ -53,6 +65,8 @@ pub struct TuicUdpAssoc {
     router: UniRespRouter,
     /// 分片重组器（native 模式接收方向，spec FRAG_TOTAL>1 时按 pkt_id 缓存拼接）。
     assembler: Arc<parking_lot::Mutex<crate::protocol::packet::FragmentAssembler>>,
+    /// per-connection native 收包信箱（同连接各 assoc 共用；见 [`DgramInbox`]）。
+    inbox: DgramInbox,
 }
 
 /// quic 模式（uni-stream）响应路由器。
@@ -235,7 +249,12 @@ pub(crate) fn encode_native_frames(
 
 impl TuicUdpAssoc {
     /// 由 [`TuicClient`](crate::client::TuicClient) 构造。
-    pub(crate) fn new(conn: quinn::Connection, assoc_id: u16, router: UniRespRouter) -> Self {
+    pub(crate) fn new(
+        conn: quinn::Connection,
+        assoc_id: u16,
+        router: UniRespRouter,
+        inbox: DgramInbox,
+    ) -> Self {
         Self {
             conn,
             assoc_id,
@@ -244,6 +263,7 @@ impl TuicUdpAssoc {
             assembler: Arc::new(parking_lot::Mutex::new(
                 crate::protocol::packet::FragmentAssembler::new(),
             )),
+            inbox,
         }
     }
 
@@ -304,7 +324,8 @@ impl TuicUdpAssoc {
     ///    片（同 pkt_id，FRAG_ID 0-based， 非首片 addr=None/0xff）
     /// 2. 通过 [`quinn::Connection::send_datagram`] 发送
     /// 3. 循环 [`quinn::Connection::read_datagram`] 收响应，FRAG_TOTAL>1 的 分片经
-    ///    `FragmentAssembler` 拼接（票 ao93：大 DNS/WireGuard 包不再丢）
+    ///    `FragmentAssembler` 拼接（票 ao93：大 DNS/WireGuard 包不再丢）； 连接被多条 UDP
+    ///    流共享时按帧内 `assoc_id` 分派（异己包转投 `DgramInbox`，不会互偷回包）
     ///
     /// `timeout` 为 None 时使用 `DEFAULT_UDP_TIMEOUT`。
     ///
@@ -323,24 +344,57 @@ impl TuicUdpAssoc {
         // 循环收响应 datagram，分片收齐即返回（同一超时窗口）
         let to = timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
         loop {
-            let resp = Budget::tokio()
-                .deadline(to)
-                .timeout(self.conn.read_datagram())
-                .await
-                .map_err(|_| TuicError::UdpTimeout(to))?
-                .map_err(TuicError::Quinn)?;
-            let mut cursor = &resp[..];
-            let type_byte = crate::protocol::parse_header(&mut cursor)?;
-            if type_byte != type_code::PACKET {
-                return Err(TuicError::UnknownCommandType(type_byte));
-            }
-            let pkt = Packet::read_payload(&mut cursor)?;
+            // 先取本 assoc 信箱（别的流读到的、本流的回包已在里面）
+            let pkt = match self.take_inbox_packet() {
+                Some(pkt) => pkt,
+                None => {
+                    let resp = Budget::tokio()
+                        .deadline(to)
+                        .timeout(self.conn.read_datagram())
+                        .await
+                        .map_err(|_| TuicError::UdpTimeout(to))?
+                        .map_err(TuicError::Quinn)?;
+                    let mut cursor = &resp[..];
+                    let type_byte = crate::protocol::parse_header(&mut cursor)?;
+                    if type_byte != type_code::PACKET {
+                        return Err(TuicError::UnknownCommandType(type_byte));
+                    }
+                    let pkt = Packet::read_payload(&mut cursor)?;
+                    if pkt.assoc_id != self.assoc_id {
+                        // 共享连接上别的 UDP 流的回包：转投其信箱后继续等本流
+                        self.stash_foreign_packet(pkt);
+                        continue;
+                    }
+                    pkt
+                },
+            };
             let complete = self.assembler.lock().feed(pkt)?;
             if let Some(full) = complete {
                 // Bytes → Vec：assembler 拼接产的 VEC-kind 唯一引用时零拷贝归还
                 return Ok(full.data.into());
             }
         }
+    }
+
+    /// 取本 assoc 信箱里的下一个包（空则顺手清掉条目）。
+    fn take_inbox_packet(&self) -> Option<Packet> {
+        let mut inbox = self.inbox.lock();
+        let queue = inbox.get_mut(&self.assoc_id)?;
+        let pkt = queue.pop_front();
+        if queue.is_empty() {
+            inbox.remove(&self.assoc_id);
+        }
+        pkt
+    }
+
+    /// 把别的 assoc 的回包转投其信箱（超上限丢最旧，UDP 有损语义）。
+    fn stash_foreign_packet(&self, pkt: Packet) {
+        let mut inbox = self.inbox.lock();
+        let queue = inbox.entry(pkt.assoc_id).or_default();
+        if queue.len() >= DGRAM_INBOX_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(pkt);
     }
 
     /// 检查连接是否支持 DATAGRAM（native 模式可用性）。

@@ -23,6 +23,10 @@ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"
 udf-skeleton = { path = "../udf-frame/skeleton" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# PreConns 预连接池（bd auf6h）：多消费者各自挂 recv ⇒ 需 MPMC 有界通道；
+# tokio mpsc 的 Receiver 非 Sync，只能 Mutex 包着锁跨 await（等待者串行化）。
+# 版本与 xray-transport 的 xdns DoH worker 队列同款（Cargo.lock 已在，不新增 crate）。
+async-channel = "2"
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }

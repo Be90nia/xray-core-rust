@@ -64,6 +64,8 @@ pub struct TuicMockServer {
     expected_uuid: Uuid,
     password: String,
     cert_der: Vec<u8>,
+    /// 已 accept 的 QUIC 连接数（复用断言用：`run()` 消费 self 后仍可读）。
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
     /// 组件内自持托管 scope（B6，bd t975）：accept/per-conn/per-flow/UDP 会话
     /// 任务统一经此 spawn；scope 随 server 释放兜底 abort，不接 close。
     fx: Arc<FxScope>,
@@ -118,6 +120,7 @@ impl TuicMockServer {
                 expected_uuid: uuid,
                 password,
                 cert_der: tls.cert_der.clone(),
+                accepted: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 fx: Arc::new(FxScope::new()),
             },
             tls.cert_der,
@@ -141,10 +144,17 @@ impl TuicMockServer {
         self.endpoint.close(0u32.into(), b"");
     }
 
+    /// 已 accept 的 QUIC 连接数句柄（`run()` 消费 self 后仍可读）。
+    #[must_use]
+    pub fn accepted_connections(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.accepted)
+    }
+
     /// 运行 accept loop（TCP + UDP relay）。
     pub async fn run(self) -> Result<()> {
         let password = self.password.clone();
         let uuid = self.expected_uuid;
+        let accepted = Arc::clone(&self.accepted);
         // B6（bd t975）：per-conn 任务经组件自持 scope 托管（接收者与被捕获
         // 绑定分离，规避 E0505；scope 随 server 释放兜底 abort）。
         let fx = Arc::clone(&self.fx);
@@ -153,6 +163,7 @@ impl TuicMockServer {
             let Some(incoming) = incoming else {
                 break;
             };
+            accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let pwd = password.clone();
             let fx_task = Arc::clone(&fx);
             // 每连接 spawn 前先收割（bd 86i4h 阶段2）：条目不随累计连接数增长。
@@ -463,9 +474,13 @@ const FRAG_IDLE: Duration = Duration::from_secs(60);
 /// 取 10s：正常客户端开流即写帧（毫秒级），留足慢链路余量。
 pub(crate) const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 会话上行项：(目标, 负载, 回写目标, 请求 pkt_id——响应帧原样回显，
-/// 客户端 quic 模式按 (assoc_id, pkt_id) 配对)。
-type UdpAssocItem = (Destination, Bytes, ReplySink, u16);
+/// 会话上行项：(目标, 负载, 回写目标)。
+///
+/// 请求的 pkt_id 不随之上行：TUIC v5 SPEC 里 `PKT_ID` 只标记「同一 UDP 包的分片」，
+/// 客户端按 `assoc_id` 配对响应（见 `crate::udp::UniRespRouter`），回包由 server
+/// 按 assoc 自编号（对照 Go sing-quic `tuic/packet.go` `udpPacketConn.WritePacket`
+/// 的 per-assoc `packetId` 自增）。
+type UdpAssocItem = (Destination, Bytes, ReplySink);
 
 /// UDP 响应回写目标：与请求到达通道同模式（spec：server 按首包模式回写）。
 ///
@@ -613,8 +628,7 @@ impl UdpAssocTable {
             return;
         };
         let assoc_id = pkt.assoc_id;
-        let pkt_id = pkt.pkt_id;
-        let item = (dest, pkt.data, sink, pkt_id);
+        let item = (dest, pkt.data, sink);
         let tx = self.sessions.entry(assoc_id).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let dispatcher = self.dispatcher.clone();
@@ -668,16 +682,17 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
         },
     };
     let mut sink: Option<ReplySink> = None;
-    let mut cur_pkt_id: u16 = 0;
+    // 响应帧 PKT_ID 由 server 按 assoc 自编号（Go sing-quic `WritePacket` 同款）：
+    // 请求的 pkt_id 只标记「同一 UDP 包的分片」，回包是另一个 UDP 包，不能复用。
+    let mut resp_pkt_id: u16 = 0;
     let mut resp_buf = vec![0u8; 65_536];
     let mut idle = xray_frame::deadline::Budget::tokio().arm_timer(UDP_ASSOC_IDLE);
     loop {
         tokio::select! {
             item = rx.recv() => {
                 match item {
-                    Some((dest, payload, s, pkt_id)) => {
+                    Some((dest, payload, s)) => {
                         sink = Some(s);
-                        cur_pkt_id = pkt_id;
                         if let Some(target) = resolve_udp_dest(&dest).await {
                             if let Err(e) = udp.send_to(&payload, target).await {
                                 log.debug(format!("tuic udp assoc {assoc_id} send: {e:?}"));
@@ -694,9 +709,10 @@ async fn udp_assoc_direct(assoc_id: u16, mut rx: tokio::sync::mpsc::Receiver<Udp
                 match r {
                     Ok((n, peer)) => {
                         if let Some(s) = sink.as_mut() {
+                            resp_pkt_id = resp_pkt_id.wrapping_add(1);
                             let pkt = Packet::new(
                                 assoc_id,
-                                cur_pkt_id,
+                                resp_pkt_id,
                                 socket_addr_to_tuic(peer),
                                 Bytes::copy_from_slice(&resp_buf[..n]),
                             );
@@ -726,15 +742,15 @@ async fn udp_assoc_dispatch(
     let log = &*SERVER_LOG;
     let mut session = UdpDispatchSession::new(dispatcher);
     let mut sink: Option<ReplySink> = None;
-    let mut cur_pkt_id: u16 = 0;
+    // 同 direct 模式：响应 PKT_ID 由 server 按 assoc 自编号，不回显请求的。
+    let mut resp_pkt_id: u16 = 0;
     let mut idle = xray_frame::deadline::Budget::tokio().arm_timer(UDP_ASSOC_IDLE);
     loop {
         tokio::select! {
             item = rx.recv() => {
                 match item {
-                    Some((dest, payload, s, pkt_id)) => {
+                    Some((dest, payload, s)) => {
                         sink = Some(s);
-                        cur_pkt_id = pkt_id;
                         if let Err(e) = session.send_packet(&dest, &payload).await {
                             log.debug(format!("tuic udp assoc {assoc_id} dispatch send: {e:?}"));
                             break;
@@ -749,9 +765,10 @@ async fn udp_assoc_dispatch(
                     Ok(Some((source, payload))) => {
                         if let Some(s) = sink.as_mut() {
                             // Vec → Bytes 零拷贝（recv_packet 的 owned 载荷）
+                            resp_pkt_id = resp_pkt_id.wrapping_add(1);
                             let pkt = Packet::new(
                                 assoc_id,
-                                cur_pkt_id,
+                                resp_pkt_id,
                                 dest_to_tuic_addr(&source),
                                 Bytes::from(payload),
                             );

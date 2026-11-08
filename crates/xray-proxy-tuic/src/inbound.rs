@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_frame::LogFacade;
-use xray_transport::handshake_gate::{HandshakeGate, MAX_INFLIGHT_HANDSHAKES};
+use xray_transport::handshake_gate::HandshakeGate;
 
 use crate::{
     client::{CongestionControl, apply_congestion_to_transport, apply_default_windows},
@@ -250,7 +250,8 @@ impl InboundHandler for TuicInboundHandler {
         let accept_loop = async move {
             // rd8yj①：每监听握手并发闸——满即 fail-fast 丢弃该 Incoming（不排队，
             // HandshakeGate 家族纪律，ws/httpupgrade 同款；预算依据见常量注释）。
-            let gate = HandshakeGate::new(MAX_INFLIGHT_HANDSHAKES);
+            let gate =
+                HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
             loop {
                 let incoming = endpoint_for_accept.accept().await;
                 let Some(incoming) = incoming else {

@@ -159,3 +159,71 @@ async fn udp_loopback_multiple_packets() {
 
     client.close(0u32.into(), b"");
 }
+
+/// w06sd (e)：server 回包的 `PKT_ID` 由本侧按 assoc 自编号，**不回显**请求的
+/// pkt_id（对照 Go sing-quic `tuic/packet.go` `udpPacketConn.WritePacket`：
+/// `packetId := uint16(c.packetId.Add(1) % math.MaxUint16)`）。
+///
+/// 走 DATAGRAM 手工收发：请求带任意 pkt_id，只断言回包 pkt_id 是 server 自己的
+/// 递增序号（1、2）——修前回包原样回显请求 id（0xBEEF/0x1111）本用例必红。
+#[tokio::test]
+async fn server_assigns_own_response_pkt_id() {
+    use bytes::{BufMut, Bytes, BytesMut};
+    use xray_proxy_tuic::{Packet, VERSION, protocol::command::type_code};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let echo_addr = start_udp_echo_server().await;
+
+    let uuid = Uuid::new_v4();
+    let password = "udp-pkt-id-test";
+    let (server, cert_der) = TuicMockServer::bind(
+        "127.0.0.1:0".parse().expect("parse addr"),
+        "localhost",
+        uuid,
+        password.to_string(),
+    )
+    .await
+    .expect("mock server bind");
+    let server_addr = server.local_addr();
+    xray_common::testing::spawn("tuic-server", async move {
+        let _ = server.run().await;
+    });
+
+    let client_cfg = make_client_config(&cert_der);
+    let client = tokio::time::timeout(
+        Duration::from_secs(10),
+        TuicClient::connect(
+            server_addr,
+            "localhost",
+            uuid,
+            password,
+            client_cfg,
+            QuinnConnectionPool::new(),
+        ),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let conn = client.quinn_conn();
+    let target = Address::Ipv4(Ipv4Addr::new(127, 0, 0, 1), echo_addr.port());
+
+    // 同一 assoc 连发两包，回包 pkt_id 必须是 server 自编号 1、2（不随请求走）。
+    for (req_pkt_id, expect_pkt_id) in [(0xBEEFu16, 1u16), (0x1111u16, 2u16)] {
+        let meta = Packet::new(0x0042, req_pkt_id, target.clone(), Bytes::new());
+        let mut frame = BytesMut::new();
+        frame.put_u8(VERSION);
+        frame.put_u8(type_code::PACKET);
+        meta.write_payload_with(&mut frame, b"pkt-id-probe").expect("encode packet");
+        conn.send_datagram(frame.freeze()).expect("send datagram");
+
+        let dg = tokio::time::timeout(Duration::from_secs(10), conn.read_datagram())
+            .await
+            .expect("udp response timed out")
+            .expect("read datagram");
+        // 帧头：VER(0) TYPE(1) ASSOC_ID(2..4) PKT_ID(4..6)
+        let got = u16::from_be_bytes([dg[4], dg[5]]);
+        assert_eq!(got, expect_pkt_id, "server must number its own responses");
+    }
+
+    client.close(0u32.into(), b"");
+}

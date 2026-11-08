@@ -201,18 +201,17 @@ const ENC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 消费时检查过期（worker 排队延迟可致交付即过期）。
 struct PreConns {
     ttl: Duration,
-    tx: tokio::sync::mpsc::Sender<(Box<dyn Connection>, Instant)>,
-    rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Box<dyn Connection>, Instant)>>,
+    tx: async_channel::Sender<(Box<dyn Connection>, Instant)>,
+    rx: async_channel::Receiver<(Box<dyn Connection>, Instant)>,
 }
 
 impl PreConns {
     fn new(ttl: Duration) -> Self {
-        // tokio mpsc 无 rendezvous 模式（capacity=0 panic），capacity=1 是最
-        // 贴近 Go unbuffered chan（outbound.go:161）的等价：空闲稳态 = 缓冲
-        // 1 条 + testpre 个 worker 各挂 1 条阻塞在 send —— 同样零新拨号；
-        // 消费时缓冲即刻有货（Go rendezvous 由队头 sender 秒交付）。
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        Self { ttl, tx, rx: tokio::sync::Mutex::new(rx) }
+        // MPMC 有界通道（Go unbuffered chan 的 capacity=1 等价：缓冲 1 条 + 空闲
+        // worker 各挂 1 条阻塞在 send，同样零新拨号）。tokio mpsc 的 Receiver 非
+        // Sync，多消费者只能 `Mutex<Receiver>` 锁跨 recv().await，等待者被串行化。
+        let (tx, rx) = async_channel::bounded(1);
+        Self { ttl, tx, rx }
     }
 
     /// 入池：满则阻塞直到消费者腾位（Go worker 空闲时休息在此）。
@@ -227,7 +226,7 @@ impl PreConns {
     async fn push(
         &self,
         conn: Box<dyn Connection>,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<(Box<dyn Connection>, Instant)>> {
+    ) -> Result<(), async_channel::SendError<(Box<dyn Connection>, Instant)>> {
         self.tx.send((conn, Instant::now())).await
     }
 
@@ -238,9 +237,8 @@ impl PreConns {
         reason = "tokio 虚拟钟预算面：与 push 侧条目时戳同钟族（713x6：tokio 一律不迁）"
     )]
     async fn pop(&self) -> Option<Box<dyn Connection>> {
-        let mut rx = self.rx.lock().await;
         loop {
-            let (conn, at) = rx.recv().await?;
+            let (conn, at) = self.rx.recv().await.ok()?;
             if Instant::now().duration_since(at) <= self.ttl {
                 return Some(conn);
             }
