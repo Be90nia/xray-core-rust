@@ -1509,30 +1509,44 @@ mod tests {
         let server = tokio::spawn(async move {
             let (server_tcp, _) = listener.accept().await.unwrap();
             let mut h2s = server::handshake(server_tcp).await.unwrap();
-            let (req, mut respond) = h2s.accept().await.unwrap().unwrap();
-            // multiMode 路径名（normalize_grpc_path cfg_multi 语义）
-            assert_eq!(req.uri().path(), "/GunService/TunMulti");
-            // 上行首帧是 MultiHunk（单元素）
-            let mut body = req.into_body();
-            let d = body.data().await.unwrap().unwrap();
-            let (used, datas) =
-                crate::encoding::decode_multi_hunk_frame(&d, None).unwrap().unwrap();
-            assert_eq!(used, d.len());
-            assert_eq!(datas, vec![b"ping".to_vec()]);
-            let resp = http::Response::builder()
-                .status(200)
-                .header("content-type", "application/grpc")
-                .body(())
-                .unwrap();
-            let mut sr = respond.send_response(resp, false).unwrap();
-            // 回多元素 MultiHunk 帧
-            let frame = crate::encoding::encode_multi_hunk_frame(&[b"first", b"second"]);
-            sr.send_data(Bytes::from(frame), true).ok();
-            // 驱动 h2 server 连接直到客户端关闭——task 提前结束会 drop h2s
-            // 发 GOAWAY，把 client 侧还没消费的 DATA 帧掐死（EOF 竞速）。
+            // 每请求独立任务：accept 环是 h2 连接 I/O 的唯一驱动者，环内 `await`
+            // `data()` 会把驱动者堵死——DATA 帧不推进 ⇒ 服务端永不回帧 ⇒ 客户端读超时
+            // （bd ll2hr 同族：Linux 上 HEADERS/DATA 不同段到达即必现）。
+            let mut reqs = Vec::new();
             while let Some(r) = h2s.accept().await {
-                let _ = r;
+                let Ok((req, mut respond)) = r else { break };
+                reqs.push(tokio::spawn(async move {
+                    // multiMode 路径名（normalize_grpc_path cfg_multi 语义）
+                    assert_eq!(req.uri().path(), "/GunService/TunMulti");
+                    // 上行首帧是 MultiHunk（单元素）。fail-loud 护栏：读不到 =
+                    // 连接驱动被堵（把读取挪回 accept 环即复发），不留哑挂。
+                    let mut body = req.into_body();
+                    let d = tokio::time::timeout(Duration::from_secs(5), body.data())
+                        .await
+                        .expect("请求体未在 5s 内收齐：h2 连接驱动被堵")
+                        .unwrap()
+                        .unwrap();
+                    let (used, datas) =
+                        crate::encoding::decode_multi_hunk_frame(&d, None).unwrap().unwrap();
+                    assert_eq!(used, d.len());
+                    assert_eq!(datas, vec![b"ping".to_vec()]);
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut sr = respond.send_response(resp, false).unwrap();
+                    // 回多元素 MultiHunk 帧
+                    let frame = crate::encoding::encode_multi_hunk_frame(&[b"first", b"second"]);
+                    sr.send_data(Bytes::from(frame), true).ok();
+                }));
             }
+            // 内层断言 panic 必须传回测试（detached spawn 的 panic 会被吞掉）。
+            for req in reqs {
+                req.await.unwrap();
+            }
+            // 本循环本身即「驱动 h2 server 连接直到客户端关闭」：task 提前结束会
+            // drop h2s 发 GOAWAY，把 client 侧还没消费的 DATA 帧掐死（EOF 竞速）。
         });
 
         let tcp = TcpStream::connect(addr).await.unwrap();
