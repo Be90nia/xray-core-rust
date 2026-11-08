@@ -14,8 +14,8 @@
 //! 握手/用户校验仍走 [`TrojanServer`]（既有 `InboundHandler` 实现原样复用，
 //! 插件只负责配置注入与构建——[`TrojanServer::new`] + `with_fallbacks` 即
 //! 接缝，server.rs 零 diff）。Trojan `flow` 已被 Go 移除（Go
-//! infra/conf/trojan.go:134-136 服务端硬报错；Rust 生产 warn+忽略），插件
-//! 同规 warn+忽略，勿复活。
+//! infra/conf/trojan.go:134-136 服务端 `PrintRemovedFeatureError` ⇒ 整配置
+//! 加载失败），插件同规拒启（build `Err`），勿复活该字段。
 //!
 //! udf 判定（A7，非通用件）：trojan wire/认证/fallback 决策树是协议方向件
 //! ——按 CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，留主仓最近消费方；
@@ -165,7 +165,7 @@ impl Lifecycle for TrojanLifecycle {
 /// （权威生产解析），字段对齐 Go `infra/conf/trojan.go`：
 /// `{"clients":[{"password":"p","email":"a@b","level":0}],"fallbacks":
 /// [{"dest":80,"xver":0}]}`。`clients` 在场则覆盖 `users`（Go trojan.go:124-126）；
-/// 带 `flow` 的 client 同规生产 warn+忽略（Go 已移除该字段，勿复活）。
+/// 带 `flow` 的 client 同规生产拒启（Go :134-136 `PrintRemovedFeatureError`）。
 /// fallback `dest` 形态推导同规生产：数字 → `localhost:N`；`/`/`@` 前缀 → unix
 /// （`@@` 抽象套接字做 108 字节 NUL padding）；`host:port` → tcp；dest 缺失 →
 /// 硬错（Go trojan.go:196-198）。与 xray-core 解析面的收敛属 P3 入口收口，
@@ -174,23 +174,25 @@ fn parse_server_section(
     section: &serde_json::Value,
 ) -> Result<(Arc<Validator>, Option<Arc<FallbackPolicy>>), PluginError> {
     let settings = section.get("settings").unwrap_or(section);
-    let validator = Arc::new(parse_users(settings));
+    let validator = Arc::new(parse_users(settings)?);
     let fallbacks = parse_fallbacks(settings)?;
     Ok((validator, fallbacks))
 }
 
 /// `clients`/`users` → [`Validator`]（`clients` 在场则覆盖 `users`，Go
 /// trojan.go:124-126）。重复用户 warn + skip（同规生产两个装配分支的语义）。
-fn parse_users(settings: &serde_json::Value) -> Validator {
+fn parse_users(settings: &serde_json::Value) -> Result<Validator, PluginError> {
     let validator = Validator::new();
     let clients =
         settings.get("clients").or_else(|| settings.get("users")).and_then(|c| c.as_array());
     if let Some(clients) = clients {
         for c in clients {
-            // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
-            // 同规生产：warn + 忽略该字段继续建用户。
-            if flow_removed_warning(c) {
-                PLUGIN_LOG.warn(removed_feature_message("Flow for Trojan", ""));
+            // Go infra/conf/trojan.go:134-136：flow 非空 → 整配置加载失败。
+            let has_flow = c.get("flow").and_then(|f| f.as_str()).is_some_and(|f| !f.is_empty());
+            if has_flow {
+                return Err(PluginError::Other(
+                    removed_feature_message("Flow for Trojan", "").into(),
+                ));
             }
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("");
@@ -202,13 +204,7 @@ fn parse_users(settings: &serde_json::Value) -> Validator {
             }
         }
     }
-    validator
-}
-
-/// Trojan `flow` 字段已移除检测（同规 xray-core outbound.rs:1636
-/// `trojan_flow_removed_warning`，Go infra/conf/trojan.go:74/:135——无迁移目标）。
-fn flow_removed_warning(user: &serde_json::Value) -> bool {
-    user.get("flow").and_then(|f| f.as_str()).is_some_and(|f| !f.is_empty())
+    Ok(validator)
 }
 
 /// `fallbacks` → 决策树；缺失/空数组 → `None`（无 fallback 直连路径）。
@@ -344,11 +340,12 @@ mod tests {
     }
 
     #[test]
-    fn flow_field_warns_and_skips_not_rejects() {
-        // Trojan Flow 已移除（Go trojan.go:134-136）：warn + 忽略，勿复活。
+    fn flow_field_rejects_build() {
+        // Trojan Flow 已移除（Go trojan.go:134-136）：整配置拒启（build Err），
+        // 与 outbound / core 入站三路同语义。
         let section = json!({ "clients": [{ "password": "p", "flow": "xtls-rprx-vision" }] });
-        let (validator, _) = parse_server_section(&section).expect("flow 不阻断");
-        assert_eq!(validator.get_key_count(), 1);
+        let err = parse_server_section(&section).expect_err("flow 必须拒启");
+        assert!(err.to_string().contains("Flow for Trojan"), "实际: {err}");
     }
 
     #[test]

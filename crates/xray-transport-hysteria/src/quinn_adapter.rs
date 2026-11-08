@@ -2080,11 +2080,12 @@ mod tests {
     ///
     /// 带宽必须用现实量级：Brutal 窗口 = 2×bps×rtt，回环 RTT 亚毫秒下小带宽
     /// 会把窗口钳到 1 MTU（1200B）导致 quinn 发送停滞（Go quic-go 同数学）。
-    // CI Linux 双连挂（1a5a8167/d9438a57 同签名 30.05s "h3 recv_response: Connection
-    // error: Timeout"，1.98 时代绿）= rustc 1.99 工具链相关的确定性失败，非 flake；
-    // 本地 Windows 同测试通过。同族先例：bd dxim（quinn-udp Linux GSO 分片差异）。
-    // 摘出默认套件，立专项票后恢复。
-    #[ignore = "CI Linux × rustc 1.99 brutal 协商 h3 超时（确定性，同族 dxim），待专项"]
+    // 原 `#[ignore]`（"CI Linux × rustc 1.99 brutal 协商 h3 超时"）已拆（2026-11-08）：
+    // 该失败在 Linux 不复现——WSL Ubuntu 上本用例连跑 10/10 通过（0.02s/次），其引用的
+    // CI run 在本仓不可解析（404，且不在该日 79 条 run 内），当初三条猜测（rustc 1.99 /
+    // quinn-udp GSO / 同族 dxim 单发吞包）均无证据。同族失败的真因已在兄弟用例里定位为
+    // 「测试给服务端传 udp_idle_timeout=0」，见 xray-proxy-hysteria/tests/e2e.rs 的
+    // hysteria_quic_loopback_udp_relay_roundtrip 注释。
     #[tokio::test]
     async fn listener_factory_brutal_negotiation_roundtrip() {
         use std::sync::Arc;

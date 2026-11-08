@@ -184,7 +184,11 @@ async fn hysteria_quic_loopback_dial_auth_bidi_roundtrip() {
 /// 真实 HysteriaClient::udp() 上行标准 wire（[4B session id BE][UdpMessage]）→
 /// server feed 路径按 id 建 session → on_new_udp_session 回调 → server 读（剥信封）→
 /// 分片重组 → echo 回写（InterConn::write 注入信封经 send_datagram）→ client 收回包。
-#[ignore = "bd dxim 同族：CI Linux 确定性挂（run 36217327371+36218202105 rerun 两连挂，316 行 server read EOF）；本地 Windows 3/3 稳定绿。疑 Linux quinn-udp GSO/GRO 分片路径差异，专项排查后拆除"]
+// 原 `#[ignore]`（"bd dxim 同族：CI Linux 确定性挂 / server read EOF，疑 quinn-udp GSO/GRO
+// 分片"）已拆（2026-11-08）：真因是服务端拿到 prost 默认 udp_idle_timeout=0，清理循环
+// 首个 tick（tokio interval 首 tick 立刻到期，Go time.NewTicker 是 +1s）把刚建好的 UDP
+// session 关掉 ⇒ 读侧 UnexpectedEof("closed")。隔离跑常年绿，同进程 3 例并行跑 120 轮
+// 失败 39 次；修法见下方 proto_cfg 注释，修后 150 轮 0 失败。
 #[tokio::test]
 async fn hysteria_quic_loopback_udp_relay_roundtrip() {
     use xray_proxy_hysteria::protocol::{Defragger, UdpMessage};
@@ -198,7 +202,12 @@ async fn hysteria_quic_loopback_udp_relay_roundtrip() {
         .with_single_cert(cert_chain, key_der)
         .unwrap();
     let factory = QuinnListenerFactory::new(Arc::new(server_tls));
-    let proto_cfg = Arc::new(ProtoConfig::default());
+    // 服务端用协议默认（Go `RegisterProtocolConfigCreator`：udp_idle_timeout=60），
+    // 不能用 prost `Config::default()` 的 0——0 秒 = 立即空闲超时：clean 循环首个 tick
+    // （tokio `interval` 首 tick 立刻到期，Go `time.NewTicker` 是 +1s）会把**刚建好**的
+    // UDP session 关掉，读侧拿 `UnexpectedEof("closed")`。这正是本用例原先那条
+    // 「server read EOF」间歇性失败的真因（并行跑 3 例时约 1/3 概率，见 ignore 拆除记录）。
+    let proto_cfg = Arc::new(xray_transport_hysteria::proto_config::default_config());
     let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
     let validator: Option<Arc<dyn AuthValidator>> = Some(Arc::new(TestValidator));
 

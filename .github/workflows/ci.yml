@@ -320,14 +320,19 @@ jobs:
       - uses: ./.github/actions/fetch-udf
       - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
       # osv-scanner：GHSA/CVE 基线扫描（gqkk 供应链票，与 cargo-deny 的 RustSec 面
-      # 互补）。当前基线含票外命中（hickory-resolver/lru/paste/rsa 等 2026-10-13
-      # 扫描记录见 reports/fix-gqkk-vendor.md），故暂为告警级（continue-on-error）；
-      # rustls 0.23.45 升级消解 GHSA-2mjx-qc3c-rqvc 后，其余命中单独开票处置，
-      # 全零后移除本行切阻断级。
+      # 互补）。**阻断级**（bd 审计 P2-1）：已知无 fix 的命中逐条登记在
+      # `.osv-scanner.toml` 的 [[IgnoredVulns]]（含 reason），未登记的新命中即红。
+      # 供应链：版本 + SHA256 双钉（原先从 releases/latest 下载后直接执行 = 上游投毒
+      # 或传输劫持即可在 CI 跑任意代码）。升级版本时同步改 OSV_VERSION 与 OSV_SHA256
+      # （后者取自同版本 release 的 osv-scanner_SHA256SUMS）。
       - name: osv-scanner (CVE/GHSA baseline)
-        continue-on-error: true
+        env:
+          OSV_VERSION: v2.7.0
+          OSV_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
         run: |
-          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          set -euo pipefail
+          curl -sSfL "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64" -o /usr/local/bin/osv-scanner
+          echo "${OSV_SHA256}  /usr/local/bin/osv-scanner" | sha256sum -c -
           chmod +x /usr/local/bin/osv-scanner
           osv-scanner scan --lockfile=Cargo.lock --format=table
 

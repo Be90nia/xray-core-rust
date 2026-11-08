@@ -379,11 +379,19 @@ static ACTIVE_BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// 连接名额（drop 即归还）。触顶 = [`ConnSlot::try_acquire`] 返 `None`。
 struct ConnSlot;
 
+/// 连接数上限（执行点唯一读数）。
+///
+/// 读 [`xray_common::mem_probe::MemoryPlan::effective_max_conns`] 而非档位原值
+/// `max_conns`：装配期预算门按本配置算出的**降档值**写在那里（bd 2026-11-08
+/// D-02）——旧状只写 warn 文案，执行点仍用档位原值，运维看到的数字不是生效的数字。
+fn conn_limit() -> usize {
+    xray_common::mem_probe::MemoryPlan::cached().effective_max_conns()
+}
+
 impl ConnSlot {
     /// 取一个连接名额；已达本机档位上限 → `None`（调用方 fail-visible 拒绝）。
     fn try_acquire() -> Option<Self> {
-        let limit = xray_common::mem_probe::MemoryPlan::cached().max_conns;
-        try_take_slot(&ACTIVE_BRIDGES, limit).then_some(Self)
+        try_take_slot(&ACTIVE_BRIDGES, conn_limit()).then_some(Self)
     }
 }
 
@@ -407,20 +415,23 @@ impl Drop for ConnSlot {
 /// 连接数触顶的 fail-visible 拒绝（日志 + `Err`）：绝不静默降级、绝不放任 OOM。
 fn connection_limit_error() -> io::Error {
     let plan = xray_common::mem_probe::MemoryPlan::cached();
+    // 报执行点的**生效**值（降档后），不是档位原值——运维看到的数字必须与
+    // `ConnSlot` 拒绝时用的那个一致（bd 2026-11-08 D-02）。
+    let limit = conn_limit();
     tracing::error!(
         target: "xray_frame::bridge",
-        limit = plan.max_conns,
+        limit,
         tier = plan.tier.as_str(),
         budget = plan.total_budget,
         "已达本机内存档位上限 {} 条连接（tier {} / 预算 {}B），拒绝新连接",
-        plan.max_conns,
+        limit,
         plan.tier.as_str(),
         plan.total_budget
     );
     io::Error::other(format!(
         "connection limit reached: 已达本机内存档位上限 {} 条（tier {} / 预算 {}B；\
          可用 XRAY_MAX_CONNS 覆盖）",
-        plan.max_conns,
+        limit,
         plan.tier.as_str(),
         plan.total_budget
     ))
@@ -1471,13 +1482,44 @@ mod tests {
     /// 触顶错误必须点名「本机内存档位上限 + 条数」（日志/Err 双可见）。
     #[test]
     fn connection_limit_error_names_tier_limit() {
+        let _g = global_state_guard();
         let err = connection_limit_error();
         let text = err.to_string();
         let plan = xray_common::mem_probe::MemoryPlan::cached();
         assert!(text.contains("connection limit reached"), "{text}");
-        assert!(text.contains(&plan.max_conns.to_string()), "必须点名条数：{text}");
+        assert!(
+            text.contains(&plan.effective_max_conns().to_string()),
+            "必须点名**生效**条数（降档后）：{text}"
+        );
         assert!(text.contains(plan.tier.as_str()), "必须点名档位：{text}");
         assert!(text.contains("XRAY_MAX_CONNS"), "必须告知覆盖手段：{text}");
+    }
+
+    /// 执行点（[`ConnSlot::try_acquire`] 的唯一读数 [`conn_limit`]）必须读装配期
+    /// 降档值，不是档位原值（bd 2026-11-08 D-02）。
+    ///
+    /// 本进程只有本用例写该静态值（`GLOBAL_STATE` 串行化其它读它的用例）。
+    #[test]
+    fn conn_limit_reads_degraded_value() {
+        let _g = global_state_guard();
+        let plan = xray_common::mem_probe::MemoryPlan::cached();
+        assert_eq!(conn_limit(), plan.max_conns, "未装配 = 档位派生值");
+        let degraded = plan.max_conns.saturating_sub(1).max(1);
+        xray_common::mem_probe::set_effective_max_conns(degraded);
+        assert_eq!(
+            conn_limit(),
+            degraded,
+            "执行点必须读降档值（档位原值 {} → 降档 {degraded}）",
+            plan.max_conns
+        );
+        // 复原，避免污染同进程后续用例（静态值进程级）。
+        xray_common::mem_probe::set_effective_max_conns(plan.max_conns);
+    }
+
+    /// 触碰进程级降档静态值的用例串行化（否则 read/write 交错即假红）。
+    fn global_state_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// bd 7p1m：`XRAY_P7LM_TRACE=0` 必须视为关闭（旧 `.is_ok()` 语义会误开埋点，

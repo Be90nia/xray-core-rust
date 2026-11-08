@@ -375,34 +375,41 @@ impl Instance {
             );
         }
 
-        #[cfg(feature = "shutdown-coordinator")]
-        {
-            crate::shutdown_bridge::close_features(&self.features)
-        }
+        let result = {
+            #[cfg(feature = "shutdown-coordinator")]
+            {
+                crate::shutdown_bridge::close_features(&self.features)
+            }
 
-        #[cfg(not(feature = "shutdown-coordinator"))]
-        {
-            let mut errors: Vec<FeatureError> = Vec::new();
-            // 逆序关闭：后注册的先关闭，模拟栈式生命周期。
-            for feat in self.features.iter().rev() {
-                if let Err(e) = feat.close() {
-                    tracing::warn!(
-                        name = feat.feature_name(),
-                        error = %e,
-                        "feature close failed"
-                    );
-                    errors.push(e);
+            #[cfg(not(feature = "shutdown-coordinator"))]
+            {
+                let mut errors: Vec<FeatureError> = Vec::new();
+                // 逆序关闭：后注册的先关闭，模拟栈式生命周期。
+                for feat in self.features.iter().rev() {
+                    if let Err(e) = feat.close() {
+                        tracing::warn!(
+                            name = feat.feature_name(),
+                            error = %e,
+                            "feature close failed"
+                        );
+                        errors.push(e);
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    // 聚合错误：用第一个错误作主因，其余记入日志已记录。
+                    // 设计权衡：返回 Vec<FeatureError> 会破坏单一错误型 API；用 anyhow!
+                    // 字符串拼接丢失类型信息。这里折中返回第一个错误，已通过 tracing 记录全部。
+                    Err(errors.into_iter().next().expect("non-empty errors"))
                 }
             }
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                // 聚合错误：用第一个错误作主因，其余记入日志已记录。
-                // 设计权衡：返回 Vec<FeatureError> 会破坏单一错误型 API；用 anyhow!
-                // 字符串拼接丢失类型信息。这里折中返回第一个错误，已通过 tracing 记录全部。
-                Err(errors.into_iter().next().expect("non-empty errors"))
-            }
-        }
+        };
+        // 停机末段：释放进程级 QUIC 客户端 endpoint 池（每个端点 8 MiB 内核缓冲
+        // ×2）。挂在这里而非装配期全局槽清理段——那些槽只是摘引用，端点要等
+        // 在途连接自然结束后的关闭动作才好落（审计 2026-11-08 CQ P2 #2）。
+        xray_transport_quic::transport::close_shared_client_endpoints();
+        result
     }
 }
 

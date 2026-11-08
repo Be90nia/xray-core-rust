@@ -18,17 +18,27 @@
 //! 2. 硬账面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]，**含每监听握手 在途**）+
 //!    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面（×2 内核记账）
 //!    + 预算内最小并发 × 每连接 pipe（双向）—— 配置合法但合计超 [`XRAY_BUDGET_BYTES`] 同样拒启；
+//!      **另两项瞬时上界也进硬账**（bd 2026-11-08 D-03 / security P2-2）：xdns frag 满表
+//!      （[`XDNS_FRAG_WORST_CASE_BYTES`] × server 数）与 QUIC 连接接收窗
+//!      （[`QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES`] ×
+//!      **预算余量装得下的满窗条数**）。两项都**装不下 只 WARN 不拒启**（用户裁决
+//!      2026-11-07「预算不足不得拒启」），但账面必须可见、 可对账——旧状 frag 只在 caps
+//!      栏（等于不判），QUIC 窗全仓零登记。
 //! 3. 上限面（不判、只打印）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 //!    预约会误杀合法配置）、xhttp h2 send_buf（每连接、惰性分配）、DoH3 resolver
-//!    socket（装配期不可数）、桥在途、xdns frag（同 bridge 口径：登记 ≠ 入账）。
+//!    socket（装配期不可数）、桥在途。
 //!
 //! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
 //! `xray_common::mem_probe::MemoryPlan` 按**探测到的可用内存**分档派生——
 //! ≤256MB→40MB / ≤512MB→96MB / ≤1GB→192MB / >1GB→`min(512MB, 可用/4)`。同一份
-//! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB`，触顶由桥
-//! fail-visible 拒绝）。预算装不下时**不拒启**：按装得下的并发数降档并 warn
-//! （只有连 1 条连接都装不下才拒）。96MB 仍是 `min` 上沿的默认设计点，故原
-//! 「96MiB 不是运行期硬上界」口径不变。
+//! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB` = 13/32/64/170，
+//! **并发能力不按闸反解**；触顶由桥 fail-visible 拒绝）。满载乘积
+//! （`max_conns × 2 × gate`）因此**过订**（3.3×–21×）——闸是瞬态背压上界，非每连接
+//! 常驻 ⇒ 该上界如实进 caps 栏 + WARN（bd 2026-11-08 D-01，口径经 PM 修正；
+//! 全局共享配额终态另票）。预算装不下时**不拒启**：按装得下的并发数降档并 warn，
+//! **降档值写进执行点**（`xray_common::mem_probe::set_effective_max_conns`，桥读
+//! 同一份值，D-02；只有连 1 条连接都装不下才拒）。96MB 仍是 `min` 上沿的默认设计点，
+//! 故原「96MiB 不是运行期硬上界」口径不变。
 
 // 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
 pub use xray_frame::budget::{
@@ -38,7 +48,8 @@ pub use xray_frame::budget::{
     HANDSHAKE_INFLIGHT_MAX, HANDSHAKE_TASK_EST_BYTES, HYPER_IDLE_CONN_EST_BYTES,
     HYPER_MAX_IDLE_PER_HOST_CONNECTIONS, HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES,
     MAX_EXPLICIT_SOCKET_BUFFER_BYTES, MAX_PER_CONN_BUFFER_BYTES, MIN_VIABLE_CONCURRENCY,
-    NEW_POOLS_TOTAL_MAX_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
+    NEW_POOLS_TOTAL_MAX_BYTES, QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
+    QUIC_STREAM_RECEIVE_WINDOW_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
     QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES, RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR,
     SPLITHTTP_ENDPOINT_BOOKED_BYTES, SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
     SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES, SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
@@ -80,7 +91,9 @@ fn stream_network(
 /// 预算门两栏报告（bd 258qt / pyka7 / nlhht 的口径修正）。
 ///
 /// - [`hard`](Self::hard)：**硬账**——装配期能判定、且真会占的字节（进
-///   [`projected`](Self::projected) 判定）。
+///   [`projected`](Self::projected) 判定）。含两项**瞬时上界**（xdns frag 满表、 QUIC
+///   连接接收窗）：它们超预算只 WARN 不拒启（用户裁决），但必须入账可见 （bd 2026-11-08 D-03 /
+///   security P2-2）。
 /// - [`caps`](Self::caps)：**上限面**——按连接数/端点的上界，装配期零连接 ⇒ 真实占用 0 或受 OS
 ///   钳制（Linux `rmem_max`），**不并入硬账**，但要 显式打印：**96 MiB 因此不是运行期硬上界**。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,10 +152,12 @@ impl BudgetReport {
 /// 校验面（bd sgdwm 扩面 + bd 258qt 口径修正 + bd sfqlu 档位自适应）：
 /// 1. 每连接 pipe 软上限（env 缺省档 + policy 各 level `bufferSize`；负值硬拒、 0 放行）；
 /// 2. **硬账**：固定底数（池/缓存 + **每监听**握手在途，bd 258qt(a)）+ 最小并发 × pipe 双向 +
-///    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面 （×2 内核记账，bd nlhht）；
+///    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面 （×2 内核记账，bd nlhht）+
+///    **瞬时上界两项**（xdns frag 满表、QUIC 连接接收窗；超预算只 WARN 不拒启）—— 固定面 +
+///    连接面超预算拒启，瞬时面超预算只 WARN（用户裁决 2026-11-07）；
 /// 3. **上限面**（不判、只报）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 ///    预约会误杀合法配置，bd 258qt(c)）、DoH3 resolver socket（装配期不可数， bd 258qt(d)）、xhttp
-///    h2 send_buf（惰性分配，bd pyka7）、桥在途、xdns frag。
+///    h2 send_buf（惰性分配，bd pyka7）、桥在途、QUIC 流窗（连接窗内子份额）。
 ///
 /// 预算取自本机档位（[`xray_common::mem_probe::MemoryPlan::cached`]）；装不下
 /// 完整并发时只**降档**（[`BudgetReport::degraded`]），连 1 条都装不下才记违例。
@@ -185,6 +200,8 @@ pub fn budget_report_with(
     // ── 2) 端点扫描（inbounds + outbounds 的 streamSettings）──
     let mut quic_default = 0usize;
     let mut quic_explicit_booked = 0usize;
+    // QUIC 端点总数（显式 + 缺省）：每端点可建 N 条连接，连接窗按连接计（D-03）。
+    let mut quic_endpoints = 0usize;
     let mut splithttp = 0usize;
     let stream_settings = built
         .inbounds
@@ -194,6 +211,7 @@ pub fn budget_report_with(
     for ss in stream_settings {
         match stream_network(ss) {
             Some(xray_common::net::transport::TransportProtocol::Quic) => {
+                quic_endpoints += 1;
                 match explicit_receive_buffer(ss) {
                     // 显式值 = 运维亲手指定 ⇒ bind 即真占（× 内核 2× 记账）⇒ 硬账。
                     Some(bytes) => {
@@ -237,12 +255,38 @@ pub fn budget_report_with(
     // `bufferSize 0`（Go 合法「不排队」）不占字节 ⇒ 装得下的条数不受限。
     let conns_fit = for_conns.checked_div(per_conn_pipe).unwrap_or(MIN_VIABLE_CONCURRENCY);
     let conns = conns_fit.min(MIN_VIABLE_CONCURRENCY);
-    let projected = fixed + quic_explicit_booked + conns * per_conn_pipe;
     // 运行期连接数上限 = 档位派生值与本配置实际装得下的条数取小。
-    let max_conns = plan.max_conns.min(conns_fit);
+    // **降档值必须到执行点**（bd 2026-11-08 D-02）：桥上 `ConnSlot` 读的正是这里
+    // 写入的同一份值；旧状只写 warn 文案，桥仍用档位原值。
+    let max_conns = xray_common::mem_probe::set_effective_max_conns(plan.max_conns.min(conns_fit));
+
+    // ── 3b) 瞬时上界入硬账（bd 2026-11-08 D-03 / security P2-2）──
+    // 两项都**由远端/负载推高、装配期不可判定**，但真的会吃掉预算：
+    // - xdns frag：每 xdns server 满表 41.2MiB（`frag_n` 由对端片数控制， security P2-2：旧状只进
+    //   caps 栏 ⇒ 等于不判，Tiny 40MiB 档静默超账）；
+    // - QUIC 连接接收窗：每已建立连接 32MiB，且**无连接级准入闸**（唯一闸是 握手在飞）⇒
+    //   入账乘数取「预算余量装得下几条满窗连接」（不是档位并发上限， 那样恒得 10× 超账 ⇒
+    //   告警噪音；D-03：旧状全仓零登记）。
+    // 二者超预算都**只 WARN 不拒启**（用户裁决 2026-11-07）；把它们排斥在
+    // `conns_fit` 之外同样是为不把连接面饿死到拒启（frag 单独就超 Tiny 预算）。
+    let xdns_servers: usize =
+        built.inbounds.iter().map(|i| xdns_mask_count(i.stream_settings_json.as_ref())).sum();
+    let frag_booked = xdns_servers * XDNS_FRAG_WORST_CASE_BYTES;
+    // QUIC 连接窗：按「本预算**实际装得下几条满窗连接**」记账（不是按档位最大并发——
+    // 后者恒得 10× 超账，告警立刻退化成噪音，PM 2026-11-08 再纠偏）。`max(1)` 是
+    // 记账口径（至少记 1 条，否则本项为 0 = 不判）；真装不下时会由 projected 超预算
+    // 触发告警，文案点明「缺连接级准入闸」这个真问题。
+    let quic_conns_fit = budget
+        .saturating_sub(fixed + quic_explicit_booked + conns * per_conn_pipe)
+        / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+    let quic_conns = if quic_endpoints > 0 { max_conns.min(quic_conns_fit.max(1)) } else { 0 };
+    let quic_windows_booked = quic_conns * QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+    let transient_booked = frag_booked + quic_windows_booked;
+    let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe;
+    let projected = steady_booked + transient_booked;
     if conns_fit == 0 {
         violations.push(format!(
-            "actual occupancy {projected}B > budget {budget}B even for 1 conn: fixed {fixed}B \
+            "actual occupancy {steady_booked}B > budget {budget}B even for 1 conn: fixed {fixed}B \
              (pools+caches + {listeners} listeners x {HANDSHAKE_INFLIGHT_MAX} x \
              {HANDSHAKE_TASK_EST_BYTES}B handshake) + explicit udp sockets \
              {quic_explicit_booked}B + 1 conn x {per_conn_pipe}B pipe(2-way); \
@@ -250,23 +294,61 @@ pub fn budget_report_with(
             plan.tier.as_str(),
         ));
     }
+    // 告警面（全部走 warn，**不拒启**）：① 连接数降档；② 瞬时上界装不下。
+    let mut notes: Vec<String> = Vec::new();
     // 装不下完整并发 ⇒ 降档运行（**不拒启**）：显式告警，让运维看得见少了多少条。
-    let degraded = (conns_fit > 0
-        && (conns < MIN_VIABLE_CONCURRENCY || max_conns < plan.max_conns))
-        .then(|| {
-            format!(
-                "内存降档运行（bd sfqlu）：档位 {}（{}，可用 {}B，来源 {}）总预算 {budget}B，\
-                 固定面 {fixed}B（{listeners} 个监听）+ 显式 socket {quic_explicit_booked}B 后\
-                 每连接 {per_conn_pipe}B pipe（双向）只装得下 {conns_fit} 条连接\
-                 （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
-                plan.tier.as_str(),
-                plan.tier.label(),
-                plan.available,
-                plan.source,
-                MIN_VIABLE_CONCURRENCY,
-                plan.max_conns,
-            )
-        });
+    if conns_fit > 0 && (conns < MIN_VIABLE_CONCURRENCY || max_conns < plan.max_conns) {
+        notes.push(format!(
+            "内存降档运行（bd sfqlu）：档位 {}（{}，可用 {}B，来源 {}）总预算 {budget}B，\
+             固定面 {fixed}B（{listeners} 个监听）+ 显式 socket {quic_explicit_booked}B 后\
+             每连接 {per_conn_pipe}B pipe（双向）只装得下 {conns_fit} 条连接\
+             （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
+            plan.tier.as_str(),
+            plan.tier.label(),
+            plan.available,
+            plan.source,
+            MIN_VIABLE_CONCURRENCY,
+            plan.max_conns,
+        ));
+    }
+    // 瞬时上界（xdns frag / QUIC 连接窗）超预算 = 只 WARN（用户裁决 2026-11-07）。
+    if transient_booked > 0 && projected > budget {
+        let mut parts: Vec<String> = Vec::new();
+        if frag_booked > 0 {
+            parts.push(format!(
+                "xdns frag 满表 {frag_booked}B（{xdns_servers} 个 server × \
+                 {XDNS_FRAG_WORST_CASE_BYTES}B，片数由对端控制）"
+            ));
+        }
+        if quic_conns > 0 {
+            parts.push(format!(
+                "QUIC 接收窗：预算只装得下 {quic_conns} 条满窗连接（\
+                 {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B/连接），且**无连接级准入闸**\
+                 （唯一闸是握手在飞）⇒ 第 {} 条起的窗口内存不受预算约束",
+                quic_conns + 1
+            ));
+        }
+        notes.push(format!(
+            "瞬时面上界超预算（只 WARN 不拒启，bd 2026-11-08 D-03/security P2-2）：{}；\
+             最坏瞬时账面 {projected}B > 预算 {budget}B，常态账面 {steady_booked}B 在预算内",
+            parts.join("；")
+        ));
+    }
+    // 满载乘积**过订**：闸是瞬态背压上界（lazy 分配，正常链路远不满），不是每连接
+    // 常驻 ⇒ `max_conns × 2 × gate` 与预算是不同量纲，乘积必然超订。**禁静默**
+    // （bd 2026-11-08 D-01）：登记成 caps 里的诚实上界 + 一条 WARN；**不**拿它反解
+    // 并发数（反解会把四档并发砍到 4/4/4/8 条 = 功能回退，PM 打回）。
+    let full_load_product = max_conns * 2 * plan.bridge_gate;
+    if full_load_product > budget {
+        notes.push(format!(
+            "满载乘积过订（bd 2026-11-08 D-01，只 WARN）：{max_conns} 条 × 2 方向 × {}B 闸 = \
+             {full_load_product}B，为预算 {budget}B 的 {:.2}× ——闸是**瞬态背压上界**（lazy，正常\
+             链路远不满），最坏情形由闸自身兜；**不**按乘积反解并发（否则并发砍到 4 条）",
+            plan.bridge_gate,
+            full_load_product as f64 / budget as f64,
+        ));
+    }
+    let degraded = (!notes.is_empty()).then(|| notes.join("；"));
 
     // ── 4) 上限面（打印用；不进 projected）──
     let caps = vec![
@@ -290,14 +372,30 @@ pub fn budget_report_with(
             format!("per conn bridge in-flight {BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES}B cap"),
             BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES,
         ),
+        // QUIC 流窗是**连接窗内**的子份额（quinn 按连接窗信用发流信用）⇒ 只登记
+        // 防回档，不另记账；真账面是硬账里的连接窗（bd 2026-11-08 D-03）。
         (
-            format!("per xdns server {XDNS_FRAG_WORST_CASE_BYTES}B frag worst case"),
-            XDNS_FRAG_WORST_CASE_BYTES,
+            format!(
+                "per QUIC stream {QUIC_STREAM_RECEIVE_WINDOW_BYTES}B rx window \
+                 (inside conn window, not added)"
+            ),
+            QUIC_STREAM_RECEIVE_WINDOW_BYTES,
         ),
         // bd sfqlu：档位派生值全部进上限面（运维核对用，不进硬账）。
         (
             format!("bridge byte gate {}B/dir x 2 dirs per conn", plan.bridge_gate),
             2 * plan.bridge_gate,
+        ),
+        // D-01（PM 2026-11-08 修正）：满载乘积是**诚实的最坏上界**，不是稳态预算
+        // ——闸 lazy 分配、正常链路远不满。登记在 caps（运维判据）+ WARN，禁静默。
+        (
+            format!(
+                "worst-case full-load bridge in-flight {full_load_product}B ({max_conns} conns x 2 \
+                 dirs x {}B gate; {:.2}x budget — transient backpressure bound, gate enforces)",
+                plan.bridge_gate,
+                full_load_product as f64 / budget as f64
+            ),
+            full_load_product,
         ),
         (format!("max {} conns (tier {})", max_conns, plan.tier.as_str()), max_conns),
     ];
@@ -312,11 +410,37 @@ pub fn budget_report_with(
             (format!("fixed floor ({listeners} listeners)"), fixed),
             ("explicit udp sockets".to_string(), quic_explicit_booked),
             (format!("{conns} conns x {per_conn_pipe}B pipe(2-way)"), conns * per_conn_pipe),
+            // 瞬时面上界两项：进硬账（可对账），超预算只 WARN（见 degraded）。
+            (
+                format!("{xdns_servers} xdns frag worst case x {XDNS_FRAG_WORST_CASE_BYTES}B"),
+                frag_booked,
+            ),
+            (
+                format!(
+                    "{quic_conns} QUIC conn receive window x \
+                     {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
+                ),
+                quic_windows_booked,
+            ),
         ],
         caps,
         degraded,
         violations,
     })
+}
+
+/// streamSettings 里 xdns 服务端 mask 的实例数（`finalmask.udp[{"type":"xdns"}]`）。
+///
+/// 每个实例一个 [`XDNS_FRAG_WORST_CASE_BYTES`] 面的分片重组器（`ServerState.frag`）
+/// ⇒ 账面按份叠加。类型名与 `xray_transport::finalmask::build_udpmask_manager_from_json`
+/// 的 match 臂同源（`"xdns"`）。
+fn xdns_mask_count(ss: Option<&serde_json::Value>) -> usize {
+    ss.and_then(|v| v.get("finalmask"))
+        .and_then(|fm| fm.get("udp"))
+        .and_then(|udp| udp.as_array())
+        .map_or(0, |arr| {
+            arr.iter().filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("xdns")).count()
+        })
 }
 
 /// 端点显式 UDP 接收缓冲（字节；`sockopt.receiveBufferSize`，`0`/缺省 = `None`）。
@@ -392,6 +516,9 @@ mod tests {
 
     /// 四档（256MB / 512MB / 1GB / 大机器）派生出的预算与连接数上限必须与档位表一致，
     /// 且派生值全部出现在报告的 caps 栏里（bd sfqlu 验收 5）。
+    ///
+    /// 连接数 13/32/64/170 = `总预算 / PER_CONN_UPPER_BYTES`(3MiB)，**并发能力不回退**
+    /// （2026-11-08 PM 打回：拿闸反解会把并发砍到 4/4/4/8 条）。
     #[test]
     fn tier_plan_drives_budget_and_conn_cap() {
         for (available, budget, conns) in [
@@ -451,6 +578,202 @@ mod tests {
         assert!(err.contains("tiny"), "错误必须点名档位：{err}");
     }
 
+    /// E1（bd 2026-11-08 D-01，口径经 PM 修正）：**账本诚实**而非乘积钳制。
+    ///
+    /// 断言三件事（`--nocapture` 打印四档数值行）：
+    /// ① 并发能力保持旧派生量级（13/32/64/170），不被乘积反解砍掉；
+    /// ② 满载乘积`max_conns × 2 × gate` 作为**最坏上界**出现在 caps 栏（运维可见）；
+    /// ③ 乘积 > 预算时必须有一条 WARN（禁静默），且**不记违例**（不拒启）。
+    ///
+    /// **不再断言** `max_conns × 2 × gate ≤ budget`：闸是瞬态背压上界，不是每连接
+    /// 常驻，那条等式本身是错的模型（PM 2026-11-08 打回）。
+    #[test]
+    fn full_load_product_is_registered_honestly() {
+        for (available, conns) in
+            [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
+        {
+            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let report = budget_report_with(&xray_conf::BuiltConfig::default(), plan)
+                .expect("缺省配置必须出报告");
+            let product = report.max_conns * 2 * plan.bridge_gate;
+            println!(
+                "tier {} budget {}B gate {}B/dir conns {} (=tier {}) -> caps worst-case {}B ({:.2}x)",
+                report.tier,
+                report.budget,
+                plan.bridge_gate,
+                report.max_conns,
+                conns,
+                product,
+                product as f64 / report.budget as f64
+            );
+            // ① 并发能力不回退（档位派生值，缺省配置下不被 pipe 面压小）。
+            assert_eq!(report.max_conns, conns, "{} 档并发能力回退了", report.tier);
+            // ② 最坏上界必须在 caps 栏可见。
+            let (name, value) = report
+                .caps
+                .iter()
+                .find(|(n, _)| n.starts_with("worst-case full-load bridge in-flight"))
+                .unwrap_or_else(|| {
+                    panic!("{} 档 caps 缺满载上界行：{:?}", report.tier, report.caps)
+                });
+            assert_eq!(*value, product, "caps 上界值必须等于乘积：{name}");
+            // ③ 过订必须 WARN，且不拒启。
+            assert!(report.is_ok(), "过订不得拒启：{:?}", report.violations);
+            assert!(
+                report.degraded.as_deref().is_some_and(|d| d.contains("满载乘积过订")),
+                "过订必须 emit WARN（禁静默）：{:?}",
+                report.degraded
+            );
+        }
+    }
+
+    /// E2（bd 2026-11-08 D-02）：降档 warn 文案承诺的条数 == 写进执行点的条数。
+    ///
+    /// 两侧数值：文案里的 `连接数上限降为 N 条` vs `report.max_conns`（后者即
+    /// `set_effective_max_conns` 的写入值，桥 `ConnSlot` 读同一份；跨进程读回见
+    /// `crates/xray-core/tests/memory_budget_degrade_wiring.rs`）。
+    #[test]
+    fn degraded_warn_text_matches_effective_conn_limit() {
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        built.inbounds.push(splithttp_inbound("xhttp-in"));
+        let report = budget_report_with(&built, plan_256mb()).expect("report");
+        let degraded = report.degraded.as_deref().expect("超预算配置必须降档并 warn");
+        assert!(
+            degraded.contains(&format!("连接数上限降为 {} 条", report.max_conns)),
+            "warn 文案的条数必须等于写入执行点的值 {}：{degraded}",
+            report.max_conns
+        );
+    }
+
+    /// E3（bd 2026-11-08 D-03）：QUIC 接收窗入簿（与实现同值）+ **入硬账**
+    /// （不是只打日志），乘数 = 预算**实际装得下几条满窗连接**（PM 2026-11-08 纠偏：
+    /// 用档位最大并发当乘数会恒得 10× 超账 ⇒ 告警退化成噪音）。
+    #[test]
+    fn quic_receive_window_ledger_enters_hard_account() {
+        use xray_transport_quic::config as qc;
+        // 入簿：与实现缺省同值（改实现即红）。
+        assert_eq!(
+            QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
+            usize::try_from(qc::DEFAULT_CONNECTION_RECEIVE_WINDOW).expect("窗口常量恒正"),
+            "QUIC 连接接收窗账面必须等于实现缺省（bd D-03）"
+        );
+        assert_eq!(
+            QUIC_STREAM_RECEIVE_WINDOW_BYTES,
+            usize::try_from(qc::DEFAULT_STREAM_RECEIVE_WINDOW).expect("窗口常量恒正"),
+            "QUIC 流接收窗账面必须等于实现缺省"
+        );
+
+        for (available, tier_conns) in
+            [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
+        {
+            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let mut built = xray_conf::BuiltConfig::default();
+            built.inbounds.push(quic_inbound("q1"));
+            let report = budget_report_with(&built, plan).expect("report");
+            // 并发能力不回退（本次改动不得动 max_conns）。
+            assert_eq!(report.max_conns, tier_conns, "{available}B 档并发能力被改动了");
+
+            // 乘数 = min(档位并发, 预算余量装得下的满窗条数)——从报告自身两项硬账
+            // 反算（不写字面量）：余量 = 预算 − 固定面 − 常态连接面。
+            let read = |pred: &dyn Fn(&str) -> bool| {
+                report.hard.iter().find(|(n, _)| pred(n)).map(|(_, b)| *b).unwrap_or(0)
+            };
+            let fixed = read(&|n| n.starts_with("fixed floor"));
+            let conns_pipe = read(&|n| n.contains("conns x") && n.contains("pipe"));
+            let explicit = read(&|n| n == "explicit udp sockets");
+            let booked = read(&|n| n.contains("QUIC conn receive window x"));
+            let fit = report.budget.saturating_sub(fixed + explicit + conns_pipe)
+                / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+            println!(
+                "tier {} budget {}B max_conns {} quic quic_conns_fit {} -> booked {} conns = {}B",
+                report.tier,
+                report.budget,
+                report.max_conns,
+                fit.max(1),
+                booked / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
+                booked
+            );
+            assert_eq!(
+                booked,
+                report.max_conns.min(fit.max(1)) * QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
+                "{} 档 QUIC 窗账面必须是 min(并发上限, 余量装得下条数) × 32MiB",
+                report.tier
+            );
+            assert_eq!(
+                report.hard.iter().map(|(_, b)| b).sum::<usize>(),
+                report.projected,
+                "硬账逐项之和必须等于合计（QUIC 窗在账内）"
+            );
+            // 只 WARN 不拒启，且**只有真装不下时才告警**（告警 ↔ 超预算一一对应）。
+            assert!(report.is_ok(), "瞬时面超预算不得拒启：{:?}", report.violations);
+            let over = report.projected > report.budget;
+            let warned = report.degraded.as_deref().is_some_and(|d| d.contains("无连接级准入闸"));
+            assert_eq!(
+                warned, over,
+                "{} 档：账面超预算（{over}）与告警存在（{warned}）必须一一对应：{:?}",
+                report.tier, report.degraded
+            );
+            assert!(
+                report.caps.iter().any(|(n, _)| n.contains("QUIC stream")),
+                "流窗必须登记在 caps（连接窗内子份额）：{:?}",
+                report.caps
+            );
+        }
+    }
+
+    /// E4（security P2-2）：Tiny 档（40MiB）下 xdns frag 满表 41.2MiB 必须**进硬账
+    /// 并 emit WARN**，且**不拒启**（用户裁决：预算不足不得拒启）。
+    #[test]
+    fn xdns_frag_on_tiny_tier_warns_without_rejecting() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(xdns_inbound("xdns-in"));
+        let plan = plan_256mb();
+        let report = budget_report_with(&built, plan).expect("report");
+        let (name, booked) = report
+            .hard
+            .iter()
+            .find(|(n, _)| n.contains("xdns frag"))
+            .expect("frag 必须进硬账（旧状只在 caps 栏 = 不判）")
+            .clone();
+        assert!(name.contains("1 xdns frag"), "账面必须点名 server 数：{name}");
+        assert_eq!(booked, XDNS_FRAG_WORST_CASE_BYTES, "单 server 满表 41.2MiB");
+        // 告警可见（该文案由 `check_startup_budget` 逐条 log.warn 发出）。
+        let degraded = report.degraded.as_deref().unwrap_or_default();
+        assert!(
+            degraded.contains("xdns frag") && degraded.contains("只 WARN 不拒启"),
+            "必须 emit frag 告警且明示不拒启：{degraded:?}"
+        );
+        assert_eq!(
+            report.hard.iter().map(|(_, b)| b).sum::<usize>(),
+            report.projected,
+            "硬账逐项之和必须等于合计（frag 在账内）"
+        );
+        assert!(
+            report.projected > report.budget,
+            "Tiny 40MiB 档装不下 41.2MiB frag 表（账面应超预算）：账面 {}B / 预算 {}B",
+            report.projected,
+            report.budget
+        );
+        // 不拒启：gate 返回 Ok（只 WARN）。
+        check_startup_budget_with(&built, plan).expect("Tiny + xdns 只 WARN 不拒启");
+    }
+
+    /// 瞬时面上界超预算的告警条数 ≥1（frag + QUIC 同时超 ⇒ 各自独立告警）；
+    /// 均为 warn 面，`violations` 必须仍空。
+    #[test]
+    fn transient_over_budget_emits_warns_only() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(xdns_inbound("xdns-in"));
+        built.inbounds.push(quic_inbound("quic-in"));
+        let report = budget_report_with(&built, plan_256mb()).expect("report");
+        assert!(report.violations.is_empty(), "瞬时面超预算不得记违例：{:?}", report.violations);
+        let notes = report.degraded.as_deref().unwrap_or_default();
+        let warns = notes.matches("只 WARN 不拒启").count();
+        assert!(warns >= 1, "至少 1 条 warn（实际 {warns}）：{notes}");
+        assert!(notes.contains("xdns frag"), "frag 告警必须在：{notes}");
+        assert!(notes.contains("无连接级准入闸"), "QUIC 窗告警（缺准入闸那句）必须在：{notes}");
+    }
+
     fn quic_inbound(tag: &str) -> BuiltInbound {
         BuiltInbound {
             entry: BuiltEntry { kind: "dokodemo-door".into(), data: b"{}".to_vec() },
@@ -470,6 +793,18 @@ mod tests {
             listen: Some("127.0.0.1".into()),
             stream_settings_json: Some(serde_json::json!({"network": "splithttp"})),
             sniffing_json: None,
+        }
+    }
+
+    /// xdns 服务端入站（`finalmask.udp[{"type":"xdns"}]`，Go `udp/hub.go:61-62`
+    /// WrapPacketConnServer 形态；每实例一份 frag 重组器）。
+    fn xdns_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            stream_settings_json: Some(serde_json::json!({
+                "network": "tcp",
+                "finalmask": { "udp": [{ "type": "xdns", "settings": {} }] }
+            })),
+            ..splithttp_inbound(tag)
         }
     }
 

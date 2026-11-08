@@ -22,7 +22,58 @@
 //!
 //! 每连接在途字节数（BDP）由链路 RTT × 带宽决定，砍它就直接砍吞吐（bd u440m：
 //! 2MiB 闸在 RTT 161.6ms 下 −6.1%）。所以单连接窗口**不压缩**，内存靠
-//! `总预算 / 每连接规划上界` 得到的连接数上限控制，触顶走 fail-visible 拒绝。
+//! `总预算 / 每连接满载上界` 得到的连接数上限控制，触顶走 fail-visible 拒绝。
+//!
+//! ## 归属判定（§3.5.5 三判据，bd 2026-11-08 D-05）
+//!
+//! 本文件此前零举证（472 行躺在 `xray-common` 里），按三判据**逐条**给出结论
+//! ——**机制上浮 udf，策略留派生层**（不是整件留仓，也不是整件上浮）：
+//!
+//! **① 零 xray 语义？→ 部分。** 探测机制（cgroup v2 `memory.max` / v1
+//! `memory.limit_in_bytes` / `/proc/meminfo MemAvailable` / Windows
+//! `GlobalMemoryStatusEx`）是**进程级平台机制**，零 xray 语义 ⇒ 归 udf
+//! （`skeleton_infra`，与 clock/logx/shutdown 同族；提炼判据「零 xray 类型 =
+//! 全泛型/trait」成立）。但**档位策略不归 udf**：40/96/192/512 MiB 四档、
+//! 闸 = 预算/8、连接数反解都绑着 Xray 自身的池/缓存分账（`xray_frame::budget`
+//! 的 16 项），且 env 名带 `XRAY_` 前缀 ⇒ 属 Xray 语义。
+//!
+//! **② 非零语义 → 派生层？→ 是，归 `xray-frame`。** `MemoryTier`/`MemoryPlan`
+//! 是「装配期一次派生的进程级能力」，与 `xray_frame::budget` 同一归属（ADR-0002
+//! 登记簿拆分后预算常量已在那里，派生产式与之同址才谈得上对账）。
+//!
+//! **③ 连派生层都放不合适？→ 否（本轮留仓纯属迁移前置未清，非归属结论）。**
+//! 迁移前置：`xray-frame` 不能反向依赖 `xray-common`——`xray-common` 已依赖
+//! `xray-frame`（唯一边 = `log::set_secrets` 写 `logging::GLOBAL_SECRETS`，
+//! 已登记为例外，待 udf 提供掩码表读面后删除）。故迁移必须先走完 ① 的上浮。
+//!
+//! **迁移清单**（另开票；本轮只出判定，不动代码）：
+//! 1. udf PR：`skeleton_infra::mem_probe`（`probe_available` + 三个纯解析器
+//!    `parse_cgroup_v2_max`/`parse_cgroup_v1_limit`/`parse_meminfo_available`
+//!    + `GlobalMemoryStatusEx` FFI）——零 xray 语义，三平台 CI 绿；
+//! 2. 主仓：`MemoryTier`/`MemoryPlan`/`BRIDGE_GATE_*`/`PER_CONN_UPPER_BYTES`/ `ENV_*` +
+//!    [`set_effective_max_conns`] 迁 `xray_frame::budget::plan` （派生层），改依赖 udf 探测件；
+//! 3. 删 `xray-common/src/mem_probe.rs` 与 `pub use`；两调用方换 import
+//!    （`xray-transport::bridge`、`xray-core::memory_budget`——两者**已**依赖
+//!    `xray-frame`，零新增依赖边）。
+//!
+//! ## 满载乘积**过订**的显式登记（bd 2026-11-08 D-01，口径经 PM 修正）
+//!
+//! 桥每方向字节闸（`bridge_gate`）兜的是「生产者远快于消费者」的**瞬态背压**
+//! （lazy 分配，正常链路实际在途远小于闸），不是每连接常驻预算。因此
+//! `max_conns × 2 × bridge_gate` 与 `total_budget` **必然过订**：四档分别为
+//! 130 / 768 / 3072 / 10880 MiB vs 预算 40 / 96 / 192 / 512 MiB（3.3×–21×）。
+//!
+//! **处置（C 案，PM 2026-11-08 拍板）**：
+//! - **不动 `max_conns` 派生**（`total_budget / PER_CONN_UPPER_BYTES` = 13/32/64/170）：
+//!   用闸反解并发会把生产连接上限砍到 4/4/4/8 条（单浏览器一页 6 连接即打满），
+//!   属「为账面自洽牺牲功能」⇒ 打回。
+//! - **过订如实进预算门 caps 栏 + WARN**（`xray-core::memory_budget`）：旧状 caps 里只有「闸
+//!   per-conn」单值，乘积面不可见 ⇒ 运维无从判断最坏情形；
+//!   现在把乘积上界写成一条显式记录并告警，**禁静默**。
+//! - 最坏情形由闸自身兜（单连接超闸块永不阻塞；并发同时过判定只允许软超闸少量）。
+//! - **全局共享配额**（进程级 in-flight 预算 `total_budget/2`，每连接 `min(per_conn_gate,
+//!   全局剩余)`，乘积由构造自洽且并发不降）是正确终态，但属 bridge 数据面改造 + 必带 A/B
+//!   门，**本轮不做**（另开票）。
 
 use std::sync::LazyLock;
 
@@ -41,7 +92,12 @@ const MIB: u64 = 1024 * 1024;
 ///
 /// 依据（用户口供 2026-11-07 「连接不会特别多，10–100 条」）：3MiB = 双向 pipe
 /// 缺省 512KiB × 2 + 单连接在途 ~2MiB（RTT 161.6ms 下实测 BDP 2.39–3.56MB 的
-/// 常驻份额）。四档由此得 13 / 32 / 64 / 170 条，小 VPS 自用足够。
+/// 常驻份额）。四档由此得 **13 / 32 / 64 / 170** 条，小 VPS 自用足够。
+///
+/// **不要**拿桥的双向闸（`2 × bridge_gate`）当每连接常驻来反解本条：闸是**瞬态
+/// 背压上界**（lazy 分配，正常链路远不满），按它反解会把四档并发砍到 4/4/4/8
+/// 条 = 为账面自洽牺牲功能（2026-11-08 PM 打回，D-01 口径修正）。满载乘积因此
+/// **过订**，如实登记进预算门 caps 栏 + WARN，不写进执行路径。
 pub const PER_CONN_UPPER_BYTES: usize = 3 * MIB as usize;
 
 /// 桥每方向字节闸的**下限**（字节）：实测 BDP 上沿 3.56MB 之上留余量，
@@ -171,6 +227,11 @@ impl MemoryPlan {
         // 恒 ≥ 实测 BDP 上沿 ⇒ 正常链路上闸不 binding（不砍吞吐），只在生产者
         // 远快于消费者时兜住内存。
         let bridge_gate = (total_budget / 8).clamp(BRIDGE_GATE_MIN_BYTES, BRIDGE_GATE_MAX_BYTES);
+        // 连接数上限只按**每连接规划上界**反解（bd sfqlu 原式，保持并发能力）。
+        // **不用** `2 × gate` 反解（D-01 口径修正 2026-11-08 PM 打回）：闸是**瞬态
+        // 背压上界**（lazy 分配，正常链路远不满），拿它当每连接常驻会把四档并发
+        // 砍到 4/4/4/8 条 —— 那是「为账面自洽牺牲功能」。满载乘积因此**过订**，
+        // 如实登记进预算门 caps 栏 + WARN（见 `xray-core::memory_budget`）。
         // `XRAY_MAX_CONNS=0` 视同未设（否则等于全拒，运维误设即服务不可用）。
         let max_conns = match max_conns_override {
             Some(n) if n > 0 => n,
@@ -194,6 +255,34 @@ impl MemoryPlan {
             self.max_conns,
         )
     }
+
+    /// 运行期**生效**的连接数上限（执行点唯一读数）。
+    ///
+    /// = 装配期降档值（[`set_effective_max_conns`]）优先，未写入时 = 本档派生值
+    /// [`Self::max_conns`]。降档**必须走到这里**（bd 2026-11-08 D-02）：旧状
+    /// 预算门算出的降档只写进 warn 文案，桥上仍读档位原值 ⇒ 运维看到的数字
+    /// 不是生效的数字。
+    #[must_use]
+    pub fn effective_max_conns(&self) -> usize {
+        match EFFECTIVE_MAX_CONNS.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => self.max_conns,
+            n => n,
+        }
+    }
+}
+
+/// 装配期写入的降档连接数上限（0 = 未写入 ⇒ 用档位派生值）。
+static EFFECTIVE_MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 写入运行期生效的连接数上限（装配期一次性，`xray-core::memory_budget` 调）。
+///
+/// 夹到 `≥ 1`：写 0 = 全拒（运维/测试误写即服务不可用），与
+/// `XRAY_MAX_CONNS=0` 视同未设同口径。返回值即实际生效值（调用方据此回填
+/// 报告，免二次读全局）。
+pub fn set_effective_max_conns(limit: usize) -> usize {
+    let limit = limit.max(1);
+    EFFECTIVE_MAX_CONNS.store(limit, std::sync::atomic::Ordering::Relaxed);
+    limit
 }
 
 /// 解析 `XRAY_MEM_LIMIT_MB` 值（`"256"` → 256；空/非数字 → `None`）。
@@ -355,6 +444,9 @@ mod tests {
     use super::*;
 
     /// 四档总预算 + 闸 + 连接数上限（对应验收 5：256/512/1024/不设 四档）。
+    ///
+    /// 连接数 13/32/64/170 = `total_budget / PER_CONN_UPPER_BYTES`（3MiB）——**保持
+    /// 旧派生量级**，绝不因满载乘积自洽而砍（2026-11-08 PM 打回）。
     #[test]
     fn tiers_derive_expected_budget_and_conns() {
         let tiny = MemoryPlan::from_available(256 * MIB);
@@ -381,6 +473,40 @@ mod tests {
         assert_eq!(large.total_budget, 512 * MIB as usize);
         assert_eq!(large.bridge_gate, BRIDGE_GATE_MAX_BYTES);
         assert_eq!(large.max_conns, 170);
+    }
+
+    /// D-01（口径经 PM 2026-11-08 修正）：满载乘积**过订是承认的事实**——
+    /// 闸是瞬态背压上界（lazy），不是每连接常驻 ⇒ 乘积 > 预算是设计取舍，
+    /// 由预算门 caps 栏 + WARN 显式登记（禁静默），**绝不反解压并发**。
+    ///
+    /// 本测试钉两头：① 并发数保持旧量级（≥ 13/32/64/170，防再被砍）；
+    /// ② 过订倍数算得出且被打印（运维判据），四档倍数 3.25/8/16/21.25。
+    // 取证数字须打印（--nocapture 人眼核对）——同 q1r4q 先例：显式 allow + 理由。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn full_load_product_is_registered_oversubscription() {
+        for (available, conns) in
+            [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
+        {
+            let plan = MemoryPlan::from_available(available);
+            assert_eq!(plan.max_conns, conns, "{available}B 档并发能力不得回退");
+            let product = plan.max_conns * 2 * plan.bridge_gate;
+            println!(
+                "tier {} budget {}B gate {}B/dir conns {} -> full-load product {}B ({:.2}x budget)",
+                plan.tier.as_str(),
+                plan.total_budget,
+                plan.bridge_gate,
+                plan.max_conns,
+                product,
+                product as f64 / plan.total_budget as f64
+            );
+            // 过订是事实，不是 bug——但必须能被算出来（禁把乘积塞进 max_conns 派生）。
+            assert!(
+                product > plan.total_budget,
+                "闸是瞬态背压上界 ⇒ 满载乘积过订；若此断言红说明 gate 被改小了，\
+                 须重审是否回档 bd u440m"
+            );
+        }
     }
 
     /// 大机器但不至于富余时的预算按可用 1/4（不到 512MB 上限）。
@@ -432,6 +558,19 @@ mod tests {
         // 上限 0 视为未设（否则等于全拒），落到派生值。
         let plan = MemoryPlan::build(256 * MIB, "test", Some(0));
         assert_eq!(plan.max_conns, 13);
+    }
+
+    /// 降档值与执行点读数同一事实源（bd 2026-11-08 D-02）：未写入 = 档位派生值，
+    /// 写入后 `effective_max_conns()` 立即反映（桥上 `ConnSlot` 读的就是它）。
+    /// 本测试是本进程唯一写该静态的用例 ⇒ 无需串行化。
+    #[test]
+    fn effective_max_conns_follows_degraded_write() {
+        let plan = MemoryPlan::from_available(256 * MIB);
+        assert_eq!(plan.effective_max_conns(), plan.max_conns, "未装配 = 档位派生值");
+        assert_eq!(set_effective_max_conns(2), 2, "写 2 生效 2");
+        assert_eq!(plan.effective_max_conns(), 2, "执行点必须读降档值");
+        assert_eq!(set_effective_max_conns(0), 1, "写 0 夹到 1（全拒不可接受）");
+        assert_eq!(plan.effective_max_conns(), 1);
     }
 
     #[test]

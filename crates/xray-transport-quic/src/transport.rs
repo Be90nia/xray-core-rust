@@ -127,6 +127,31 @@ pub async fn dial(
     Ok(Box::new(QuicConn::new(send, recv, local, Some(remote), endpoint)))
 }
 
+/// 进程级客户端 endpoint 池的键：`(disableGSO, receiveBufferSize, sendBufferSize)`。
+type ClientEndpointKey = (bool, i32, i32);
+
+/// 进程级客户端 endpoint 池（见 [`shared_client_endpoint`]）。停机期由
+/// [`close_shared_client_endpoints`] 清空——池不是无界缓存，但**必须随实例停机释放**：
+/// 旧端点（每个 8 MiB 内核缓冲 ×2）若永不被 drop，配置热重载换缓冲/GSO 组合即泄漏
+/// 整批 UDP socket，直到进程退出。
+static SHARED_CLIENT_ENDPOINTS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<ClientEndpointKey, quinn::Endpoint>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// 释放进程级客户端 endpoint 池（`Instance::close()` 停机末段调用）。
+///
+/// 对每个池内端点 `close()`（quinn 停止收发并在最后一个句柄 drop 时释放 UDP
+/// socket），再清空表——之后 `shared_client_endpoint` 会重新 bind。幂等。
+pub fn close_shared_client_endpoints() {
+    let drained: Vec<quinn::Endpoint> = {
+        let mut map = SHARED_CLIENT_ENDPOINTS.lock();
+        map.drain().map(|(_, ep)| ep).collect()
+    };
+    for ep in drained {
+        ep.close(quinn::VarInt::from_u32(0), b"instance closed");
+    }
+}
+
 /// 进程级客户端 QUIC endpoint 复用（bd jzwib）。
 ///
 /// 原实现每条出站连接各自 `make_endpoint` 新 bind 一个 UDP socket：QUIC 系 socket 缺省
@@ -141,13 +166,8 @@ fn shared_client_endpoint(
     disable_gso: bool,
     sockopt: &SocketOptions,
 ) -> io::Result<quinn::Endpoint> {
-    type Key = (bool, i32, i32);
-    static ENDPOINTS: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashMap<Key, quinn::Endpoint>>,
-    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
     let key = (disable_gso, sockopt.receive_buffer_size, sockopt.send_buffer_size);
-    let mut map = ENDPOINTS.lock();
+    let mut map = SHARED_CLIENT_ENDPOINTS.lock();
     if let Some(ep) = map.get(&key) {
         return Ok(ep.clone());
     }
@@ -408,6 +428,15 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
 mod tests {
     use super::*;
 
+    /// 池内端点计数（停机释放的观察面；仅测试可见）。
+    fn shared_client_endpoint_count() -> usize {
+        SHARED_CLIENT_ENDPOINTS.lock().len()
+    }
+
+    /// 池是进程级静态：断言池内容的用例必须串行（否则互相 drain/复用）。
+    /// 用 tokio Mutex：guard 要跨 await 持有，std 版会触发 `clippy::await_holding_lock`。
+    static POOL_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn ensure_provider() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -420,6 +449,7 @@ mod tests {
     /// 低估真实内核占用（6 条并发 = 96MiB 却只记 1 份）。
     #[tokio::test]
     async fn client_endpoint_is_shared_per_config() {
+        let _guard = POOL_GUARD.lock().await;
         let a = shared_client_endpoint(false, &SocketOptions::default()).unwrap();
         let b = shared_client_endpoint(false, &SocketOptions::default()).unwrap();
         assert_eq!(
@@ -435,6 +465,41 @@ mod tests {
         )
         .unwrap();
         assert_ne!(a.local_addr().unwrap(), c.local_addr().unwrap());
+    }
+
+    /// 停机释放（审计 2026-11-08 CQ P2 #2）：`Instance::close()` 收尾调
+    /// [`close_shared_client_endpoints`] ⇒ 池清空 + 旧端点被 close（每个端点
+    /// 8 MiB 内核缓冲 ×2 不再随进程钉住）。`accept()` 是关闭的观察面：开着时挂起，
+    /// 关闭后立即 `None`。
+    ///
+    /// 用**本用例独占的缓冲键**：池是进程级静态，但 quinn endpoint 的 driver 绑在
+    /// 创建它的 tokio runtime 上——复用别的用例留下的池项会拿到 `driver_lost` 的
+    /// 死端点（accept 立即 None），对照组就失去判别力（实测踩过）。
+    #[tokio::test]
+    async fn shutdown_releases_shared_client_endpoints() {
+        let _guard = POOL_GUARD.lock().await;
+        let sockopt = SocketOptions { send_buffer_size: 3 << 20, ..Default::default() };
+        let ep = shared_client_endpoint(false, &sockopt).unwrap();
+        assert!(shared_client_endpoint_count() > 0, "取用后池内应有端点");
+        // 对照组：未关闭时 accept 挂起（超时 = 仍在服务）。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), ep.accept()).await.is_err(),
+            "close 前 endpoint 必须存活（accept 挂起）"
+        );
+
+        close_shared_client_endpoints();
+
+        assert_eq!(shared_client_endpoint_count(), 0, "停机后池必须清空");
+        let closed = tokio::time::timeout(Duration::from_secs(1), ep.accept()).await;
+        assert!(matches!(closed, Ok(None)), "close 后旧端点 accept 必须收 None: {closed:?}");
+
+        // 池可重新填充（stop → start 后仍能拨号）。
+        let fresh = shared_client_endpoint(false, &sockopt).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), fresh.accept()).await.is_err(),
+            "重新取用得到的是新端点（未复用一个已关闭的句柄）"
+        );
+        close_shared_client_endpoints();
     }
 
     /// 服务端 StreamSettings：显式配一张自签证书。

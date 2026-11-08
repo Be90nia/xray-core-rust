@@ -4893,6 +4893,14 @@ async fn spawn_unix_transport_inbound(
             ),
         ));
     };
+    // L2 能力句柄先于 on_conn 构造：per-conn 连接任务与监听保活任务共用同一
+    // scope（§3.5.6 ①类；ctx 经 `UnixTransportCtx` 穿进各臂）。
+    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
+    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
+    if let Some(api) = api {
+        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
+    }
+    let arm_ctx = Arc::new(ctx_builder);
     let on_conn = build_on_conn(crate::arm_builders::UnixTransportCtx {
         ib,
         ohm: &ohm,
@@ -4900,6 +4908,7 @@ async fn spawn_unix_transport_inbound(
         settings: &settings,
         api,
         ident: listen,
+        plugin_ctx: Arc::clone(&arm_ctx),
     })?;
     // sockopt 先取（trustedXForwardedFor 等，Go socketSettings 对 unix 分支
     // 同样生效）；settings 随后移入 registry。
@@ -4907,13 +4916,6 @@ async fn spawn_unix_transport_inbound(
     let listener =
         xray_transport::listener_registry::listen_unix(listen, settings, sockopt, on_conn).await?;
     tracing::info!(tag = %ib.tag, path = %listen, "transport inbound listening (unix)");
-    // L2 能力句柄：监听保活任务同 transport 分支同源（arm_plugin_ctx 派发点构造）。
-    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
-    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str());
-    if let Some(api) = api {
-        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
-    }
-    let arm_ctx = std::sync::Arc::new(ctx_builder);
     Ok(Some(spawn_inbound_serve(&arm_ctx, ib.tag.clone(), shutdown_token, async move {
         let _listener = listener;
         std::future::pending::<()>().await;
@@ -5224,10 +5226,11 @@ pub(crate) fn build_trojan_users(
     let client_list = v.get("clients").or_else(|| v.get("users")).and_then(|c| c.as_array());
     if let Some(clients) = client_list {
         for c in clients {
-            // Trojan Flow 已移除（Go infra/conf/trojan.go:134-136 服务端逐用户检查）。
-            // Rust 保留现行为：warn + 忽略该字段继续建用户。
-            if let Some(w) = crate::outbound::trojan_flow_removed_warning(c) {
-                xray_common::log::warning(w);
+            // Go infra/conf/trojan.go:134-136：服务端逐用户 flow 非空 →
+            // `PrintRemovedFeatureError` ⇒ 整配置加载失败。三路（入站/出站/插件）
+            // 统一拒启，勿再本地降级成 warn+忽略（同 feature 两种处理 = 静默复活）。
+            if let Some(msg) = crate::outbound::trojan_flow_removed_warning(c) {
+                return Err(std::io::Error::other(msg));
             }
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -11870,15 +11873,15 @@ mod tests {
     }
 
     #[test]
-    fn build_trojan_users_with_flow_still_builds() {
-        // Trojan Flow 已移除（Go trojan.go:134-136 硬报错）；Rust warn + 不阻断：
-        // 带 flow 的 client 仍正常入表（触发文案断言见 outbound 侧 helper 测试）。
+    fn build_trojan_users_rejects_flow() {
+        // Go trojan.go:134-136：flow 非空 → `PrintRemovedFeatureError` 整配置拒启。
+        // 入站/出站/插件三路同一语义（曾为 warn+忽略，与出站路相反）。
         let settings = serde_json::json!({
             "clients": [{ "password": "secret", "email": "alice", "flow": "xtls-rprx-vision" }],
         });
         let data = serde_json::to_vec(&settings).unwrap();
-        let users = super::build_trojan_users(&data).unwrap();
-        assert_eq!(users.len(), 1, "flow field should not block user build");
+        let err = super::build_trojan_users(&data).expect_err("trojan flow must reject");
+        assert!(err.to_string().contains("Flow for Trojan"), "实际: {err}");
     }
     #[test]
     fn build_trojan_users_empty_clients() {

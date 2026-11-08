@@ -100,6 +100,10 @@ pub(crate) struct UnixTransportCtx<'a> {
     pub(crate) api: Option<&'a crate::inbound::InboundRuntime>,
     /// 监听标识：UDS 路径（TCP 侧同位置传 `addr:port`）。
     pub(crate) ident: &'a str,
+    /// L2 能力句柄（与 TCP 臂同源，见 [`InboundCtx::plugin_ctx`]）：per-conn
+    /// 连接任务经它的 scope 托管（§3.5.6 ①类），与 UDS listener 保活任务同一
+    /// scope——停机随 arm scope 取消。
+    pub(crate) plugin_ctx: Arc<PluginContext>,
 }
 
 pub(crate) type UnixTransportBuilder =

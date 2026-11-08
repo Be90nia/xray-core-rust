@@ -91,6 +91,33 @@ pub const SOCKET_KERNEL_BOOKKEEPING_FACTOR: usize = 2;
 pub const QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES: usize =
     QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES * SOCKET_KERNEL_BOOKKEEPING_FACTOR;
 
+/// QUIC **连接级接收窗**账面（字节/已建立连接）= 32 MiB（quinn
+/// `TransportConfig::receive_window`，**应用层真缓冲**）。
+///
+/// **与 [`QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES`] 不同账**：那是内核
+/// `SO_RCVBUF`（每 socket，1 端点 1 份）；本项是流控信用换来的、对端在窗内可
+/// **无背压灌满**的缓冲，**每已建立连接一份**。
+///
+/// **为什么必须入硬账（bd 2026-11-08 D-03）**：已握手的 QUIC 连接**没有连接级
+/// 准入闸**（唯一的闸是握手在飞 [`HANDSHAKE_INFLIGHT_MAX`]），旧簿只登记了
+/// socket 面 ⇒ N 条连接可占 `N × 32 MiB` 而预算门看不见。现计入预算门硬账，
+/// 乘数 = **本预算余量实际装得下几条满窗连接**（`min(并发上限, 余额/32MiB)`；
+/// 用档位最大并发当乘数会恒得 10× 超账 ⇒ 告警退化成噪音，PM 2026-11-08 纠偏），
+/// 真装不下时 emit WARN 点明「第 N+1 条起不受预算约束」（用户裁决：预算不足
+/// **不得拒启**）。
+///
+/// 值 = 实现缺省
+/// `xray_transport_quic::config::DEFAULT_CONNECTION_RECEIVE_WINDOW`
+/// （交叉断言钉住，改实现即红）。流窗（[`QUIC_STREAM_RECEIVE_WINDOW_BYTES`]）
+/// 的花费由连接窗信用发放 ⇒ 是**连接窗内**的子份额，不叠加记账。
+pub const QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES: usize = 32 * 1024 * 1024;
+
+/// QUIC 缺省**流级**接收窗（字节/流）= 16 MiB——与实现缺省交叉断言钉住
+/// （防回档：bd wz2b W4 把它从 quinn 缺省 1.25 MiB 抬到 16 MiB，缩回去会钉
+/// 高 BDP 吞吐）。**不单独入账**：流的字节花在连接窗信用内
+/// （[`QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES`] 已含）。
+pub const QUIC_STREAM_RECEIVE_WINDOW_BYTES: usize = 16 * 1024 * 1024;
+
 /// 握手在途任务并发上限（P0-1 accept 解耦后 per-conn 握手任务数）。
 ///
 /// **64**——与实现 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES` 同一

@@ -7,9 +7,15 @@ use std::{io, sync::Arc};
 
 /// 缺省流接收窗（bd wz2b W4：quinn 缺省流收窗 1.25MB STREAM_RWND 高 BDP 钉
 /// 1.25MB/RTT@169ms≈7.4MB/s；缺省显式 16MB，与 h2 族同值）。
-const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
+///
+/// **pub 是为了登记簿交叉断言**（`xray_frame::budget::QUIC_STREAM_RECEIVE_WINDOW_BYTES`，
+/// 同 `handshake_gate::MAX_INFLIGHT_HANDSHAKES` 先例）；行为面不变。
+pub const DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 /// 缺省连接接收窗（与 splithttp/grpc h2 连接窗同值）。
-const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 32 * 1024 * 1024;
+///
+/// **pub 是为了登记簿交叉断言**（`xray_frame::budget::QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES`
+/// ——这是**应用层真缓冲**，与 socket `SO_RCVBUF` 不同账，bd 2026-11-08 D-03）。
+pub const DEFAULT_CONNECTION_RECEIVE_WINDOW: u64 = 32 * 1024 * 1024;
 /// 缺省空闲超时（毫秒）。Go `transport/internet/quic/dialer.go`（v26 移除前）硬编码
 /// `MaxIdleTimeout: 300s`——quinn 缺省 30s 会把长空闲会话早抬重付握手。
 const DEFAULT_MAX_IDLE_TIMEOUT_MS: u64 = 300_000;

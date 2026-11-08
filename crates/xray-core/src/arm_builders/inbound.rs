@@ -225,8 +225,16 @@ pub(crate) async fn build_vless_inbound(
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        let on_conn =
-            vless_transport_on_conn(ib, &ohm, &settings, validator, options, bind_addr, addr)?;
+        let on_conn = vless_transport_on_conn(
+            ib,
+            &ohm,
+            &settings,
+            validator,
+            options,
+            bind_addr,
+            addr,
+            &plugin_ctx,
+        )?;
         return spawn_transport_listener_inbound(
             &plugin_ctx,
             &ib.tag,
@@ -296,7 +304,15 @@ pub(crate) async fn build_trojan_inbound(
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
         let on_conn = trojan_transport_on_conn(
-            ib, &ohm, &policy, &settings, validator, fallbacks, bind_addr, addr,
+            ib,
+            &ohm,
+            &policy,
+            &settings,
+            validator,
+            fallbacks,
+            bind_addr,
+            addr,
+            &plugin_ctx,
         )?;
         return spawn_transport_listener_inbound(
             &plugin_ctx,
@@ -384,8 +400,16 @@ pub(crate) async fn build_vmess_inbound(
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        let on_conn =
-            vmess_transport_on_conn(ib, &ohm, &policy, &settings, validator, bind_addr, addr)?;
+        let on_conn = vmess_transport_on_conn(
+            ib,
+            &ohm,
+            &policy,
+            &settings,
+            validator,
+            bind_addr,
+            addr,
+            &plugin_ctx,
+        )?;
         return spawn_transport_listener_inbound(
             &plugin_ctx,
             &ib.tag,
@@ -591,7 +615,7 @@ pub(crate) async fn build_shadowsocks_inbound(
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
         })?;
-        let on_conn = ss_transport_on_conn(ib, &ohm, &policy, api, &settings, addr)?;
+        let on_conn = ss_transport_on_conn(ib, &ohm, &policy, api, &settings, addr, &plugin_ctx)?;
         return spawn_transport_listener_inbound(
             &plugin_ctx,
             &ib.tag,
@@ -976,6 +1000,8 @@ pub(crate) async fn build_freedom_inbound(
 // （对齐 Go UnixConnWrapper.RemoteAddr）。
 
 /// vless transport 分支 ConnHandler（ws/grpc/kcp/httpupgrade/splithttp）。
+// 8 参 = TCP/unix 双路径直译签名，打包聚合体属内部 API 变更（同 trojan_transport_on_conn 先例）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vless_transport_on_conn(
     ib: &BuiltInbound,
     ohm: &Arc<SimpleOhm>,
@@ -984,6 +1010,7 @@ pub(crate) fn vless_transport_on_conn(
     mut options: VlessInboundOptions,
     fallback_addr: std::net::SocketAddr,
     ident: &str,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     // splithttp 入站 AllowedNetwork（Go proxyman inbound.go:177-179）
     if settings.protocol == "splithttp" {
@@ -994,17 +1021,15 @@ pub(crate) fn vless_transport_on_conn(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let fallbacks = build_vless_fallbacks(&ib.entry.data)?;
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, users = validator.get_uuid_count(), "vless transport inbound listening");
+    let plugin_ctx = Arc::clone(plugin_ctx);
     Ok(Arc::new(move |conn| {
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let fallbacks = fallbacks.clone();
         let options = options.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（vless fallback，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
+        let spawned = plugin_ctx.spawn(async move {
             // TLS 已在 transport hub 内终结，name/alpn 不可得
             if let Err(e) = xray_proxy_vless::handle_connection_with_fallback(
                 conn,
@@ -1024,11 +1049,15 @@ pub(crate) fn vless_transport_on_conn(
                 tracing::info!(peer = %peer, error = %e, "vless transport connection ended with error");
             }
         });
+        if spawned.is_err() {
+            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
+            tracing::warn!(peer = %peer, "vless transport: arm scope closed at shutdown, dropping connection");
+        }
     }))
 }
 
 /// trojan transport 分支 ConnHandler。
-#[allow(clippy::too_many_arguments)] // 8 参 = TCP/unix 双路径直译签名，打包聚合体属内部 API 变更
+#[allow(clippy::too_many_arguments)] // 9 参 = TCP/unix 双路径直译签名，打包聚合体属内部 API 变更
 pub(crate) fn trojan_transport_on_conn(
     ib: &BuiltInbound,
     ohm: &Arc<SimpleOhm>,
@@ -1039,22 +1068,21 @@ pub(crate) fn trojan_transport_on_conn(
     fallbacks: Option<Arc<xray_proxy_trojan::fallback::FallbackPolicy>>,
     fallback_addr: std::net::SocketAddr,
     ident: &str,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, users = validator.get_key_count(), "trojan transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
+    let plugin_ctx = Arc::clone(plugin_ctx);
     Ok(Arc::new(move |conn| {
         let validator = Arc::clone(&validator);
         let handler = Arc::clone(&handler);
         let fb_policy = fallbacks.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（trojan fallback，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
+        let spawned = plugin_ctx.spawn(async move {
             xray_proxy_trojan::serve_trojan_conn(
                 conn,
                 validator,
@@ -1068,10 +1096,16 @@ pub(crate) fn trojan_transport_on_conn(
             )
             .await;
         });
+        if spawned.is_err() {
+            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
+            tracing::warn!(peer = %peer, "trojan transport: arm scope closed at shutdown, dropping connection");
+        }
     }))
 }
 
 /// vmess transport 分支 ConnHandler。
+// 8 参 = TCP/unix 双路径直译签名，打包聚合体属内部 API 变更（同 trojan_transport_on_conn 先例）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn vmess_transport_on_conn(
     ib: &BuiltInbound,
     ohm: &Arc<SimpleOhm>,
@@ -1080,32 +1114,28 @@ pub(crate) fn vmess_transport_on_conn(
     validator: Arc<xray_proxy_vmess::TimedUserValidator>,
     fallback_addr: std::net::SocketAddr,
     ident: &str,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     let history = Arc::new(xray_proxy_vmess::SessionHistory::new());
-    // bd txtpo：反重放历史的 30s 周期清理（Go task.Periodic）。托管 ctx 就地构造
-    // （同 ss_transport_on_conn），由返回的 ConnHandler 闭包保活——监听器结束即
-    // 随 scope 收口，任务不会活得比 inbound 久。
-    let cleanup_ctx = Arc::new(crate::arm_builders::arm_plugin_ctx(ib.entry.kind.as_str()));
-    history.start_cleanup(&cleanup_ctx);
+    // bd txtpo：反重放历史的 30s 周期清理（Go task.Periodic）。清理任务与本臂同一
+    // ctx scope——监听器结束即随 scope 收口，任务不会活得比 inbound 久。
+    let history_ctx = Arc::clone(plugin_ctx);
+    history.start_cleanup(&history_ctx);
     // transport 层无 TLS 时维持裸 TCP 的 drain 防指纹语义（Go：!isTLS → drain）
     let is_drain = !settings.is_tls();
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "vmess transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
+    let plugin_ctx = Arc::clone(plugin_ctx);
     Ok(Arc::new(move |conn| {
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
-        // 保活：清理任务挂在 cleanup_ctx 的 scope 上，闭包在监听器存活期间持有它。
-        let _cleanup_ctx = Arc::clone(&cleanup_ctx);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（vmess，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
-            let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
+        let spawned = plugin_ctx.spawn(async move {
             if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
                 conn, &handler, &validator, &history, is_drain, hs_timeout,
             )
@@ -1115,6 +1145,10 @@ pub(crate) fn vmess_transport_on_conn(
                 tracing::info!(peer = %peer, error = %e, "vmess transport connection ended with error");
             }
         });
+        if spawned.is_err() {
+            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
+            tracing::warn!(peer = %peer, "vmess transport: arm scope closed at shutdown, dropping connection");
+        }
     }))
 }
 
@@ -1127,6 +1161,7 @@ pub(crate) fn ss_transport_on_conn(
     api: Option<&crate::inbound::InboundRuntime>,
     settings: &xray_transport::dialer::StreamSettings,
     ident: &str,
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     let mode = parse_ss_inbound_config(&ib.entry.data)?;
     register_ss_user_manager(api, &ib.tag, &mode);
@@ -1135,16 +1170,18 @@ pub(crate) fn ss_transport_on_conn(
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
     tracing::info!(tag = %ib.tag, addr = %ident, network = %settings.protocol, security = %settings.security, "ss transport inbound listening");
     let hs_timeout = handshake_timeout_for(policy, 0);
+    let plugin_ctx = Arc::clone(plugin_ctx);
     Ok(Arc::new(move |conn| {
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类·脱管债（bd kwevg · §3.5.6）：inbound 连接处理任务（ss/ss2022，每连接）；寿命随所属连接或会话 ⇒ 本应随组件停机取消，因本层无 PluginContext/ctx 可穿而临时脱管；接线 = xray_frame::compat::ManagedScope（P1 插件装配）"
-        )]
-        tokio::spawn(async move {
+        // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
+        let spawned = plugin_ctx.spawn(async move {
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
         });
+        if spawned.is_err() {
+            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
+            tracing::warn!("ss transport: arm scope closed at shutdown, dropping connection");
+        }
     }))
 }
 
@@ -1383,13 +1420,8 @@ pub(crate) fn unix_vless_transport(
     ctx: UnixTransportCtx<'_>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
     let validator: Arc<dyn VlessValidator> = build_vless_validator(&ctx.ib.entry.data)?;
-    // L2 能力句柄：与 UDS 裸流分支同源（arm_plugin_ctx 派发点构造）。
-    // bd a9xgp：宿主登记表接线（api 缺省 = 独立构造不接线）。
-    let mut ctx_builder = crate::arm_builders::arm_plugin_ctx(ctx.ib.entry.kind.as_str());
-    if let Some(api) = ctx.api {
-        ctx_builder = ctx_builder.with_arm_registry(Arc::clone(api.arm_scopes()));
-    }
-    let decryption = build_vless_decryption(&ctx.ib.entry.data, Arc::new(ctx_builder))?;
+    // L2 能力句柄：直接消费 ctx 已构造/已接线的 arm ctx（不再就地造第二份）。
+    let decryption = build_vless_decryption(&ctx.ib.entry.data, Arc::clone(&ctx.plugin_ctx))?;
     let mut options = VlessInboundOptions {
         decryption: decryption.clone(),
         handshake_timeout: Some(handshake_timeout_for(ctx.policy, 0)),
@@ -1404,6 +1436,7 @@ pub(crate) fn unix_vless_transport(
         options,
         uds_fallback_addr(),
         ctx.ident,
+        &ctx.plugin_ctx,
     )
 }
 
@@ -1424,6 +1457,7 @@ pub(crate) fn unix_trojan_transport(
         fallbacks,
         uds_fallback_addr(),
         ctx.ident,
+        &ctx.plugin_ctx,
     )
 }
 
@@ -1440,6 +1474,7 @@ pub(crate) fn unix_vmess_transport(
         validator,
         uds_fallback_addr(),
         ctx.ident,
+        &ctx.plugin_ctx,
     )
 }
 
@@ -1447,7 +1482,15 @@ pub(crate) fn unix_vmess_transport(
 pub(crate) fn unix_shadowsocks_transport(
     ctx: UnixTransportCtx<'_>,
 ) -> std::io::Result<xray_transport::listener_registry::ConnHandler> {
-    ss_transport_on_conn(ctx.ib, ctx.ohm, ctx.policy, ctx.api, ctx.settings, ctx.ident)
+    ss_transport_on_conn(
+        ctx.ib,
+        ctx.ohm,
+        ctx.policy,
+        ctx.api,
+        ctx.settings,
+        ctx.ident,
+        &ctx.plugin_ctx,
+    )
 }
 
 // ---- tun：自管监听面（不消费 TCP 地址，入口见 needs_listen_addr=false 直接分派） ----
@@ -1781,5 +1824,126 @@ mod socks_http_fallback_tests {
             .expect("HTTP CONNECT 的目标必须交给 dispatch")
             .expect("recorder 通道未关");
         assert!(dest.contains("example.com"), "dispatch 目标须是 CONNECT 目标: {dest}");
+    }
+}
+
+#[cfg(test)]
+mod transport_on_conn_shutdown_tests {
+    //! §3.5.6 ①类验收（审计 2026-11-08 code-quality / architecture）：四条
+    //! transport on_conn 臂的连接任务改经 `PluginContext::spawn` 托管后，
+    //! arm scope 已关时的**新连接必须被拒并留日志**——不静默丢、也不复用
+    //! 已关 scope 假装成功。
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+    use xray_app_dispatcher::default::SimpleOhm;
+    use xray_conf::{BuiltEntry, BuiltInbound};
+    use xray_transport::connection::{Connection, DuplexConnection};
+
+    use super::*;
+
+    fn freedom_ohm() -> Arc<SimpleOhm> {
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(xray_app_dispatcher::default::DialBridge::new(
+            "freedom",
+            xray_proxy_freedom::make_freedom_dial_fn(),
+        )) as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        ohm
+    }
+
+    fn trojan_ib() -> BuiltInbound {
+        BuiltInbound {
+            entry: BuiltEntry {
+                kind: "trojan".into(),
+                data: br#"{"clients":[{"password":"shutdownpw"}]}"#.to_vec(),
+            },
+            tag: "trojan-shutdown".into(),
+            port: Some(12829),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: None,
+            sniffing_json: None,
+        }
+    }
+
+    /// tracing 事件捕获（同 `inbound.rs` `WarnCapture` 口径：无 tracing-subscriber 依赖）。
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.level() <= &tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fmt(String);
+            impl tracing::field::Visit for Fmt {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut v = Fmt(String::new());
+            event.record(&mut v);
+            self.0.lock().push(v.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn closed_arm_scope_rejects_new_connection_and_warns() {
+        let ohm = freedom_ohm();
+        let ib = trojan_ib();
+        let arm = Arc::new(xray_frame::PluginContext::for_plugin("trojan"));
+        let on_conn = trojan_transport_on_conn(
+            &ib,
+            &ohm,
+            &None,
+            &xray_transport::dialer::StreamSettings::default(),
+            Arc::new(xray_proxy_trojan::Validator::new()),
+            None,
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:12829",
+            &arm,
+        )
+        .expect("on_conn 构造");
+
+        // 停机：arm scope 关闸（同 `Instance::close` 的 arm 级联形态）。
+        arm.arm_scope().close();
+        assert!(arm.arm_scope().is_closed(), "关闸后 accepting 闸必须为关");
+
+        let capture = WarnCapture::default();
+        let (mut peer, server) = tokio::io::duplex(64);
+        tracing::subscriber::with_default(capture.clone(), || {
+            on_conn(Box::new(DuplexConnection::new(server)) as Box<dyn Connection>);
+        });
+
+        let lines = capture.0.lock().join("\n");
+        assert!(lines.contains("arm scope closed at shutdown"), "必须留诊断日志: {lines:?}");
+        assert_eq!(arm.arm_scope().fx().in_flight(), 0, "关闸后不得再入 scope");
+
+        // 被拒连接必须 drop（不是静默挂住）：对端读到 EOF。
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut buf))
+            .await
+            .expect("被拒连接必须立即关闭（peer 读不得超时）")
+            .expect("read");
+        assert_eq!(n, 0, "被拒连接必须 drop（peer 读 EOF）");
     }
 }
