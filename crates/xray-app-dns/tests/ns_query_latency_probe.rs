@@ -224,24 +224,35 @@ async fn spawn_counting_h2c_doh_server(
                     if close_after_first_response && served > 0 {
                         return; // 复用的第二个请求：断开连接（对端关闭语义）
                     }
-                    let mut body = req.into_body();
-                    let mut buf = Vec::new();
-                    while let Some(chunk) = body.data().await {
-                        let Ok(chunk) = chunk else { return };
-                        buf.extend_from_slice(&chunk);
-                    }
-                    let Ok(q) = Message::from_vec(&buf) else { return };
-                    let payload = make_a_response(q.metadata.id, &fqdn, ips.clone(), ttl);
-                    let resp = http::Response::builder()
-                        .status(http::StatusCode::OK)
-                        .header(http::header::CONTENT_TYPE, "application/dns-message")
-                        .body(())
-                        .unwrap();
-                    let Ok(mut send) = respond.send_response(resp, false) else { return };
-                    if send.send_data(bytes::Bytes::from(payload), true).is_err() {
-                        return;
-                    }
                     served += 1;
+                    // 请求体排空 + 应答放**独立任务**：accept 环是 h2 连接 I/O 的唯一
+                    // 驱动者，环内 `await` `data()` 会把驱动者堵死——DATA 帧未入缓冲时
+                    // 永久挂起（bd ll2hr 同款，Linux 必现）。`served` 在 accept 时即计
+                    // （顺序客户端下与旧「应答后计」观测等价）。
+                    let fqdn = fqdn.clone();
+                    let ips = ips.clone();
+                    xray_common::testing::spawn("ns-latency-probe-h2c-doh-answer", async move {
+                        let mut body = req.into_body();
+                        let mut buf = Vec::new();
+                        // fail-loud 护栏：读不齐 = 连接驱动被堵（把排空挪回 accept 环即复发）。
+                        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                            while let Some(chunk) = body.data().await {
+                                let Ok(chunk) = chunk else { return };
+                                buf.extend_from_slice(&chunk);
+                            }
+                        })
+                        .await;
+                        assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
+                        let Ok(q) = Message::from_vec(&buf) else { return };
+                        let payload = make_a_response(q.metadata.id, &fqdn, ips, ttl);
+                        let resp = http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "application/dns-message")
+                            .body(())
+                            .unwrap();
+                        let Ok(mut send) = respond.send_response(resp, false) else { return };
+                        let _ = send.send_data(bytes::Bytes::from(payload), true);
+                    });
                 }
             });
         }
