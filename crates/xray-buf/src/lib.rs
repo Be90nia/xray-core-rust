@@ -10,11 +10,9 @@
 
 pub mod alloc;
 pub mod buffer;
-pub mod copy;
 pub mod io;
 pub mod multi;
 pub mod pipe;
 pub mod reader;
 pub mod readv;
-pub mod timeout;
 pub mod writer;
