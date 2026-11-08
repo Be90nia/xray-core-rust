@@ -18,11 +18,16 @@
 //!
 //! 非 Windows：机制不适用（helper 透传），只留透传冒烟。
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, time::Duration};
+
+#[cfg(windows)]
+use std::net::SocketAddr;
 
 use xray_transport::udp::{bind_std_udp_no_connreset, bind_udp_no_connreset};
 
 /// 本机死端口：bind 后立刻 drop ⇒ 之后发往它的包触发 ICMP Port Unreachable。
+/// （仅 Windows 用例消费：ICMP connreset 机制 Windows-only，见文件头注释。）
+#[cfg(windows)]
 async fn dead_loopback_addr_tokio() -> SocketAddr {
     let dead = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind dead");
     let addr = dead.local_addr().expect("dead addr");
@@ -30,6 +35,7 @@ async fn dead_loopback_addr_tokio() -> SocketAddr {
     addr
 }
 
+#[cfg(windows)]
 fn dead_loopback_addr_std() -> SocketAddr {
     let dead = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind dead");
     let addr = dead.local_addr().expect("dead addr");
