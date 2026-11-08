@@ -227,9 +227,8 @@ impl CacheController {
     /// （与 cleanup 的 effective_now 口径对齐：宽限尽即消费侧本就拒绝服务）。
     #[must_use]
     pub fn find_records(&self, fqdn: &str) -> Option<Arc<Record>> {
-        // shortcut: SyncTtlCache 无 Borrow<str> 查表面，每次 `&str` 查一次小分配；
-        // DNS 每查询一次、远小于上游往返，热起来再给 udf 提 Borrow 口。
-        self.ips.get(&fqdn.to_string())
+        // 基件 `get` 有借用键面（`K: Borrow<Q>`）：`&str` 直查 `String` 键，零分配。
+        self.ips.get(fqdn)
     }
 
     /// 条目物理保留 TTL：家族最晚过期时刻 + serveStale 宽限窗（宽限内条目必须

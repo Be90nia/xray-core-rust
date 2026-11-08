@@ -45,11 +45,16 @@ fn sf_wait_timeout<S: CachedNameserver + ?Sized>(server: &S) -> Duration {
 const PULL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// 按 key 移除 singleflight 条目；`same_channel` 校验防止误删后来领导者的新条目。
+///
+/// `single_flight` 是 `parking_lot::Mutex`（**同步锁**）：临界区只有 HashMap 查/
+/// 删（无 await、无分配），故 Drop 里 `lock()` 阻塞到拿到锁即可真删。改前用
+/// `try_lock`，抢不到就静默放弃——而「等待者兜底删」从未存在（等待者不删），
+/// 被抢占时该 fqdn 条目**永久滞留**，后续同 key 查询全落等待者路径、每次白等
+/// 一个 `sf_wait` 超时（bd n6jqu F6）。
 fn remove_sf_entry(sf: &SfMap, key: &(Arc<str>, bool, bool), tx: &broadcast::Sender<QueryOutcome>) {
-    if let Some(mut sf) = sf.try_lock() {
-        if sf.get(key).is_some_and(|t| t.same_channel(tx)) {
-            sf.remove(key);
-        }
+    let mut sf = sf.lock();
+    if sf.get(key).is_some_and(|t| t.same_channel(tx)) {
+        sf.remove(key);
     }
 }
 
@@ -64,7 +69,8 @@ struct SfLeaderGuard<'a> {
 
 impl Drop for SfLeaderGuard<'_> {
     fn drop(&mut self) {
-        // Drop 不能 await；try_lock 失败时条目由等待者的 remove_sf_entry 兜底清除。
+        // Drop 不能 await，但 `single_flight` 是同步锁：`lock()` 阻塞（微秒级）
+        // 后真删，不放弃清理（见 `remove_sf_entry`）。
         remove_sf_entry(self.sf, &self.key, &self.tx);
     }
 }
@@ -551,6 +557,38 @@ mod tests {
             cache.single_flight.lock().len(),
             SF_MAX_ENTRIES,
             "表满后不得再插入新 singleflight 条目（软上界失效）"
+        );
+    }
+
+    /// bd n6jqu F6：领导者条目移除必须**真删**。守卫 Drop 期间若另一线程正
+    /// 持 singleflight 锁，改前 `try_lock` 静默放弃（且没有任何等待者兜底——
+    /// 等待者从不删），条目永久滞留 ⇒ 同 fqdn 后续查询全部退化为等待者、
+    /// 每次白等一个 `sf_wait` 超时。
+    #[test]
+    fn sf_leader_guard_removes_entry_under_lock_contention() {
+        let cache = CacheController::new("test", false, false, 0, 0);
+        let key = (Arc::from("contended.example."), true, false);
+        let (tx, _) = broadcast::channel(1);
+        cache.single_flight.lock().insert(key.clone(), tx.clone());
+
+        let guard = SfLeaderGuard { sf: &cache.single_flight, key: key.clone(), tx };
+
+        std::thread::scope(|s| {
+            let sf = &cache.single_flight;
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                let _holding = sf.lock();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            held_rx.recv_timeout(Duration::from_secs(5)).expect("持锁线程须先抢到锁");
+            // 锁被另一线程占着：改前 try_lock 在此静默失败，条目就此泄漏。
+            drop(guard);
+        });
+
+        assert!(
+            cache.single_flight.lock().get(&key).is_none(),
+            "锁被抢占时领导者守卫仍必须删除 singleflight 条目（bd n6jqu F6）"
         );
     }
 
