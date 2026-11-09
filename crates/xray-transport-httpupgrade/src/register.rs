@@ -1462,4 +1462,47 @@ mod tests {
 
         listener.close().expect("close");
     }
+
+    /// ADR-0004 §2.6 A2（transport 族关闸档）：`TransportListener::close()` 关闸
+    /// 后拒新握手任务，**且**在途握手任务不由此口中止——放行后照样跑完。
+    ///
+    /// 反证：若 `close()` 把在途任务一起中止（或闸没关），本测试的「拒发」或
+    /// 「放行后跑完」必红。
+    #[tokio::test]
+    async fn httpupgrade_listener_scope_a2_gate_closes_but_keeps_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // close() 要 abort 的 accept 泵句柄：本测试不跑泵，占一个待取消任务即可。
+        #[allow(clippy::disallowed_methods, reason = "测试：accept 泵句柄占位任务")]
+        let accept_pump = tokio::spawn(std::future::pending::<()>());
+        let listener = HttpUpgradeListener {
+            local: "127.0.0.1:0".parse().expect("addr"),
+            abort: accept_pump.abort_handle(),
+            scope: ComponentScope::new("httpupgrade-accept:a2-test"),
+        };
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (task_release, task_finished) = (Arc::clone(&release), Arc::clone(&finished));
+        listener
+            .scope
+            .spawn(async move {
+                task_release.notified().await;
+                task_finished.store(true, Ordering::SeqCst);
+            })
+            .expect("新建 scope 必须受理握手任务");
+
+        TransportListener::close(&listener).expect("close");
+        assert!(listener.scope.spawn(async {}).is_err(), "关闸后必须拒新握手任务");
+        assert_eq!(listener.scope.in_flight(), 1, "在途握手任务关闸后仍在账本内");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !finished.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("关闸不得中止在途任务：放行后必须跑完（超时 = 被 abort 或被饿死）");
+    }
 }

@@ -1662,6 +1662,46 @@ mod tests {
         }
         assert_eq!(got, payload, "large payload roundtrip must be byte-identical");
     }
+
+    /// ADR-0004 §2.6 A2（transport 族关闸档）：`TransportListener::close()` 关闸
+    /// 后拒新握手任务，**且**在途握手任务不由此口中止——放行后照样跑完。
+    ///
+    /// 反证：若 `close()` 把在途任务一起中止（或闸没关），本测试的「拒发」或
+    /// 「放行后跑完」必红。
+    #[tokio::test]
+    async fn ws_listener_scope_a2_gate_closes_but_keeps_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let listener = WsTransportListener {
+            local_addr: "127.0.0.1:0".parse().expect("addr"),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
+            scope: ComponentScope::new("ws-accept:a2-test"),
+        };
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (task_release, task_finished) = (Arc::clone(&release), Arc::clone(&finished));
+        listener
+            .scope
+            .spawn(async move {
+                task_release.notified().await;
+                task_finished.store(true, Ordering::SeqCst);
+            })
+            .expect("新建 scope 必须受理握手任务");
+
+        TransportListener::close(&listener).expect("close");
+        assert!(listener.scope.spawn(async {}).is_err(), "关闸后必须拒新握手任务");
+        assert_eq!(listener.scope.in_flight(), 1, "在途握手任务关闸后仍在账本内");
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !finished.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("关闸不得中止在途任务：放行后必须跑完（超时 = 被 abort 或被饿死）");
+    }
 }
 
 #[cfg(test)]

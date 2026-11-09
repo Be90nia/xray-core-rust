@@ -1017,6 +1017,38 @@ pub(crate) mod tests {
         assert_eq!(source, dest, "echo source should carry per-packet target");
     }
 
+    /// ADR-0004 §2.6 A1（账本侧）：首包建立的 dispatch link 任务必须落在本会话
+    /// 的账本内（在途可见），且 `drain` 后归零、报告 `timed_out == 0`。
+    ///
+    /// 本持有件无 `close_gate` / `drain` 调用面（排空档 · 外部 stop 面 = 会话
+    /// 释放，见字段注释）⇒ 生产路径不调 `drain`；本断言钉的是**账本本身可排空**，
+    /// 不是站点调用形态。
+    #[tokio::test]
+    async fn udp_session_scope_a1_drain_zeroes_in_flight() {
+        #[derive(Debug)]
+        struct Hanging;
+
+        impl DispatchHandler for Hanging {
+            fn tag(&self) -> &str {
+                "hanging"
+            }
+
+            fn dispatch(&self, _dest: &Destination, _link: Link) -> crate::default::PinFuture<()> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let mut session = UdpDispatchSession::new(Arc::new(Hanging));
+        assert_eq!(session.scope.in_flight(), 0, "新建会话零在途任务");
+
+        session.send_packet(&udp_dest([1, 1, 1, 1], 53), b"first").await.expect("首包建 link");
+        assert_eq!(session.scope.in_flight(), 1, "首包后 dispatch link 任务必须在账本内");
+
+        let report = session.scope.drain(std::time::Duration::from_secs(5)).await;
+        assert_eq!(report.timed_out, 0, "可中止的在途任务应能等净");
+        assert_eq!(session.scope.in_flight(), 0, "排空后归零（泄漏判据）");
+    }
+
     /// bd kol4a：`with_access` 的会话 establish 必须走 `dispatch_with_access`
     /// 且原样携带 `from`/`inbound_name`（GlobalID 派生链第一环——生产链终点
     /// `MuxBridge::dispatch_with_access` 按它们算 XUDP GlobalID）；无 access
