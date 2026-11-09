@@ -79,8 +79,8 @@
 | 项（符号） | crate | 性质 | 三判据结论 | 实义理由 | 落点（HEAD） | 消费方状态 |
 |---|---|---|---|---|---|---|
 | `MuxCarrierHandler::new` | xray-core | 签名变更（增 `plugin_ctx: Arc<PluginContext>`） | 留主仓（判据 2：装配 wiring 绑 core 出入站分发语义；同件原地改形，无新归属裁决） | carrier 后台任务需 ctx 取 fx 托管口（§3.5.6 ①类接管）；旧 `(inner)` 签名拿不到托管口 | `crates/xray-core/src/wiring.rs` | 生产 wiring 装配消费（`snap.set_default`）；mux 修复 9hl0s 配套 |
-| `QuinnQuicListener::new` | xray-transport-hysteria | 签名变更（增 `scope` 参数）；**注：参数类型 ADR-0004 B1 已迁 `compat::ManagedScope` → `scope::ComponentScope`（ADR-0004 B1 批产物，批次在飞，HEAD 快照仍 ManagedScope）** | 留主仓（§3.5.3 QUIC/hysteria 方向件；§3.5.6 ①类托管接线，无新归属裁决） | listener 持每连接任务账本（accept 泵 / auth h3 任务），`close` 关闸；旧 `new(endpoint)` 无账本 | `crates/xray-transport-hysteria/src/quinn_adapter.rs` | register 循环构造注入；hysteria 入站全量经此 |
-| `SessionMap::scope` | xray-transport-splithttp | 新访问器（→ `&compat::ManagedScope`）；**注：暴露内部账本句柄，ADR-0004 §2.2 Q2 判本轮不扩注入** | 留主仓（splithttp hub 传输语义；Q2 判定 = transport 族账本对宿主不可见、无 drain 面） | hub 级托管口（ctx 内 SessionMap 持有）供 hub 内部 spawn（每连接删除消息任务 ②豁免 bd kwevg 的对照面） | `crates/xray-transport-splithttp/src/hub/session.rs` | 仅 hub 内部消费；无宿主消费（Q2 判定） |
+| `QuinnQuicListener::new` | xray-transport-hysteria | 签名变更（增 `scope` 参数）；**注：参数类型 ADR-0004 B1 已迁 `compat::ManagedScope` → `scope::ComponentScope`（B1 组 2 已提交 ff179cf5；旧类型已于 B1' 8202b2ef 删除，grep 归零）** | 留主仓（§3.5.3 QUIC/hysteria 方向件；§3.5.6 ①类托管接线，无新归属裁决） | listener 持每连接任务账本（accept 泵 / auth h3 任务），`close` 关闸；旧 `new(endpoint)` 无账本 | `crates/xray-transport-hysteria/src/quinn_adapter.rs` | register 循环构造注入；hysteria 入站全量经此 |
+| `SessionMap::scope` | xray-transport-splithttp | 新访问器（→ `&scope::ComponentScope`，B1 组 6 d34482f7）；**注：暴露内部账本句柄，ADR-0004 §2.2 Q2 判本轮不扩注入** | 留主仓（splithttp hub 传输语义；Q2 判定 = transport 族账本对宿主不可见、无 drain 面） | hub 级托管口（ctx 内 SessionMap 持有）供 hub 内部 spawn（每连接删除消息任务 ②豁免 bd kwevg 的对照面） | `crates/xray-transport-splithttp/src/hub/session.rs` | 仅 hub 内部消费；无宿主消费（Q2 判定） |
 
 ## E. `xray-frame::budget` 常量簿（36 项）
 
@@ -99,7 +99,7 @@
 
 | 项（符号） | crate | 性质 | 三判据结论 | 实义理由 | 落点（HEAD） | 消费方状态 |
 |---|---|---|---|---|---|---|
-| `ComponentScope`（含 new / spawn / reap / fx_scope / close_gate / drain / in_flight / live_refs 8 法；1 项 = 9 声明合记） | xray-frame | 新类型（**ADR-0004 B0' 批产物**，d2ed4436） | 判据 1 不成立（持有者契约绑 Xray 组件生命周期 / 两词分档 / Go 对拍档位）、判据 2 命中归 xray-frame；机制本体 = udf `FxScope` 组合包装零复制（件头契约九条为唯一权威） | 组件自持任务账本时的**持有者契约唯一落点**：close_gate（关闸档）与 drain（排空档）两词分档 + live_refs 环诊断锚 | `crates/xray-frame/src/scope.rs` | dispatcher（B1 组 1 已迁，bd os4kz）+ transport 六族（B1 在飞）；`compat::ManagedScope` 过渡并存、B1' 删 |
+| `ComponentScope`（含 new / spawn / reap / fx_scope / close_gate / drain / in_flight / live_refs 8 法；1 项 = 9 声明合记） | xray-frame | 新类型（**ADR-0004 B0' 批产物**，d2ed4436） | 判据 1 不成立（持有者契约绑 Xray 组件生命周期 / 两词分档 / Go 对拍档位）、判据 2 命中归 xray-frame；机制本体 = udf `FxScope` 组合包装零复制（件头契约九条为唯一权威） | 组件自持任务账本时的**持有者契约唯一落点**：close_gate（关闸档）与 drain（排空档）两词分档 + live_refs 环诊断锚 | `crates/xray-frame/src/scope.rs` | dispatcher（B1 组 1，069cb2d4）+ transport 六族（B1 组 2-6，ff179cf5/d34482f7）+ tun（组 7）；旧件 `compat::ManagedScope` 已于 B1' 8202b2ef 删除，`grep -rn ManagedScope crates` 归零 |
 | `SharedPoolRegistry`（含 shared / get_or_init；1 项 = 3 声明合记） | xray-frame | 新类型（ARCH-05，b3431fad） | 判据 2（尺寸 class 分桶 = Xray 池类别分账；登记簿本体为进程级 LazyLock 机制） | 多个进程级共享池按尺寸 class 登记上限，防同类池各自无界 | `crates/xray-frame/src/pool.rs` | udphop / splithttp pool_stream 池类别注册；`with_pool` 装配门（r9z0g）配套 |
 | `MAX_POOL_CLASSES` | xray-frame | 新增常量 | 判据 2（同上） | 登记簿 class 容量上限（= 8），超限 fail-visible | `crates/xray-frame/src/pool.rs` | `get_or_init` 超限拒绝 |
 | `UNBOUNDED_RETENTION` | xray-frame | 新增常量（ARCH-04，2d4305da） | 判据 2（随宿主模块 `xray-frame::cache` 归属；零 xray 语义常量，udf 提炼随宿主模块评估，不单独裁决） | 「不过期」条目的物理保留下限哨兵（365d），防无上限宽限窗被当成永活 | `crates/xray-frame/src/cache.rs` | frame cache + `app-dns::cache_controller`（同源消费） |

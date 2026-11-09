@@ -36,6 +36,8 @@ planned 关闭**，理由（udf CHANGELOG 原文）：纯组合无新语义（`F
 
 ## 后果
 
+> **命名演进标注（2026-11-09，bd os4kz / ADR-0004）**：本文中的 `compat::ManagedScope` 是当时的持有件名；该类型已迁位并更名为 `xray_frame::scope::ComponentScope`（`close`→`close_gate`、`shutdown_timeout`→`drain`，并明确「Drop 不作中止保证」）。本文的归属裁决与禁令**不变**，仅类型名按 ADR-0004 终态读。
+
 - +xray-frame 承担该派生件的维护与测试（托管端到端 + MockClock 确定性推进）。
 - 协议/传输 crate **禁止**再手写同类老化循环（单账本；旧手写 ManagedScope loop
   已删，bd jovl4 缺口 3 收口为统一托管口）——新需求走本口接线。
