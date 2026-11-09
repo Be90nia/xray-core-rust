@@ -230,7 +230,9 @@ async fn dial_xray_two_instance_smoke() {
 
 /// VMess body payload roundtrip（独立用例，真实 fail 留档）。
 ///
-/// #[ignore] 理由（bd 待登记 P3）：CI Linux（run 36196572740 Test job）与本地
+/// #[ignore] 理由（bd 待登记 P3）：CI Linux（run 36196572740 —— **该 id 于
+/// 2026-11-09 核验已 404，疑被删除；结论以本段诊断与后续复现为准，bd 4kby0**
+/// Test job）与本地
 /// Windows 双复现——`decode_response_body_async` 立即返回空（对端 EOF），即
 /// server 端 vmess inbound→dispatcher→freedom→echo 回程在 body 阶段断链；
 /// 而 e2e_vmess_proxy（同构单实例拓扑）CI 绿，双实例并存 + 独立 echo task

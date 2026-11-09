@@ -325,6 +325,7 @@ bd update <id> --append-notes "..."  # 追加，不删历史
 - 每次审计 → `docs/audit-*.md` 落档 + `bd update <id> --append-notes`
 - 每次 commit → `git log --oneline` 简短，不写废文
 - 5 维+9 票+立项级 3 份大报告**未 commit**（per 5 维审计 §14.2）—— 待 PM 评审后批量 commit
+- **引用 CI run id 的纪律（bd 4kby0，2026-11-09 立）**：①注释/文档/bd 里写 run id 时**当场验证**：`gh api repos/Be90nia/xray-core-rust/actions/runs/<id> --jq .id` 必须回显同一 id；②run 会被删除/过期（2026-11-09 全仓审计：23 个引用里 5 个已 404，同期其他 id 仍可解析，故非 retention 所致），所以**结论必须自带可独立复核的证据**（失败步骤名 + 日志摘录 + 复现条件），id 只作辅助定位；③报告模板固定加一行「证据可解析性自检：引用的 run id 今日是否仍 404」；(4)`.github/workflows/` 内的 id 引用属红线区，只登记不改。
 
 ---
 

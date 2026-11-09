@@ -535,7 +535,8 @@ async fn e2e_p2_dns_core_resolution() {
 /// WireGuard 真实握手探测（bd dxim）。
 ///
 /// 历史：初版手写单发 init 段（client encapsulate → 一次 UDP send → 裸等
-/// response）在 CI Linux（run 36206616471）20s 无 response，本地 Windows 绿。
+/// response）在 CI Linux（run 36206616471 —— **该 id 于 2026-11-09 核验已 404，
+/// 疑被删除；结论以本节分诊与后续复现为准，bd 4kby0**）20s 无 response，本地 Windows 绿。
 /// 分诊结论（2026-10-09 复核）：
 /// - 服务端路径在 CI Linux 无罪——`inbound::tests::tunnel_tcp_end_to_end_echoes` （同
 ///   `WireguardInboundHandler` + driver worker_loop + loopback UDP 真 noise 握手）在 CI Linux
