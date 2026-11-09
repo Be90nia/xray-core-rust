@@ -186,12 +186,28 @@ pub fn log() -> LogFacade {
     caps().log().clone()
 }
 
+/// 进程级 [`spawn`] 的收割节流计数（bd s3tig）：udf `JoinSet` 条目只在
+/// `try_reap`/`join_next` 出集，无收割装配点的 scope 条目按累计 spawn 数永久
+/// 滞留。与 [`REAP_EVERY`] 配套摊薄，口径同 [`ManagedScope::spawn`]；tick 进程级
+/// 共享——生产常驻 scope 仅一份（fallback → permanent 装配期一次性换轨），每
+/// scope 条目上界不破；`install_scoped` 测试窗口短暂多份并存且窗口内 spawn 数
+/// 有限（上游修法不涉本仓，udf issue#13 缺口一）。
+static SPAWN_REAP_TICK: AtomicUsize = AtomicUsize::new(0);
+
 /// 便捷访问器：进程级托管 spawn（禁裸 spawn 的唯一替代口）。
+///
+/// 收割装配（bd s3tig）：走 [`spawn_reaping_ticked`] + `SPAWN_REAP_TICK`——每
+/// [`REAP_EVERY`] 次 spawn 摊一次收割，已完成条目出集不再随累计任务数滞留
+/// （上界 = [`REAP_EVERY`] - 1 + 在途数），条目内 panic 载荷经 `caps` 日志面上报。
+/// 任务生命周期与拒发语义不变：句柄 abort 面 / 归属 scope drop=abort 同前，scope
+/// 关闭仍回 `Err(ScopeClosed)`（新增仅一条拒发 warn，口径同 [`ManagedScope`]）。
+#[inline(always)]
 pub fn spawn<T>(fut: impl Future<Output = T> + Send + 'static) -> Result<Spawned<T>, ScopeClosed>
 where
     T: Send + 'static,
 {
-    spawn_scope().spawn_tracked(fut)
+    let caps = caps();
+    spawn_reaping_ticked(caps.fx(), caps.log(), "compat::spawn", Some(&SPAWN_REAP_TICK), fut)
 }
 
 /// 增量收割：把已完成条目清出 udf `JoinSet`，其中 panic 载荷落 `log`（abort
@@ -638,6 +654,72 @@ mod tests {
             1,
             "Cancelled（abort）不得计入 panic 上报: {lines:?}"
         );
+    }
+
+    /// bd s3tig 验收：`spawn_reaping_ticked` 的节流两态——非触发位**不**收割
+    /// （完成条目滞留 = 进程级 `compat::spawn` 修复前的泄漏形态，且上报面静默），
+    /// 连续 [`REAP_EVERY`] 次调用必含一个触发位（`prev % REAP_EVERY == 0`）→
+    /// 滞留条目清出集合并上报。判别器 = `try_reap()` 错误结局（Panicked 条目真在
+    /// 集合里才数得出）+ Capture 日志；tick 为本地值，无全局态，全确定性。
+    #[test]
+    fn spawn_reaping_ticked_holds_between_and_reaps_on_threshold() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let scope = FxScope::new();
+                let log = LogFacade::new("ticked-test", Vec::new());
+                let tick = AtomicUsize::new(1); // 1..=REAP_EVERY-1 = 非触发位
+
+                // ① 非触发位：完成条目滞留集合，载荷不上报（静默滞留形态）。
+                let boom = spawn_reaping_ticked(&scope, &log, "ticked", Some(&tick), async {
+                    panic!("park-boom")
+                })
+                .expect("spawn accepted");
+                while !boom.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                drop(boom); // 载荷只在集合面
+                let held = scope.try_reap();
+                assert_eq!(held.len(), 1, "非触发位不得收割（节流语义）: {held:?}");
+                assert!(
+                    matches!(&held[0], TaskError::Panicked(m) if m.contains("park-boom")),
+                    "滞留条目必须带 panic 载荷: {held:?}"
+                );
+
+                // ② 触发位：本 spawn（prev=2）不触发；下面 REAP_EVERY 次连发
+                // （prev=3..）在 prev % REAP_EVERY == 0 处必触发一次 → 清出并上报。
+                let boom2 = spawn_reaping_ticked(&scope, &log, "ticked", Some(&tick), async {
+                    panic!("threshold-boom")
+                })
+                .expect("spawn accepted");
+                while !boom2.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                drop(boom2);
+                for _ in 0..REAP_EVERY {
+                    spawn_reaping_ticked(&scope, &log, "ticked", Some(&tick), async {})
+                        .expect("spawn accepted");
+                }
+                assert!(scope.try_reap().is_empty(), "触发位 spawn 必须收割（滞留条目清出集合）");
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(
+            !lines.contains("park-boom"),
+            "非触发位条目未清出 → 不得上报（静默滞留形态）: {lines:?}"
+        );
+        assert!(lines.contains("background task panicked"), "触发位收割必须上报 panic: {lines:?}");
+        assert!(lines.contains("threshold-boom"), "panic 载荷必须带上: {lines:?}");
+        assert!(lines.contains("ticked"), "报告必须带域标识: {lines:?}");
     }
 
     /// 接线验收（bd 86i4h 阶段1）：`ArmScope::spawn` / `ConnScope::spawn` 内部
