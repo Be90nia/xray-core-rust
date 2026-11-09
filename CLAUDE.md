@@ -94,7 +94,7 @@ cargo doc --workspace --no-deps
 4. **审计口径**：任何"新增功能"类改动，review 必查"udf 是否已有等价件"；命中重复即打回。
 5. **常用白拿清单**（免得重新发明——核对最新签名以 udf 源码为准）：
    - 池化：`skeleton::pool::PoolManaged`（resize/metrics/subscribe_audit 三挂点）｜`skeleton_infra::pool::PoolBase`（校验/水位线/审计环/溢出计数/借还记账）｜`ThreadPool`（core/max/queue_cap、零自旋、优雅缩容）｜`RejectPolicy` 四件套（Abort/CallerRuns/Discard/DiscardOldest）｜`skeleton_infra::memgov::{MemoryPool, BoundedRegistry, CountingAllocator, LeakGuard}`
-   - 异步与停机：`skeleton_infra::fx::FxScope`（spawn 唯一托管口）｜`skeleton_infra::shutdown::ShutdownCoordinator`（注册窗+编排窗+超时/panic 隔离）
+   - 异步与停机：`skeleton_infra::fx::FxScope`（spawn 唯一托管口）｜`skeleton_infra::shutdown::ShutdownCoordinator`（注册窗+编排窗+超时/panic 隔离）｜`xray_frame::scope::ComponentScope`（**组件 scope 持有件唯一形态**，ADR-0004：`new`/`spawn`/`close_gate`/`drain`/`in_flight`/`fx_scope`/`live_refs`；`close_gate` 关闸档 vs `drain` 排空档两词分档禁混用；Drop 不作中止保证；禁自引用环 / 双账本 / 绕过自造）
    - 日志观测：`skeleton_infra::logx`（唯一入口 + `mask_secrets`）｜`log-embed` 埋点规范（target `xray_frame::<域>`）
    - 缓存/重试/调度/时钟：`std_ext::cache::{LruCache, TtlCache}`（⚠️ **单线程 `&mut self`**，并发面另批）｜`std_ext::retry::{RetryPolicy, retry, retry_if, Sleeper}`｜`std_ext::scheduler::Scheduler`（after/every/close/`panic_count`/优雅 join）｜`skeleton::clock::{Clock, MockClock}`
    - 配置/JSON：`skeleton::config::{ConfigPort, EnvSource, StdEnv, MockEnv}`｜`skeleton_infra::config::ConfigFile<C>`（`config-json`/`config-toml` feature：分层折叠 `layer`/`default_layer`/`file_layer` + `load`/`save`，真相不静默丢）｜`skeleton_infra::parse_mock`（解析测试替身）
@@ -196,8 +196,8 @@ serena-cli undo                                                        # 改坏�
 
 | 类 | 判据 | 处理 |
 |---|---|---|
-| **① 接管类** | 任务生命周期绑定某组件——宿主 drop 或停机时**应当**随之取消（连接级 dispatch、arm/连接任务、装配级批次） | 必须走托管口：`PluginContext` 的 fx 句柄；**无 ctx 站点**走 `xray_frame::compat::ManagedScope`（组合包装 udf `FxScope`，提供 spawn / close / in_flight / shutdown_timeout） |
-| **② 豁免类** | 任务**必须**活得比任何组件久（进程级 `LazyLock` 初始化、日志 flush、指标上报），或属数据面逐包泵（坑约束 ⑫ 零改动红线） | 允许裸 spawn，但必须逐站 `#[allow(clippy::disallowed_methods, reason = "...")]` 登记；CI 门核对「调用集合 ⊆ 登记集合」 |
+| **① 接管类** | 任务生命周期绑定某组件——宿主 drop 或停机时**应当**随之取消（连接级 dispatch、arm/连接任务、装配级批次） | 必须走托管口：`PluginContext` 的 fx 句柄；**无 ctx 站点**走 `xray_frame::scope::ComponentScope`（组合包装 udf `FxScope`；`close_gate` 关闸档 / `drain` 排空档的分档见 ADR-0004 §2.2 Q1） |
+| **② 豁免类** | 任务**必须**活得比任何组件久（进程级 `LazyLock` 初始化、日志 flush、指标上报），或属数据面逐包泵（坑约束 ⑫ 零改动红线） | 允许裸 spawn，但必须逐站 `#[allow(clippy::disallowed_methods, reason = "...")]` 登记（reason 按 bd xosi9 模板填，**禁自造子类**）；CI 门核对「调用集合 ⊆ 登记集合」 |
 | **③ 违规** | 裸 spawn 且无 allow / reason | CI 红，不得合入 |
 
 - **口径等价性**：D6 面⑦「任务托管迁 FxScope」的解释 = **① 类站点全部有托管口消费**；② 类逐站登记即视为达成（**不要求**把数据面逐包泵强迁，那会撞坑约束 ⑫）。按此判据，D6 面⑦ 与 D7 是同一结论的两种数法。

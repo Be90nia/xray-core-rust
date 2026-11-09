@@ -119,7 +119,7 @@
 | 2 | **握手/首包必须带 deadline**，禁止无限等待 | L2 `ctx.deadline()` 唯一入口 + L3 禁裸 sleep | `xray-app-reverse/timer.rs:35` InactivityTimer 缺 set_timeout 回调（Go CancelAfterInactivity 等价件缺失） | 慢速攻击面/资源挂死 |
 | 3 | **每条连接必有 conn_id**（观测可追溯） | L1 必选 + L4 断言 | observe 件需求（conn_id/stage/peer/dest 字段模板） | 线上问题无法定位 |
 | 4 | **缓冲必须走 BufferPool 接缝**，禁止绕过池直接分配 | L3-10 + 池审计断言 | **from_vec 假池污染**：假块被标 Pooled 经 TLS_CACHE 粘死 worker 线程 → per-node 选择性死 | 隐蔽的 per-node 死亡 |
-| 5 | **异步任务必须托管**（FxScope），禁止裸 spawn | L3-1 + L4 `in_flight` 归零断言 | 706 处裸 spawn 失管（存量计数引自旧规划，未复数） | 任务泄漏/停机不干净 |
+| 5 | **异步任务必须托管**（FxScope），禁止裸 spawn；**组件自有账本唯一形态 = `xray_frame::scope::ComponentScope`**（ADR-0004）：`close_gate`（关闸档，Go 口径不杀已建立连接）/ `drain`（排空档，唯一「在途归零」口）两词分档禁混用；禁自引用环（被托管任务不得持所在账本 owner 强引用）；禁伪 Drop-abort 断言文案（A5 静态门 `tools/check_scope_claims.py`）；`live_refs()` 诊断面证伪环（A4） | L3-1 + L4 `in_flight` 归零断言 + B3 静态门 | 706 处裸 spawn 失管（存量计数引自旧规划，未复数）；12 处组件 scope 持有件三派语义分裂 + splithttp/tun 自引用环使 Drop-abort 恒不可达（ADR-0004，bd os4kz / hnicl） | 任务泄漏 / 停机不干净 / 停机语义随 crate 漂移 |
 | 6 | **停机必须注册**到 ShutdownCoordinator | L1 `lifecycle()` + L4 注册断言 | 各处自拼停机序（`ShutdownCoordinator` 编排纪律现成） | 停机挂死/资源泄漏 |
 | 7 | **配置必须走 per-plugin 段路由 + ConfigPort**，禁止读全局/读文件 | L2 `ctx.config()` + L3-7 + L5 缺段 fail-fast | `xray-conf` 三格式+built 中间态；udf `ConfigFile` 无段路由语义（缺口 #7） | 配置错配在运行期才炸 |
 | 8 | **错误必须归类；panic 不得逃逸到 IO 线程** | L4 断言（panic 隔离） | v49/v50/v52 三轮挂死战役：poll_write 丢唤醒、包装层 flush Pending 语义 | 连接级崩溃扩散 |

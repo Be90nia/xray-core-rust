@@ -186,7 +186,7 @@ impl ComponentScope {
 |---|---|---|---|
 | **B0'** | **框架件（本批不碰任何站点 crate）**：`xray-frame` 落 `scope::ComponentScope`（`close`→`close_gate`、`shutdown_timeout`→`drain`、增 `live_refs` 诊断面 + `#[doc(hidden)]`、件头写完整契约）+ 单测覆盖 **A2 / A3 / A4**。**与 `compat::ManagedScope` 临时并存**（过渡期，非终态别名）；不删旧类型、不替换任何站点类型路径 | 无 | — |
 | **B1** | **逐站替换类型路径**（**7 组按 crate 并行** = transport 六族 + dispatcher 独立组；**splithttp 组排在 zct77 完成之后**）：每站把持有件类型换成 `ComponentScope`、调用点改 `close_gate()` / `drain()`、删伪断言 doc、补该站 stop 面归属 | B0' | ✅ **7 组并行**（splithttp 组串行在 zct77 之后） |
-| **B1'** | **末批（终态收口）**：删除 `compat::ManagedScope` + `grep -rn "compat::ManagedScope" crates` 归零 ⇒ 合规「**不留兼容别名**」终态 | B1 全部完成 | — |
+| **B1'** | **末批（终态收口）**：删除 `compat::ManagedScope` + `grep -rn "compat::ManagedScope" crates` 归零 ⇒ 合规「**不留兼容别名**」终态（**已完成**：B1' 收口 `8202b2ef`，`grep -rn ManagedScope crates` 归零） | B1 全部完成 | — |
 | **B2** | 环破除 + 排空落位（依赖 B1 对应站）：tun（driver 子账本 + 父 drain 级联子）、naive（弱引用/快照）、splithttp（hub 账本 owner 上移 + 每连接任务捕获链改弱引用/快照）；并给 transport 族补「无 drain ⇒ 不得声称 abort」收口 | B1 各站 | ✅ 3 组并行 |
 | **B3** | 可观测面 + 静态门 + 文档同步：每站一条「stop 后 `in_flight == 0`」断言；`tools/check_scope_claims.py` 静态门（禁「Drop 即 abort 在途」类伪断言文案、禁 `compat::ManagedScope` 残留）；文档同步（CLAUDE.md §3.5.6 spawn 三分类口径 + §3.5.2 白拿清单、插件模型文档 §2.4 坑约束表、**本目录 README「允许 `Proposed` 草案入目录」一行 + ADR-0004 索引行**——PM 拍板 P5） | B1 + B2 | ✅ |
 | **B4**（可选） | transport listen API 注入 scope 句柄（让宿主可见 transport 账本 ⇒ 宿主可 drain）——**另票**，PM 拍板 P2 = 本轮不做 | PM P2 | — |

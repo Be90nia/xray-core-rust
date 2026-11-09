@@ -17,7 +17,7 @@
 
 - 文件名 `adr-NNNN-<短横线-slug>.md`，NNNN 四位零填充，从 0001 递增，**不复用**。
 - 决策被取代时：旧 ADR 状态改 `Superseded by ADR-NNNN`，**不删除**（历史裁决链）。
-- 状态字段取值：`Accepted`（生效）/ `Superseded`（被取代）。草案不进本目录。
+- 状态字段取值：`Accepted`（生效）/ `Proposed`（草案）/ `Superseded`（被取代）。允许 `Proposed` 草案入目录（PM 拍板 P5，2026-11-09）：草案落本目录便于评审，拍板后转 `Accepted`。
 
 ## 索引
 
@@ -26,6 +26,7 @@
 | [ADR-0001](adr-0001-spawn-idle-pruner-derived-not-promoted.md) | 派生件扩面：`spawn_idle_pruner` 留 xray-frame，不上浮 udf | Accepted | 2026-11-06 |
 | [ADR-0002](adr-0002-memory-budget-ownership-split.md) | 装配面登记簿：常量簿上浮 `xray-frame::budget`，预算门留 xray-core | Accepted | 2026-11-06 |
 | [ADR-0003](adr-0003-frame-net-socket-ioctl-not-promoted.md) | socket ioctl 去重件落 `xray-frame::net`，不上浮 udf、不下沉 transport | Accepted | 2026-11-08 |
+| [ADR-0004](adr-0004-component-scope-holder-contract.md) | 组件 scope 持有件统一契约：`ComponentScope` 落 xray-frame（close 只关闸 / drain 才 abort / Drop 不作保证） | Accepted | 2026-11-09 |
 
 ## 附件
 
