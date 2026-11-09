@@ -1033,6 +1033,17 @@ mod tests {
         fn add_conn(&self, _conn: ServerConn) {}
     }
 
+    /// 测试用 hub 账本 owner：`SessionMap` 只持弱引用句柄（B2 破环），owner 必须与
+    /// `HandlerContext` 同寿命乃至更长 ⇒ 本测试模块一份进程级单例（无测试对其
+    /// 关闸/排空，故共享无干扰）。
+    fn test_owner() -> &'static xray_frame::scope::ComponentScope {
+        static OWNER: std::sync::LazyLock<xray_frame::scope::ComponentScope> =
+            std::sync::LazyLock::new(|| {
+                xray_frame::scope::ComponentScope::new("splithttp-hub-test")
+            });
+        &OWNER
+    }
+
     fn make_ctx(host: &str) -> HandlerContext {
         HandlerContext {
             config: Arc::new(Config::default()),
@@ -1042,7 +1053,7 @@ mod tests {
             // 使 session/seq 错位——测试必须与生产同口径（bd imhvg）。
             base_path: "/".into(),
             local_addr: "127.0.0.1:1".parse().unwrap(),
-            sessions: Arc::new(SessionMap::new()),
+            sessions: Arc::new(SessionMap::new(test_owner())),
             conn_handler: Arc::new(NoopConnHandler),
             max_buffered_posts: 16,
             sc_max_each_post_bytes: 1024 * 1024,
@@ -1183,7 +1194,7 @@ mod tests {
             host: String::new(),
             base_path: String::new(),
             local_addr: "127.0.0.1:1".parse().unwrap(),
-            sessions: Arc::new(SessionMap::new()),
+            sessions: Arc::new(SessionMap::new(test_owner())),
             conn_handler: Arc::new(NoopConnHandler),
             max_buffered_posts: 16,
             sc_max_each_post_bytes: 1024 * 1024,
@@ -1391,7 +1402,7 @@ mod tests {
     #[tokio::test]
     async fn session_table_full_rejects_new_ids_with_429() {
         let mut ctx = make_ctx("");
-        ctx.sessions = Arc::new(SessionMap::with_max_sessions(1));
+        ctx.sessions = Arc::new(SessionMap::with_max_sessions(1, test_owner()));
 
         let resp =
             dispatch_request(padded_post("/sess-a/0"), "127.0.0.1:2".parse().unwrap(), &ctx).await;

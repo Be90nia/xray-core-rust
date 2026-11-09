@@ -177,8 +177,10 @@ pub struct TunInboundHandler {
     /// arm/dispatcher/tun 族口径）：`close()` 走 `drain`（关闸 → abort 在途 →
     /// 等净），在途任务一并 abort。
     ///
-    /// 已知：driver 任务持有本账本的强引用（自引用环，bd hnicl）⇒ 纯 Drop 路径
-    /// 不会触发在途中止；环破除见 ADR-0004 B2 批次。
+    /// 本字段是账本的**唯一强引用**（owner，ADR-0004 §2.2 Q5）：driver 及其派生
+    /// 任务一律持 [`ComponentScope::downgrade`] 的弱引用句柄 ⇒ 无自引用环（B2
+    /// 破环）。账本寿命只由本字段决定；Drop 时 `FxScope` 为最后一份强引用 ⇒
+    /// JoinSet drop ⇒ abort 全组（udf 语义，实现事实）。
     scope: ParkMutex<Option<xray_frame::scope::ComponentScope>>,
     /// smoltcp 网栈句柄（与 driver task 共享）。
     netstack: Arc<AsyncMutex<TunNetStack>>,
@@ -407,9 +409,10 @@ impl InboundHandler for TunInboundHandler {
         let dev = Arc::clone(&device);
         let dispatch = Arc::clone(&self.dispatch);
         // §3.5.6 ①类托管：tun 组件自持托管口（driver loop 及全部派生任务共用一本账；
-        // 排空档，stop 面 = close() 的 drain）。
+        // 排空档，stop 面 = close() 的 drain）。driver 与派生任务只持弱引用句柄
+        // （B2 破环：任务体不得持账本 owner 强引用），owner 留本 handler 的字段。
         let scope = xray_frame::scope::ComponentScope::new(format!("tun:{}", self.tag));
-        let driver_scope = scope.clone();
+        let driver_scope = scope.downgrade();
         if scope
             .spawn(async move {
                 tun_driver_loop(dev, netstack, dispatch, driver_scope).await;
@@ -673,7 +676,7 @@ async fn tun_driver_loop(
     device: Arc<TunDevice>,
     netstack: Arc<AsyncMutex<TunNetStack>>,
     dispatch: Arc<dyn DispatchHandler>,
-    scope: xray_frame::scope::ComponentScope,
+    scope: xray_frame::scope::ScopeRef,
 ) {
     let mut timer = interval(POLL_INTERVAL);
     // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
@@ -882,7 +885,7 @@ fn handle_udp_packet(
     payload: &[u8],
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
-    scope: &xray_frame::scope::ComponentScope,
+    scope: &xray_frame::scope::ScopeRef,
 ) {
     // 票 ijn7：目的组播/广播不进 relay；relay 刚失败过的目的地址在冷却窗内
     // 也不再新建会话（防「失败 → 立刻重建」的忙循环）。判定与计数在
@@ -960,7 +963,7 @@ pub(crate) fn now_nanos() -> i64 {
 /// p14e：周期性扫描 idle 60s+ 的 UDP session 并从 map 淘汰（票 8gr6 重构：
 /// 无 try_lock 探测——owner task 独占 session，map 移除即可回收）。
 /// 经 tun 组件托管口 spawn（§3.5.6 ①类），无关主 driver loop。
-fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::scope::ComponentScope) {
+fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::scope::ScopeRef) {
     if scope
         .spawn(async move {
             let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
@@ -1043,7 +1046,7 @@ fn spawn_udp_session_task(
     sessions: UdpSessions,
     failed: FailedDsts,
     entry: std::sync::Weak<UdpSessionEntry>,
-    scope: xray_frame::scope::ComponentScope,
+    scope: xray_frame::scope::ScopeRef,
 ) {
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
@@ -1225,7 +1228,7 @@ async fn dispatch_accepted(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     events: Vec<TcpAcceptEvent>,
     dispatch: &Arc<dyn DispatchHandler>,
-    scope: &xray_frame::scope::ComponentScope,
+    scope: &xray_frame::scope::ScopeRef,
 ) {
     for event in events {
         accept_tcp_connection(netstack, event, dispatch, scope).await;
@@ -1238,7 +1241,7 @@ async fn accept_tcp_connection(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     event: TcpAcceptEvent,
     dispatch: &Arc<dyn DispatchHandler>,
-    scope: &xray_frame::scope::ComponentScope,
+    scope: &xray_frame::scope::ScopeRef,
 ) {
     // 从 local endpoint 构建 destination
     let dest = match ip_endpoint_to_destination(&event.local) {
@@ -1467,6 +1470,51 @@ mod tests {
     /// 被 abort，永远不跑。
     fn test_scope() -> xray_frame::scope::ComponentScope {
         xray_frame::scope::ComponentScope::new("tun-test")
+    }
+
+    /// ADR-0004 §2.6 A4：driver 形态（任务只持弱引用句柄，并在任务体内再经同一
+    /// 弱引用 spawn 派生任务）下账本无自引用环——owner 释放后弱引用升不起来。
+    /// 环存在时该账本被任务吊住（`live_refs() > 1`）且本断言不成立。
+    #[tokio::test]
+    async fn tun_scope_has_no_self_reference() {
+        let owner = test_scope();
+        let driver = owner.downgrade();
+        let spawned_child = driver.clone();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        owner
+            .spawn(async move {
+                // driver 体内派生任务：一律经弱引用句柄（B2 破环后的实态）
+                if spawned_child.spawn(std::future::pending()).is_err() {
+                    return;
+                }
+                let _ = stop_rx.await;
+            })
+            .expect("driver 任务入集");
+        tokio::task::yield_now().await;
+        assert_eq!(owner.live_refs(), 1, "driver 只持弱引用 ⇒ 账本强引用 1 份");
+        stop_tx.send(()).expect("通知 driver 退出");
+        // 释放 owner 的全部权（账本归零）后，弱引用升级失败必须 fail-visible 拒发
+        drop(owner);
+        assert!(driver.spawn(std::future::pending()).is_err(), "账本归零后 spawn 必须拒发");
+    }
+
+    /// ADR-0004 §2.6 A1：排空档 —— driver 形态任务全 abortable，`drain` 后在途归零
+    /// 且报告无超时/panic。
+    #[tokio::test]
+    async fn tun_scope_drain_idle() {
+        let owner = test_scope();
+        let driver = owner.downgrade();
+        owner
+            .spawn(async move {
+                let _keep = driver;
+                std::future::pending::<()>().await;
+            })
+            .expect("driver 任务入集");
+        assert_eq!(owner.in_flight(), 1);
+        let report = owner.drain(std::time::Duration::from_millis(100)).await;
+        assert_eq!(report.timed_out, 0, "abortable 任务排空不得超时");
+        assert!(report.panicked.is_empty(), "正常排空不得有 panic 载荷");
+        assert_eq!(owner.in_flight(), 0, "排空后在途归零");
     }
 
     #[tokio::test]
@@ -1822,7 +1870,8 @@ mod tests {
             // ④ accept → dispatch（票 fnlv：锁内收集事件，锁外建桥）
             let accepted = stack.check_tcp_accepts();
             drop(stack);
-            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>), &scope)
+            let sref = scope.downgrade();
+            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>), &sref)
                 .await;
         }
 
@@ -1853,12 +1902,13 @@ mod tests {
 
         // 托管口持有到测试末尾（同 `tcp_syn_handshake_triggers_dispatch_*`：临时值会 abort）。
         let scope = test_scope();
+        let sref = scope.downgrade();
 
         {
             let mut stack = netstack.lock().await;
             let accepted = stack.check_tcp_accepts();
             drop(stack);
-            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>), &scope)
+            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>), &sref)
                 .await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
@@ -2278,8 +2328,9 @@ mod tests {
         // 最后一份强引用消失，锁外 spawn 的 dispatch task 全组 abort（udf 语义），
         // 跑不到下面的 sleep。
         let scope = test_scope();
+        let sref = scope.downgrade();
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
-        dispatch_accepted(&netstack, accepted2, &handler, &scope).await;
+        dispatch_accepted(&netstack, accepted2, &handler, &sref).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let dest = captured.lock().clone().expect("dispatch must fire from lock-external bridge");
         assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));

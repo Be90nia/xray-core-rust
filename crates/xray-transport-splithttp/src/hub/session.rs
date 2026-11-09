@@ -83,34 +83,40 @@ pub struct SessionMap {
     /// 条目数上限（新 id 超出即 [`SessionUpsertError::TooManySessions`]）。
     max_sessions: usize,
     /// §3.5.6 ①类托管：hub 级托管口（会话 reap 定时器 / 每 TCP 连接服务 /
-    /// keepalive 流共用一本账）的 owner。stop 面 = transport 族关闸档
-    /// （ADR-0004 §2.2 Q1）：listener `close()` 只关闸拒新，不杀已建立连接
-    /// （Go 26.10.17 `listener.Close()` 口径）；无 drain 面 ⇒ 不声称 abort；
-    /// Drop 不作中止保证（§2.2 Q3）。
-    /// 已知自引用环（每连接任务经 `Arc<HandlerContext>` 持本表、reap 定时器持
-    /// `Arc<SessionMap>`，bd hnicl）⇒ 纯 Drop 路径不触发在途中止；破环见
-    /// ADR-0004 B2 批次。
-    scope: xray_frame::scope::ComponentScope,
+    /// keepalive 流共用一本账）的**弱引用句柄**（ADR-0004 §2.2 Q4 形态①，B2
+    /// 破环）。stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1）：listener
+    /// `close()` 只关闸拒新，不杀已建立连接（Go 26.10.17 `listener.Close()` 口径）；
+    /// 无 drain 面 ⇒ 不声称 abort；Drop 不作中止保证（§2.2 Q3）。
+    ///
+    /// 本表**不是**账本 owner：每连接任务经 `Arc<HandlerContext>` → `Arc<SessionMap>`
+    /// 反向持有本表，若本表再持账本强引用即自引用环（§2.7 反模式 3）。owner 上移
+    /// 到 listener（`SplithttpListener.scope` / `HubListener.scope`）。
+    scope: xray_frame::scope::ScopeRef,
 }
 
 impl SessionMap {
-    /// 构造空会话表（上限 [`DEFAULT_MAX_SESSIONS`]）。
-    pub fn new() -> Self {
-        Self::with_max_sessions(DEFAULT_MAX_SESSIONS)
+    /// 构造空会话表（上限 [`DEFAULT_MAX_SESSIONS`]）；`scope` 为 hub 账本 owner
+    /// （本表只取弱引用句柄，不延长其寿命）。
+    pub fn new(scope: &xray_frame::scope::ComponentScope) -> Self {
+        Self::with_max_sessions(DEFAULT_MAX_SESSIONS, scope)
     }
 
     /// 构造带自定义上限的空会话表（测试/容量调优用）。
-    pub fn with_max_sessions(max_sessions: usize) -> Self {
+    pub fn with_max_sessions(
+        max_sessions: usize,
+        scope: &xray_frame::scope::ComponentScope,
+    ) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             max_sessions: max_sessions.max(1),
-            scope: xray_frame::scope::ComponentScope::new("splithttp-hub"),
+            scope: scope.downgrade(),
         }
     }
 
-    /// hub 级托管口（listener 的每连接任务与 reap 定时器共用同一本账）。
+    /// hub 级托管口（listener 的每连接任务与 reap 定时器共用同一本账）的弱引用
+    /// 句柄：任务体内 spawn 一律经它（禁把 owner 强引用带进任务体）。
     #[must_use]
-    pub fn scope(&self) -> &xray_frame::scope::ComponentScope {
+    pub fn scope(&self) -> &xray_frame::scope::ScopeRef {
         &self.scope
     }
 
@@ -193,19 +199,19 @@ impl SessionMap {
     }
 }
 
-impl Default for SessionMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 测试用账本 owner（构造 `SessionMap` 需要它；本地在测试全过程存活）。
+    fn test_scope() -> xray_frame::scope::ComponentScope {
+        xray_frame::scope::ComponentScope::new("splithttp-hub-test")
+    }
+
     #[tokio::test]
     async fn upsert_creates_and_reuses_session() {
-        let map = Arc::new(SessionMap::new());
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::new(&owner));
         let s1 = map.upsert("sess-1", 30).await.expect("首建会话");
         let s2 = map.upsert("sess-1", 30).await.expect("复用会话");
         assert!(Arc::ptr_eq(&s1, &s2));
@@ -213,7 +219,8 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_different_sessions() {
-        let map = Arc::new(SessionMap::new());
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::new(&owner));
         let s1 = map.upsert("a", 30).await.expect("会话 a");
         let s2 = map.upsert("b", 30).await.expect("会话 b");
         assert!(!Arc::ptr_eq(&s1, &s2));
@@ -222,7 +229,8 @@ mod tests {
     /// 3zbwx：新 id 达上限即拒，已存在的 id 不受门影响。
     #[tokio::test]
     async fn upsert_rejects_new_ids_over_capacity() {
-        let map = Arc::new(SessionMap::with_max_sessions(2));
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::with_max_sessions(2, &owner));
         map.upsert("a", 10).await.expect("会话 a");
         map.upsert("b", 10).await.expect("会话 b");
         assert_eq!(
@@ -246,20 +254,23 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_none_for_unknown() {
-        let map = SessionMap::new();
+        let owner = test_scope();
+        let map = SessionMap::new(&owner);
         assert!(map.get("nope").await.is_none());
     }
 
     #[tokio::test]
     async fn get_returns_some_after_upsert() {
-        let map = Arc::new(SessionMap::new());
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::new(&owner));
         map.upsert("x", 10).await.expect("会话 x");
         assert!(map.get("x").await.is_some());
     }
 
     #[tokio::test]
     async fn remove_deletes_session() {
-        let map = Arc::new(SessionMap::new());
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::new(&owner));
         map.upsert("x", 10).await.expect("会话 x");
         map.remove("x").await;
         assert!(map.get("x").await.is_none());
@@ -267,7 +278,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_reaped_after_30s_without_get() {
-        let map = Arc::new(SessionMap::new());
+        let owner = test_scope();
+        let map = Arc::new(SessionMap::new(&owner));
         let _s = map.upsert("reap-me", 10).await.expect("会话 reap-me");
         // Simulate timeout by using a very short sleep — the real timer is 30s,
         // but we can't wait that long in a test. Instead test the reap logic

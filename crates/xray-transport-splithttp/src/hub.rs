@@ -150,6 +150,10 @@ pub struct HubListener {
     local_addr: SocketAddr,
     sessions: Arc<SessionMap>,
     conn_handler: Arc<dyn HubConnHandler>,
+    /// §3.5.6 ①类托管：hub 账本 **owner**（ADR-0004 §2.2 Q5，B2 破环后唯一强引用）。
+    /// `SessionMap` 只持弱引用句柄 ⇒ 每连接任务经 `Arc<HandlerContext>` 反向持有本表
+    /// 不再形成自引用环。寿命 = 本 listener（`serve` 期间）。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl HubListener {
@@ -170,12 +174,14 @@ impl HubListener {
         .map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
         let local_addr =
             tcp_listener.local_addr().map_err(|e| SplitHttpError::ListenFailed(e.to_string()))?;
+        let scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
         Ok(Self {
             config,
             tcp_listener,
             local_addr,
-            sessions: Arc::new(SessionMap::new()),
+            sessions: Arc::new(SessionMap::new(&scope)),
             conn_handler,
+            scope,
         })
     }
 
@@ -205,8 +211,8 @@ impl HubListener {
         });
         // §3.5.6 ①类：每 TCP 连接的 hyper 服务任务归 hub 托管口（listener close
         // 关闸，transport 族关闸档——ADR-0004 §2.2 Q1：不杀已建立连接；Drop
-        // 不作中止保证，§2.2 Q3）。
-        let hub_scope = ctx.sessions.scope().clone();
+        // 不作中止保证，§2.2 Q3）。任务住在本账本里 ⇒ 只持弱引用句柄（B2 破环）。
+        let hub_scope = self.scope.downgrade();
         loop {
             let (stream, peer_addr) = match self.tcp_listener.accept().await {
                 Ok(conn) => conn,

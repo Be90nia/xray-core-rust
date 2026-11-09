@@ -275,12 +275,13 @@ async fn listen_tcp(
                 fallback: rc.max_useless_records,
             })
         });
-    let ctx = build_context(config, local, handler);
-    // §3.5.6 ①类托管：hub 级托管口（ctx 内 SessionMap 持有），每连接任务归它；
-    // listener close 关闸（transport 族关闸档，ADR-0004 §2.2 Q1：不杀已建立
-    // 连接，在途服务到 EOF）；Drop 不作中止保证（§2.2 Q3）。
+    // §3.5.6 ①类托管：hub 级托管口（ctx 内 SessionMap 持**弱引用**，owner 在本
+    // listener 字段——B2 破环）；每连接任务归它。listener close 关闸（transport 族
+    // 关闸档，ADR-0004 §2.2 Q1：不杀已建立连接，在途服务到 EOF）；Drop 不作中止
+    // 保证（§2.2 Q3）。
+    let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
+    let ctx = build_context(config, local, handler, &listener_scope);
     let hub_scope = ctx.sessions.scope().clone();
-    let listener_scope = hub_scope.clone();
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
     #[allow(
@@ -387,10 +388,11 @@ pub async fn listen_unix_splithttp(
                 fallback: rc.max_useless_records,
             })
         });
-    let ctx = build_context(&config, local, handler);
-    // §3.5.6 ①类托管：hub 级托管口（同 TCP 路径）。
+    let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
+    let ctx = build_context(&config, local, handler, &listener_scope);
+    // §3.5.6 ①类托管：hub 级托管口（同 TCP 路径：SessionMap 持弱引用，owner 在
+    // listener 字段）。任务住在本账本里 ⇒ 只持弱引用句柄（B2 破环）。
     let hub_scope = ctx.sessions.scope().clone();
-    let listener_scope = hub_scope.clone();
     crate::LOG.info(format!("{path} listening unix for XHTTP"));
 
     // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
@@ -961,9 +963,10 @@ async fn listen_h3(
     )?;
     let local = endpoint.local_addr()?;
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
-    let ctx = build_context(config, local, handler);
-    // §3.5.6 ①类托管：hub 级托管口（同 TCP/unix 路径）。
-    let listener_scope = ctx.sessions.scope().clone();
+    // §3.5.6 ①类托管：hub 级托管口（同 TCP/unix 路径：SessionMap 持弱引用，owner
+    // 在本 listener 字段）；accept 泵与每 QUIC 连接任务只持弱引用句柄（B2 破环）。
+    let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
+    let ctx = build_context(config, local, handler, &listener_scope);
     crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
@@ -1020,7 +1023,8 @@ fn spawn_h3_accept(
     ctx: Arc<HandlerContext>,
 ) {
     let local = endpoint.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
-    // §3.5.6 ①类托管：hub 级托管口（每 QUIC 连接的握手+服务任务归它）。
+    // §3.5.6 ①类托管：hub 级托管口（每 QUIC 连接的握手+服务任务归它）；任务住在
+    // 本账本里 ⇒ 只持弱引用句柄（B2 破环）。
     let hub_scope = ctx.sessions.scope().clone();
     spawn_supervised_h3_accept(local, async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -1193,17 +1197,21 @@ impl hyper::body::Body for H3RecvBody {
 // ===== hub handler ↔ listener registry 适配 =====
 
 /// 构造 hub handler 上下文（镜像 `HubListener::serve` 的构造）。
+///
+/// `scope` 为 hub 账本 owner（在 listen 入口创建、由 listener 字段持有）；本上下文
+/// 内的 `SessionMap` 只取弱引用句柄（B2 破环：任务不得持账本 owner 强引用）。
 fn build_context(
     config: &Arc<Config>,
     local: SocketAddr,
     handler: ConnHandler,
+    scope: &xray_frame::scope::ComponentScope,
 ) -> Arc<HandlerContext> {
     Arc::new(HandlerContext {
         config: Arc::clone(config),
         host: config.host.clone(),
         base_path: config.normalized_path(),
         local_addr: local,
-        sessions: Arc::new(SessionMap::new()),
+        sessions: Arc::new(SessionMap::new(scope)),
         conn_handler: Arc::new(ConnHandlerAdapter(handler)),
         max_buffered_posts: config.normalized_sc_max_buffered_posts() as usize,
         sc_max_each_post_bytes: config.normalized_sc_max_each_post_bytes().to as usize,
@@ -1314,13 +1322,11 @@ struct SplithttpListener {
     local: SocketAddr,
     tcp_abort: Option<tokio::task::AbortHandle>,
     h3_endpoint: Option<quinn::Endpoint>,
-    /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本，本字段是 hub 账本的克隆
-    /// 句柄，owner 见 `SessionMap.scope`）。stop 面 = transport 族关闸档
-    /// （ADR-0004 §2.2 Q1）：`close()` 只关闸拒新，不杀已建立连接（Go 26.10.17
-    /// `listener.Close()` 口径，在途服务到 EOF）；无 drain 面 ⇒ 不声称 abort；
-    /// Drop 不作中止保证（§2.2 Q3）。
-    /// 已知自引用环（任务持 SessionMap/HandlerContext 强引用，bd hnicl）⇒ 纯
-    /// Drop 路径不触发在途中止；破环见 ADR-0004 B2 批次。
+    /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本）。**本字段是账本 owner**
+    /// （唯一强引用，ADR-0004 §2.2 Q5；`SessionMap` 只持弱引用句柄 ⇒ 无自引用环，
+    /// B2 破环）。stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1）：`close()` 只关闸
+    /// 拒新，不杀已建立连接（Go 26.10.17 `listener.Close()` 口径，在途服务到 EOF）；
+    /// 无 drain 面 ⇒ 不声称 abort；Drop 不作中止保证（§2.2 Q3）。
     scope: xray_frame::scope::ComponentScope,
 }
 
@@ -1363,6 +1369,60 @@ mod tests {
     };
 
     use super::*;
+
+    /// ADR-0004 §2.6 A4：hub 账本无自引用环 —— 每连接任务经 `Arc<HandlerContext>`
+    /// → `Arc<SessionMap>` 反向持有会话表，而会话表只持弱引用句柄，故：①在途任务
+    /// 存在时账本强引用仍只有 owner 一份；②owner 释放后弱引用升不起来（spawn 拒发）。
+    #[tokio::test]
+    async fn splithttp_scope_has_no_self_reference() {
+        let owner = xray_frame::scope::ComponentScope::new("splithttp-hub");
+        let handle = owner.downgrade();
+        let config = Arc::new(crate::register::parse_splithttp_config(None).expect("parse config"));
+        let (handler, _count) = greeting_handler();
+        let ctx = build_context(&config, "127.0.0.1:1".parse().unwrap(), handler, &owner);
+
+        // 每连接任务形态：持 `Arc<HandlerContext>`（生产路径的捕获链）
+        let conn_ctx = Arc::clone(&ctx);
+        owner
+            .spawn(async move {
+                let _keep = conn_ctx;
+                std::future::pending::<()>().await;
+            })
+            .expect("连接任务入集");
+        assert_eq!(owner.live_refs(), 1, "会话表只持弱引用 ⇒ 账本强引用仍 owner 一份");
+
+        drop(ctx);
+        drop(owner);
+        assert!(handle.spawn(std::future::pending()).is_err(), "账本归零后 spawn 必须拒发");
+    }
+
+    /// ADR-0004 §2.6 A2：关闸 ≠ 排空 —— `close_gate()` 后新 spawn 必
+    /// `Err(ScopeClosed)`（含 hub 会话 reap 定时器 / keepalive 流），已派发任务不被
+    /// abort（transport 族关闸档：在途服务到底）。
+    #[tokio::test]
+    async fn splithttp_close_gate_rejects_new_spawns_but_keeps_in_flight() {
+        let owner = xray_frame::scope::ComponentScope::new("splithttp-hub");
+        let handle = owner.downgrade();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        owner
+            .spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .expect("在途任务入集");
+
+        owner.close_gate();
+        assert!(handle.spawn(async {}).is_err(), "关闸后 spawn 必须 Err(ScopeClosed)");
+        assert_eq!(owner.in_flight(), 1, "关闸不得 abort 在途");
+
+        tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+        assert!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            "已派发任务必须跑到底（关闸只拒新）"
+        );
+        assert_eq!(owner.in_flight(), 0, "任务自然结束后在途归零");
+    }
 
     /// 捕获日志 (级别, message)：xray-transport-splithttp 无 tracing-subscriber
     /// dev-dep（不动 Cargo.toml），手写最小 Subscriber 足够断言留痕。
@@ -1729,7 +1789,8 @@ mod tests {
 
         let config = Arc::new(crate::register::parse_splithttp_config(None).expect("parse config"));
         let (handler, _count) = greeting_handler();
-        let ctx = build_context(&config, server_addr, handler);
+        let owner = xray_frame::scope::ComponentScope::new("splithttp-hub-test");
+        let ctx = build_context(&config, server_addr, handler, &owner);
         let gate = xray_transport::handshake_gate::HandshakeGate::new(1); // 容量 1：单名额可观测
         spawn_h3_accept(endpoint, Arc::clone(&gate), ctx);
 

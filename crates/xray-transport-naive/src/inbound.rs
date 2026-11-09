@@ -85,8 +85,11 @@ struct InboundSlot {
     _accept_task: JoinHandle<()>,
     /// §3.5.6 ①类托管：连接任务（h2 tunnel/mock relay）归本 scope。stop 面 =
     /// `NaiveInboundHandler::close` 显式排空（`drain(100ms)`，ADR-0004 §2.2 Q2：
-    /// 唯一能声称「在途归零」的口）；Drop 不作中止保证（§2.2 Q3；每连接任务持
-    /// conn_scope 克隆 ⇒ Drop 兜底不可达，破环归 B2）。
+    /// 唯一能声称「在途归零」的口）；Drop 不作中止保证（§2.2 Q3）。
+    ///
+    /// 本 `Arc` 是账本的**唯一强引用**（owner，§2.2 Q5）：accept 泵与每连接任务
+    /// 一律持 [`ComponentScope::downgrade`] 的弱引用句柄（B2 破环）⇒ 无自引用环；
+    /// slot 摘除后账本归零，弱引用升级失败即拒发（fail-visible）。
     scope: Arc<xray_frame::scope::ComponentScope>,
 }
 
@@ -171,10 +174,13 @@ impl InboundHandler for NaiveInboundHandler {
         let acceptor = self.tls.clone();
         let auth = Arc::clone(&self.auth);
         let dispatch = self.dispatch.clone();
-        // §3.5.6 ①类托管：连接任务归 handler 自持 scope（Arc 共享进 service 闭包）；
-        // 收口只经 close() 显式排空（drain），Drop 不作中止保证（ADR-0004 §2.2 Q3）。
+        // §3.5.6 ①类托管：连接任务归 handler 自持 scope（弱引用句柄共享进 service
+        // 闭包）；收口只经 close() 显式排空（drain），Drop 不作中止保证（ADR-0004
+        // §2.2 Q3）。B2 破环：任务住在本账本里 ⇒ 只持 [`ComponentScope::downgrade`]
+        // 的弱引用，owner（`Arc<ComponentScope>`）只留 slot 一份。
         let scope = Arc::new(xray_frame::scope::ComponentScope::new("naive-inbound"));
         let scope_for_slot = Arc::clone(&scope);
+        let accept_scope = scope.downgrade();
         #[allow(
             clippy::disallowed_methods,
             reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（naive accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
@@ -186,12 +192,10 @@ impl InboundHandler for NaiveInboundHandler {
                         let acceptor = acceptor.clone();
                         let auth = Arc::clone(&auth);
                         let dispatch = dispatch.clone();
-                        let scope = Arc::clone(&scope);
-                        let conn_scope = Arc::clone(&scope);
-                        // §3.5.6 ①类：每连接 TLS/h2 任务归 handler 自持 scope
-                        // （conn_scope 克隆进任务 = 环事实，破环归 B2）；闸关即拒
-                        // （留 debug）；在途收口只经 close() 显式排空（§2.2 Q3）。
-                        let spawned = scope.spawn(async move {
+                        let conn_scope = accept_scope.clone();
+                        // §3.5.6 ①类：每连接 TLS/h2 任务归 handler 自持 scope；
+                        // 闸关即拒（留 debug）；在途收口只经 close() 显式排空（§2.2 Q3）。
+                        let spawned = accept_scope.spawn(async move {
                             let tls =
                                 match xray_transport::tls_handshake_gate::accept_tls_with_timeout(
                                     &acceptor,
@@ -206,13 +210,13 @@ impl InboundHandler for NaiveInboundHandler {
                                         return;
                                     },
                                 };
-                            let service_scope = Arc::clone(&conn_scope);
+                            let service_scope = conn_scope.clone();
                             let service = service_fn(move |req| {
                                 handle_request(
                                     req,
                                     dispatch.clone(),
                                     Arc::clone(&auth),
-                                    Arc::clone(&service_scope),
+                                    service_scope.clone(),
                                 )
                             });
                             // bd wz2b N1：hyper server h2 缺省收窗 1MB/1MB + 每流
@@ -275,7 +279,7 @@ async fn handle_request(
     mut req: http::Request<Incoming>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     auth: Arc<NaiveInboundConfig>,
-    scope: Arc<xray_frame::scope::ComponentScope>,
+    scope: xray_frame::scope::ScopeRef,
 ) -> Result<http::Response<RespBody>, Infallible> {
     // fallback：非 CONNECT 一律 404 空响应（naiveproxy probe-resistance——
     // 主动探测看到的是普通 404 站点，不暴露代理身份）
@@ -321,8 +325,9 @@ async fn handle_request(
     );
     match dispatch {
         Some(dispatch) => {
-            // §3.5.6 ①类：tunnel dispatch 任务归所属 h2 连接 scope（连接任务
-            // 结束即 abort）；闸关即拒（200 已回，客户端读到断流而非挂住）。
+            // §3.5.6 ①类：tunnel 任务归 handler 账本（弱引用句柄入集，B2 破环）。
+            // 闸关即拒（200 已回，客户端读到断流而非挂住）；升级失败同口径——连接
+            // 已随账本归零，tunnel 不再派发（fail-visible 留 debug）。
             let spawned = scope.spawn(async move {
                 let upgraded = match upgrade.await {
                     Ok(u) => u,
@@ -483,6 +488,68 @@ mod tests {
         let addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
         std::mem::forget(handler);
         (addr, pin, cert_der)
+    }
+
+    /// ADR-0004 §2.6 A1：排空档 —— 在途连接任务（h2 服务 + 隧道）abortable，
+    /// `drain` 后在途归零且报告无超时。
+    #[tokio::test]
+    async fn naive_scope_drain_idle() {
+        let (config, pin, _cert_der) = test_tls();
+        let handler = NaiveInboundHandler::new(
+            "naive-a1",
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+            test_auth(),
+        );
+        handler.start().await.expect("naive inbound start");
+        let addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
+        let conn = dial_naive(&client_config(addr.port(), &pin, "pass"), "drain.test", 443)
+            .await
+            .expect("tunnel");
+        let scope = {
+            let guard = handler.lock_slot();
+            Arc::clone(&guard.as_ref().expect("slot").scope)
+        };
+        assert!(scope.in_flight() > 0, "连接任务必须已在账本里（否则断言无意义）");
+
+        let report = scope.drain(Duration::from_millis(100)).await;
+        assert_eq!(report.timed_out, 0, "abortable 连接任务排空不得超时");
+        assert_eq!(scope.in_flight(), 0, "排空后在途归零");
+
+        drop(conn);
+        handler.close().await.expect("close");
+    }
+
+    /// ADR-0004 §2.6 A4：账本无自引用环 —— accept 泵与每连接任务只持弱引用句柄。
+    /// 可证伪锚：摘除 owner（不排空）后账本强引用必须归零（弱引用升不起来）；
+    /// 环存在时连接任务会吊住账本，升级仍成功。
+    #[tokio::test]
+    async fn naive_scope_has_no_self_reference() {
+        let (config, pin, _cert_der) = test_tls();
+        let handler = NaiveInboundHandler::new(
+            "naive-a4",
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+            test_auth(),
+        );
+        handler.start().await.expect("naive inbound start");
+        let addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
+        let weak = {
+            let guard = handler.lock_slot();
+            let slot = guard.as_ref().expect("slot");
+            assert_eq!(slot.scope.live_refs(), 1, "账本 owner 恰一份（slot）");
+            Arc::downgrade(&slot.scope)
+        };
+        // 真实连接：h2 服务任务入账本（B2 前它持 owner 强引用 = 环）
+        let conn = dial_naive(&client_config(addr.port(), &pin, "pass"), "ring.test", 443)
+            .await
+            .expect("tunnel");
+
+        let slot = handler.lock_slot().take().expect("slot");
+        slot._accept_task.abort();
+        drop(slot);
+        assert!(weak.upgrade().is_none(), "账本强引用必须随 owner 归零（连接任务不得持有它）");
+        drop(conn);
     }
 
     /// 回显 fake dispatcher：读尽 link 上行全部写回 link.writer。

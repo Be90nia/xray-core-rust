@@ -35,7 +35,7 @@
 
 use std::{
     future::Future,
-    sync::{Arc, LazyLock, atomic::AtomicUsize},
+    sync::{Arc, LazyLock, Weak, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -350,6 +350,45 @@ impl std::fmt::Debug for ArmScopeRegistry {
     }
 }
 
+/// 账本的**弱引用句柄**（ADR-0004 §2.2 Q4 形态① · PM P4）：传给「住在该账本里」
+/// 的任务体用——只持 `Weak`，**不延长账本寿命** ⇒ 破自引用环。强引用形态
+/// （把 [`ComponentScope`] 克隆进自己托管的任务体）= ADR §2.7 反模式 3，禁。
+///
+/// 用途：任务体内需要再 spawn（driver 派生 TCP 中继 / UDP 会话、hub 每连接任务
+/// 派生子任务 …）时，**只能**经本件；owner 强引用只留在组件字段 / stop 面。
+///
+/// 拒发口径与 [`ComponentScope::spawn`] 一致（fail-visible）：升级失败（账本已
+/// 随最后一个强引用消失）⇒ `Err(ScopeClosed)` + 一条 warn，禁静默丢任务。
+#[derive(Clone)]
+pub struct ScopeRef {
+    /// 账本弱引用（升级失败 = 账本已消失，见 [`Self::spawn`]）。
+    inner: Weak<FxScope>,
+    /// 日志域标识（与创建它的 [`ComponentScope`] 同 label）。
+    label: Arc<str>,
+    /// 收割节流计数：与账本共享同一份（克隆计数，不持账本强引用）。
+    tick: Arc<AtomicUsize>,
+}
+
+impl ScopeRef {
+    /// 托管 spawn：升级账本后走与 [`ComponentScope::spawn`] 同一「收割 + 入集」口。
+    pub fn spawn<F>(&self, fut: F) -> Result<Spawned<()>, ScopeClosed>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let Some(scope) = self.inner.upgrade() else {
+            scope_log().warn(format!("{}: spawn rejected (ledger dropped)", self.label));
+            return Err(ScopeClosed);
+        };
+        crate::compat::spawn_reaping_ticked(
+            &scope,
+            &scope_log(),
+            &self.label,
+            Some(&self.tick),
+            fut,
+        )
+    }
+}
+
 /// 组件自有 scope 持有件（ADR-0004 §2.3 候选 A · PM 已拍板采纳 P3）：组件内
 /// 账本的**持有者契约**唯一落点——组件（transport listener / inbound handler /
 /// dispatcher / tun …）自持一本任务账本时必须持本件，禁自造（§2.7 反模式 5）。
@@ -473,6 +512,20 @@ impl ComponentScope {
         &self.scope
     }
 
+    /// 弱引用句柄（[`ScopeRef`]，ADR-0004 §2.2 Q4 形态①）：传给「住在本账本里」的
+    /// 任务体用——不延长账本寿命，故**破自引用环**（§2.7 反模式 3）。
+    ///
+    /// 环破除后的实态：任务体内再 spawn 一律经本件；`ComponentScope` 克隆只留在
+    /// 组件字段 / stop 面（owner 恰一，ADR §2.2 Q5）。
+    #[must_use]
+    pub fn downgrade(&self) -> ScopeRef {
+        ScopeRef {
+            inner: Arc::downgrade(&self.scope),
+            label: Arc::clone(&self.label),
+            tick: Arc::clone(&self.tick),
+        }
+    }
+
     /// **关闸**（同步、幂等）：只关 accepting 闸（拒新 spawn，放行在途）。
     ///
     /// **不断在途、不等净、不 abort**（ADR-0004 §2.2 Q2）。语义 = Go
@@ -534,6 +587,41 @@ mod tests {
     };
 
     use super::*;
+
+    /// ADR-0004 §2.2 Q4 形态①机制面：任务体只持弱引用句柄时，账本强引用不增
+    /// （A4 的机制锚）。
+    #[tokio::test]
+    async fn scope_ref_does_not_keep_ledger_alive() {
+        let owner = ComponentScope::new("scope-ref-test");
+        let handle = owner.downgrade();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        owner
+            .spawn(async move {
+                // 任务体只持弱引用（破环形态），在途期间一直不释放
+                let _keep = handle;
+                let _ = stop_rx.await;
+            })
+            .expect("任务入集");
+        assert_eq!(owner.live_refs(), 1, "任务体只持弱引用 ⇒ 账本强引用仍 1 份");
+        assert_eq!(owner.in_flight(), 1);
+
+        stop_tx.send(()).expect("通知任务退出");
+        let report = owner.drain(Duration::from_millis(100)).await;
+        assert_eq!(report.timed_out, 0, "可 abort 任务排空不得超时");
+        assert_eq!(owner.in_flight(), 0, "排空后在途归零");
+    }
+
+    /// 账本随最后一个强引用消失 ⇒ 弱引用句柄升级失败必回 `Err(ScopeClosed)`
+    /// （fail-visible，禁静默丢任务）。
+    #[tokio::test]
+    async fn scope_ref_spawn_after_owner_dropped_returns_closed() {
+        let handle = {
+            let owner = ComponentScope::new("scope-ref-dropped");
+            owner.downgrade()
+        };
+        let spawned = handle.spawn(async {});
+        assert!(matches!(spawned, Err(ScopeClosed)), "账本已消失必须拒发");
+    }
 
     /// bd il9lh MW-5：同 tag 连续登记 K 次 → 表内恒 1 条（修前 = K 条永久条目），
     /// 且**最后登记的** scope 才是存活的那条。

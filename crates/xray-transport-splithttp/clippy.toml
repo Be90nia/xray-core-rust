@@ -8,9 +8,9 @@
 # FxScope/PluginContext::spawn（坑约束 #5），时钟唯一源 = skeleton::clock（L3-5）。
 # 本 crate 是 h2/h3 传输层：dialer/transport/handler/hub 的连接级任务全部落在
 # 数据面（坑约束⑫ 热路径零改动）。xray-frame 是本 crate 的生产依赖，托管承托面
-# 可达（SplithttpListener 的 ComponentScope 持有件 / hub SessionMap.scope /
-# pool_stream 的 clock()·SharedPoolRegistry）；不可达的是 PluginContext（本
-# crate 无插件装配注入面）——故存量裸 spawn 逐点
+# 可达（SplithttpListener 的 ComponentScope 持有件 / hub SessionMap.scope 的弱引用
+# 句柄（B2 破环后 owner 在 listener）/ pool_stream 的 clock()·SharedPoolRegistry）；
+# 不可达的是 PluginContext（本 crate 无插件装配注入面）——故存量裸 spawn 逐点
 # #[allow(clippy::disallowed_methods)] + 理由注释登记；托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，否则逐点登记显式脱管）。
 # 注：`path` 是被禁方法的 def path，不是源码 glob——glob 写进 path 不报 fatal 但
 # 禁令静默无效（xray-frame 探针 1 实测），落地禁用该形态。
