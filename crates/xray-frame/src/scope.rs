@@ -26,6 +26,12 @@
 //! [`ArmScope`] 持有（`close` = 关闸 + `watch` 广播同一同步段落账），子 scope
 //! 经 [`ConnScope::child_of`] 订阅信号**事件驱动**级联取消——替代旧 20ms 闸位
 //! 轮询（每连接 ≈50 次/秒空转唤醒，bd mzput），稳态零唤醒。
+//!
+//! **第三类 scope：组件自有账本**（[`ComponentScope`]，ADR-0004）——组件
+//! （transport listener / inbound handler / dispatcher / tun …）自持一本任务账本时
+//! 必须持本件：它承载**持有者契约**（谁 close / 关闸 vs 排空两词分档 / Drop 不作
+//! abort 保证 / 环禁令 / 单账本 / Go 对拍分档），机制本体仍是 udf `FxScope`
+//! （组合包装，禁复制）。组件账本与 arm→conn 的寿命链**并列**，不参与级联。
 
 use std::{
     future::Future,
@@ -344,8 +350,189 @@ impl std::fmt::Debug for ArmScopeRegistry {
     }
 }
 
+/// 组件自有 scope 持有件（ADR-0004 §2.3 候选 A · PM 已拍板采纳 P3）：组件内
+/// 账本的**持有者契约**唯一落点——组件（transport listener / inbound handler /
+/// dispatcher / tun …）自持一本任务账本时必须持本件，禁自造（§2.7 反模式 5）。
+///
+/// **本件头是持有者契约的唯一权威**（ADR-0004 维护义务）：站点 doc 只写「本组件
+/// 属于哪一档 + 特殊事实」，与本件头冲突以本件头为准；新增 transport / handler
+/// 类组件必须从本件起手，并在 PR 描述里回答 ADR §2.2 六问。
+///
+/// # 契约九条（逐条可核对：审阅者不翻别的文件即可判真伪）
+///
+/// **① 归属（ADR §2.1 三判据）**——**机制在 udf，禁复制**；持有者契约含 xray
+/// 语义 ⇒ 归 **xray-frame 派生层**（判据 1 不成立：契约绑 xray 侧组件生命周期 +
+/// 停机编排面 + Go 对拍分档；判据 2 成立：消费方横跨 8 crate、公共祖先 =
+/// xray-frame；判据 3 不适用）。本件 = **组合包装** udf [`FxScope`]（spawn /
+/// accepting 闸 / 在途计数 / 三段排空全部转调，零重写）。
+///
+/// **② stop 面归属（ADR §2.2 Q1）**——每个持有件**恰一个 stop 面**（禁「组件
+/// close + 宿主 watcher」双排空口径打架）：
+///
+/// | stop 面形态 | 谁负责 | 允许的收口动作 |
+/// |---|---|---|
+/// | 组件自有 async close | 组件自身 | `close_gate()` + `drain(timeout)` |
+/// | 组件自有 sync close（`TransportListener::close`） | 组件自身只能关闸 | `close_gate()` |
+/// | 无 close 面（dispatcher / dial bridge / udp session） | 外部 stop 面（宿主 watcher / 宿主 drop） | `drain(timeout)` 或依赖 Drop 兜底（须写明） |
+///
+/// **③ 档位分档（ADR §2.2 Q1 档位表 · PM P1）**——**关闸档**（transport 族：
+/// splithttp / hysteria / websocket / httpupgrade / naive）：只 `close_gate()`，拒新
+/// 连接、**不杀已建立连接**（Go 26.10.17 `listener.Close()` 口径，在途服务到 EOF）；
+/// **排空档**（arm / dispatcher / tun 族）：`drain(timeout)` = 关闸 + abort 在途 +
+/// 等净，停机后 `in_flight == 0`（Rust 现行口径，bd a9xgp）。同进程两种停机观感 =
+/// **刻意分层**，非缺陷。
+///
+/// **④ 两词不可混用（ADR §2.2 Q2）**——[`close_gate`](Self::close_gate)：同步、
+/// 幂等，只关 accepting 闸（拒新 spawn、放行在途），**不断在途、不等净、不
+/// abort**；[`drain`](Self::drain)：异步三段（关闸 → abort 在途 → 等净），返回
+/// udf `ShutdownReport`，**唯一能声称「在途归零」的口**。禁一个 `close()` 同时
+/// 被当两种语义用。
+///
+/// **⑤ Drop 不作保证（ADR §2.2 Q3）**——Drop 只允许释放**与任务存活无关**的资源
+/// （socket / QUIC endpoint / 文件句柄），**不得**当作「在途任务终止」的实现手段
+/// （udf 的 abort-on-drop 只在「最后一份 `Arc<FxScope>` 归零」时可达 ⇒ 多持有者
+/// 共享时**时点不确定**、自引用环时**恒不可达**）。**禁**写「句柄丢弃即 abort
+/// 在途」「Drop 兜底 abort 在途」这类依赖 Drop 的断言；可写的事实性表述：「Drop
+/// 时 `FxScope` 若为最后一份强引用，则 JoinSet drop ⇒ abort 全组（udf 语义）」。
+///
+/// **⑥ 无 drain 面 ⇒ 不得声称 abort（ADR §2.2 Q3 + PM P2 / R1）**——transport
+/// 族账本对宿主**不可见**（transport crate 无 ctx 注入面 ⇒ 宿主触达不到该账本
+/// ⇒ 无 drain 面）⇒ 该族**不得**声称 abort 在途；「扩 listen API 注入句柄」另票。
+///
+/// **⑦ 环禁令（ADR §2.2 Q4 + PM P4）**——被托管任务**不得持有其所在账本的 owner
+/// 强引用**（自引用环 ⇒ 该账本强引用永不归零 ⇒ Drop-abort 恒不可达）。可行形态
+/// **只有两种**：①**弱引用 / 快照**（任务只持所需状态的副本，或持 `Weak`；升级
+/// 失败即放弃——语义须逐站写明）；②**子账本**（确需向同一账本再 spawn 的任务住
+/// **另一本账**；**父 drain 必须显式级联子账本**——udf `FxScope` 无父子语义 ⇒
+/// 手工接线，漏接线 = 停机残留 ⇒ 须配 `in_flight` 断言兜住）。**第三种形态
+/// （同账本自持 owner）禁止**。可观测锚 = [`live_refs`](Self::live_refs)。
+///
+/// **⑧ 单账本（ADR §2.2 Q5）**——一个组件恰一本账；可有多个**克隆句柄**（同一本
+/// 账），但 **owner 恰一**，owner 由 stop 面负责 drain（禁「listener 一本 + hub
+/// 一本」双份账本）。
+///
+/// **⑨ 诊断面（ADR §2.3 + PM P6）**——[`live_refs`](Self::live_refs) 是 A4
+/// 「环已破」的**唯一可证伪锚**（只看「stop 后 `in_flight == 0`」证伪力不足：环
+/// 存在时 `drain` 仍能归零 ⇒ 断言假绿）；标 `#[doc(hidden)]` = 诊断用、非稳定
+/// API，未来若 udf 提供等价能力则随上游收敛删除。
+#[derive(Clone)]
+pub struct ComponentScope {
+    /// 日志域标识（拼进每条报告；`Arc<str>` 便于克隆进 'static future）。
+    label: Arc<str>,
+    /// 账本本体 = udf `FxScope`（spawn / accepting 闸 / 在途计数 / 三段排空；
+    /// 机制零复制，本件只组合调用）。
+    scope: Arc<FxScope>,
+    /// 域日志门面（scope 域单例，克隆零堆分配）：拒发 / panic / 排空结果的上报口。
+    log: LogFacade,
+    /// 收割节流计数（O29）：随本件共享（克隆同一份），每
+    /// [`crate::compat::REAP_EVERY`] 次 spawn 摊一次 `try_reap`。
+    tick: Arc<AtomicUsize>,
+}
+
+impl ComponentScope {
+    /// 新建组件账本（label 进每条报告前缀）。
+    pub fn new(label: impl Into<Arc<str>>) -> Self {
+        Self {
+            label: label.into(),
+            scope: Arc::new(FxScope::new()),
+            log: scope_log(),
+            tick: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// 托管 spawn：闸已关（拒发）时记 warn 并回 `Err(ScopeClosed)`（禁静默放弃）。
+    ///
+    /// 走 [`crate::compat::spawn_reaping_ticked`]（udf `try_reap` + 入集，收割按本
+    /// 账本的 `tick` 摊薄）：已完成条目出集，panic 载荷落日志（udf `task_body`
+    /// 自带 `catch_unwind` 归一 ⇒ 本件**不再包任务体**）。
+    pub fn spawn<F>(&self, fut: F) -> Result<Spawned<()>, ScopeClosed>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        crate::compat::spawn_reaping_ticked(
+            &self.scope,
+            &self.log,
+            &self.label,
+            Some(&self.tick),
+            fut,
+        )
+    }
+
+    /// 增量收割已完成条目（udf `try_reap`）并上报 panic；返回收割条数。
+    ///
+    /// [`Self::spawn`] 每次调用前已自动收割；本体供**无 spawn 的空闲期**显式
+    /// 触发（调用方自定节拍），确保滞留窗口有界。
+    pub fn reap(&self) -> usize {
+        crate::compat::reap_into(&self.scope, &self.log, &self.label)
+    }
+
+    /// 暴露底层 [`FxScope`] 句柄：供「拿不到 PluginContext 但持有本件」的宿主把
+    /// 托管任务喂给统一托管口（如 `crate::pool::spawn_idle_pruner`）。
+    #[must_use]
+    pub fn fx_scope(&self) -> &FxScope {
+        &self.scope
+    }
+
+    /// **关闸**（同步、幂等）：只关 accepting 闸（拒新 spawn，放行在途）。
+    ///
+    /// **不断在途、不等净、不 abort**（ADR-0004 §2.2 Q2）。语义 = Go
+    /// `listener.Close()`。要「在途归零」只能用 [`Self::drain`]。
+    pub fn close_gate(&self) {
+        self.scope.close();
+    }
+
+    /// **排空**（异步三段：关闸 → abort 在途 → 等净，带 timeout）。
+    ///
+    /// **唯一能声称「在途归零」的口**（ADR-0004 §2.2 Q2）。任务是**被取消**而非
+    /// 被等完成（abortable 段零残留）；不可让渡的在途段会让等净超时 → 报告
+    /// `timed_out > 0` + 一条 error 上报（禁静默）；成功 = 一条 info 报告
+    /// （`drained N`）。返回 udf `ShutdownReport` 供调用方断言。
+    pub async fn drain(&self, timeout: Duration) -> ShutdownReport {
+        let pending = self.scope.in_flight();
+        let report = self.scope.shutdown_timeout(timeout).await;
+        for msg in &report.panicked {
+            self.log.error(format!("{}: background task panicked: {msg}", self.label));
+        }
+        if report.timed_out > 0 {
+            self.log.error(format!(
+                "{}: shutdown incomplete ({pending} task(s) in flight, {} unfinished at deadline)",
+                self.label, report.timed_out
+            ));
+        } else {
+            self.log.info(format!("{}: drained {pending} background task(s)", self.label));
+        }
+        report
+    }
+
+    /// 在途任务数（排空断言锚）。
+    pub fn in_flight(&self) -> usize {
+        self.scope.in_flight()
+    }
+
+    /// **诊断面**（环破除锚，ADR-0004 §2.6 A4 · PM P6）：本账本（内嵌 udf
+    /// [`FxScope`]）的**强引用持有者数**（每个本件句柄持一份，stop 面自身那一份
+    /// 计入读数）。
+    ///
+    /// 读数：`1` = 只有 stop 面持有 ⇒ **无自引用环**；`> 1` = 有克隆句柄（**可能**
+    /// 是合法克隆，**也可能**是派 C 自引用环 ⇒ 须逐个核）。**静止点**读才有判据
+    /// 意义（运行期含合法克隆句柄）。
+    ///
+    /// `#[doc(hidden)]`：**诊断用**，非稳定 API；未来若 udf 提供等价能力则随上游
+    /// 收敛删除（ADR-0004 R4）。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn live_refs(&self) -> usize {
+        Arc::strong_count(&self.scope)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fmt,
+        sync::{Mutex, PoisonError},
+    };
+
     use super::*;
 
     /// bd il9lh MW-5：同 tag 连续登记 K 次 → 表内恒 1 条（修前 = K 条永久条目），
@@ -436,5 +623,188 @@ mod tests {
         }
         closer.join().expect("close thread must not panic");
         assert!(reg.registered() <= 4, "entries must stay bounded, got {}", reg.registered());
+    }
+
+    // ==== ADR-0004 §2.6 断言 A2/A3/A4：组件账本持有者契约 ====
+
+    /// ADR-0004 §2.6 A2：**关闸 ≠ 排空**——`close_gate()` 后 `spawn` 必回
+    /// `Err(ScopeClosed)`，而在途任务**不被 abort**（自然跑完）。
+    #[tokio::test]
+    async fn close_gate_rejects_new_spawns_but_keeps_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scope = ComponentScope::new("test-close-gate");
+        let done = Arc::new(AtomicBool::new(false));
+        let task_done = Arc::clone(&done);
+        let handle = scope
+            .spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                task_done.store(true, Ordering::SeqCst);
+            })
+            .expect("新建账本即 accepting");
+        assert_eq!(scope.in_flight(), 1, "spawn 后在途数必须可见");
+
+        scope.close_gate();
+        assert!(scope.spawn(async {}).is_err(), "关闸后必须拒发新任务");
+        assert_eq!(scope.in_flight(), 1, "关闸**不断**在途");
+        assert!(!done.load(Ordering::SeqCst), "关闸不得 abort 在途任务");
+
+        // 在途任务自然跑完（未被 abort）⇒ join 得正常值（Err = 被取消）。
+        handle.join().await.expect("在途任务不得被取消");
+        assert!(done.load(Ordering::SeqCst), "在途任务应自然完成");
+        assert_eq!(scope.in_flight(), 0, "任务结束后在途归零");
+    }
+
+    /// ADR-0004 §2.6 A3：**排空是唯一「在途归零」保证**——`drain()` 返回 udf
+    /// `ShutdownReport{ panicked, timed_out }`；`timed_out > 0` 走 error 级上报。
+    ///
+    /// 构造（确定性，不靠固定 spin 余量）：① panic 任务——先跑到 panic 再排空
+    /// （否则 abort 抢先，载荷根本没产生）；② 不可让渡的 spin 任务——abort 只在
+    /// 任务回到 Pending 后生效 ⇒ 排空必真超时。
+    #[test]
+    fn drain_reports_timeout_and_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            // `set_default` 是线程局部门面 + `block_on`：future 恒在调用线程 poll，
+            // 捕获必定命中（多线程 runtime 上任务跨 worker 迁移会逃出捕获窗）。
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let scope = ComponentScope::new("test-drain");
+
+                // ① panic 任务：先跑到终局（载荷入账本集合面），再排空。
+                let boom = scope.spawn(async { panic!("drain-boom") }).expect("spawn accepted");
+                while !boom.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+
+                // ② 不可让渡的在途任务（poll 不让渡 → abort 落不了地 → 必超时）。
+                //    `started` 闸：任务**真跑起来**后才排空——未启动就被 abort 的任务
+                //    是「取消」而非「超时」（abort 落不了地的前提 = 它在跑）。
+                let started = Arc::new(AtomicBool::new(false));
+                let hold = Arc::new(AtomicBool::new(true));
+                let (task_started, task_hold) = (Arc::clone(&started), Arc::clone(&hold));
+                scope
+                    .spawn(async move {
+                        task_started.store(true, Ordering::SeqCst);
+                        while task_hold.load(Ordering::Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    })
+                    .expect("spawn accepted");
+                while !started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+
+                let report = scope.drain(Duration::from_millis(50)).await;
+                assert!(report.timed_out > 0, "不可让渡的在途任务必须计入排空超时: {report:?}");
+                assert!(
+                    report.panicked.iter().any(|m| m.contains("drain-boom")),
+                    "排空报告必须带 panic 载荷: {:?}",
+                    report.panicked
+                );
+
+                // 放行 → 剩余任务收尾（超时退回 = abort 兜底，禁留活口）。
+                hold.store(false, Ordering::Relaxed);
+                for _ in 0..200 {
+                    if scope.in_flight() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(scope.in_flight(), 0, "超时后剩余任务必须收尾");
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(
+            lines.contains("shutdown incomplete"),
+            "排空超时必须 error 级上报（禁静默）: {lines:?}"
+        );
+        assert!(lines.contains("test-drain"), "报告必须带域标识: {lines:?}");
+        assert!(lines.contains("background task panicked"), "panic 载荷必须上报: {lines:?}");
+    }
+
+    /// ADR-0004 §2.6 A4：**环破除锚**——`live_refs()` = 本账本强引用持有者数：
+    /// 归 1 = 只有 stop 面持有（无自引用环）；> 1 = 存在克隆句柄。
+    ///
+    /// 反向锚：构造「任务持 owner 强引用」（ADR-0004 §2.2 Q4 的派 C 形态）⇒
+    /// 读数 > 1；环破除（任务终局、克隆句柄释放）后归 1。
+    #[tokio::test]
+    async fn live_refs_detects_self_reference() {
+        let scope = ComponentScope::new("test-live-refs");
+        assert_eq!(scope.live_refs(), 1, "静止点读数 = 只有 stop 面持有（无环）");
+
+        // 派 C 形态：克隆句柄住进本账本的任务体 = 任务强引用账本 owner。
+        let holder = scope.clone();
+        let handle = scope
+            .spawn(async move {
+                let _keep = holder;
+                std::future::pending::<()>().await;
+            })
+            .expect("spawn accepted");
+        assert!(
+            scope.live_refs() > 1,
+            "任务持 owner 强引用 ⇒ live_refs > 1（环存在）: {}",
+            scope.live_refs()
+        );
+
+        // 环破除：任务终局 ⇒ 克隆句柄释放 ⇒ 读数归 1。
+        handle.abort();
+        for _ in 0..200 {
+            if scope.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(scope.in_flight(), 0, "被 abort 的任务必须终局");
+        assert_eq!(scope.live_refs(), 1, "环破除 ⇒ live_refs 归 1（只剩 stop 面）");
+    }
+
+    /// 事件捕获订阅器（只把日志文本收进 `Vec`；线程局部安装，不抢全局槽）——
+    /// 口径同 `compat.rs` 测试面的同名件。
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Text(String);
+            impl tracing::field::Visit for Text {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut text = Text(String::new());
+            event.record(&mut text);
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).push(text.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
     }
 }

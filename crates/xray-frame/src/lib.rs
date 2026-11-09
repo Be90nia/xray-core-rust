@@ -68,7 +68,8 @@ pub mod reload;
 // 受控执行入口（spawn_unchecked / event）+ 台账（CI 门核对调用集合）。
 pub mod redline;
 // 两级 scope 模型（面 6 · 能力收敛方案 §2 面 6）：arm scope → connection
-// scope（表达 mux link 的跨连接生命周期）。
+// scope（表达 mux link 的跨连接生命周期）+ 组件自有账本（ADR-0004
+// `ComponentScope`：持有者契约唯一落点）。
 pub mod scope;
 // 派生件 1（bd h4bl5）：serveStale 缓存——udf `std_ext::cache::SyncTtlCache` 之上
 // 组合包装「过期保留读 + 同 key 刷新 single-flight」。
@@ -107,7 +108,7 @@ pub use reload::{
     ConfigChange, ConfigReloadListener, ConfigSource, ReloadError, ReloadTx, Swap, clean, swap_all,
     swap_one,
 };
-pub use scope::{ArmScope, ArmScopeRegistry, ConnScope};
+pub use scope::{ArmScope, ArmScopeRegistry, ComponentScope, ConnScope};
 
 #[cfg(test)]
 mod wiring_smoke_tests {
