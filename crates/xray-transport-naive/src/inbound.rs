@@ -83,15 +83,17 @@ impl NaiveInboundConfig {
 
 struct InboundSlot {
     _accept_task: JoinHandle<()>,
-    /// §3.5.6 ①类托管：连接任务（h2 tunnel/mock relay）归本 scope；slot 摘除
-    /// （close/Drop）即 scope Drop 兜底 abort 在途连接。
-    scope: Arc<xray_frame::compat::ManagedScope>,
+    /// §3.5.6 ①类托管：连接任务（h2 tunnel/mock relay）归本 scope。stop 面 =
+    /// `NaiveInboundHandler::close` 显式排空（`drain(100ms)`，ADR-0004 §2.2 Q2：
+    /// 唯一能声称「在途归零」的口）；Drop 不作中止保证（§2.2 Q3；每连接任务持
+    /// conn_scope 克隆 ⇒ Drop 兜底不可达，破环归 B2）。
+    scope: Arc<xray_frame::scope::ComponentScope>,
 }
 
 /// naive 入站 Handler，实现 [`InboundHandler`]。
 ///
 /// `start` 时 bind TcpListener 并 spawn accept 循环（TLS + h2 服务）；
-/// drop 时 abort accept 任务关闭端口（xray-core 接线层以保活模式持有）。
+/// drop 时经 Drop impl 取消 accept 任务关闭端口（xray-core 接线层以保活模式持有）。
 pub struct NaiveInboundHandler {
     tag: String,
     bind_addr: SocketAddr,
@@ -169,9 +171,9 @@ impl InboundHandler for NaiveInboundHandler {
         let acceptor = self.tls.clone();
         let auth = Arc::clone(&self.auth);
         let dispatch = self.dispatch.clone();
-        // §3.5.6 ①类托管：连接任务归 handler 自持 scope（Arc 共享进 service 闭包，
-        // slot 摘除即 Drop abort）。
-        let scope = Arc::new(xray_frame::compat::ManagedScope::new("naive-inbound"));
+        // §3.5.6 ①类托管：连接任务归 handler 自持 scope（Arc 共享进 service 闭包）；
+        // 收口只经 close() 显式排空（drain），Drop 不作中止保证（ADR-0004 §2.2 Q3）。
+        let scope = Arc::new(xray_frame::scope::ComponentScope::new("naive-inbound"));
         let scope_for_slot = Arc::clone(&scope);
         #[allow(
             clippy::disallowed_methods,
@@ -187,7 +189,8 @@ impl InboundHandler for NaiveInboundHandler {
                         let scope = Arc::clone(&scope);
                         let conn_scope = Arc::clone(&scope);
                         // §3.5.6 ①类：每连接 TLS/h2 任务归 handler 自持 scope
-                        // （close/Drop 摘 slot 即 abort）；闸关即拒（留 debug）。
+                        // （conn_scope 克隆进任务 = 环事实，破环归 B2）；闸关即拒
+                        // （留 debug）；在途收口只经 close() 显式排空（§2.2 Q3）。
                         let spawned = scope.spawn(async move {
                             let tls =
                                 match xray_transport::tls_handshake_gate::accept_tls_with_timeout(
@@ -252,7 +255,7 @@ impl InboundHandler for NaiveInboundHandler {
             slot._accept_task.abort();
             // §3.5.6 ①类收口：关闸 + abort 在途（连接任务全 abortable ⇒ 立即归零）；
             // 报告（panic 清单 / 未完成数）由托管口自行落日志，此处只吸收值。
-            let _ = slot.scope.shutdown_timeout(std::time::Duration::from_millis(100)).await;
+            let _ = slot.scope.drain(std::time::Duration::from_millis(100)).await;
         }
         self.local_port.store(0, Ordering::SeqCst);
         self.started.store(false, Ordering::SeqCst);
@@ -272,7 +275,7 @@ async fn handle_request(
     mut req: http::Request<Incoming>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     auth: Arc<NaiveInboundConfig>,
-    scope: Arc<xray_frame::compat::ManagedScope>,
+    scope: Arc<xray_frame::scope::ComponentScope>,
 ) -> Result<http::Response<RespBody>, Infallible> {
     // fallback：非 CONNECT 一律 404 空响应（naiveproxy probe-resistance——
     // 主动探测看到的是普通 404 站点，不暴露代理身份）
@@ -458,7 +461,7 @@ mod tests {
         }
     }
 
-    /// 起一个 naive 入站并返回监听地址（handler drop = abort accept task，
+    /// 起一个 naive 入站并返回监听地址（handler drop 经 Drop impl 取消 accept task，
     /// 但任务 detach 自持 listener——测试进程存活期间端口保持服务）。
     ///
     /// ponytail: 测试收尾靠进程退出回收端口，不做显式 close。

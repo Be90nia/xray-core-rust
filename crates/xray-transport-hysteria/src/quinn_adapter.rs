@@ -378,13 +378,19 @@ pub struct QuinnQuicListener {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
     /// §3.5.6 ①类托管：每 QUIC 连接任务账本（accept 泵与 auth 持有任务共用）。
-    /// `close()` 关闸；listener 丢弃即 abort 在途。
-    scope: xray_frame::compat::ManagedScope,
+    /// stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1）：`close()` 只关闸拒新、
+    /// 放行在途（Go 26.10.17 `listener.Close()` 不杀已建立连接，h3 分支亦按
+    /// 关闸档）；无 drain 面 ⇒ 不得声称 abort 在途（Drop-abort 时点不确定，
+    /// 仅为实现事实，非契约保证）。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl QuinnQuicListener {
     #[must_use]
-    pub fn new(endpoint: quinn::Endpoint, scope: xray_frame::compat::ManagedScope) -> Option<Self> {
+    pub fn new(
+        endpoint: quinn::Endpoint,
+        scope: xray_frame::scope::ComponentScope,
+    ) -> Option<Self> {
         let local_addr = endpoint.local_addr().ok()?;
         Some(Self { endpoint, local_addr, scope })
     }
@@ -413,8 +419,9 @@ impl HysteriaQuicListener for QuinnQuicListener {
 
     fn close(&self) -> Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send>> {
         let ep = self.endpoint.clone();
-        // 连接任务账本关闸：停机后拒新任务（在途随 listener 丢弃被 abort）。
-        self.scope.close();
+        // 连接任务账本关闸（transport 族关闸档，ADR-0004 §2.2 Q1）：停机后拒新
+        // 任务；在途任务不由此口 abort（Drop-abort 时点不确定，仅为实现事实）。
+        self.scope.close_gate();
         Box::pin(async move {
             ep.close(VarInt::from_u32(0), b"");
             Ok(())
@@ -567,7 +574,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
             let gate =
                 HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
             // §3.5.6 ①类托管：每 QUIC 连接任务账本（accept 泵内 spawn + auth 持有任务）。
-            let scope = xray_frame::compat::ManagedScope::new(format!(
+            let scope = xray_frame::scope::ComponentScope::new(format!(
                 "hysteria-quinn:{}",
                 endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()
             ));
@@ -617,8 +624,9 @@ fn spawn_gated_hysteria_accept(
     masq_handler: Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: String,
     udp_idle_timeout: Duration,
-    // §3.5.6 ①类托管：每连接任务账本（listener 持有，close 关闸）。
-    scope: xray_frame::compat::ManagedScope,
+    // §3.5.6 ①类托管：每连接任务账本（listener 持有，close 关闸——transport 族
+    // 关闸档，ADR-0004 §2.2 Q1）。
+    scope: xray_frame::scope::ComponentScope,
 ) {
     let local = ep.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
     spawn_supervised_accept_loop(local, async move {
@@ -704,7 +712,7 @@ async fn serve_hysteria_connection(
     udp_idle_timeout: Duration,
     on_new_udp_session: Option<Arc<dyn Fn(Arc<crate::conn::InterConn>) + Send + Sync>>,
     // §3.5.6 ①类托管：auth 阶段的 detached h3 状态持有任务归本连接所属账本。
-    scope: xray_frame::compat::ManagedScope,
+    scope: xray_frame::scope::ComponentScope,
 ) {
     let remote = conn.remote_address();
     let local = conn
@@ -916,7 +924,7 @@ async fn h3_auth(
     masq: &Arc<dyn crate::hub::MasqueradeHandler>,
     static_auth: &str,
     // §3.5.6 ①类托管：detached h3 状态持有任务归本连接所属账本。
-    scope: &xray_frame::compat::ManagedScope,
+    scope: &xray_frame::scope::ComponentScope,
 ) -> Option<u64> {
     let h3_server: h3::server::Connection<AuthH3Conn, bytes::Bytes> =
         match h3::server::Connection::new(AuthH3Conn::new(conn.clone())).await {
@@ -2718,7 +2726,7 @@ mod tests {
             .build_handler(),
             "test-secret".into(),
             Duration::from_secs(300),
-            xray_frame::compat::ManagedScope::new("hysteria-gate-test"),
+            xray_frame::scope::ComponentScope::new("hysteria-gate-test"),
         );
 
         // 永挂验证器客户端：占住唯一名额（entered ⇒ 服务器已接纳、许可已被占）。

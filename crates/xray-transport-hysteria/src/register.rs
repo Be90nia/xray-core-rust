@@ -120,9 +120,9 @@ async fn listen_hysteria(
     // 全部 clone 归零，driver 停、UDP socket 关、端口释放。修复前 close() 仅日志，
     // endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
     let quic_listener = listener.clone();
-    // §3.5.6 ①类托管：每 QUIC 连接的桥接任务归本 listener 的 scope；close() 关闸，
-    // 句柄丢弃即 abort 在途。
-    let scope = xray_frame::compat::ManagedScope::new(format!("hysteria-accept:{local}"));
+    // §3.5.6 ①类托管：每 QUIC 连接的桥接任务归本 listener 的 scope（stop 面 =
+    // transport 族关闸档，ADR-0004 §2.2 Q1：关闸拒新、放行在途；无 drain 面）。
+    let scope = xray_frame::scope::ComponentScope::new(format!("hysteria-accept:{local}"));
     let conn_scope = scope.clone();
 
     #[allow(
@@ -222,9 +222,11 @@ struct HysteriaTransportListener {
     local: SocketAddr,
     listener: Arc<dyn HysteriaQuicListener>,
     abort: tokio::task::AbortHandle,
-    /// §3.5.6 ①类托管：每 QUIC 连接桥接任务账本。`close()` 关闸，句柄丢弃即
-    /// abort 在途（连接任务全 abortable）。
-    scope: xray_frame::compat::ManagedScope,
+    /// §3.5.6 ①类托管：每 QUIC 连接桥接任务账本。stop 面 = transport 族关闸档
+    /// （ADR-0004 §2.2 Q1）：`close()` 只关闸拒新、放行在途（Go 26.10.17
+    /// `listener.Close()` 不杀已建立连接）；无 drain 面 ⇒ 不得声称 abort 在途
+    /// （accept 泵退出后的 Drop-abort 时点不确定，仅为实现事实，非契约保证）。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl TransportListener for HysteriaTransportListener {
@@ -235,8 +237,9 @@ impl TransportListener for HysteriaTransportListener {
     fn close(&self) -> io::Result<()> {
         crate::LOG.info(format!("hysteria listener close addr={}", self.local));
         self.abort.abort();
-        // 连接任务账本关闸：停机后拒新连接任务（在途随 listener 丢弃被 abort）。
-        self.scope.close();
+        // 连接任务账本关闸（transport 族关闸档，ADR-0004 §2.2 Q1）：停机后拒新
+        // 连接任务；在途任务不由此口 abort（Drop-abort 时点不确定，仅为实现事实）。
+        self.scope.close_gate();
         // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
         // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。
         // ②豁免：该任务是停机动作本身（关闭 QUIC endpoint），必须跑完才有端口释放，

@@ -18,7 +18,7 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_frame::compat::ManagedScope;
+use xray_frame::scope::ComponentScope;
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
@@ -308,9 +308,11 @@ async fn listen_httpupgrade(
     // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）；上界核算见
     // `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
-    // 握手任务托管口（CLAUDE.md §3.5.6 ①）：listener 丢弃/关闭 ⇒ scope 归零 ⇒
-    // 在途握手任务 abort（不残留 4s 尾巴）。
-    let scope = ManagedScope::new(format!("httpupgrade-accept:{local}"));
+    // 握手任务托管口（CLAUDE.md §3.5.6 ①）：stop 面 = transport 族关闸档
+    // （ADR-0004 §2.2 Q1）：close 只拒新握手，不杀已建立连接（Go 26.10.17
+    // `listener.Close()` 口径，在途服务到 EOF）；无 drain 面 ⇒ 不声称 abort；
+    // Drop 不作中止保证（ADR-0004 §2.2 Q3）。
+    let scope = ComponentScope::new(format!("httpupgrade-accept:{local}"));
     let loop_scope = scope.clone();
     let ctx = Arc::new(HandshakeCtx {
         accept_proxy,
@@ -399,7 +401,8 @@ async fn listen_unix_httpupgrade(
     // 日志标识进块（supervise_accept_loop 另需 path 所有权）。
     let log_ident = path.clone();
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
-    let scope = ManagedScope::new(format!("httpupgrade-unix-accept:{log_ident}"));
+    // 握手任务托管口：stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1，同 TCP 路径）。
+    let scope = ComponentScope::new(format!("httpupgrade-unix-accept:{log_ident}"));
     let loop_scope = scope.clone();
     let ctx = Arc::new(HandshakeCtx {
         accept_proxy: false,
@@ -493,17 +496,19 @@ fn build_tls_server_config(
 struct HttpUpgradeListener {
     local: SocketAddr,
     abort: tokio::task::AbortHandle,
-    /// 在途握手任务的托管口：`close()` 关闸，listener 丢弃时 scope 归零 ⇒ 在途
-    /// 握手任务 abort（不残留 4s 尾巴）。
-    scope: ManagedScope,
+    /// 在途握手任务的托管口：`close()` 关闸（拒新 spawn，放行在途）。stop 面 =
+    /// transport 族关闸档（ADR-0004 §2.2 Q1）：不杀已建立连接；Drop 不作中止
+    /// 保证（ADR-0004 §2.2 Q3）。
+    scope: ComponentScope,
 }
 
 impl TransportListener for HttpUpgradeListener {
     fn close(&self) -> io::Result<()> {
         // 取消 accept task：正在 accept()/握手 await 中的循环被打断，端口释放。
         self.abort.abort();
-        // 握手托管口关闸：停机后拒新握手任务（在途任务随 listener 丢弃被 abort）。
-        self.scope.close();
+        // 握手托管口关闸：停机后拒新握手任务（transport 族关闸档：在途按 Go 口径
+        // 服务到 EOF，ADR-0004 §2.2 Q1；Drop 不作中止保证，§2.2 Q3）。
+        self.scope.close_gate();
         Ok(())
     }
 
@@ -514,7 +519,7 @@ impl TransportListener for HttpUpgradeListener {
 
 impl Drop for HttpUpgradeListener {
     fn drop(&mut self) {
-        // v7nqa：停机只 drop 监听句柄 → 不 abort 则 accept task 继续持有 socket
+        // v7nqa：停机只 drop 监听句柄 → 不取消 accept task 则其继续持有 socket
         // （Go worker.close 显式 hub.Close()，worker.go:151-158；httpupgrade 侧
         // hub.go:30-32 `Close()` = `innnerListener.Close()`）。
         let _ = TransportListener::close(self);

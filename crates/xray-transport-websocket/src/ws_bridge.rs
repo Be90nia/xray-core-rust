@@ -61,7 +61,7 @@ pub struct WsConnection<S> {
     pub(crate) remote: Option<SocketAddr>,
     /// 本端地址。
     pub(crate) local: Option<SocketAddr>,
-    /// 心跳 ping 任务中止器（托管 spawn 句柄的 abort 面）；`Drop` 时 abort 防泄漏
+    /// 心跳 ping 任务中止器（托管 spawn 句柄的取消面）；drop 时经此中止防泄漏
     /// （对应 Go heartbeat goroutine 生命周期）。
     pub(crate) heartbeat_abort: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -380,7 +380,7 @@ mod tests {
             conn.start_heartbeat(Duration::from_millis(20));
             // 保活 200ms 让心跳发出几个 Ping。
             tokio::time::sleep(Duration::from_millis(200)).await;
-            // conn drop → Drop::drop abort heartbeat task。
+            // conn 丢弃 → Drop::drop 中止 heartbeat 任务。
         });
 
         // 2. Client: 连接并读 Ping 帧。

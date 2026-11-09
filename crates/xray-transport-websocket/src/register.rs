@@ -19,7 +19,7 @@
 use std::{io, net::SocketAddr, sync::Arc};
 
 use xray_common::net::destination::Destination;
-use xray_frame::compat::ManagedScope;
+use xray_frame::scope::ComponentScope;
 use xray_transport::{
     accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
     connection::Connection,
@@ -204,10 +204,12 @@ fn spawn_ws_accept_loop(
     // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）。生产 256MB 小机场，
     // 上界核算见 `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
-    // 握手任务托管口（CLAUDE.md §3.5.6 ①「接管类必须托管」）：`ManagedScope` 组合
-    // 包装 udf `FxScope`。listener 关闭/丢弃 ⇒ scope 最后一份引用归零 ⇒ 在途握手
-    // 任务被 abort（不残留 4s 尾巴）。
-    let scope = ManagedScope::new(format!("ws-accept:{ident}"));
+    // 握手任务托管口（CLAUDE.md §3.5.6 ①「接管类必须托管」）：
+    // `xray_frame::scope::ComponentScope` 组合包装 udf `FxScope`。stop 面 =
+    // transport 族关闸档（ADR-0004 §2.2 Q1）：close 只拒新握手，不杀已建立
+    // 连接（Go 26.10.17 `listener.Close()` 口径，在途服务到 EOF）；无 drain 面
+    // ⇒ 不声称 abort；Drop 不作中止保证（ADR-0004 §2.2 Q3）。
+    let scope = ComponentScope::new(format!("ws-accept:{ident}"));
     let loop_scope = scope.clone();
     #[allow(
         clippy::disallowed_methods,
@@ -306,9 +308,10 @@ fn spawn_ws_accept_loop(
 struct WsTransportListener {
     local_addr: SocketAddr,
     close_notify: Arc<tokio::sync::Notify>,
-    /// 在途握手任务的托管口：`close()` 关闸（拒新 spawn），listener 丢弃时
-    /// scope 归零 ⇒ 在途握手任务 abort。
-    scope: ManagedScope,
+    /// 在途握手任务的托管口：`close()` 关闸（拒新 spawn，放行在途）。stop 面 =
+    /// transport 族关闸档（ADR-0004 §2.2 Q1）：不杀已建立连接；Drop 不作中止
+    /// 保证（ADR-0004 §2.2 Q3）。
+    scope: ComponentScope,
 }
 
 impl TransportListener for WsTransportListener {
@@ -317,8 +320,9 @@ impl TransportListener for WsTransportListener {
         // 也不丢失（notify_waiters 只唤醒已注册 waiter，会留下永久 accept 的僵尸）。
         // 底层 TcpListener 在 WsListener drop 时关闭。
         self.close_notify.notify_one();
-        // 握手托管口关闸：停机后拒新握手任务（在途任务随 listener 丢弃被 abort）。
-        self.scope.close();
+        // 握手托管口关闸：停机后拒新握手任务（transport 族关闸档：在途按 Go 口径
+        // 服务到 EOF，ADR-0004 §2.2 Q1；Drop 不作中止保证，§2.2 Q3）。
+        self.scope.close_gate();
         Ok(())
     }
 

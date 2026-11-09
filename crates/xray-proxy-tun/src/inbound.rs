@@ -173,8 +173,13 @@ pub struct TunInboundHandler {
     /// TUN 设备句柄——start() 后填充。
     device: ParkMutex<Option<Arc<TunDevice>>>,
     /// 托管口（§3.5.6 ①类）：driver loop 与其派生的全部任务（TCP 中继/dispatch、
-    /// UDP 会话/写回/sweeper）共用一本账；`close()` 三段排空即一并 abort。
-    scope: ParkMutex<Option<xray_frame::compat::ManagedScope>>,
+    /// UDP 会话/写回/sweeper）共用一本账。stop 面 = 排空档（ADR-0004 §2.2 Q1，
+    /// arm/dispatcher/tun 族口径）：`close()` 走 `drain`（关闸 → abort 在途 →
+    /// 等净），在途任务一并 abort。
+    ///
+    /// 已知：driver 任务持有本账本的强引用（自引用环，bd hnicl）⇒ 纯 Drop 路径
+    /// 不会触发在途中止；环破除见 ADR-0004 B2 批次。
+    scope: ParkMutex<Option<xray_frame::scope::ComponentScope>>,
     /// smoltcp 网栈句柄（与 driver task 共享）。
     netstack: Arc<AsyncMutex<TunNetStack>>,
     /// 配置参数（用于构造 TUN 设备和网栈）。
@@ -401,8 +406,9 @@ impl InboundHandler for TunInboundHandler {
         let netstack = Arc::clone(&self.netstack);
         let dev = Arc::clone(&device);
         let dispatch = Arc::clone(&self.dispatch);
-        // §3.5.6 ①类托管：tun 组件自持托管口（driver loop 及全部派生任务共用一本账）。
-        let scope = xray_frame::compat::ManagedScope::new(format!("tun:{}", self.tag));
+        // §3.5.6 ①类托管：tun 组件自持托管口（driver loop 及全部派生任务共用一本账；
+        // 排空档，stop 面 = close() 的 drain）。
+        let scope = xray_frame::scope::ComponentScope::new(format!("tun:{}", self.tag));
         let driver_scope = scope.clone();
         if scope
             .spawn(async move {
@@ -423,12 +429,12 @@ impl InboundHandler for TunInboundHandler {
     /// 关闭 TUN 设备 + 停止驱动 task。
     async fn close(&self) -> std::result::Result<(), InboundError> {
         self.started.store(false, Ordering::SeqCst);
-        // 托管口收口（close 闸 → abort 在途 → 等净）：driver loop 与全部派生任务
-        // 一并停（含 TCP 中继/dispatch、UDP 会话/写回/sweeper）。任务全 abortable
-        // ⇒ 立即归零；报告由托管口自行落日志，此处只吸收值。
+        // 托管口收口（drain 三段：关闸 → abort 在途 → 等净）：driver loop 与全部
+        // 派生任务一并停（含 TCP 中继/dispatch、UDP 会话/写回/sweeper）。任务全
+        // abortable ⇒ 立即归零；报告由托管口自行落日志，此处只吸收值。
         let scope = self.scope.lock().take();
         if let Some(scope) = scope {
-            let _ = scope.shutdown_timeout(std::time::Duration::from_millis(100)).await;
+            let _ = scope.drain(std::time::Duration::from_millis(100)).await;
         }
         // 回滚 A3/A4 系统变更（对齐 Go Close：unsetSystemDNS → unsetSystemRoutes → 设备下线）。
         if let Some(applied) = self.applied_sysroute.lock().take() {
@@ -667,7 +673,7 @@ async fn tun_driver_loop(
     device: Arc<TunDevice>,
     netstack: Arc<AsyncMutex<TunNetStack>>,
     dispatch: Arc<dyn DispatchHandler>,
-    scope: xray_frame::compat::ManagedScope,
+    scope: xray_frame::scope::ComponentScope,
 ) {
     let mut timer = interval(POLL_INTERVAL);
     // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
@@ -876,7 +882,7 @@ fn handle_udp_packet(
     payload: &[u8],
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
-    scope: &xray_frame::compat::ManagedScope,
+    scope: &xray_frame::scope::ComponentScope,
 ) {
     // 票 ijn7：目的组播/广播不进 relay；relay 刚失败过的目的地址在冷却窗内
     // 也不再新建会话（防「失败 → 立刻重建」的忙循环）。判定与计数在
@@ -954,7 +960,7 @@ pub(crate) fn now_nanos() -> i64 {
 /// p14e：周期性扫描 idle 60s+ 的 UDP session 并从 map 淘汰（票 8gr6 重构：
 /// 无 try_lock 探测——owner task 独占 session，map 移除即可回收）。
 /// 经 tun 组件托管口 spawn（§3.5.6 ①类），无关主 driver loop。
-fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::compat::ManagedScope) {
+fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::scope::ComponentScope) {
     if scope
         .spawn(async move {
             let mut tick = interval(Duration::from_secs(UDP_SESSION_SWEEP_SECS));
@@ -1037,7 +1043,7 @@ fn spawn_udp_session_task(
     sessions: UdpSessions,
     failed: FailedDsts,
     entry: std::sync::Weak<UdpSessionEntry>,
-    scope: xray_frame::compat::ManagedScope,
+    scope: xray_frame::scope::ComponentScope,
 ) {
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
@@ -1219,7 +1225,7 @@ async fn dispatch_accepted(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     events: Vec<TcpAcceptEvent>,
     dispatch: &Arc<dyn DispatchHandler>,
-    scope: &xray_frame::compat::ManagedScope,
+    scope: &xray_frame::scope::ComponentScope,
 ) {
     for event in events {
         accept_tcp_connection(netstack, event, dispatch, scope).await;
@@ -1232,7 +1238,7 @@ async fn accept_tcp_connection(
     netstack: &Arc<AsyncMutex<TunNetStack>>,
     event: TcpAcceptEvent,
     dispatch: &Arc<dyn DispatchHandler>,
-    scope: &xray_frame::compat::ManagedScope,
+    scope: &xray_frame::scope::ComponentScope,
 ) {
     // 从 local endpoint 构建 destination
     let dest = match ip_endpoint_to_destination(&event.local) {
@@ -1453,12 +1459,14 @@ mod tests {
         (Arc::new(d), calls)
     }
 
-    /// §3.5.6 ①类接线：`dispatch_accepted` 的托管口（测试自持，Drop 兜底 abort）。
+    /// §3.5.6 ①类接线：`dispatch_accepted` 的托管口（测试自持；Drop 时本账本若为
+    /// 最后一份强引用，JoinSet drop ⇒ abort 全组——udf `FxScope` 语义）。
     ///
     /// **必须绑定到局部变量**再传 `&`：写成临时值 `&test_scope()` 会在该语句结束时
-    /// 立即 Drop（= abort 在途任务），spawn 出的 dispatch/relay task 永远不跑。
-    fn test_scope() -> xray_frame::compat::ManagedScope {
-        xray_frame::compat::ManagedScope::new("tun-test")
+    /// 立即 Drop——账本最后一份强引用消失，spawn 出的 dispatch/relay task 全组
+    /// 被 abort，永远不跑。
+    fn test_scope() -> xray_frame::scope::ComponentScope {
+        xray_frame::scope::ComponentScope::new("tun-test")
     }
 
     #[tokio::test]
@@ -1776,8 +1784,9 @@ mod tests {
             0x02, // SYN
         );
 
-        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop（= abort 在途任务，
-        // 托管口 drop 语义），spawn 出的 dispatch task 永远跑不到下面的 sleep。
+        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop——账本
+        // 最后一份强引用消失，spawn 出的 dispatch task 全组 abort（udf 语义），
+        // 永远跑不到下面的 sleep。
         let scope = test_scope();
 
         {
@@ -2265,8 +2274,9 @@ mod tests {
         };
         assert_eq!(accepted2.len(), 1, "accept collected once per batch");
 
-        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop（= abort 在途任务），
-        // 锁外 spawn 的 dispatch task 跑不到下面的 sleep。
+        // 托管口持有到测试末尾：临时值 `&test_scope()` 会在语句结束即 Drop——账本
+        // 最后一份强引用消失，锁外 spawn 的 dispatch task 全组 abort（udf 语义），
+        // 跑不到下面的 sleep。
         let scope = test_scope();
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
         dispatch_accepted(&netstack, accepted2, &handler, &scope).await;

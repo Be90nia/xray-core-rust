@@ -258,7 +258,7 @@ pub type DialFactory = Arc<dyn Fn(Option<Vec<u8>>) -> DialFuture + Send + Sync>;
 ///   到拨号完成；被握手吸收则 `Ready(Ok(len))`，超 Ed 则不带 early
 ///   data、原包落帧写（`dialer.go:178-198`）。
 /// - `poll_read`：未拨号时等待拨号完成（`dialed` channel 语义，`dialer.go:200-212`）。
-/// - 关闭/drop：abort 未完成的拨号任务（`cancel()` 语义，`dialer.go:214-221`）。
+/// - 关闭：取消未完成的拨号任务（`cancel()` 语义，drop 时生效，`dialer.go:214-221`）。
 pub struct DelayDialConn {
     ed: u32,
     factory: DialFactory,

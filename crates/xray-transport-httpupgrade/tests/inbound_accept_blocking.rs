@@ -135,8 +135,8 @@ async fn start_hu_listener(
     )
     .await
     .expect("httpupgrade listener starts");
-    // listener 句柄 Drop 兜底会 abort accept task（register.rs Drop impl / v7nqa）——
-    // 探针需监听存活到用例结束，forget 之（进程退出即回收）。
+    // listener 句柄 Drop 会触发 close（register.rs Drop impl / v7nqa）取消 accept
+    // task——探针需监听存活到用例结束，forget 之（进程退出即回收）。
     let addr = listener.local_addr().expect("httpupgrade local_addr");
     std::mem::forget(listener);
     addr
