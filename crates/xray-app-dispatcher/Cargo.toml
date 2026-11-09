@@ -17,7 +17,7 @@ xray-xudp = { path = "../xray-xudp" }
 # memgov 纯 std 零三方增量；不拖 runtime/pool 默认档（口径同 xray-core）。
 # path 形态同各 app crate（udf-frame 仓内工作副本即改即用；CI 由 fetch-udf 拉料）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", default-features = false, features = ["memgov"] }
-# bd 4a1zy：后台任务托管面走 xray-frame `compat::ManagedScope`（组合包装 udf
+# bd 4a1zy：后台任务托管面走 xray-frame `scope::ComponentScope`（组合包装 udf
 # `FxScope` + fail-visible 报告），生产托管为常规依赖（依赖方向合规：xray-frame
 # 零 xray-core/proxy 依赖，无环）。
 xray-frame = { path = "../xray-frame" }

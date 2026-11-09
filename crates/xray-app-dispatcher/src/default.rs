@@ -21,7 +21,7 @@ use std::{
 
 use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use xray_buf::multi::MultiBuffer;
-use xray_frame::compat::ManagedScope;
+use xray_frame::scope::ComponentScope;
 
 use crate::{error::DispatcherError, sniffer::SniffResult};
 
@@ -897,7 +897,7 @@ impl Drop for OnlineIpGuard {
     }
 }
 
-// 后台 task 托管自 bd 4a1zy 起走 xray-frame `compat::ManagedScope`（组合包装
+// 后台 task 托管自 bd 4a1zy 起走 xray-frame `scope::ComponentScope`（组合包装
 // udf `FxScope`）：生命周期集、拒发闸、排空/超时全部归框架件，本 crate 不再自持
 // JoinSet 账本（双份账本 = 两套停机语义，已删）。
 
@@ -928,9 +928,16 @@ pub struct DefaultDispatcher {
     /// None = 不记 access log（等价 Go ctx 无 AccessMessage → 不 Record）。
     pub access_sink: Option<Arc<dyn AccessLogSink>>,
     /// 后台 dispatch task 收口（bd 4a1zy）：dispatch_link spawn 的处理 task 全部
-    /// 归框架托管 scope（`in_flight` 计数 + 停机排空），宿主 drop 时 scope 随之
-    /// abort 在途 task。停机 watcher 见 xray-core `functions.rs`。
-    scope: ManagedScope,
+    /// 归框架托管 scope（`in_flight` 计数 + 停机排空）。
+    ///
+    /// 档位 = **排空档**（arm/dispatcher/tun 族口径，ADR-0004 §2.2 Q1 档位表）：
+    /// 排空 = 关闸 + abort 在途 + 等净。**stop 面在外部**：本组件无 close 面，
+    /// 排空由宿主 watcher 调 `drain(timeout)` 完成（xray-core `functions.rs`）。
+    ///
+    /// Drop **不作**中止保证（ADR-0004 §2.2 Q3）：账本强引用归零时 udf
+    /// `FxScope` 的 JoinSet drop 会中止全组，那是实现事实（时点随其他持有者
+    /// 而定），不是契约保证——唯一可声称「在途归零」的口是 `drain`。
+    scope: ComponentScope,
 }
 
 impl Debug for DefaultDispatcher {
@@ -965,13 +972,13 @@ impl DefaultDispatcher {
             policy_manager: None,
             udp443_policies: std::sync::Arc::new(HashMap::new()),
             access_sink: None,
-            scope: ManagedScope::new("dispatcher"),
+            scope: ComponentScope::new("dispatcher"),
         }
     }
 
-    /// 后台任务托管 scope（宿主停机编排面：`shutdown_timeout` 排空在途 dispatch
-    /// task，超时/失败由 `ManagedScope` 记 error，不静默）。
-    pub fn scope(&self) -> &ManagedScope {
+    /// 后台任务托管 scope（宿主停机编排面：`drain` 排空在途 dispatch task，
+    /// 超时/失败由 `ComponentScope` 记 error，不静默）。
+    pub fn scope(&self) -> &ComponentScope {
         &self.scope
     }
 
@@ -1529,7 +1536,7 @@ impl DefaultDispatcher {
         let fut = SKIP_DNS_RESOLVE.scope(skip_dns_resolve, fut);
 
         // 停机窗内 scope 已关：拒发必须回错（否则连接静默挂住等对端超时）。
-        // ManagedScope 内部已记 warn，此处只负责把失败交给调用方。
+        // ComponentScope 内部已记 warn，此处只负责把失败交给调用方。
         self.scope
             .spawn(fut)
             .map(|_| ())
@@ -1720,9 +1727,13 @@ pub struct DialBridge {
     /// 最近一次 dispatch 的 splice 准入结果（[`Self::splice_admitted`] 读；
     /// Arc 便于 dispatch future（'static）捕获落盘）。
     splice_admitted: Arc<std::sync::atomic::AtomicBool>,
-    /// chained dispatch task 收口（bd 4a1zy）：bridge 自持托管 scope，bridge drop
-    /// ⇒ scope 随之 abort 在途 chained task（杜绝 fire-and-forget 孤儿）。
-    scope: ManagedScope,
+    /// chained dispatch task 收口（bd 4a1zy）：bridge 自持托管 scope。
+    ///
+    /// 档位 = **排空档**（arm/dispatcher/tun 族口径，ADR-0004 §2.2 Q1 档位表）。
+    /// stop 面 = 外部（宿主 drop）：本持有件**无 `close_gate` / `drain` 调用面**
+    /// ⇒ 不得声称「在途归零」；收口只随 bridge 释放发生——Drop 时 `FxScope` 若为
+    /// 最后一份强引用，则 JoinSet drop ⇒ abort 全组（udf 语义，实现事实而非保证）。
+    scope: ComponentScope,
     /// 代理链失败累计（chain handler 缺失 / 无 outbound manager 两种）。
     ///
     /// epyge：这两处原先只记 error 日志后**静默 return**——下行永不关闭，
@@ -1827,7 +1838,7 @@ impl DialBridge {
     pub fn new(tag: impl Into<String>, dial: DialFn) -> Self {
         let tag: String = tag.into();
         Self {
-            scope: ManagedScope::new(format!("dial-bridge:{tag}")),
+            scope: ComponentScope::new(format!("dial-bridge:{tag}")),
             tag,
             dial,
             proxy_chain: parking_lot::RwLock::new(ProxyChainConfig {
@@ -2768,8 +2779,8 @@ mod tests {
     }
 
     /// bd 4a1zy 验收（dispatcher 侧）：后台任务托管面从自持 `JoinSet` 迁到
-    /// `xray-frame` `compat::ManagedScope` 后，实例 scope 的三个契约仍成立——
-    /// ①在途 dispatch task 可见（`in_flight`）；②`shutdown_timeout` 收口后归零
+    /// `xray-frame` `scope::ComponentScope` 后，实例 scope 的三个契约仍成立——
+    /// ①在途 dispatch task 可见（`in_flight`）；②`drain` 收口后归零
     /// 且闸关拒发；③被托管 task panic 不传染 scope（后续 spawn 照常受理，panic
     /// 由 udf `FxScope` 归一 + 进程 panic hook 承接，本 crate 不再自持收割账本）。
     #[tokio::test]
@@ -2794,7 +2805,7 @@ mod tests {
             .expect("新建 scope 必须受理");
         assert_eq!(dispatcher.scope().in_flight(), 1, "spawn 后在途数必须可见");
 
-        let report = dispatcher.scope().shutdown_timeout(Duration::from_secs(5)).await;
+        let report = dispatcher.scope().drain(Duration::from_secs(5)).await;
         assert_eq!(report.timed_out, 0, "可 abort 的在途任务应能等净");
         assert!(!finished.load(Ordering::SeqCst), "停机走 abort：不得等 30s 任务跑完");
         assert_eq!(dispatcher.scope().in_flight(), 0, "收口后 in_flight 归零（泄漏判据）");

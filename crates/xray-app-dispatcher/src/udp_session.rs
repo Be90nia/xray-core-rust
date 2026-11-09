@@ -99,9 +99,13 @@ impl Drop for Inner {
 pub struct UdpDispatchSession {
     dispatcher: Arc<dyn DispatchHandler>,
     inner: Option<Inner>,
-    /// §3.5.6 ①类托管：dispatch link 任务归本会话自持 scope——会话 Drop =
-    /// 组件终，scope 兜底 abort 拆任务（无双份账本）。
-    scope: xray_frame::compat::ManagedScope,
+    /// §3.5.6 ①类托管：dispatch link 任务归本会话自持 scope（无双份账本）。
+    ///
+    /// 档位 = **排空档**（arm/dispatcher/tun 族口径，ADR-0004 §2.2 Q1 档位表）。
+    /// stop 面 = 外部（宿主 drop）：本持有件**无 `close_gate` / `drain` 调用面**
+    /// ⇒ 不得声称「在途归零」；收口只随会话释放发生——Drop 时 `FxScope` 若为
+    /// 最后一份强引用，则 JoinSet drop ⇒ abort 全组（udf 语义，实现事实而非保证）。
+    scope: xray_frame::scope::ComponentScope,
     /// 入站 access 上下文（bd kol4a）：`establish` 时经
     /// [`DispatchHandler::dispatch_with_access`] 下传——生产链终点
     /// `MuxBridge::dispatch_with_access` 按它派生 XUDP GlobalID（cone 语义，
@@ -122,7 +126,7 @@ impl UdpDispatchSession {
             dispatcher,
             inner: None,
             access: parking_lot::Mutex::new(None),
-            scope: xray_frame::compat::ManagedScope::new("udp-dispatch"),
+            scope: xray_frame::scope::ComponentScope::new("udp-dispatch"),
         }
     }
 
@@ -266,8 +270,8 @@ impl UdpDispatchSession {
         let dispatcher = Arc::clone(&self.dispatcher);
         let access = self.access.lock().take();
         // §3.5.6 ①类托管：dispatch link 任务归本会话自持 scope（会话 Drop 即
-        // abort，随组件停机取消）。闸关不可达（scope 无显式 close），拒发按
-        // fail-visible 计数回滚处理（禁静默）。
+        // 组件终，随组件停机取消；收口语义见字段注释）。闸关不可达（scope 无
+        // 显式 close_gate），拒发按 fail-visible 计数回滚处理（禁静默）。
         if self
             .scope
             .spawn(async move {

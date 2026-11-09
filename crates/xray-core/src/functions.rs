@@ -564,7 +564,7 @@ async fn start_full_dispatched(
     );
 
     // 关闭 watcher（bd 4a1zy）：shutdown_token 取消 → dispatcher 后台任务排空。
-    // 排空结果（成功/超时）由 `ManagedScope::shutdown_timeout` 经 LogFacade 上报，
+    // 排空结果（成功/超时）由 `ComponentScope::drain` 经 LogFacade 上报，
     // 禁静默；watcher 自身**不得**挂在被排空的 scope 上（否则等自己 = 恒超时），
     // 故走进程级托管口 `compat::spawn`（装配根一次性安装的同一 scope）。
     {
@@ -581,8 +581,8 @@ async fn start_full_dispatched(
         let watcher = xray_frame::compat::spawn_scope().spawn_detached(async move {
             token.cancelled().await;
             let Some(dispatcher) = weak.upgrade() else { return };
-            // 报告由 ManagedScope 内部落日志（panic 清单 + 未完成数），此处只吸收值。
-            let _ = dispatcher.scope().shutdown_timeout(DISPATCHER_DRAIN_TIMEOUT).await;
+            // 报告由 ComponentScope 内部落日志（panic 清单 + 未完成数），此处只吸收值。
+            let _ = dispatcher.scope().drain(DISPATCHER_DRAIN_TIMEOUT).await;
         });
         if watcher.is_err() {
             log.error("dispatcher shutdown watcher not spawned: process scope already closed");
