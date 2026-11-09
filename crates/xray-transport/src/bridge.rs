@@ -332,7 +332,7 @@ fn p7lm_trace() -> bool {
 
 /// 每方向在途字节闸。
 ///
-/// 闸值 = [`xray_common::mem_probe::MemoryPlan::bridge_gate`]（四档 5/12/24/32 MiB）。
+/// 闸值 = [`xray_frame::budget::plan::MemoryPlan::bridge_gate`]（四档 5/12/24/32 MiB）。
 /// 为什么不是 u440m 的固定 2MiB：RTT 161.6ms 下 BDP 2.39–3.56MB > 2MiB ⇒ 闸把吞吐
 /// 钉在 ≈12.9MB/s（A/B 中位比 0.939，超 5% 门已回退）。闸的用途只是把「64 条目 ×
 /// 512KiB = 32MiB/方向」的满载瞬态收成有限值。
@@ -387,11 +387,11 @@ struct ConnSlot;
 
 /// 连接数上限（执行点唯一读数）。
 ///
-/// 读 [`xray_common::mem_probe::MemoryPlan::effective_max_conns`] 而非档位原值
+/// 读 [`xray_frame::budget::plan::MemoryPlan::effective_max_conns`] 而非档位原值
 /// `max_conns`：装配期预算门按本配置算出的**降档值**写在那里（bd 2026-11-08
 /// D-02）——旧状只写 warn 文案，执行点仍用档位原值，运维看到的数字不是生效的数字。
 fn conn_limit() -> usize {
-    xray_common::mem_probe::MemoryPlan::cached().effective_max_conns()
+    xray_frame::budget::plan::MemoryPlan::cached().effective_max_conns()
 }
 
 impl ConnSlot {
@@ -420,7 +420,7 @@ impl Drop for ConnSlot {
 
 /// 连接数触顶的 fail-visible 拒绝（日志 + `Err`）：绝不静默降级、绝不放任 OOM。
 fn connection_limit_error() -> io::Error {
-    let plan = xray_common::mem_probe::MemoryPlan::cached();
+    let plan = xray_frame::budget::plan::MemoryPlan::cached();
     // 报执行点的**生效**值（降档后），不是档位原值——运维看到的数字必须与
     // `ConnSlot` 拒绝时用的那个一致（bd 2026-11-08 D-02）。
     let limit = conn_limit();
@@ -735,7 +735,7 @@ where
     // 档位派生且恒 ≥ 4MiB。两者叠加 = 「条数 + 字节」双上界。
     // 条目闸管「多少批在排队」，字节闸管「一共压了多少内存」——单批可达 512KiB，
     // 64 条满载 = 32MiB/方向，小内存机器上这才是真上界。
-    let gate_bytes = xray_common::mem_probe::MemoryPlan::cached().bridge_gate;
+    let gate_bytes = xray_frame::budget::plan::MemoryPlan::cached().bridge_gate;
     let up_gate = ByteGate::new(gate_bytes);
     let down_gate = ByteGate::new(gate_bytes);
     let (up_tx, mut up_rx) =
@@ -1539,7 +1539,7 @@ mod tests {
         let _g = global_state_guard();
         let err = connection_limit_error();
         let text = err.to_string();
-        let plan = xray_common::mem_probe::MemoryPlan::cached();
+        let plan = xray_frame::budget::plan::MemoryPlan::cached();
         assert!(text.contains("connection limit reached"), "{text}");
         assert!(
             text.contains(&plan.effective_max_conns().to_string()),
@@ -1556,10 +1556,10 @@ mod tests {
     #[test]
     fn conn_limit_reads_degraded_value() {
         let _g = global_state_guard();
-        let plan = xray_common::mem_probe::MemoryPlan::cached();
+        let plan = xray_frame::budget::plan::MemoryPlan::cached();
         assert_eq!(conn_limit(), plan.max_conns, "未装配 = 档位派生值");
         let degraded = plan.max_conns.saturating_sub(1).max(1);
-        xray_common::mem_probe::set_effective_max_conns(degraded);
+        xray_frame::budget::plan::set_effective_max_conns(degraded);
         assert_eq!(
             conn_limit(),
             degraded,
@@ -1567,7 +1567,7 @@ mod tests {
             plan.max_conns
         );
         // 复原，避免污染同进程后续用例（静态值进程级）。
-        xray_common::mem_probe::set_effective_max_conns(plan.max_conns);
+        xray_frame::budget::plan::set_effective_max_conns(plan.max_conns);
     }
 
     /// 触碰进程级降档静态值的用例串行化（否则 read/write 交错即假红）。

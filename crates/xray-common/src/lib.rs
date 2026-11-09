@@ -21,7 +21,6 @@ pub mod dice;
 pub mod drain;
 pub mod errors;
 pub mod log;
-pub mod mem_probe;
 pub mod net;
 pub mod ocsp;
 pub mod padding;

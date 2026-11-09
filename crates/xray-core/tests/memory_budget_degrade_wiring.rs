@@ -16,7 +16,7 @@ fn degraded_conn_limit_reaches_execution_point() {
         // 运维覆盖口（`XRAY_MAX_CONNS`）抬到 64 条 ⇒ 40MiB 档必然装不下 ⇒ 必定降档。
         std::env::set_var("XRAY_MAX_CONNS", "64");
     }
-    let plan = *xray_common::mem_probe::MemoryPlan::cached();
+    let plan = *xray_frame::budget::plan::MemoryPlan::cached();
     assert_eq!(plan.tier.as_str(), "tiny", "档位必须由 XRAY_MEM_LIMIT_MB 钉死");
     assert_eq!(plan.max_conns, 64, "XRAY_MAX_CONNS 覆盖必须生效（档位派生值之上）");
 

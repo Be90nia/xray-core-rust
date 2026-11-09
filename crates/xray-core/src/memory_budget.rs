@@ -29,14 +29,14 @@
 //!    socket（装配期不可数）、桥在途。
 //!
 //! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
-//! `xray_common::mem_probe::MemoryPlan` 按**探测到的可用内存**分档派生——
+//! `xray_frame::budget::plan::MemoryPlan` 按**探测到的可用内存**分档派生——
 //! ≤256MB→40MB / ≤512MB→96MB / ≤1GB→192MB / >1GB→`min(512MB, 可用/4)`。同一份
 //! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB` = 13/32/64/170，
 //! **并发能力不按闸反解**；触顶由桥 fail-visible 拒绝）。满载乘积
 //! （`max_conns × 2 × gate`）因此**过订**（3.3×–21×）——闸是瞬态背压上界，非每连接
 //! 常驻 ⇒ 该上界如实进 caps 栏 + WARN（bd 2026-11-08 D-01，口径经 PM 修正；
 //! 全局共享配额终态另票）。预算装不下时**不拒启**：按装得下的并发数降档并 warn，
-//! **降档值写进执行点**（`xray_common::mem_probe::set_effective_max_conns`，桥读
+//! **降档值写进执行点**（`xray_frame::budget::plan::set_effective_max_conns`，桥读
 //! 同一份值，D-02；只有连 1 条连接都装不下才拒）。96MB 仍是 `min` 上沿的默认设计点，
 //! 故原「96MiB 不是运行期硬上界」口径不变。
 
@@ -159,19 +159,19 @@ impl BudgetReport {
 ///    预约会误杀合法配置，bd 258qt(c)）、DoH3 resolver socket（装配期不可数， bd 258qt(d)）、xhttp
 ///    h2 send_buf（惰性分配，bd pyka7）、桥在途、QUIC 流窗（连接窗内子份额）。
 ///
-/// 预算取自本机档位（[`xray_common::mem_probe::MemoryPlan::cached`]）；装不下
+/// 预算取自本机档位（[`xray_frame::budget::plan::MemoryPlan::cached`]）；装不下
 /// 完整并发时只**降档**（[`BudgetReport::degraded`]），连 1 条都装不下才记违例。
 ///
 /// # 错误
 /// `policy` 配置 JSON 坏 → `Err`；违例 → [`BudgetReport::violations`] 非空。
 pub fn budget_report(built: &xray_conf::BuiltConfig) -> Result<BudgetReport, String> {
-    budget_report_with(built, *xray_common::mem_probe::MemoryPlan::cached())
+    budget_report_with(built, *xray_frame::budget::plan::MemoryPlan::cached())
 }
 
 /// 同 [`budget_report`]，档位计划由调用方注入（单测按档位钉行为）。
 pub fn budget_report_with(
     built: &xray_conf::BuiltConfig,
-    plan: xray_common::mem_probe::MemoryPlan,
+    plan: xray_frame::budget::plan::MemoryPlan,
 ) -> Result<BudgetReport, String> {
     let mut violations = Vec::new();
 
@@ -258,7 +258,8 @@ pub fn budget_report_with(
     // 运行期连接数上限 = 档位派生值与本配置实际装得下的条数取小。
     // **降档值必须到执行点**（bd 2026-11-08 D-02）：桥上 `ConnSlot` 读的正是这里
     // 写入的同一份值；旧状只写 warn 文案，桥仍用档位原值。
-    let max_conns = xray_common::mem_probe::set_effective_max_conns(plan.max_conns.min(conns_fit));
+    let max_conns =
+        xray_frame::budget::plan::set_effective_max_conns(plan.max_conns.min(conns_fit));
 
     // ── 3b) 瞬时上界入硬账（bd 2026-11-08 D-03 / security P2-2）──
     // 三项都**由远端/负载推高、装配期不可判定**，但真的会吃掉预算：
@@ -488,13 +489,13 @@ fn explicit_receive_buffer(ss: Option<&serde_json::Value>) -> Option<usize> {
 /// 2. 本配置在该预算下装不下最小并发（[`BudgetReport::degraded`]）—— 再一条 warn
 ///    说明连接数上限被压到多少。
 pub fn check_startup_budget(built: &xray_conf::BuiltConfig) -> Result<(), String> {
-    check_startup_budget_with(built, *xray_common::mem_probe::MemoryPlan::cached())
+    check_startup_budget_with(built, *xray_frame::budget::plan::MemoryPlan::cached())
 }
 
 /// 同 [`check_startup_budget`]，档位计划由调用方注入（单测按档位钉行为）。
 fn check_startup_budget_with(
     built: &xray_conf::BuiltConfig,
-    plan: xray_common::mem_probe::MemoryPlan,
+    plan: xray_frame::budget::plan::MemoryPlan,
 ) -> Result<(), String> {
     let report = budget_report_with(built, plan)?;
     if !report.is_ok() {
@@ -535,13 +536,13 @@ mod tests {
     const MIB: u64 = 1024 * 1024;
 
     /// 原设计点（96MB 预算）的档位计划（bd sfqlu 起预算随机器变 ⇒ 测试须注入）。
-    fn plan_96mb() -> xray_common::mem_probe::MemoryPlan {
-        xray_common::mem_probe::MemoryPlan::from_available(512 * MIB)
+    fn plan_96mb() -> xray_frame::budget::plan::MemoryPlan {
+        xray_frame::budget::plan::MemoryPlan::from_available(512 * MIB)
     }
 
     /// 256MB 小鸡档（40MB 预算）。
-    fn plan_256mb() -> xray_common::mem_probe::MemoryPlan {
-        xray_common::mem_probe::MemoryPlan::from_available(256 * MIB)
+    fn plan_256mb() -> xray_frame::budget::plan::MemoryPlan {
+        xray_frame::budget::plan::MemoryPlan::from_available(256 * MIB)
     }
 
     /// 四档（256MB / 512MB / 1GB / 大机器）派生出的预算与连接数上限必须与档位表一致，
@@ -557,7 +558,7 @@ mod tests {
             (1024 * MIB, 192 * MIB, 64),
             (16 * 1024 * MIB, 512 * MIB, 170),
         ] {
-            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
             let report =
                 budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
             assert_eq!(report.budget, budget as usize, "{available}B 档总预算");
@@ -622,7 +623,7 @@ mod tests {
         for (available, conns) in
             [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
         {
-            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
             let report = budget_report_with(&xray_conf::BuiltConfig::default(), plan)
                 .expect("缺省配置必须出报告");
             let product = report.max_conns * 2 * plan.bridge_gate;
@@ -696,7 +697,7 @@ mod tests {
         for (available, tier_conns) in
             [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
         {
-            let plan = xray_common::mem_probe::MemoryPlan::from_available(available);
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
             let mut built = xray_conf::BuiltConfig::default();
             built.inbounds.push(quic_inbound("q1"));
             let report = budget_report_with(&built, plan).expect("report");

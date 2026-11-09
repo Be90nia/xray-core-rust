@@ -28,6 +28,12 @@
 //! 二进制 + Rust 运行时 ~25-30MB 属 RSS 实测面（MEMORY-BUDGET-256MB §1「待实测
 //! 锚定」），同样不进门，上线由 PM 亲核 RSS。
 
+/// 档位策略（一次探测 + 一次派生：总预算 → 桥每方向字节闸 → 连接数上限）。
+///
+/// bd 1rc1o-b：从 `xray-common::mem_probe` 整体上浮本层（档位策略绑 Xray 分账
+/// ⇒ 判据 ②；探测机制零语义 ⇒ udf 提炼候选，件内有标注）。
+pub mod plan;
+
 /// 整机 256MB 分账后 xray 的保守预算（96MB；留 24MB 给抖动/page cache）。
 pub const XRAY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 

@@ -26,35 +26,32 @@
 //!
 //! ## 归属判定（§3.5.5 三判据，bd 2026-11-08 D-05）
 //!
-//! 本文件此前零举证（472 行躺在 `xray-common` 里），按三判据**逐条**给出结论
-//! ——**机制上浮 udf，策略留派生层**（不是整件留仓，也不是整件上浮）：
+//! **落地状态（bd 1rc1o-b，2026-11-09）**：原住 `crates/xray-common/src/mem_probe.rs`，
+//! 已按迁移清单第 2/3 步整体上浮本件——`xray-common::mem_probe` 模块与文件已删，
+//! 消费点全改，**零双定义**。第 1 步（udf 上浮）**未做**，见 ①：
 //!
-//! **① 零 xray 语义？→ 部分。** 探测机制（cgroup v2 `memory.max` / v1
+//! **① 零 xray 语义？→ 探测机制部分是。** cgroup v2 `memory.max` / v1
 //! `memory.limit_in_bytes` / `/proc/meminfo MemAvailable` / Windows
-//! `GlobalMemoryStatusEx`）是**进程级平台机制**，零 xray 语义 ⇒ 归 udf
-//! （`skeleton_infra`，与 clock/logx/shutdown 同族；提炼判据「零 xray 类型 =
-//! 全泛型/trait」成立）。但**档位策略不归 udf**：40/96/192/512 MiB 四档、
-//! 闸 = 预算/8、连接数反解都绑着 Xray 自身的池/缓存分账（`xray_frame::budget`
-//! 的 16 项），且 env 名带 `XRAY_` 前缀 ⇒ 属 Xray 语义。
+//! `GlobalMemoryStatusEx` 是**进程级平台机制**，零 xray 语义 ⇒ 归 udf 提炼候选
+//! （`skeleton_infra`，与 clock/logx/shutdown 同族）。`udf-promotion-candidate`：
+//! [`probe_available`] + 三个纯解析器 + `GlobalMemoryStatusEx` FFI = 迁移清单
+//! 第 1 步的提炼面；udf 有此件后本文件换依赖删本地副本（档位策略不动）。
+//! 之所以暂随本件落派生层：`xray-frame` 不能反向依赖 `xray-common`（`xray-common`
+//! 已依赖 `xray-frame`，唯一边 = `log::set_secrets` 写 `logging::GLOBAL_SECRETS`，
+//! 已登记例外）⇒ 档位策略上浮时探测只能一起走，不能留在原地。
 //!
-//! **② 非零语义 → 派生层？→ 是，归 `xray-frame`。** `MemoryTier`/`MemoryPlan`
-//! 是「装配期一次派生的进程级能力」，与 `xray_frame::budget` 同一归属（ADR-0002
-//! 登记簿拆分后预算常量已在那里，派生产式与之同址才谈得上对账）。
+//! **② 非零语义 → 派生层？→ 是。** 档位策略（40/96/192/512 MiB 四档、闸 = 预算/8、
+//! 连接数反解）绑 Xray 自身池/缓存分账（`xray_frame::budget` 的登记簿），且 env 名带
+//! `XRAY_` 前缀 ⇒ Xray 语义 ⇒ 归 `xray-frame`；派生产式与预算常量同址才谈得上对账。
 //!
-//! **③ 连派生层都放不合适？→ 否（本轮留仓纯属迁移前置未清，非归属结论）。**
-//! 迁移前置：`xray-frame` 不能反向依赖 `xray-common`——`xray-common` 已依赖
-//! `xray-frame`（唯一边 = `log::set_secrets` 写 `logging::GLOBAL_SECRETS`，
-//! 已登记为例外，待 udf 提供掩码表读面后删除）。故迁移必须先走完 ① 的上浮。
+//! **③ 连派生层都放不合适？→ 否。** 无反向依赖 / 无第三方栈驱动契约；Windows FFI
+//! 仅本文件私有函数（`GlobalMemoryStatusEx`，kernel32 由 std 恒链接，同
+//! `xray-transport` `RtlGetVersion` 手写 FFI 先例）。
 //!
-//! **迁移清单**（另开票；本轮只出判定，不动代码）：
-//! 1. udf PR：`skeleton_infra::mem_probe`（`probe_available` + 三个纯解析器
-//!    `parse_cgroup_v2_max`/`parse_cgroup_v1_limit`/`parse_meminfo_available`
-//!    + `GlobalMemoryStatusEx` FFI）——零 xray 语义，三平台 CI 绿；
-//! 2. 主仓：`MemoryTier`/`MemoryPlan`/`BRIDGE_GATE_*`/`PER_CONN_UPPER_BYTES`/ `ENV_*` +
-//!    [`set_effective_max_conns`] 迁 `xray_frame::budget::plan` （派生层），改依赖 udf 探测件；
-//! 3. 删 `xray-common/src/mem_probe.rs` 与 `pub use`；两调用方换 import
-//!    （`xray-transport::bridge`、`xray-core::memory_budget`——两者**已**依赖
-//!    `xray-frame`，零新增依赖边）。
+//! **消费点**（全改完，零残留）：`xray-transport::bridge`（闸值 + 执行点读数）、
+//! `xray-core::memory_budget`（预算门 + 降档写入口）、
+//! `xray-core/tests/memory_budget_degrade_wiring.rs`——三者**已**依赖 `xray-frame`，
+//! 零新增依赖边。
 //!
 //! ## 满载乘积**过订**的显式登记（bd 2026-11-08 D-01，口径经 PM 修正）
 //!
@@ -406,7 +403,9 @@ fn meminfo_available() -> Option<u64> {
     parse_meminfo_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
 }
 
-// ── Windows 探测实现（手写 FFI：本 crate 不引 windows-sys 依赖）──
+// ── Windows 探测实现（手写 FFI：`GlobalMemoryStatusEx` 不在本 crate 已开的
+//    windows-sys 特性面（只有 Win32_Networking_WinSock / Win32_System_IO），
+//    为一个结构体加特性不划算）──
 
 #[cfg(windows)]
 fn windows_available_physical() -> Option<u64> {
@@ -482,7 +481,11 @@ mod tests {
     /// 本测试钉两头：① 并发数保持旧量级（≥ 13/32/64/170，防再被砍）；
     /// ② 过订倍数算得出且被打印（运维判据），四档倍数 3.25/8/16/21.25。
     // 取证数字须打印（--nocapture 人眼核对）——同 q1r4q 先例：显式 allow + 理由。
-    #[allow(clippy::print_stdout)]
+    #[allow(
+        clippy::print_stdout,
+        clippy::disallowed_macros,
+        reason = "取证数字须打印（--nocapture 人眼核对），同 q1r4q 先例"
+    )]
     #[test]
     fn full_load_product_is_registered_oversubscription() {
         for (available, conns) in
