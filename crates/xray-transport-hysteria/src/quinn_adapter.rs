@@ -481,12 +481,12 @@ fn spawn_supervised_accept_loop(
 ) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面 QUIC accept 泵（hysteria listener）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：hysteria QUIC accept 泵，寿命 = 该 listener（close 经 endpoint 关闭）；目标托管口 = 该 listener 的 ComponentScope"
     )]
     let accept_task = tokio::spawn(body);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：accept 循环意外退出监控（panic 留痕）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = QUIC accept 泵；目标托管口 = 该 listener 的 ComponentScope"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria-quic",
@@ -1185,7 +1185,7 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                         let h = handler.clone();
                         #[allow(
                             clippy::disallowed_methods,
-                            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h3 请求 resolver 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+                            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（h3 请求 resolver 泵）；数据面泵：寿命 = 该 QUIC 连接（h3 请求 pump 随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
                         )]
                         tokio::spawn(async move {
                             let (req, mut stream) = match resolver.resolve_request().await {

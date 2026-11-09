@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""je3u3 质量门七件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
+"""je3u3 质量门八件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
 
-七道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发 +
-bd st3l1/s4xsk 的 `#[ignore]` 登记）：
+八道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发 +
+bd st3l1/s4xsk 的 `#[ignore]` 登记 + bd xosi9 的 ②类 spawn 登记）：
   (a) 失败留痕门    生产代码禁 `hot_log!(DEBUG, "error=…")` 形态——失败在默认
                     warn 门下必须可见（bd u0pe2 ① 缺陷指纹：26 处失败留痕在
                     loglevel=warn 下零痕迹）。白名单只登记有 Go 源码依据的
@@ -43,9 +43,9 @@ bd st3l1/s4xsk 的 `#[ignore]` 登记）：
                     段）或 `check_scope_claims.py --self-test` 本地跑。
 
 用法（房规 check_udp_binds.py / check_proto_drift.py）：
-  python tools/check_quality_gates.py             # 七道门全跑（(c) 含 cargo）
-  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)(e)(f)(g)（快路径）
-  python tools/check_quality_gates.py --list      # 枚举 (a)(b)(d)(f) 全部命中与分类
+  python tools/check_quality_gates.py             # 八道门全跑（(c) 含 cargo）
+  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)(e)(f)(g)(h)（快路径）
+  python tools/check_quality_gates.py --list      # 枚举 (a)(b)(d)(f)(h) 全部命中与分类
   python tools/check_quality_gates.py --self-test # 每道门各一条故意违反→必须报错
   python tools/check_lock_across_await.py [--list|--self-test]  # (f) 单独跑（实现所在）
 
@@ -59,6 +59,13 @@ bd st3l1/s4xsk 的 `#[ignore]` 登记）：
 - 已知盲区（登记，不静默）：(a) 只匹配消息字面量以 `error=` 开头的形态
   （u0pe2 判定表同口径）；`tracing::debug!`/`log::debug!` 面不在本门
   （生产留痕走 hot_log 单口，见 xray-common logx 纪律）。
+  (h) ②类 spawn 登记（bd xosi9 / CLAUDE.md §3.5.6）：生产面每处
+                    `tokio::spawn` / `tokio::task::spawn` / `std::thread::spawn`
+                    必须有覆盖它的 `#[allow(clippy::disallowed_methods, reason=…)]`
+                    （逐站紧邻，行距 ≤ 60），或该文件在 SPAWN_FILE_LEVEL_REGISTRY
+                    内用 `#![allow]` 覆盖；reason 命中模板串（`任务必须长于组件` /
+                    「进程级+数据面逐包泵+公开契约外返」三连）视为无理由。
+                    `#![cfg_attr(test, allow(…))]` 不覆盖生产面。
 """
 
 from __future__ import annotations
@@ -823,6 +830,113 @@ def scan_bare_ignores(root: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# (h) ②类 spawn 登记门（bd xosi9 / CLAUDE.md §3.5.6）
+# ---------------------------------------------------------------------------
+# 判据：生产面每处 `tokio::spawn` / `tokio::task::spawn` / `std::thread::spawn`
+# 必须有覆盖它的 `#[allow(clippy::disallowed_methods, reason = "…")]`（逐站，或
+# 文件级 `#![allow]` 且该文件进 SPAWN_FILE_LEVEL_REGISTRY），且 reason 不是模板
+# 复述——模板理由 = 没写理由（§3.5.6「禁自造子类」的反向判据）。
+SPAWN_CALL = re.compile(r"\b(?:tokio::spawn|tokio::task::spawn|std::thread::spawn)\s*\(")
+ALLOW_DISALLOWED_METHODS = re.compile(
+    r"(#!?)\[\s*allow\s*\(([^\[\]]*?clippy::disallowed_methods[^\[\]]*?)\)\s*\]", re.S
+)
+REASON_STR = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
+# 逐站 allow 与 spawn 的最大行距（跨 fn 的陈旧 allow 不得顺带覆盖）。
+SPAWN_ALLOW_MAX_LINES = 60
+# 模板理由指纹：命中即视为「无实义理由」。
+SPAWN_TEMPLATE_REASON = ("任务必须长于组件",)
+SPAWN_TEMPLATE_TRIPLE = ("进程级", "数据面逐包泵", "公开契约外返")
+
+# 文件级 allow 登记簿：只有本表列出的文件才允许用文件级 allow 覆盖生产 spawn
+# （每项写清为何无法逐站：站点数超 clippy.toml 分层阈值，且理由已在文件头成立）。
+SPAWN_FILE_LEVEL_REGISTRY: dict[str, str] = {
+    "crates/xray-transport-grpc/src/transport.rs": (
+        "文件级 allow 覆盖 8 处生产 spawn（h2 conn driver / accept / close_notify / "
+        "ping_pong / duplex 泵），超 clippy.toml 20 处/文件分层阈值；寿命随 h2 连接"
+        "（bd a5r4j/lzzja/hj3jf）"
+    ),
+}
+
+
+def spawn_reason_is_template(reason: str) -> bool:
+    """reason 是否只是分类枚举复述（模板）——是则等同没写理由。"""
+    if not reason.strip():
+        return True
+    if any(m in reason for m in SPAWN_TEMPLATE_REASON):
+        return True
+    return all(m in reason for m in SPAWN_TEMPLATE_TRIPLE)
+
+
+def scan_spawn_registrations(
+    root: Path, registry: dict[str, str] | None = None
+) -> list[dict]:
+    """生产面 spawn 调用 × 覆盖它的 disallowed_methods allow（(h) 门命中面）。
+
+    覆盖判据（优先序）：① 同一文件内位于 spawn 之前、行距 ≤ SPAWN_ALLOW_MAX_LINES
+    的逐站 `#[allow(…)]`；② 文件级 `#![allow(…)]`（恒覆盖全文，但只认登记簿内的
+    文件）；③ 只有更远的逐站 allow ⇒ STALE_ALLOW（跨 fn 的陈旧 allow 不得顺带覆盖）。
+
+    位置口径：命中在 `strip_comments_and_strings + strip_cfg_test_blocks` 的文本上定位
+    （字符串被掏空 ⇒ 字符串里的花括号不干扰 cfg(test) 块配对）；reason 原文按同一字符
+    偏移回**原始源码**取（两次剥离都是原位掏空，偏移不变）。
+    """
+    registry = SPAWN_FILE_LEVEL_REGISTRY if registry is None else registry
+    hits: list[dict] = []
+    for p in candidate_files(root):
+        r = rel(root, p)
+        if r.startswith("crates/udf-frame/") or r.startswith("udf-frame/"):
+            continue
+        try:
+            src = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # 生产面文本：注释+字符串掏空 → cfg(test) 块剥离（测试面归 clippy.toml 批量豁免）。
+        cleaned = strip_cfg_test_blocks(strip_comments_and_strings(src))[0]
+        if "spawn" not in cleaned:
+            continue
+        allows = []
+        for m in ALLOW_DISALLOWED_METHODS.finditer(cleaned):
+            # 属性体（含 reason 原文）从原文本同偏移取。
+            body = src[m.start():m.end()]
+            if "cfg_attr" in body and "test" in body:
+                continue  # cfg_attr(test, …)：测试面豁免，不覆盖生产
+            rm = REASON_STR.search(body)
+            allows.append(
+                {
+                    "start": m.start(),
+                    "line": line_of(cleaned, m.start()),
+                    "inner": m.group(1) == "#!",
+                    "reason": rm.group(1) if rm else "",
+                }
+            )
+        for m in SPAWN_CALL.finditer(cleaned):
+            line = line_of(cleaned, m.start())
+            prev = [a for a in allows if a["start"] < m.start()]
+            near = [a for a in prev if not a["inner"] and line - a["line"] <= SPAWN_ALLOW_MAX_LINES]
+            inner = [a for a in prev if a["inner"]]
+            if near:
+                a, kind = near[-1], "ADJACENT"
+            elif inner:
+                a = inner[-1]
+                kind = "FILE_LEVEL_REGISTERED" if r in registry else "FILE_LEVEL_UNREGISTERED"
+            elif prev:
+                a, kind = prev[-1], "STALE_ALLOW"
+            else:
+                hits.append(
+                    {"file": r, "line": line, "kind": "UNREGISTERED", "reason": "", "allow": None}
+                )
+                continue
+            if kind in ("ADJACENT", "FILE_LEVEL_REGISTERED") and spawn_reason_is_template(
+                a["reason"]
+            ):
+                kind = "TEMPLATE_REASON"
+            hits.append(
+                {"file": r, "line": line, "kind": kind, "reason": a["reason"], "allow": a["line"]}
+            )
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # 门执行
 # ---------------------------------------------------------------------------
 
@@ -959,6 +1073,36 @@ def gate_e(root: Path) -> tuple[bool, str]:
         "禁删测试或改成永不执行"
     )
     return False, "\n".join(lines)
+
+
+def gate_h(root: Path, registry: dict[str, str] | None = None) -> tuple[bool, str]:
+    """(h) ②类 spawn 登记门：生产 spawn ⊆ 逐站/文件级 allow 登记集合（bd xosi9）。"""
+    hits = scan_spawn_registrations(root, registry)
+    bad = [
+        h
+        for h in hits
+        if h["kind"]
+        in ("UNREGISTERED", "FILE_LEVEL_UNREGISTERED", "STALE_ALLOW", "TEMPLATE_REASON")
+    ]
+    file_level = [h for h in hits if h["kind"] == "FILE_LEVEL_REGISTERED"]
+    file_level_files = sorted({h["file"] for h in file_level})
+    if bad:
+        lines = [f"FAIL (h) ②类 spawn 登记门：未登记/理由无效 {len(bad)} 处（生产 spawn 共 {len(hits)}）："]
+        for h in bad:
+            where = f"  allow@{h['allow']}" if h["allow"] else "  无 allow"
+            lines.append(f"  {h['file']}:{h['line']}  {h['kind']}{where}")
+            if h["kind"] == "TEMPLATE_REASON":
+                lines.append("    → reason 只是分类枚举复述；改写为该站自己的寿命/不可托管理由（§3.5.6 ②类三项，禁自造子类）")
+        lines.append(
+            "    → 逐站补 `#[allow(clippy::disallowed_methods, reason = \"…\")]`（紧邻 spawn）；"
+            "①类站点写 `①类待迁移（bd xosi9 改判）：…；目标托管口 = …`"
+        )
+        return False, "\n".join(lines)
+    return True, (
+        f"OK (h) ②类 spawn 登记门：生产 spawn {len(hits)} 处全部登记"
+        f"（逐站 allow {len(hits) - len(file_level)} / 文件级登记 {len(file_level)} 处"
+        f"：{'; '.join(file_level_files) or '无'}；模板理由 0）"
+    )
 
 
 def gate_c(run_cargo: bool) -> tuple[bool, str]:
@@ -1226,6 +1370,63 @@ def cmd_self_test() -> int:
         )
         check("(g) 伪断言+残留 ⇒ 门必须红", not gate_g(troot)[0])
 
+        # (h) ②类 spawn 登记门（bd xosi9）：紧邻 allow 放行 / 裸 spawn 红 /
+        # 模板理由红 / 文件级未登记红 / cfg_attr(test, …) 不覆盖生产。
+        (src / "spawn_ok.rs").write_text(
+            "fn ok() {\n"
+            "    #[allow(clippy::disallowed_methods, reason = \"逐包泵：寿命 = 该连接，EOF 即自终\")]\n"
+            "    tokio::spawn(async {});\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (src / "spawn_bare.rs").write_text(
+            "fn bad() {\n    tokio::spawn(async {});\n}\n", encoding="utf-8"
+        )
+        (src / "spawn_tpl.rs").write_text(
+            "fn bad() {\n"
+            "    #[allow(clippy::disallowed_methods, reason = \"②豁免：任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口\")]\n"
+            "    tokio::spawn(async {});\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (src / "spawn_file.rs").write_text(
+            "#![allow(clippy::disallowed_methods, reason = \"文件级：站点数超阈值\")]\n"
+            "fn f() {\n    std::thread::spawn(|| {});\n}\n",
+            encoding="utf-8",
+        )
+        (src / "spawn_testcfg.rs").write_text(
+            "#![cfg_attr(test, allow(clippy::disallowed_methods))]\n"
+            "fn f() {\n    tokio::spawn(async {});\n}\n",
+            encoding="utf-8",
+        )
+        spawn_hits = {h["file"]: h["kind"] for h in scan_spawn_registrations(troot, registry={})}
+        check(
+            "(h) 紧邻 allow（实义理由）放行",
+            spawn_hits.get("crates/fx/src/spawn_ok.rs") == "ADJACENT",
+        )
+        check("(h) 裸 spawn 必须报", spawn_hits.get("crates/fx/src/spawn_bare.rs") == "UNREGISTERED")
+        check(
+            "(h) 模板理由必须报",
+            spawn_hits.get("crates/fx/src/spawn_tpl.rs") == "TEMPLATE_REASON",
+        )
+        check(
+            "(h) 文件级 allow 未登记必须报 / 登记后放行",
+            spawn_hits.get("crates/fx/src/spawn_file.rs") == "FILE_LEVEL_UNREGISTERED"
+            and [
+                h["kind"]
+                for h in scan_spawn_registrations(
+                    troot, registry={"crates/fx/src/spawn_file.rs": "self-test"}
+                )
+                if h["file"] == "crates/fx/src/spawn_file.rs"
+            ]
+            == ["FILE_LEVEL_REGISTERED"],
+        )
+        check(
+            "(h) cfg_attr(test, allow(…)) 不覆盖生产 spawn",
+            spawn_hits.get("crates/fx/src/spawn_testcfg.rs") == "UNREGISTERED",
+        )
+        check("(h) 有违规 ⇒ 门必须红", not gate_h(troot, registry={})[0])
+
     print("SELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 2
 
@@ -1258,16 +1459,20 @@ def cmd_list(root: Path) -> int:
     print(f_msg)
     g_ok, g_msg = gate_g(root)
     print(g_msg)
-    return 0 if (a_ok and b_ok and e_ok and f_ok and g_ok) else 1
+    h_ok, h_msg = gate_h(root)
+    print(h_msg)
+    for h in scan_spawn_registrations(root):
+        print(f"  {h['kind']:22} {h['file']}:{h['line']}")
+    return 0 if (a_ok and b_ok and e_ok and f_ok and g_ok and h_ok) else 1
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="je3u3 质量门七件套（失败留痕/抑制登记/登记簿漂移/注释漂移/ignore 理由/锁跨 await/scope 契约）"
+        description="je3u3 质量门八件套（失败留痕/抑制登记/登记簿漂移/注释漂移/ignore 理由/锁跨 await/scope 契约/②类 spawn 登记）"
     )
     ap.add_argument("--no-cargo", action="store_true", help="跳过 (c) cargo 面（纯静态快路径）")
-    ap.add_argument("--list", action="store_true", help="枚举 (a)(b)(d)(f) 全部命中与分类")
-    ap.add_argument("--self-test", action="store_true", help="注入违规自测（七道门各一条）")
+    ap.add_argument("--list", action="store_true", help="枚举 (a)(b)(d)(f)(h) 全部命中与分类")
+    ap.add_argument("--self-test", action="store_true", help="注入违规自测（八道门各一条）")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     args = ap.parse_args()
     if args.self_test:
@@ -1292,6 +1497,9 @@ def main() -> int:
     g_gate = gate_g(args.root)
     results.append(("g", *g_gate))
     print(g_gate[1])
+    h_gate = gate_h(args.root)
+    results.append(("h", *h_gate))
+    print(h_gate[1])
     c_gate = gate_c(run_cargo=not args.no_cargo)
     results.append(("c", *c_gate))
     print(c_gate[1])
@@ -1302,7 +1510,7 @@ def main() -> int:
         return 1
     print(
         "\n质量门 PASS：(a) 失败留痕 / (b) 抑制登记 / (c) 登记簿漂移 / (d) 注释漂移抽查"
-        " / (e) ignore 理由 / (f) 锁跨 await / (g) scope 契约"
+        " / (e) ignore 理由 / (f) 锁跨 await / (g) scope 契约 / (h) ②类 spawn 登记"
     )
     return 0
 

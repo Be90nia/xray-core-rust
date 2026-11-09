@@ -3757,7 +3757,7 @@ pub(crate) fn spawn_inbound_serve(
     let arm_anchor = Arc::clone(arm);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）+ 停机级联监视（bd a9xgp）同壳承载，serve 任务本体已迁 arm scope；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：监控壳外层：JoinHandle 外返契约（InboundRuntime→functions.rs 消费链，超出本波文件面）；panic 监督语义（51d50459）+ 停机级联监视（bd a9xgp）同壳承载，serve 任务本体已迁 arm scope；公共契约外返（§3.5.6 ②类第三项限本两站之一）：`JoinHandle` 外返 InboundRuntime→functions.rs 消费链，serve 本体已迁 arm scope，本壳只承载监督"
     )]
     tokio::spawn(async move {
         let arm = arm_anchor;

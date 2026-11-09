@@ -2024,7 +2024,7 @@ async fn dispatch_dns_link(
         let mut writer = link.writer;
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：DNS outbound 客户端帧泵（client_rx → link.writer），寿命随 dispatch_dns_link 会话，句柄无需持有；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：DNS outbound 客户端帧泵（client_rx → link.writer），寿命随 dispatch_dns_link 会话，句柄无需持有；数据面泵：寿命 = dispatch_dns_link 会话（链路关闭即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         tokio::spawn(async move {
             while let Some(msg) = client_rx.recv().await {

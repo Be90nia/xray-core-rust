@@ -164,7 +164,7 @@ pub async fn dial_packet_up(
     let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（packet-up pipe→并发 POST）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（packet-up pipe→并发 POST）；数据面泵：寿命 = 该 packet-up 请求体（EOF 即上传泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;
@@ -555,7 +555,7 @@ where
     let xmux_client = Arc::clone(&client);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（H3 packet-up pipe→POST）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面上传泵（H3 packet-up pipe→POST）；数据面泵：寿命 = 该 h3 packet-up 请求体（EOF 即上传泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         let mut seq: u64 = 0;

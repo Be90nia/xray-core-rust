@@ -139,7 +139,7 @@ async fn tcp_bridge(
     let layouts: Vec<Layout> = tables.iter().map(|t| t.layout.clone()).collect();
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（inner→pipe 解码方向）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（inner→pipe 解码方向）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即解码方向自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     let back = tokio::spawn(async move {
         let mut packed_dec = PackedDecoder::default();

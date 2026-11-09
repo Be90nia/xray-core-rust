@@ -403,7 +403,7 @@ impl UdpHopPacketConn {
         let pool_for_recv = Arc::clone(&pool);
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（UDP hop recv 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（UDP hop recv 泵）；数据面泵：寿命 = 该 UDP hop 连接（recv 泵随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         let recv_handle = tokio::spawn(async move {
             recv_loop(conn_for_recv, recv_tx_clone, pool_for_recv).await;
@@ -686,7 +686,7 @@ async fn hop_once(
     let pool_for_recv = Arc::clone(pool);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（换口后新 recv 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（换口后新 recv 泵）；数据面泵：寿命 = 换口后的新 UDP hop 连接（recv 泵随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     let recv_handle = tokio::spawn(async move {
         recv_loop(conn_for_recv, tx, pool_for_recv).await;

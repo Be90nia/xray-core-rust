@@ -90,7 +90,7 @@ impl Dispatcher for DispatchHandlerAdapter {
         let dest_clone = dest.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（每连接 dispatch 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判，原 bd kwevg ② 盖章已撤）：每连接 dispatch 泵，寿命 = 返回给调用方的 Link；目标托管口 = 该 mux 会话的 ComponentScope，迁移另票"
         )]
         tokio::spawn(async move {
             handler.dispatch(&dest_clone, dispatch_link).await;
@@ -221,7 +221,7 @@ impl ServerWorker {
         let closed = Arc::clone(&self.closed);
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（JoinHandle 返回给调用方托管）+ interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改写 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判）：mux carrier 监控 tick，寿命 = 该会话（句柄现外返给会话持有并 abort）；目标托管口 = 会话 ComponentScope；interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）"
         )]
         tokio::spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
@@ -321,7 +321,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；数据面泵：寿命 = 该 mux 会话（会话终结即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -428,7 +428,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；数据面泵：寿命 = 该 mux 会话（会话终结即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;
@@ -487,7 +487,7 @@ impl ServerWorker {
         let ow = link_writer.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面会话输出泵（每连接）；数据面泵：寿命 = 该 mux 会话（会话终结即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         tokio::spawn(async move {
             Self::handle_session_output(os, ow).await;

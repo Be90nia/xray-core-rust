@@ -687,7 +687,7 @@ pub(super) async fn tcp_bridge(
     // 唯一写者任务：明文 MC 包字节 → CFB8 加密 → raw（对应 Go cryptoStream 写侧）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（xmc 加密写泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（xmc 加密写泵）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即加密写泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         let mut ww = ww;
@@ -718,7 +718,7 @@ pub(super) async fn tcp_bridge(
     let tx_ka = tx.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（pipe→raw 分块编码泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（pipe→raw 分块编码泵）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即分块编码泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         run_encode_pump(pipe_r, tx_data, local_cp_id).await;
@@ -730,7 +730,7 @@ pub(super) async fn tcp_bridge(
     let tx_read = tx;
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw→pipe 解密读泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw→pipe 解密读泵）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即解密读泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         let tx = tx_read;
@@ -782,7 +782,7 @@ pub(super) async fn tcp_bridge(
     if !is_client {
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（xmc server keepalive 循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判）：server CONNECT keepalive tick，寿命 = 该会话（会话关闭即退）；目标托管口 = 会话级 ComponentScope"
         )]
         tokio::spawn(async move {
             let tx = tx_ka;

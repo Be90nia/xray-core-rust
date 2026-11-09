@@ -273,7 +273,7 @@ async fn bind_unspecified(target: SocketAddr) -> io::Result<UdpSocket> {
 fn spawn_forwarder(io: Arc<dyn UdpIo>, tx: mpsc::Sender<(Vec<u8>, SocketAddr)>) -> JoinHandle<()> {
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（socket 收包转发）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（socket 收包转发）；数据面泵：寿命 = 该 UDP socket（socket 关闭即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     tokio::spawn(async move {
         let mut buf = vec![0u8; UDP_SIZE];

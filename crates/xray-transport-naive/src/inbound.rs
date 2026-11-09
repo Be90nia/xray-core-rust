@@ -183,7 +183,7 @@ impl InboundHandler for NaiveInboundHandler {
         let accept_scope = scope.downgrade();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（naive accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判）：naive accept 泵，寿命 = 该 listener（close() 走 `_accept_task.abort()`）；目标托管口 = 该 listener slot 的 ComponentScope"
         )]
         let accept_task = tokio::spawn(async move {
             loop {

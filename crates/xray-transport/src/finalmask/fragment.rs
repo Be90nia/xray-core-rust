@@ -97,7 +97,7 @@ async fn fragment_bridge(
     let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（inner↔pipe 回程拷贝）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（inner↔pipe 回程拷贝）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即回程拷贝自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     let back = tokio::spawn(async move {
         // 读侧结束/出错 → 关掉 pipe 写侧，让对端读到 EOF（错误按流结束传播）。

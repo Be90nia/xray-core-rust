@@ -860,7 +860,7 @@ impl UdpSessionManager {
         let clean_inner = Arc::clone(&self.inner);
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（UDP idle 会话清理循环）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判）：UDP idle 会话清理循环，寿命 = `UdpSessionManager` 宿主（`clean_handle` 现手工持句柄）；目标托管口 = 宿主 ComponentScope"
         )]
         let clean_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
@@ -904,7 +904,7 @@ impl UdpSessionManager {
         let run_remote = remote;
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（QUIC datagram 接收泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（QUIC datagram 接收泵）；数据面泵：寿命 = 该 QUIC 连接（datagram 接收泵随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         let run_handle = tokio::spawn(async move {
             loop {

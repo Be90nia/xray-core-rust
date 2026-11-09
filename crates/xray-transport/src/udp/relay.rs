@@ -210,7 +210,7 @@ fn spawn_session(
     // 数据面泵热路径豁免（约束⑫）：recv→channel 转发循环不加托管口。
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵热路径豁免（坑约束⑫）：UDP 会话 recv 泵；数据面泵：寿命 = 该 UDP 会话（socket 关闭即自终），坑约束⑫ 数据面零改动红线，不迁托管口"
     )]
     let reader = tokio::spawn(async move {
         let mut buf = vec![0u8; RECV_BUF];

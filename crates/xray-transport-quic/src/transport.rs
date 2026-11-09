@@ -242,7 +242,7 @@ fn make_server_endpoint(
 fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handler: ConnHandler) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（QUIC accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：QUIC accept 泵，寿命 = 该 listener（close() 走 `endpoint.close()` ⇒ accept 收 None）；目标托管口 = QuicListener 的 ComponentScope"
     )]
     tokio::spawn(async move {
         loop {
@@ -259,7 +259,7 @@ fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handle
             let h = handler.clone();
             #[allow(
                 clippy::disallowed_methods,
-                reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（每连接握手+stream 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+                reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（每连接握手+stream 泵）；数据面泵：寿命 = 该 QUIC 连接（握手+stream 泵随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
             )]
             tokio::spawn(async move {
                 let conn = match tokio::time::timeout(QUIC_HANDSHAKE_TIMEOUT, incoming).await {
@@ -311,7 +311,7 @@ impl<E: Send + Sync + Unpin> QuicConn<E> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面桥接 copy 泵（quinn↔DuplexStream）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：数据面桥接 copy 泵（quinn↔DuplexStream）；数据面泵：寿命 = 该 QUIC 连接（quinn↔DuplexStream copy 桥随连接关闭自终），坑约束⑫ 数据面零改动红线，不迁托管口"
         )]
         tokio::spawn(async move {
             let (mut rd, mut wr) = tokio::io::split(server);

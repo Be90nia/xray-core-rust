@@ -213,7 +213,7 @@ fn spawn_ws_accept_loop(
     let loop_scope = scope.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（ws accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：ws accept 泵，寿命 = 该 listener（close() 走 `close_notify`）；目标托管口 = `WsTransportListener` 的 ComponentScope（scope.close_gate 已有）"
     )]
     let accept_loop_handle = tokio::spawn(async move {
         // Arc<str>：每连接任务都要日志标识，克隆不分配。
@@ -297,7 +297,7 @@ fn spawn_ws_accept_loop(
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（accept 循环意外退出监控）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = ws accept 泵；目标托管口 = `WsTransportListener` 的 ComponentScope"
     )]
     tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
 

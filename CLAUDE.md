@@ -197,12 +197,13 @@ serena-cli undo                                                        # 改坏�
 | 类 | 判据 | 处理 |
 |---|---|---|
 | **① 接管类** | 任务生命周期绑定某组件——宿主 drop 或停机时**应当**随之取消（连接级 dispatch、arm/连接任务、装配级批次） | 必须走托管口：`PluginContext` 的 fx 句柄；**无 ctx 站点**走 `xray_frame::scope::ComponentScope`（组合包装 udf `FxScope`；`close_gate` 关闸档 / `drain` 排空档的分档见 ADR-0004 §2.2 Q1） |
-| **② 豁免类** | 任务**必须**活得比任何组件久（进程级 `LazyLock` 初始化、日志 flush、指标上报），或属数据面逐包泵（坑约束 ⑫ 零改动红线） | 允许裸 spawn，但必须逐站 `#[allow(clippy::disallowed_methods, reason = "...")]` 登记（reason 按 bd xosi9 模板填，**禁自造子类**）；CI 门核对「调用集合 ⊆ 登记集合」 |
+| **② 豁免类** | 只有三项，**禁自造第四项**（bd xosi9）<br>1. 任务**必须**活得比任何组件久（进程级 `LazyLock` 初始化、日志 flush、指标上报、压测/测试基建）<br>2. 数据面逐包泵（坑约束 ⑫ 零改动红线）<br>3. 公共契约外返（**限两站**：`arm_builders/inbound.rs` 的 tun serve 保活 + `xray-core/src/inbound.rs` 的监控壳——`JoinHandle` 是公开返回契约，改托管即改公开 API） | 允许裸 spawn，但必须逐站 `#[allow(clippy::disallowed_methods, reason = "...")]` 登记；reason **必须是该站自己的实义理由**（寿命/取消语义/为何不能托管），**禁复述分类枚举**；门 (h) 核对「调用集合 ⊆ 登记集合」 |
 | **③ 违规** | 裸 spawn 且无 allow / reason | CI 红，不得合入 |
 
 - **口径等价性**：D6 面⑦「任务托管迁 FxScope」的解释 = **① 类站点全部有托管口消费**；② 类逐站登记即视为达成（**不要求**把数据面逐包泵强迁，那会撞坑约束 ⑫）。按此判据，D6 面⑦ 与 D7 是同一结论的两种数法。
 - **停机语义**：托管口的 `shutdown_timeout` = udf 三段（close 闸 → **abort 在途** → 等净），**不是**「等任务跑完」；连接级优雅终止由 inbound arm scope 先取消。零残留判据 = 排空后 `in_flight() == 0`。
 - **禁止双份账本**：同一组任务不得既自持 `JoinSet` / 自建收割账本、又经托管口记账——两套账本 = 两套停机语义。
+- **reason 台账口径（bd xosi9）**：①类站点若托管口尚未接上，reason 前缀写 `①类待迁移（bd xosi9 改判）：<本站在做什么>；寿命 = <宿主>；目标托管口 = <具体 scope>`，**迁移是另一票，改标签不等于迁走**；②类站点 reason 写本站自己的寿命/不可托管依据。门 (h) 红判据 = 裸 spawn 无 allow，或 reason 命中模板串（`任务必须长于组件` / 「进程级+数据面逐包泵+公开契约外返」三连复述）——模板理由视为无理由。
 
 ---
 

@@ -127,7 +127,7 @@ async fn listen_hysteria(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（hysteria accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：hysteria accept 泵，寿命 = 该 listener（close() 走 abort.abort()）；目标托管口 = `HysteriaTransportListener.scope`（已管连接任务，accept 泵本体未纳入）"
     )]
     let accept_task = tokio::spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
@@ -170,7 +170,7 @@ async fn listen_hysteria(
     // error! 兜底发声。
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：常驻监控任务（accept 循环意外退出监控）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = hysteria accept 泵；目标托管口 = `HysteriaTransportListener.scope`（supervise 句柄现无宿主持有）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "hysteria",
@@ -247,7 +247,7 @@ impl TransportListener for HysteriaTransportListener {
         let l = self.listener.clone();
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：停机动作本身（同步 close 桥 async ep.close）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "①类待迁移（bd xosi9 改判）：停机动作（同步 close 桥 async ep.close）；现 spawn 后立即丢句柄 ⇒ 进程先退时优雅 QUIC close 静默丢失；目标托管口 = 停机编排窗（ComponentScope shutdown / ShutdownCoordinator），迁移另票"
         )]
         tokio::spawn(async move {
             let _ = l.close().await;

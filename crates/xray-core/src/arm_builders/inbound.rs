@@ -1532,7 +1532,7 @@ pub(crate) fn tun_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
         // 记账）远小于风险 → 保留裸 spawn，逐点理由登记。
         #[allow(
             clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+            reason = "②豁免（bd kwevg · §3.5.6）：tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留；公共契约外返（§3.5.6 ②类第三项限本两站之一）：`JoinHandle` 是 tun inbound 装配的公开返回值，改 scope 托管即改公开契约"
         )]
         let handle = tokio::spawn(async move {
             if let Err(e) = handler.start().await {

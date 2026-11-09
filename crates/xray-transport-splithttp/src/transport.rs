@@ -286,7 +286,7 @@ async fn listen_tcp(
 
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（splithttp TCP accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：splithttp TCP accept 泵，寿命 = 该 listener（close() 走 tcp_abort.abort()）；目标托管口 = 同函数已有的 ComponentScope `loop_scope`"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -316,7 +316,7 @@ async fn listen_tcp(
     // 意外退出监控：循环只应经 close() 的 abort 句柄退出；panic 会静默杀掉监听。
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；accept 循环意外退出监控任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = TCP accept 泵；目标托管口 = 该 listener 的 ComponentScope（ctx 不可达只影响插件面，不影响 scope 托管）"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp",
@@ -400,7 +400,7 @@ pub async fn listen_unix_splithttp(
     let log_ident = path.clone();
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面连接任务（splithttp unix accept 泵）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：splithttp unix accept 泵，寿命 = 该 listener（close() 走 tcp_abort.abort()）；目标托管口 = unix 分支 listener 的 ComponentScope"
     )]
     let accept_task = tokio::spawn(async move {
         loop {
@@ -426,7 +426,7 @@ pub async fn listen_unix_splithttp(
     let abort = accept_task.abort_handle();
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面热路径豁免（坑约束⑫）+ ctx 不可达：splithttp 为 h2/h3 传输层，transport 无 PluginContext 注入面；unix accept 循环意外退出监控任务；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：unix accept 循环意外退出监控，寿命 = unix accept 泵；目标托管口 = unix 分支 listener 的 ComponentScope"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-unix",
@@ -993,12 +993,12 @@ async fn listen_h3(
 fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> + Send + 'static) {
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面 QUIC accept 泵（splithttp h3 listener）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：splithttp h3 QUIC accept 泵，寿命 = 该 listener（close() 走 endpoint.close()）；目标托管口 = h3 listener 的 ComponentScope"
     )]
     let accept_task = tokio::spawn(body);
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：accept 循环意外退出监控（panic 留痕）；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+        reason = "①类待迁移（bd xosi9 改判）：h3 accept 循环意外退出监控（panic 留痕），寿命 = h3 accept 泵；目标托管口 = h3 listener 的 ComponentScope"
     )]
     tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
         "splithttp-h3",

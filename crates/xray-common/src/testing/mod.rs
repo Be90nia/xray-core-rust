@@ -24,7 +24,7 @@ use tracing::Instrument as _;
 /// `task` 是测试内任务标签（如 `"mock-dns-server"`），出现在 `test_task` span 上。
 #[allow(
     clippy::disallowed_methods,
-    reason = "②豁免（bd kwevg · §3.5.6）：本模块是 L3 闸唯一的测试面裸 spawn 豁免点（测试无 PluginContext 可穿，见模块文档）；不要在别处复制；任务必须长于组件（进程级/数据面逐包泵/公开契约外返），不迁托管口"
+    reason = "②豁免（bd kwevg · §3.5.6）：本模块是 L3 闸唯一的测试面裸 spawn 豁免点（测试无 PluginContext 可穿，见模块文档）；不要在别处复制"
 )]
 pub fn spawn<F>(task: &'static str, fut: F) -> JoinHandle<F::Output>
 where
