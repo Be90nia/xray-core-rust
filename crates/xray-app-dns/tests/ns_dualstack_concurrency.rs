@@ -247,19 +247,28 @@ async fn spawn_doq_server() -> (SocketAddr, Arc<ClientConfig>) {
 }
 
 /// h2c（明文 HTTP/2）DoH mock：逐连接独立任务、连接内多请求，记录 TCP accept 次数。
-async fn spawn_h2c_doh_server() -> (SocketAddr, Arc<AtomicUsize>) {
+///
+/// 第三个返回值是**失败回报通道**（bd h36x2）：逐请求任务由
+/// `xray_common::testing::spawn` 启动且 JoinHandle 被丢弃（detached）——detached 任务里的
+/// 判定性 assert 无人观测（panic 被 tokio 吞掉 ⇒ 假绿）。故 mock 任务只**报告**失败，
+/// 由测试主体 select! 断言。
+async fn spawn_h2c_doh_server()
+-> (SocketAddr, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedReceiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
     let accepts_c = Arc::clone(&accepts);
+    let (fail_tx, fail_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     xray_common::testing::spawn("dualstack-doh-mock", async move {
         loop {
             let Ok((sock, _)) = listener.accept().await else { return };
             accepts_c.fetch_add(1, Ordering::SeqCst);
+            let fail_tx = fail_tx.clone();
             xray_common::testing::spawn("dualstack-doh-conn", async move {
                 let Ok(mut h2) = h2::server::handshake(sock).await else { return };
                 while let Some(req) = h2.accept().await {
                     let Ok((req, mut respond)) = req else { return };
+                    let fail_tx = fail_tx.clone();
                     // 逐请求独立任务：请求体排空与应答都不得阻塞 h2 accept 循环——
                     // accept 环是连接 I/O 的唯一驱动者，环内 `await` `data()` 自堵
                     // （DATA 未入缓冲时永久挂起，bd ll2hr 同款）；延迟在环外也保住
@@ -269,13 +278,28 @@ async fn spawn_h2c_doh_server() -> (SocketAddr, Arc<AtomicUsize>) {
                         let mut buf = Vec::new();
                         let drained = tokio::time::timeout(Duration::from_secs(5), async {
                             while let Some(chunk) = body.data().await {
-                                let Ok(chunk) = chunk else { return };
+                                let chunk = chunk.map_err(|e| format!("请求体读取失败：{e}"))?;
                                 buf.extend_from_slice(&chunk);
                             }
+                            Ok::<_, String>(())
                         })
                         .await;
-                        assert!(drained.is_ok(), "请求体未在 5s 内收齐：h2 连接驱动被堵");
-                        let Ok(query) = Message::from_vec(&buf) else { return };
+                        match drained {
+                            Ok(Ok(())) => {},
+                            Ok(Err(e)) => {
+                                let _ = fail_tx.send(e);
+                                return;
+                            },
+                            Err(_) => {
+                                let _ = fail_tx
+                                    .send("请求体未在 5s 内收齐：h2 连接驱动被堵".to_string());
+                                return;
+                            },
+                        }
+                        let Ok(query) = Message::from_vec(&buf) else {
+                            let _ = fail_tx.send("请求体不是合法 DNS 报文".to_string());
+                            return;
+                        };
                         let payload = make_response(&query, 60);
                         tokio::time::sleep(MOCK_RTT).await;
                         let resp = http::Response::builder()
@@ -290,7 +314,7 @@ async fn spawn_h2c_doh_server() -> (SocketAddr, Arc<AtomicUsize>) {
             });
         }
     });
-    (addr, accepts)
+    (addr, accepts, fail_rx)
 }
 
 // ---------------------------------------------------------------------------
@@ -388,20 +412,28 @@ async fn doq_dual_stack_is_concurrent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn doh_dual_stack_is_concurrent_without_extra_connection() {
-    let (addr, accepts) = spawn_h2c_doh_server().await;
+    let (addr, accepts, mut failures) = spawn_h2c_doh_server().await;
     let ns = Arc::new(DohNameServer::new(
         tcp_dest(addr),
         addr.to_string(),
         xray_tls::utls::default_client_config(),
         cache("dualstack-doh"),
         Vec::new(),
-        Duration::from_secs(2),
+        // 查询预算必须 > mock 排空守卫（5s）：否则客户端先超时，mock 的根因诊断
+        // （h2 连接驱动被堵）永远轮不到上报，失败被误判为"查询超时"。
+        Duration::from_secs(10),
         true,
     ));
     // 生产由 `DnsService::start()` 注单托管 scope；测试走同一注单面。
     ns.start_managed_tasks(&Arc::new(FxScope::new()));
 
-    measure(&*ns, "DoH 双栈耗时").await;
+    // mock 侧失败优先：detached 任务里的 panic 无人观测（bd h36x2），故 mock 只
+    // 上报失败原因，由本主体断言 ⇒ 失败必红。
+    tokio::select! {
+        biased;
+        Some(reason) = failures.recv() => panic!("DoH mock 夹具失败：{reason}"),
+        _ = measure(&*ns, "DoH 双栈耗时") => {}
+    }
     probe("DoH accepts（预热 + 测量 = 4 条请求）", accepts.load(Ordering::SeqCst));
     assert_eq!(
         accepts.load(Ordering::SeqCst),

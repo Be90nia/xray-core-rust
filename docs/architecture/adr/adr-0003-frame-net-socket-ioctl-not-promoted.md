@@ -85,6 +85,9 @@ fail-open 兜底文案。bd vqvn1（commit `73bb85a1`）把它收敛成唯一实
   `bare_bind_control_receives_connreset`（**对照组**：裸 bind 必须拿到
   `ConnectionReset`，否则本机不复现该语义，测试失效）+ `ioctl_suppresses_connreset`
   （本件关掉上报后同触发不再拿到 `ConnectionReset`）。
-- 消费点接线：`crates/xray-transport/src/udp/mod.rs:46` 与
-  `crates/xray-proxy-dns/src/udp_connreset.rs:30` 两处转调同一函数（无本地副本）。
+- 消费点接线（按符号名定位，不钉行号——行号随树漂移，见 CLAUDE.md §3.5 锚点纪律）：
+  `xray-transport` 的 `udp::disable_icmp_unreachable_report`（crate 内薄转调）与
+  `xray-proxy-dns` 的 `bind_udp_no_connreset`（bind 后薄转调）两处转调同一正本
+  `xray-frame::net::disable_icmp_unreachable_report`（无本地副本）。定位命令：
+  `grep -rn "disable_icmp_unreachable_report" crates --include=*.rs`。
 - 静态门：`python tools/check_udp_binds.py`（bind 机制只允许出现在白名单两文件）。

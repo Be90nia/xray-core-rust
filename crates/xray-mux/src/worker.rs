@@ -984,7 +984,6 @@ mod tests {
     /// （take/put-back，同 Session::close 修法）。旧实现持锁跨 carrier 写 ⇒
     /// 该会话 close/interrupt 在 carrier 停滞时与写路径互卡。放行后写完成、
     /// 槽位恢复 Some、写成功不关会话。
-    #[allow(clippy::disallowed_methods, reason = "测试：卡死 carrier 的 keep 任务")]
     #[tokio::test]
     async fn keep_write_output_lock_free_while_carrier_pending() {
         use std::{future::Future, pin::Pin};
@@ -1017,7 +1016,7 @@ mod tests {
         let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
             Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
         let meta = FrameMetadata::keep_with_udp_target(7, udp_dest());
-        let keeper = tokio::spawn(async move {
+        let keeper = xray_common::testing::spawn("mux-keep-write-output-lock-free", async move {
             worker
                 .handle_status_keep(&meta, Buffer::from_vec(b"x".to_vec()), &link_writer)
                 .await
@@ -1179,8 +1178,10 @@ mod tests {
 
         let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
             Arc::new(tokio::sync::Mutex::new(Some(Box::new(StalledWriter))));
-        #[allow(clippy::disallowed_methods, reason = "测试：卡死泵任务")]
-        tokio::spawn(ServerWorker::handle_session_output(Arc::clone(&session), link_writer));
+        xray_common::testing::spawn(
+            "mux-stalled-session-output-pump",
+            ServerWorker::handle_session_output(Arc::clone(&session), link_writer),
+        );
         // 等泵进入写 pending（修复前此处泵仍持 input 锁）
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1468,8 +1469,7 @@ mod tests {
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
-            #[allow(clippy::disallowed_methods, reason = "测试：帧服务处理泵")]
-            tokio::spawn(async move {
+            xray_common::testing::spawn("mux-xudp-frame-pump", async move {
                 while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
                 monitor_h.abort();
@@ -1523,8 +1523,7 @@ mod tests {
 
             let w = Arc::clone(&client);
             let d = udp_target();
-            #[allow(clippy::disallowed_methods, reason = "测试：udp dispatch 任务")]
-            let task = tokio::spawn(async move {
+            let task = xray_common::testing::spawn("mux-udp-dispatch", async move {
                 w.dispatch_with_source(
                     &d,
                     ClientLink { reader: Box::new(req_rd), writer: Box::new(resp_wr) },
@@ -1753,8 +1752,7 @@ mod tests {
                 Arc::new(AsyncMutex::new(Some(Box::new(s_write))));
             let monitor_h = server.spawn_monitor(Arc::clone(&link_writer));
             let frame_server = Arc::clone(&server);
-            #[allow(clippy::disallowed_methods, reason = "测试：帧服务处理泵")]
-            tokio::spawn(async move {
+            xray_common::testing::spawn("mux-reverse-frame-pump", async move {
                 while let Ok(true) = frame_server.process_frame(&mut reader, &link_writer).await {}
                 frame_server.close();
                 monitor_h.abort();
@@ -1772,8 +1770,7 @@ mod tests {
 
             let w = Arc::clone(&client);
             let d = tcp_target();
-            #[allow(clippy::disallowed_methods, reason = "测试：tcp dispatch 任务")]
-            let task = tokio::spawn(async move {
+            let task = xray_common::testing::spawn("mux-tcp-dispatch", async move {
                 w.dispatch_with_source(
                     &d,
                     ClientLink { reader: Box::new(_req_rd), writer: Box::new(resp_wr) },
