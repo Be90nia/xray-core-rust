@@ -28,7 +28,7 @@ xray-proxy-vless = { path = "../crates/xray-proxy-vless" }
 # `new_with_session_id_generator` API，会让 Watfaq fork 残留调用点 E0599 编译失败。
 # 改 path vendor 后 CI 100% 可达；vendor/rustls 内有完整 `new_with_session_id_generator`
 # 实现（client_conn.rs:744），vendor/tokio-rustls 已删 Shadow-TLS V3 公开 API
-# （gqkk 报告记全仓无调用方），与 rustls 0.23.45 ABI 兼容。
+# （gqkk 报告记全仓无调用方），与 rustls 0.23.46 ABI 兼容。
 rustls = { path = "../vendor/rustls" }
 tokio-rustls = { path = "../vendor/tokio-rustls" }
 quinn-proto = { path = "../vendor/quinn-proto" }
