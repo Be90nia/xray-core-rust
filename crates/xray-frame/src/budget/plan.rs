@@ -6,7 +6,7 @@
 //!
 //! ## 一次探测 + 一次派生（无运行时重平衡）
 //!
-//! 探测顺序（第一个命中即用；全失效兜底 [`FALLBACK_AVAILABLE_BYTES`]）：
+//! 探测顺序（第一个命中即用；全失效兜底 [`crate::budget::plan::FALLBACK_AVAILABLE_BYTES`]）：
 //! 1. `XRAY_MEM_LIMIT_MB`（测试/运维强制档位，最高优先）
 //! 2. Linux cgroup v2 `memory.max`
 //! 3. Linux cgroup v1 `memory.limit_in_bytes`
@@ -14,7 +14,7 @@
 //! 5. Windows `GlobalMemoryStatusEx().ullAvailPhys`
 //! 6. 兜底 512MB（**不得 panic、不得返 0**）
 //!
-//! 派生面（[`MemoryPlan`]）：总预算 → 桥每方向字节闸 → 连接数上限。改探测量即
+//! 派生面（[`crate::budget::plan::MemoryPlan`]）：总预算 → 桥每方向字节闸 → 连接数上限。改探测量即
 //! 换档，不改代码（这与 `xray_frame::budget` 的「上界一律显式常量」不冲突：
 //! 那条管单个容器的上界常量，本条管**整机分账总额**随机器自适）。
 //!
@@ -34,7 +34,7 @@
 //! `memory.limit_in_bytes` / `/proc/meminfo MemAvailable` / Windows
 //! `GlobalMemoryStatusEx` 是**进程级平台机制**，零 xray 语义 ⇒ 归 udf 提炼候选
 //! （`skeleton_infra`，与 clock/logx/shutdown 同族）。`udf-promotion-candidate`：
-//! [`probe_available`] + 三个纯解析器 + `GlobalMemoryStatusEx` FFI = 迁移清单
+//! [`crate::budget::plan::probe_available`] + 三个纯解析器 + `GlobalMemoryStatusEx` FFI = 迁移清单
 //! 第 1 步的提炼面；udf 有此件后本文件换依赖删本地副本（档位策略不动）。
 //! 之所以暂随本件落派生层：`xray-frame` 不能反向依赖 `xray-common`（`xray-common`
 //! 已依赖 `xray-frame`，唯一边 = `log::set_secrets` 写 `logging::GLOBAL_SECRETS`，
