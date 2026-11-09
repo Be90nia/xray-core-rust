@@ -6,9 +6,17 @@
 #
 # L3 静态闸（bd a5r4j/lzzja 家族模板 + 本轮补齐，票 txmhr）：异步托管唯一口 =
 # PluginContext::spawn（透传 skeleton_infra::fx::FxScope），裸 spawn 失管
-# （坑约束 #5）。本 crate 生产依赖图**无** PluginContext（xray-frame 仅
-# dev-dependency），ctx 不可达 → 存量调用逐点 #[allow(clippy::disallowed_methods)]
-# + 理由注释登记；托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，否则逐点登记显式脱管）。
+# （坑约束 #5）。**实况核对（2026-11-09，bd c4d1s A-08）**：xray-frame 登记在本 crate 的
+# Cargo.toml `[dependencies]` 段（`xray-frame = { path = "../xray-frame" }`），即**生产
+# 依赖**（非仅开发期依赖）；生产代码直接持有 `xray_frame::compat::ManagedScope`
+# （src/udp_session.rs:104、src/default.rs:933/968）⇒ **托管口可达**，裸 spawn 禁令
+# 有合规出口。本 crate 生产代码**不持 PluginContext**（无插件装配面），这一事实不改变
+# xray-frame 为生产依赖的判定——已接的托管口是 `xray_frame::compat::ManagedScope`
+# （组合包装 udf FxScope，bd 4a1zy / kwevg）。
+# 存量裸 spawn：**生产面零处**（全 crate 扫 tokio::spawn / thread::spawn，命中全在
+# #[cfg(test)] 测试面），经 src/lib.rs 顶部 `#![cfg_attr(test, allow(clippy::disallowed_methods))]`
+# 统一豁免 ⇒ 无需逐点 #[allow] 登记。托管裁决见 bd hj3jf（fx 可达即 spawn_tracked，
+# 否则逐点登记显式脱管）。
 # 注：`path` 是被禁方法的 def path，不是源码 glob——glob 写进 path 不报 fatal 但
 # 禁令静默无效（xray-frame 探针 1 实测），落地禁用该形态。
 # 注：`tokio::spawn` 与 `tokio::task::spawn` 是同 def-id 的两个路径拼写，
