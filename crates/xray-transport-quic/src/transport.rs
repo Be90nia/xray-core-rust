@@ -693,13 +693,24 @@ mod tests {
         }
     }
 
-    /// 测试收尾守卫：无论断言过红，Drop 都解除验证器自旋——否则 panic 路径下
-    /// quinn 驱动线程永远卡在自旋里，测试进程 runtime drop 卡死。
-    struct ReleaseGuard(Arc<std::sync::atomic::AtomicBool>);
+    /// 测试收尾守卫（bd 6qf1b）：无论断言过红，Drop 都解除验证器自旋**并关闭
+    /// 两端 endpoint**——否则 panic 路径下自旋虽解（ParkedVerifier 退出），
+    /// `ep`/`keepalive` 却走普通 Drop 而非 `close()`，quinn 驱动线程仍持
+    /// socket ⇒ 测试进程在退出阶段永挂（CI Test 挂 5h45m 被取消的根因）。
+    /// `quinn::Endpoint: Clone` 且 `close` 对 clone 生效；close 幂等（覆写同一
+    /// close flag + 对残余连接重播 Close），正常路径清理块已显式 close，此处
+    /// 重复调用无副作用。
+    struct CleanupGuard {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        ep: quinn::Endpoint,
+        keepalive: quinn::Endpoint,
+    }
 
-    impl Drop for ReleaseGuard {
+    impl Drop for CleanupGuard {
         fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.ep.close(0u32.into(), b"panic cleanup");
+            self.keepalive.close(0u32.into(), b"panic cleanup");
         }
     }
 
@@ -733,7 +744,6 @@ mod tests {
         // 永挂验证器 + 完成信号（entered ⇒ 服务器已接纳该连接并回过飞行包）。
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _release_guard = ReleaseGuard(Arc::clone(&release)); // panic 安全收尾
         let mut client_tls = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ParkedVerifier {
@@ -750,13 +760,24 @@ mod tests {
         // 客户端 transport 用缺省（idle 30s > 窗 8s），排除 idle 抢先关连的假阳性。
         let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         ep.set_default_client_config(quinn_client);
+        // panic 安全收尾（bd 6qf1b）：endpoint 一旦存在即入守卫——`connect` 的
+        // unwrap、15s/60s 窗 expect、观测窗后的断言，任何一条 panic 路径都由
+        // Drop 关闭两端 endpoint，进程才退得出去。
+        let _cleanup_guard = CleanupGuard {
+            release: Arc::clone(&release),
+            ep: ep.clone(),
+            keepalive: keepalive.clone(),
+        };
         // 不 await Connecting：Initial 由 endpoint 驱动发出，握手卡死在验证器。
         let _connecting = ep.connect(addr, "localhost").unwrap();
 
         // 客户端收到服务器飞行包（= 验证器被唤起）⇒ 服务器侧接纳已发生、名额已被占。
-        tokio::time::timeout(Duration::from_secs(15), entered_rx)
+        // 60s（bd 6qf1b）：CI 慢机上 15s 偶发不足 ⇒ 误 panic；此处只是「卡死已
+        // 建立」的等待上界，判据窗（20s 观测 + QUIC_HANDSHAKE_TIMEOUT 释放断言）
+        // 原样保留，不构成「延窗让测试过」。
+        tokio::time::timeout(Duration::from_secs(60), entered_rx)
             .await
-            .expect("verifier must be reached within 15s (stall not established)")
+            .expect("verifier must be reached within 60s (stall not established)")
             .expect("entered channel");
         let admitted_at = std::time::Instant::now();
 
@@ -776,6 +797,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         ep.close(0u32.into(), b"test done");
         keepalive.close(0u32.into(), b"test done");
+
+        // 反向锚（bd 6qf1b）：close 后 endpoint 的连接集合必须清空（quinn 驱动
+        // 收到 Close、连接逐一关停）——「panic 后进程能退出」同一收口在正常路径
+        // 的可观测证明；有界包裹防锚自身变成新挂死面（守卫在 unwind 时兜底关）。
+        tokio::time::timeout(Duration::from_secs(5), ep.wait_idle())
+            .await
+            .expect("endpoint must drain to idle after close (quinn driver released)");
 
         // ---- 断言（全部在清理之后，panic 不再阻塞 runtime 收尾）----
         // 名额释放后的可复用性由既有 echo_roundtrip_* 测试（经 listen() 同一闸接线）
