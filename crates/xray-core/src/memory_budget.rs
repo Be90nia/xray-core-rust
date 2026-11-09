@@ -322,6 +322,18 @@ pub fn budget_report_with(
             plan.max_conns,
         ));
     }
+    // TUIC 信箱乘数被封顶（装不下全部出站）⇒ **独立 WARN**（bd k5pqt）：账面必须
+    // 可见。不能只放在下面「瞬时面超预算」分支里——该分支仅在 projected > budget 时
+    // 进，而封顶后 projected 可能仍在预算内，此时「漏记的条数」同样必须告警。
+    if tuic_outbounds > tuic_inbox_conns {
+        notes.push(format!(
+            "TUIC dgram 信箱记账封顶（只 WARN 不拒启，bd k5pqt）：{} 个 tuic 出站 × {}B 字节上界，\
+             预算余量只装得下 {tuic_inbox_conns} 个 ⇒ 第 {} 个起的滞留不受预算约束",
+            tuic_outbounds,
+            xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP,
+            tuic_inbox_conns + 1
+        ));
+    }
     // 瞬时上界（xdns frag / QUIC 连接窗）超预算 = 只 WARN（用户裁决 2026-11-07）。
     if transient_booked > 0 && projected > budget {
         let mut parts: Vec<String> = Vec::new();
@@ -337,15 +349,6 @@ pub fn budget_report_with(
                  {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B/连接），且**无连接级准入闸**\
                  （唯一闸是握手在飞）⇒ 第 {} 条起的窗口内存不受预算约束",
                 quic_conns + 1
-            ));
-        }
-        if tuic_outbounds > tuic_inbox_conns {
-            parts.push(format!(
-                "TUIC dgram 信箱：{} 个 tuic 出站 × {}B 字节上界（bd k5pqt），预算余量只装得下 \
-                 {tuic_inbox_conns} 个 ⇒ 第 {} 个起的滞留不受预算约束",
-                tuic_outbounds,
-                xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP,
-                tuic_inbox_conns + 1
             ));
         }
         notes.push(format!(
