@@ -46,8 +46,16 @@ const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `assoc_id` 的包时转投信箱，属主下次读取先取信箱——否则两条并发 UDP 流
 /// 互偷回包（Go sing-quic `handleUDPMessage` 按 `udpConnMap[sessionID]` 分派
 /// 的无泵等价物）。
-pub(crate) type DgramInbox =
-    Arc<parking_lot::Mutex<HashMap<u16, std::collections::VecDeque<Packet>>>>;
+pub(crate) type DgramInbox = Arc<parking_lot::Mutex<DgramInboxState>>;
+
+/// 信箱状态（bd k5pqt）：键 → 积压队列 + 全箱滞留字节记账。键数上界
+/// （4096 键 × 64 包）不封总量，字节记账与键/包操作同锁增减，无竞态窗口。
+#[derive(Default)]
+pub(crate) struct DgramInboxState {
+    map: HashMap<u16, std::collections::VecDeque<Packet>>,
+    /// 滞留包字节权重合计（[`packet_weight`] 口径）；stash 入账 / take 释放。
+    retained_bytes: usize,
+}
 
 /// 单 assoc 信箱积压上限（UDP 有损语义：超限丢最旧，读方永不被信箱阻塞）。
 const DGRAM_INBOX_CAP: usize = 64;
@@ -57,6 +65,14 @@ const DGRAM_INBOX_CAP: usize = 64;
 /// 4096 满则未命中键的包整包丢弃（UDP 有损语义：退化优于无界增长）；
 /// 已存在的键不受影响（属主仍在读）。
 const DGRAM_INBOX_KEY_CAP: usize = 4096;
+
+/// 全连接信箱**字节**软上界（bd k5pqt）：条目仅在属主读取时移除，键数上界
+/// 不封总量——对端以 ~1.2KB 包填满 4096 键 × 64 包即可把单连接滞留推到
+/// ~300MB 且无人认领即常驻。超限整包拒新（UDP 有损语义，键数上界同款）；
+/// 属主读取释放配额。8MiB ≈ 85 条满积压流（64 包 × 1.5KB MTU），正常多流
+/// 共享连接远达不到。`pub`：`xray-core` 内存账本（memory_budget）引用同一
+/// 常量，禁两份定义（§3.5.2）。
+pub const DGRAM_INBOX_BYTE_CAP: usize = 8 * 1024 * 1024;
 
 /// TUIC 客户端 UDP 关联句柄。
 ///
@@ -384,13 +400,7 @@ impl TuicUdpAssoc {
 
     /// 取本 assoc 信箱里的下一个包（空则顺手清掉条目）。
     fn take_inbox_packet(&self) -> Option<Packet> {
-        let mut inbox = self.inbox.lock();
-        let queue = inbox.get_mut(&self.assoc_id)?;
-        let pkt = queue.pop_front();
-        if queue.is_empty() {
-            inbox.remove(&self.assoc_id);
-        }
-        pkt
+        take_inbox_packet_from(&self.inbox, self.assoc_id)
     }
 
     /// 把别的 assoc 的回包转投其信箱（超上限丢最旧，UDP 有损语义）。
@@ -407,19 +417,58 @@ impl TuicUdpAssoc {
     }
 }
 
+/// 信箱滞留字节权重（bd k5pqt 账本口径）：payload + 地址 wire 长度（滞留内存
+/// 主导项；VecDeque 节点等常数小开销不计）。
+fn packet_weight(pkt: &Packet) -> usize {
+    pkt.data.len() + pkt.addr.encoded_len()
+}
+
 /// [`TuicUdpAssoc::stash_foreign_packet`] 的纯函数体（可单测）：转投信箱，
-/// 超 [`DGRAM_INBOX_CAP`] 丢最旧；键数满 [`DGRAM_INBOX_KEY_CAP`] 时未命中键
-/// 整包丢弃（软上界退化，UDP 有损语义）。
+/// 超 [`DGRAM_INBOX_CAP`] 丢最旧；键数满 [`DGRAM_INBOX_KEY_CAP`] 或滞留字节满
+/// [`DGRAM_INBOX_BYTE_CAP`] 时整包丢弃（软上界退化，UDP 有损语义）。
 fn stash_foreign_packet_to(inbox: &DgramInbox, pkt: Packet) {
     let mut inbox = inbox.lock();
-    if inbox.len() >= DGRAM_INBOX_KEY_CAP && !inbox.contains_key(&pkt.assoc_id) {
+    if inbox.map.len() >= DGRAM_INBOX_KEY_CAP && !inbox.map.contains_key(&pkt.assoc_id) {
         return;
     }
-    let queue = inbox.entry(pkt.assoc_id).or_default();
-    if queue.len() >= DGRAM_INBOX_CAP {
-        queue.pop_front();
+    let weight = packet_weight(&pkt);
+    if inbox.retained_bytes.saturating_add(weight) > DGRAM_INBOX_BYTE_CAP {
+        return;
     }
-    queue.push_back(pkt);
+    // MutexGuard 不跨字段分裂借用（E0499）：map 借用（挤出最旧 + 入队）收进
+    // 作用域块，挤出的权重带出后记账。
+    let evicted_weight = {
+        let queue = inbox.map.entry(pkt.assoc_id).or_default();
+        let evicted_weight = if queue.len() >= DGRAM_INBOX_CAP {
+            queue.pop_front().map(|old| packet_weight(&old))
+        } else {
+            None
+        };
+        queue.push_back(pkt);
+        evicted_weight
+    };
+    inbox.retained_bytes += weight;
+    if let Some(w) = evicted_weight {
+        inbox.retained_bytes -= w;
+    }
+}
+
+/// [`TuicUdpAssoc::take_inbox_packet`] 的纯函数体（可单测）：弹出属主队首并
+/// 释放字节配额（空队顺手清键）。
+fn take_inbox_packet_from(inbox: &DgramInbox, assoc_id: u16) -> Option<Packet> {
+    let mut inbox = inbox.lock();
+    let (pkt, now_empty) = {
+        let queue = inbox.map.get_mut(&assoc_id)?;
+        let pkt = queue.pop_front();
+        (pkt, queue.is_empty())
+    };
+    if let Some(p) = &pkt {
+        inbox.retained_bytes -= packet_weight(p);
+    }
+    if now_empty {
+        inbox.map.remove(&assoc_id);
+    }
+    pkt
 }
 
 /// 按 native datagram 容量切分 Packet 帧（纯函数，可单测；server 响应侧复用）。
@@ -656,7 +705,7 @@ mod tests {
     /// 已存在键不受影响（属主在读）；单键积压上限语义不变（丢最旧）。
     #[test]
     fn stash_foreign_packet_key_cap_degrades_without_unbounded_keys() {
-        let inbox: DgramInbox = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let inbox = DgramInbox::default();
         let pkt =
             |assoc: u16, id: u16| Packet::new(assoc, id, Address::None, Bytes::from_static(b"x"));
 
@@ -664,24 +713,75 @@ mod tests {
         for assoc in 0..DGRAM_INBOX_KEY_CAP as u16 {
             stash_foreign_packet_to(&inbox, pkt(assoc, 1));
         }
-        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP);
+        assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP);
 
         // 未命中新键：整包丢弃（软上界满则退化）
         stash_foreign_packet_to(&inbox, pkt(u16::MAX, 1));
-        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP, "满后新键不得再占键");
-        assert!(!inbox.lock().contains_key(&u16::MAX));
+        assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP, "满后新键不得再占键");
+        assert!(!inbox.lock().map.contains_key(&u16::MAX));
 
         // 已存在键：正常入队（键不受上界影响）
         stash_foreign_packet_to(&inbox, pkt(0, 2));
-        assert_eq!(inbox.lock().len(), DGRAM_INBOX_KEY_CAP);
-        assert_eq!(inbox.lock()[&0].len(), 2, "已有键的包必须照常入队");
+        assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP);
+        assert_eq!(inbox.lock().map[&0].len(), 2, "已有键的包必须照常入队");
 
         // 单键积压上限（64）语义不变：第 65 包挤出最旧
         for i in 0..=DGRAM_INBOX_CAP as u16 {
             stash_foreign_packet_to(&inbox, pkt(1, 10 + i));
         }
-        let q = &inbox.lock()[&1];
+        let guard = inbox.lock();
+        let q = &guard.map[&1];
         assert_eq!(q.len(), DGRAM_INBOX_CAP, "单键积压封顶");
         assert_eq!(q.front().expect("非空").pkt_id, 11, "最旧的 10 已被挤出");
+    }
+
+    /// bd k5pqt：信箱**字节**上界——滞留字节数封顶，超限整包拒新；属主读取
+    /// 释放配额后恢复接收；单键丢最旧语义在字节预算内不回退。
+    #[test]
+    fn stash_foreign_packet_inbox_byte_cap_bounds_retained_bytes() {
+        let inbox = DgramInbox::default();
+        // 4KiB 载荷（DNS 大响应 / WireGuard 包量级）；weight = 4096 + Address::None(1)
+        let big = |assoc: u16, id: u16| {
+            Packet::new(assoc, id, Address::None, Bytes::from(vec![0u8; 4096]))
+        };
+        let big_weight = packet_weight(&big(0, 0));
+
+        // ① 单键积压丢最旧不回退（小包，字节预算充裕时既有语义）
+        let small =
+            |assoc: u16, id: u16| Packet::new(assoc, id, Address::None, Bytes::from_static(b"x"));
+        for i in 0..=DGRAM_INBOX_CAP as u16 {
+            stash_foreign_packet_to(&inbox, small(7, 10 + i));
+        }
+        // guard 必须限制在本块内：parking_lot Mutex 非重入，活到函数尾会让
+        // 后面的 stash_foreign_packet_to 再次 lock() ⇒ 自死锁（本次实测挂死）。
+        {
+            let guard = inbox.lock();
+            let q = &guard.map[&7];
+            assert_eq!(q.len(), DGRAM_INBOX_CAP, "单键积压封顶");
+            assert_eq!(q.front().expect("非空").pkt_id, 11, "最旧的 10 已被挤出");
+        }
+
+        // ② 灌入 > 字节上界的外异包：键数远未到 4096 ⇒ 触发面必是字节上界
+        //    先把信箱清空：① 的 key 7 残留 63 个小包（126B）会污染字节记账断言
+        *inbox.lock() = Default::default();
+        let fit = DGRAM_INBOX_BYTE_CAP / big_weight;
+        assert!(fit < DGRAM_INBOX_KEY_CAP, "测试前提：字节上界先于键数上界触发");
+        for i in 0..(fit + 8) as u16 {
+            stash_foreign_packet_to(&inbox, big(i, 1));
+        }
+        {
+            let st = inbox.lock();
+            assert_eq!(st.map.len(), fit, "每键恰 1 包；超限包整包拒新");
+            assert!(st.retained_bytes <= DGRAM_INBOX_BYTE_CAP, "滞留字节必须 ≤ 上界");
+            assert_eq!(st.retained_bytes, fit * big_weight, "字节记账逐包精确");
+        }
+
+        // ③ 属主读取释放配额：取走 key 0 后新键恢复接收（正常键仍可收取）
+        let taken = take_inbox_packet_from(&inbox, 0).expect("key 0 应有一包");
+        assert_eq!(taken.pkt_id, 1);
+        assert!(take_inbox_packet_from(&inbox, 0).is_none(), "取空后应返回 None");
+        assert_eq!(inbox.lock().retained_bytes, (fit - 1) * big_weight, "读取释放配额");
+        stash_foreign_packet_to(&inbox, big(u16::MAX, 2));
+        assert_eq!(inbox.lock().map.len(), fit, "释放 1 键配额 ⇒ 恰好再收 1 键");
     }
 }

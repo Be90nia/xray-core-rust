@@ -288,7 +288,7 @@ impl TuicClient {
             uuid,
             password: password.to_string(),
             router,
-            dgram_inbox: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            dgram_inbox: crate::udp::DgramInbox::default(),
             fx: Arc::new(FxScope::new()),
         })
     }

@@ -18,12 +18,12 @@
 //! 2. 硬账面：进程级池/缓存固定占用（[`startup_fixed_floor_bytes`]，**含每监听握手 在途**）+
 //!    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面（×2 内核记账）
 //!    + 预算内最小并发 × 每连接 pipe（双向）—— 配置合法但合计超 [`XRAY_BUDGET_BYTES`] 同样拒启；
-//!      **另两项瞬时上界也进硬账**（bd 2026-11-08 D-03 / security P2-2）：xdns frag 满表
-//!      （[`XDNS_FRAG_WORST_CASE_BYTES`] × server 数）与 QUIC 连接接收窗
-//!      （[`QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES`] ×
-//!      **预算余量装得下的满窗条数**）。两项都**装不下 只 WARN 不拒启**（用户裁决
-//!      2026-11-07「预算不足不得拒启」），但账面必须可见、 可对账——旧状 frag 只在 caps
-//!      栏（等于不判），QUIC 窗全仓零登记。
+//!      **另三项瞬时上界也进硬账**（bd 2026-11-08 D-03 / security P2-2；TUIC 面 bd k5pqt）： xdns
+//!      frag 满表（[`XDNS_FRAG_WORST_CASE_BYTES`] × server 数）、QUIC 连接接收窗
+//!      （[`QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES`] × **预算余量装得下的满窗条数**）与 TUIC dgram
+//!      信箱（ `xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP` × tuic 出站数）。三项都**装不下 只 WARN
+//!      不拒启**（用户裁决 2026-11-07「预算不足不得拒启」），但账面必须可见、 可对账——旧状 frag
+//!      只在 caps 栏（等于不判），QUIC 窗全仓零登记。
 //! 3. 上限面（不判、只打印）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 //!    预约会误杀合法配置）、xhttp h2 send_buf（每连接、惰性分配）、DoH3 resolver
 //!    socket（装配期不可数）、桥在途。
@@ -91,9 +91,9 @@ fn stream_network(
 /// 预算门两栏报告（bd 258qt / pyka7 / nlhht 的口径修正）。
 ///
 /// - [`hard`](Self::hard)：**硬账**——装配期能判定、且真会占的字节（进
-///   [`projected`](Self::projected) 判定）。含两项**瞬时上界**（xdns frag 满表、 QUIC
-///   连接接收窗）：它们超预算只 WARN 不拒启（用户裁决），但必须入账可见 （bd 2026-11-08 D-03 /
-///   security P2-2）。
+///   [`projected`](Self::projected) 判定）。含三项**瞬时上界**（xdns frag 满表、QUIC
+///   连接接收窗、TUIC dgram 信箱）：它们超预算只 WARN 不拒启（用户裁决），但必须入账可见 （bd
+///   2026-11-08 D-03 / security P2-2 / bd k5pqt）。
 /// - [`caps`](Self::caps)：**上限面**——按连接数/端点的上界，装配期零连接 ⇒ 真实占用 0 或受 OS
 ///   钳制（Linux `rmem_max`），**不并入硬账**，但要 显式打印：**96 MiB 因此不是运行期硬上界**。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,8 +153,8 @@ impl BudgetReport {
 /// 1. 每连接 pipe 软上限（env 缺省档 + policy 各 level `bufferSize`；负值硬拒、 0 放行）；
 /// 2. **硬账**：固定底数（池/缓存 + **每监听**握手在途，bd 258qt(a)）+ 最小并发 × pipe 双向 +
 ///    **显式** `sockopt.receiveBufferSize` 的 UDP 端点账面 （×2 内核记账，bd nlhht）+
-///    **瞬时上界两项**（xdns frag 满表、QUIC 连接接收窗；超预算只 WARN 不拒启）—— 固定面 +
-///    连接面超预算拒启，瞬时面超预算只 WARN（用户裁决 2026-11-07）；
+///    **瞬时上界三项**（xdns frag 满表、QUIC 连接接收窗、TUIC dgram 信箱；超预算只 WARN 不拒启）——
+///    固定面 + 连接面超预算拒启，瞬时面超预算只 WARN（用户裁决 2026-11-07）；
 /// 3. **上限面**（不判、只报）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 ///    预约会误杀合法配置，bd 258qt(c)）、DoH3 resolver socket（装配期不可数， bd 258qt(d)）、xhttp
 ///    h2 send_buf（惰性分配，bd pyka7）、桥在途、QUIC 流窗（连接窗内子份额）。
@@ -261,13 +261,16 @@ pub fn budget_report_with(
     let max_conns = xray_common::mem_probe::set_effective_max_conns(plan.max_conns.min(conns_fit));
 
     // ── 3b) 瞬时上界入硬账（bd 2026-11-08 D-03 / security P2-2）──
-    // 两项都**由远端/负载推高、装配期不可判定**，但真的会吃掉预算：
+    // 三项都**由远端/负载推高、装配期不可判定**，但真的会吃掉预算：
     // - xdns frag：每 xdns server 满表 41.2MiB（`frag_n` 由对端片数控制， security P2-2：旧状只进
     //   caps 栏 ⇒ 等于不判，Tiny 40MiB 档静默超账）；
     // - QUIC 连接接收窗：每已建立连接 32MiB，且**无连接级准入闸**（唯一闸是 握手在飞）⇒
     //   入账乘数取「预算余量装得下几条满窗连接」（不是档位并发上限， 那样恒得 10× 超账 ⇒
-    //   告警噪音；D-03：旧状全仓零登记）。
-    // 二者超预算都**只 WARN 不拒启**（用户裁决 2026-11-07）；把它们排斥在
+    //   告警噪音；D-03：旧状全仓零登记）；
+    // - TUIC dgram 信箱（bd k5pqt）：每 TUIC 出站一个 per-connection 收包信箱，滞留
+    //   条目属主不读取即常驻（字节上界 = `xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP`，
+    //   修复前键数上界不封总量、单连接滞留可达 ~300MB）。乘数同 D-03 余量口径。
+    // 三者超预算都**只 WARN 不拒启**（用户裁决 2026-11-07）；把它们排斥在
     // `conns_fit` 之外同样是为不把连接面饿死到拒启（frag 单独就超 Tiny 预算）。
     let xdns_servers: usize =
         built.inbounds.iter().map(|i| xdns_mask_count(i.stream_settings_json.as_ref())).sum();
@@ -281,7 +284,15 @@ pub fn budget_report_with(
         / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
     let quic_conns = if quic_endpoints > 0 { max_conns.min(quic_conns_fit.max(1)) } else { 0 };
     let quic_windows_booked = quic_conns * QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
-    let transient_booked = frag_booked + quic_windows_booked;
+    // TUIC dgram 信箱（bd k5pqt）：常量单一事实源 = tuic 实现（登记簿直引，禁复制值）。
+    let tuic_outbounds = built.outbounds.iter().filter(|o| o.entry.kind == "tuic").count();
+    let tuic_inbox_fit = budget
+        .saturating_sub(fixed + quic_explicit_booked + conns * per_conn_pipe)
+        / xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP;
+    let tuic_inbox_conns =
+        if tuic_outbounds > 0 { tuic_inbox_fit.max(1).min(tuic_outbounds) } else { 0 };
+    let tuic_inbox_booked = tuic_inbox_conns * xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP;
+    let transient_booked = frag_booked + quic_windows_booked + tuic_inbox_booked;
     let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe;
     let projected = steady_booked + transient_booked;
     if conns_fit == 0 {
@@ -326,6 +337,15 @@ pub fn budget_report_with(
                  {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B/连接），且**无连接级准入闸**\
                  （唯一闸是握手在飞）⇒ 第 {} 条起的窗口内存不受预算约束",
                 quic_conns + 1
+            ));
+        }
+        if tuic_outbounds > tuic_inbox_conns {
+            parts.push(format!(
+                "TUIC dgram 信箱：{} 个 tuic 出站 × {}B 字节上界（bd k5pqt），预算余量只装得下 \
+                 {tuic_inbox_conns} 个 ⇒ 第 {} 个起的滞留不受预算约束",
+                tuic_outbounds,
+                xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP,
+                tuic_inbox_conns + 1
             ));
         }
         notes.push(format!(
@@ -410,7 +430,7 @@ pub fn budget_report_with(
             (format!("fixed floor ({listeners} listeners)"), fixed),
             ("explicit udp sockets".to_string(), quic_explicit_booked),
             (format!("{conns} conns x {per_conn_pipe}B pipe(2-way)"), conns * per_conn_pipe),
-            // 瞬时面上界两项：进硬账（可对账），超预算只 WARN（见 degraded）。
+            // 瞬时面上界三项：进硬账（可对账），超预算只 WARN（见 degraded）。
             (
                 format!("{xdns_servers} xdns frag worst case x {XDNS_FRAG_WORST_CASE_BYTES}B"),
                 frag_booked,
@@ -421,6 +441,13 @@ pub fn budget_report_with(
                      {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
                 ),
                 quic_windows_booked,
+            ),
+            (
+                format!(
+                    "{tuic_inbox_conns} tuic dgram inbox x {}B",
+                    xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP
+                ),
+                tuic_inbox_booked,
             ),
         ],
         caps,
@@ -829,6 +856,69 @@ mod tests {
             mux_json: None,
             target_strategy: None,
         }
+    }
+
+    /// TUIC 出站（bd k5pqt）：每个 tuic 出站一个 per-connection dgram 信箱。
+    fn tuic_outbound(tag: &str) -> BuiltOutbound {
+        BuiltOutbound {
+            entry: BuiltEntry { kind: "tuic".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            send_through: None,
+            stream_settings_json: None,
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }
+    }
+
+    /// bd k5pqt：TUIC dgram 信箱字节上界入账——瞬态面、余量口径（乘数 =
+    /// 预算余量装得下的条数，不是档位/出站上限），装不下只 WARN 不拒启。
+    #[test]
+    fn tuic_dgram_inbox_ledger_books_margin_count() {
+        const CAP: usize = xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP;
+        // 单一事实源 = tuic 实现（登记簿直引，无副本可漂移）；钉值口径：改实现
+        // 值必须同步重审本文件登记算式与 tuic 行为测试（改值即红）。
+        assert_eq!(CAP, 8 * 1024 * 1024, "TUIC 信箱字节上界口径钉值（bd k5pqt）");
+
+        // 少量出站（3 个）：96MB 档余量必然装得下 ⇒ 按实际出站数记账。
+        let mut built = xray_conf::BuiltConfig::default();
+        for i in 0..3 {
+            built.outbounds.push(tuic_outbound(&format!("tuic-out-{i}")));
+        }
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        let booked = report
+            .hard
+            .iter()
+            .find(|(name, _)| name.contains("tuic dgram inbox"))
+            .map_or(0, |(_, bytes)| *bytes);
+        assert_eq!(booked, 3 * CAP, "装得下时按实际出站数记账");
+        assert!(
+            !report.degraded.as_ref().is_some_and(|d| d.contains("TUIC")),
+            "装得下不得产生 TUIC WARN：{:?}",
+            report.degraded
+        );
+
+        // 20 个出站：96MB 档余量上限 = budget/CAP = 12 < 20（结构性保证，与
+        // 固定面无关）⇒ 乘数封顶在余量装得下的条数，且 WARN 点名 TUIC 面。
+        let mut built = xray_conf::BuiltConfig::default();
+        for i in 0..20 {
+            built.outbounds.push(tuic_outbound(&format!("tuic-out-{i}")));
+        }
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        let booked = report
+            .hard
+            .iter()
+            .find(|(name, _)| name.contains("tuic dgram inbox"))
+            .map_or(0, |(_, bytes)| *bytes);
+        let fit_max = report.budget / CAP;
+        assert!(fit_max < 20, "测试前提：预算装不下全部出站");
+        assert!(booked > 0 && booked % CAP == 0, "乘数 ≥ 1（记账口径至少记 1 个）且为上界整数倍");
+        assert!(booked / CAP <= fit_max, "乘数必须 ≤ 预算余量装得下的条数（余量口径）");
+        assert!(
+            report.degraded.as_ref().is_some_and(|d| d.contains("TUIC")),
+            "装不下必须 WARN 点名 TUIC 面：{:?}",
+            report.degraded
+        );
     }
 
     #[test]
