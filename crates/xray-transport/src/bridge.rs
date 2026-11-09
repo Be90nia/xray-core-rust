@@ -752,6 +752,12 @@ where
     // （responseDone defer SetTimeout(UplinkOnly)）。
     let (up_done_tx, up_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
     let (down_done_tx, down_done_rx) = tokio::sync::watch::channel(None::<std::time::Duration>);
+    // bd zct77：对向写腿的**写出进展**（累计字节）。半关闭窗的语义是「整连接无
+    // 进展」，不是「剩余方向无入站数据」——读腿 EOF 只代表上游读完，写腿手里
+    // 可能还压着数十 MB 未写出（解耦管线 + h2 流控满时）。缺此重置时，窗口会在
+    // 排空途中到期 → abort 丢弃在飞批次 = 下载尾部静默截断（curl 18）。
+    let (up_written_tx, up_written_rx) = tokio::sync::watch::channel(0u64);
+    let (down_written_tx, down_written_rx) = tokio::sync::watch::channel(0u64);
 
     // 中止闸（bd rjt2o）：`join!` 要求四腿全归，而被堵在 send/write 的腿不再被
     // poll → 读侧判定（connIdle / 半窗）永远无法执行 ⇒ 对端活着但不读时连接
@@ -772,6 +778,7 @@ where
         let abort_tx = abort_tx.clone();
         let mut abort_rx = abort_rx.clone();
         let up_end = up_end.clone();
+        let mut down_written = down_written_rx;
         async move {
             let mut down_done = down_done_rx;
             let mut window: Option<std::time::Duration> = None;
@@ -794,13 +801,31 @@ where
                             continue;
                         }
                     },
-                    Some(d) => match timeout(d, reader.read_multi_buffer()).await {
-                        Ok(r) => r,
-                        Err(_) => {
-                            // uplink_only 窗口内无数据
-                            let _ = abort_tx.send(true);
-                            break LegExit::IdleExpired;
-                        },
+                    Some(d) => {
+                        // 半窗 = 「整连接 d 内零进展」：对向（下行）写腿每写出一批
+                        // 即重置计时（bd zct77）。对向已收尾（sender drop）⇒ 退化为
+                        // 纯 d 计时，语义同旧实现，不会无限续期。
+                        let idle = async {
+                            loop {
+                                match timeout(d, down_written.changed()).await {
+                                    Ok(Ok(())) => continue,
+                                    Ok(Err(_)) => {
+                                        tokio::time::sleep(d).await;
+                                        return;
+                                    },
+                                    Err(_) => return,
+                                }
+                            }
+                        };
+                        tokio::pin!(idle);
+                        tokio::select! {
+                            r = reader.read_multi_buffer() => r,
+                            () = &mut idle => {
+                                // uplink_only 窗口内整连接无进展
+                                let _ = abort_tx.send(true);
+                                break LegExit::IdleExpired;
+                            },
+                        }
                     },
                 };
                 match mb {
@@ -841,6 +866,7 @@ where
     let up_writer = {
         let mut abort_rx = abort_rx.clone();
         let up_end = up_end.clone();
+        let up_written_tx = up_written_tx;
         async move {
             let mut up_bytes: u64 = 0;
             let end = loop {
@@ -866,6 +892,8 @@ where
                 if wrote.is_err() {
                     break end_policy::LegEnd::WriteError;
                 }
+                // bd zct77：写出进展发布（供对向读腿的半窗重置计时）。
+                up_written_tx.send_replace(up_bytes);
             };
             // 收尾按**原因**分流（唯一决策点）：只关本向写半部。
             // 级联：本 task 退出即 drop up_rx → 上行 reader send 失败 → up_done
@@ -896,6 +924,7 @@ where
     let down_reader = {
         let abort_tx = abort_tx.clone();
         let mut abort_rx = abort_rx.clone();
+        let mut up_written = up_written_rx;
         async move {
             let mut up_done = up_done_rx;
             let mut window: Option<std::time::Duration> = None;
@@ -916,13 +945,30 @@ where
                             continue;
                         }
                     },
-                    Some(d) => match timeout(d, read_downlink(&mut s_read)).await {
-                        Ok(r) => r,
-                        Err(_) => {
-                            // downlink_only 窗口内无数据
-                            let _ = abort_tx.send(true);
-                            break LegExit::IdleExpired;
-                        },
+                    Some(d) => {
+                        // 半窗 = 「整连接 d 内零进展」（bd zct77）：对向（上行）写腿
+                        // 每写出一批即重置计时，避免排空途中被误判死连接。
+                        let idle = async {
+                            loop {
+                                match timeout(d, up_written.changed()).await {
+                                    Ok(Ok(())) => continue,
+                                    Ok(Err(_)) => {
+                                        tokio::time::sleep(d).await;
+                                        return;
+                                    },
+                                    Err(_) => return,
+                                }
+                            }
+                        };
+                        tokio::pin!(idle);
+                        tokio::select! {
+                            r = read_downlink(&mut s_read) => r,
+                            () = &mut idle => {
+                                // downlink_only 窗口内整连接无进展
+                                let _ = abort_tx.send(true);
+                                break LegExit::IdleExpired;
+                            },
+                        }
                     },
                 };
                 match mb {
@@ -956,6 +1002,7 @@ where
     // 下行 writer：down_rx → link.writer（xray_buf Writer 管线，自带池化）。
     let down_writer = {
         let mut abort_rx = abort_rx.clone();
+        let down_written_tx = down_written_tx;
         async move {
             let mut dw_bytes: u64 = 0;
             loop {
@@ -980,6 +1027,8 @@ where
                     }
                     break;
                 }
+                // bd zct77：写出进展发布（供对向读腿的半窗重置计时）。
+                down_written_tx.send_replace(dw_bytes);
             }
             // 桥结束确保下游 reader 收到 EOF；同样只关本向，不碰 stream 写半部。
             // bd VISIONMAC：收尾必须 flush+shutdown（poll_shutdown）——TLS 层
@@ -2567,6 +2616,114 @@ mod tests {
         .expect("bridge must close dn_r after upstream EOF + window expiry (decoupled)");
         // 对端不读，up_writer 停在写背压——由 abort 收尾，非本测试断言对象。
         bridge.abort();
+    }
+
+    /// bd zct77 回归门（C4 下载尾部静默截断 / curl 18）：读腿先 EOF、而写腿队列
+    /// 仍有残量且**正在推进**时，半关闭窗必须被对向写腿的进展重置——残留字节
+    /// 必须全部送达。
+    ///
+    /// 构造：下行源 `Cursor` 一次读尽 256KiB 后 EOF（解耦 mpsc 全量吸收）；下行
+    /// sink 用**每批 40ms 的慢 Writer**（等价生产里 h2 流控满时的写背压）⇒ 排空
+    /// ≈1.28s > 半窗 1s。旧语义（布防点=读腿 EOF、计时只看剩余方向）在 1s 处
+    /// abort 丢弃仍在排队的批次（生产即 82MB/100MB 处断流）；修复后对向每写出
+    /// 一批即重置窗口。
+    #[tokio::test]
+    async fn bridge_stream_full_read_eof_keeps_draining_queued_bytes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use xray_buf::{io::Writer, multi::MultiBuffer};
+
+        use crate::link::Link;
+
+        const TOTAL: usize = 256 * 1024;
+
+        /// 慢 sink：每批 40ms 才「写出」，累计字节计数（8KiB/批 ⇒ 256KiB ≈1.28s）。
+        struct SlowSink(Arc<AtomicUsize>);
+        impl Writer for SlowSink {
+            fn write_multi_buffer(
+                &mut self,
+                mb: MultiBuffer,
+            ) -> Pin<Box<dyn Future<Output = xray_buf::io::Result<()>> + Send + '_>> {
+                let n = mb.len();
+                let got = Arc::clone(&self.0);
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    got.fetch_add(n, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+
+            fn shutdown(&self) {}
+        }
+
+        /// 下行源读尽即 EOF；写半（上行方向）丢弃——本用例只考察下行排空。
+        struct DlConn(std::io::Cursor<Vec<u8>>);
+        impl tokio::io::AsyncRead for DlConn {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_read(cx, buf)
+            }
+        }
+        impl tokio::io::AsyncWrite for DlConn {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                data: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(data.len()))
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl Connection for DlConn {
+            fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        // 上传方向全程空闲（下载型连接）：_up_w 保活，上行腿只等半窗。
+        let (up_r, _up_w) = xray_buf::pipe::new();
+        let got = Arc::new(AtomicUsize::new(0));
+        let link = Link::new(Box::new(up_r), Box::new(SlowSink(Arc::clone(&got))));
+        let conn = DlConn(std::io::Cursor::new(vec![0x5Au8; TOTAL]));
+
+        #[allow(clippy::disallowed_methods, reason = "测试：stream 桥任务（断流回归门）")]
+        let bridge = tokio::spawn(bridge_link_with_stream_full_default(
+            link,
+            Box::new(conn) as Box<dyn Connection>,
+        ));
+
+        #[allow(clippy::disallowed_methods, reason = "测试：15s 兜底界")]
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), bridge)
+            .await
+            .expect("bridge must finish after drain");
+        assert_eq!(
+            got.load(Ordering::SeqCst),
+            TOTAL,
+            "读腿 EOF 后队列残留必须全部送达（半窗须被对向写腿进展重置；旧语义 1s abort 丢弃）"
+        );
     }
 
     /// 瞬时写错误不永久断向（验收 5；50074b2 头号嫌疑回归门）：上行 writer 写
