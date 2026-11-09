@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""je3u3 质量门五件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
+"""je3u3 质量门七件套 —— MASTER-BACKLOG「防复发机制」表的脚本化落盘。
 
-五道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发 +
+七道门（对应 MASTER-BACKLOG.md 门表 1-4 + CQ-04 / PM-04 / u0pe2 / er2q5 防复发 +
 bd st3l1/s4xsk 的 `#[ignore]` 登记）：
   (a) 失败留痕门    生产代码禁 `hot_log!(DEBUG, "error=…")` 形态——失败在默认
                     warn 门下必须可见（bd u0pe2 ① 缺陷指纹：26 处失败留痕在
@@ -32,10 +32,19 @@ bd st3l1/s4xsk 的 `#[ignore]` 登记）：
                     持锁等对端）② 绑定 `let g = x.lock().await` 后同一块内 `.await`
                     （`drop(g)` 之前）。`parking_lot`/`std` 的 `!Send` guard 跨 await 在
                     Send future 里根本编译不过，故不入本门（(f) 只收 tokio 面）。
+  (g) scope 契约门    ADR-0004 B3 组件 scope 持有件契约静态门（实现住
+                    `tools/check_scope_claims.py`，本脚本只做汇总——房规同 (f)）：
+                    .rs 注释/doc 与 docs/**/*.md 禁「drop/丢弃/归零 … 即/=/⇒ …
+                    abort」伪 Drop-abort 断言（A5；白名单 = ADR-0004 自身 + 正确
+                    口吻/禁令引文行）；crates/** 禁 `compat::ManagedScope` 残留
+                    （B1' 收口）；同文件 JoinSet+ComponentScope 并存仅 WARN
+                    （A6，人工确认是否双账本）。CI 的 quality-gates job 只跑扫描
+                    面——self-test 由 `check_quality_gates.py --self-test`（含 (g)
+                    段）或 `check_scope_claims.py --self-test` 本地跑。
 
 用法（房规 check_udp_binds.py / check_proto_drift.py）：
-  python tools/check_quality_gates.py             # 六道门全跑（(c) 含 cargo）
-  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)(e)(f)（快路径）
+  python tools/check_quality_gates.py             # 七道门全跑（(c) 含 cargo）
+  python tools/check_quality_gates.py --no-cargo  # 只跑静态门 (a)(b)(d)(e)(f)(g)（快路径）
   python tools/check_quality_gates.py --list      # 枚举 (a)(b)(d)(f) 全部命中与分类
   python tools/check_quality_gates.py --self-test # 每道门各一条故意违反→必须报错
   python tools/check_lock_across_await.py [--list|--self-test]  # (f) 单独跑（实现所在）
@@ -74,6 +83,11 @@ from check_lock_across_await import (  # noqa: E402  (房规工具导入)
     GUARD_ACROSS_AWAIT_REGISTRY,
     gate as gate_f,
     scan_guard_across_await,
+)
+from check_scope_claims import (  # noqa: E402  (房规工具导入)
+    gate as gate_g,
+    scan_drop_abort_claims,
+    scan_managed_scope_residue,
 )
 
 INT_TYPES = {
@@ -1171,6 +1185,47 @@ def cmd_self_test() -> int:
         )
         check("(f) 全部登记 ⇒ 门必须绿", ok_f_reg)
 
+        # (g) scope 契约门（ADR-0004 B3）：伪 Drop-abort 断言 / B1' 残留 / A6 WARN
+        docs_arch = troot / "docs" / "architecture"
+        (docs_arch / "adr").mkdir(parents=True)
+        (src / "scope_bad.rs").write_text(
+            "// 句柄丢弃即 abort 在途任务\npub struct S1;\n", encoding="utf-8"
+        )
+        (src / "scope_ok.rs").write_text(
+            "/// Drop 不作中止保证，为实现事实，非契约保证。\n"
+            "/// 若为最后一份强引用，则 JoinSet drop ⇒ abort 全组（udf 语义）。\n"
+            "pub struct S2;\n",
+            encoding="utf-8",
+        )
+        (src / "scope_residue.rs").write_text(
+            "// 旧口径同 compat::ManagedScope。\npub struct S3;\n", encoding="utf-8"
+        )
+        (docs_arch / "scope_bad.md").write_text(
+            "# 坏文\n\nscope 句柄丢弃即 abort 在途任务。\n", encoding="utf-8"
+        )
+        (docs_arch / "adr" / "adr-0004-component-scope-holder-contract.md").write_text(
+            "禁令描述：句柄丢弃 ⇒ 在途任务 abort 这类文案不得再写。\n", encoding="utf-8"
+        )
+        scope_claims = scan_drop_abort_claims(troot)
+        claim_keys = {(h["file"], h["line"]) for h in scope_claims}
+        check(
+            "(g) .rs 注释与 docs 伪 Drop-abort 断言必须报",
+            {("crates/fx/src/scope_bad.rs", 1), ("docs/architecture/scope_bad.md", 3)}
+            <= claim_keys,
+        )
+        check(
+            "(g) 正确口吻行与 ADR-0004 自身不报",
+            not any(
+                h["file"].endswith(("scope_ok.rs", "adr-0004-component-scope-holder-contract.md"))
+                for h in scope_claims
+            ),
+        )
+        check(
+            "(g) compat::ManagedScope 残留必须报",
+            any(h["file"] == "crates/fx/src/scope_residue.rs" for h in scan_managed_scope_residue(troot)),
+        )
+        check("(g) 伪断言+残留 ⇒ 门必须红", not gate_g(troot)[0])
+
     print("SELF-TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 2
 
@@ -1201,16 +1256,18 @@ def cmd_list(root: Path) -> int:
         print(f"  {mark}  {h['file']}:{h['line']}  {h['var']}（{h['form']}）")
     f_ok, f_msg = gate_f(root)
     print(f_msg)
-    return 0 if (a_ok and b_ok and e_ok and f_ok) else 1
+    g_ok, g_msg = gate_g(root)
+    print(g_msg)
+    return 0 if (a_ok and b_ok and e_ok and f_ok and g_ok) else 1
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="je3u3 质量门六件套（失败留痕/抑制登记/登记簿漂移/注释漂移/ignore 理由/锁跨 await）"
+        description="je3u3 质量门七件套（失败留痕/抑制登记/登记簿漂移/注释漂移/ignore 理由/锁跨 await/scope 契约）"
     )
     ap.add_argument("--no-cargo", action="store_true", help="跳过 (c) cargo 面（纯静态快路径）")
     ap.add_argument("--list", action="store_true", help="枚举 (a)(b)(d)(f) 全部命中与分类")
-    ap.add_argument("--self-test", action="store_true", help="注入违规自测（六道门各一条）")
+    ap.add_argument("--self-test", action="store_true", help="注入违规自测（七道门各一条）")
     ap.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     args = ap.parse_args()
     if args.self_test:
@@ -1232,6 +1289,9 @@ def main() -> int:
     f_gate = gate_f(args.root)
     results.append(("f", *f_gate))
     print(f_gate[1])
+    g_gate = gate_g(args.root)
+    results.append(("g", *g_gate))
+    print(g_gate[1])
     c_gate = gate_c(run_cargo=not args.no_cargo)
     results.append(("c", *c_gate))
     print(c_gate[1])
@@ -1242,7 +1302,7 @@ def main() -> int:
         return 1
     print(
         "\n质量门 PASS：(a) 失败留痕 / (b) 抑制登记 / (c) 登记簿漂移 / (d) 注释漂移抽查"
-        " / (e) ignore 理由 / (f) 锁跨 await"
+        " / (e) ignore 理由 / (f) 锁跨 await / (g) scope 契约"
     )
     return 0
 

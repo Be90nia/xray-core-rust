@@ -36,7 +36,7 @@ pub struct TcpHubListener {
     /// B6（bd 39hko 切片1）：accept 循环 + 退出监控任务唯一托管口（坑约束 5）。
     /// 协作停机仍走 close_notify（close/Drop 触发）；scope 随句柄 drop 兜底 abort
     /// ——socket 归循环所有，任一路径端口都即时释放（Go `Close()` 同形）。
-    /// 只持不读：存活锚（drop=abort 兜底），读回面待需（salamander_gecko 同形）。
+    /// 只持不读：存活锚（Drop 时 udf `JoinSet` abort，实现事实），读回面待需（salamander_gecko 同形）。
     #[allow(dead_code)]
     fx: Arc<FxScope>,
 }
@@ -242,7 +242,7 @@ pub fn tcp_listen_fn() -> crate::listener_registry::TransportListenFn {
 pub struct TcpUnixHubListener {
     close_notify: Arc<Notify>,
     /// B6（bd 39hko 切片1）：accept 循环 + 退出监控唯一托管口（坑约束 5），
-    /// 同 `TcpHubListener` 的 `fx` 字段口径（只持不读存活锚，drop=abort 兜底）。
+    /// 同 `TcpHubListener` 的 `fx` 字段口径（只持不读存活锚，Drop 时 udf `JoinSet` abort，实现事实）。
     #[allow(dead_code)]
     fx: Arc<FxScope>,
 }

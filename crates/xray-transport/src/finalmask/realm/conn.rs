@@ -83,7 +83,7 @@ struct Shared {
     /// 任务经 `spawn` 捕获 `Arc<Shared>`，若 Shared 再强持 scope，就成
     /// 「任务 → Arc<Shared> → Arc<FxScope> → JoinSet(任务)」的环 ⇒ Shared 永不 drop、
     /// scope 永不 drop、兜底 abort 永不可达、任务与 UDP socket 全泄漏（bd npw6b）。
-    /// Weak 化后 conn drop ⇒ scope drop ⇒ 在飞任务 abort ⇒ 任务释放 Arc<Shared>。
+    /// Weak 化后 conn drop ⇒ scope drop ⇒ 在飞任务 abort（udf `JoinSet` drop 语义，实现事实）⇒ 任务释放 Arc<Shared>。
     /// 协作停机仍走 `cancel`。
     fx: Weak<FxScope>,
 }

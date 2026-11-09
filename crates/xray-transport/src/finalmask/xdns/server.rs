@@ -165,7 +165,7 @@ impl XdnsConnServer {
         // Drop = detach，.expect() 后句柄即丢 ⇒ 无任何持有者能 abort 它们，conn
         // drop 后 recv 泵继续阻塞在 recv_from 上、持有 `Arc<dyn UdpIo>` ⇒ fd 不
         // 释放且该 socket 继续收包应答。进 JoinSet 后 `FxScope` drop ⇒ JoinSet
-        // drop ⇒ abort 全组，「scope 随 conn drop 兜底 abort」才成立。
+        // drop ⇒ abort 全组（udf 语义，实现事实），「scope 随 conn drop 兜底 abort」才成立。
         this.fx
             .spawn_tracked(recv_loop(state.clone(), closed.clone()))
             .expect("internal FxScope is never closed");

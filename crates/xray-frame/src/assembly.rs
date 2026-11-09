@@ -8,7 +8,7 @@
 //! - **三段式停机（PM 拍板 2026-10-23：异步排空隔离在第③段）**：① `fx.close()`（拒新 spawn）→ ②
 //!   `coordinator.shutdown()`（插件停机闭包， 注册序 =
 //!   逆启动序，同步快收：只发关闭信号不等排空，否则停机被拖成串行 等待）→ ③
-//!   `fx.shutdown_timeout(d)`（在途 abort + 排空，剩余集 Drop=abort 兜底零残留）。
+//!   `fx.shutdown_timeout(d)`（在途 abort + 排空，剩余集 Drop=abort 兜底零残留；udf `JoinSet` 语义，实现事实）。
 //! - **Context 单一权威**：每插件一个 ctx，build 期构造并经 `build(ctx)` 变更后 原样交
 //!   init/start（handler 登记不丢）；裸 [`FxScope`](skeleton_infra::fx::FxScope) 不进插件（L2
 //!   能力只经 ctx 句柄集），`scope()` 供宿主/测试。
@@ -152,7 +152,7 @@ impl Framework {
         self.fx.close();
         // ② 插件停机闭包：注册序 = 逆启动序，同步快收（异步排空隔离在第③段）。
         let mut report = self.started.take().map(StartedPlugins::tear_down).unwrap_or_default();
-        // ③ 在途排空：abort + 超时兜底（剩余集 Drop=abort，零残留）。超时留痕
+        // ③ 在途排空：abort + 超时兜底（剩余集 Drop=abort，零残留；udf `JoinSet` 语义，实现事实）。超时留痕
         // fail-visible 且并入报告末行（T1.3：is_clean() 覆盖 fx 面；插件闭包
         // 超时档 = coordinator 默认档，P0-8：`FrameworkOptions.shutdown_timeout`
         // 透传见 `FrameworkBuilder::new`）。

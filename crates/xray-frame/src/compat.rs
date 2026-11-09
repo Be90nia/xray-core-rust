@@ -198,7 +198,7 @@ static SPAWN_REAP_TICK: AtomicUsize = AtomicUsize::new(0);
 /// 收割装配（bd s3tig）：走 [`spawn_reaping_ticked`] + `SPAWN_REAP_TICK`——每
 /// [`REAP_EVERY`] 次 spawn 摊一次收割，已完成条目出集不再随累计任务数滞留
 /// （上界 = [`REAP_EVERY`] - 1 + 在途数），条目内 panic 载荷经 `caps` 日志面上报。
-/// 任务生命周期与拒发语义不变：句柄 abort 面 / 归属 scope drop=abort 同前，scope
+/// 任务生命周期与拒发语义不变：句柄 abort 面 / 归属 scope drop=abort 同前（udf `JoinSet` 语义，实现事实），scope
 /// 关闭仍回 `Err(ScopeClosed)`（新增仅一条拒发 warn，口径同 [`crate::scope::ComponentScope`]）。
 #[inline(always)]
 pub fn spawn<T>(fut: impl Future<Output = T> + Send + 'static) -> Result<Spawned<T>, ScopeClosed>

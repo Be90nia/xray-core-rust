@@ -883,7 +883,8 @@ pub(crate) async fn build_naive_inbound(
         xray_transport_naive::NaiveInboundHandler::new(&ib.tag, bind_addr, tls_config, auth)
             .with_dispatch(dispatch);
     handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
-    // 保活持有（anytls 同款）：handler drop = abort accept loop 关端口，
+    // 保活持有（anytls 同款）：`NaiveInboundHandler` 的 Drop impl 显式
+    // `accept_task.abort()` 关端口（注意：tokio 里 JoinHandle 丢弃只是 detach，不会中止任务），
     // shutdown 随本 task 被 token cancel 时 abort 生效。
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
         let _keep = handler;
