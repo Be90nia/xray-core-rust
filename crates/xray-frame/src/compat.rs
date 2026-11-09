@@ -26,11 +26,10 @@ use std::{
         Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 
 use skeleton::clock::{Clock, SystemClock};
-use skeleton_infra::fx::{FxScope, ScopeClosed, ShutdownReport, Spawned, TaskError};
+use skeleton_infra::fx::{FxScope, ScopeClosed, Spawned, TaskError};
 
 use crate::logging::LogFacade;
 
@@ -188,7 +187,7 @@ pub fn log() -> LogFacade {
 
 /// 进程级 [`spawn`] 的收割节流计数（bd s3tig）：udf `JoinSet` 条目只在
 /// `try_reap`/`join_next` 出集，无收割装配点的 scope 条目按累计 spawn 数永久
-/// 滞留。与 [`REAP_EVERY`] 配套摊薄，口径同 [`ManagedScope::spawn`]；tick 进程级
+/// 滞留。与 [`REAP_EVERY`] 配套摊薄，口径同 [`crate::scope::ComponentScope::spawn`]；tick 进程级
 /// 共享——生产常驻 scope 仅一份（fallback → permanent 装配期一次性换轨），每
 /// scope 条目上界不破；`install_scoped` 测试窗口短暂多份并存且窗口内 spawn 数
 /// 有限（上游修法不涉本仓，udf issue#13 缺口一）。
@@ -200,7 +199,7 @@ static SPAWN_REAP_TICK: AtomicUsize = AtomicUsize::new(0);
 /// [`REAP_EVERY`] 次 spawn 摊一次收割，已完成条目出集不再随累计任务数滞留
 /// （上界 = [`REAP_EVERY`] - 1 + 在途数），条目内 panic 载荷经 `caps` 日志面上报。
 /// 任务生命周期与拒发语义不变：句柄 abort 面 / 归属 scope drop=abort 同前，scope
-/// 关闭仍回 `Err(ScopeClosed)`（新增仅一条拒发 warn，口径同 [`ManagedScope`]）。
+/// 关闭仍回 `Err(ScopeClosed)`（新增仅一条拒发 warn，口径同 [`crate::scope::ComponentScope`]）。
 #[inline(always)]
 pub fn spawn<T>(fut: impl Future<Output = T> + Send + 'static) -> Result<Spawned<T>, ScopeClosed>
 where
@@ -239,7 +238,7 @@ pub const REAP_EVERY: usize = 32;
 /// 托管 spawn 的收割版（bd 86i4h 阶段1）：**先收割已完成条目、再入集新任务**
 /// ——条目数跟随在途任务数而非累计任务数（长跑服务端「每连接一个任务」形态的
 /// 内存只涨不降即由此消失）。拒发（`ScopeClosed`）与 panic 上报口径同
-/// [`ManagedScope::spawn`]，调用方无需各自处理。
+/// [`crate::scope::ComponentScope::spawn`]，调用方无需各自处理。
 ///
 /// 逐次收割（无节流）；长生命周期 scope 用 [`spawn_reaping_ticked`] 摊薄。
 /// spawn 速率 ≥ panic 速率时滞留窗口恒有界；空闲期 panic 由停机排空兜底上报
@@ -284,110 +283,6 @@ where
     spawned
 }
 
-/// 托管任务面（bd 4a1zy）：组合包装 udf [`FxScope`]，四口 = `spawn` / `close` /
-/// `in_flight` / `shutdown_timeout`。
-///
-/// 派生方式 = **组合包装**（不复制 udf 任何托管机制）。相对裸 `FxScope` 只加一条
-/// Xray 语义：**拒发与停机未收净必须留日志**——udf 的两个静默面
-/// （`spawn_tracked` 回 `Err(ScopeClosed)`、`shutdown_timeout` 回 `Err(TimedOut)`）
-/// 在本件里落 `LogFacade` 报告，调用方不必各自处理（禁静默放弃）。
-///
-/// 生命周期：`ManagedScope` 的 Drop 不等不报，随内嵌 `Arc<FxScope>` 最后一份引用
-/// 归零时 JoinSet Drop=abort 在途任务（udf 语义）。要"停机收口"必须显式调
-/// [`Self::shutdown_timeout`]——它走 udf 三段（close 闸 → abort 在途 → 等净），
-/// **不是**等任务自然跑完（口径同迁移前自持 `JoinSet` 的 drop=abort）。
-///
-/// 已知上界（迁移前自持账本的差异，已由上游补齐）：`FxScope` 在 udf `51c2428b`
-/// （issue#13）后提供增量收割口 `try_reap`，本件每次 spawn 先收割（每
-/// [`REAP_EVERY`] 次摊一次，O29）——已完成条目出集不再随 spawn 总数累积（滞留
-/// 上限 `REAP_EVERY - 1` 条），其中的 panic 载荷随之经本件落日志；停机排空
-/// （`shutdown_timeout`）返回 udf [`ShutdownReport`]，panic 清单与
-/// 未完成数一并在本件上报（udf 侧此前丢弃 join 结果、静默丢条目的缺口已修）。
-#[derive(Clone)]
-pub struct ManagedScope {
-    /// 日志域标识（拼进每条报告；`Arc<str>` 便于克隆进 'static future）。
-    label: Arc<str>,
-    scope: Arc<FxScope>,
-    log: LogFacade,
-    /// 收割节流计数（O29）：随 scope 共享（clone 同一份），每 [`REAP_EVERY`] 次
-    /// spawn 摊一次 `try_reap`。
-    tick: Arc<AtomicUsize>,
-}
-
-impl ManagedScope {
-    /// 自有 scope + 域 `compat` 门面（target `xray_frame::compat`）。
-    pub fn new(label: impl Into<Arc<str>>) -> Self {
-        Self {
-            label: label.into(),
-            scope: Arc::new(FxScope::new()),
-            log: LogFacade::new("compat", Vec::new()),
-            tick: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// 托管 spawn：scope 已关（拒发）时记 warn 并回 `Err`。
-    ///
-    /// 走 [`spawn_reaping_ticked`]（udf `try_reap` + 入集，收割按本 scope 的 `tick`
-    /// 摊薄）：已完成条目出集，其中的 panic 载荷落日志。udf `task_body` 自带
-    /// `catch_unwind`（panic 归一成 `TaskError::Panicked` 双投 oneshot + 集合条目），
-    /// 故本件**不再包任务体**：上报口径 = `background task panicked: {payload}`
-    /// （同迁移前 `harvest`）。
-    pub fn spawn<F>(&self, fut: F) -> Result<Spawned<()>, ScopeClosed>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        spawn_reaping_ticked(&self.scope, &self.log, &self.label, Some(&self.tick), fut)
-    }
-
-    /// 增量收割已完成条目（udf `try_reap`）并上报 panic；返回收割条数。
-    ///
-    /// [`Self::spawn`] 每次调用前已自动收割；本体供**无 spawn 的空闲期**显式
-    /// 触发（调用方自定节拍），确保滞留窗口有界。
-    pub fn reap(&self) -> usize {
-        reap_into(&self.scope, &self.log, &self.label)
-    }
-
-    /// 暴露底层 [`FxScope`] 句柄：供「拿不到 PluginContext 但持有 ManagedScope」
-    /// 的宿主把托管任务喂给统一托管口（如 `crate::pool::spawn_idle_pruner`）；
-    /// 本门面语义（spawn 排程 / reap / 停机报告）不变（bd jovl4 接线授权）。
-    #[must_use]
-    pub fn fx_scope(&self) -> &FxScope {
-        &self.scope
-    }
-
-    /// 关 accepting 闸（拒新 spawn，放行在途——udf `FxScope::close` 语义）。
-    pub fn close(&self) {
-        self.scope.close();
-    }
-
-    /// 在途任务数（排空断言锚）。
-    pub fn in_flight(&self) -> usize {
-        self.scope.in_flight()
-    }
-
-    /// 停机收口（udf 三段：close 闸 → abort 在途 → 等净，带超时）：任务是
-    /// **被取消**而非被等完成（abortable 段零残留）；不可让渡的在途段会让等净
-    /// 超时 → 报告 `timed_out > 0` + 一条 error。成功 = 一条 info 报告
-    /// （`drained N`）；排空中收割到的任务 panic 逐条 error 上报（udf `issue#13`
-    /// 前这条路径会静默丢弃 join 结果）。返回 udf `ShutdownReport` 供调用方断言。
-    pub async fn shutdown_timeout(&self, timeout: Duration) -> ShutdownReport {
-        let pending = self.scope.in_flight();
-        let report = self.scope.shutdown_timeout(timeout).await;
-        for msg in &report.panicked {
-            self.log.error(format!("{}: background task panicked: {msg}", self.label));
-        }
-        if report.timed_out > 0 {
-            self.log.error(format!(
-                "{}: shutdown incomplete ({pending} task(s) in flight, {} unfinished at deadline)",
-                self.label, report.timed_out
-            ));
-        } else {
-            self.log.info(format!("{}: drained {pending} background task(s)", self.label));
-        }
-        report
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,167 +317,6 @@ mod tests {
         install(CompatCaps::fallback()).expect("首次安装成功");
         let second = install(CompatCaps::fallback());
         assert!(matches!(second, Err(CompatAlreadyInstalled)), "重复安装 → fail-visible");
-    }
-
-    /// bd 4a1zy 验收①：停机 = udf 三段（close 闸 → abort 在途 → 等净）。口径
-    /// 对齐迁移前自持 `JoinSet`（drop = abort 全组）：**不等**在途连接跑完，
-    /// 只保证零残留 + 闸关拒发。连接级优雅终止由 inbound arm scope 先取消。
-    #[tokio::test]
-    async fn managed_scope_shutdown_aborts_and_zeroes_in_flight() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let scope = ManagedScope::new("test-drain");
-        let done = Arc::new(AtomicBool::new(false));
-        let task_done = Arc::clone(&done);
-        scope
-            .spawn(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                task_done.store(true, Ordering::SeqCst);
-            })
-            .expect("scope 新建即 accepting");
-        assert_eq!(scope.in_flight(), 1, "spawn 后在途数必须可见");
-
-        let report = scope.shutdown_timeout(Duration::from_secs(5)).await;
-        assert_eq!(report.timed_out, 0, "可 abort 的在途任务应能等净");
-        assert!(report.panicked.is_empty(), "无 panic 任务不应有 panic 清单");
-        assert!(!done.load(Ordering::SeqCst), "停机走 abort：不得等 20ms 任务跑完");
-        assert_eq!(scope.in_flight(), 0, "等净后 in_flight 归零");
-
-        // 排空后闸已关：拒发必须回 Err 且留日志（不静默吞）。
-        assert!(scope.spawn(async {}).is_err(), "停机后拒发新任务");
-    }
-
-    /// bd 4a1zy 验收②：任务永不完成（poll 不让渡 → abort 落不了地）时停机
-    /// **超时可见**：`Err(TimedOut)` + 一条带域标识的 error 报告，且剩余任务
-    /// 最终收尾（零残留）。
-    ///
-    /// 捕获为何走专用线程 + `block_on`：`set_default` 是线程局部门面，测试任务
-    /// 在多线程 runtime 上跨 worker 迁移会逃出捕获窗；`Runtime::block_on` 的
-    /// future 恒在调用线程 poll，故捕获必定命中（不入全局槽 → 测试隔离）。
-    #[test]
-    fn managed_scope_shutdown_timeout_is_reported() {
-        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&captured);
-        std::thread::spawn(move || {
-            let _guard = tracing::subscriber::set_default(Capture(sink));
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("runtime");
-            rt.block_on(async move {
-                use std::sync::atomic::{AtomicBool, Ordering};
-
-                let scope = ManagedScope::new("test-timeout");
-                let started = Arc::new(AtomicBool::new(false));
-                let hold = Arc::new(AtomicBool::new(true));
-                let (task_started, task_hold) = (Arc::clone(&started), Arc::clone(&hold));
-                scope
-                    .spawn(async move {
-                        task_started.store(true, Ordering::SeqCst);
-                        // 不可让渡的 poll：abort 只在任务回到 Pending 后生效 →
-                        // drain 必然真超时（确定性构造，不靠固定 spin 余量）。
-                        while task_hold.load(Ordering::Relaxed) {
-                            std::hint::spin_loop();
-                        }
-                    })
-                    .expect("spawn accepted");
-                while !started.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-
-                let report = scope.shutdown_timeout(Duration::from_millis(50)).await;
-                assert!(report.timed_out > 0, "不可让渡的在途任务必须计入停机超时");
-
-                // 放行 → 剩余任务收尾（超时退回 = abort 兜底，禁留活口）。
-                hold.store(false, Ordering::Relaxed);
-                for _ in 0..200 {
-                    if scope.in_flight() == 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert_eq!(scope.in_flight(), 0, "超时后剩余任务必须收尾");
-            });
-        })
-        .join()
-        .expect("测试线程");
-
-        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
-        assert!(lines.contains("shutdown incomplete"), "停机超时必须上报（禁静默）: {lines:?}");
-        assert!(lines.contains("test-timeout"), "报告必须带域标识: {lines:?}");
-    }
-
-    /// bd 4a1zy 裁决①（udf issue#13 后口径）：被托管任务 panic 必须可观测——
-    /// 两条上报路径都验：①**运行期**（下次 `spawn` 前 `try_reap` 收割 → error 带
-    /// 载荷 + 域标识）；②**停机期**（`ShutdownReport::panicked` 不再被丢弃）。
-    /// 且 panic 不逃逸（`in_flight` 归零、进程不因任务 panic 拉倒）。
-    #[test]
-    fn managed_scope_reports_task_panic() {
-        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&captured);
-        std::thread::spawn(move || {
-            let _guard = tracing::subscriber::set_default(Capture(sink));
-            // 捕获窗为何走专用线程 + `block_on`：`set_default` 是线程局部门面，
-            // 任务在多线程 runtime 上跨 worker 迁移会逃出捕获窗；`block_on` 的
-            // future 恒在调用线程 poll，故捕获必命中（不入全局槽 → 测试隔离）。
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("runtime");
-            rt.block_on(async move {
-                // ① 运行期路径：panic 任务终局后，下一次 spawn 触发收割即上报。
-                let scope = ManagedScope::new("test-panic");
-                let panicked =
-                    scope.spawn(async { panic!("managed-scope boom") }).expect("spawn accepted");
-                for _ in 0..200 {
-                    if panicked.is_finished() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert!(panicked.is_finished(), "panic 任务必须终局（udf task_body 归一）");
-                // 收割按 REAP_EVERY 摊薄（O29）→ 触发面要够一整轮才轮到收割。
-                for _ in 0..REAP_EVERY {
-                    scope.spawn(async {}).expect("spawn 照常受理（panic 不传染 scope）");
-                }
-                for _ in 0..200 {
-                    if scope.in_flight() == 0 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert_eq!(scope.in_flight(), 0, "panic 任务必须正常收尾（零残留）");
-
-                // ② 停机期路径：排空中收割的 panic 进报告（issue#13 前是静默丢弃）。
-                // 任务须**先被 poll 到 panic** 再停机——否则 abort 抢先，任务根本没跑过，
-                // 报告里当然没有载荷（那不是缺口，是没发生）。
-                let scope = ManagedScope::new("test-panic-drain");
-                let drain_task =
-                    scope.spawn(async { panic!("drain boom") }).expect("spawn accepted");
-                for _ in 0..200 {
-                    if drain_task.is_finished() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                assert!(drain_task.is_finished(), "panic 任务必须先跑完再验停机路径");
-                let report = scope.shutdown_timeout(Duration::from_secs(5)).await;
-                assert!(
-                    report.panicked.iter().any(|m| m.contains("drain boom")),
-                    "停机报告必须带 panic 载荷: {:?}",
-                    report.panicked
-                );
-            });
-        })
-        .join()
-        .expect("测试线程");
-
-        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
-        assert!(lines.contains("background task panicked"), "运行期 panic 必须上报: {lines:?}");
-        assert!(lines.contains("managed-scope boom"), "panic 载荷必须带上: {lines:?}");
-        assert!(lines.contains("test-panic"), "报告必须带域标识: {lines:?}");
-        assert!(lines.contains("drain boom"), "停机期 panic 必须上报: {lines:?}");
     }
 
     /// bd 86i4h 阶段1 验收：`spawn_reaping` 的收割分类——`Panicked` 载荷上报

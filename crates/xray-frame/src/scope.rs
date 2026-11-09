@@ -770,6 +770,83 @@ mod tests {
         assert_eq!(scope.live_refs(), 1, "环破除 ⇒ live_refs 归 1（只剩 stop 面）");
     }
 
+    /// bd 4a1zy 验收①（迁自旧 compat 持有件自测 · ADR-0004 B1' 删旧件）：排空
+    /// **成功档** = abort 在途（不等跑完）+ 报告干净 + `in_flight` 归零 + 排空后
+    /// 拒发。A2（关闸放行在途）/ A3（超时 + panic 档）之外的第三档不变量。
+    #[tokio::test]
+    async fn drain_aborts_and_zeroes_in_flight() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let scope = ComponentScope::new("test-drain-clean");
+        let done = Arc::new(AtomicBool::new(false));
+        let task_done = Arc::clone(&done);
+        scope
+            .spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                task_done.store(true, Ordering::SeqCst);
+            })
+            .expect("scope 新建即 accepting");
+        assert_eq!(scope.in_flight(), 1, "spawn 后在途数必须可见");
+
+        let report = scope.drain(Duration::from_secs(5)).await;
+        assert_eq!(report.timed_out, 0, "可 abort 的在途任务应能等净");
+        assert!(report.panicked.is_empty(), "无 panic 任务不应有 panic 清单");
+        assert!(!done.load(Ordering::SeqCst), "停机走 abort：不得等 20ms 任务跑完");
+        assert_eq!(scope.in_flight(), 0, "等净后 in_flight 归零");
+
+        // 排空后闸已关：拒发必须回 Err 且留日志（不静默吞）。
+        assert!(scope.spawn(async {}).is_err(), "停机后拒发新任务");
+    }
+
+    /// bd 4a1zy 裁决① 运行期路径（迁自旧 compat 持有件自测 · ADR-0004
+    /// B1' 删旧件）：panic 载荷经下一次 spawn 的内置收割上报（error 带载荷 + 域标识）；
+    /// panic 不传染账本（后续 spawn 照常受理）；panic 任务正常收尾零残留。
+    /// 停机期路径已由 A3 `drain_reports_timeout_and_panics` 覆盖。
+    #[test]
+    fn spawn_reaps_and_reports_runtime_panic() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            // `set_default` 是线程局部门面 + `block_on`：future 恒在调用线程 poll，
+            // 捕获必定命中（多线程 runtime 上任务跨 worker 迁移会逃出捕获窗）。
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let scope = ComponentScope::new("test-panic");
+                let panicked =
+                    scope.spawn(async { panic!("managed-scope boom") }).expect("spawn accepted");
+                for _ in 0..200 {
+                    if panicked.is_finished() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(panicked.is_finished(), "panic 任务必须终局（udf task_body 归一）");
+                // 收割按 REAP_EVERY 摊薄（O29）→ 触发面要够一整轮才轮到收割。
+                for _ in 0..crate::compat::REAP_EVERY {
+                    scope.spawn(async {}).expect("spawn 照常受理（panic 不传染 scope）");
+                }
+                for _ in 0..200 {
+                    if scope.in_flight() == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert_eq!(scope.in_flight(), 0, "panic 任务必须正常收尾（零残留）");
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(lines.contains("background task panicked"), "运行期 panic 必须上报: {lines:?}");
+        assert!(lines.contains("managed-scope boom"), "panic 载荷必须带上: {lines:?}");
+        assert!(lines.contains("test-panic"), "报告必须带域标识: {lines:?}");
+    }
+
     /// 事件捕获订阅器（只把日志文本收进 `Vec`；线程局部安装，不抢全局槽）——
     /// 口径同 `compat.rs` 测试面的同名件。
     struct Capture(Arc<Mutex<Vec<String>>>);
