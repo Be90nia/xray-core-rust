@@ -659,8 +659,22 @@ mod tests {
             if let Some(entered) = self.entered.lock().take() {
                 let _ = entered.send(());
             }
+            // bd 6qf1b：本回调跑在 tokio runtime worker 上。纯 `thread::sleep` 会
+            // **占住**该 worker；CI runner 只有 4 vCPU，多个 stall 型测试叠加时
+            // worker 被占满 ⇒ 连 `tokio::time::timeout` 的定时器都得不到 poll，
+            // 测试表现为「无 panic、无输出、挂死数十分钟」（本地核多不复现）。
+            // 故在多线程 runtime 上用 `block_in_place` 让运行时补 worker。
+            let multi_thread = tokio::runtime::Handle::try_current()
+                .map(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread))
+                .unwrap_or(false);
             while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(50));
+                if multi_thread {
+                    tokio::task::block_in_place(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                    });
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
             Err(rustls::Error::General("parked verifier released".into()))
         }
