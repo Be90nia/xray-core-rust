@@ -276,8 +276,9 @@ async fn listen_tcp(
             })
         });
     let ctx = build_context(config, local, handler);
-    // §3.5.6 ①类托管：hub 级托管口（ctx 内 SessionMap 持有），每连接任务归它，
-    // listener close 关闸、句柄丢弃即 abort 在途。
+    // §3.5.6 ①类托管：hub 级托管口（ctx 内 SessionMap 持有），每连接任务归它；
+    // listener close 关闸（transport 族关闸档，ADR-0004 §2.2 Q1：不杀已建立
+    // 连接，在途服务到 EOF）；Drop 不作中止保证（§2.2 Q3）。
     let hub_scope = ctx.sessions.scope().clone();
     let listener_scope = hub_scope.clone();
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
@@ -1313,9 +1314,14 @@ struct SplithttpListener {
     local: SocketAddr,
     tcp_abort: Option<tokio::task::AbortHandle>,
     h3_endpoint: Option<quinn::Endpoint>,
-    /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本）。`close()` 关闸；
-    /// 句柄丢弃时 scope 归零 ⇒ 在途连接任务 abort。
-    scope: xray_frame::compat::ManagedScope,
+    /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本，本字段是 hub 账本的克隆
+    /// 句柄，owner 见 `SessionMap.scope`）。stop 面 = transport 族关闸档
+    /// （ADR-0004 §2.2 Q1）：`close()` 只关闸拒新，不杀已建立连接（Go 26.10.17
+    /// `listener.Close()` 口径，在途服务到 EOF）；无 drain 面 ⇒ 不声称 abort；
+    /// Drop 不作中止保证（§2.2 Q3）。
+    /// 已知自引用环（任务持 SessionMap/HandlerContext 强引用，bd hnicl）⇒ 纯
+    /// Drop 路径不触发在途中止；破环见 ADR-0004 B2 批次。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl TransportListener for SplithttpListener {
@@ -1331,8 +1337,9 @@ impl TransportListener for SplithttpListener {
         if let Some(ep) = &self.h3_endpoint {
             ep.close(quinn::VarInt::from_u32(0), b"listener closed");
         }
-        // 托管口关闸：停机后拒新连接任务（在途任务随 listener 丢弃被 abort）。
-        self.scope.close();
+        // 托管口关闸：停机后拒新连接任务（transport 族关闸档：在途按 Go 口径
+        // 服务到 EOF，ADR-0004 §2.2 Q1；Drop 不作中止保证，§2.2 Q3）。
+        self.scope.close_gate();
         Ok(())
     }
 }

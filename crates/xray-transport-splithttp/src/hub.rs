@@ -204,7 +204,8 @@ impl HubListener {
             sc_max_each_post_bytes: self.config.normalized_sc_max_each_post_bytes().to as usize,
         });
         // §3.5.6 ①类：每 TCP 连接的 hyper 服务任务归 hub 托管口（listener close
-        // 关闸，hub 句柄丢弃即 abort 在途连接）。
+        // 关闸，transport 族关闸档——ADR-0004 §2.2 Q1：不杀已建立连接；Drop
+        // 不作中止保证，§2.2 Q3）。
         let hub_scope = ctx.sessions.scope().clone();
         loop {
             let (stream, peer_addr) = match self.tcp_listener.accept().await {

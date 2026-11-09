@@ -83,8 +83,14 @@ pub struct SessionMap {
     /// 条目数上限（新 id 超出即 [`SessionUpsertError::TooManySessions`]）。
     max_sessions: usize,
     /// §3.5.6 ①类托管：hub 级托管口（会话 reap 定时器 / 每 TCP 连接服务 /
-    /// keepalive 流共用一本账）。listener `close()` 关闸，句柄丢弃即 abort 在途。
-    scope: xray_frame::compat::ManagedScope,
+    /// keepalive 流共用一本账）的 owner。stop 面 = transport 族关闸档
+    /// （ADR-0004 §2.2 Q1）：listener `close()` 只关闸拒新，不杀已建立连接
+    /// （Go 26.10.17 `listener.Close()` 口径）；无 drain 面 ⇒ 不声称 abort；
+    /// Drop 不作中止保证（§2.2 Q3）。
+    /// 已知自引用环（每连接任务经 `Arc<HandlerContext>` 持本表、reap 定时器持
+    /// `Arc<SessionMap>`，bd hnicl）⇒ 纯 Drop 路径不触发在途中止；破环见
+    /// ADR-0004 B2 批次。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl SessionMap {
@@ -98,13 +104,13 @@ impl SessionMap {
         Self {
             inner: Mutex::new(HashMap::new()),
             max_sessions: max_sessions.max(1),
-            scope: xray_frame::compat::ManagedScope::new("splithttp-hub"),
+            scope: xray_frame::scope::ComponentScope::new("splithttp-hub"),
         }
     }
 
     /// hub 级托管口（listener 的每连接任务与 reap 定时器共用同一本账）。
     #[must_use]
-    pub fn scope(&self) -> &xray_frame::compat::ManagedScope {
+    pub fn scope(&self) -> &xray_frame::scope::ComponentScope {
         &self.scope
     }
 
