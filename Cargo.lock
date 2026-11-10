@@ -6754,6 +6754,7 @@ dependencies = [
  "x25519-dalek",
  "x509-parser",
  "xray-common",
+ "xray-frame",
  "xray-proto",
  "xray-transport",
 ]

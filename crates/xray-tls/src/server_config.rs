@@ -3,7 +3,11 @@
 //! 对应 Go `transport/internet/tls/config.go::ConfigFromStreamSettings` (server side) +
 //! `getNewGetCertificateFunc`（SNI 多证书选择）。
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rustls::{
     RootCertStore, ServerConfig,
@@ -11,8 +15,11 @@ use rustls::{
     server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier},
     sign::CertifiedKey,
 };
+// 证书快照热替换（bd 5ctu1）：无锁读 + 原子整体换 `Arc`，禁自造 arc-swap 包装。
+use xray_frame::hot_slot::HotSlot;
 
 use crate::{
+    cert_reload::CertEntrySpec,
     certificate::{
         EntryUsage, entry_certs_and_key, entry_usage, extract_cert_names, pem_private_key,
     },
@@ -43,7 +50,13 @@ impl NamedCertKey {
         let signing = rustls::crypto::ring::sign::any_supported_type(&key)
             .map_err(|e| io::Error::other(format!("unsupported private key: {e}")))?;
         let names = cert_names(&certs);
-        Ok(Self { key: Arc::new(CertifiedKey::new(certs, signing)), names })
+        let certified = CertifiedKey::new(certs, signing);
+        // Go `tls.X509KeyPair` 同语义：证书与私钥必须配对——配错的一对装上去只会让
+        // 后续每条握手都失败（热重载路径尤其致命：好证书会被坏配对覆盖）。
+        certified
+            .keys_match()
+            .map_err(|e| io::Error::other(format!("certificate/private key mismatch: {e}")))?;
+        Ok(Self { key: Arc::new(certified), names })
     }
 }
 
@@ -66,38 +79,26 @@ fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
 // SNI 证书选择（对应 Go getNewGetCertificateFunc）
 // ============================================================
 
-/// rustls [`ResolvesServerCert`]：按 SNI 从多张证书中选择，支持通配符。
+/// 证书快照：一次装配或一次重载的不可变结果，经 [`HotSlot`] 整体替换。
 ///
-/// 对应 Go `getNewGetCertificateFunc`（无 CA 动态签发的静态多证书路径）。
-/// 匹配规则与 Go 一致：
-/// 1. 无证书 → `None`
-/// 2. 非 `reject_unknown` 且（仅一张证书 **或** 客户端未发 SNI）→ 首张
-/// 3. 精确匹配 SNI（CN/SAN）→ 命中
-/// 4. 通配符匹配（`sub.example.com` → `*.example.com`）→ 命中
-/// 5. `reject_unknown` → `None`，否则回退首张
+/// 条目顺序决定 SNI 无命中时的回退（Go 取 `certs[0]`）。
 #[derive(Debug)]
-pub struct SniCertResolver {
+pub(crate) struct CertSnapshot {
     entries: Vec<NamedCertKey>,
     reject_unknown: bool,
 }
 
-impl SniCertResolver {
-    /// 从命名证书列表构造。`reject_unknown` 对应 Go `Config.RejectUnknownSni`。
-    #[must_use]
-    pub fn new(entries: Vec<NamedCertKey>, reject_unknown: bool) -> Self {
+impl CertSnapshot {
+    pub(crate) fn new(entries: Vec<NamedCertKey>, reject_unknown: bool) -> Self {
         Self { entries, reject_unknown }
     }
 
-    /// 条目数。
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub(crate) fn entries(&self) -> &[NamedCertKey] {
+        &self.entries
     }
 
-    /// 是否为空。
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub(crate) fn reject_unknown(&self) -> bool {
+        self.reject_unknown
     }
 
     /// 纯 SNI 选择：按 `sni`（已小写或原样）选出命中条目。便于单测。
@@ -127,11 +128,74 @@ impl SniCertResolver {
     }
 }
 
+/// rustls [`ResolvesServerCert`]：按 SNI 从多张证书中选择，支持通配符。
+///
+/// 对应 Go `getNewGetCertificateFunc`（无 CA 动态签发的静态多证书路径）。
+/// 证书集合可热替换（bd 5ctu1，见 `cert_reload` 模块）：每次握手经
+/// [`HotSlot::with`] 读当前快照——一次原子 load，无引用计数自增。
+/// 匹配规则与 Go 一致：
+/// 1. 无证书 → `None`
+/// 2. 非 `reject_unknown` 且（仅一张证书 **或** 客户端未发 SNI）→ 首张
+/// 3. 精确匹配 SNI（CN/SAN）→ 命中
+/// 4. 通配符匹配（`sub.example.com` → `*.example.com`）→ 命中
+/// 5. `reject_unknown` → `None`，否则回退首张
+pub struct SniCertResolver {
+    slot: Arc<HotSlot<CertSnapshot>>,
+}
+
+impl SniCertResolver {
+    /// 从命名证书列表构造（一次性快照，不热重载）。`reject_unknown` 对应 Go
+    /// `Config.RejectUnknownSni`。
+    #[must_use]
+    pub fn new(entries: Vec<NamedCertKey>, reject_unknown: bool) -> Self {
+        Self::from_slot(Arc::new(HotSlot::new(Arc::new(CertSnapshot::new(
+            entries,
+            reject_unknown,
+        )))))
+    }
+
+    /// 共用一份可热替换的快照槽（`build_server_config` 路径）。
+    #[must_use]
+    pub(crate) fn from_slot(slot: Arc<HotSlot<CertSnapshot>>) -> Self {
+        Self { slot }
+    }
+
+    /// 条目数。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slot.with(|s| s.entries.len())
+    }
+
+    /// 是否为空。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slot.with(|s| s.entries.is_empty())
+    }
+
+    /// 选择入口（生产读路径在 [`ResolvesServerCert::resolve`]）。
+    #[cfg(test)]
+    fn select(&self, sni: Option<&str>) -> Option<Arc<NamedCertKey>> {
+        self.slot.with(|s| s.select(sni).map(|e| Arc::new(e.clone())))
+    }
+}
+
+impl std::fmt::Debug for SniCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.slot.with(|s| {
+            f.debug_struct("SniCertResolver")
+                .field("entries", &s.entries.len())
+                .field("reject_unknown", &s.reject_unknown)
+                .finish()
+        })
+    }
+}
+
 impl ResolvesServerCert for SniCertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
         // 仅取 DNS 类型的 SNI，统一小写
         let sni: Option<String> = client_hello.server_name().map(|sn| sn.to_lowercase());
-        self.select(sni.as_deref()).map(|e| Arc::clone(&e.key))
+        self.slot
+            .with(|snapshot| snapshot.select(sni.as_deref()).map(|entry| Arc::clone(&entry.key)))
     }
 }
 
@@ -157,11 +221,16 @@ impl ResolvesServerCert for SniCertResolver {
 /// - 均缺失：**不自签**（Go 语义：启动成功但每条连接报 `tls: no certificates
 ///   configured`）——构建期只 warn，握手由空 resolver 拒绝。
 ///
-/// # 热重载 / OCSP ticker
-/// 对应 Go `setupOcspTicker` 的后台热重载 + OCSP 刷新当前留作 TODO：
-/// 需把 resolver 包进 `arc_swap::ArcSwap` 并 spawn tokio 定时任务重新读取
-/// `certificatePath`/`keyPath` 后原子替换。OCSP 装订已由 `ocsp-stapler`（`ocsp-stapling`
-/// feature）在握手层实现，参见 `crate::ocsp_stapling`。
+/// # 证书热重载（bd 5ctu1）
+/// 对应 Go `setupOcspTicker` 的热重载面（`transport/internet/tls/config.go:104-136`）：
+/// `certificates[]` 里 `certificateFile`+`keyFile` 形态的条目由托管周期任务（默认
+/// 3600 s，同 Go `:110`）重新读盘，内容变化才整体换快照；**失败保留旧证书** + warn，
+/// 绝不打挂服务（见 `cert_reload` 模块）。内联条目与 `oneTimeLoading=true` 的条目
+/// 只在装配期读一次（Go `:105-107`）。构建时无 tokio runtime ⇒ 不启动任务（证书即
+/// 装配期那份）。
+///
+/// OCSP 装订走 `ocsp-stapler`（`ocsp-stapling` feature）的握手层实现，
+/// 参见 `crate::ocsp_stapling`；证书级 `ocspStapling` 配置键仍按 bd mvmwu 拒启。
 ///
 /// # pwh6: Go v26 TLS 字段族增量（服务端）
 /// - `masterKeyLog`：Go `tls.Config.KeyLogWriter`（transport_security.go→config.go:467-474） string
@@ -172,9 +241,9 @@ impl ResolvesServerCert for SniCertResolver {
 ///   cache，对齐 Go `SessionTicketsDisabled=true` + `SessionCache=nil`。
 /// - 证书级字段（Go `TLSCertConfig`，transport_security.go:248-257，作用于 `certificates[]`
 ///   每条目）：`ocspStapling`（uint64 热重载间隔秒，>0 启用 OCSP 装订，接线
-///   `crate::ocsp_stapling`）；`oneTimeLoading`（bool，禁 证书热重载 ticker——Rust
-///   无热重载，no-op）；`buildChain`（bool，Go v26.6.1 实际未消费 BuildNameToCertificate
-///   无条件调用；rustls resolver 恒用解析 names，no-op）。
+///   `crate::ocsp_stapling`）；`oneTimeLoading`（bool，禁证书热重载——file 形态条目
+///   本会按周期重读，置 true 则只在装配期读一次）；`buildChain`（bool，Go v26.6.1 实际未消费
+///   BuildNameToCertificate 无条件调用；rustls resolver 恒用解析 names，no-op）。
 pub fn build_server_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
@@ -226,23 +295,26 @@ pub fn build_server_config(
         ));
     }
 
-    // bd 4w092(b)：`echServerKeys` 在本仓**零消费**——btls v0.5.6 未导出
-    // `SslEchKeys`/`SslEchKeysBuilder`，服务端握手又走 rustls（无 ECH feature）。
-    // 配了等于没配：客户端 ECH 到该入站解不出内层 SNI，且管理员从日志看不出
-    // 「这条入站的 ECH 承诺是假的」⇒ 与 `certificates[].ocspStapling` 同口径
-    // 拒启（安全/连接语义静默失效一律硬错，不再 warn 放行）。
+    // bd 5t1zj：本函数产出的恒是 **rustls** `ServerConfig`，而 rustls 0.23 的 ECH
+    // 全在客户端（`with_ech`/`ech_status`/`client/ech.rs`），服务端零 API ⇒ 这条
+    // acceptor 注册不了 ECH 解密 keys。真服务端 ECH 只有 btls（BoringSSL）后端的
+    // 装配入口：[`crate::btls_server::build_server_ssl_context_with_ech`]。
+    // 配了 `echServerKeys` 却拿 rustls 服务 = 客户端 ECH 到该入站解不出内层 SNI
+    // （握手失败或静默回退明文 SNI）而管理员无感 ⇒ 与 `certificates[].ocspStapling`
+    // 同口径硬错拒启，文案指明可用的后端。
     if json.get("echServerKeys").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "echServerKeys is not supported by this build (security: {security}): the server \
-                 handshake stack cannot register ECH decryption keys, so ECH clients would fail \
-                 and their inner SNI could never be recovered; remove the field to start"
+                "echServerKeys requires the btls backend (rustls 0.23 has no server-side ECH \
+                 support): the rustls acceptor built for security: {security} cannot register \
+                 ECH decryption keys, so ECH clients would fail and their inner SNI could never \
+                 be recovered; remove the field to start"
             ),
         ));
     }
 
-    let entries = build_named_cert_keys(&json)?;
+    let (entries, cert_specs) = build_named_cert_keys(&json)?;
 
     // 缺证书不再自签（bd mwvwd F2）：Go 服务端没证书时每条连接都失败
     // （`tls: no certificates configured`），而旧实现每次启动现生成一张 rcgen
@@ -261,7 +333,9 @@ pub fn build_server_config(
     // minVersion/maxVersion/cipherSuites/curvePreferences → 自定义 provider + 版本列表
     let (provider, versions) = security_params(&json);
 
-    let resolver = Arc::new(SniCertResolver::new(entries, reject_unknown));
+    // 证书快照槽（bd 5ctu1）：resolver 每次握手经 `with()` 读它，重载只换指针。
+    let cert_slot = Arc::new(HotSlot::new(Arc::new(CertSnapshot::new(entries, reject_unknown))));
+    let resolver = Arc::new(SniCertResolver::from_slot(Arc::clone(&cert_slot)));
     let builder = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&versions)
         .map_err(|e| io::Error::other(format!("protocol versions: {e}")))?;
@@ -348,6 +422,9 @@ pub fn build_server_config(
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
     }
+
+    // 证书热重载（bd 5ctu1）：file 形态条目由托管周期任务重读，内容变化才换快照。
+    crate::cert_reload::start(cert_slot, cert_specs);
 
     Ok(Some(Arc::new(config)))
 }
@@ -493,7 +570,8 @@ impl rustls::KeyLog for KeyLogFileWriter {
 struct CertEntryFlags {
     /// Go `ocspStapling`：uint64 热重载间隔秒，>0 = 启用 OCSP 装订。
     ocsp_stapling_secs: u64,
-    /// Go `oneTimeLoading`：禁证书热重载 ticker——Rust 无热重载，no-op。
+    /// Go `oneTimeLoading`：禁证书热重载——file 形态条目本会按周期重读，置 true 则
+    /// 只在装配期读一次（Go `config.go:105-107`）。
     one_time_loading: bool,
     /// Go `buildChain`：v26.6.1 实际未消费（BuildNameToCertificate 无条件调用）；
     /// rustls resolver 恒用解析 names，no-op。
@@ -523,10 +601,14 @@ fn any_cert_ocsp_stapling(json: &serde_json::Value) -> bool {
 
 /// 从 `tlsSettings` JSON 解析全部命名证书。
 ///
+/// 返回 `(首轮快照条目, 重读源规格)`——两者一一对应（顺序 = SNI 无命中时的回退序）。
 /// 优先 `certificates[]`（file 或内联，支持多张，仅 `usage:"encipherment"`）；
-/// 若该数组为空且顶层存在内联 `cert`+`key`，则解析单张。
-fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKey>> {
-    let mut out = Vec::new();
+/// 若该数组为空且顶层存在内联 `cert`+`key`，则解析单张（不可热重载）。
+fn build_named_cert_keys(
+    json: &serde_json::Value,
+) -> io::Result<(Vec<NamedCertKey>, Vec<CertEntrySpec>)> {
+    let mut entries = Vec::new();
+    let mut specs = Vec::new();
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
             // Go BuildCertificates：仅 ENCIPHERMENT 条目用作服务端证书，
@@ -535,12 +617,6 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
                 continue;
             }
             let flags = cert_entry_flags(entry);
-            if flags.one_time_loading {
-                tracing::debug!(
-                    target: "xray_tls::server_config",
-                    "certificates[] entry oneTimeLoading=true: no-op (Rust has no cert hot-reload ticker)"
-                );
-            }
             if !flags.build_chain {
                 tracing::debug!(
                     target: "xray_tls::server_config",
@@ -548,25 +624,80 @@ fn build_named_cert_keys(json: &serde_json::Value) -> io::Result<Vec<NamedCertKe
                 );
             }
             let (certs, key) = entry_certs_and_key(entry)?;
-            match key {
-                Some(key) => out.push(NamedCertKey::from_cert_der(certs, key)?),
-                None => tracing::warn!(
+            let Some(key) = key else {
+                tracing::warn!(
                     "certificates[] encipherment entry has certificate but no key; skipped"
-                ),
-            }
+                );
+                continue;
+            };
+            let named = NamedCertKey::from_cert_der(certs, key)?;
+            specs.push(reload_spec(entry, &named, flags));
+            entries.push(named);
         }
     }
-    if out.is_empty() {
+    if entries.is_empty() {
         if let (Some(cert_str), Some(key_str)) =
             (json.get("cert").and_then(|x| x.as_str()), json.get("key").and_then(|x| x.as_str()))
         {
-            out.push(NamedCertKey::from_cert_der(
+            let named = NamedCertKey::from_cert_der(
                 pem_certs(cert_str.as_bytes())?,
                 pem_key(key_str.as_bytes())?,
-            )?);
+            )?;
+            specs.push(CertEntrySpec::Static(named.clone()));
+            entries.push(named);
         }
     }
-    Ok(out)
+    Ok((entries, specs))
+}
+
+/// 该条目的重读源：`certificateFile`+`keyFile` 都在且 Go `oneTimeLoading` 未禁 ⇒ 周期
+/// 重读；否则保留装配期结果。
+fn reload_spec(
+    entry: &serde_json::Value,
+    named: &NamedCertKey,
+    flags: CertEntryFlags,
+) -> CertEntrySpec {
+    let certificate = entry.get("certificateFile").and_then(|v| v.as_str());
+    let key = entry.get("keyFile").and_then(|v| v.as_str());
+    match (certificate, key) {
+        (Some(certificate), Some(key)) if !flags.one_time_loading => {
+            CertEntrySpec::File { certificate: PathBuf::from(certificate), key: PathBuf::from(key) }
+        },
+        _ => {
+            // 不可重读的三种情形（Go config.go:105-107 / `:115` 同语义）：内联 PEM、
+            // `oneTimeLoading=true`、只有一侧是文件（无法整体重读）。
+            tracing::debug!(
+                target: "xray_tls::server_config",
+                "certificates[] entry is not hot-reloadable (inline PEM, oneTimeLoading=true, \
+                 or only one of certificateFile/keyFile)"
+            );
+            CertEntrySpec::Static(named.clone())
+        },
+    }
+}
+
+/// 从磁盘读（证书链，私钥）→ [`NamedCertKey`]；重载与首次装配共用同一套解析。
+///
+/// # Errors
+/// 文件读失败 / PEM 无证书块 / 私钥无法识别。
+pub(crate) fn named_cert_key_from_files(
+    certificate: &Path,
+    key: &Path,
+) -> io::Result<NamedCertKey> {
+    let cert_bytes = std::fs::read(certificate).map_err(|e| {
+        io::Error::other(format!("read certificate file {}: {e}", certificate.display()))
+    })?;
+    let key_bytes = std::fs::read(key)
+        .map_err(|e| io::Error::other(format!("read key file {}: {e}", key.display())))?;
+    let certs = pem_certs(&cert_bytes)?;
+    // 空链（文件被换成非 PEM 内容）必须当失败：否则会用"无证书条目"覆盖好证书。
+    if certs.is_empty() {
+        return Err(io::Error::other(format!(
+            "certificate file {}: no PEM certificate block found",
+            certificate.display()
+        )));
+    }
+    NamedCertKey::from_cert_der(certs, pem_key(&key_bytes)?)
 }
 
 /// `certificates[]` 中 `usage:"verify"` 条目 → 客户端 CA 信任池（mTLS，Rust 扩展）。
@@ -705,14 +836,16 @@ mod tests {
         assert!(config.is_err(), "非法内联数字数组必须报错");
     }
 
-    /// bd 4w092(b)：`echServerKeys` 在本仓零消费（服务端栈无 ECH 解密键注册面）
-    /// ⇒ 配置期硬错拒启，不再静默 warn 放行。
+    /// bd 4w092(b) + bd 5t1zj：rustls 服务端栈无 ECH 解密键注册面（rustls 0.23 只有
+    /// 客户端 ECH）⇒ 配置期硬错拒启，文案指明真后端 = btls，不静默放行。
     #[test]
     fn ech_server_keys_fails_loud() {
         let err = build_server_config("tls", Some(&serde_json::json!({ "echServerKeys": "AAAA" })))
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
         assert!(err.to_string().contains("echServerKeys"), "got: {err}");
+        // 文案必须指明可用后端 = btls（rustls 0.23 无服务端 ECH），否则用户无从修。
+        assert!(err.to_string().contains("btls"), "must point at the btls backend, got: {err}");
         // 空串 = 未配置（Go proto 零值）⇒ 不拒。
         assert!(
             build_server_config("tls", Some(&serde_json::json!({ "echServerKeys": "" }))).is_ok()
@@ -762,10 +895,17 @@ mod tests {
 
     // ----- SNI 多证书选择测试（验收项） -----
 
+    /// 一次 `leaf_cert` 调用产出的证书 + 配套私钥（证书/私钥必须配对：`from_cert_der`
+    /// 走 Go `X509KeyPair` 同款校验）。
+    fn named_for(san: &str) -> NamedCertKey {
+        let (cert_pem, key_pem) = leaf_cert(&[san]);
+        named(&cert_pem, &key_pem)
+    }
+
     #[test]
     fn sni_single_cert_no_sni_returns_first() {
         install_provider();
-        let e = named(&leaf_cert(&["a.com"]).0, &leaf_cert(&["a.com"]).1);
+        let e = named_for("a.com");
         let r = SniCertResolver::new(vec![e], false);
         // 单证书：无论 SNI 与否都返回首张
         assert!(r.select(None).is_some());
@@ -810,10 +950,7 @@ mod tests {
         install_provider();
         let (c, k) = leaf_cert(&["example.com"]);
         let e = named(&c, &k);
-        let r = SniCertResolver::new(
-            vec![e.clone(), named(&leaf_cert(&["other.com"]).0, &leaf_cert(&["other.com"]).1)],
-            false,
-        );
+        let r = SniCertResolver::new(vec![e.clone(), named_for("other.com")], false);
 
         // 大写 SNI 应回落小写后匹配
         let got = r.select(Some("EXAMPLE.COM")).unwrap();
@@ -823,8 +960,8 @@ mod tests {
     #[test]
     fn sni_unknown_falls_back_to_first_when_not_reject() {
         install_provider();
-        let e1 = named(&leaf_cert(&["a.com"]).0, &leaf_cert(&["a.com"]).1);
-        let e2 = named(&leaf_cert(&["b.com"]).0, &leaf_cert(&["b.com"]).1);
+        let e1 = named_for("a.com");
+        let e2 = named_for("b.com");
         let r = SniCertResolver::new(vec![e1, e2], false);
 
         let got = r.select(Some("nomatch.com")).unwrap();
@@ -834,8 +971,8 @@ mod tests {
     #[test]
     fn sni_unknown_rejected_when_reject_unknown() {
         install_provider();
-        let e1 = named(&leaf_cert(&["a.com"]).0, &leaf_cert(&["a.com"]).1);
-        let e2 = named(&leaf_cert(&["b.com"]).0, &leaf_cert(&["b.com"]).1);
+        let e1 = named_for("a.com");
+        let e2 = named_for("b.com");
         let r = SniCertResolver::new(vec![e1, e2], true);
 
         assert!(r.select(Some("nomatch.com")).is_none());
@@ -966,9 +1103,9 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         assert!(cfg.ticketer.enabled());
     }
 
-    /// 证书级 `oneTimeLoading=true`（Go TLSCertConfig）：Rust 无证书热重载
-    /// ticker，该键为 no-op——ticket 数保持默认、session cache 类型不变
-    /// （票 8k4s②：顶层方言读取已移除，不再错误抑制 ticket）。
+    /// 证书级 `oneTimeLoading=true`（Go TLSCertConfig）：只影响 file 形态条目的周期
+    /// 重读；此处是内联证书（本就不重读），断言其余字段——ticket 数保持默认、session
+    /// cache 类型不变——不因该键变化（票 8k4s②：顶层方言读取已移除，不再错误抑制 ticket）。
     #[test]
     fn pwh6_one_time_loading_is_noop_at_cert_level() {
         install_provider();
@@ -1136,5 +1273,157 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
         assert_eq!(full.ocsp_stapling_secs, 7200);
         assert!(full.one_time_loading);
         assert!(full.build_chain);
+    }
+
+    // ============================================================
+    // bd 5ctu1：证书文件热重载（end-to-end）
+    // ============================================================
+
+    /// workspace 外的临时目录（进程 id + tag 隔离，跑完即删）。
+    fn reload_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xray-tls-e2e-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// PEM 首张证书的 SHA-256 hex（= 服务端实际送出的叶子证书指纹）。
+    fn pem_fingerprint(cert_pem: &str) -> String {
+        let der = pem_certs(cert_pem.as_bytes()).unwrap();
+        hex::encode(crate::pin::generate_cert_hash(der[0].as_ref()))
+    }
+
+    /// 真握手一次，取客户端看到的服务端叶子证书指纹。
+    async fn served_fingerprint(config: Arc<ServerConfig>) -> String {
+        let client = crate::client_config::build_client_config(
+            "tls",
+            Some(&serde_json::json!({ "allowInsecure": true })),
+            "localhost",
+        )
+        .unwrap()
+        .unwrap();
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let accept = async move {
+            tokio_rustls::TlsAcceptor::from(config)
+                .accept(server_io)
+                .await
+                .map_err(io::Error::other)
+        };
+        let connect = async move {
+            let name = rustls_pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+            tokio_rustls::TlsConnector::from(client)
+                .connect(name, client_io)
+                .await
+                .map_err(io::Error::other)
+        };
+        let (server, client) = tokio::join!(accept, connect);
+        let _server = server.expect("server handshake");
+        let client = client.expect("client handshake");
+        let (_, conn) = client.get_ref();
+        let leaf = conn.peer_certificates().expect("peer certs")[0].as_ref().to_vec();
+        hex::encode(crate::pin::generate_cert_hash(&leaf))
+    }
+
+    /// 推进一个重载周期（3600 s + 1 s）并让托管任务跑完一轮。
+    ///
+    /// `start_paused` 把生产常量 3600 s 压成虚拟时间（不为测试改短周期）。
+    async fn advance_one_reload_period() {
+        tokio::time::advance(std::time::Duration::from_secs(3601)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// 只收集 WARN 及以上事件的订阅器（断言「重载失败留 warn」，不引新依赖）。
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl WarnCapture {
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// bd 5ctu1 end-to-end（走生产路径 `build_server_config` 自启的重读任务）：
+    /// 真实 TLS 握手取指纹 → 换证书文件 → 过一周期 → 指纹必变；文件损坏时旧证书
+    /// 继续服务且留 warn。
+    #[tokio::test(start_paused = true)]
+    async fn cert_files_hot_reload_changes_served_fingerprint() {
+        install_provider();
+        let dir = reload_dir("reload");
+        let (cert1, key1) = leaf_cert(&["localhost"]);
+        std::fs::write(dir.join("cert.pem"), &cert1).unwrap();
+        std::fs::write(dir.join("key.pem"), &key1).unwrap();
+
+        let json = serde_json::json!({ "certificates": [{
+            "certificateFile": dir.join("cert.pem").to_string_lossy(),
+            "keyFile": dir.join("key.pem").to_string_lossy(),
+        }] });
+        let config = build_server_config("tls", Some(&json)).unwrap().expect("tls config");
+
+        let fp1 = served_fingerprint(Arc::clone(&config)).await;
+        assert_eq!(fp1, pem_fingerprint(&cert1), "首连必须拿到装配期证书");
+
+        let (cert2, key2) = leaf_cert(&["localhost"]);
+        std::fs::write(dir.join("cert.pem"), &cert2).unwrap();
+        std::fs::write(dir.join("key.pem"), &key2).unwrap();
+        advance_one_reload_period().await;
+
+        let fp2 = served_fingerprint(Arc::clone(&config)).await;
+        assert_eq!(fp2, pem_fingerprint(&cert2), "换文件并过一周期后必须送新证书");
+        assert_ne!(fp1, fp2, "换证书后指纹必须变");
+
+        // 文件损坏：重载失败 ⇒ 旧证书（cert2）继续服务 + warn
+        std::fs::write(dir.join("cert.pem"), b"not a pem").unwrap();
+        let capture = WarnCapture::default();
+        let guard = tracing::subscriber::set_default(capture.clone());
+        advance_one_reload_period().await;
+        let warnings = capture.messages();
+        drop(guard);
+
+        let fp3 = served_fingerprint(config).await;
+        assert_eq!(fp3, fp2, "重载失败必须保留旧证书");
+        assert!(
+            warnings.iter().any(|m| m.contains("reload failed")),
+            "重载失败必须留 warn，实收: {warnings:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

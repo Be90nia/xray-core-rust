@@ -18,10 +18,14 @@
 //!   + `RandCarrier` 数据结构
 //! - `certificate`：证书生成/名称提取 + `certificates[]` 条目解析（usage/entry_certs_and_key）
 //! - `ech`：ECH key 二进制 TLV 解析 + keyset 生成 + config list 解析/打包 + JSON 字段 解析 +
-//!   `ApplyEch`（btls 客户端实装）+ `EchConfigCache` 数据结构 + `ech_cache_key`
+//!   `ApplyEch`（btls 客户端实装）+ `EchConfigCache` 数据结构 + `ech_cache_key` （服务端 ECH keys
+//!   注册走 `btls_server::build_server_ssl_context_with_ech`， rustls 后端无服务端 ECH ⇒ 配
+//!   `echServerKeys` 硬错并指向 btls）
 //! - `error`：统一 `TlsError` 枚举
 //! - `ocsp_stapling`：OCSP stapling 集成（`OcspStaplerConfig` +
 //!   `build_server_config_with_stapling`）
+//! - `cert_reload`：服务端证书热重载——周期重读 `certificateFile`/`keyFile` + `HotSlot`
+//!   原子换快照（失败保留旧证书）
 //!
 //! ## IO 边界与实现状态
 //! - `utls`：标准 rustls 包装的 `Conn`/`UConn`，async 工厂 `client`/`server`/`u_client`
@@ -31,11 +35,14 @@
 //!
 //! ## 后续工作
 //! - REALITY 切片 (k9t): 评估接入 watfaq-rustls git 依赖以实现真实指纹伪装
-//! - TLS 热重载（ArcSwap + 定时任务，第 8 版 handoff 记录的技术债）
+//! - 服务端证书热重载**已实现**（bd 5ctu1）：`server_config::build_server_config` 起 `cert_reload`
+//!   托管周期任务，`certificates[].certificateFile/keyFile` 换文件即生效
 //! - x509 证书加载（依赖 `x509-parser`）；OCSP stapling 已由 `ocsp-stapler` 实现
 //!
 //! 参考：Go 版本位于 `E:\Projcet\Xray-core\transport\internet\tls\`。
 
+/// 服务端证书热重载（Go `setupOcspTicker` 的非 OCSP 面；bd 5ctu1）。
+mod cert_reload;
 pub mod certificate;
 pub mod client_config;
 pub mod config;

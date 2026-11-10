@@ -79,7 +79,11 @@ pub fn convert_to_ech_keys(data: &[u8]) -> Result<Vec<EncryptedClientHelloKey>, 
         // 读 key_len（2 字节大端）
         let key_len = read_u16_be(s)?;
         s = &s[2..];
-        if s.len() < usize::from(key_len) + 4 {
+        // Go 检查 `len(s) < keyLength+4`（此时 s 仍含 2B 长度头）⇒ 本条等价于
+        // 「剩余 ≥ key_len + 2」：只保证 config_len 字段读得到，config 自身长度
+        // 由下面第二条检查兜住。写成 +4 会多拒一档 Go 接受的输入
+        // （`[len=4][4B key][cfg_len=0]`）。
+        if s.len() < usize::from(key_len) + 2 {
             return Err(TlsError::InvalidEchKeyLength);
         }
         let sk = &s[..usize::from(key_len)];
@@ -258,15 +262,19 @@ pub fn generate_ech_key_set(public_name: &str) -> (Vec<u8>, [u8; 32]) {
     rand::rng().fill_bytes(&mut priv_bytes);
     let secret = StaticSecret::from(priv_bytes);
     let public = PublicKey::from(&secret);
+    (marshal_ech_config(public_name, public.as_bytes(), DEFAULT_SUITES), priv_bytes)
+}
 
+/// ECHConfig wire 格式 `[version:u16][len:u16][body]`。
+fn marshal_ech_config(public_name: &str, public_key: &[u8], suites: &[(u16, u16)]) -> Vec<u8> {
     // body（u16 长度前缀内的部分）
     let mut body = Vec::with_capacity(8 + public_name.len());
     body.push(0u8); // config_id
     body.extend_from_slice(&KEM_X25519_HKDF_SHA256.to_be_bytes());
-    body.extend_from_slice(&(public.as_bytes().len() as u16).to_be_bytes());
-    body.extend_from_slice(public.as_bytes());
-    body.extend_from_slice(&((DEFAULT_SUITES.len() * 4) as u16).to_be_bytes());
-    for &(kdf, aead) in DEFAULT_SUITES {
+    body.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+    body.extend_from_slice(public_key);
+    body.extend_from_slice(&((suites.len() * 4) as u16).to_be_bytes());
+    for &(kdf, aead) in suites {
         body.extend_from_slice(&kdf.to_be_bytes());
         body.extend_from_slice(&aead.to_be_bytes());
     }
@@ -279,7 +287,28 @@ pub fn generate_ech_key_set(public_name: &str) -> (Vec<u8>, [u8; 32]) {
     config.extend_from_slice(&EXTENSION_ENCRYPTED_CLIENT_HELLO.to_be_bytes());
     config.extend_from_slice(&(body.len() as u16).to_be_bytes());
     config.extend_from_slice(&body);
-    (config, priv_bytes)
+    config
+}
+
+/// 服务端 keyset：`suites` 只留 HKDF-SHA256 三套（AES-128/256-GCM、ChaCha20）。
+///
+/// 与 Go CLI（[`generate_ech_key_set`]，9 套件）的唯一差别就在这里——Go 服务端
+/// 允许 ECHConfig 里含自己不支持的套件（客户端自选），而 BoringSSL 服务端是
+/// **严格**校验：`ECHServerConfig::Init`（`ssl/encrypted_client_hello.cc`）要求每套
+/// suite 的 `kdf_id == HKDF-SHA256`，否则 `SSL_ECH_KEYS_add` 直接返回
+/// `SSL_R_UNSUPPORTED_ECH_SERVER_CONFIG`（fail-visible，不是静默丢弃）。
+/// ⇒ 给 btls 服务端用的 keyset 必须由本函数生成（`examples/ech_interop_server.rs`
+/// 与 `btls_server::tests` 消费）。
+#[must_use]
+pub fn generate_ech_key_set_sha256(public_name: &str) -> (Vec<u8>, [u8; 32]) {
+    use rand::RngCore;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let mut priv_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut priv_bytes);
+    let secret = StaticSecret::from(priv_bytes);
+    let public = PublicKey::from(&secret);
+    (marshal_ech_config(public_name, public.as_bytes(), &DEFAULT_SUITES[..3]), priv_bytes)
 }
 
 /// 打包 server keys 二进制：`[key_len:u16][key][config_len:u16][config]`。
@@ -495,10 +524,9 @@ pub fn parse_ech_force_query(json: &serde_json::Value) -> Result<EchForceQuery, 
 ///
 /// 对应 Go `ApplyECH(c *Config, config *tls.Config) error`（双分支单函数）：
 /// - 客户端：`config_list` 非空 → 提供 ECH config list（加密 ClientHello）。
-/// - 服务端：`server_keys` 非空 → 注册 ECH 解密 keys。**当前不可实装**： btls v0.5.6 未公开导出
-///   `SslEchKeys`/`SslEchKeysBuilder`（仅 `SslEchKeysRef`）， `SslContextRef::set_ech_keys`
-///   的参数类型在 crate 外不可构造；且生产 inbound TLS 走 rustls（无 btls acceptor、rustls 无 ECH
-///   feature），本就没有接线点。 待 btls 上游导出修复 + btls server acceptor 集成后补充。
+/// - 服务端：`server_keys` 非空 → 注册 ECH 解密 keys。**不在本 trait**：服务端 keys 挂 `SSL_CTX`
+///   而非单条 `SSL`，实装在 `btls_server::build_server_ssl_context_with_ech` （裸 `SSL_ECH_KEYS_*`
+///   FFI，因为 btls 只导出 `SslEchKeysRef`， `SslEchKeys`/`SslEchKeysBuilder` 仍是 crate 私有）。
 ///
 /// 已有实装：[`btls::ssl::Ssl`]（客户端，per-connection）→ `SSL_set1_ech_config_list`，
 /// 由 [`crate::utls::u_client`] 在握手前调用（`xray-transport-tcp` 生产 dial 路径）。
@@ -606,6 +634,26 @@ mod tests {
     #[test]
     fn convert_single_byte_input_errors() {
         assert!(matches!(convert_to_ech_keys(&[0u8]), Err(TlsError::InvalidEchKeyLength)));
+    }
+
+    /// Go `ConvertToGoECHKeys` 接受「config 为空」的完整单元（`[len=k][k B][0]`）：
+    /// 长度检查只要求 config_len 字段读得到，不要求有 config 内容。
+    #[test]
+    fn convert_accepts_empty_config_like_go() {
+        let data = pack_key(b"sk", b"");
+        assert_eq!(data.len(), 6);
+        let keys = convert_to_ech_keys(&data).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].private_key, b"sk");
+        assert!(keys[0].config.is_empty());
+    }
+
+    /// 单元边界截断（第二单元只剩 1 字节长度头）⇒ Go 同样 `ErrInvalidLen`。
+    #[test]
+    fn convert_trailing_partial_unit_errors() {
+        let mut data = pack_key(b"sk", b"cfg");
+        data.push(0);
+        assert!(matches!(convert_to_ech_keys(&data), Err(TlsError::InvalidEchKeyLength)));
     }
 
     // ---- EchConfigRecord / EchConfigCache ----

@@ -11,8 +11,9 @@
 //!
 //! **已删除**（bd yuz 死代码清理，全仓零调用方）：`CertificateUsage` proto wrapper、
 //! `is_encipherment`/`is_authority_issue`、`issue_certificate`（AUTHORITY_ISSUE 动态
-//! 签发路径 `getGetCertificateFunc` 为非目标）、`is_certificate_expired`（热重载 ticker
-//! 专用，热重载为已知技术债）、`load_self_cert_pool`（被 DER 直加 `RootCertStore` 取代）。
+//! 签发路径 `getGetCertificateFunc` 为非目标）、`is_certificate_expired`（Go 的 CA 动态
+//! 签发路径按有效期淘汰旧证书用；本仓无该路径，热重载见 `cert_reload`）、
+//! `load_self_cert_pool`（被 DER 直加 `RootCertStore` 取代）。
 //! 钉扎校验 [`crate::config::verify_chain`] 由 `client_config` 的钉扎 verifier 接入。
 //!
 //! # 副作用
