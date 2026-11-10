@@ -278,6 +278,16 @@ pub fn make_http_dial_fn(config: Arc<HttpOutboundConfig>, ctx: Arc<PluginContext
             if status != "200" {
                 return Err(format!("http CONNECT proxy returned non-200: {first_line}"));
             }
+            // Go client.go:253-260 + 391-402（earlyDataConn）：隧道字节可能与 200 响应
+            // 同批到达（服务端先发言的协议：SMTP/FTP/MySQL 问候）——头之后的残留必须
+            // 前置回灌，否则服务端首个数据被吞成"永久静默"。
+            if header_end < total {
+                return Ok(Box::new(EarlyDataConn {
+                    inner: conn,
+                    early: buf[header_end..total].to_vec(),
+                    early_pos: 0,
+                }));
+            }
             Ok(conn)
         })
     })
@@ -512,6 +522,91 @@ impl Connection for H2TunnelConn {
     }
 }
 
+/// CONNECT 响应头同批读到的隧道字节（Go `earlyDataConn`，client.go:253-260 / 391-402）：
+/// 读侧先吐残留、耗尽后读底层。
+///
+/// `is_raw_tcp`/`raw_tcp_clone`/`frozen_reader` 刻意**不转发**：残留字节还没交付，
+/// 任何"绕过本条 AsyncRead 直取底层"的零拷贝通道都会把它们丢掉（splice 准入因此
+/// 天然拒绝、回退既有桥）。
+struct EarlyDataConn {
+    inner: Box<dyn Connection>,
+    early: Vec<u8>,
+    /// 已交付游标（不 drain：残留量小于读缓冲，一次拷贝足够）。
+    early_pos: usize,
+}
+
+impl tokio::io::AsyncRead for EarlyDataConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = &mut *self;
+        if this.early_pos < this.early.len() {
+            let rest = &this.early[this.early_pos..];
+            let n = rest.len().min(buf.remaining());
+            buf.put_slice(&rest[..n]);
+            this.early_pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for EarlyDataConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+impl Connection for EarlyDataConn {
+    fn remote_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        self.inner.remote_addr()
+    }
+
+    fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        self.inner.local_addr()
+    }
+
+    fn close_read(&mut self) -> std::io::Result<()> {
+        self.inner.close_read()
+    }
+
+    fn close_write(&mut self) -> std::io::Result<()> {
+        self.inner.close_write()
+    }
+}
+
 /// 渲染 header 值：支持 `{{.Source}}` / `{{ .Source }}` / `{{.Target}}` / `{{ .Target }}`。
 ///
 /// Go `text/template` 的刻意子集（proxy/http/client.go:167-205 fillRequestHeader
@@ -680,6 +775,46 @@ mod tests {
         let missing = r#"{ "servers": [{ "address": "proxy.example.com", "port": 443 }] }"#;
         let config = parse_http_config(missing.as_bytes()).unwrap();
         assert!(!config.h2, "h2 must default to false when absent");
+    }
+
+    /// bd 47ci3（A-7，Go client.go:253-260 + 391-402）：200 响应同批到达的隧道字节
+    /// （服务端先发言的问候）必须回灌给隧道——旧实现把它们连同响应头一起丢弃，
+    /// 服务端首个数据被吞成永久静默。
+    #[tokio::test]
+    async fn connect_early_data_bytes_replayed_to_tunnel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        xray_common::testing::spawn("connect-early-data-bytes-replayed-accept", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let mut req: Vec<u8> = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+            }
+            // 单次 write：响应头 + 首包（SMTP 式问候）同批到达。
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nhello").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let cfg = Arc::new(HttpOutboundConfig::new(
+            Address::ipv4(std::net::Ipv4Addr::LOCALHOST),
+            Port::new(port),
+        ));
+        let dial_fn = make_http_dial_fn(cfg, test_ctx());
+        let dest = Destination::tcp(Address::new_domain("smtp.example.com"), Port::new(25));
+        let mut conn = dial_fn(&dest).await.expect("tunnel established");
+
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf))
+            .await
+            .expect("first read must not stall: residual bytes were dropped")
+            .expect("first read must not error");
+        assert_eq!(
+            &buf[..n],
+            b"hello",
+            "server-first greeting arriving with the 200 response must reach the tunnel"
+        );
     }
 
     #[tokio::test]

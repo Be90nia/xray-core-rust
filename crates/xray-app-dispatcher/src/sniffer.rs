@@ -455,6 +455,10 @@ fn parse_client_hello_from_handshake(
                     return Ok(None);
                 }
                 if name_type == 0 {
+                    // RFC 6066 要求 host_name 非空（Go tls/sniff.go:104-107 errNotClientHello）
+                    if name_len == 0 {
+                        return Ok(None);
+                    }
                     let name = &d[..name_len];
                     // va51⑥：名字含控制字符/空格 → QUIC 分段可能未到齐，
                     // 重试（Go tls/sniff.go:104-111 b <= ' ' → NeedMoreData）
@@ -1451,6 +1455,16 @@ mod tests {
             .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)))
             .expect("ok");
         assert!(result.is_none());
+    }
+
+    /// RFC 6066：host_name 名长 0 非法 → 无嗅探结果（Go tls/sniff.go:104-107 errNotClientHello）
+    #[test]
+    fn tls_sniff_sni_empty_name_rejected() {
+        let entries: Vec<(u8, &[u8])> = vec![(0, b"")];
+        let result = TlsSniffer
+            .sniff(&wrap_record(&build_client_hello_with_sni_entries(&entries)))
+            .expect("ok");
+        assert!(result.is_none(), "空 SNI 不应产出嗅探结果");
     }
 
     /// TLS record layer 包装（content_type + version + length）

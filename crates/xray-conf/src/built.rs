@@ -393,7 +393,8 @@ mod tests {
         ],
         "outbounds": [
             { "protocol": "freedom", "tag": "direct" },
-            { "protocol": "vless", "tag": "proxy", "settings": { "vnext": [] } }
+            { "protocol": "vless", "tag": "proxy",
+              "settings": { "vnext": [{ "address": "127.0.0.1", "port": 443 }] } }
         ],
         "routing": { "rules": [] },
         "log": { "loglevel": "warning" }
@@ -627,6 +628,7 @@ mod tests {
             "outbounds": [
                 {
                     "protocol": "vless", "tag": "out",
+                    "settings": { "vnext": [{ "address": "127.0.0.1", "port": 443 }] },
                     "proxySettings": { "tag": "proxy-out", "transportLayer": true }
                 }
             ]
@@ -649,6 +651,7 @@ mod tests {
             "outbounds": [
                 {
                     "protocol": "vless", "tag": "out",
+                    "settings": { "vnext": [{ "address": "127.0.0.1", "port": 443 }] },
                     "proxySettings": { "tag": "proxy-out" }
                 }
             ]

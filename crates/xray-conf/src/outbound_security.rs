@@ -5,60 +5,17 @@
 //! 与 trojan 无 stream TLS 的出站目标非私网 IP/域名时直接报错（Go
 //! `common/errors.PrintRemovedFeatureError` 等价的 hard error）。
 //!
-//! # 私网判定
+//! # 私网判定（bd 8wg9u，对齐 Go commit 43c29f8e）
 //!
-//! Go 端走 geodata 私网匹配器；Rust 端用 [`xray_geodata::matcher::ip::IPSet`]
-//! 内置 RFC1918 + link-local + loopback + ULA + IPv6 link-local +
-//! `localhost`/`.local`/`.internal`/`.lan`/`.localdomain`/`.home`/`.corp`/`.lan`
-//! 等常用私网域名。覆盖范围与 Go geodata `private`/`cn-priv` 列表不完全等价，
-//! 但符合 Batch16-M 任务范围内「用 crates/xray-geodata 已有 API + RFC1918 +
-//! link-local + loopback 默认集」的明确边界。
-//!
-//! ponytail: 默认私网集是「够用」而非「穷举」——若需严格对齐 Go geodata 全量数据，
-//! 后续可挂 xray-geodata 的 geoip-loader 加载 `geoip-private.dat`。当前任务不需要。
+//! IP 侧不维护自有 CIDR 表，逐条对齐 Go
+//! `net.IP.IsPrivate() || IsLoopback() || IsLinkLocalUnicast()`（IPv4-mapped IPv6
+//! 先 unmap 再判）；域名侧 Go 走 geodata 私网域名匹配器，Rust 用固定后缀表近似。
 
-use std::{net::IpAddr, sync::LazyLock};
+use std::net::Ipv4Addr;
 
 use xray_common::net::address::Address;
-use xray_geodata::{matcher::ip::IPSet, pb::Cidr};
 
 use crate::error::ConfError;
-
-/// 默认私网 IP 集（IPv4 + IPv6，懒初始化）。
-///
-/// 覆盖：
-/// - IPv4: RFC1918 10/8 + 172.16/12 + 192.168/16；loopback 127/8；link-local 169.254/16
-/// - IPv6: loopback ::1/128；ULA fc00::/7；link-local fe80::/10；unspecified ::
-/// - IPv4-mapped IPv6 形式（::ffff:10.0.0.0/104 等）暂不展开，靠裸 IP 走 IPv4 路径
-static PRIVATE_IP_SET: LazyLock<IPSet> = LazyLock::new(|| {
-    let cidrs: &[(Vec<u8>, u32)] = &[
-        // RFC1918
-        (vec![10, 0, 0, 0], 8),
-        (vec![172, 16, 0, 0], 12),
-        (vec![192, 168, 0, 0], 16),
-        // loopback
-        (vec![127, 0, 0, 0], 8),
-        // link-local
-        (vec![169, 254, 0, 0], 16),
-        // 0.0.0.0（unspecified）
-        (vec![0, 0, 0, 0], 8),
-        // 100.64/10 carrier-grade NAT（RFC6598）
-        (vec![100, 64, 0, 0], 10),
-        // IPv6 loopback ::1/128
-        (vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128),
-        // IPv6 unspecified ::/128
-        (vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128),
-        // IPv6 ULA fc00::/7
-        (vec![0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 7),
-        // IPv6 link-local fe80::/10
-        (vec![0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10),
-        // IPv4-mapped IPv6 (::ffff:0:0/96)
-        (vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0], 96),
-    ];
-    let cidrs: Vec<Cidr> =
-        cidrs.iter().map(|(ip, p)| Cidr { ip: ip.clone(), prefix: *p }).collect();
-    IPSet::from_cidrs(&cidrs)
-});
 
 /// 默认私网域名前缀（mDNS / 链路本地 / RFC6762）。
 ///
@@ -66,26 +23,30 @@ static PRIVATE_IP_SET: LazyLock<IPSet> = LazyLock::new(|| {
 const PRIVATE_DOMAIN_SUFFIXES: &[&str] =
     &["localhost", "local", "internal", "intranet", "lan", "home", "corp", "localdomain"];
 
+/// Go `ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()` 的 IPv4 侧。
+fn is_local_v4(ip: Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_link_local()
+}
+
 /// 是否需要传输层加密（`true` = 需要 TLS/reality 等加密；`false` = 允许明文）。
 ///
-/// 对应 Go `infra/conf/xray.go:234-243` `requiresTransportSecurity`：
-/// - `address == nil` → 不需要（无目标不算明文出站）
-/// - IP 类地址且命中私网 → 不需要（私网内可明文）
+/// 对应 Go `infra/conf/xray.go:238-247` `requiresTransportSecurity`（commit 43c29f8e）：
+/// - `address == nil`（或地址解析不出）→ **需要**加密（fail-closed；旧实现返回 false， 与 Go 的
+///   `address == nil || address.Address == nil → true` 相反）
+/// - IP 命中私网/loopback/link-local 任一 → 不需要（私网内可明文）
 /// - 域名命中私网后缀 → 不需要
 #[must_use]
 pub fn requires_transport_security(address: Option<&Address>) -> bool {
     let Some(addr) = address else {
-        return false;
+        return true;
     };
     match addr {
-        Address::IPv4(v4) => {
-            let ip = IpAddr::V4(*v4);
-            !PRIVATE_IP_SET.contains(ip)
-        },
-        Address::IPv6(v6) => {
-            let ip = IpAddr::V6(*v6);
-            !PRIVATE_IP_SET.contains(ip)
-        },
+        Address::IPv4(v4) => !is_local_v4(*v4),
+        // Go `To4()` 先行：IPv4-mapped（::ffff:a.b.c.d）按 IPv4 谓词判
+        Address::IPv6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || !(v6.is_unique_local() || v6.is_loopback() || v6.is_unicast_link_local()),
+            |v4| !is_local_v4(v4),
+        ),
         Address::Domain(d) => {
             let normalized = d.trim_end_matches('.').to_ascii_lowercase();
             !PRIVATE_DOMAIN_SUFFIXES
@@ -268,9 +229,38 @@ mod tests {
         assert!(requires_transport_security(Some(&a)));
     }
 
+    /// Go `address == nil || address.Address == nil` → true（commit 43c29f8e 改版：
+    /// 无目标 fail-closed，不再是「不需要加密」）。
     #[test]
-    fn nil_address_not_required() {
-        assert!(!requires_transport_security(None));
+    fn nil_address_requires_security() {
+        assert!(requires_transport_security(None));
+    }
+
+    /// 新语义逐项：私网/loopback/link-local（含 IPv4-mapped）× 公网对照。
+    #[test]
+    fn private_predicates_match_go_net_ip() {
+        let private = [
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "169.254.1.1",
+            "127.0.0.1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "::1",
+            "::ffff:10.1.2.3",
+            "::ffff:127.0.0.1",
+        ];
+        for s in private {
+            let a: Address = s.parse().unwrap();
+            assert!(!requires_transport_security(Some(&a)), "{s} 应允许明文");
+        }
+        let public = ["8.8.8.8", "100.64.0.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"];
+        for s in public {
+            let a: Address = s.parse().unwrap();
+            assert!(requires_transport_security(Some(&a)), "{s} 应要求 TLS");
+        }
     }
 
     #[test]
@@ -379,17 +369,18 @@ mod tests {
         assert!(validate_outbound_transport_security("trojan", &bytes, None).is_ok());
     }
 
+    /// Go 基准 xray.go:238-240（commit 43c29f8e）：`address == nil` →
+    /// requiresTransportSecurity=true → 明文出站禁令触发。
     #[test]
-    fn empty_settings_vless_allowed() {
-        // Go 基准 xray.go:237-239:address == nil → requiresTransportSecurity=false → 允许。
+    fn empty_settings_vless_rejected() {
         let bytes = b"{}";
-        assert!(validate_outbound_transport_security("vless", bytes, None).is_ok());
+        assert!(validate_outbound_transport_security("vless", bytes, None).is_err());
     }
 
     #[test]
-    fn empty_settings_trojan_allowed() {
+    fn empty_settings_trojan_rejected() {
         let bytes = b"{}";
-        assert!(validate_outbound_transport_security("trojan", bytes, None).is_ok());
+        assert!(validate_outbound_transport_security("trojan", bytes, None).is_err());
     }
 
     #[test]

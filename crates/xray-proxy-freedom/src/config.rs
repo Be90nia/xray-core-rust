@@ -481,15 +481,19 @@ pub struct FinalRuleConfig {
     pub port_list: Option<xray_proto::xray::common::net::PortList>,
     /// IP CIDR 规则（prost repeated message）。
     pub ip: Vec<xray_proto::xray::common::geodata::IpRule>,
-    pub block_delay: Option<Range>,
+    /// 阻断延时（proto `Range delay`，仅 block 规则有值）。
+    pub delay: Option<Range>,
+    /// 阻断期日志级别（proto `optional log.Severity`，仅 block 规则有值）。
+    pub log_level: Option<i32>,
 }
 
 impl FinalRuleConfig {
-    /// 从 freedom settings JSON 解析（Go `infra/conf/freedom.go:46-52`
-    /// `FreedomFinalRuleConfig` + `Build` :252-288）。
+    /// 从 freedom settings JSON 解析（Go `infra/conf/freedom.go:46-54`
+    /// `FreedomFinalRuleConfig` + `Build` :252-320）。
     ///
     /// 形态：`{"action": "block", "network": "tcp,udp", "port": "443,80-90",
-    /// "ip": ["10.0.0.0/8"], "blockDelay": "30-90" | {"from":30,"to":90}}`。
+    /// "ip": ["10.0.0.0/8"], "delay": "30-90" | {"from":30,"to":90},
+    /// "logLevel": "warning"}`；`blockDelay` 为弃用别名（优先于 `delay`）。
     pub fn from_json(v: &serde_json::Value) -> Result<Self> {
         let action = match v
             .get("action")
@@ -523,8 +527,58 @@ impl FinalRuleConfig {
             })?,
             _ => Vec::new(),
         };
-        let block_delay = v.get("blockDelay").and_then(json_int32_range);
-        Ok(Self { action, networks, port_list, ip, block_delay })
+        // Go :286-288：`blockDelay` 弃用别名，非 nil 时覆盖 `delay`（`c.Delay = c.BlockDelay`）。
+        let mut delay = match v.get("delay") {
+            Some(d) => json_int32_range(d).map_err(|e| invalid(format!("finalRule delay: {e}")))?,
+            None => None,
+        };
+        let legacy_delay = match v.get("blockDelay") {
+            Some(d) => {
+                json_int32_range(d).map_err(|e| invalid(format!("finalRule blockDelay: {e}")))?
+            },
+            None => None,
+        };
+        if let Some(d) = legacy_delay {
+            crate::FREEDOM_LOG
+                .warn("freedom: \"finalRules.blockDelay\" is deprecated, use \"finalRules.delay\"");
+            delay = Some(d);
+        }
+        let log_level_str = match v.get("logLevel") {
+            None | Some(serde_json::Value::Null) => "",
+            Some(serde_json::Value::String(s)) => s.as_str(),
+            Some(_) => {
+                return Err(invalid("finalRule logLevel must be a string"));
+            },
+        };
+        // Go :290-293：allow 规则带 delay/logLevel 直接报错（不是忽略）。
+        if action != RuleAction::Block {
+            if delay.is_some() || !log_level_str.is_empty() {
+                return Err(invalid("delay and logLevel are only supported for block finalRules"));
+            }
+            return Ok(Self { action, networks, port_list, ip, delay: None, log_level: None });
+        }
+        Ok(Self {
+            action,
+            networks,
+            port_list,
+            ip,
+            delay,
+            log_level: Some(parse_log_level(log_level_str)?),
+        })
+    }
+}
+
+/// Go `infra/conf/freedom.go:302-317`：`logLevel` 值域 → proto `Severity`。
+/// 缺省/`"info"` = Info（Go 恒给 block 规则一个非 nil 指针）。
+fn parse_log_level(s: &str) -> Result<i32> {
+    use xray_proto::xray::common::log::Severity;
+    match s.to_ascii_lowercase().as_str() {
+        "" | "info" => Ok(Severity::Info as i32),
+        "none" => Ok(Severity::Unknown as i32),
+        "debug" => Ok(Severity::Debug as i32),
+        "warning" => Ok(Severity::Warning as i32),
+        "error" => Ok(Severity::Error as i32),
+        other => Err(invalid(format!("unknown finalRules.logLevel: {other}"))),
     }
 }
 
@@ -670,22 +724,36 @@ fn json_ip_rules(
         .collect()
 }
 
-/// Go `Int32Range`：`"30-90"` 字符串或 `{"from":30,"to":90}` 对象 → `Range`。
-fn json_int32_range(v: &serde_json::Value) -> Option<Range> {
-    match v {
-        serde_json::Value::String(s) => {
-            let (a, b) = s.split_once('-')?;
-            let from = a.trim().parse::<i64>().ok()?;
-            let to = b.trim().parse::<i64>().ok()?;
-            Some(Range { min: from.max(0) as u64, max: to.max(0) as u64 })
+/// Go `Int32Range`（`infra/conf/common.go:316-349`）：`"30-90"` / `30` / `""` → `Range`，
+/// 且 `From > To` 时交换（`ensureOrder`）；非法形态**硬错**（Go 解码期即报错）。
+/// `{"from":a,"to":b}` 是本仓既有方言（Go 无此形态），保留兼容。
+fn json_int32_range(v: &serde_json::Value) -> Result<Option<Range>> {
+    let (a, b) = match v {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Number(n) => {
+            let x = n.as_i64().ok_or_else(|| invalid("invalid integer range"))?;
+            (x, x)
         },
-        serde_json::Value::Object(o) => {
-            let from = o.get("from").and_then(|x| x.as_i64()).unwrap_or(0);
-            let to = o.get("to").and_then(|x| x.as_i64()).unwrap_or(0);
-            Some(Range { min: from.max(0) as u64, max: to.max(0) as u64 })
+        serde_json::Value::String(s) if s.is_empty() => (0, 0),
+        serde_json::Value::String(s) => match s.split_once('-') {
+            Some((a, b)) => match (a.trim().parse::<i64>(), b.trim().parse::<i64>()) {
+                (Ok(a), Ok(b)) => (a, b),
+                _ => return Err(invalid(format!("invalid range string: {s}"))),
+            },
+            // Go `ParseRangeString`：裸数字等同 [n, n]
+            None => match s.trim().parse::<i64>() {
+                Ok(n) => (n, n),
+                Err(_) => return Err(invalid(format!("invalid range string: {s}"))),
+            },
         },
-        _ => None,
-    }
+        serde_json::Value::Object(o) => (
+            o.get("from").and_then(serde_json::Value::as_i64).unwrap_or(0),
+            o.get("to").and_then(serde_json::Value::as_i64).unwrap_or(0),
+        ),
+        _ => return Err(invalid("invalid integer range, expected string or plain integer")),
+    };
+    let (min, max) = if a > b { (b, a) } else { (a, b) };
+    Ok(Some(Range { min: min.max(0) as u64, max: max.max(0) as u64 }))
 }
 
 /// Freedom 主配置。对应 proto `xray.proxy.freedom.Config`。
@@ -741,7 +809,8 @@ impl Config {
                     networks: r.networks,
                     port_list: r.port_list,
                     ip: r.ip,
-                    block_delay: r.block_delay.map(|b| Range { min: b.min, max: b.max }),
+                    delay: r.delay.map(|b| Range { min: b.min, max: b.max }),
+                    log_level: r.log_level,
                 })
                 .collect(),
         })
@@ -787,10 +856,11 @@ impl Config {
                     networks: r.networks.clone(),
                     port_list: r.port_list.clone(),
                     ip: r.ip.clone(),
-                    block_delay: r.block_delay.map(|b| xray_proto::xray::proxy::freedom::Range {
+                    delay: r.delay.map(|b| xray_proto::xray::proxy::freedom::Range {
                         min: b.min,
                         max: b.max,
                     }),
+                    log_level: r.log_level,
                 })
                 .collect(),
         }
@@ -805,7 +875,8 @@ impl std::fmt::Debug for FinalRule {
             .field("network", &self.network)
             .field("port", &self.port.is_some())
             .field("has_ip_matcher", &self.ip.is_some())
-            .field("block_delay", &self.block_delay)
+            .field("delay", &self.delay)
+            .field("log_level", &self.log_level)
             .finish()
     }
 }
@@ -818,7 +889,10 @@ pub struct FinalRule {
     pub port: Option<MemoryPortList>,
     /// IP CIDR 匹配器（None 表示无 IP 限制 → 匹配所有地址）。
     pub ip: Option<Arc<dyn IPMatcher>>,
-    pub block_delay: Option<Range>,
+    /// 阻断延时；None = 默认 [30, 90] 秒。对应 Go `FinalRule.delay`。
+    pub delay: Option<Range>,
+    /// 阻断期日志级别（proto `Severity` 值）；None = Info。对应 Go `FinalRule.logLevel`。
+    pub log_level: Option<i32>,
 }
 
 impl Clone for FinalRule {
@@ -828,7 +902,8 @@ impl Clone for FinalRule {
             network: self.network,
             port: self.port.clone(),
             ip: self.ip.clone(),
-            block_delay: self.block_delay,
+            delay: self.delay,
+            log_level: self.log_level,
         }
     }
 }
@@ -836,27 +911,68 @@ impl Clone for FinalRule {
 /// 默认允许所有网络（与 Go `allNetworks` 一致）。
 pub const ALL_NETWORKS: [bool; 8] = [true; 8];
 
-/// 默认阻止私有地址的 CIDR 列表（与 Go `defaultBlockPrivateRule` 一致）。
+/// 默认阻止私有地址的 CIDR 列表——逐条抄自 Go `common/geodata/consts.go:9-72`
+/// （`geodata.GetPrivateIPMatcher()` 的表，`defaultBlockPrivateRule` 用它）。
 ///
-/// 包含 RFC 1918 私有地址 + 保留段 + 链路本地 + 多播等。
+/// 分组与注释一一对应 Go 源；Go 中被注释掉的条目在此同样注释保留
+/// （`// "192.0.0.0/24"` 等），便于下轮对拍。
 pub const DEFAULT_BLOCK_PRIVATE_CIDRS: &[&str] = &[
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.0.0.0/24",
-    "192.0.2.0/24",
-    "192.88.99.0/24",
-    "192.168.0.0/16",
-    "198.18.0.0/15",
-    "198.51.100.0/24",
-    "203.0.113.0/24",
-    "224.0.0.0/3",
-    "::/127",
-    "fc00::/7",
-    "fe80::/10",
+    // https://www.iana.org/assignments/iana-ipv4-special-registry
+    "0.0.0.0/8",      // "This network"
+    "0.0.0.0/32",     // "This host on this network"
+    "10.0.0.0/8",     // Private-Use
+    "100.64.0.0/10",  // Shared Address Space
+    "127.0.0.0/8",    // Loopback
+    "169.254.0.0/16", // Link Local
+    "172.16.0.0/12",  // Private-Use
+    // "192.0.0.0/24",   // IETF Protocol Assignments
+    "192.0.0.0/29",   // IPv4 Service Continuity Prefix
+    "192.0.0.8/32",   // IPv4 dummy address
+    "192.0.0.9/32",   // Port Control Protocol Anycast
+    "192.0.0.10/32",  // Traversal Using Relays around NAT Anycast
+    "192.0.0.170/32", // NAT64/DNS64 Discovery
+    "192.0.0.171/32", // NAT64/DNS64 Discovery
+    "192.0.2.0/24",   // Documentation (TEST-NET-1)
+    // "192.31.196.0/24",    // AS112-v4
+    "192.52.193.0/24", // AMT
+    // "192.88.99.0/24",  // Deprecated (6to4 Relay Anycast)
+    "192.88.99.2/32", // 6a44-relay anycast address
+    "192.168.0.0/16", // Private-Use
+    // "192.175.48.0/24",    // Direct Delegation AS112 Service
+    "198.18.0.0/15",      // Benchmarking
+    "198.51.100.0/24",    // Documentation (TEST-NET-2)
+    "203.0.113.0/24",     // Documentation (TEST-NET-3)
+    "240.0.0.0/4",        // Reserved
+    "255.255.255.255/32", // Limited Broadcast
+    // https://www.iana.org/assignments/multicast-addresses
+    "224.0.0.0/4",
+    // https://www.iana.org/assignments/iana-ipv6-special-registry
+    "::1/128", // Loopback Address
+    "::/128",  // Unspecified Address
+    // "::ffff:0:0/96",     // IPv4-mapped Address
+    "64:ff9b::/96",   // IPv4-IPv6 Translat.
+    "64:ff9b:1::/48", // IPv4-IPv6 Translat.
+    "100::/64",       // Discard-Only Address Block
+    "100:0:0:1::/64", // Dummy IPv6 Prefix
+    // "2001::/23",      // IETF Protocol Assignments
+    "2001::/32",     // TEREDO
+    "2001:1::1/128", // Port Control Protocol Anycast
+    "2001:1::2/128", // Traversal Using Relays around NAT Anycast
+    "2001:1::3/128", // DNS-SD Service Registration Protocol Anycast
+    "2001:2::/48",   // Benchmarking
+    "2001:3::/32",   // AMT
+    // "2001:4:112::/48", // AS112-v6
+    // "2001:10::/28",    // Deprecated (previously ORCHID)
+    "2001:20::/28",  // ORCHIDv2
+    "2001:30::/28",  // Drone Remote ID Protocol Entity Tags (DETs) Prefix
+    "2001:db8::/32", // Documentation
+    "2002::/16",     // 6to4
+    // "2620:4f:8000::/48", // Direct Delegation AS112 Service
+    "3fff::/20", // Documentation
+    "5f00::/16", // Segment Routing (SRv6) SIDs
+    "fc00::/7",  // Unique-Local
+    "fe80::/10", // Link-Local Unicast
+    // https://www.iana.org/assignments/ipv6-multicast-addresses
     "ff00::/8",
 ];
 
@@ -883,7 +999,8 @@ impl FinalRule {
             network,
             port,
             ip: build_ip_matcher_from_rules(&config.ip)?,
-            block_delay: config.block_delay,
+            delay: config.delay,
+            log_level: config.log_level,
         })
     }
 
@@ -892,22 +1009,28 @@ impl FinalRule {
     ///
     /// - [`DefaultRuleType::BlockPrivate`]：action=Block，network=all，ip=私有 CIDR matcher。
     /// - [`DefaultRuleType::BlockAll`]：action=Block，network=all，ip=None（匹配所有）。
+    ///
+    /// 两者的 `log_level` 都是 Warning（Go `freedom.go:78-90` 显式
+    /// `log.Severity_Warning.Enum()`）。
     #[must_use]
     pub fn build_default_rule(kind: DefaultRuleType) -> Self {
+        let log_level = Some(xray_proto::xray::common::log::Severity::Warning as i32);
         match kind {
             DefaultRuleType::BlockPrivate => Self {
                 action: RuleAction::Block,
                 network: ALL_NETWORKS,
                 port: None,
                 ip: Some(private_ip_matcher()),
-                block_delay: None,
+                delay: None,
+                log_level,
             },
             DefaultRuleType::BlockAll => Self {
                 action: RuleAction::Block,
                 network: ALL_NETWORKS,
                 port: None,
                 ip: None,
-                block_delay: None,
+                delay: None,
+                log_level,
             },
         }
     }
@@ -1012,14 +1135,14 @@ pub fn private_ip_matcher() -> Arc<dyn IPMatcher> {
 ///
 /// 对应 Go `getDefaultFinalRule`：
 /// - `"vless-reverse"` → 阻止所有
-/// - `"vless"` / `"vmess"` / `"trojan"` / `"hysteria"` / `"wireguard"` / `"shadowsocks*"` →
-///   阻止私有
+/// - `"vless"` / `"vmess"` / `"trojan"` / `"hysteria"` / `"wireguard"` / `"masque"` /
+///   `"shadowsocks*"` → 阻止私有
 /// - 其他 → None（不应用默认规则）
 #[must_use]
 pub fn get_default_rule_type(inbound_name: &str) -> Option<DefaultRuleType> {
     match inbound_name {
         "vless-reverse" => Some(DefaultRuleType::BlockAll),
-        "vless" | "vmess" | "trojan" | "hysteria" | "wireguard" => {
+        "vless" | "vmess" | "trojan" | "hysteria" | "wireguard" | "masque" => {
             Some(DefaultRuleType::BlockPrivate)
         },
         other if other.starts_with("shadowsocks") => Some(DefaultRuleType::BlockPrivate),
@@ -1181,9 +1304,12 @@ fn ip_or_domain_to_address(iod: &xray_proto::xray::common::net::IpOrDomain) -> O
 /// 对应 Go `Process` blockedDest 分支 :352-366——不拨号，慢速丢弃防探测。
 pub(crate) async fn blackhole_link(link: xray_transport::link::Link, tag: &str, rule: &FinalRule) {
     let delay = block_delay(rule);
-    crate::FREEDOM_LOG.info(format!(
-        "freedom: target blocked by final rule, blackholing connection tag={tag} delay={delay:?}"
-    ));
+    log_blocked(
+        rule,
+        format!(
+            "freedom: target blocked by final rule, blackholing connection tag={tag} delay={delay:?}"
+        ),
+    );
     let xray_transport::link::Link { mut reader, writer } = link;
     // EOF 语义与 udp pump 一致：Err 或 Ok(空 buffer) 都视为对端关闭
     let drain = async {
@@ -1201,12 +1327,25 @@ pub(crate) async fn blackhole_link(link: xray_transport::link::Link, tag: &str, 
     writer.shutdown();
 }
 
+/// 按规则 `log_level` 发射阻断日志。对应 Go `FinalRule.log`（:234-250）：
+/// 未设级别 = Info；`Unknown`（`"none"`）在 Go 的 switch 里无分支 ⇒ 不打日志。
+fn log_blocked(rule: &FinalRule, message: String) {
+    use xray_proto::xray::common::log::Severity;
+    match rule.log_level.and_then(|v| Severity::try_from(v).ok()) {
+        None | Some(Severity::Info) => crate::FREEDOM_LOG.info(message),
+        Some(Severity::Warning) => crate::FREEDOM_LOG.warn(message),
+        Some(Severity::Error) => crate::FREEDOM_LOG.error(message),
+        Some(Severity::Debug) => crate::FREEDOM_LOG.debug(message),
+        Some(Severity::Unknown) => {},
+    }
+}
+
 /// 计算阻断延时。对应 Go `Handler.blockDelay` :226-238。
 ///
-/// 默认 [30, 90] 秒；`rule.block_delay` 可覆盖。`dice.Roll(span+1)` → [0, span]。
+/// 默认 [30, 90] 秒；`rule.delay` 可覆盖。`dice.Roll(span+1)` → [0, span]。
 #[must_use]
 pub fn block_delay(rule: &FinalRule) -> std::time::Duration {
-    let (min, max) = match rule.block_delay {
+    let (min, max) = match rule.delay {
         Some(r) => (r.min, r.max),
         None => (30, 90),
     };
@@ -1508,7 +1647,8 @@ mod tests {
             network: [true, false, false, false, false, false, false, false],
             port: None,
             ip: None,
-            block_delay: None,
+            delay: None,
+            log_level: None,
         };
         assert!(rule.match_network(0)); // TCP
         assert!(!rule.match_network(1)); // UDP
@@ -1524,7 +1664,8 @@ mod tests {
             network: ALL_NETWORKS,
             port: None,
             ip: None,
-            block_delay: None,
+            delay: None,
+            log_level: None,
         };
         assert!(rule.match_port(80));
         assert!(rule.match_port(443));
@@ -1537,7 +1678,8 @@ mod tests {
             network: ALL_NETWORKS,
             port: Some(MemoryPortList::new(vec![PortRange::new(Port::new(80), Port::new(80))])),
             ip: None,
-            block_delay: None,
+            delay: None,
+            log_level: None,
         };
         assert!(rule.match_port(80));
         assert!(!rule.match_port(443));
@@ -1552,7 +1694,8 @@ mod tests {
             network: ALL_NETWORKS,
             port: None,
             ip: None,
-            block_delay: None,
+            delay: None,
+            log_level: None,
         };
         assert!(rule.match_ip(Some("8.8.8.8".parse().unwrap())));
         assert!(rule.match_ip(Some("::1".parse().unwrap())));
@@ -1566,7 +1709,8 @@ mod tests {
             network: [true, true, false, false, false, false, false, false],
             port: None,
             ip: None,
-            block_delay: None,
+            delay: None,
+            log_level: None,
         };
         assert!(rule.apply(0, 80, Some("1.2.3.4".parse().unwrap()))); // TCP:80
         assert!(rule.apply(1, 443, Some("1.2.3.4".parse().unwrap()))); // UDP:443
@@ -1658,6 +1802,10 @@ mod tests {
         assert_eq!(get_default_rule_type("vless"), Some(DefaultRuleType::BlockPrivate));
         assert_eq!(get_default_rule_type("vmess"), Some(DefaultRuleType::BlockPrivate));
         assert_eq!(get_default_rule_type("trojan"), Some(DefaultRuleType::BlockPrivate));
+        assert_eq!(get_default_rule_type("hysteria"), Some(DefaultRuleType::BlockPrivate));
+        assert_eq!(get_default_rule_type("wireguard"), Some(DefaultRuleType::BlockPrivate));
+        // bd uixeu：Go 26.11.9 `getDefaultFinalRule` 的 masque 分支
+        assert_eq!(get_default_rule_type("masque"), Some(DefaultRuleType::BlockPrivate));
         assert_eq!(
             get_default_rule_type("shadowsocks-aes-256-gcm"),
             Some(DefaultRuleType::BlockPrivate)
@@ -1671,16 +1819,78 @@ mod tests {
         assert_eq!(get_default_rule_type(""), None);
     }
 
-    // ===== 常量 =====
+    // ===== bd mwdf1：私有地址表对齐 Go common/geodata/consts.go =====
 
+    /// 表内容与 Go 26.11.9 `consts.go:9-72` 逐条一致：条数 + 新增项 + 已删项。
     #[test]
-    fn default_block_private_cidrs_not_empty() {
-        assert!(!DEFAULT_BLOCK_PRIVATE_CIDRS.is_empty());
-        // 关键私有地址段必须包含
-        assert!(DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&"10.0.0.0/8"));
-        assert!(DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&"192.168.0.0/16"));
-        assert!(DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&"172.16.0.0/12"));
-        assert!(DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&"127.0.0.0/8"));
+    fn default_block_private_cidrs_match_go_table() {
+        // Go 表 44 条有效项（注释掉的 8 条不计）
+        assert_eq!(DEFAULT_BLOCK_PRIVATE_CIDRS.len(), 44, "{DEFAULT_BLOCK_PRIVATE_CIDRS:?}");
+        for added in [
+            "0.0.0.0/32",
+            "192.0.0.0/29",
+            "192.0.0.171/32",
+            "240.0.0.0/4",
+            "255.255.255.255/32",
+            "64:ff9b:1::/48",
+            "100:0:0:1::/64",
+            "2001:30::/28",
+            "2002::/16",
+            "3fff::/20",
+            "5f00::/16",
+        ] {
+            assert!(DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&added), "missing {added}");
+        }
+        for removed in ["192.0.0.0/24", "192.88.99.0/24", "224.0.0.0/3", "::/127"] {
+            assert!(!DEFAULT_BLOCK_PRIVATE_CIDRS.contains(&removed), "stale {removed}");
+        }
+    }
+
+    /// `private_ip_matcher` 用 `filter_map` 建 matcher——任何一条解析失败会被**静默丢弃**
+    /// （等于悄悄缩小阻止面）。逐条校验可解析。
+    #[test]
+    fn default_block_private_cidrs_all_parse() {
+        for s in DEFAULT_BLOCK_PRIVATE_CIDRS {
+            assert!(
+                xray_geodata::rule_parser::parse_cidr(s).is_ok(),
+                "unparseable default CIDR {s} (silently dropped by private_ip_matcher)"
+            );
+        }
+    }
+
+    /// 新表的实际命中面：新增段被拦、Go 已删段不再连带拦截。
+    #[test]
+    fn default_block_private_matcher_matches_go_table() {
+        let rule = FinalRule::build_default_rule(DefaultRuleType::BlockPrivate);
+        let blocked: &[&str] = &[
+            "10.1.2.3",
+            "192.0.0.3",       // 192.0.0.0/29
+            "192.0.0.9",       // Port Control Protocol Anycast
+            "192.0.2.1",       // TEST-NET-1
+            "224.0.0.1",       // multicast
+            "240.1.2.3",       // Reserved（新增）
+            "255.255.255.255", // Limited Broadcast（新增）
+            "::",
+            "::1",
+            "2001:db8::1",
+            "2002::1",    // 6to4（新增）
+            "3fff::1",    // Documentation（新增）
+            "64:ff9b::1", // IPv4-IPv6 Translat.
+        ];
+        for ip in blocked {
+            assert!(rule.apply(0, 80, Some(ip.parse().unwrap())), "{ip} must be blocked");
+        }
+        let allowed: &[&str] = &[
+            "8.8.8.8",
+            "1.1.1.1",
+            "192.0.0.17", // 旧表 192.0.0.0/24 连带拦，Go 新表不收
+            "::2",        // 旧表 ::/127 连带拦，Go 新表只收 :: 与 ::1
+            "2001:4860:4860::8888",
+            "2606:4700::1111",
+        ];
+        for ip in allowed {
+            assert!(!rule.apply(0, 80, Some(ip.parse().unwrap())), "{ip} must be allowed");
+        }
     }
 
     #[test]
@@ -1771,7 +1981,7 @@ mod tests {
             "network": "tcp,udp",
             "port": "53,80-90",
             "ip": ["10.0.0.0/8", "192.168.1.1"],
-            "blockDelay": "30-90"
+            "delay": "30-90"
         }))
         .unwrap();
         assert_eq!(cfg.action, RuleAction::Block);
@@ -1787,8 +1997,10 @@ mod tests {
             443,
             Some("192.168.1.1".parse().unwrap())
         ));
-        // blockDelay 解析
-        assert_eq!(cfg.block_delay.map(|r| (r.min, r.max)), Some((30, 90)));
+        // delay 解析
+        assert_eq!(cfg.delay.map(|r| (r.min, r.max)), Some((30, 90)));
+        // 未写 logLevel 的 block 规则 → Info（Go 恒给非 nil 指针）
+        assert_eq!(cfg.log_level, Some(xray_proto::xray::common::log::Severity::Info as i32));
     }
 
     /// 单条 IP 规则 JSON → 运行时规则。
@@ -1867,19 +2079,122 @@ mod tests {
         assert_eq!(matched.map(|r| r.action), Some(RuleAction::Allow));
     }
 
+    /// Go `infra/conf/freedom.go:290-293`：`delay` / `logLevel` 只对 block 规则生效，
+    /// 出现在 allow 规则里是**配置错误**（不是忽略）。
     #[test]
-    fn final_rule_from_json_object_block_delay_and_allow_action() {
-        let cfg = FinalRuleConfig::from_json(&serde_json::json!({
-            "action": "allow",
-            "blockDelay": {"from": 5, "to": 9}
-        }))
-        .unwrap();
+    fn final_rule_allow_with_delay_or_log_level_is_error() {
+        for rule in [
+            serde_json::json!({"action": "allow", "delay": {"from": 5, "to": 9}}),
+            // 弃用别名同样受限（Go 先 `c.Delay = c.BlockDelay` 再校验 action）
+            serde_json::json!({"action": "allow", "blockDelay": {"from": 5, "to": 9}}),
+            serde_json::json!({"action": "allow", "logLevel": "warning"}),
+        ] {
+            let e = FinalRuleConfig::from_json(&rule).unwrap_err();
+            assert!(
+                e.to_string().contains("only supported for block finalRules"),
+                "unexpected error for {rule}: {e}"
+            );
+        }
+        // allow 规则空 logLevel（Go 判 `!= ""`）不算设置
+        let cfg =
+            FinalRuleConfig::from_json(&serde_json::json!({"action": "allow", "logLevel": ""}))
+                .expect("empty logLevel on allow rule is accepted");
         assert_eq!(cfg.action, RuleAction::Allow);
+        assert_eq!((cfg.delay, cfg.log_level), (None, None));
         // 无 network 限制 = 全网络
         let rule = FinalRule::build(&cfg).unwrap();
         assert!(rule.match_network(network_index(Network::TCP)));
         assert!(rule.match_network(network_index(Network::UDP)));
-        assert_eq!(cfg.block_delay.map(|r| (r.min, r.max)), Some((5, 9)));
+    }
+
+    // ===== bd uixeu：finalRules 的 delay / blockDelay / logLevel =====
+
+    /// `delay` 为新键、`blockDelay` 为弃用别名；两者取值一致，同时出现时别名优先
+    /// （Go `c.Delay = c.BlockDelay`）。
+    #[test]
+    fn final_rule_delay_and_block_delay_alias_equivalent() {
+        let new = FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "block", "delay": {"from": 5, "to": 9}}),
+        )
+        .unwrap();
+        let legacy = FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "block", "blockDelay": {"from": 5, "to": 9}}),
+        )
+        .unwrap();
+        assert_eq!(new, legacy);
+        assert_eq!(new.delay.map(|r| (r.min, r.max)), Some((5, 9)));
+
+        // 同时出现 → blockDelay 覆盖 delay
+        let both = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block",
+            "delay": {"from": 5, "to": 9},
+            "blockDelay": {"from": 10, "to": 20}
+        }))
+        .unwrap();
+        assert_eq!(both.delay.map(|r| (r.min, r.max)), Some((10, 20)));
+
+        // 运行时延时取自 delay（random roll 落在 [min, max] 闭区间）
+        let rule = FinalRule::build(&both).unwrap();
+        assert_eq!(rule.delay.map(|r| (r.min, r.max)), Some((10, 20)));
+        for _ in 0..16 {
+            let d = block_delay(&rule).as_secs();
+            assert!((10..=20).contains(&d), "delay out of range: {d}");
+        }
+
+        // Go `Int32Range` 三形态：交换顺序 / 裸数字 / 非法硬错
+        let swapped =
+            FinalRuleConfig::from_json(&serde_json::json!({"action": "block", "delay": "90-30"}))
+                .unwrap();
+        assert_eq!(swapped.delay.map(|r| (r.min, r.max)), Some((30, 90)));
+        let plain = FinalRuleConfig::from_json(&serde_json::json!({"action": "block", "delay": 5}))
+            .unwrap();
+        assert_eq!(plain.delay.map(|r| (r.min, r.max)), Some((5, 5)));
+        assert!(
+            FinalRuleConfig::from_json(&serde_json::json!({"action": "block", "delay": "abc"}))
+                .is_err()
+        );
+    }
+
+    /// `logLevel` 值域对齐 Go `freedom.go:302-317`；未知值硬错。
+    #[test]
+    fn final_rule_log_level_values_match_go() {
+        use xray_proto::xray::common::log::Severity;
+        let cases: &[(&str, Option<Severity>)] = &[
+            ("", Some(Severity::Info)),
+            ("info", Some(Severity::Info)),
+            ("INFO", Some(Severity::Info)),
+            ("none", Some(Severity::Unknown)),
+            ("debug", Some(Severity::Debug)),
+            ("warning", Some(Severity::Warning)),
+            ("error", Some(Severity::Error)),
+        ];
+        for &(s, want) in cases {
+            let cfg =
+                FinalRuleConfig::from_json(&serde_json::json!({"action": "block", "logLevel": s}))
+                    .unwrap_or_else(|e| panic!("logLevel={s}: {e}"));
+            assert_eq!(cfg.log_level, want.map(|v| v as i32), "logLevel={s}");
+        }
+        let e = FinalRuleConfig::from_json(
+            &serde_json::json!({"action": "block", "logLevel": "verbose"}),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("unknown finalRules.logLevel"), "{e}");
+    }
+
+    /// unset 级别 = Info、`none` = 不打日志（Go `FinalRule.log` 的 switch 无 Unknown 分支）。
+    #[test]
+    fn block_log_level_selects_severity() {
+        use xray_proto::xray::common::log::Severity;
+        let rule = FinalRule::build_default_rule(DefaultRuleType::BlockPrivate);
+        assert_eq!(rule.log_level, Some(Severity::Warning as i32), "默认规则记 Warning");
+        let configured = FinalRule::build(
+            &FinalRuleConfig::from_json(
+                &serde_json::json!({"action": "block", "logLevel": "none"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(configured.log_level, Some(Severity::Unknown as i32));
     }
 
     #[test]

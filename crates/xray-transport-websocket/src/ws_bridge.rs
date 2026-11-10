@@ -37,7 +37,10 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::Mutex,
 };
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message, protocol::frame::coding::CloseCode},
+};
 use xray_transport::connection::Connection;
 
 /// 桥接 WebSocket 帧流为字节流。
@@ -159,9 +162,23 @@ where
                         // tungstenite 自动回 Pong；控制帧对字节流透明。
                         continue;
                     },
-                    Ok(Message::Close(_)) => {
-                        // 对端关闭：返回 EOF（Ok + 0 bytes）。
-                        return Poll::Ready(Ok(()));
+                    Ok(Message::Close(frame)) => {
+                        // Go connection.go:49-55：正常关闭 1000 与无状态码（1005）= EOF，
+                        // 其它关闭码保留错误语义（含码值）。
+                        // 1005 只以"空关闭载荷"形态到达（None 分支）——tungstenite 的
+                        // do_close 会把不合规码（含 CloseCode::Status）归一成 Protocol，
+                        // 读路径上不会出现 Status 变体。
+                        match frame {
+                            None => return Poll::Ready(Ok(())),
+                            Some(f) if f.code == CloseCode::Normal => return Poll::Ready(Ok(())),
+                            Some(f) => {
+                                return Poll::Ready(Err(io::Error::other(format!(
+                                    "websocket closed with code {}: {}",
+                                    u16::from(f.code),
+                                    f.reason.as_str()
+                                ))));
+                            },
+                        }
                     },
                     Ok(Message::Text(_)) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -428,6 +445,72 @@ mod tests {
                 "chunk={chunk}: unexpected frame count (duplicate start_send)"
             );
         }
+    }
+
+    /// bd ldmmy（Go connection.go:49-55）：正常关闭 1000 与无状态码 1005 = EOF，
+    /// 1001/1011 等其它码仍报错。旧实现一律 EOF（异常关闭被伪装成正常结束）。
+    #[tokio::test]
+    async fn close_code_normal_and_no_status_are_eof() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, coding::CloseCode};
+
+        for frame in [
+            Some(CloseFrame { code: CloseCode::Normal, reason: "".into() }),
+            None, // 无状态码 = 1005
+        ] {
+            let mut conn = pair_with_peer_close(frame).await;
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+                .await
+                .expect("close frame must be delivered")
+                .expect("1000/1005 close must be EOF, not an error");
+            assert_eq!(n, 0, "EOF delivers 0 bytes");
+        }
+    }
+
+    /// 对照：1001（Away）/1011（Error）不得伪装成 EOF——错误须带关闭码。
+    #[tokio::test]
+    async fn close_code_abnormal_surfaces_error_with_code() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::frame::{CloseFrame, coding::CloseCode};
+
+        for (code, expected) in [(CloseCode::Away, "1001"), (CloseCode::Error, "1011")] {
+            let mut conn =
+                pair_with_peer_close(Some(CloseFrame { code, reason: "bye".into() })).await;
+            let mut buf = [0u8; 16];
+            let err = tokio::time::timeout(Duration::from_secs(5), conn.read(&mut buf))
+                .await
+                .expect("close frame must be delivered")
+                .expect_err("abnormal close must surface an error");
+            let msg = err.to_string();
+            assert!(msg.contains(expected), "error must carry close code {expected}: {msg}");
+        }
+    }
+
+    /// 起一对 ws（duplex）：服务端握手后发 Close 帧（`None` = 无状态码），
+    /// 返回客户端侧桥接连接。
+    async fn pair_with_peer_close(
+        frame: Option<tokio_tungstenite::tungstenite::protocol::frame::CloseFrame>,
+    ) -> WsConnection<tokio::io::DuplexStream> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        #[allow(clippy::disallowed_methods, reason = "测试：ws mock peer 任务")]
+        let _server = tokio::spawn(async move {
+            let ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
+            let (mut sink, _read) = ws.split();
+            sink.send(Message::Close(frame)).await.unwrap();
+            // 保 sink 存活到测试读完：提前 drop 会让底流 EOF 抢在 Close 消息之前。
+            std::future::pending::<()>().await;
+        });
+
+        let req = "ws://localhost/".into_client_request().unwrap();
+        let (ws, _resp) = tokio_tungstenite::client_async(req, client_io).await.unwrap();
+        WsConnection::from_stream(ws, None, None)
     }
 
     /// 经 4 KiB duplex 的 ws 对端搬运 `payload`（每片一次 `poll_write`），

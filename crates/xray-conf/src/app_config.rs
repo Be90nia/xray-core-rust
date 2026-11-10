@@ -10,12 +10,16 @@ use serde::{Deserialize, Serialize};
 // Log
 // =========================================================================
 
-/// 日志配置，对应 Go `infra/conf.LogConfig`（json 字段：loglevel/access/error/
+/// 日志配置，对应 Go `infra/conf.LogConfig`（json 字段：logLevel/access/error/
 /// dnsLog/maskAddress；`format` 为 Rust 扩展——Go v26.6.1 无此字段）。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LogConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 日志级别。Go v26.11.9 把 json tag 从 `loglevel` 改为 `logLevel`，但
+    /// encoding/json 字段匹配大小写不敏感 ⇒ 旧 `loglevel` 仍生效；serde 大小写
+    /// 敏感，故两键并列（序列化仍出 `loglevel`，Go 侧不区分）。非法值不报错，
+    /// 落 Go `Build` 的 `default:` 分支（Warning）。
+    #[serde(skip_serializing_if = "Option::is_none", alias = "logLevel")]
     pub loglevel: Option<String>,
     /// Access log：文件路径，`"none"` 关闭，空（未配置）= console。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +335,19 @@ pub use serde_json::Value;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Go v26.11.9 的 `logLevel` 与旧 `loglevel` 均解析出同一级别；非法级别
+    /// 不报错（Go `Build` 落 `default:` → Warning，见 infra/conf/log.go:58-64）。
+    #[test]
+    fn log_level_accepts_both_spellings() {
+        let new_key: LogConfig = serde_json::from_str(r#"{"logLevel": "debug"}"#).unwrap();
+        let old_key: LogConfig = serde_json::from_str(r#"{"loglevel": "debug"}"#).unwrap();
+        assert_eq!(new_key.loglevel.as_deref(), Some("debug"));
+        assert_eq!(old_key.loglevel.as_deref(), Some("debug"));
+
+        let bogus: LogConfig = serde_json::from_str(r#"{"logLevel": "verbose"}"#).unwrap();
+        assert_eq!(bogus.loglevel.as_deref(), Some("verbose"));
+    }
 
     /// Go 标准 camelCase 键生效（policy levels/system）。
     #[test]

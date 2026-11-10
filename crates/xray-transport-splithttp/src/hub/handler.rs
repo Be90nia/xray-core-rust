@@ -136,9 +136,13 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // OPTIONS → CORS preflight（CORS header 由 handle_request 统一追加；
-    // Go 在 padding 校验之前放行，padding 注入已在外层完成）。
-    if req.method() == Method::OPTIONS {
+    // 只有真 CORS preflight（带 Access-Control-Request-Method）才 200 放行——
+    // Go hub.go:129-135；不带该头的 OPTIONS 是 uplinkHTTPMethod:"OPTIONS" 的上行
+    // 请求，必须走下面的正常分发（旧实现一律 200 把它吞成空响应）。
+    // CORS header 由 handle_request 统一追加；padding 注入已在外层完成。
+    if req.method() == Method::OPTIONS
+        && req.headers().get("Access-Control-Request-Method").is_some_and(|v| !v.is_empty())
+    {
         return status_response(StatusCode::OK);
     }
 
@@ -1114,7 +1118,9 @@ mod tests {
             .unwrap();
         assert!(req.headers().get("host").is_none(), "h2 request must carry no Host header");
         let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
-        assert_eq!(resp.status(), StatusCode::OK, ":authority must feed the host gate");
+        // :authority 过关即可（不带 Access-Control-Request-Method 的 OPTIONS 已按上行
+        // 请求分发，A-4 后不再是无条件 200——此处只断言 host 门通过）。
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, ":authority must feed the host gate");
     }
 
     /// r2lq 对照：:authority 不在白名单 → 仍 404（伪头不能绕过 host 门）。
@@ -1133,11 +1139,17 @@ mod tests {
     // ===== H3：X-Padding 三重偏离 =====
 
     /// H3a 回归：通过 host/path 校验的响应必带 X-Padding（Go hub.go:110-131 每
-    /// 响应注入；旧实现响应永无 padding——JA4H 级指纹）。OPTIONS 200 也带。
+    /// 响应注入；旧实现响应永无 padding——JA4H 级指纹）。OPTIONS preflight 200 也带。
     #[tokio::test]
     async fn h3a_response_carries_x_padding_header() {
         let ctx = make_ctx("");
-        let req = plain_request(Method::OPTIONS, "/x", "h", None);
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/x")
+            .header("Host", "h")
+            .header("Access-Control-Request-Method", "POST")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
         let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let pad = resp.headers().get("X-Padding").expect("X-Padding must be present");
@@ -1151,12 +1163,49 @@ mod tests {
         );
     }
 
+    /// A-4（Go hub.go:129-135）：不带 `Access-Control-Request-Method` 的 OPTIONS 是
+    /// `uplinkHTTPMethod: "OPTIONS"` 的上行请求，必须进正常分发（uplink handler 建会话）；
+    /// 旧实现一律提前 200，把它吞成空响应 → 会话永远不出现。
+    #[tokio::test]
+    async fn options_without_acrm_dispatches_to_uplink_handler() {
+        let ctx = make_ctx("");
+        // 非 obfs 默认配置：Referer 带合法 padding 才过 padding 门。
+        let referer = format!("https://ref.example/page?x_padding={}", "X".repeat(200));
+        let req = plain_request(Method::OPTIONS, "/sess-a4", "h", Some(referer));
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ctx.sessions.get("sess-a4").await.is_some(),
+            "non-preflight OPTIONS must be dispatched as an uplink request (session upserted)"
+        );
+    }
+
+    /// 对照：带 `Access-Control-Request-Method` 的 OPTIONS 仍是 CORS preflight——
+    /// 200 直接返回，不进分发（不建设话，也不需要 padding）。
+    #[tokio::test]
+    async fn options_with_acrm_stays_preflight() {
+        let ctx = make_ctx("");
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/sess-a4")
+            .header("Host", "h")
+            .header("Access-Control-Request-Method", "POST")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            ctx.sessions.get("sess-a4").await.is_none(),
+            "CORS preflight must not reach the uplink handler"
+        );
+    }
+
     /// H3b 回归：非 obfs 无 Referer 且 URL 无 x_padding → 400（Go
     /// IsPaddingValid 空值即 false；旧实现放行裸请求直达业务层）。
     #[tokio::test]
     async fn h3b_missing_padding_rejected() {
         let ctx = make_ctx("");
-        // OPTIONS 在 padding 校验之前放行（Go 同），用 GET 验证 padding 门。
+        // A-4 后非 preflight 的 OPTIONS 也走 padding 门；用 GET 验证同一门。
         let req = Request::builder()
             .method(Method::GET)
             .uri("/x")
