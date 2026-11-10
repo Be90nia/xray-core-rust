@@ -199,8 +199,12 @@ impl HubListener {
         // SETTINGS_MAX_HEADER_LIST_SIZE（与 TLS 路径 serve_http_conn 同源）。
         // 在 `self.config` 移入 HandlerContext 之前取值。
         let max_head_bytes = self.config.normalized_server_max_header_bytes().max(8192) as usize;
+        // h2Params（Go hub.go:559-565）：listener 启动期解析一次，失败即拒启
+        // （`json.Unmarshal` 失败在 Go 里是 `failed to parse HTTP2Config` 启动失败）。
+        let h2_params = crate::h2_params::H2Params::parse(&self.config.h2_params)?.map(Arc::new);
         let ctx = Arc::new(handler::HandlerContext {
             config: Arc::clone(&self.config),
+            h2_params,
             host: self.config.host.clone(),
             base_path: self.config.normalized_path(),
             local_addr: self.local_addr,
@@ -223,6 +227,8 @@ impl HubListener {
             if hub_scope
                 .spawn(async move {
                     use hyper::service::service_fn;
+                    // `ctx` 随 `svc` 闭包移走 ⇒ 先取 h2Params。
+                    let h2_params = ctx.h2_params.clone();
                     let svc = service_fn(move |req| {
                         let ctx = Arc::clone(&ctx);
                         async move {
@@ -250,6 +256,11 @@ impl HubListener {
                         .max_send_buf_size(win.max_send_buf)
                         .initial_stream_window_size(win.stream_window)
                         .initial_connection_window_size(win.connection_window);
+                    // h2Params（Go hub.go:559-565）：显式字段覆盖上面的默认值；
+                    // 未配置 ⇒ None ⇒ 零 setter（默认行为逐字节不变）。
+                    if let Some(p) = &h2_params {
+                        p.apply(&mut builder.http2());
+                    }
                     let _ = builder.serve_connection(io, svc).await;
                 })
                 .is_err()

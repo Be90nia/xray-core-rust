@@ -73,6 +73,7 @@ pub mod connection;
 pub mod dialer;
 pub mod error;
 pub(crate) mod flow_window;
+pub(crate) mod h2_params;
 pub mod h3_client;
 pub mod hub;
 pub mod mux;

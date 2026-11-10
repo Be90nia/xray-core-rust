@@ -258,6 +258,11 @@ pub struct Config {
     pub session_placement: String,
     /// session key 名。
     pub session_key: String,
+    /// 服务端 h2 参数（proto `h2Params=30`；Go `http.HTTP2Config` 的 JSON blob）。
+    ///
+    /// 原样透传：消费点在 hub 侧（对应 Go `splithttp/hub.go` 把 `h2Params` unmarshal
+    /// 后塞进 `http.Server{HTTP2: ...}`）。
+    pub h2_params: Vec<u8>,
     /// seq placement（默认 `path`）。
     pub seq_placement: String,
     /// seq key 名。
@@ -536,8 +541,8 @@ impl Config {
             x_padding_placement: p.x_padding_placement,
             x_padding_method: p.x_padding_method,
             uplink_http_method: p.uplink_http_method,
-            session_placement: p.session_placement,
-            session_key: p.session_key,
+            session_placement: p.session_id_placement,
+            session_key: p.session_id_key,
             seq_placement: p.seq_placement,
             seq_key: p.seq_key,
             uplink_data_placement: p.uplink_data_placement,
@@ -546,6 +551,7 @@ impl Config {
             server_max_header_bytes: p.server_max_header_bytes,
             session_id_table: p.session_id_table,
             session_id_length: p.session_id_length.map(range_from_proto),
+            h2_params: p.h2_params,
         };
         validate_session_id(&cfg.session_id_table, cfg.session_id_length)?;
         Ok(cfg)
@@ -574,8 +580,8 @@ impl Config {
             x_padding_placement: self.x_padding_placement.clone(),
             x_padding_method: self.x_padding_method.clone(),
             uplink_http_method: self.uplink_http_method.clone(),
-            session_placement: self.session_placement.clone(),
-            session_key: self.session_key.clone(),
+            session_id_placement: self.session_placement.clone(),
+            session_id_key: self.session_key.clone(),
             seq_placement: self.seq_placement.clone(),
             seq_key: self.seq_key.clone(),
             uplink_data_placement: self.uplink_data_placement.clone(),
@@ -584,6 +590,7 @@ impl Config {
             server_max_header_bytes: self.server_max_header_bytes,
             session_id_table: self.session_id_table.clone(),
             session_id_length: self.session_id_length.map(range_to_proto),
+            h2_params: self.h2_params.clone(),
         }
     }
 }

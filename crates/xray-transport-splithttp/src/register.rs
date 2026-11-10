@@ -703,6 +703,19 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         x_padding_placement: get_str("xPaddingPlacement"),
         x_padding_method: get_str("xPaddingMethod"),
         uplink_http_method: get_str("uplinkHTTPMethod"),
+        // proto `bytes h2Params = 30`：Go conf 层是 `json.RawMessage`
+        // （infra/conf/transport_method.go:296 `H2Params json.RawMessage` → :499
+        // 原样赋给 proto bytes）——JSON 面是**裸 JSON**（如
+        // `"h2Params": {"maxConcurrentStreams": 100}`），不是 base64。
+        // 此处只做「值 → 字节」；是否为对象/是否可解析由 listener 启动期定夺
+        // （Go 同层：conf 层不拒，hub.go:559-565 unmarshal 才失败 ⇒ 启动失败）。
+        // `null` ⇒ 空（Go `json.Unmarshal("null", &cfg)` 是 no-op ⇒ 等同未配置）。
+        h2_params: match obj.get("h2Params") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => serde_json::to_vec(v).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("h2Params encode failed: {e}"))
+            })?,
+        },
         session_placement: get_str2("sessionIDPlacement", "sessionPlacement"),
         session_key: get_str2("sessionIDKey", "sessionKey"),
         seq_placement: get_str("seqPlacement"),
@@ -916,6 +929,7 @@ mod tests {
                "seqPlacement":"query","seqKey":"seq","uplinkDataPlacement":"query",
                "uplinkDataKey":"d","uplinkChunkSize":{"from":1000,"to":2000},
                "scStreamUpServerSecs":{"from":1,"to":2},"serverMaxHeaderBytes":8192,
+               "h2Params":{"maxConcurrentStreams":128},
                "xmux":{"maxConnections":{"from":2,"to":8},
                        "cMaxReuseTimes":{"from":3,"to":3},"hMaxRequestTimes":{"from":5,"to":6},
                        "hMaxReusableSecs":{"from":7,"to":8},"hKeepAlivePeriod":30},
@@ -941,6 +955,9 @@ mod tests {
         assert_eq!(cfg.uplink_chunk_size.as_ref().unwrap().from, 1000);
         assert_eq!(cfg.sc_stream_up_server_secs.as_ref().unwrap().to, 2);
         assert_eq!(cfg.server_max_header_bytes, 8192);
+        let h2: serde_json::Value =
+            serde_json::from_slice(&cfg.h2_params).expect("h2Params 是裸 JSON 字节");
+        assert_eq!(h2["maxConcurrentStreams"], 128);
         let xm = cfg.xmux.as_ref().unwrap();
         // maxConcurrency 与 maxConnections 互斥（Go transport_method.go:458-460 硬错），
         // 全字段用例只配后者；互斥本身由 `parse_xmux_rejects_concurrency_with_connections` 覆盖。
@@ -951,6 +968,44 @@ mod tests {
         assert_eq!(dl.config.path, "/dl");
         assert_eq!(dl.destination.port().value(), 8443);
         assert_eq!(dl.destination.address().to_string(), "dl.example.com");
+    }
+
+    /// bd zm2m2：`h2Params` JSON 面是**裸 JSON 对象**（Go conf 层 `json.RawMessage`，
+    /// `infra/conf/transport_method.go:296`/`:499` 原样进 proto bytes）——不是 base64。
+    #[test]
+    fn parse_splithttp_h2_params_raw_json_object() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"h2Params":{"maxConcurrentStreams":100,"maxReadFrameSize":1048576}}"#,
+        )
+        .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+        let params = crate::h2_params::H2Params::parse(&cfg.h2_params)
+            .expect("listener 层可解析")
+            .expect("已配置");
+        assert_eq!(params.max_concurrent_streams, Some(100));
+        assert_eq!(params.max_frame_size, Some(1_048_576));
+    }
+
+    /// 缺省 / `null` ⇒ 空字节 ⇒ 消费端 `None`（连接级 builder 零 setter）。
+    #[test]
+    fn parse_splithttp_h2_params_absent_or_null_is_empty() {
+        for json in [r#"{}"#, r#"{"h2Params":null}"#] {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
+            assert!(cfg.h2_params.is_empty(), "{json}");
+            assert!(crate::h2_params::H2Params::parse(&cfg.h2_params).expect("ok").is_none());
+        }
+    }
+
+    /// conf 层不判形态（Go 同层：`json.RawMessage` 收任何值），非对象值在 listener 启动期
+    /// 拒启——base64 字符串形态因此不会被误当配置接受。
+    #[test]
+    fn parse_splithttp_h2_params_non_object_rejected_at_listener() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"h2Params":"eyJtYXhDb25jdXJyZW50U3RyZWFtcyI6MTAwfQ=="}"#)
+                .unwrap();
+        let cfg = parse_splithttp_config(Some(&v)).expect("conf 层不拒");
+        assert!(crate::h2_params::H2Params::parse(&cfg.h2_params).is_err());
     }
 
     /// 票 037f：scMaxEachPostBytes JSON 灌入（此前只走 proto，JSON 恒默认 1MB）。

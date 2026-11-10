@@ -280,7 +280,8 @@ async fn listen_tcp(
     // 关闸档，ADR-0004 §2.2 Q1：不杀已建立连接，在途服务到 EOF）；Drop 不作中止
     // 保证（§2.2 Q3）。
     let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
-    let ctx = build_context(config, local, handler, &listener_scope);
+    let h2_params = parse_h2_params(config)?;
+    let ctx = build_context(config, local, handler, &listener_scope, h2_params);
     let hub_scope = ctx.sessions.scope().clone();
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
@@ -394,7 +395,8 @@ pub async fn listen_unix_splithttp(
             })
         });
     let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
-    let ctx = build_context(&config, local, handler, &listener_scope);
+    let h2_params = parse_h2_params(&config)?;
+    let ctx = build_context(&config, local, handler, &listener_scope, h2_params);
     // §3.5.6 ①类托管：hub 级托管口（同 TCP 路径：SessionMap 持弱引用，owner 在
     // listener 字段）。任务住在本账本里 ⇒ 只持弱引用句柄（B2 破环）。
     let hub_scope = ctx.sessions.scope().clone();
@@ -588,6 +590,8 @@ where
     // 装进 `http.Server.MaxHeaderBytes` —— 此前本栈该键零消费者（解析/归一化/单测俱全但
     // 没接线），Go 的 8KiB 头上界形同虚设。在 ctx 移入 svc 闭包前取值。
     let max_head_bytes = ctx.config.normalized_server_max_header_bytes().max(8192);
+    // `ctx` 随 `svc` 闭包移走 ⇒ 先取 h2Params（Go hub.go:559-565）。
+    let h2_params = ctx.h2_params.clone();
     let svc = service_fn(move |req| {
         let ctx = Arc::clone(&ctx);
         async move { Ok::<_, std::convert::Infallible>(handler::handle_request(req, peer, &ctx).await) }
@@ -642,6 +646,11 @@ where
                 // bd imhvg(b)：`serverMaxHeaderBytes` → SETTINGS_MAX_HEADER_LIST_SIZE
                 // （Go 把同一值给 http.Server.MaxHeaderBytes，h2 侧同样生效）。
                 .max_header_list_size(max_head_bytes as u32);
+            // h2Params（Go hub.go:559-565 `http.Server{HTTP2: cfg}`）：显式字段覆盖上面
+            // 各默认值；未配置 ⇒ `h2_params` 为 None ⇒ **零 setter**（默认行为逐字节不变）。
+            if let Some(p) = &h2_params {
+                p.apply(&mut builder.http2());
+            }
             let _ = builder.serve_connection(io, svc).await;
         }),
     );
@@ -975,7 +984,9 @@ async fn listen_h3(
     // §3.5.6 ①类托管：hub 级托管口（同 TCP/unix 路径：SessionMap 持弱引用，owner
     // 在本 listener 字段）；accept 泵与每 QUIC 连接任务只持弱引用句柄（B2 破环）。
     let listener_scope = xray_frame::scope::ComponentScope::new("splithttp-hub");
-    let ctx = build_context(config, local, handler, &listener_scope);
+    // h3 无 h2 面：Go 同样只在 tcp/unix 分支读 `h2Params`（hub.go:559-565 在
+    // `if l.listener != nil` 内）⇒ h3 不解析、不因此拒启。
+    let ctx = build_context(config, local, handler, &listener_scope, None);
     crate::LOG.info(format!("{local} listening QUIC for XHTTP/3"));
 
     let listener_endpoint = endpoint.clone();
@@ -1207,6 +1218,16 @@ impl hyper::body::Body for H3RecvBody {
 
 // ===== hub handler ↔ listener registry 适配 =====
 
+/// `h2Params` 解析（Go hub.go:559-565：listener 启动期解析，失败即启动失败）。
+///
+/// 在 `build_context` 之前调用 ⇒ 只有 h1/h2 监听解析（h3 传入 `None`，与 Go 的
+/// `if l.listener != nil` 分支同层）。
+fn parse_h2_params(config: &Config) -> io::Result<Option<Arc<crate::h2_params::H2Params>>> {
+    crate::h2_params::H2Params::parse(&config.h2_params)
+        .map(|p| p.map(Arc::new))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
+}
+
 /// 构造 hub handler 上下文（镜像 `HubListener::serve` 的构造）。
 ///
 /// `scope` 为 hub 账本 owner（在 listen 入口创建、由 listener 字段持有）；本上下文
@@ -1216,9 +1237,11 @@ fn build_context(
     local: SocketAddr,
     handler: ConnHandler,
     scope: &xray_frame::scope::ComponentScope,
+    h2_params: Option<Arc<crate::h2_params::H2Params>>,
 ) -> Arc<HandlerContext> {
     Arc::new(HandlerContext {
         config: Arc::clone(config),
+        h2_params,
         host: config.host.clone(),
         base_path: config.normalized_path(),
         local_addr: local,
@@ -1392,7 +1415,7 @@ mod tests {
         let handle = owner.downgrade();
         let config = Arc::new(crate::register::parse_splithttp_config(None).expect("parse config"));
         let (handler, _count) = greeting_handler();
-        let ctx = build_context(&config, "127.0.0.1:1".parse().unwrap(), handler, &owner);
+        let ctx = build_context(&config, "127.0.0.1:1".parse().unwrap(), handler, &owner, None);
 
         // 每连接任务形态：持 `Arc<HandlerContext>`（生产路径的捕获链）
         let conn_ctx = Arc::clone(&ctx);
@@ -1805,7 +1828,7 @@ mod tests {
         let config = Arc::new(crate::register::parse_splithttp_config(None).expect("parse config"));
         let (handler, _count) = greeting_handler();
         let owner = xray_frame::scope::ComponentScope::new("splithttp-hub-test");
-        let ctx = build_context(&config, server_addr, handler, &owner);
+        let ctx = build_context(&config, server_addr, handler, &owner, None);
         let gate = xray_transport::handshake_gate::HandshakeGate::new(1); // 容量 1：单名额可观测
         spawn_h3_accept(&owner, endpoint, Arc::clone(&gate), ctx);
 

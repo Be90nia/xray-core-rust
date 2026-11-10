@@ -40,6 +40,10 @@ use crate::{
 /// 处理器上下文（每个 listener 实例一份，Arc 共享给所有连接）。
 pub struct HandlerContext {
     pub config: Arc<Config>,
+    /// 服务端 h2 参数（`h2Params` = Go `http.HTTP2Config`）。`None` = 未配置/`null`
+    /// ⇒ 连接级 builder **零 setter**（默认行为逐字节不变）。listener 启动期解析一次，
+    /// 不进连接热路径（Go hub.go:559-565 同层）。
+    pub(crate) h2_params: Option<Arc<crate::h2_params::H2Params>>,
     pub host: String,
     pub base_path: String,
     pub local_addr: SocketAddr,
@@ -1053,6 +1057,7 @@ mod tests {
     fn make_ctx(host: &str) -> HandlerContext {
         HandlerContext {
             config: Arc::new(Config::default()),
+            h2_params: None,
             host: host.into(),
             // 生产恒为 `Config::normalized_path()`（首尾都带 `/`，缺省 "/"）。
             // 空串会让 path placement 的首个 split 段变成空串（Go 同样如此），
@@ -1242,6 +1247,7 @@ mod tests {
     async fn get_body_drop_removes_session_immediately() {
         let ctx = HandlerContext {
             config: Arc::new(Config::default()),
+            h2_params: None,
             host: String::new(),
             base_path: String::new(),
             local_addr: "127.0.0.1:1".parse().unwrap(),
