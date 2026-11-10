@@ -445,7 +445,7 @@ pub(crate) mod tests {
         let _guard = lock_env();
         clear_env();
         set_env(TUN_FD_KEYS[0], "7");
-        let err = crate::device::TunDevice::create("xrayfd", "10.0.0.1", 24, 1500)
+        let err = crate::device::TunDevice::create("xrayfd", "10.0.0.1", 24, 1500, &[])
             .err()
             .expect("env 给了 fd 而平台不支持 → 必须显式报错");
         assert!(format!("{err}").contains("xray.tun.fd"), "got: {err}");

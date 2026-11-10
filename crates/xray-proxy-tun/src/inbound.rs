@@ -254,6 +254,9 @@ impl TunInboundHandler {
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
         }
+        // 适配器地址归设备：设备关闭前清（Go Close 的 FlushIPAddresses 两族）。
+        #[cfg(target_os = "windows")]
+        sysroute::flush_adapter_addresses(&self.options);
         sysroute::set_outbound_iface(None);
         *self.device.lock() = None;
         let _ = device.close();
@@ -304,10 +307,23 @@ impl InboundHandler for TunInboundHandler {
             .ok_or_else(|| InboundError::ListenError("tun device config missing".into()))?;
 
         // 创建 TUN 设备（JSON name/mtu/gateway；缺省由 parse_json 归一化）
+        //
+        // 票 1qmer B-8：IPv6 双栈。能力门先于建设备——配了 IPv6 而系统禁用 ⇒ Err
+        // （否则 tun-rs 的 v6 地址下发只会抛含糊的 OS 错误，用户看不出根因）。
+        #[cfg(target_os = "windows")]
+        sysroute::ensure_ipv6_supported(cfg)
+            .map_err(|e| InboundError::ListenError(format!("tun ipv6: {e}")))?;
         let (v4_addr, v4_prefix) = cfg.device_ipv4();
+        let ipv6_addrs = cfg.ipv6_gateways();
         let device = Arc::new(
-            TunDevice::create(&cfg.name, &v4_addr.to_string(), v4_prefix, cfg.mtu as u16)
-                .map_err(|e| InboundError::ListenError(format!("tun device create: {e}")))?,
+            TunDevice::create(
+                &cfg.name,
+                &v4_addr.to_string(),
+                v4_prefix,
+                cfg.mtu as u16,
+                &ipv6_addrs,
+            )
+            .map_err(|e| InboundError::ListenError(format!("tun device create: {e}")))?,
         );
 
         // 启动设备
@@ -322,12 +338,12 @@ impl InboundHandler for TunInboundHandler {
 
         *self.device.lock() = Some(Arc::clone(&device));
 
-        // cv3w：适配器属性残余项（RouterDiscovery=Disabled，Go tun_windows.go:174-199；
-        // IP/MTU/Metric=0 已由 TunDevice::create 的 builder 覆盖）。失败不致命：
-        // 适配器刚建时 IP 接口条目可能暂不可枚举——1s 后重试一次（Go startOver
-        // 15×1s 的缩范围版，完整重试留下一片），仍失败告警继续启动。
+        // cv3w：适配器属性残余项（RouterDiscovery=Disabled + v6 的 DadTransmits=0，
+        // Go tun_windows.go:174-199；IP/MTU/Metric=0 已由 TunDevice::create 的 builder
+        // 覆盖）。失败不致命：适配器刚建时 IP 接口条目可能暂不可枚举——1s 后重试一次
+        // （Go startOver 15×1s 的缩范围版，完整重试留下一片），仍失败告警继续启动。
         #[cfg(target_os = "windows")]
-        sysroute::apply_adapter_props(&cfg.name);
+        sysroute::apply_adapter_props(cfg);
 
         // A3/A4：系统路由表 + 系统 DNS 接管——默认关闭（配置显式开启才动作）。
         // 接管前跑防环路验证（dns_verify），接管失败宁可无 TUN（对齐 Go
@@ -443,6 +459,10 @@ impl InboundHandler for TunInboundHandler {
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
         }
+        // 适配器地址（Go Close 的 `FlushIPAddresses`，两族）：适配器在进程退出后仍在，
+        // 地址不清就会跨配置叠加。必须在设备关闭之前（适配器还活着才能删）。
+        #[cfg(target_os = "windows")]
+        sysroute::flush_adapter_addresses(&self.options);
         // 出站绑定状态清零：controller 变 no-op，后续拨号回归系统路由表
         // （Go Close 不清，语义差异记录于报告；Rust 全局残留会错绑新流量）。
         sysroute::set_outbound_iface(None);

@@ -21,7 +21,14 @@
 //!
 //! - 路由：`autoSystemRoutingTable` 每条 CIDR → masked → 挂 TUN 接口 （Linux `Priority
 //!   1`，tun_linux.go:451-458；Windows `Metric 0` + 接口 metric
-//!   0，tun_windows.go:120-150）。失败宁可无 TUN（handler.go:196-205）。
+//!   0，tun_windows.go:120-150）。失败宁可无 TUN（handler.go:196-205）。 **两族都下发**：v4 →
+//!   `route.exe`，v6 → `netsh interface ipv6 add route` （`route.exe` 不认 v6）。
+//! - Windows IPv6 双栈（票 1qmer B-8）：地址由 [`crate::device::TunDevice::create`] 的 tun-rs
+//!   builder 下发（`CreateUnicastIpAddressEntry(AF_INET6)` = Go
+//!   `SetIPAddressesForFamily`，tun_windows.go:192-204）；适配器属性补 v6 侧
+//!   （`adapter_props_cmds`）；DNS 按族（[`executor::WindowsDns`]）；关闭侧清地址
+//!   （`flush_address_cmds` = Go `FlushIPAddresses`）。**配了 IPv6 而系统 `DisabledComponents`
+//!   关掉它 ⇒ 拒启**（`ensure_ipv6_supported`，Go 那边只记日志—— 本仓按票判 fail-loud）。
 //! - 出口接口：`findDefaultInterface` 排除回环/未 Up/TUN 自身/索引 0 （tun_linux.go:545-576）。
 //! - 系统 DNS：`autoSystemDnsToGateway`（默认 false，仅 Linux 语义）→ 源=gateway
 //!   首地址、指向=gateway 后继（tun_linux.go:47-64）→ **应用前防环路验证**
@@ -499,29 +506,48 @@ const ADAPTER_PROPS_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 
 /// Windows 适配器属性残余项的命令渲染（cv3w 纯函数面，测试断言命令行文本）。
 ///
-/// Go `ipif.RouterDiscoveryBehavior = RouterDiscoveryDisabled`（tun_windows.go:180）
-/// 的 CLI 等价；IP/`NLMTU`/`UseAutomaticMetric=false + Metric=0` 已由 tun-rs
-/// builder（`ipv4`/`mtu`/`metric`，`CreateUnicastIpAddressEntry` /
-/// `SetIpInterfaceEntry` API 面）覆盖，无需 netsh 重复。仅 IPv4：IPv6 禁用的
-/// 系统上无 v6 接口条目，命令必败（Go 对该场景显式 skip 该族）。
+/// Go `ipif.RouterDiscoveryBehavior = RouterDiscoveryDisabled` + `DadTransmits = 0`
+/// （tun_windows.go:180-181），按族各下发一次；IP/`NLMTU`/`UseAutomaticMetric=false +
+/// Metric=0` 已由 tun-rs builder（`ipv4`/`ipv6`/`mtu`/`metric`，
+/// `CreateUnicastIpAddressEntry` / `SetIpInterfaceEntry` API 面）覆盖，无需 netsh 重复。
+///
+/// `ipv6` = 配置里真有 v6（[`ipv6_configured`]）：仅在此时下发 v6 命令——IPv6 被系统
+/// 关掉的机器上 `netsh interface ipv6` 必败，无条件下发只是白发告警。
 ///
 /// 结构化 args 直接传进程（无 shell 解析），接口名含空格也安全，不加引号
 /// （与 [`executor`] 的 netsh 渲染约定一致）。
 #[cfg(target_os = "windows")]
-pub(crate) fn adapter_props_cmds(interface: &str) -> Vec<Cmd> {
-    vec![executor::Cmd::new(
+pub(crate) fn adapter_props_cmds(interface: &str, ipv6: bool) -> Vec<Cmd> {
+    // netsh `set interface` 的接口是**位置参数**（`set interface [interface=]<string>`），
+    // 没有 `name=` 参数——用 name= 会报 "name is not a valid argument"。
+    let mut cmds = vec![executor::Cmd::new(
         "netsh",
         vec![
             "interface".into(),
             "ipv4".into(),
             "set".into(),
             "interface".into(),
-            // netsh `set interface` 的接口是**位置参数**（`set interface [interface=]<string>`），
-            // 没有 `name=` 参数——用 name= 会报 "name is not a valid argument"。
             format!("interface={interface}"),
             "routerdiscovery=disabled".into(),
         ],
-    )]
+    )];
+    if ipv6 {
+        // 票 1qmer B-8：v6 侧同款关闭路由发现（否则 TUN 上跑 RA 会装出默认路由），
+        // 并关掉 DAD（重复地址检测窗口内地址处于 tentative，路由不可用）。
+        cmds.push(executor::Cmd::new(
+            "netsh",
+            vec![
+                "interface".into(),
+                "ipv6".into(),
+                "set".into(),
+                "interface".into(),
+                format!("interface={interface}"),
+                "routerdiscovery=disabled".into(),
+                "dadtransmits=0".into(),
+            ],
+        ));
+    }
+    cmds
 }
 
 /// 重试循环（纯逻辑，[`std::thread::sleep`] 由参数注入以便测试）：至多
@@ -551,8 +577,8 @@ pub(crate) fn retry_with_backoff(
 /// 适配器刚建时 IP 接口条目可能暂不可枚举，重试（`ADAPTER_PROPS_ATTEMPTS`）
 /// 仍失败仅记 error 继续启动（完整 startOver 15×1s 致命重试留待后续票）。
 #[cfg(target_os = "windows")]
-pub(crate) fn apply_adapter_props(interface: &str) {
-    let cmds = adapter_props_cmds(interface);
+pub(crate) fn apply_adapter_props(options: &StackOptions) {
+    let cmds = adapter_props_cmds(&options.name, ipv6_configured(options));
     let ok = retry_with_backoff(
         ADAPTER_PROPS_ATTEMPTS,
         ADAPTER_PROPS_BACKOFF,
@@ -561,9 +587,135 @@ pub(crate) fn apply_adapter_props(interface: &str) {
     );
     if !ok {
         crate::TUN_LOG.error(format!(
-            "tun adapter props (routerdiscovery) failed after retries; continuing (non-fatal) interface={interface}"
+            "tun adapter props (routerdiscovery) failed after retries; continuing (non-fatal) \
+             interface={}",
+            options.name
         ));
     }
+}
+
+// ===== 票 1qmer B-8：Windows IPv6 双栈（地址 / 路由 / DNS / 清理）=====
+
+/// 配置是否涉及 IPv6：`gateway` / `autoSystemRoutingTable` 的 v6 CIDR，或 `dns` 的 v6 地址。
+///
+/// 两个消费点：①能力门（配了 IPv6 而系统禁用它 ⇒ 拒启）；②v6 适配器属性只在真配了
+/// v6 时下发。路由与 DNS 的 v6 命令面本身由 [`plan_routes`]/[`plan_dns`] 按内容自动覆盖
+/// （v6 CIDR → `netsh interface ipv6`，v6 服务器 → v6 DNS 命令）。
+#[cfg(any(target_os = "windows", test))]
+fn ipv6_configured(options: &StackOptions) -> bool {
+    options
+        .gateway
+        .iter()
+        .chain(options.auto_system_routing_table.iter())
+        .any(|cidr| matches!(parse_ip_cidr(cidr), Some((IpAddr::V6(_), _))))
+        || options.dns.iter().any(|s| matches!(s.parse::<IpAddr>(), Ok(IpAddr::V6(_))))
+}
+
+/// 能力门失败文案（单测断言之；点名注册表位置与两条出路，用户才知道怎么救）。
+#[cfg(any(target_os = "windows", test))]
+const IPV6_DISABLED: &str = concat!(
+    "IPv6 is configured (gateway/autoSystemRoutingTable/dns) but this system has IPv6 disabled ",
+    "for non-tunnel interfaces (HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\\",
+    "DisabledComponents has bit 0x10): remove the IPv6 entries or re-enable IPv6 ",
+    "(Windows applies that at boot)",
+);
+
+/// IPv6 能力门（纯函数，`ipv6_off` 由调用方探测，便于离线单测）。
+///
+/// Go 对 v6 失败只记日志继续（tun_windows.go:156-165）；**本仓按票 1qmer B-8 判 fail-loud**：
+/// 配了双栈却只起来单栈是「沉默降级」，比拒启更难排查。
+#[cfg(any(target_os = "windows", test))]
+fn ipv6_gate(configured: bool, ipv6_off: bool) -> Result<()> {
+    if !configured || !ipv6_off {
+        return Ok(());
+    }
+    Err(TunError::InvalidConfig(IPV6_DISABLED.into()))
+}
+
+/// 启动侧能力门（Windows）：配置涉及 IPv6 而系统禁用 IPv6 ⇒ `Err`。
+///
+/// 必须在建适配器之前调用——否则 tun-rs 的 `CreateUnicastIpAddressEntry(AF_INET6)` 会先
+/// 以含糊的 OS 错误失败，用户看不出根因是系统级 IPv6 被关掉。
+#[cfg(target_os = "windows")]
+pub(crate) fn ensure_ipv6_supported(options: &StackOptions) -> Result<()> {
+    ipv6_gate(ipv6_configured(options), ipv6_off())
+}
+
+/// 读 `DisabledComponents`（`& 0x10` = 关掉非隧道接口的 IPv6，TUN 也在其中）。
+/// Go `ipv6Off()`（tun_windows.go:105-111）。
+///
+/// 读不到 / 类型不对 ⇒ 视为「未禁用」：真禁用的话后续 v6 命令会以真实错误浮现（不吞）；
+/// 读失败本身不足以断言禁用（Go 同款 fail-open）。
+#[cfg(target_os = "windows")]
+fn ipv6_off() -> bool {
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        System::Registry::{
+            HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, REG_DWORD, RegCloseKey, RegOpenKeyExW,
+            RegQueryValueExW,
+        },
+    };
+
+    let subkey: Vec<u16> =
+        "SYSTEM\\CurrentControlSet\\Services\\Tcpip6\\Parameters\0".encode_utf16().collect();
+    let value_name: Vec<u16> = "DisabledComponents\0".encode_utf16().collect();
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: subkey 以 NUL 结尾且存活到调用结束；成功时注册表 API 写入 key。
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) }
+        != ERROR_SUCCESS
+    {
+        return false;
+    }
+    let mut data: u32 = 0;
+    let mut size: u32 = std::mem::size_of::<u32>() as u32;
+    let mut ty: u32 = 0;
+    // SAFETY: key 为上一步成功打开的句柄；data/size/ty 指向本栈帧有效内存，
+    // size 声明 data 的容量 4 字节（REG_DWORD）。
+    let code = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null(),
+            &mut ty,
+            &mut data as *mut u32 as *mut u8,
+            &mut size,
+        )
+    };
+    // SAFETY: key 由 RegOpenKeyExW 成功返回，只关一次。
+    unsafe { RegCloseKey(key) };
+    code == ERROR_SUCCESS && ty == REG_DWORD && data & 0x10 != 0
+}
+
+/// 关闭侧地址清理命令（Go Close `FlushIPAddresses(AF_INET/AF_INET6)`，tun_windows.go:379-384）。
+///
+/// wintun 适配器在进程退出后仍然存在（下次启动按名复用）⇒ 地址不清就会跨配置叠加。
+/// Go 按 LUID 整族清；CLI 面按地址逐条删。
+///
+/// ⚠️ 两族的接口参数名**不同**（netsh 实测）：v4 收 `name=<iface>`，v6 收
+/// `interface=<iface>`（v6 写 `name=` 报「不是这个指令的有效参数」，v4 写 `interface=` 同理）。
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn flush_address_cmds(interface: &str, addrs: &[IpAddr]) -> Vec<Cmd> {
+    addrs
+        .iter()
+        .map(|addr| {
+            let (family, iface_arg) = if addr.is_ipv4() {
+                ("ipv4", format!("name={interface}"))
+            } else {
+                ("ipv6", format!("interface={interface}"))
+            };
+            executor::Cmd::new(
+                "netsh",
+                vec![
+                    "interface".into(),
+                    family.into(),
+                    "delete".into(),
+                    "address".into(),
+                    iface_arg,
+                    format!("address={addr}"),
+                ],
+            )
+        })
+        .collect()
 }
 
 /// 把本次接管的 DNS 服务器登记进进程级 skip 集合（Go `internet.SkipDNSServers`，
@@ -708,6 +860,9 @@ pub fn revert_changes_exec(
 /// 关闭侧接线（[`prepare`] 的逆操作）。回滚失败显式 `TUN_LOG.error` 上报
 /// （系统状态可能残留），但不阻塞设备关闭——对齐 Go Close 对 unset 错误的
 /// 记日志不中止语义（tun_linux.go:353-367）。
+///
+/// 只管路由与 DNS；**适配器地址**由设备下线路径清（`flush_adapter_addresses`）——
+/// 地址归设备、不归计划，且没配路由/DNS 时本函数根本不会被调用。
 pub(crate) fn revert(applied: &AppliedSystemChanges) {
     let (routes, dns) = default_executors();
     if let Err(e) = revert_changes_exec(applied, routes.as_deref(), dns.as_deref()) {
@@ -718,6 +873,30 @@ pub(crate) fn revert(applied: &AppliedSystemChanges) {
     // Go Close 无条件清除 skip 集合（tun_windows.go:360）：DNS 已不再指向 TUN，
     // 上一步 revert 失败也照样清（残留 skip 会让 Xray 的查询永久拒拨该服务器）。
     skip_dns_servers(&[]);
+}
+
+/// 删除本进程装到 TUN 适配器上的地址（Windows）。
+///
+/// 装的地址 = 设备 IPv4（`device_ipv4`：gateway 首个 v4，缺省 `10.0.0.1/24`）
+/// ∪ gateway 全部 v6（[`crate::config::StackOptions::ipv6_gateways`]）——与
+/// [`crate::device::TunDevice::create`] 下发的完全一致。
+///
+/// 调用点必须在设备关闭**之前**（适配器还活着才能删它的地址），且与「配没配路由/DNS」
+/// 无关——只要适配器是本进程建的，地址就得清（Go Close 无条件 `FlushIPAddresses`）。
+///
+/// 失败只记 warn：Go 丢弃 `FlushIPAddresses` 返回值（地址残留不致死，
+/// 下次 `CreateUnicastIpAddressEntry` 对已存在地址幂等），这里同样不阻塞关闭，
+/// 但**不静默**。
+#[cfg(target_os = "windows")]
+pub(crate) fn flush_adapter_addresses(options: &StackOptions) {
+    let (v4, _) = options.device_ipv4();
+    let mut addrs = vec![IpAddr::V4(v4)];
+    addrs.extend(options.ipv6_gateways().into_iter().map(|(a, _)| IpAddr::V6(a)));
+    for cmd in flush_address_cmds(&options.name, &addrs) {
+        if let Err(e) = cmd.run() {
+            crate::TUN_LOG.warn(format!("tun adapter address cleanup failed: {cmd}: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1209,13 +1388,77 @@ mod tests {
     // ===== cv3w：适配器属性命令渲染 + 重试纯逻辑 =====
 
     /// 命令构造：netsh routerdiscovery=disabled，结构化 args 无引号（netsh 渲染约定）。
+    /// 未配 IPv6 → 只下发 v4 一条（IPv6 被关掉的机器上 v6 命令必败，白打告警）。
     #[cfg(target_os = "windows")]
     #[test]
     fn adapter_props_commands_render_netsh_routerdiscovery() {
-        let cmds = adapter_props_cmds("xray0");
+        let cmds = adapter_props_cmds("xray0", false);
         assert_eq!(
             render(&cmds),
             vec!["netsh interface ipv4 set interface interface=xray0 routerdiscovery=disabled"]
+        );
+    }
+
+    /// 票 1qmer B-8：配了 IPv6 → 追加 v6 侧（routerdiscovery + dadtransmits）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn adapter_props_commands_add_ipv6_when_configured() {
+        let cmds = adapter_props_cmds("xray0", true);
+        assert_eq!(
+            render(&cmds),
+            vec![
+                "netsh interface ipv4 set interface interface=xray0 routerdiscovery=disabled",
+                "netsh interface ipv6 set interface interface=xray0 routerdiscovery=disabled \
+                 dadtransmits=0",
+            ]
+        );
+    }
+
+    // ===== 票 1qmer B-8：Windows IPv6 双栈 =====
+
+    /// `ipv6_configured` 覆盖面：gateway / autoSystemRoutingTable / dns 三处任一含 v6 即真。
+    #[test]
+    fn ipv6_configured_covers_gateway_routes_and_dns() {
+        let parse = |json: &[u8]| StackOptions::parse_json(json).unwrap();
+        assert!(!ipv6_configured(&parse(b"{}")), "全空配置不含 v6");
+        assert!(!ipv6_configured(&parse(
+            br#"{"gateway":["10.0.0.1/24"],"autoSystemRoutingTable":["0.0.0.0/0"],
+                "dns":["1.1.1.1"]}"#
+        )));
+        assert!(ipv6_configured(&parse(br#"{"gateway":["10.0.0.1/24","fd00::1/64"]}"#)));
+        assert!(ipv6_configured(&parse(br#"{"autoSystemRoutingTable":["::/0"]}"#)));
+        assert!(ipv6_configured(&parse(br#"{"dns":["1.1.1.1","2606:4700:4700::1111"]}"#)));
+    }
+
+    /// 能力门：配了 v6 + 系统禁用 ⇒ Err（fail-loud，不静默降级成单栈）；
+    /// 未配 v6 或系统未禁用 ⇒ Ok。
+    #[test]
+    fn ipv6_gate_rejects_configured_ipv6_when_system_disabled() {
+        let err = ipv6_gate(true, true).expect_err("配了 v6 而系统禁用必须拒启");
+        let msg = format!("{err}");
+        assert!(msg.contains("DisabledComponents"), "必须点名注册表位置: {msg}");
+        assert!(
+            msg.contains("Tcpip6\\Parameters\\DisabledComponents"),
+            "注册表路径必须完整（反斜杠不能丢）: {msg}"
+        );
+        assert!(msg.contains("0x10"), "必须点名禁用位: {msg}");
+        assert!(ipv6_gate(false, true).is_ok(), "没配 v6 就不关本仓的事");
+        assert!(ipv6_gate(true, false).is_ok(), "系统未禁用照常放行");
+        assert!(ipv6_gate(false, false).is_ok());
+    }
+
+    /// 关闭侧地址清理：两族命令面（Go Close `FlushIPAddresses` 的 CLI 等价）。
+    /// 接口参数名两族不同（v4 `name=` / v6 `interface=`）——已由 netsh 实测确认。
+    #[test]
+    fn flush_address_cmds_cover_both_families() {
+        let cmds =
+            flush_address_cmds("xray0", &["10.0.0.1".parse().unwrap(), "fd00::1".parse().unwrap()]);
+        assert_eq!(
+            render(&cmds),
+            vec![
+                "netsh interface ipv4 delete address name=xray0 address=10.0.0.1",
+                "netsh interface ipv6 delete address interface=xray0 address=fd00::1",
+            ]
         );
     }
 

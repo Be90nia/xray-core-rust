@@ -90,6 +90,9 @@ impl TunDevice {
     /// - `name`：设备名（Linux 自由命名；macOS 用 `utun` 前缀；Windows 由 wintun 决定）
     /// - `ipv4_addr`/`ipv4_prefix`：IPv4 地址与掩码长度（如 `("10.0.0.1", 24)`）
     /// - `mtu`：MTU，常见 1500
+    /// - `ipv6_addrs`：IPv6 地址与掩码长度（如 `[("fd00::1", 64)]`）。**仅 Windows 消费** （票
+    ///   1qmer B-8：Go `SetIPAddressesForFamily(AF_INET6)`，tun_windows.go:192-204）；
+    ///   其它平台地址归宿主/外部配置（Go Linux 同）。
     ///
     /// env 给了已打开 TUN fd（`xray.tun.fd`）时接管该 fd，地址/MTU 参数不生效；
     /// 非 Linux 平台直接报错。
@@ -98,6 +101,7 @@ impl TunDevice {
         ipv4_addr: &str,
         ipv4_prefix: u8,
         mtu: u16,
+        ipv6_addrs: &[(std::net::Ipv6Addr, u8)],
     ) -> Result<Self> {
         let name_str = name.into();
         // Go NewTun 首行（tun_linux.go:202 → openFromEnv）：env 给了既开 TUN fd 即
@@ -109,7 +113,7 @@ impl TunDevice {
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         crate::tun_fd::refuse_unsupported()?;
 
-        let dev = DeviceBuilder::new()
+        let builder = DeviceBuilder::new()
             .name(&name_str)
             .layer(Layer::L3)
             .ipv4(ipv4_addr, ipv4_prefix, None)
@@ -133,9 +137,18 @@ impl TunDevice {
                 // "The interface has been disabled"，tun/mod.rs:147-162）。
                 #[cfg(not(target_os = "linux"))]
                 let _ = b;
-            })
-            .build_async()
-            .map_err(|e| TunError::DeviceCreateFailed(format!("{e}")))?;
+            });
+        // 票 1qmer B-8：适配器 IPv6 地址 = Go `SetIPAddressesForFamily(AF_INET6)`
+        // （tun_windows.go:192-204）。tun-rs 走 `CreateUnicastIpAddressEntry`，已存在的
+        // 同地址条目不报错（ffi.rs:720-722，重启幂等）。失败即创建失败 —— 「系统禁用
+        // IPv6」的能力门已由调用方 `sysroute::ensure_ipv6_supported` 先行拦下。
+        #[cfg(target_os = "windows")]
+        let builder = ipv6_addrs.iter().fold(builder, |b, (addr, prefix)| b.ipv6(*addr, *prefix));
+        // 非 Windows：IPv6 地址归宿主/外部配置（Go Linux 同），本参数不消费。
+        #[cfg(not(target_os = "windows"))]
+        let _ = ipv6_addrs;
+        let dev =
+            builder.build_async().map_err(|e| TunError::DeviceCreateFailed(format!("{e}")))?;
         Ok(Self {
             dev,
             name: name_str,
@@ -392,7 +405,7 @@ mod tests {
             format!("xray{}", std::process::id() % 100)
         };
 
-        let dev = match TunDevice::create(&device_name, "10.0.99.1", 24, 1280) {
+        let dev = match TunDevice::create(&device_name, "10.0.99.1", 24, 1280, &[]) {
             Ok(d) => d,
             Err(e) => {
                 // CI/无权限环境——跳过而不失败（Go 端同样可能在 build_async 处失败）
@@ -428,7 +441,7 @@ mod tests {
             format!("xray_io_{}", std::process::id() % 100)
         };
 
-        let dev = match TunDevice::create(&device_name, "10.0.98.1", 24, 1280) {
+        let dev = match TunDevice::create(&device_name, "10.0.98.1", 24, 1280, &[]) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("SKIP: TUN create failed (likely no permission): {e}");
@@ -740,7 +753,7 @@ mod inherit_vnet_tests {
         let guard = crate::tun_fd::tests::lock_env();
         // SAFETY（edition 2024 set_var 为 unsafe）：测试进程内单键独占（持锁）。
         unsafe { std::env::set_var(TUN_FD_KEYS[0], tun_file.as_raw_fd().to_string()) };
-        let dev = TunDevice::create(&name, &tun_ip.to_string(), 24, 1500)
+        let dev = TunDevice::create(&name, &tun_ip.to_string(), 24, 1500, &[])
             .expect("继承 fd 必须被接管（bd y93up）");
         unsafe { std::env::remove_var(TUN_FD_KEYS[0]) };
         drop(guard);

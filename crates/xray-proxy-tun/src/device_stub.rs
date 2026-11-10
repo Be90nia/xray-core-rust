@@ -56,6 +56,7 @@ impl TunDevice {
         _ipv4_addr: &str,
         _ipv4_prefix: u8,
         _mtu: u16,
+        _ipv6_addrs: &[(std::net::Ipv6Addr, u8)],
     ) -> Result<Self> {
         let Some(inherited) = crate::tun_fd::inherit_from_env("")? else {
             return Err(TunError::DeviceCreateFailed(
@@ -170,6 +171,7 @@ impl TunDevice {
         _ipv4_addr: &str,
         _ipv4_prefix: u8,
         _mtu: u16,
+        _ipv6_addrs: &[(std::net::Ipv6Addr, u8)],
     ) -> Result<Self> {
         Err(TunError::DeviceCreateFailed(UNSUPPORTED.into()))
     }
@@ -228,8 +230,9 @@ mod tests {
     /// create 必须报 Unsupported 语义（DeviceCreateFailed + 宿主注入提示）。
     #[test]
     fn create_returns_unsupported() {
-        let err =
-            TunDevice::create("xray0", "10.0.0.1", 24, 1500).err().expect("stub create must fail");
+        let err = TunDevice::create("xray0", "10.0.0.1", 24, 1500, &[])
+            .err()
+            .expect("stub create must fail");
         assert!(format!("{err}").contains("VpnService"), "got: {err}");
     }
 }

@@ -284,6 +284,22 @@ impl StackOptions {
         self.ipv4_gateway().unwrap_or((std::net::Ipv4Addr::new(10, 0, 0, 1), 24))
     }
 
+    /// gateway 中全部 IPv6 CIDR（保持配置顺序）。
+    ///
+    /// 消费点：Windows 适配器地址（Go `SetIPAddressesForFamily(AF_INET6)`，
+    /// tun_windows.go:192-204）。非 Windows 不消费——地址归宿主/外部配置
+    /// （Go Linux 同，tun_linux.go 不设地址）。
+    #[must_use]
+    pub fn ipv6_gateways(&self) -> Vec<(std::net::Ipv6Addr, u8)> {
+        self.gateway
+            .iter()
+            .filter_map(|g| match parse_ip_cidr(g) {
+                Some((std::net::IpAddr::V6(a), p)) => Some((a, p)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// netstack 本地地址列表：gateway 全部 CIDR（v4+v6）；空则设备默认 v4。
     #[must_use]
     pub fn local_cidrs(&self) -> Vec<smoltcp::wire::IpCidr> {
@@ -697,6 +713,25 @@ mod tests {
             assert_eq!(addr, std::net::Ipv4Addr::new(10, 0, 0, 1));
             assert_eq!(prefix, 24);
         }
+    }
+
+    #[test]
+    fn ipv6_gateways_only_v6_keeps_order() {
+        let opts = StackOptions::parse_json(
+            br#"{"gateway":["172.16.0.1/24","fd00::1/64","10.0.0.1/8","2001:db8::1/32"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            opts.ipv6_gateways(),
+            vec![
+                (std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 64),
+                (std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 32),
+            ]
+        );
+        // 无 v6 gateway → 空（不是默认地址：Windows 只下发配置过的族，Go 同）。
+        let v4_only = StackOptions::parse_json(br#"{"gateway":["10.0.0.1/24"]}"#).unwrap();
+        assert!(v4_only.ipv6_gateways().is_empty());
+        assert!(StackOptions::parse_json(b"{}").unwrap().ipv6_gateways().is_empty());
     }
 
     #[test]

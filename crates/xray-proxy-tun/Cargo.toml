@@ -43,5 +43,8 @@ windows-sys = { workspace = true, features = [
   "Win32_Security_Authorization",
   "Win32_System_SystemInformation",
   "Win32_System_Rpc",
+  # 票 1qmer B-8：IPv6 能力探测读 HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters
+  # 的 DisabledComponents（Go `ipv6Off()`，tun_windows.go:105-111）。
+  "Win32_System_Registry",
 ] }
 uuid = { workspace = true }
