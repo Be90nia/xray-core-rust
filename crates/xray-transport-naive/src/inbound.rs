@@ -26,7 +26,6 @@ use http::{Method, StatusCode, header::PROXY_AUTHORIZATION};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use subtle::ConstantTimeEq;
-use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use xray_app_dispatcher::default::DispatchHandler;
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
@@ -82,10 +81,10 @@ impl NaiveInboundConfig {
 // ============================================================
 
 struct InboundSlot {
-    _accept_task: JoinHandle<()>,
-    /// §3.5.6 ①类托管：连接任务（h2 tunnel/mock relay）归本 scope。stop 面 =
-    /// `NaiveInboundHandler::close` 显式排空（`drain(100ms)`，ADR-0004 §2.2 Q2：
-    /// 唯一能声称「在途归零」的口）；Drop 不作中止保证（§2.2 Q3）。
+    /// §3.5.6 ①类托管：accept 泵 + 连接任务（h2 tunnel/mock relay）归本 scope。
+    /// stop 面 = `NaiveInboundHandler::close` 显式排空（`drain(100ms)` 连带中止
+    /// accept 泵，ADR-0004 §2.2 Q2：唯一能声称「在途归零」的口）；Drop 不作中止
+    /// 保证（§2.2 Q3）。
     ///
     /// 本 `Arc` 是账本的**唯一强引用**（owner，§2.2 Q5）：accept 泵与每连接任务
     /// 一律持 [`ComponentScope::downgrade`] 的弱引用句柄（B2 破环）⇒ 无自引用环；
@@ -144,9 +143,10 @@ impl NaiveInboundHandler {
 
 impl Drop for NaiveInboundHandler {
     fn drop(&mut self) {
-        if let Some(slot) = self.lock_slot().take() {
-            slot._accept_task.abort();
-        }
+        // 摘除 slot = 账本强引用归零；accept 泵随之出账本（泵与连接任务只持弱
+        // 引用句柄）。Drop **不作**中止保证（ADR-0004 §2.2 Q3）：显式停机走
+        // `close()` 的 drain。
+        drop(self.lock_slot().take());
     }
 }
 
@@ -181,12 +181,11 @@ impl InboundHandler for NaiveInboundHandler {
         let scope = Arc::new(xray_frame::scope::ComponentScope::new("naive-inbound"));
         let scope_for_slot = Arc::clone(&scope);
         let accept_scope = scope.downgrade();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：naive accept 泵，寿命 = 该 listener（close() 走 `_accept_task.abort()`）；目标托管口 = 该 listener slot 的 ComponentScope"
-        )]
-        let accept_task = tokio::spawn(async move {
-            loop {
+        // 泵住在本账本里（bd 29sgj）：停机经 `close()` 的 drain 连带中止，任务体只持
+        // 弱引用句柄（B2 破环）。
+        scope
+            .spawn(async move {
+                loop {
                 match listener.accept().await {
                     Ok((tcp, _peer)) => {
                         let acceptor = acceptor.clone();
@@ -246,8 +245,9 @@ impl InboundHandler for NaiveInboundHandler {
                     },
                 }
             }
-        });
-        *self.lock_slot() = Some(InboundSlot { _accept_task: accept_task, scope: scope_for_slot });
+            })
+            .expect("freshly created scope never closed");
+        *self.lock_slot() = Some(InboundSlot { scope: scope_for_slot });
         crate::LOG
             .info(format!("tag={} addr={} naive inbound listening", self.tag, self.bind_addr));
         Ok(())
@@ -257,9 +257,8 @@ impl InboundHandler for NaiveInboundHandler {
         // 先脱离锁再排空：temporary guard 若留在 if-let scrutinee 会跨 await 持锁。
         let slot = self.lock_slot().take();
         if let Some(slot) = slot {
-            slot._accept_task.abort();
-            // §3.5.6 ①类收口：关闸 + abort 在途（连接任务全 abortable ⇒ 立即归零）；
-            // 报告（panic 清单 / 未完成数）由托管口自行落日志，此处只吸收值。
+            // §3.5.6 ①类收口：关闸 + abort 在途（accept 泵与连接任务均 abortable ⇒
+            // 立即归零）；报告（panic 清单 / 未完成数）由托管口自行落日志，此处只吸收值。
             let _ = slot.scope.drain(std::time::Duration::from_millis(100)).await;
         }
         self.local_port.store(0, Ordering::SeqCst);
@@ -496,6 +495,40 @@ mod tests {
         (addr, pin, cert_der)
     }
 
+    /// close() 收口（bd 29sgj）：排空连带中止 accept 泵 ⇒ 端口释放，不再接新连接
+    /// （泵迁进账本后仍须保留 `close()` 停 accept 的对外行为）。
+    #[tokio::test]
+    async fn close_rejects_new_connections() {
+        let (config, _pin, _cert_der) = test_tls();
+        let handler = NaiveInboundHandler::new(
+            "naive-close",
+            "127.0.0.1:0".parse().unwrap(),
+            config,
+            test_auth(),
+        );
+        handler.start().await.expect("naive inbound start");
+        let addr = SocketAddr::from(([127, 0, 0, 1], handler.port()));
+        tokio::net::TcpStream::connect(addr).await.expect("close 前应可连接");
+
+        handler.close().await.expect("close");
+
+        // 泵中止 → TcpListener drop 是异步的：轮询直至 connect 被拒（取时走 clock 端口）。
+        let deadline =
+            xray_frame::compat::clock().now_instant() + std::time::Duration::from_secs(5);
+        loop {
+            match tokio::net::TcpStream::connect(addr).await {
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        xray_frame::compat::clock().now_instant() < deadline,
+                        "close 后端口仍接受连接（accept 泵未终止）"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                },
+            }
+        }
+    }
+
     /// ADR-0004 §2.6 A1：排空档 —— 在途连接任务（h2 服务 + 隧道）abortable，
     /// `drain` 后在途归零且报告无超时。
     #[tokio::test]
@@ -552,7 +585,6 @@ mod tests {
             .expect("tunnel");
 
         let slot = handler.lock_slot().take().expect("slot");
-        slot._accept_task.abort();
         drop(slot);
         assert!(weak.upgrade().is_none(), "账本强引用必须随 owner 归零（连接任务不得持有它）");
         drop(conn);

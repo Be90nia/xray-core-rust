@@ -21,6 +21,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 use xray_common::padding::validate_padding_len;
+use xray_frame::scope::ComponentScope;
 
 use crate::{
     config::{IDLE_CLEANUP_INTERVAL, TcpRequestPadding, UDP_MESSAGE_CHAN_SIZE},
@@ -785,12 +786,13 @@ impl InterConn {
 /// 每个 QUIC conn 一个 manager，接收 datagram → 按 session id 路由到 InterConn。
 pub struct UdpSessionManager {
     inner: Arc<TokioMutex<UdpSessionInner>>,
-    /// 后台清理任务句柄。
-    #[allow(dead_code)]
-    // 句柄随 manager 保活统一回收（abort 走 inner.closed 检查），本体无需读取
-    clean_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// 后台 recv 任务句柄。
-    #[allow(dead_code)] // 同 clean_handle，任务生命周期随 manager
+    /// §3.5.6 ①类托管口（bd fsdbw）：UDP idle 清理循环归本账本（寿命 =
+    /// manager）。**无 close 面**（ADR-0004 §2.2 Q1）：`close_all` 置 `inner.closed`
+    /// 后循环在下一 tick 自终；最后一份强引用归零时 `FxScope` drop 连带 abort 在途
+    /// （udf 语义）。
+    scope: ComponentScope,
+    /// 后台 recv 任务句柄（②豁免：数据面 datagram 接收泵）。
+    #[allow(dead_code)] // 任务生命周期随 manager
     run_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -836,7 +838,7 @@ impl UdpSessionManager {
         }));
         Arc::new(Self {
             inner,
-            clean_handle: tokio::sync::Mutex::new(None),
+            scope: ComponentScope::new("xray_frame::transport::hysteria:udp-idle-clean"),
             run_handle: tokio::sync::Mutex::new(None),
         })
     }
@@ -858,45 +860,52 @@ impl UdpSessionManager {
             g.udp_idle_timeout
         };
         let clean_inner = Arc::clone(&self.inner);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：UDP idle 会话清理循环，寿命 = `UdpSessionManager` 宿主（`clean_handle` 现手工持句柄）；目标托管口 = 宿主 ComponentScope"
-        )]
-        let clean_handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
-            // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let to_close = {
-                    let g = clean_inner.lock().await;
-                    if g.closed {
-                        return;
-                    }
-                    #[allow(
-                        clippy::disallowed_methods,
-                        reason = "UDP idle 清理墙钟取时；Clock 端口注入待 bd 39hko"
-                    )]
-                    let now = Instant::now();
-                    let mut out = Vec::new();
-                    for (id, sess) in &g.sessions {
-                        if now.duration_since(sess.last_active()) > timeout {
-                            out.push(*id);
+        // §3.5.6 ①类托管（bd fsdbw）：闸关（构造期不可达）时 fail-visible 留痕，
+        // 清理循环缺席 ⇒ idle 会话不回收，必须可诊断。
+        if self
+            .scope
+            .spawn(async move {
+                let mut ticker = tokio::time::interval(IDLE_CLEANUP_INTERVAL);
+                // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let to_close = {
+                        let g = clean_inner.lock().await;
+                        if g.closed {
+                            return;
+                        }
+                        #[allow(
+                            clippy::disallowed_methods,
+                            reason = "UDP idle 清理墙钟取时；Clock 端口注入待 bd 39hko"
+                        )]
+                        let now = Instant::now();
+                        let mut out = Vec::new();
+                        for (id, sess) in &g.sessions {
+                            if now.duration_since(sess.last_active()) > timeout {
+                                out.push(*id);
+                            }
+                        }
+                        out
+                    };
+                    for id in to_close {
+                        let sess = {
+                            let mut g = clean_inner.lock().await;
+                            g.sessions.remove(&id)
+                        };
+                        if let Some(s) = sess {
+                            let _ = s.close().await;
                         }
                     }
-                    out
-                };
-                for id in to_close {
-                    let sess = {
-                        let mut g = clean_inner.lock().await;
-                        g.sessions.remove(&id)
-                    };
-                    if let Some(s) = sess {
-                        let _ = s.close().await;
-                    }
                 }
-            }
-        });
+            })
+            .is_err()
+        {
+            crate::LOG.warn(format!(
+                "udp-idle-clean: scope closed at startup — idle UDP sessions will not be reclaimed (rejected {})",
+                self.scope.rejected_spawns()
+            ));
+        }
 
         let run_inner = Arc::clone(&self.inner);
         let run_conn = Arc::clone(&conn);
@@ -928,7 +937,6 @@ impl UdpSessionManager {
                 let _ = s.close().await;
             }
         });
-        *self.clean_handle.lock().await = Some(clean_handle);
         *self.run_handle.lock().await = Some(run_handle);
     }
 
@@ -1204,6 +1212,32 @@ mod tests {
         // 前 4 字节是 session id (100 big-endian)
         assert_eq!(&got[..4], &[0, 0, 0, 100]);
         assert_eq!(&got[4..], &[10, 20, 30]);
+    }
+
+    /// §3.5.6 ①类托管（bd fsdbw）：UDP idle 清理循环住 manager 账本、任务体不持
+    /// owner 强引用；`close_all` 置 closed 后循环在下一 tick 自终（账本排空）。
+    #[tokio::test(start_paused = true)]
+    async fn idle_cleanup_loop_is_hosted_and_stops_on_close() {
+        let local: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let conn: Arc<dyn QuicConn> =
+            Arc::new(NoopConn { local, remote, sent: parking_lot::Mutex::new(Vec::new()) });
+        let mgr = UdpSessionManager::new(Duration::from_secs(60), None);
+        assert_eq!(mgr.scope.in_flight(), 0, "构造期无任务");
+
+        mgr.start(conn, local, remote).await;
+        assert_eq!(mgr.scope.in_flight(), 1, "清理循环入托管账本（recv 泵为②豁免不入账）");
+        assert_eq!(mgr.scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
+
+        mgr.close_all().await;
+        tokio::time::advance(IDLE_CLEANUP_INTERVAL).await;
+        for _ in 0..32 {
+            if mgr.scope.in_flight() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mgr.scope.in_flight(), 0, "closed 后清理循环自终，账本排空");
     }
 
     #[tokio::test]

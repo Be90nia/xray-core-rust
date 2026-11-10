@@ -210,12 +210,10 @@ fn spawn_ws_accept_loop(
     // 连接（Go 26.10.17 `listener.Close()` 口径，在途服务到 EOF）；无 drain 面
     // ⇒ 不声称 abort；Drop 不作中止保证（ADR-0004 §2.2 Q3）。
     let scope = ComponentScope::new(format!("ws-accept:{ident}"));
-    let loop_scope = scope.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：ws accept 泵，寿命 = 该 listener（close() 走 `close_notify`）；目标托管口 = `WsTransportListener` 的 ComponentScope（scope.close_gate 已有）"
-    )]
-    let accept_loop_handle = tokio::spawn(async move {
+    // accept 泵住在同一本账（bd 29sgj）⇒ 泵内再 spawn 只持弱引用句柄（B2 破环）。
+    let loop_scope = scope.downgrade();
+    let accept_loop_handle = scope
+        .spawn(async move {
         // Arc<str>：每连接任务都要日志标识，克隆不分配。
         let ident: Arc<str> = Arc::from(log_ident);
         loop {
@@ -292,14 +290,14 @@ fn spawn_ws_accept_loop(
                 _ = close_notify_clone.notified() => break,
             }
         }
-    });
+        })
+        .expect("freshly created scope never closed");
     // 意外退出监控：循环只应经 close_notify 分支退出；panic（如 handler 回调
     // panic 沿任务栈炸掉 accept task）会静默杀掉监听——error! 兜底发声。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = ws accept 泵；目标托管口 = `WsTransportListener` 的 ComponentScope"
-    )]
-    tokio::spawn(supervise_accept_loop(tag, ident, accept_loop_handle));
+    // 监控与泵同账（bd 29sgj）：句柄两吃 `Spawned::join()`（TaskError 分类）。
+    scope
+        .spawn(supervise_accept_loop(tag, ident, accept_loop_handle.join()))
+        .expect("freshly created scope never closed");
 
     Box::new(WsTransportListener { local_addr, close_notify, scope })
 }

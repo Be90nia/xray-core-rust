@@ -114,28 +114,32 @@ async fn listen_hysteria(
 
     let local = listener.local_addr();
 
-    // 3. spawn accept loop。listener 句柄持 endpoint（Arc clone）+ abort 句柄：
-    // close() 先 abort 本循环，再触发 HysteriaQuicListener::close()（ep.close 强杀
-    // QUIC 栈——factory.listen 内层的 accept 循环因此 accept None 退出，endpoint
-    // 全部 clone 归零，driver 停、UDP socket 关、端口释放。修复前 close() 仅日志，
-    // endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
+    // 3. spawn accept loop。listener 句柄持 endpoint（Arc clone）+ 停机信号：
+    // close() 先唤醒本循环（泵退出），再触发 HysteriaQuicListener::close()（ep.close
+    // 强杀 QUIC 栈——factory.listen 内层的 accept 循环因此 accept None 退出，
+    // endpoint 全部 clone 归零，driver 停、UDP socket 关、端口释放。修复前 close()
+    // 仅日志，endpoint 永不释放成幽灵 inbound，对齐 Go hub.go Close=listener+tr.Close）。
     let quic_listener = listener.clone();
     // §3.5.6 ①类托管：每 QUIC 连接的桥接任务归本 listener 的 scope（stop 面 =
     // transport 族关闸档，ADR-0004 §2.2 Q1：关闸拒新、放行在途；无 drain 面）。
     let scope = xray_frame::scope::ComponentScope::new(format!("hysteria-accept:{local}"));
-    let conn_scope = scope.clone();
+    // 连接任务与 accept 泵同账（bd 29sgj）⇒ 泵体只持弱引用句柄（B2 破环）。
+    let conn_scope = scope.downgrade();
 
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：hysteria accept 泵，寿命 = 该 listener（close() 走 abort.abort()）；目标托管口 = `HysteriaTransportListener.scope`（已管连接任务，accept 泵本体未纳入）"
-    )]
-    let accept_task = tokio::spawn(async move {
+    // 停机信号：`close()` 唤醒 ⇒ 泵退出（`listener.close()` 关 QUIC 栈，端口释放）。
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_loop = Arc::clone(&stop);
+    let accept_task = scope
+        .spawn(async move {
         use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
         loop {
-            let conn = match listener.accept().await {
+            let conn = match tokio::select! {
+                r = listener.accept() => r,
+                _ = stop_loop.notified() => break,
+            } {
                 Ok(c) => c,
                 // 错误永不退出（accept_policy 铁律）：退出唯一来源是 close() 的
-                // abort 句柄——原 `Err(_) => break` 会因任何 accept 错误（含单连接
+                // 停机信号——原 `Err(_) => break` 会因任何 accept 错误（含单连接
                 // 级）静默杀死整个 hysteria 监听，无退避、无日志。
                 Err(e) => {
                     match classify(&e) {
@@ -167,21 +171,19 @@ async fn listen_hysteria(
                 ));
             }
         }
-    });
-    let abort = accept_task.abort_handle();
-    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听——
-    // error! 兜底发声。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = hysteria accept 泵；目标托管口 = `HysteriaTransportListener.scope`（supervise 句柄现无宿主持有）"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "hysteria",
-        local.to_string(),
-        accept_task,
-    ));
+        })
+        .expect("freshly created scope never closed");
+    // 意外退出监控（同账）：循环只应经 close() 的停机信号退出；panic 会静默杀掉
+    // 监听——error! 兜底发声。
+    scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "hysteria",
+            local.to_string(),
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
 
-    Ok(Box::new(HysteriaTransportListener { local, listener: quic_listener, abort, scope }))
+    Ok(Box::new(HysteriaTransportListener { local, listener: quic_listener, stop, scope }))
 }
 
 /// 单条 QUIC conn 内的 accept_bi 循环：把 client-initiated bi-stream 桥到 handler。
@@ -219,12 +221,14 @@ async fn accept_hysteria_conn(conn: Arc<dyn QuicConn>, handler: ConnHandler) {
 
 /// Hysteria transport listener 句柄。
 ///
-/// 持 QUIC endpoint（`HysteriaQuicListener` Arc clone）+ accept task abort 句柄；
+/// 持 QUIC endpoint（`HysteriaQuicListener` Arc clone）+ accept 泵停机信号；
 /// `close()` 二者皆触发，确定性释放端口。
 struct HysteriaTransportListener {
     local: SocketAddr,
     listener: Arc<dyn HysteriaQuicListener>,
-    abort: tokio::task::AbortHandle,
+    /// accept 泵停机信号（`close()` 唤醒 ⇒ 泵退出）。泵住在本 listener 的账本里
+    /// ⇒ 不强持 `Spawned`（禁双份账本）。
+    stop: Arc<tokio::sync::Notify>,
     /// §3.5.6 ①类托管：每 QUIC 连接桥接任务账本。stop 面 = transport 族关闸档
     /// （ADR-0004 §2.2 Q1）：`close()` 只关闸拒新、放行在途（Go 26.10.17
     /// `listener.Close()` 不杀已建立连接）；无 drain 面 ⇒ 不得声称 abort 在途
@@ -239,22 +243,32 @@ impl TransportListener for HysteriaTransportListener {
 
     fn close(&self) -> io::Result<()> {
         crate::LOG.info(format!("hysteria listener close addr={}", self.local));
-        self.abort.abort();
+        self.stop.notify_one();
         // 连接任务账本关闸（transport 族关闸档，ADR-0004 §2.2 Q1）：停机后拒新
         // 连接任务；在途任务不由此口 abort（Drop-abort 时点不确定，仅为实现事实）。
         self.scope.close_gate();
-        // trait close 是 async（内部 ep.close 同步生效）；TransportListener::close
-        // 是同步 fn，spawn 之。调用方均在 runtime 上下文（生产 instance close / 测试）。
-        // ②豁免：该任务是停机动作本身（关闭 QUIC endpoint），必须跑完才有端口释放，
-        // 不得随 listener 一起 abort。
-        let l = self.listener.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：停机动作（同步 close 桥 async ep.close）；现 spawn 后立即丢句柄 ⇒ 进程先退时优雅 QUIC close 静默丢失；目标托管口 = 停机编排窗（ComponentScope shutdown / ShutdownCoordinator），迁移另票"
-        )]
-        tokio::spawn(async move {
-            let _ = l.close().await;
-        });
+        // 停机动作本身（不是可托管任务，bd k5cr4）：`HysteriaQuicListener::close` 是 async
+        // 只为直译 Go `Close()`，唯一生产实现 `QuinnQuicListener::close` 的 future body 全
+        // 同步（`ep.close` + Ok）⇒ 首轮 poll 即完成，就地驱动。原 spawn 后立即丢句柄 ⇒ 进程
+        // 先退时优雅 QUIC close 静默丢失（端口不释放）；托管口语义是「取消在途」而非「保证
+        // 完成」，接不住这一步，故不入 ComponentScope。
+        let mut close_fut = self.listener.close();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // shortcut: 首轮 poll 必完成（当前唯一生产实现 body 无 await）；将来若引入真实
+        // await，须改走停机编排窗——此处打 ERROR 留痕，不做静默丢失。
+        match close_fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(Ok(())) => {},
+            std::task::Poll::Ready(Err(e)) => {
+                crate::LOG
+                    .error(format!("hysteria listener close failed addr={}: {e}", self.local));
+            },
+            std::task::Poll::Pending => {
+                crate::LOG.error(format!(
+                    "hysteria listener close pending after first poll addr={}: QUIC endpoint 未关闭（需停机编排窗）",
+                    self.local
+                ));
+            },
+        }
         Ok(())
     }
 }
@@ -613,13 +627,11 @@ mod tests {
             }
         }
 
-        // close() 要 abort 的 accept 泵句柄：本测试不跑泵，占一个待取消任务即可。
-        #[allow(clippy::disallowed_methods, reason = "测试：accept 泵句柄占位任务")]
-        let accept_pump = tokio::spawn(std::future::pending::<()>());
+        // accept 泵停机信号：本测试不跑泵，只验 close() 的关闸面。
         let listener = HysteriaTransportListener {
             local: "127.0.0.1:0".parse().expect("addr"),
             listener: Arc::new(StubQuicListener),
-            abort: accept_pump.abort_handle(),
+            stop: Arc::new(tokio::sync::Notify::new()),
             scope: xray_frame::scope::ComponentScope::new("hysteria-accept:a2-test"),
         };
 
@@ -646,5 +658,51 @@ mod tests {
         })
         .await
         .expect("关闸不得中止在途任务：放行后必须跑完（超时 = 被 abort 或被饿死）");
+    }
+
+    /// bd k5cr4：停机动作必须**就地跑完**——`close()` 返回时 QUIC endpoint close future
+    /// 的 body 已执行（原实现 spawn 后立即丢句柄 ⇒ 进程先退时优雅 close 静默丢失）。
+    #[tokio::test]
+    async fn close_drives_quic_close_inline() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        struct FlagListener(Arc<AtomicBool>);
+
+        impl HysteriaQuicListener for FlagListener {
+            fn accept(
+                &self,
+            ) -> Pin<Box<dyn Future<Output = io::Result<Arc<dyn QuicConn>>> + Send>> {
+                Box::pin(std::future::pending())
+            }
+
+            fn local_addr(&self) -> SocketAddr {
+                "127.0.0.1:0".parse().expect("addr")
+            }
+
+            fn close(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+                let flag = Arc::clone(&self.0);
+                Box::pin(async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        let closed = Arc::new(AtomicBool::new(false));
+        // accept 泵停机信号：本测试不跑泵，只验 close() 就地驱动 QUIC close。
+        let listener = HysteriaTransportListener {
+            local: "127.0.0.1:0".parse().expect("addr"),
+            listener: Arc::new(FlagListener(Arc::clone(&closed))),
+            stop: Arc::new(tokio::sync::Notify::new()),
+            scope: xray_frame::scope::ComponentScope::new("hysteria-close-inline"),
+        };
+
+        TransportListener::close(&listener).expect("close");
+        // 不 await 任何 yield 点：close 返回时 body 必须已跑完（spawn 形态此处必红）。
+        assert!(closed.load(Ordering::SeqCst), "close 返回时 QUIC close future 必须已执行完");
     }
 }

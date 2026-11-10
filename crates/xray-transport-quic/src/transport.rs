@@ -196,12 +196,15 @@ pub async fn listen(
 
     // endpoint clone 给 listener 句柄；本体 move 进 accept task。
     let listener_endpoint = endpoint.clone();
-    // rd8yj①：每监听握手并发闸 + 应用层握手窗（见 [`spawn_quic_accept`]）。
+    // 每连接握手闸 + 应用层握手窗（见 [`spawn_quic_accept`]）。
     // 闸容量 = MAX_INFLIGHT_HANDSHAKES，预算依据见其常量注释（handshake_gate 家族口径）。
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
-    spawn_quic_accept(endpoint, gate, handler);
+    // accept 泵托管口（§3.5.6 ①）：stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1）
+    // ——`close()` 关 QUIC 栈（accept 收 None）+ 关闸拒新。
+    let scope = xray_frame::scope::ComponentScope::new(format!("quic-accept:{local}"));
+    spawn_quic_accept(&scope, endpoint, gate, handler);
 
-    Ok(Box::new(QuicListener { local, endpoint: listener_endpoint }))
+    Ok(Box::new(QuicListener { local, endpoint: listener_endpoint, scope }))
 }
 
 /// 构建监听 endpoint（TLS + quicSettings transport config；`listen` 与测试共用）。
@@ -239,12 +242,14 @@ fn make_server_endpoint(
 ///   任务。QUIC 侧静默丢弃 = 对端收不到回应。
 /// - **握手窗**：per-conn 以 [`QUIC_HANDSHAKE_TIMEOUT`] 罩 `incoming.await`， 超时放弃——「发
 ///   Initial 不完成握手」的连接最多占在途名额一个窗的时间。
-fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handler: ConnHandler) {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：QUIC accept 泵，寿命 = 该 listener（close() 走 `endpoint.close()` ⇒ accept 收 None）；目标托管口 = QuicListener 的 ComponentScope"
-    )]
-    tokio::spawn(async move {
+fn spawn_quic_accept(
+    scope: &xray_frame::scope::ComponentScope,
+    endpoint: quinn::Endpoint,
+    gate: Arc<HandshakeGate>,
+    handler: ConnHandler,
+) {
+    scope
+        .spawn(async move {
         loop {
             let incoming = match endpoint.accept().await {
                 Some(c) => c,
@@ -283,7 +288,8 @@ fn spawn_quic_accept(endpoint: quinn::Endpoint, gate: Arc<HandshakeGate>, handle
                 }
             });
         }
-    });
+        })
+        .expect("freshly created scope never closed");
 }
 
 /// quinn (SendStream, RecvStream) + tokio DuplexStream 桥接的 Connection。
@@ -404,6 +410,9 @@ impl<E: Send + Sync + Unpin> Connection for QuicConn<E> {
 struct QuicListener {
     local: SocketAddr,
     endpoint: quinn::Endpoint,
+    /// accept 泵托管口（§3.5.6 ①）：泵住在本账本里；stop 面 = transport 族关闸档
+    /// （ADR-0004 §2.2 Q1）：只关闸拒新，在途连接由 `endpoint.close` 终结（quinn 语义）。
+    scope: xray_frame::scope::ComponentScope,
 }
 
 impl TransportListener for QuicListener {
@@ -412,6 +421,8 @@ impl TransportListener for QuicListener {
         // 立即关闭 QUIC 栈：accept 循环收到 None 退出，活跃连接全部断开，
         // UDP socket 释放（对齐 Go hysteria/hub.go Close=listener+transport+pktConn）。
         self.endpoint.close(quinn::VarInt::from_u32(0), b"listener closed");
+        // 托管口关闸：停机后拒新（泵退出后无新 acceptor，闸是终态标记）。
+        self.scope.close_gate();
         Ok(())
     }
 
@@ -753,7 +764,9 @@ mod tests {
         let addr = endpoint.local_addr().unwrap();
         let keepalive = endpoint.clone(); // endpoint 本体 move 进 accept 泵，clone 保活
         let gate = HandshakeGate::new(1); // 容量 1：单名额可观测占用/释放
-        spawn_quic_accept(endpoint, Arc::clone(&gate), echo_handler());
+        // 账本必须在测试存活期内持有：accept 泵住在它里面。
+        let scope = xray_frame::scope::ComponentScope::new("quic-accept:gate-test");
+        spawn_quic_accept(&scope, endpoint, Arc::clone(&gate), echo_handler());
 
         // 永挂验证器 + 完成信号（entered ⇒ 服务器已接纳该连接并回过飞行包）。
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();

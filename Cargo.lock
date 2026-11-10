@@ -6903,6 +6903,7 @@ dependencies = [
  "udf-std-ext",
  "xray-buf",
  "xray-common",
+ "xray-frame",
  "xray-proto",
  "xray-tls",
  "xray-transport",

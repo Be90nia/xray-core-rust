@@ -179,7 +179,7 @@ async fn log_xh_accept_err(e: &io::Error, tag: &str, log_ident: &str) {
 /// 连接获取 + Tcpmask wrap（仅 TCP 分支）。
 ///
 /// 返回 `None` = 该连接丢弃/accept 瞬时错误已分类退避，循环继续（错误永不
-/// 退出——退出唯一来源是 close() 的 abort 句柄）。
+/// 退出——退出唯一来源是 listener `close()` 的停机信号）。
 async fn accept_xh_conn(
     source: &XhSource,
     tcpmask: Option<&Arc<xray_transport::finalmask::TcpmaskManager>>,
@@ -284,51 +284,53 @@ async fn listen_tcp(
     let hub_scope = ctx.sessions.scope().clone();
     crate::LOG.info(format!("{local} listening TCP for XHTTP"));
 
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：splithttp TCP accept 泵，寿命 = 该 listener（close() 走 tcp_abort.abort()）；目标托管口 = 同函数已有的 ComponentScope `loop_scope`"
-    )]
-    let accept_task = tokio::spawn(async move {
-        loop {
-            // 连接获取 + Tcpmask wrap（仅 TCP 分支）；None = 丢弃继续（accept
-            // 瞬时错误已分类退避）。
-            let Some((stream, peer)) =
-                accept_xh_conn(&source, tcpmask.as_ref(), "splithttp", &local.to_string()).await
-            else {
-                continue;
-            };
-            let ctx = Arc::clone(&ctx);
-            let tls = tls_cfg.clone();
-            let rc = reality.clone();
-            let probe = reality_probe.clone();
-            // 闸关（停机中）：连接随 stream 释放，留可诊断日志（禁静默）。
-            if hub_scope
-                .spawn(async move {
-                    handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
-                })
-                .is_err()
-            {
-                crate::LOG.debug(format!(
-                    "splithttp: scope closed at shutdown, connection dropped — rejected {}",
-                    hub_scope.rejected_spawns()
-                ));
+    // accept 泵的停机信号：`close()` 唤醒 ⇒ 泵退出并 drop `source`（端口释放）。
+    // 泵住在 `listener_scope` 里 ⇒ 体只持弱引用句柄（B2 破环）。
+    let tcp_stop = Arc::new(tokio::sync::Notify::new());
+    let tcp_stop_loop = Arc::clone(&tcp_stop);
+    let accept_task = listener_scope
+        .spawn(async move {
+            let ident = local.to_string();
+            loop {
+                // 连接获取 + Tcpmask wrap（仅 TCP 分支）；None = 丢弃继续（accept
+                // 瞬时错误已分类退避）。
+                let accepted = tokio::select! {
+                    r = accept_xh_conn(&source, tcpmask.as_ref(), "splithttp", &ident) => r,
+                    _ = tcp_stop_loop.notified() => break,
+                };
+                let Some((stream, peer)) = accepted else {
+                    continue;
+                };
+                let ctx = Arc::clone(&ctx);
+                let tls = tls_cfg.clone();
+                let rc = reality.clone();
+                let probe = reality_probe.clone();
+                // 闸关（停机中）：连接随 stream 释放，留可诊断日志（禁静默）。
+                if hub_scope
+                    .spawn(async move {
+                        handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
+                    })
+                    .is_err()
+                {
+                    crate::LOG.debug(format!(
+                        "splithttp: scope closed at shutdown, connection dropped — rejected {}",
+                        hub_scope.rejected_spawns()
+                    ));
+                }
             }
-        }
-    });
-    let tcp_abort = accept_task.abort_handle();
-    // 意外退出监控：循环只应经 close() 的 abort 句柄退出；panic 会静默杀掉监听。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = TCP accept 泵；目标托管口 = 该 listener 的 ComponentScope（ctx 不可达只影响插件面，不影响 scope 托管）"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "splithttp",
-        local.to_string(),
-        accept_task,
-    ));
+        })
+        .expect("freshly created scope never closed");
+    // 意外退出监控：循环只应经 close() 的停机信号退出；panic 会静默杀掉监听。
+    listener_scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "splithttp",
+            local.to_string(),
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
     Ok(Box::new(SplithttpListener {
         local,
-        tcp_abort: Some(tcp_abort),
+        tcp_stop: Some(tcp_stop),
         h3_endpoint: None,
         scope: listener_scope,
     }))
@@ -401,47 +403,48 @@ pub async fn listen_unix_splithttp(
     // 恒等 manager 占位（unix 无 finalmask，入口已拒绝非空配置）。
     let tcpmask = Some(Arc::new(xray_transport::finalmask::TcpmaskManager::new(Vec::new())));
     let log_ident = path.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：splithttp unix accept 泵，寿命 = 该 listener（close() 走 tcp_abort.abort()）；目标托管口 = unix 分支 listener 的 ComponentScope"
-    )]
-    let accept_task = tokio::spawn(async move {
-        loop {
-            let Some((stream, peer)) =
-                accept_xh_conn(&source, tcpmask.as_ref(), "splithttp-unix", &log_ident).await
-            else {
-                continue;
-            };
-            let ctx = Arc::clone(&ctx);
-            let tls = tls_cfg.clone();
-            let rc = reality.clone();
-            let probe = reality_probe.clone();
-            if hub_scope
-                .spawn(async move {
-                    handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
-                })
-                .is_err()
-            {
-                crate::LOG.debug(format!(
-                    "splithttp unix: scope closed at shutdown, connection dropped — rejected {}",
-                    hub_scope.rejected_spawns()
-                ));
+    // 停机信号：`close()` 唤醒 ⇒ 泵退出并 drop unix listener（socket 释放）。
+    let tcp_stop = Arc::new(tokio::sync::Notify::new());
+    let tcp_stop_loop = Arc::clone(&tcp_stop);
+    let accept_task = listener_scope
+        .spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    r = accept_xh_conn(&source, tcpmask.as_ref(), "splithttp-unix", &log_ident) => r,
+                    _ = tcp_stop_loop.notified() => break,
+                };
+                let Some((stream, peer)) = accepted else {
+                    continue;
+                };
+                let ctx = Arc::clone(&ctx);
+                let tls = tls_cfg.clone();
+                let rc = reality.clone();
+                let probe = reality_probe.clone();
+                if hub_scope
+                    .spawn(async move {
+                        handle_accepted_stream(stream, peer, local, tls, rc, probe, ctx).await;
+                    })
+                    .is_err()
+                {
+                    crate::LOG.debug(format!(
+                        "splithttp unix: scope closed at shutdown, connection dropped — rejected {}",
+                        hub_scope.rejected_spawns()
+                    ));
+                }
             }
-        }
-    });
-    let abort = accept_task.abort_handle();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：unix accept 循环意外退出监控，寿命 = unix accept 泵；目标托管口 = unix 分支 listener 的 ComponentScope"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "splithttp-unix",
-        path,
-        accept_task,
-    ));
+        })
+        .expect("freshly created scope never closed");
+    // 意外退出监控（同账）：panic 静默杀掉监听 ⇒ error! 留痕（accept_policy 铁律 3）。
+    listener_scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "splithttp-unix",
+            path,
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
     Ok(Box::new(SplithttpListener {
         local,
-        tcp_abort: Some(abort),
+        tcp_stop: Some(tcp_stop),
         h3_endpoint: None,
         scope: listener_scope,
     }))
@@ -982,10 +985,10 @@ async fn listen_h3(
     let gate = xray_transport::handshake_gate::HandshakeGate::new(
         xray_transport::handshake_gate::effective_inflight_limit(),
     );
-    spawn_h3_accept(endpoint, gate, ctx);
+    spawn_h3_accept(&listener_scope, endpoint, gate, ctx);
     Ok(Box::new(SplithttpListener {
         local,
-        tcp_abort: None,
+        tcp_stop: None,
         h3_endpoint: Some(listener_endpoint),
         scope: listener_scope,
     }))
@@ -996,21 +999,19 @@ async fn listen_h3(
 /// 循环唯一合法退出是 listener `close()`（endpoint 关闭 → `accept` 返回 `None`）；
 /// panic 则监听静默消失——endpoint 的另一 clone 留在 `SplithttpListener` 里，
 /// UDP 端口仍绑定但永不 accept（`accept_policy` 铁律 3：意外退出必须 `error!` 留痕）。
-fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> + Send + 'static) {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：splithttp h3 QUIC accept 泵，寿命 = 该 listener（close() 走 endpoint.close()）；目标托管口 = h3 listener 的 ComponentScope"
-    )]
-    let accept_task = tokio::spawn(body);
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：h3 accept 循环意外退出监控（panic 留痕），寿命 = h3 accept 泵；目标托管口 = h3 listener 的 ComponentScope"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "splithttp-h3",
-        local.to_string(),
-        accept_task,
-    ));
+fn spawn_supervised_h3_accept(
+    scope: &xray_frame::scope::ComponentScope,
+    local: SocketAddr,
+    body: impl Future<Output = ()> + Send + 'static,
+) {
+    let accept_task = scope.spawn(body).expect("freshly created scope never closed");
+    scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "splithttp-h3",
+            local.to_string(),
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
 }
 
 /// H3 accept 泵 + 每连接握手并发闸 + 应用层握手窗（jcnjb⑤，rd8yj① 同款配方）。
@@ -1024,6 +1025,7 @@ fn spawn_supervised_h3_accept(local: SocketAddr, body: impl Future<Output = ()> 
 ///   `nameserver_quic.go:27` 口径）罩 `incoming.await`（quinn 握手）； 握手完成即 `drop(permit)`
 ///   让位，已建连接的活性归 idle 超时管。
 fn spawn_h3_accept(
+    scope: &xray_frame::scope::ComponentScope,
     endpoint: quinn::Endpoint,
     gate: std::sync::Arc<xray_transport::handshake_gate::HandshakeGate>,
     ctx: Arc<HandlerContext>,
@@ -1032,7 +1034,7 @@ fn spawn_h3_accept(
     // §3.5.6 ①类托管：hub 级托管口（每 QUIC 连接的握手+服务任务归它）；任务住在
     // 本账本里 ⇒ 只持弱引用句柄（B2 破环）。
     let hub_scope = ctx.sessions.scope().clone();
-    spawn_supervised_h3_accept(local, async move {
+    spawn_supervised_h3_accept(scope, local, async move {
         while let Some(incoming) = endpoint.accept().await {
             // jcnjb⑤：闸满即丢（不排队）；同步决策，超额连接不 spawn 任务。
             let Some(permit) = gate.try_admit() else {
@@ -1325,11 +1327,13 @@ impl Connection for DuplexConn {
 }
 
 /// listener 句柄。对应 Go `Listener`（h3listener/listener 二选一）。
-/// 两条监听形态各持一个关闭句柄：TCP 分支 abort accept task（TcpListener drop
-/// 释放端口），H3 分支直接关 QUIC endpoint（对齐 Go tr.Close()）。
+/// 两条监听形态各持一个关闭句柄：TCP 分支唤醒 accept 泵停机信号（泵退出 ⇒
+/// TcpListener drop 释放端口），H3 分支直接关 QUIC endpoint（对齐 Go tr.Close()）。
 struct SplithttpListener {
     local: SocketAddr,
-    tcp_abort: Option<tokio::task::AbortHandle>,
+    /// TCP/unix accept 泵停机信号（`close()` 唤醒 ⇒ 泵退出并 drop 监听 socket）。
+    /// 泵住在本 listener 的账本里 ⇒ 不强持 `Spawned`（禁双份账本）。
+    tcp_stop: Option<Arc<tokio::sync::Notify>>,
     h3_endpoint: Option<quinn::Endpoint>,
     /// §3.5.6 ①类托管：hub 级托管口（每连接任务账本）。**本字段是账本 owner**
     /// （唯一强引用，ADR-0004 §2.2 Q5；`SessionMap` 只持弱引用句柄 ⇒ 无自引用环，
@@ -1346,8 +1350,8 @@ impl TransportListener for SplithttpListener {
 
     fn close(&self) -> io::Result<()> {
         crate::LOG.info(format!("splithttp listener close addr={}", self.local));
-        if let Some(task) = &self.tcp_abort {
-            task.abort();
+        if let Some(stop) = &self.tcp_stop {
+            stop.notify_one();
         }
         if let Some(ep) = &self.h3_endpoint {
             ep.close(quinn::VarInt::from_u32(0), b"listener closed");
@@ -1492,7 +1496,9 @@ mod tests {
         // 注册全局 dispatcher 会 bump generation，强制全部 callsite 重算 interest。
         let _ = tracing::subscriber::set_global_default(CaptureLogs(Arc::clone(&logs)));
         let addr: SocketAddr = "127.0.0.1:8443".parse().expect("addr");
-        spawn_supervised_h3_accept(addr, async { panic!("h3 accept loop exploded") });
+        // 账本必须在测试存活期内持有：泵与监控都住在它里面。
+        let scope = xray_frame::scope::ComponentScope::new("splithttp-hub:supervise-test");
+        spawn_supervised_h3_accept(&scope, addr, async { panic!("h3 accept loop exploded") });
         // 监督 task 与被监督 task 的调度次序不确定：墙钟截止轮询等到监控落日志
         // （取时走 clock 端口，裸 Instant::now 被 lint 禁）
         let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
@@ -1801,7 +1807,7 @@ mod tests {
         let owner = xray_frame::scope::ComponentScope::new("splithttp-hub-test");
         let ctx = build_context(&config, server_addr, handler, &owner);
         let gate = xray_transport::handshake_gate::HandshakeGate::new(1); // 容量 1：单名额可观测
-        spawn_h3_accept(endpoint, Arc::clone(&gate), ctx);
+        spawn_h3_accept(&owner, endpoint, Arc::clone(&gate), ctx);
 
         // 永挂验证器客户端：占住唯一名额（entered ⇒ 服务器已接纳、许可已被占）。
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();

@@ -7,6 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use skeleton_infra::fx::Spawned;
 use tokio::{sync::watch, time::Duration};
 use tracing::{debug, info, warn};
 use xray_buf::{
@@ -17,6 +18,7 @@ use xray_buf::{
     writer::BufferedWriter,
 };
 use xray_common::net::{destination::Destination, network::Network};
+use xray_frame::scope::ComponentScope;
 
 use crate::{
     client::{Link, MUX_COOL_ADDRESS},
@@ -64,11 +66,18 @@ pub enum DispatchError {
 /// 对应 Go `mux.Server.Dispatch` 内部调用 `proxy.Dispatch` 的桥接逻辑。
 pub struct DispatchHandlerAdapter {
     handler: Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    /// §3.5.6 ①类托管口（bd fsdbw）：每连接 dispatch 泵归本账本。
+    ///
+    /// 寿命 = 返回给调用方的 Link（link 关闭 ⇒ handler 侧 pipe EOF ⇒ 泵自终）；条目
+    /// 由每次 spawn 前的收割出集，不随累计连接数增长。**无 close 面**（ADR-0004
+    /// §2.2 Q1）：停止只靠最后一份强引用归零 ⇒ `FxScope` drop 连带 abort 在途
+    /// （udf 语义），不作「Drop 保证中止」断言。
+    scope: ComponentScope,
 }
 
 impl DispatchHandlerAdapter {
     pub fn new(handler: Arc<dyn xray_app_dispatcher::DispatchHandler>) -> Self {
-        Self { handler }
+        Self { handler, scope: ComponentScope::new("xray_frame::mux:dispatch") }
     }
 }
 
@@ -88,13 +97,17 @@ impl Dispatcher for DispatchHandlerAdapter {
 
         let handler = Arc::clone(&self.handler);
         let dest_clone = dest.clone();
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判，原 bd kwevg ② 盖章已撤）：每连接 dispatch 泵，寿命 = 返回给调用方的 Link；目标托管口 = 该 mux 会话的 ComponentScope，迁移另票"
-        )]
-        tokio::spawn(async move {
-            handler.dispatch(&dest_clone, dispatch_link).await;
-        });
+        // §3.5.6 ①类托管（bd fsdbw）：闸关（本账本无 close 调用 ⇒ 不可达）时
+        // fail-visible 留痕，返回的 Link 随即 EOF。
+        if self
+            .scope
+            .spawn(async move {
+                handler.dispatch(&dest_clone, dispatch_link).await;
+            })
+            .is_err()
+        {
+            warn!("mux dispatch pump rejected: dispatch scope closed");
+        }
 
         Ok(return_link)
     }
@@ -138,6 +151,10 @@ pub struct ServerWorker {
     /// common/mux/server.go:189-192）：Some(net) 时 New 帧目标网络不匹配 →
     /// 错误 → run 退出拆整条 carrier。
     allowed_network: Option<xray_common::net::network::Network>,
+    /// §3.5.6 ①类托管口（bd fsdbw）：本 carrier 的监控 tick 任务账本（寿命 =
+    /// 会话）。**无 close 面**（ADR-0004 §2.2 Q1）：`close()` 经 done 广播让 tick
+    /// 自退出；最后一份强引用归零时 `FxScope` drop 连带 abort 在途（udf 语义）。
+    scope: ComponentScope,
 }
 
 impl ServerWorker {
@@ -156,6 +173,7 @@ impl ServerWorker {
             done_rx,
             read_source_and_local: false,
             allowed_network: None,
+            scope: ComponentScope::new("xray_frame::mux:carrier"),
         }
     }
 
@@ -209,27 +227,29 @@ impl ServerWorker {
     ///
     /// Go 双端从不发送 KeepAlive 帧；monitor 每 60s 快照 size/count，tick 时
     /// 「当前无会话 && 快照 size==0 && count 未变」→ 关闭整条 carrier
-    /// （done → 清理会话 + 丢弃 carrier 写端，Go :129-133）。返回 JoinHandle
-    /// 供调用方 abort。
+    /// （done → 清理会话 + 丢弃 carrier 写端，Go :129-133）。任务住本 worker 的
+    /// [`ComponentScope`]（§3.5.6 ①类，bd fsdbw），返回托管句柄供调用方 abort。
     pub fn spawn_monitor(
         &self,
         link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Spawned<()> {
         let session_manager = Arc::clone(&self.session_manager);
         let done_rx = self.done_rx.clone();
         let done_tx = self.done_tx.clone();
         let closed = Arc::clone(&self.closed);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：mux carrier 监控 tick，寿命 = 该会话（句柄现外返给会话持有并 abort）；目标托管口 = 会话 ComponentScope；interval_at 首参是 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改 deadline+pending 链会改 missed-tick(Burst) 与 done 响应语义）"
-        )]
-        tokio::spawn(async move {
+        self.scope
+            .spawn(async move {
             // Go time.Ticker 首 tick 在 60s 后；interval_at 对齐
             // W4 面 3 残余登记：`interval_at` 首参是 **tokio Instant 类型位**（非
             // "取时点"语义）——`BudgetDeadline` 不暴露 tokio Instant（`BudgetInstant`
             // 私有），且 select 臂 ticker 改写成 deadline+pending 链会改变 missed-tick
             //（Burst 补发）与 done 响应语义 = 非机械替换，方案面 3 风险节明令禁止 →
-            // 保留原形态。D8 起 L3 闸已禁 `tokio::time::Instant::now` → 由本项 allow 登记。
+            // 保留原形态。D8 起 L3 闸已禁 `tokio::time::Instant::now` → 由本项 allow
+            // 登记（本任务已迁托管口，本条只登记 tokio Instant 取时）。
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "mux carrier monitor 首 tick 需 tokio Instant 类型位（BudgetDeadline 不外露 tokio Instant，改 deadline+pending 链会改 missed-tick 与 done 响应语义）；D8 L3 闸登记项，与 spawn 无关"
+            )]
             let mut ticker = tokio::time::interval_at(
                 tokio::time::Instant::now() + SERVER_MONITOR_INTERVAL,
                 SERVER_MONITOR_INTERVAL,
@@ -259,7 +279,8 @@ impl ServerWorker {
                     }
                 }
             }
-        })
+            })
+            .expect("mux carrier scope is never closed")
     }
 
     /// Handle normal New frame (non-XUDP).
@@ -876,6 +897,33 @@ mod tests {
         monitor.abort();
     }
 
+    /// §3.5.6 ①类托管（bd fsdbw）：monitor tick 住 ServerWorker 账本、任务体不持
+    /// owner 强引用；宿主收口（`close()` 广播 done）后排空。
+    #[tokio::test]
+    async fn monitor_is_hosted_and_drained_on_close() {
+        let worker = Arc::new(ServerWorker::new(Arc::new(MockDispatcher)));
+        let (_r, w) = xray_buf::pipe::new();
+        let link_writer: Arc<tokio::sync::Mutex<Option<Box<dyn Writer>>>> =
+            Arc::new(tokio::sync::Mutex::new(Some(Box::new(w))));
+
+        assert_eq!(worker.scope.in_flight(), 0, "构造期无任务");
+        let monitor = worker.spawn_monitor(Arc::clone(&link_writer));
+        tokio::task::yield_now().await;
+        assert_eq!(worker.scope.in_flight(), 1, "monitor tick 入托管账本");
+        assert_eq!(worker.scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
+
+        worker.close();
+        for _ in 0..64 {
+            if worker.scope.in_flight() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(worker.scope.in_flight(), 0, "宿主收口后账本排空");
+        assert!(link_writer.lock().await.is_none(), "done 分支释放 carrier 写端");
+        monitor.abort();
+    }
+
     #[test]
     fn test_dispatch_error_display() {
         assert_eq!(
@@ -1149,6 +1197,49 @@ mod tests {
         );
         let result = adapter.dispatch(dest).await;
         assert!(result.is_ok(), "adapter should return a link");
+    }
+
+    /// §3.5.6 ①类托管（bd fsdbw）：每连接 dispatch 泵住 adapter 账本，任务体不持
+    /// owner 强引用（A4 环锚），关闸后拒发计数可见。
+    #[tokio::test]
+    async fn dispatch_pump_is_hosted_without_self_reference() {
+        use xray_app_dispatcher::default::DispatchHandler;
+        use xray_common::net::{address::Address, port::Port};
+
+        #[derive(Debug)]
+        struct HangingHandler;
+        impl DispatchHandler for HangingHandler {
+            fn tag(&self) -> &str {
+                "hanging"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &xray_common::net::destination::Destination,
+                _link: xray_transport::link::Link,
+            ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        fn dest() -> Destination {
+            Destination::new(
+                Address::new_domain("example.com".to_string()),
+                Port::new(443),
+                Network::TCP,
+            )
+        }
+
+        let adapter = DispatchHandlerAdapter::new(Arc::new(HangingHandler));
+        assert_eq!(adapter.scope.in_flight(), 0, "构造期无任务");
+        let link = adapter.dispatch(dest()).await.expect("adapter returns a link");
+        assert_eq!(adapter.scope.in_flight(), 1, "dispatch 泵入托管账本");
+        assert_eq!(adapter.scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
+
+        adapter.scope.close_gate();
+        let _link2 = adapter.dispatch(dest()).await.expect("link 仍返回（随即 EOF）");
+        assert_eq!(adapter.scope.rejected_spawns(), 1, "关闸后拒发计数可见（禁静默）");
+        drop(link);
     }
 
     /// huk7 回归：carrier 写停滞（write 永久 pending）时 `Session::close`

@@ -303,8 +303,8 @@ async fn listen_httpupgrade(
     // Go hub.go:117-121 + 90-94）。
     let mut server = HttpUpgradeServer::new(config);
     server.trusted_x_forwarded_for = sockopt.trusted_x_forwarded_for.clone();
-    // accept task 的 abort 句柄：close() 直接取消 task，parked 在 accept() 上的
-    // 循环被确定性解除，TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
+    // accept 泵的停机信号：close() 唤醒循环，parked 在 accept() 上的泵被确定性解除，
+    // TcpListener drop 即释放端口（对齐 Go hub.go Close()）。
     // 握手闸（判据 3）：并发有界 + 满即 fail-fast（不排队）；上界核算见
     // `xray_transport::handshake_gate::MAX_INFLIGHT_HANDSHAKES`。
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
@@ -313,7 +313,8 @@ async fn listen_httpupgrade(
     // `listener.Close()` 口径，在途服务到 EOF）；无 drain 面 ⇒ 不声称 abort；
     // Drop 不作中止保证（ADR-0004 §2.2 Q3）。
     let scope = ComponentScope::new(format!("httpupgrade-accept:{local}"));
-    let loop_scope = scope.clone();
+    // accept 泵住在同一本账（bd 29sgj）⇒ 泵内再 spawn 只持弱引用句柄（B2 破环）。
+    let loop_scope = scope.downgrade();
     let ctx = Arc::new(HandshakeCtx {
         accept_proxy,
         tcpmask,
@@ -323,48 +324,49 @@ async fn listen_httpupgrade(
         tag: "httpupgrade",
         handler,
     });
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：httpupgrade TCP accept 泵，寿命 = 该 listener（close() abort 该 task 释放端口）；目标托管口 = 同函数已有的 ComponentScope `loop_scope`（已接管握手任务，accept 泵本体未纳入）"
-    )]
-    let accept_task = tokio::spawn(async move {
-        loop {
-            // 只 accept 裸连接（零握手）；None = accept 瞬时错误已分类退避。
-            let Some(raw) =
-                accept_raw_upgrade_conn(&source, "httpupgrade", &local.to_string()).await
-            else {
-                continue;
-            };
+    // 停机信号：`close()` 唤醒 ⇒ 泵退出并 drop TcpListener（端口释放）。
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_loop = Arc::clone(&stop);
+    let accept_task = scope
+        .spawn(async move {
+            let ident = local.to_string();
+            loop {
+                // 只 accept 裸连接（零握手）；None = accept 瞬时错误已分类退避。
+                let accepted = tokio::select! {
+                    r = accept_raw_upgrade_conn(&source, "httpupgrade", &ident) => r,
+                    _ = stop_loop.notified() => break,
+                };
+                let Some(raw) = accepted else {
+                    continue;
+                };
 
-            // 握手移出 accept 循环（Go `keepAccepting` 的 `go s.Handle(conn)`）：
-            // 单条只连不握手的探测连接不再独占循环（bd 0wvne：好连接曾等 3696ms，
-            // PROXY 档无界）。闸满 ⇒ fail-fast 丢弃（drop = 对端见 FIN/RST）。
-            let Some(permit) = ctx.gate.try_admit() else {
-                ctx.gate.record_reject("httpupgrade");
-                continue;
-            };
-            let ctx = Arc::clone(&ctx);
-            // scope 已关（停机中）：托管口自身已 warn 留痕，连接随 raw 释放。
-            let _ = loop_scope.spawn(async move {
-                let _permit = permit;
-                run_handshake_task(raw, ctx).await;
-            });
-        }
-    });
+                // 握手移出 accept 循环（Go `keepAccepting` 的 `go s.Handle(conn)`）：
+                // 单条只连不握手的探测连接不再独占循环（bd 0wvne：好连接曾等 3696ms，
+                // PROXY 档无界）。闸满 ⇒ fail-fast 丢弃（drop = 对端见 FIN/RST）。
+                let Some(permit) = ctx.gate.try_admit() else {
+                    ctx.gate.record_reject("httpupgrade");
+                    continue;
+                };
+                let ctx = Arc::clone(&ctx);
+                // scope 已关（停机中）：托管口自身已 warn 留痕，连接随 raw 释放。
+                let _ = loop_scope.spawn(async move {
+                    let _permit = permit;
+                    run_handshake_task(raw, ctx).await;
+                });
+            }
+        })
+        .expect("freshly created scope never closed");
 
-    let abort = accept_task.abort_handle();
-    // 意外退出监控：循环只应经 close() 的 abort 退出；panic 会静默杀掉监听。
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：accept 循环意外退出监控，寿命 = accept 泵（循环退出即自终）；目标托管口 = 该 listener 的 ComponentScope（现 accept_task 句柄由 listener 持）"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "httpupgrade",
-        local.to_string(),
-        accept_task,
-    ));
+    // 意外退出监控（同账）：循环只应经 close() 的停机信号退出；panic 会静默杀掉监听。
+    scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "httpupgrade",
+            local.to_string(),
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
 
-    Ok(Box::new(HttpUpgradeListener { local, abort, scope }) as Box<dyn TransportListener>)
+    Ok(Box::new(HttpUpgradeListener { local, stop, scope }) as Box<dyn TransportListener>)
 }
 
 /// unix 路径 HTTPUpgrade 监听（对应 Go hub.go:134-139 `port == net.Port(0)`
@@ -403,7 +405,8 @@ async fn listen_unix_httpupgrade(
     let gate = HandshakeGate::new(xray_transport::handshake_gate::effective_inflight_limit());
     // 握手任务托管口：stop 面 = transport 族关闸档（ADR-0004 §2.2 Q1，同 TCP 路径）。
     let scope = ComponentScope::new(format!("httpupgrade-unix-accept:{log_ident}"));
-    let loop_scope = scope.clone();
+    // accept 泵住在同一本账 ⇒ 泵内再 spawn 只持弱引用句柄（B2 破环）。
+    let loop_scope = scope.downgrade();
     let ctx = Arc::new(HandshakeCtx {
         accept_proxy: false,
         tcpmask,
@@ -413,41 +416,43 @@ async fn listen_unix_httpupgrade(
         tag: "httpupgrade-unix",
         handler,
     });
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：httpupgrade unix accept 泵，寿命 = 该 listener（close() abort 该 task）；目标托管口 = unix 分支 listener 的 ComponentScope（该分支现无 scope）"
-    )]
-    let accept_task = tokio::spawn(async move {
-        loop {
-            let Some(raw) = accept_raw_upgrade_conn(&source, "httpupgrade-unix", &log_ident).await
-            else {
-                continue;
-            };
-            // 握手移出 accept 循环（Go `go s.Handle(conn)`）；闸满 fail-fast 丢弃。
-            let Some(permit) = ctx.gate.try_admit() else {
-                ctx.gate.record_reject("httpupgrade-unix");
-                continue;
-            };
-            let ctx = Arc::clone(&ctx);
-            let _ = loop_scope.spawn(async move {
-                let _permit = permit;
-                run_handshake_task(raw, ctx).await;
-            });
-        }
-    });
+    // 停机信号：`close()` 唤醒 ⇒ 泵退出并 drop unix listener（socket 释放）。
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_loop = Arc::clone(&stop);
+    let accept_task = scope
+        .spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    r = accept_raw_upgrade_conn(&source, "httpupgrade-unix", &log_ident) => r,
+                    _ = stop_loop.notified() => break,
+                };
+                let Some(raw) = accepted else {
+                    continue;
+                };
+                // 握手移出 accept 循环（Go `go s.Handle(conn)`）；闸满 fail-fast 丢弃。
+                let Some(permit) = ctx.gate.try_admit() else {
+                    ctx.gate.record_reject("httpupgrade-unix");
+                    continue;
+                };
+                let ctx = Arc::clone(&ctx);
+                let _ = loop_scope.spawn(async move {
+                    let _permit = permit;
+                    run_handshake_task(raw, ctx).await;
+                });
+            }
+        })
+        .expect("freshly created scope never closed");
 
-    let abort = accept_task.abort_handle();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：unix accept 循环意外退出监控，寿命 = unix accept 泵；目标托管口 = unix 分支 listener 的 ComponentScope（supervise 句柄现无宿主持有）"
-    )]
-    tokio::spawn(xray_transport::accept_policy::supervise_accept_loop(
-        "httpupgrade-unix",
-        path,
-        accept_task,
-    ));
+    // 意外退出监控（同账）：panic 静默杀掉监听 ⇒ error! 留痕（accept_policy 铁律 3）。
+    scope
+        .spawn(xray_transport::accept_policy::supervise_accept_loop(
+            "httpupgrade-unix",
+            path,
+            accept_task.join(),
+        ))
+        .expect("freshly created scope never closed");
 
-    Ok(Box::new(HttpUpgradeListener { local, abort, scope }) as Box<dyn TransportListener>)
+    Ok(Box::new(HttpUpgradeListener { local, stop, scope }) as Box<dyn TransportListener>)
 }
 
 /// unix 监听无 finalmask（入口已拒绝非空配置）：恒等空 manager 占位。
@@ -495,7 +500,9 @@ fn build_tls_server_config(
 /// HTTPUpgrade transport listener 句柄。
 struct HttpUpgradeListener {
     local: SocketAddr,
-    abort: tokio::task::AbortHandle,
+    /// accept 泵停机信号（`close()` 唤醒 ⇒ 泵退出并 drop 监听 socket）。泵住在
+    /// 本 listener 的账本里 ⇒ 不强持 `Spawned`（禁双份账本）。
+    stop: Arc<tokio::sync::Notify>,
     /// 在途握手任务的托管口：`close()` 关闸（拒新 spawn，放行在途）。stop 面 =
     /// transport 族关闸档（ADR-0004 §2.2 Q1）：不杀已建立连接；Drop 不作中止
     /// 保证（ADR-0004 §2.2 Q3）。
@@ -504,8 +511,8 @@ struct HttpUpgradeListener {
 
 impl TransportListener for HttpUpgradeListener {
     fn close(&self) -> io::Result<()> {
-        // 取消 accept task：正在 accept()/握手 await 中的循环被打断，端口释放。
-        self.abort.abort();
+        // 唤醒 accept 泵：循环退出 ⇒ 监听 socket drop，端口释放。
+        self.stop.notify_one();
         // 握手托管口关闸：停机后拒新握手任务（transport 族关闸档：在途按 Go 口径
         // 服务到 EOF，ADR-0004 §2.2 Q1；Drop 不作中止保证，§2.2 Q3）。
         self.scope.close_gate();
@@ -1472,12 +1479,10 @@ mod tests {
     async fn httpupgrade_listener_scope_a2_gate_closes_but_keeps_in_flight() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // close() 要 abort 的 accept 泵句柄：本测试不跑泵，占一个待取消任务即可。
-        #[allow(clippy::disallowed_methods, reason = "测试：accept 泵句柄占位任务")]
-        let accept_pump = tokio::spawn(std::future::pending::<()>());
+        // accept 泵停机信号：本测试不跑泵，只验 close() 的关闸面。
         let listener = HttpUpgradeListener {
             local: "127.0.0.1:0".parse().expect("addr"),
-            abort: accept_pump.abort_handle(),
+            stop: Arc::new(tokio::sync::Notify::new()),
             scope: ComponentScope::new("httpupgrade-accept:a2-test"),
         };
 

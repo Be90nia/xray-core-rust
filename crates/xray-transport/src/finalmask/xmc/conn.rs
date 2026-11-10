@@ -31,7 +31,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     sync::mpsc,
 };
-use xray_frame::deadline::Budget;
+use xray_frame::{deadline::Budget, scope::ComponentScope};
 
 use super::{
     super::AsyncIo,
@@ -724,15 +724,25 @@ pub(super) async fn tcp_bridge(
         run_encode_pump(pipe_r, tx_data, local_cp_id).await;
     });
 
+    // §3.5.6 ①类托管口（bd fsdbw）：服务端 keepalive tick 的账本（寿命 = 本会话）。
+    // owner 交给下面的 raw→pipe 读泵（其退出 = 数据面终止）；keeper 任务体只持 tx
+    // ⇒ 无自引用环。client 路径无 keepalive 任务，账本随同一读泵空转归零。
+    let keepalive_scope = ComponentScope::new("xray_frame::transport::finalmask:xmc-keepalive");
+    // 服务端 keep alive 循环：每 15s 发递增 id（对应 Go keepAliveLoop，仅 server）。
+    if !is_client {
+        spawn_server_keepalive(&keepalive_scope, tx_ka);
+    }
+
     // raw → pipe：解密读 MC 包循环，xmc:data payload 写回 pipe（对应 Go
     // packetStream.Read）；keep alive 客户端回显，其余包吞掉。任务退出（drop
     // pipe_w / tx）即向对端传导断连。
     let tx_read = tx;
     #[allow(
         clippy::disallowed_methods,
-        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw→pipe 解密读泵）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即解密读泵自终），坑约束⑫ 数据面零改动红线，不迁托管口"
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵任务（raw→pipe 解密读泵）；数据面泵：寿命 = 该连接 pipe 两端（EOF 即解密读泵自终），坑约束⑫ 数据面零改动红线，不迁托管口。另持本会话 keepalive 账本 owner（账本归零即 abort 该 tick）"
     )]
     tokio::spawn(async move {
+        let _keepalive_scope = keepalive_scope;
         let tx = tx_read;
         loop {
             let (id, data) = match read_packet_async(&mut dec_reader).await {
@@ -777,15 +787,15 @@ pub(super) async fn tcp_bridge(
             }
         }
     });
+}
 
-    // 服务端 keep alive 循环：每 15s 发递增 id（对应 Go keepAliveLoop，仅 server）。
-    if !is_client {
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：server CONNECT keepalive tick，寿命 = 该会话（会话关闭即退）；目标托管口 = 会话级 ComponentScope"
-        )]
-        tokio::spawn(async move {
-            let tx = tx_ka;
+/// 服务端 keepalive tick（对应 Go `keepAliveLoop`）：每 15s 发递增 id。
+///
+/// §3.5.6 ①类托管（bd fsdbw）：寿命 = 本会话，任务体只持发送端（不持账本 owner
+/// ⇒ 无自引用环）。闸关（构造期不可达）时 fail-visible 留痕。
+fn spawn_server_keepalive(scope: &ComponentScope, tx: mpsc::Sender<Vec<u8>>) {
+    if scope
+        .spawn(async move {
             let mut id: i64 = 0;
             loop {
                 tokio::time::sleep(KEEP_ALIVE_PERIOD).await;
@@ -803,13 +813,43 @@ pub(super) async fn tcp_bridge(
                     Err(_) => break,
                 }
             }
-        });
+        })
+        .is_err()
+    {
+        crate::LOG.warn("xmc: keepalive scope closed — server keepalive disabled");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{super::super::Tcpmask, *};
+
+    /// §3.5.6 ①类托管（bd fsdbw）：keepalive tick 住会话账本、任务体不持 owner；
+    /// 账本最后一份强引用归零 ⇒ tick 被 abort（不再发包）。
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_tick_is_hosted_and_aborts_with_ledger() {
+        let (tx, mut rx) = packet_channel();
+        let scope = ComponentScope::new("xmc-keepalive-test");
+        spawn_server_keepalive(&scope, tx);
+        assert_eq!(scope.in_flight(), 1, "keepalive tick 入托管账本");
+        assert_eq!(scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
+
+        // 先让 tick 跑一轮注册 sleep（虚拟时间此刻为 0），否则 advance 后注册的
+        // 定时器落在未来，永不到点。
+        tokio::task::yield_now().await;
+        tokio::time::advance(KEEP_ALIVE_PERIOD).await;
+        tokio::task::yield_now().await;
+        let mut sent = 0;
+        while rx.try_recv().is_ok() {
+            sent += 1;
+        }
+        assert!(sent >= 1, "周期到点发出 keepalive，实际 {sent}");
+
+        drop(scope);
+        tokio::time::advance(KEEP_ALIVE_PERIOD * 3).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "账本归零 ⇒ tick 已 abort，不再发包");
+    }
 
     fn test_config() -> Config {
         let password = "super-secure-shared-key-12345";

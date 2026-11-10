@@ -848,6 +848,15 @@ REASON_STR = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
 SPAWN_TEMPLATE_REASON = ("任务必须长于组件",)
 SPAWN_TEMPLATE_TRIPLE = ("进程级", "数据面逐包泵", "公开契约外返")
 
+# ①类待迁移存活站点基线（bd k5cr4）：门 (h) 旧口径只核「spawn ⊆ 登记集合」，①类欠账
+# 与②类豁免在门里不可区分 ⇒ 单列只读计数，只准下降、增长即红。
+# 口径 = **spawn 归属**的生产 allow reason（`scan_spawn_registrations`，已剥 cfg(test)/
+# 注释）；孤儿 allow（站点已迁走、无 spawn）不计入。
+# 演进：收到 bd k5cr4 时实测 22；同批 bd fsdbw(6 站)/29sgj(18 站)/k5cr4(1 站) 落地后
+# 实测 0 ⇒ 基线由 PM 统一下调到 0（只准下调，禁上调）：新增「①类待迁移」站点即红。
+CLASS1_DEBT_REASON = "①类待迁移"
+CLASS1_DEBT_BASELINE = 0
+
 # 文件级 allow 登记簿：只有本表列出的文件才允许用文件级 allow 覆盖生产 spawn
 # （每项写清为何无法逐站：站点数超分层阈值，且理由已在文件头成立）。
 # ⚠️ 值里**禁写站点处数**——处数由工具数出来（gate (h) 输出逐文件计数，bd fx93f：
@@ -1049,6 +1058,19 @@ def scan_spawn_registrations(
     return hits
 
 
+def count_class1_debt(root: Path, registry: dict[str, str] | None = None) -> int:
+    """生产面「①类待迁移」存活站点数（门 (h) 只读统计，bd k5cr4）。
+
+    只数生产 spawn 上覆盖 allow 的 reason（`scan_spawn_registrations` 已剥 cfg(test)
+    与注释）；①类站点收口后前缀消失 ⇒ 计数自然下降。
+    """
+    return sum(
+        1
+        for h in scan_spawn_registrations(root, registry)
+        if CLASS1_DEBT_REASON in h["reason"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # 门执行
 # ---------------------------------------------------------------------------
@@ -1189,8 +1211,21 @@ def gate_e(root: Path) -> tuple[bool, str]:
 
 
 def gate_h(root: Path, registry: dict[str, str] | None = None) -> tuple[bool, str]:
-    """(h) ②类 spawn 登记门：生产 spawn ⊆ 逐站/文件级 allow 登记集合（bd xosi9）。"""
+    """(h) ②类 spawn 登记门：生产 spawn ⊆ 逐站/文件级 allow 登记集合（bd xosi9）。
+
+    附只读统计：①类待迁移存活站点数不得超基线（bd k5cr4——旧口径下①类欠账与②类
+    豁免在门里不可区分）。
+    """
     hits = scan_spawn_registrations(root, registry)
+    class1 = sum(1 for h in hits if CLASS1_DEBT_REASON in h["reason"])
+    class1_msg = (
+        f"{CLASS1_DEBT_REASON}存活 {class1} 站 / 基线 ≤{CLASS1_DEBT_BASELINE}（bd k5cr4）"
+    )
+    if class1 > CLASS1_DEBT_BASELINE:
+        return False, (
+            f"FAIL (h) ①类欠账增长：{class1_msg}——新增「{CLASS1_DEBT_REASON}」站点即新增欠账；"
+            "直接落托管口（§3.5.6 ①类）或收口后同步下调 CLASS1_DEBT_BASELINE"
+        )
     bad = [
         h
         for h in hits
@@ -1217,11 +1252,12 @@ def gate_h(root: Path, registry: dict[str, str] | None = None) -> tuple[bool, st
             "（写在 spawn 所在函数体内）；"
             "①类站点写 `①类待迁移（bd xosi9 改判）：…；目标托管口 = …`"
         )
+        lines.append(f"  （{class1_msg}）")
         return False, "\n".join(lines)
     return True, (
         f"OK (h) ②类 spawn 登记门：生产 spawn {len(hits)} 处全部登记"
         f"（逐站 allow {len(hits) - len(file_level)} / 文件级登记 {len(file_level)} 处"
-        f"：{file_level_desc}；模板理由 0）"
+        f"：{file_level_desc}；模板理由 0）\n  OK (h) ①类欠账只读统计：{class1_msg}"
     )
 
 
@@ -1542,6 +1578,14 @@ def cmd_self_test() -> int:
             "}\n",
             encoding="utf-8",
         )
+        # bd k5cr4：①类待迁移存活站点计数（门 (h) 只读统计）——只数带该类前缀的 reason。
+        (src / "spawn_class1.rs").write_text(
+            "fn accept() {\n"
+            "    #[allow(clippy::disallowed_methods, reason = \"①类待迁移（bd xosi9 改判）：accept 泵；目标托管口 = 该 listener 的 ComponentScope\")]\n"
+            "    tokio::spawn(async {});\n"
+            "}\n",
+            encoding="utf-8",
+        )
         spawn_hits = {h["file"]: h["kind"] for h in scan_spawn_registrations(troot, registry={})}
         check(
             "(h) 紧邻 allow（实义理由）放行",
@@ -1575,6 +1619,10 @@ def cmd_self_test() -> int:
         check(
             "(h) allow 与 spawn 同函数体（含块级嵌套）⇒ 放行（bd fx93f 反向例）",
             spawn_hits.get("crates/fx/src/spawn_same_fn.rs") == "ADJACENT",
+        )
+        check(
+            "(h) ①类待迁移计数只数带前缀的生产站点（bd k5cr4）",
+            count_class1_debt(troot, registry={}) == 1,
         )
         check("(h) 有违规 ⇒ 门必须红", not gate_h(troot, registry={})[0])
 

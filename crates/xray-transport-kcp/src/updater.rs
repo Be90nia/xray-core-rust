@@ -25,6 +25,7 @@ use std::{
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use xray_frame::scope::ComponentScope;
 
 /// Updater 接口。
 pub trait Updater: Send + Sync {
@@ -43,12 +44,20 @@ pub trait Updater: Send + Sync {
 /// 调用方必须保证 `wake_up` 在 tokio runtime 上下文中调用（spawn 需要 runtime）。
 /// 若调用方在同步上下文中，需要先用 `tokio::spawn` 包一层。
 pub struct TokioUpdater {
-    interval: Mutex<Duration>,
-    running: AtomicBool,
+    /// `Arc` 共享给 tick 任务体（任务体不持 `Arc<Self>` ⇒ 无自引用环，
+    /// ADR-0004 §2.2 Q4 形态①）。
+    interval: Arc<Mutex<Duration>>,
+    /// 同上：任务体退出时复位 running，供下次 `wake_up_arc` 重新拉起。
+    running: Arc<AtomicBool>,
     notify: Notify,
     should_continue: Arc<dyn Fn() -> bool + Send + Sync>,
     should_terminate: Arc<dyn Fn() -> bool + Send + Sync>,
     update_func: Arc<dyn Fn() + Send + Sync>,
+    /// §3.5.6 ①类托管口（bd fsdbw）：keepalive/update tick 归本账本（寿命 = 持有
+    /// 本 updater 的 `KcpConnection`）。**无 close 面**（ADR-0004 §2.2 Q1）：循环经
+    /// `should_continue` 自终，宿主 release 后账本归零 ⇒ `FxScope` drop 连带 abort
+    /// 在途（udf 语义）。
+    scope: ComponentScope,
 }
 
 impl TokioUpdater {
@@ -60,16 +69,18 @@ impl TokioUpdater {
         update_func: impl Fn() + Send + Sync + 'static,
     ) -> Arc<Self> {
         Arc::new(Self {
-            interval: Mutex::new(interval),
-            running: AtomicBool::new(false),
+            interval: Arc::new(Mutex::new(interval)),
+            running: Arc::new(AtomicBool::new(false)),
             notify: Notify::new(),
             should_continue: Arc::new(should_continue),
             should_terminate: Arc::new(should_terminate),
             update_func: Arc::new(update_func),
+            scope: ComponentScope::new("xray_frame::transport::kcp:updater"),
         })
     }
 
-    /// 自引用 spawn：方法内克隆 Arc 并 spawn 一个 task。
+    /// 拉起 tick 任务：CAS 保证同一时刻只有一个 task 在跑，任务住
+    /// [`ComponentScope`]（§3.5.6 ①类，bd fsdbw），任务体只持所需状态副本。
     ///
     /// 必须在 tokio runtime 上下文调用。如果调用方在同步代码中，用
     /// `tokio::runtime::Handle::try_current()` 检查后再 spawn。
@@ -79,34 +90,47 @@ impl TokioUpdater {
             return;
         }
 
-        let this = Arc::clone(self);
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：kcp keepalive/update tick，寿命 = 该 KcpConnection（`should_terminate`/`should_continue` 判连接在否）；目标托管口 = 连接级 ComponentScope"
-        )]
-        tokio::spawn(async move {
-            if (this.should_terminate)() {
-                this.running.store(false, Ordering::SeqCst);
-                return;
-            }
-
-            let mut interval = tokio::time::interval(*this.interval.lock());
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            while (this.should_continue)() {
-                (this.update_func)();
-                interval.tick().await;
-                // 检查间隔是否被外部更新
-                let new_interval = *this.interval.lock();
-                if interval.period() != new_interval {
-                    interval = tokio::time::interval(new_interval);
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    interval.tick().await; // consume immediate tick
+        let this_running = Arc::clone(&self.running);
+        let this_interval = Arc::clone(&self.interval);
+        let should_terminate = Arc::clone(&self.should_terminate);
+        let should_continue = Arc::clone(&self.should_continue);
+        let update_func = Arc::clone(&self.update_func);
+        // §3.5.6 ①类托管（bd fsdbw）：任务体只持所需状态副本（不持 `Arc<Self>` ⇒
+        // 无自引用环）。闸关（本账本无 close 调用 ⇒ 不可达）时复位 running，让下次
+        // `wake_up_arc` 重试而不是把 updater 卡死。
+        if self
+            .scope
+            .spawn(async move {
+                if (should_terminate)() {
+                    this_running.store(false, Ordering::SeqCst);
+                    return;
                 }
-            }
 
-            this.running.store(false, Ordering::SeqCst);
-        });
+                let mut interval = tokio::time::interval(*this_interval.lock());
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                while (should_continue)() {
+                    (update_func)();
+                    interval.tick().await;
+                    // 检查间隔是否被外部更新
+                    let new_interval = *this_interval.lock();
+                    if interval.period() != new_interval {
+                        interval = tokio::time::interval(new_interval);
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        interval.tick().await; // consume immediate tick
+                    }
+                }
+
+                this_running.store(false, Ordering::SeqCst);
+            })
+            .is_err()
+        {
+            self.running.store(false, Ordering::SeqCst);
+            tracing::warn!(
+                "kcp updater: scope closed, update tick rejected (rejected {})",
+                self.scope.rejected_spawns()
+            );
+        }
     }
 }
 
@@ -238,6 +262,35 @@ mod tests {
 
         let calls = counter.load(Ordering::SeqCst);
         assert!(calls >= 1, "update_func 应被调用至少一次，实际 {calls}");
+    }
+
+    /// §3.5.6 ①类托管（bd fsdbw）：update tick 住 updater 账本、任务体不持
+    /// `Arc<Self>`（无自引用环）；宿主（updater）强引用归零 ⇒ 账本 drop 连带
+    /// abort 在途（tick 不再调用 update_func）。
+    #[tokio::test]
+    async fn update_tick_is_hosted_and_aborts_with_host() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = Arc::clone(&counter);
+        let u = TokioUpdater::new(
+            Duration::from_millis(5),
+            || true,
+            || false,
+            move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+
+        u.wake_up_arc();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(u.scope.in_flight(), 1, "tick 入托管账本");
+        assert_eq!(u.scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
+        assert!(counter.load(Ordering::SeqCst) >= 1, "tick 真在跑");
+
+        drop(u);
+        tokio::task::yield_now().await;
+        let after_drop = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), after_drop, "宿主收口后不再 tick");
     }
 
     #[tokio::test]

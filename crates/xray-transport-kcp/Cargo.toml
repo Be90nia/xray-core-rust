@@ -11,6 +11,9 @@ xray-common = { path = "../xray-common" }
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
 xray-tls = { path = "../xray-tls" }
+# §3.5.6 ①类托管（bd fsdbw）：updater tick 归连接级 ComponentScope
+# （xray-frame 组合包装 udf FxScope；派生层，无反向依赖）。
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

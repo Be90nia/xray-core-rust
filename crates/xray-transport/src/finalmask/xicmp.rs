@@ -42,6 +42,7 @@ use tokio::{
     sync::{Mutex as TokioMutex, mpsc},
     task::JoinHandle,
 };
+use xray_frame::scope::ComponentScope;
 
 use super::{UDP_SIZE, UdpIo, Udpmask};
 
@@ -269,8 +270,12 @@ pub struct XicmpPassthroughConn {
     /// 后台 recv 任务句柄；Drop 时 abort（对应 Go `Close()` 关闭 icmp4/icmp6 使
     /// 阻塞中的 recv goroutine 立即退出——否则任务要等下一个包到达才发现退出）。
     recv_task: Mutex<Option<JoinHandle<()>>>,
-    /// 后台 rec 清理任务句柄（仅 Server 构造，Go `clean()` goroutine）；Drop 时 abort。
-    clean_task: Mutex<Option<JoinHandle<()>>>,
+    /// 后台 rec 清理任务托管口（§3.5.6 ①类，bd fsdbw：寿命 = 本连接）。
+    ///
+    /// **无 async close 面**（ADR-0004 §2.2 Q1）：Drop 只能关闸；在途清理循环的终止
+    /// 靠「最后一份强引用归零 ⇒ `FxScope` drop 连带 abort」（任务体不持 owner ⇒ 无
+    /// 自引用环）。旧 `clean_task.abort()` 自持句柄已删（单账本）。
+    clean_scope: ComponentScope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +342,7 @@ impl XicmpPassthroughConn {
             server_state: None,
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
-            clean_task: Mutex::new(None),
+            clean_scope: ComponentScope::new("xray_frame::transport::finalmask:xicmp-clean"),
         }
     }
 
@@ -347,7 +352,8 @@ impl XicmpPassthroughConn {
         // server 仅放行 echo request（v4 type=8 / v6 type=128）
         let (rx, task) = spawn_recv_task(raw.clone(), false, ips.into());
         let state = Arc::new(Mutex::new(XicmpServerState::default()));
-        let clean_task = spawn_clean_task(state.clone());
+        let clean_scope = ComponentScope::new("xray_frame::transport::finalmask:xicmp-clean");
+        spawn_clean_task(&clean_scope, state.clone());
         Self {
             mode: XicmpMode::Server,
             raw,
@@ -356,7 +362,7 @@ impl XicmpPassthroughConn {
             server_state: Some(state),
             closed: Mutex::new(false),
             recv_task: Mutex::new(Some(task)),
-            clean_task: Mutex::new(Some(clean_task)),
+            clean_scope,
         }
     }
 }
@@ -423,33 +429,40 @@ const SERVER_REC_TTL: Duration = Duration::from_secs(60);
 /// 独立清理 ticker 周期（Go `server.go:75` `time.NewTicker(time.Minute / 2)`）。
 const SERVER_CLEAN_INTERVAL: Duration = Duration::from_secs(30);
 
-/// spawn 独立 rec 清理任务（Go `server.go:74,91-107` `clean()` goroutine）：
+/// spawn 独立 rec 清理任务到连接账本（Go `server.go:74,91-107` `clean()` goroutine）：
 /// 每 30s 扫一遍 rec，驱逐空闲超 60s 的记录——清理节奏独立于收发包路径，
 /// 单向 echo 洪水（只 insert、永不触发 send 路径）不再无界增长（bd 8kaea）。
-fn spawn_clean_task(state: Arc<Mutex<XicmpServerState>>) -> JoinHandle<()> {
-    spawn_clean_task_with(state, SERVER_CLEAN_INTERVAL, SERVER_REC_TTL)
+fn spawn_clean_task(scope: &ComponentScope, state: Arc<Mutex<XicmpServerState>>) {
+    spawn_clean_task_with(scope, state, SERVER_CLEAN_INTERVAL, SERVER_REC_TTL)
 }
 
 /// [`spawn_clean_task`] 的周期/TTL 可注入版——仅测试用，生产恒走 Go 对齐常量。
 fn spawn_clean_task_with(
+    scope: &ComponentScope,
     state: Arc<Mutex<XicmpServerState>>,
     interval: Duration,
     ttl: Duration,
-) -> JoinHandle<()> {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：xicmp 记录 TTL 清理循环，寿命 = 该 `XicmpPassthroughConn`（Drop 现手工 abort `clean_handle`）；目标托管口 = 连接级 ComponentScope"
-    )]
-    tokio::spawn(async move {
-        // Delay：错过 tick 顺延，不补发（Go time.Ticker 丢错过 tick 同语义）
-        let mut tick = tokio::time::interval(interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let now = xray_frame::compat::clock().now_instant();
-            state.lock().rec.retain(|_, r| now.duration_since(r.last) <= ttl);
-        }
-    })
+) {
+    // §3.5.6 ①类托管（bd fsdbw）：闸关只可能来自本连接 Drop（构造期不可达）⇒
+    // fail-visible 留痕，禁静默丢掉清理循环（rec 会无界增长）。
+    if scope
+        .spawn(async move {
+            // Delay：错过 tick 顺延，不补发（Go time.Ticker 丢错过 tick 同语义）
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let now = xray_frame::compat::clock().now_instant();
+                state.lock().rec.retain(|_, r| now.duration_since(r.last) <= ttl);
+            }
+        })
+        .is_err()
+    {
+        crate::hot_log!(
+            tracing::Level::WARN,
+            "xicmp: clean task rejected (connection scope closed) — rec entries will not be reclaimed"
+        );
+    }
 }
 
 impl Drop for XicmpPassthroughConn {
@@ -459,11 +472,10 @@ impl Drop for XicmpPassthroughConn {
         if let Some(handle) = self.recv_task.lock().take() {
             handle.abort();
         }
-        // 独立清理任务一并终止（Go clean() 经 closeCh 退出）；否则任务持有
-        // Arc<ServerState> 永续 tick，连接关闭后泄漏。
-        if let Some(handle) = self.clean_task.lock().take() {
-            handle.abort();
-        }
+        // 独立清理任务：关闸 + 最后一份强引用归零 ⇒ 账本 drop 连带 abort 在途
+        // （ADR-0004 §2.2 Q3 的可证伪表述；任务体不持 owner ⇒ 无自引用环）。
+        // 否则任务持有 Arc<ServerState> 永续 tick，连接关闭后泄漏。
+        self.clean_scope.close_gate();
     }
 }
 
@@ -1373,7 +1385,12 @@ mod tests {
             .collect();
         let mock = Arc::new(MockIcmpRawSocket::new(seeds));
         let conn = XicmpPassthroughConn::new_server(mock.clone(), vec![]);
-        assert!(conn.clean_task.lock().is_some(), "server 构造必须挂上独立清理任务");
+        assert_eq!(
+            conn.clean_scope.in_flight(),
+            1,
+            "server 构造必须挂上独立清理任务（连接账本内）"
+        );
+        assert_eq!(conn.clean_scope.live_refs(), 1, "任务体不持 owner ⇒ 无自引用环");
 
         // 64 个不同 clientID 的单向包 → 64 条 rec
         let mut buf = [0u8; 64];
@@ -1384,13 +1401,37 @@ mod tests {
         assert_eq!(state.lock().rec.len(), 64, "每包一条 rec 条目");
 
         // 清理周期过后：空闲条目全部回收；期间无新包，条目只减不增（不发包不泄漏）
-        let _clean = spawn_clean_task_with(
+        let clean_scope = ComponentScope::new("xicmp-clean-test");
+        spawn_clean_task_with(
+            &clean_scope,
             state.clone(),
             Duration::from_millis(20),
             Duration::from_millis(50),
         );
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(state.lock().rec.len(), 0, "空闲超 TTL 的条目应被独立清理任务回收");
+    }
+
+    /// §3.5.6 ①类托管（bd fsdbw）：连接 Drop 关闸 + 账本最后一份强引用归零 ⇒ 清理
+    /// 任务被 abort（`state` 强引用随之消失 = 任务确实不再存活）。
+    #[tokio::test]
+    async fn clean_task_ends_with_connection() {
+        let mock = Arc::new(MockIcmpRawSocket::new(vec![]));
+        let conn = XicmpPassthroughConn::new_server(mock, vec![]);
+        let probe = Arc::downgrade(conn.server_state.as_ref().unwrap());
+        assert_eq!(conn.clean_scope.in_flight(), 1, "清理任务在账本内");
+
+        drop(conn);
+        for _ in 0..64 {
+            if probe.upgrade().is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            probe.upgrade().is_none(),
+            "连接 Drop 后清理任务不再持 state（账本归零 ⇒ abort 在途）"
+        );
     }
 
     #[tokio::test]
@@ -1404,7 +1445,9 @@ mod tests {
         let (_n, vaddr) = conn.recv_from(&mut buf).await.unwrap();
 
         let state = conn.server_state.as_ref().unwrap().clone();
-        let _clean = spawn_clean_task_with(
+        let clean_scope = ComponentScope::new("xicmp-clean-test");
+        spawn_clean_task_with(
+            &clean_scope,
             state.clone(),
             Duration::from_millis(20),
             Duration::from_millis(10_000),
