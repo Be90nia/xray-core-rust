@@ -659,8 +659,7 @@ pub(crate) fn parse_udp443_policies(
 /// 出站级 mux.enabled 包装（w1l8，Go `senderSettings.MultiplexSettings`，
 /// `app/proxyman/outbound/handler.go:123-145`）：任意协议出站带
 /// `"mux": {"enabled": true}` 时 dispatch 包一层 [`MuxBridge`]——concurrency
-/// <0 完全禁用不包装，其余按 Go 门控改写（0..=128 → 128，见
-/// [`outbound_mux_concurrency`]）。底层 handler 为出站自身，
+/// 0→8（Go "same as before"）、<0 完全禁用不包装。底层 handler 为出站自身，
 /// worker carrier 经该出站协议拨向 v1.mux.cool:9527，多连接复用同一 carrier。
 /// protocol=="mux" 出站本身已是 MuxBridge，不叠包。UDP443 策略仍由 dispatcher
 /// 按 tag 检查、UDP GlobalID 走 [`MuxBridge::dispatch_with_access`]，均不受影响。
@@ -707,18 +706,16 @@ fn try_build_handler(
     Ok((handler, bridge_ref, proxy_chain_tag))
 }
 
-/// 出站级 mux 并发数（Go `NewHandler` handler.go:124-133 门控）：mux_json 缺失/
-/// 解析失败/enabled=false/concurrency<0 → `None`（不包装）；其余一律 clamp 到
-/// **≥128**（Go 把 `0 <= n <= 128` 显式改写成 128，含未配置的 0 与显式 4/128），
-/// `>128` 用原值。
-/// ponytail: MaxConnection 恒 Go 硬编码 1024（[`mux_client_strategy`]），不读配置
-/// ——需要按配置调池深时再拆。
+/// 出站级 mux 并发数（Go `NewHandler` :124-130 门控）：mux_json 缺失/解析失败/
+/// enabled=false/concurrency<0 → `None`（不包装）；concurrency==0 → 8。
+/// ponytail: Go 的 MaxConnection=128 与 xudp 独立 ClientManager 未拆——单
+/// MuxBridge 管理器 + XUDP GlobalID 路径已覆盖语义，>128 worker 场景再补。
 fn outbound_mux_concurrency(ob: &BuiltOutbound) -> Option<u32> {
     let cfg = serde_json::from_value::<xray_conf::MuxConfig>(ob.mux_json.clone()?).ok()?;
     if !cfg.enabled || cfg.concurrency < 0 {
         return None;
     }
-    Some(u32::try_from(cfg.concurrency).ok()?.max(128))
+    Some(if cfg.concurrency == 0 { 8 } else { cfg.concurrency as u32 })
 }
 
 #[allow(clippy::doc_lazy_continuation)] // 存量清零批次
@@ -861,20 +858,18 @@ pub struct MuxBridge {
     xudp_picker: Option<Arc<IncrementalWorkerPicker>>,
 }
 
-/// mux `ClientStrategy`（Go `handler.go:140`/`:161` 两处字面量，值恒同）。
-///
-/// `MaxConnection` 恒 **1024**（Go 硬编码，不读配置）：累计连接达限后
-/// `is_closing → is_full` → picker 另建 carrier（滚动退役，存量会话排干后
-/// monitor 回收旧 worker）。恒 0 会让单 carrier 累计会话无上限（bd 4uuo）。
-fn mux_client_strategy(concurrency: u32) -> ClientStrategy {
-    ClientStrategy { max_concurrency: concurrency, max_connection: 1024 }
-}
-
 impl MuxBridge {
     /// 构造 Mux outbound handler。`concurrency` 为最大并发会话数（0 = 不限制）。
     #[must_use]
     pub fn new(tag: impl Into<String>, concurrency: u32) -> (Self, UnderlyingSlot) {
-        let strategy = mux_client_strategy(concurrency);
+        let strategy = ClientStrategy {
+            max_concurrency: concurrency,
+            // Go proxyman/outbound/handler.go:140,161 硬编码 MaxConnection=128：
+            // 累计连接达限后 is_closing → is_full → picker 另建 carrier（滚动
+            // 退役，存量会话排干后 monitor 回收旧 worker）。恒 0 会让单 carrier
+            // 累计会话无上限（bd 4uuo）。
+            max_connection: 128,
+        };
         // 空槽构造：register Phase 2 拿到底层 handler 后 set_underlying。
 
         let slot: UnderlyingSlot = Arc::new(parking_lot::RwLock::new(None));
@@ -915,7 +910,7 @@ impl MuxBridge {
     /// 挂独立 UDP worker 管理器（xudpConcurrency > 0）：与 TCP 载体共用底层
     /// slot 拨号，但并发账本独立（Go `h.xudp` 独立 ClientManager/Picker）。
     pub(crate) fn attach_xudp_manager(&mut self, concurrency: u32) {
-        let strategy = mux_client_strategy(concurrency);
+        let strategy = ClientStrategy { max_concurrency: concurrency, max_connection: 128 };
         let factory = Arc::new(DialingWorkerFactory::with_slot(Arc::clone(&self.slot), strategy));
         self.xudp_picker = Some(Arc::new(IncrementalWorkerPicker::new(factory)));
     }
@@ -4853,8 +4848,8 @@ mod tests {
         assert_eq!(super::parse_mux_config(b"{}").unwrap(), (8, None));
     }
 
-    /// 出站级 mux 并发门控（Go NewHandler handler.go:124-133）：enabled=false /
-    /// concurrency<0 / 无 mux_json 不包装；0..=128 → 128；>128 原值。
+    /// 出站级 mux 并发门控（Go NewHandler :124-130）：enabled=false /
+    /// concurrency<0 / 无 mux_json 不包装；0 → 8；正值透传。
     #[test]
     fn outbound_mux_concurrency_gates_like_go_new_handler() {
         use serde_json::json;
@@ -4862,32 +4857,22 @@ mod tests {
             mux_json: mux,
             ..make_outbound("freedom", "m", "{}")
         };
-        let conc = |c: i64| {
-            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": c}))))
-        };
         // enabled=false → None（Go h.mux = nil）
         assert_eq!(super::outbound_mux_concurrency(&ob(Some(json!({"enabled": false})))), None);
         // 无 mux_json → None
         assert_eq!(super::outbound_mux_concurrency(&ob(None)), None);
         // concurrency<0 → None（Go ClientManager{Enabled: false} 直通）
-        assert_eq!(conc(-1), None);
-        // 0..=128 → Go 显式改写成 128（含未配置的 0 与显式 4/128）
-        assert_eq!(conc(0), Some(128));
-        assert_eq!(conc(4), Some(128));
-        assert_eq!(conc(128), Some(128));
-        // >128 → 原值
-        assert_eq!(conc(129), Some(129));
-    }
-
-    /// `MaxConnection` 恒 Go 硬编码 1024（handler.go:140 mux / :161 xudp）。
-    #[test]
-    fn mux_client_strategy_hardcodes_go_max_connection() {
-        // max_concurrency 跟随入参（非恒 128 常量），max_connection 恒 1024
-        for n in [4, 128, 129, 1024] {
-            let s = super::mux_client_strategy(n);
-            assert_eq!(s.max_concurrency, n);
-            assert_eq!(s.max_connection, 1024);
-        }
+        assert_eq!(
+            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": -1})))),
+            None
+        );
+        // 0 → 8（Go "same as before" 默认）
+        assert_eq!(super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true})))), Some(8));
+        // 正值透传
+        assert_eq!(
+            super::outbound_mux_concurrency(&ob(Some(json!({"enabled": true, "concurrency": 16})))),
+            Some(16)
+        );
     }
 
     /// xudpConcurrency 三态解析（Go NewHandler :143-164）。
