@@ -358,21 +358,43 @@ pub async fn execute_remove_outbound(args: &RemoveOutboundArgs) -> Result<(), Cl
 }
 
 /// add-rule：读取配置 → 构建 AddRuleRequest → gRPC 调用。
+///
+/// Go `rules_add.go`（上游 38f09025）：多配置文件时**逐个 add**，第 2 个起
+/// `should_append=true` ⇒ 后者追加合并而非覆盖前者（规则集取并集）。
+/// Go 侧先解码全部配置文件再逐个 add（任一文件解码失败即中止，不发起任何 add）。
 pub async fn execute_add_rule(args: &AddRuleArgs) -> Result<(), CliError> {
-    let data = load_config(&args.config)?;
-    let config = build_rule_typed_message(&data)?;
+    // Go rules_add.go:57-77 —— 先把全部配置文件解码为 routing config，任一失败即中止
+    // （此时尚未发起任何 AddRule，服务端规则集不变）。
+    let mut typed_configs = Vec::with_capacity(args.configs.len());
+    for path in &args.configs {
+        let data = load_config(path)?;
+        typed_configs.push(build_rule_typed_message(&data)?);
+    }
 
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();
 
-    let req = Request::new(AddRuleRequest { config: Some(config), should_append: args.append });
-    routing
-        .add_rule(req)
-        .await
-        .map_err(|e| CliError::ApiRequestFailed(format!("failed to add rule: {e}")))?;
+    for (index, config) in typed_configs.into_iter().enumerate() {
+        let req = Request::new(AddRuleRequest {
+            config: Some(config),
+            should_append: rule_should_append(index, args.append),
+        });
+        routing
+            .add_rule(req)
+            .await
+            .map_err(|e| CliError::ApiRequestFailed(format!("failed to add rule: {e}")))?;
 
-    println!("added rule");
+        println!("added rule");
+    }
     Ok(())
+}
+
+/// 第 `index` 个配置文件（0 起）的 `should_append` 取值。
+///
+/// Go `rules_add.go:97`（上游 38f09025）：首个请求沿用 `--append` 标志值，
+/// 其后一律 `true` ⇒ 多文件时后者追加合并，服务端规则集为各文件规则的并集。
+fn rule_should_append(index: usize, append_flag: bool) -> bool {
+    if index == 0 { append_flag } else { true }
 }
 
 /// remove-rule：发送 RemoveRuleRequest。
@@ -606,22 +628,27 @@ pub async fn execute_inbound_user_count(args: &InboundUserCountArgs) -> Result<(
 }
 
 /// balancer-info：发送 GetBalancerInfoRequest { tag }。
+///
+/// Go `balancer_info.go`（上游 6ca6d8a6）：对**每个** tag 各查一次并各输出一次
+/// （原先只取 `unnamedArgs[0]`，其余 tag 被丢弃）。
 pub async fn execute_balancer_info(args: &BalancerInfoArgs) -> Result<(), CliError> {
     let client = ApiClient::connect(&args.api.server, args.api.timeout).await?;
     let mut routing = client.routing_client();
 
-    let req = Request::new(GetBalancerInfoRequest { tag: args.balancer.clone() });
-    let resp = routing
-        .get_balancer_info(req)
-        .await
-        .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?
-        .into_inner();
+    for tag in &args.balancers {
+        let req = Request::new(GetBalancerInfoRequest { tag: tag.clone() });
+        let resp = routing
+            .get_balancer_info(req)
+            .await
+            .map_err(|e| CliError::ApiRequestFailed(format!("failed to get balancer info: {e}")))?
+            .into_inner();
 
-    // Go balancer_info.go:56-61：--json 消费 → 纯 JSON；缺省 → 表格。
-    if args.api.json {
-        print_json_value(&balancer_info_json(&resp));
-    } else {
-        show_balancer_info_table(&resp.balancer.unwrap_or_default());
+        // Go balancer_info.go:56-61：--json 消费 → 纯 JSON；缺省 → 表格。
+        if args.api.json {
+            print_json_value(&balancer_info_json(&resp));
+        } else {
+            show_balancer_info_table(&resp.balancer.unwrap_or_default());
+        }
     }
     Ok(())
 }
@@ -1025,4 +1052,5 @@ mod tests {
         assert!(v["users"][0].get("traffic").is_none());
         assert!(v["users"][0].get("ips").is_none());
     }
+
 }

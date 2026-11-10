@@ -81,8 +81,9 @@ pub struct RemoveOutboundArgs {
 pub struct AddRuleArgs {
     #[command(flatten)]
     pub api: ApiSharedArgs,
-    /// 路由配置文件路径。
-    pub config: String,
+    /// 路由配置文件路径（可传多个；Go `adrules <c1.json> [c2.json]...`）。
+    #[arg(required = true)]
+    pub configs: Vec<String>,
     /// 追加到现有规则末尾而非替换。
     #[arg(long = "append", default_value_t = false)]
     pub append: bool,
@@ -215,8 +216,9 @@ pub struct InboundUserCountArgs {
 pub struct BalancerInfoArgs {
     #[command(flatten)]
     pub api: ApiSharedArgs,
-    /// 均衡器 tag。
-    pub balancer: String,
+    /// 均衡器 tag 列表（可传多个，逐个查询；Go `api bi b1 b2`）。
+    #[arg(required = true)]
+    pub balancers: Vec<String>,
 }
 
 /// `xray api balancer-override` - 覆盖均衡器目标。
