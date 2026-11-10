@@ -188,7 +188,7 @@ impl ComponentScope {
 | **B1** | **逐站替换类型路径**（**7 组按 crate 并行** = transport 六族 + dispatcher 独立组；**splithttp 组排在 zct77 完成之后**）：每站把持有件类型换成 `ComponentScope`、调用点改 `close_gate()` / `drain()`、删伪断言 doc、补该站 stop 面归属 | B0' | ✅ **7 组并行**（splithttp 组串行在 zct77 之后） |
 | **B1'** | **末批（终态收口）**：删除 `compat::ManagedScope` + `grep -rn "compat::ManagedScope" crates` 归零 ⇒ 合规「**不留兼容别名**」终态（**已完成**：B1' 收口 `8202b2ef`，`grep -rn ManagedScope crates` 归零） | B1 全部完成 | — |
 | **B2** | 环破除 + 排空落位（依赖 B1 对应站）：tun（driver 子账本 + 父 drain 级联子）、naive（弱引用/快照）、splithttp（hub 账本 owner 上移 + 每连接任务捕获链改弱引用/快照）；并给 transport 族补「无 drain ⇒ 不得声称 abort」收口 | B1 各站 | ✅ 3 组并行 |
-| **B3** | 可观测面 + 静态门 + 文档同步：每站一条「stop 后 `in_flight == 0`」断言；`tools/check_scope_claims.py` 静态门（禁「Drop 即 abort 在途」类伪断言文案、禁 `compat::ManagedScope` 残留）；文档同步（CLAUDE.md §3.5.6 spawn 三分类口径 + §3.5.2 白拿清单、插件模型文档 §2.4 坑约束表、**本目录 README「允许 `Proposed` 草案入目录」一行 + ADR-0004 索引行**——PM 拍板 P5） | B1 + B2 | ✅ |
+| **B3** | 可观测面 + 静态门 + 文档同步：站点断言集（**实测覆盖见 §验证方式（二）实测表——未达逐站**）；`tools/check_scope_claims.py` 静态门（禁「Drop 即 abort 在途」类伪断言文案、禁 `compat::ManagedScope` 残留）；文档同步（CLAUDE.md §3.5.6 spawn 三分类口径 + §3.5.2 白拿清单、插件模型文档 §2.4 坑约束表、**本目录 README「允许 `Proposed` 草案入目录」一行 + ADR-0004 索引行**——PM 拍板 P5） | B1 + B2 | ✅ |
 | **B4**（可选） | transport listen API 注入 scope 句柄（让宿主可见 transport 账本 ⇒ 宿主可 drain）——**另票**，PM 拍板 P2 = 本轮不做 | PM P2 | — |
 
 **过渡期并存说明（PM 批次边界改判）**：B0' 期间 `xray_frame::compat::ManagedScope` 与 `xray_frame::scope::ComponentScope` **并存**，用于避开与在飞代理（zct77）的同文件并发冲突。**并存属实施中间态，不是本 ADR 的终态设计**——终态由 **B1'** 收口：删旧类型 + `grep` 归零，符合「只扩展不 fork / 不留兼容别名」纪律。
@@ -197,10 +197,10 @@ impl ComponentScope {
 
 | 编号 | 不变量 | 可观测锚 | 判定命令形态 |
 |---|---|---|---|
-| **A1** | 组件 stop 后账本在途归零（排空档站点） | `ComponentScope::in_flight() == 0` + `drain` 报告 `timed_out == 0` | 每站一条单测：`cargo test -p <crate> --lib <站名>`（如 `cargo test -p xray-proxy-tun --lib tun_scope_drain_idle`） |
+| **A1** | 组件 stop 后账本在途归零（排空档站点） | `ComponentScope::in_flight() == 0` + `drain` 报告 `timed_out == 0` | 目标态要求 = 每站各有单测（**实测覆盖 = 12 站中 5 站，逐站见 §验证方式（二）**）：`cargo test -p <crate> --lib <站名>`（如 `cargo test -p xray-proxy-tun --lib tun_scope_drain_idle`） |
 | **A2** | 关闸 ≠ 排空 | `close_gate()` 后 `spawn` 必 `Err(ScopeClosed)`；**且**在途任务未被 abort（同一测试内断言 `in_flight` 未归零 / 任务仍可 join） | `cargo test -p xray-frame --lib scope::tests::close_gate_rejects_new_spawns_but_keeps_in_flight` |
 | **A3** | 排空是唯一「在途归零」保证 | `drain()` 返回 `ShutdownReport{ panicked, timed_out }`；`timed_out > 0` ⇒ error 级上报（沿用 `compat.rs:373-386` 现行口径） | `cargo test -p xray-frame --lib scope::tests::drain_reports_timeout_and_panics` |
-| **A4** | 环已破（唯一可证伪锚） | owner 释放后该账本强引用计数归零：`ComponentScope::live_refs() == 1`（只剩 stop 面自身）⇒ 无环 | 每站一条：`cargo test -p <crate> --lib <站名>_scope_has_no_self_reference`（须先有 A4 的 `live_refs` 诊断面） |
+| **A4** | 环已破（唯一可证伪锚） | owner 释放后该账本强引用计数归零：`ComponentScope::live_refs() == 1`（只剩 stop 面自身）⇒ 无环 | 目标态要求 = 每站各有单测（**实测覆盖 = 12 站中 3 站（#1+#2 同账本计一站），逐站见 §验证方式（二）**）：`cargo test -p <crate> --lib <站名>_scope_has_no_self_reference`（须先有 A4 的 `live_refs` 诊断面） |
 | **A5** | 伪断言禁令 | 全仓无「Drop 即 abort 在途 / 句柄丢弃即 abort」类文案 | CI 静态门：`python tools/check_scope_claims.py`（退出码非零 = 红） |
 | **A6** | 单账本 | 一个组件恰一本账（多克隆句柄允许，owner 恰一） | 评审 + `live_refs` 断言配合；静态门 `tools/check_scope_claims.py` 兼查「同一组件多本账」 |
 
@@ -243,6 +243,16 @@ impl ComponentScope {
   - 「明确 abandon」⇒ 本 ADR §2.2 Q3 的**伪 Drop 断言禁令**（A5 静态门把「Drop 兜底」文案清零）。
 - **建议**：hnicl 改为 **os4kz 实施批次的验收项**（B2 完成 + A4/A5 断言落地即销号），不单独立票修；os4kz 在 B3 完成后销号。
 - **PM 裁决（2026-11-09）采纳该建议**：**hnicl 归口为本 ADR 实施批次的验收项，不再单独立票修**。销号判据固定为两条同时成立：① **B2 完成**（splithttp / tun / naive 三处环破除落地）；② **A4（`live_refs` 环破除断言）+ A5（伪 Drop 断言静态门）落地**。两条齐备 ⇒ hnicl 销号；os4kz 在 B3 完成后销号。
+
+### 2.9 已知缺口（2026-11-10 审计实测登记 · **不改变本 ADR 任何裁决**）
+
+> 本节只登记实测事实与欠账，不是新裁决，也不改 §2.1–§2.8 / §3 的任何条款与 Accepted 状态；缺口由另票修复（bd bbvuo 追踪）。
+
+**G1｜站点断言未逐站落地**：§2.6 的 A1/A2/A4 三不变量在 B1/B2 交付后**并未逐站有断言**。实测（2026-11-10 重数，命令与逐站清单见 §验证方式（二））：12 站共 13 条站点级断言，A1 覆盖 5 站、A2 覆盖 6 站、A4 覆盖 3 站；`#11 dispatcher DialBridge.scope` 三项全无，`#2 splithttp SessionMap.scope` 无独立断言（与 #1 同一本账）。**读本节与 §验证方式（二）时禁把「有断言」推广成「全覆盖」。**
+
+**G2｜A2 断言是机制级近重复，缺「生产 accept 路径真入账」断言**：现存 4 个 A2 族（splithttp `transport.rs:1403`、hysteria `register.rs:587` + `quinn_adapter.rs:2848`、websocket `register.rs:1672`、httpupgrade `register.rs:1472`）与框架断言 `xray-frame/src/scope.rs:721` **同构**：都自建一个 `ComponentScope`（或直接构造 listener 结构体）→ spawn 一个 sleep/pending 任务 → `close_gate()` → 断言新 `spawn` 回 `Err` 且在途未 abort。它们证明的是 udf `FxScope` 机制，**没有一条**驱动生产的 accept 环把真实连接任务放进该站账本（即生产路径上 `in_flight` 真的 0→1）。⇒ 「关闸语义确实作用在该组件的真实任务上」仍无断言，需补 accept 路径入账断言（另票，不在本 ADR 范围）。
+
+**G3｜「①类待迁移」欠账与 ②类豁免在门面不可区分**：全仓 **25 处** `#[allow(clippy::disallowed_methods)]` 的 reason 以「①类待迁移（bd xosi9 改判）」自称①类欠账，但 `tools/check_quality_gates.py` 门 (h) 与 ② 类豁免**计法完全相同**（只核「调用集合 ⊆ 登记集合」），门绿 ⇒ 只证明登记齐备，**不证明①类已收口**。25 处分布（crate: 处数）= `xray-transport-splithttp` 6 / `xray-transport-httpupgrade` 4 / `xray-transport-hysteria` 6 / `xray-mux` 2 / `xray-transport-websocket` 2 / `xray-transport-kcp` 1 / `xray-transport-naive` 1 / `xray-transport-quic` 1 / `xray-transport`（finalmask `xicmp.rs` 1 + `xmc/conn.rs` 1）2；完整 `file:line` 清单见 `reports/2026-11-10-fixes/bbvuo.md`。**处置口径 = 转显式待迁票**（PM 建票、按站迁移）；本 ADR 不改这些站点的文案、不动其代码。
 
 ## 3. PM 拍板裁决记录（2026-11-09）
 
@@ -340,11 +350,32 @@ B0'（框架件）→ B1（**7 组并行** = transport 六族 + dispatcher 独�
 - `cargo test --workspace --all-targets` —— 全仓编译与测试（迁移面 8 crate 12 站）。
 - `cargo clippy --workspace --all-targets -- -D warnings` —— 各 crate `clippy.toml` 的 `disallowed-methods` 理由文本须同步改写（引用旧名会误导）。
 
-**（二）站点断言（B1/B2 交付，每站一条）**
+**（二）站点断言（B1/B2 交付）——实测覆盖表（2026-11-10 按代码重数）**
 
-- 排空档：`cargo test -p xray-proxy-tun --lib tun_scope_drain_idle`（A1）、`cargo test -p xray-transport-naive --lib naive_scope_drain_idle`。
-- 环破除：`cargo test -p xray-transport-splithttp --lib splithttp_scope_has_no_self_reference`（A4）、`cargo test -p xray-proxy-tun --lib tun_scope_has_no_self_reference`。
-- 宿主 stop 面：`cargo test -p xray-app-dispatcher --lib dispatcher_scope_drain_idle`（A1，宿主 watcher 侧）。
+> 本节原列 5 条命令并声称覆盖 12 站中的每一站，与代码实测不符（当时只覆盖 4 个 crate，且 `dispatcher_scope_drain_idle` 这条测试**不存在**，实测名见下表）。现改为**实测数字 + 逐站清单**：读者据此可知**哪站有断言、哪站没有**，不把下表读成「已全覆盖」。
+>
+> 复现命令：`grep -rn "scope_drain_idle\|scope_has_no_self_reference" crates --include=*.rs`（5 命中）+ A2 命名族 `*a2_gate_closes_but_keeps_in_flight` / `*close_gate_rejects_new_spawns_but_keeps_in_flight` + A1 命名族 `*_a1_*`；合计**站点级断言 13 条，覆盖 §2.4 的 12 站中 11 站**（#2 与 #1 同一本账，#11 零断言）。
+
+| #（§2.4） | 站 | A1（stop 后 in_flight 归零） | A2（关闸 ≠ 排空） | A4（无自引用环） |
+|---|---|---|---|---|
+| 1 | splithttp `SplithttpListener.scope` | — | ✅ `splithttp_close_gate_rejects_new_spawns_but_keeps_in_flight`（`transport.rs:1403`） | ✅ `splithttp_scope_has_no_self_reference`（`transport.rs:1377`） |
+| 2 | splithttp `SessionMap.scope` | — | — | △ 与 #1 同一本账（B2 后 owner 在 hub，`SessionMap` 只持 `ScopeRef` 弱引用，`hub/session.rs:119`）⇒ 由 #1 的 A4 覆盖 |
+| 3 | hysteria `HysteriaTransportListener.scope` | — | ✅ `hysteria_listener_scope_a2_gate_closes_but_keeps_in_flight`（`register.rs:587`） | — |
+| 4 | hysteria `QuinnQuicListener.scope` | — | ✅ `quinn_listener_scope_a2_gate_closes_but_keeps_in_flight`（`quinn_adapter.rs:2848`） | — |
+| 5 | websocket `WsTransportListener.scope` | — | ✅ `ws_listener_scope_a2_gate_closes_but_keeps_in_flight`（`register.rs:1672`） | — |
+| 6 | httpupgrade `HttpUpgradeListener.scope` | — | ✅ `httpupgrade_listener_scope_a2_gate_closes_but_keeps_in_flight`（`register.rs:1472`） | — |
+| 7 | tun `TunInboundHandler.scope` | ✅ `tun_scope_drain_idle`（`inbound.rs:1504`） | — | ✅ `tun_scope_has_no_self_reference`（`inbound.rs:1479`） |
+| 8 | hysteria `UdpHopPacketConn.prune_scope` | ✅ `idle_pruner_is_hosted_by_connection_scope`（`udphop.rs:1161`：托管恰 2 项 + `close` 后归零） | — | — |
+| 9 | naive `InboundSlot.scope` | ✅ `naive_scope_drain_idle`（`inbound.rs:496`） | — | ✅ `naive_scope_has_no_self_reference`（`inbound.rs:527`） |
+| 10 | dispatcher `DefaultDispatcher.scope` | ✅ `dispatcher_scope_drains_and_rejects_after_shutdown`（`default.rs:2787`） | ✅ 同一条（`drain` 后 `spawn` 必 `Err`） | — |
+| 11 | dispatcher `DialBridge.scope` | — | — | — |
+| 12 | dispatcher `UdpDispatchSession.scope` | ✅ `udp_session_scope_a1_drain_zeroes_in_flight`（`udp_session.rs:1027`） | — | — |
+
+- **框架机制面（非站点，B0' 交付，全部存在）**：`xray-frame/src/scope.rs` A2 `close_gate_rejects_new_spawns_but_keeps_in_flight`（`:721`）、A3 `drain_reports_timeout_and_panics`（`:753`）、A1 机制 `drain_aborts_and_zeroes_in_flight`（`:865`）、A4 机制 `scope_ref_does_not_keep_ledger_alive`（`:594`）/ `scope_ref_spawn_after_owner_dropped_returns_closed`（`:617`）。
+- **按不变量数的实际覆盖**：A1 = **5 站**（#7/#8/#9/#10/#12）；A2 = **6 站**（#1/#3/#4/#5/#6/#10）；A4 = **3 站**（#1(+#2)/#7/#9）。
+- **缺断言的站（逐名）**：`#11 dispatcher DialBridge.scope` —— A1/A2/A4 三项全无（该站无 close 面，现有 `DialBridge` 测试只钉数据面/管限/洪水，不涉 scope 不变量）；`#2 splithttp SessionMap.scope` —— 无独立断言，唯一相关锚是 #1 的 A4。
+- **A1 缺**：`#1 #2 #3 #4 #5 #6 #11`；**A4 缺**：`#3 #4 #5 #6 #8 #10 #11 #12`。
+- 逐条命令（替换上面原列表）：`cargo test -p xray-transport-splithttp --lib scope`、`cargo test -p xray-transport-hysteria --lib listener_scope`、`cargo test -p xray-transport-websocket --lib ws_listener_scope`、`cargo test -p xray-transport-httpupgrade --lib listener_scope`、`cargo test -p xray-proxy-tun --lib scope`、`cargo test -p xray-transport-naive --lib scope`、`cargo test -p xray-app-dispatcher --lib scope`。
 
 **（三）静态门（B3 交付）**
 
