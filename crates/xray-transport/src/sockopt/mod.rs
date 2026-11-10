@@ -1181,9 +1181,11 @@ fn check_explicit_udp_buffer_size(explicit: i32, dir: UdpBufDir) -> std::io::Res
     check_explicit_udp_buffer_size_with(explicit, dir, large_rcvbuf_confirmed())
 }
 
+#[cfg(not(target_os = "freebsd"))]
 /// 应用 [`SocketOptions::custom_sockopt`]。对应 Go 各平台 apply*SocketOptions 的
 /// custom 循环（sockopt_linux.go:66-102/172-208、sockopt_windows.go:84-118/145-179、
-/// sockopt_darwin.go:152-188/248-284；sockopt_freebsd.go 无此循环，调用点已 cfg 门控）。
+/// sockopt_darwin.go:152-188/248-284；sockopt_freebsd.go 无此循环 ⇒ 调用点、本定义、
+/// 以及 `set_custom_sockopt_*` 两助手一律 `#[cfg(not(target_os = "freebsd"))]` 同门控）。
 ///
 /// - `system` 过滤：非空且 ≠ 当前 OS 跳过（`std::env::consts::OS` ≡ `runtime.GOOS`）。
 /// - `network` 前缀过滤（Go `strings.HasPrefix`）：Go 调用层只产生 "tcp"/"udp" 两族 （net.Dial
@@ -1247,6 +1249,7 @@ fn apply_custom_sockopt(socket: &Socket, opts: &SocketOptions) -> std::io::Resul
     Ok(())
 }
 
+#[cfg(not(target_os = "freebsd"))]
 /// CustomSockopt int 值 setsockopt（跨平台）。
 fn set_custom_sockopt_int(
     socket: &Socket,
@@ -1286,7 +1289,7 @@ fn set_custom_sockopt_int(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 /// CustomSockopt str 值 setsockopt（unix；Go `syscall.SetsockoptString` 同形，
 /// 按字节写入不含 NUL 终止符）。
 fn set_custom_sockopt_str(
