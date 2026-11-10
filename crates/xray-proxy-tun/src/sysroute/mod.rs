@@ -57,9 +57,16 @@ pub enum Platform {
     Linux,
     /// Windows：`route.exe`/`netsh`（metric = Go `Metric 0`）+ TUN 适配器 DNS。
     Windows,
-    /// 其余平台：Go darwin/freebsd 有实现但不在本切片范围——计划层拒绝。
+    /// 其余平台（macOS/FreeBSD 等）：Go 的 `tun_darwin.go`/`tun_freebsd.go` 系统层
+    /// （utun 地址/SIOCAIFADDR、AF_ROUTE 路由报文、resolvconf）尚未接线 ⇒ 计划层
+    /// **入口即拒绝**（fail-loud）。绝不返回「无变更」让 TUN 静默起来却不配路由/DNS
+    /// ——那样的 TUN 一个包也过不去，用户只会看到「代理没生效」却没有报错（bd bv98n）。
     Other,
 }
+
+/// 未接线平台的统一错误文案（计划层各入口共用；单测断言此串，别再散落字面量）。
+const UNWIRED_PLATFORM: &str = "TUN is not wired on this platform yet; supported: Linux/Windows \
+     (Android/iOS take a host-injected fd)";
 
 impl Platform {
     /// 编译目标平台。
@@ -140,12 +147,14 @@ fn dns_wanted(platform: Platform, options: &StackOptions) -> bool {
         // Windows：`dns` 配置写 TUN 适配器（Go tun_windows.go:157 无条件 SetDNS，
         // 空列表等价清空→无事可做）；接管 flag 在 Windows 无运行时实现（Go 同）。
         Platform::Windows => !options.dns.is_empty(),
-        // Go macOS 忽略 dns 字段（README "SYSTEM DNS" 节），同忽略。
+        // 未接线平台：`plan_changes` 已先行拒绝，本分支不会被问到——保留只为平台分派
+        // 穷尽。`plan_dns` 自身对 `Platform::Other` 是 `Err`（见 [`UNWIRED_PLATFORM`]）。
         Platform::Other => false,
     }
 }
 
-/// 计划入口：接口列表 + 配置 → 变更计划。默认关闭 → `Ok(None)`。
+/// 计划入口：接口列表 + 配置 → 变更计划。默认关闭 → `Ok(None)`；未接线平台 → `Err`
+/// （即使配置全关也不放行——见 [`Platform::Other`]）。
 ///
 /// `interfaces` 生产路径传 `xray_common::net::interfaces()`；测试传伪造值。
 pub fn plan_changes(
@@ -153,6 +162,11 @@ pub fn plan_changes(
     interfaces: &[Interface],
     options: &StackOptions,
 ) -> Result<Option<AppliedSystemChanges>> {
+    // 平台门闸先于「配没配」判断：平台系统层没接线时起 TUN 本身就没意义
+    // （无路由 → 流量永不经 TUN），必须显式拒启而不是静默返回无变更（bd bv98n）。
+    if platform == Platform::Other {
+        return Err(TunError::InvalidConfig(UNWIRED_PLATFORM.into()));
+    }
     let routes_wanted = !options.auto_system_routing_table.is_empty();
     let dns_wanted = dns_wanted(platform, options);
     if !routes_wanted && !dns_wanted {
@@ -174,9 +188,7 @@ pub fn plan_routes(
     options: &StackOptions,
 ) -> Result<RoutePlan> {
     if platform == Platform::Other {
-        return Err(TunError::InvalidConfig(
-            "automatic system routes are not supported on this platform".into(),
-        ));
+        return Err(TunError::InvalidConfig(UNWIRED_PLATFORM.into()));
     }
     let tun = interfaces.iter().find(|i| i.name == options.name).ok_or_else(|| {
         TunError::DeviceNotFound(format!(
@@ -365,8 +377,8 @@ pub fn plan_dns(platform: Platform, options: &StackOptions) -> Result<Option<Dns
                 target: DnsTarget::WindowsAdapterServers { servers },
             }))
         },
-        // Go macOS 忽略 dns 字段。
-        Platform::Other => Ok(None),
+        // Go macOS 忽略 dns 字段；本仓平台层整体未接线 ⇒ 同 [`UNWIRED_PLATFORM`] 拒。
+        Platform::Other => Err(TunError::InvalidConfig(UNWIRED_PLATFORM.into())),
     }
 }
 
@@ -840,7 +852,29 @@ mod tests {
     fn route_plan_rejects_unsupported_platform() {
         let o = opts(&["0.0.0.0/0"], &[], false);
         let err = plan_routes(Platform::Other, &tun_and_eth(), &o).unwrap_err();
-        assert!(err.to_string().contains("not supported"));
+        assert!(err.to_string().contains("not wired on this platform"), "{err}");
+    }
+
+    // ===== 平台门闸（bd bv98n）：macOS/FreeBSD 未接线 ⇒ 即使是默认配置也拒绝 =====
+
+    /// 未接线平台**不得**因「配置全关」而静默放行：否则 TUN 会在 macOS/FreeBSD 上
+    /// 起来却一条路由/DNS 都不配，流量永不经代理，而启动日志无任何异常。
+    #[test]
+    fn plan_changes_rejects_unwired_platform_even_when_disabled() {
+        let disabled = StackOptions::default();
+        let err = plan_changes(Platform::Other, &tun_and_eth(), &disabled).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not wired on this platform"), "{msg}");
+        // 消息必须点名支持面，否则用户无从判断该怎么办。
+        assert!(msg.contains("Linux/Windows"), "{msg}");
+
+        // 配了路由 / DNS 接管同样拒（不是「没配才拒」）。
+        let routed = opts(&["0.0.0.0/0"], &[], false);
+        assert!(plan_changes(Platform::Other, &tun_and_eth(), &routed).is_err());
+        let dns_takeover = opts(&[], &[], true);
+        assert!(plan_changes(Platform::Other, &tun_and_eth(), &dns_takeover).is_err());
+        // DNS 计划入口本身也拒（不留「单独调用时静默 Ok(None)」的口子）。
+        assert!(plan_dns(Platform::Other, &dns_takeover).is_err());
     }
 
     // ===== 验收 2：排除回环与未 Up 接口 =====
