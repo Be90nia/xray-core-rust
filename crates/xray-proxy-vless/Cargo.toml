@@ -11,6 +11,9 @@ xray-features = { path = "../xray-features" }
 xray-proto = { path = "../xray-proto" }
 xray-buf = { path = "../xray-buf" }
 xray-transport = { path = "../xray-transport" }
+# 入站 TLS acceptor 后端二选一（rustls / btls，bd mdpl2）——`InboundTlsAcceptor` 的
+# 家在 xray-tls（btls 服务端装配只在那里），生产面必须生产依赖。
+xray-tls = { path = "../xray-tls" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 # P2 批次 B 插件化：L1/L4 面来自装配框架（src/plugin.rs impl xray_frame::Plugin
 # 是生产代码——cargo 模型下必须生产依赖；xray-frame 不依赖协议 crate，无环）。

@@ -219,7 +219,7 @@ pub async fn serve_vless(
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<dyn Validator>,
-    tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    tls: Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>,
     fallbacks: Option<Arc<crate::inbound::handler::FallbackPolicy>>,
     options: Option<VlessInboundOptions>,
     // §3.5.6 ①类托管：连接任务 spawn 归本 inbound 的 arm ctx（停机随 scope 取消）。
@@ -278,27 +278,23 @@ pub async fn serve_vless(
                 // mask 生效时 wire 字节非明文，裸 socket 克隆不可直接 splice → None
                 // （splice 关闭，走常规 TLS 读；未配 finalmask 时与原路径逐字节一致）。
                 let raw_tcp = stream.plain().and_then(xray_transport::connection::dup_tcp_stream);
-                // 记录对齐读（bd jeu9/e0ni）：rustls deframer 贪婪 recv 会把
+                // 记录对齐读（bd jeu9/e0ni）：TLS 库的 deframer 贪婪 recv 会把
                 // 「DIRECT 帧 + 其后端到端裸流」一并拉进 TLS 层（DecryptError
                 // 或半记录滞留，字节不可恢复 → Linux CI 确定性挂）。framer 按
                 // 记录边界限长读，裸尾留在内核缓冲，raw_tcp 克隆（dup 共享
                 // 内核缓冲游标）切 DIRECT 后天然读到完整裸流。
-                match acc
-                    .accept_with(xray_transport::record_framer::RecordFramer::new(stream), |_| ())
-                    .await
-                {
+                // 两个后端都要过 framer（btls/BoringSSL 的 BIO 同样会预读）。
+                match acc.accept(xray_transport::record_framer::RecordFramer::new(stream)).await {
                     Ok(tls_stream) => {
-                        let conn = tls_stream.get_ref().1;
-                        let name = conn.server_name().unwrap_or("").to_string();
-                        let alpn = conn
+                        let name = tls_stream.server_name().unwrap_or("").to_string();
+                        let alpn = tls_stream
                             .alpn_protocol()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();
                         // lwep（Go inbound.go:571-574）：XRV 校验需要外层 TLS 版本。
                         let mut options = options;
                         if let Some(o) = options.as_mut() {
-                            o.outer_tls13 = conn.protocol_version()
-                                == Some(xray_transport::rustls::ProtocolVersion::TLSv1_3);
+                            o.outer_tls13 = tls_stream.is_tls13();
                         }
                         // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS 隧道内）。
                         let io = xray_transport::headers::conn::maybe_wrap_server(

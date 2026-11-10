@@ -26,6 +26,10 @@
 //!   `build_server_config_with_stapling`）
 //! - `cert_reload`：服务端证书热重载——周期重读 `certificateFile`/`keyFile` + `HotSlot`
 //!   原子换快照（失败保留旧证书）
+//! - `inbound_acceptor`：入站 plain-TLS 后端选路——`echServerKeys` 非空 ⇒ btls （BoringSSL），否则
+//!   rustls；`echServerKeys` 装配失败即配置期硬错（禁静默回退）
+//! - `btls_server`：btls 服务端上下文装配（ECH keys / ALPN / 版本门 / `rejectUnknownSni`）
+//!   + 握手（`accept_with_ctx`，装配期 ctx 逐连接复用）
 //!
 //! ## IO 边界与实现状态
 //! - `utls`：标准 rustls 包装的 `Conn`/`UConn`，async 工厂 `client`/`server`/`u_client`
@@ -64,6 +68,7 @@ pub mod btls_reality;
 #[cfg(not(target_os = "ios"))]
 pub mod btls_server;
 pub mod grpc;
+pub mod inbound_acceptor;
 #[cfg(test)]
 mod stress_tests;
 pub mod tls_session_cache;

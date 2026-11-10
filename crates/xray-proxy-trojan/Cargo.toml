@@ -21,6 +21,9 @@ prost = { workspace = true }
 
 xray-proto = { path = "../xray-proto" }
 xray-transport = { path = "../xray-transport" }
+# 入站 TLS acceptor 后端二选一（rustls / btls，bd mdpl2）——`InboundTlsAcceptor` 的
+# 家在 xray-tls（btls 服务端装配只在那里），生产面必须生产依赖。
+xray-tls = { path = "../xray-tls" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 async-trait = "0.1"
 xray-app-proxyman = { path = "../xray-app-proxyman" }

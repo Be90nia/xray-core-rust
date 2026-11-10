@@ -459,7 +459,7 @@ pub async fn serve_trojan(
     ohm: Arc<SimpleOhm>,
     validator: Arc<Validator>,
     fallbacks: Option<Arc<FallbackPolicy>>,
-    tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    tls: Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>,
     // sm80④：装配层传 policy_for_level(level).timeout.handshake；测试可传短值。
     handshake_timeout: std::time::Duration,
 ) -> std::io::Result<()> {
@@ -498,9 +498,8 @@ pub async fn serve_trojan(
                     Ok(tls_stream) => {
                         // fallback 路由需要 TLS 层 SNI/ALPN（Go：connectionState.ServerName /
                         // NegotiatedProtocol）
-                        let conn = tls_stream.get_ref().1;
-                        let name = conn.server_name().unwrap_or("").to_string();
-                        let alpn = conn
+                        let name = tls_stream.server_name().unwrap_or("").to_string();
+                        let alpn = tls_stream
                             .alpn_protocol()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();

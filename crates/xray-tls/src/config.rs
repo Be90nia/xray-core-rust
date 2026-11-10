@@ -296,7 +296,7 @@ fn kx_named_group(c: CurveId) -> Option<rustls::NamedGroup> {
 }
 
 /// 版本字符串 `"1.0"`-`"1.3"` → 数字。未知值 `None`（对齐 Go switch：不认识就忽略保持默认）。
-fn parse_version_str(s: &str) -> Option<u16> {
+pub(crate) fn parse_version_str(s: &str) -> Option<u16> {
     match s {
         "1.0" => Some(10),
         "1.1" => Some(11),

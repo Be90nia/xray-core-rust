@@ -200,6 +200,156 @@ impl ResolvesServerCert for SniCertResolver {
 }
 
 // ============================================================
+// build_btls_server_context（btls 后端，bd mdpl2）
+// ============================================================
+
+/// 从 `tlsSettings` 构建 **btls（BoringSSL）** 后端的入站 `SslContext`。
+///
+/// 触发条件：`echServerKeys` 非空（rustls 0.23 无服务端 ECH，见
+/// [`build_server_config`] 的拒启分支）——选路在
+/// [`crate::inbound_acceptor::build_inbound_acceptor`]。
+///
+/// # 与 rustls 后端的差异（逐条显式，禁静默）
+/// - **单证书**：btls 侧无 SNI 多证书选择接线 ⇒ 多张 `encipherment` 条目**配置期硬错**
+///   （否则会静默用首张，SNI 命中错证书）。
+/// - **无 mTLS**：`certificates[].usage:"verify"`（客户端 CA）有配置即**硬错**。
+/// - **无热重载**：ctx 静态；`certificateFile`/`keyFile` 装配期读一次。
+/// - `masterKeyLog` / `enableSessionResumption=false` / `cipherSuites` / `curvePreferences`
+///   后端未接线 ⇒ 聚合成一条 warn 列出被忽略的键（与 rustls 侧 「不支持的密钥套件 warn
+///   跳过」同口径：不假装生效）。
+/// - `minVersion`/`maxVersion`/`rejectUnknownSni`/`alpn` **已接线**（见
+///   [`crate::btls_server::InboundContextParams`]）。
+///
+/// # Errors
+/// - 证书/私钥读取或解析失败、证书与私钥不匹配
+/// - 多证书条目 / `usage:"verify"` 条目（`Unsupported`）
+/// - ECH keys 非法（BoringSSL 拒绝，含非 HKDF-SHA256 suite / 无 retry config）
+#[cfg(not(target_os = "ios"))]
+pub fn build_btls_server_context(
+    json: &serde_json::Value,
+    ech_server_keys: &[u8],
+) -> io::Result<Arc<btls::ssl::SslContext>> {
+    use crate::btls_server::{InboundContextParams, build_inbound_context};
+
+    let mut entries: Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> = Vec::new();
+    if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
+        for entry in arr {
+            match entry_usage(entry) {
+                // btls 面无客户端证书校验接线 ⇒ 有配置即硬错（静默丢弃 = 用户以为开了 mTLS）。
+                EntryUsage::Verify => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "certificates[].usage:\"verify\" (mTLS client CA) is not supported by the \
+                         btls backend: deploy ECH inbounds without client certificate \
+                         verification, or remove echServerKeys",
+                    ));
+                },
+                EntryUsage::Encipherment => {},
+                // 与 build_named_cert_keys 同口径：`issue`（动态签发）不是服务端证书。
+                EntryUsage::Issue => continue,
+            }
+            let (certs, key) = entry_certs_and_key(entry)?;
+            let Some(key) = key else {
+                tracing::warn!(
+                    "certificates[] encipherment entry has certificate but no key; skipped"
+                );
+                continue;
+            };
+            entries.push((certs, key));
+        }
+    }
+    if entries.is_empty() {
+        if let (Some(cert_str), Some(key_str)) =
+            (json.get("cert").and_then(|x| x.as_str()), json.get("key").and_then(|x| x.as_str()))
+        {
+            entries.push((pem_certs(cert_str.as_bytes())?, pem_key(key_str.as_bytes())?));
+        }
+    }
+    if entries.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "echServerKeys + {} certificates[] entries: the btls backend serves a single \
+                 certificate, so the remaining entries would never be selected (SNI would \
+                 silently get the first one); keep one encipherment entry to use ECH",
+                entries.len()
+            ),
+        ));
+    }
+
+    // 后置处理不了的字段：显式 warn（不假装生效）。热重载同理（ctx 静态）。
+    let ignored: Vec<&str> = [
+        ("masterKeyLog", json.get("masterKeyLog").is_some()),
+        (
+            "enableSessionResumption=false",
+            json.get("enableSessionResumption").and_then(|v| v.as_bool()) == Some(false),
+        ),
+        ("cipherSuites", json.get("cipherSuites").is_some()),
+        ("curvePreferences", json.get("curvePreferences").is_some()),
+        (
+            "certificates[].certificateFile/keyFile hot reload",
+            json.get("certificates")
+                .and_then(|v| v.as_array())
+                .is_some_and(|arr| arr.iter().any(|e| e.get("certificateFile").is_some())),
+        ),
+    ]
+    .iter()
+    .filter_map(|(name, set)| set.then_some(*name))
+    .collect();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            target: "xray_tls::server_config",
+            ignored = ?ignored,
+            "btls (echServerKeys) backend does not apply these tlsSettings fields"
+        );
+    }
+
+    let (leaf_der, key_der, chain_ders, leaf_names) = match entries.pop() {
+        Some((certs, key)) => {
+            let names = cert_names(&certs);
+            let leaf = certs
+                .first()
+                .ok_or_else(|| io::Error::other("certificate chain is empty"))?
+                .as_ref()
+                .to_vec();
+            let chain: Vec<Vec<u8>> = certs.iter().skip(1).map(|c| c.as_ref().to_vec()).collect();
+            (Some(leaf), Some(key.secret_der().to_vec()), chain, names)
+        },
+        None => {
+            // Go 语义（同 build_server_config）：启动成功、每条连接握手失败。
+            tracing::warn!(
+                target: "xray_tls::server_config",
+                "no TLS certificate configured for the btls backend: every handshake will fail"
+            );
+            (None, None, Vec::new(), Vec::new())
+        },
+    };
+
+    let alpn_protos = parse_alpn(json)?;
+    let (min_version, max_version) = version_gates(json);
+    // `rejectUnknownSni`：白名单取叶子证书的 CN + DNS SAN（与 rustls resolver 同口径；
+    // 空名单 = 拒一切 SNI，与 rustls `CertSnapshot::select` 的 reject 分支一致）。
+    let server_names = json
+        .get("rejectUnknownSni")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then_some(leaf_names.as_slice());
+
+    let ctx = build_inbound_context(InboundContextParams {
+        cert_der: leaf_der.as_deref(),
+        chain_ders: &chain_ders,
+        key_der: key_der.as_deref(),
+        ech_server_keys,
+        alpn_protos: &alpn_protos,
+        min_version,
+        max_version,
+        server_names,
+    })
+    .map_err(io::Error::other)?;
+    Ok(Arc::new(ctx))
+}
+
+// ============================================================
 // build_server_config
 // ============================================================
 
@@ -448,6 +598,34 @@ fn parse_alpn(json: &serde_json::Value) -> io::Result<Vec<Vec<u8>>> {
     } else {
         Ok(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
     }
+}
+
+/// `minVersion`/`maxVersion` → btls 版本门（`None` = BoringSSL 默认）。
+///
+/// 与 rustls 路径同口径（`security_params`）：TLS 1.0/1.1 不可用时下限钳到 1.2 并 warn
+/// （BoringSSL 虽支持 1.0/1.1，但本仓对拍基准 Go `crypto/tls` 默认 min = 1.2）；
+/// 未知值忽略保持默认。
+#[cfg(not(target_os = "ios"))]
+fn version_gates(
+    json: &serde_json::Value,
+) -> (Option<btls::ssl::SslVersion>, Option<btls::ssl::SslVersion>) {
+    use btls::ssl::SslVersion;
+    let map = |v: u16| match v {
+        10..=12 => Some(SslVersion::TLS1_2),
+        13 => Some(SslVersion::TLS1_3),
+        _ => None,
+    };
+    let parse = |key: &str| {
+        json.get(key).and_then(|v| v.as_str()).and_then(crate::config::parse_version_str)
+    };
+    let min = parse("minVersion");
+    if matches!(min, Some(10) | Some(11)) {
+        tracing::warn!(
+            target: "xray_tls::server_config",
+            "TLS 1.0/1.1 not offered by this build, clamping minVersion to 1.2"
+        );
+    }
+    (min.and_then(map), parse("maxVersion").and_then(map))
 }
 
 /// `masterKeyLog` 解析结果（票 8k4s①：Go string 路径 vs Rust bool 方言双形态）。

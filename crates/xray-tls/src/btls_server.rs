@@ -215,10 +215,18 @@ fn apply_ech_keys(ctx: *mut btls_sys::SSL_CTX, ech_server_keys: &[u8]) -> Result
             )
         };
         if added != 1 {
-            return Err(format!(
-                "btls server: SSL_ECH_KEYS_add({idx}): {}",
-                btls::error::ErrorStack::get()
-            ));
+            let stack = btls::error::ErrorStack::get().to_string();
+            // Go CLI `xray tls ech` 产 9 套件（含 HKDF-SHA384/512），而 BoringSSL 服务端
+            // 只接受 HKDF-SHA256 ⇒ 照 CLI 输出配 `echServerKeys` 会撞在这里。给出可操作
+            // 修法（换后端解不了，客户端 keyset 是给 Go 服务端用的）。
+            let hint = if stack.contains("UNSUPPORTED_ECH_SERVER_CONFIG") {
+                "; BoringSSL requires HKDF-SHA256-only ECHConfigs — `xray tls ech` emits suites \
+                 for Go servers, generate server keys with \
+                 `cargo run -p xray-tls --example ech_keys`"
+            } else {
+                ""
+            };
+            return Err(format!("btls server: SSL_ECH_KEYS_add({idx}): {stack}{hint}"));
         }
     }
     // SAFETY: ctx 由调用方传入且存活；keyset 非空且首条为 retry config。
@@ -229,6 +237,129 @@ fn apply_ech_keys(ctx: *mut btls_sys::SSL_CTX, ech_server_keys: &[u8]) -> Result
         ));
     }
     Ok(())
+}
+
+/// 入站 btls 服务端上下文装配参数（bd mdpl2：plain-TLS 入站的 btls 后端）。
+///
+/// [`build_server_ssl_context_with_ech`] 只装证书 + ECH keys；入站还要 ALPN（fallback
+/// 路由用）、版本门与 `rejectUnknownSni` 白名单——这三项缺一即"配置写了但不生效"，
+/// 故在此显式承接，`None`/空 = 未配置。
+#[derive(Default)]
+pub struct InboundContextParams<'a> {
+    /// 叶子证书 DER。`None` = 无证书（Go 语义：启动成功、每条连接握手失败）。
+    pub cert_der: Option<&'a [u8]>,
+    /// 链中间证书 DER（`certificates[]` 条目除叶子外全部）。
+    pub chain_ders: &'a [Vec<u8>],
+    /// 私钥 DER（PKCS#8；Ed25519 ring 变体由 `normalize_ed25519_pkcs8` 归一）。
+    pub key_der: Option<&'a [u8]>,
+    /// ECH 解密 keys（`[u16 sk_len][sk][u16 cfg_len][cfg]*`）；空 = 不开 ECH。
+    pub ech_server_keys: &'a [u8],
+    /// ALPN 协议名（服务端偏好序，同 Go `Config.NextProtos`）。
+    pub alpn_protos: &'a [Vec<u8>],
+    /// `minVersion`（缺省 = BoringSSL 默认）。
+    pub min_version: Option<btls::ssl::SslVersion>,
+    /// `maxVersion`（缺省 = BoringSSL 默认）。
+    pub max_version: Option<btls::ssl::SslVersion>,
+    /// `rejectUnknownSni=true` 时的 SNI 白名单（`None` = 不校验，任意 SNI 都发本证书）。
+    pub server_names: Option<&'a [String]>,
+}
+
+/// 按入站参数装配 btls 服务端 `SslContext`（装配期一次，逐连接复用）。
+///
+/// # Errors
+/// - 证书/链/私钥 DER 非法或证书与私钥不匹配
+/// - ALPN / 版本门设置失败
+/// - ECH keys 注册失败（同 [`build_server_ssl_context_with_ech`]）
+pub fn build_inbound_context(
+    params: InboundContextParams<'_>,
+) -> Result<btls::ssl::SslContext, String> {
+    use btls::ssl::{SslContextBuilder, SslMethod};
+    let mut builder = SslContextBuilder::new(SslMethod::tls())
+        .map_err(|e| format!("btls server: ssl ctx: {e}"))?;
+    if let Some(cert_der) = params.cert_der {
+        let cert = btls::x509::X509::from_der(cert_der)
+            .map_err(|e| format!("btls server: cert der: {e}"))?;
+        builder.set_certificate(&cert).map_err(|e| format!("btls server: set cert: {e}"))?;
+        // 无私钥 = 配置错（`certificates[]` 条目只给证书不给 key 时上面已跳过；
+        // 走到这里说明装配层传了叶子却漏 key）。
+        let key_der = params
+            .key_der
+            .ok_or_else(|| "btls server: certificate loaded without private key".to_string())?;
+        let key = btls::pkey::PKey::private_key_from_der(&normalize_ed25519_pkcs8(key_der))
+            .map_err(|e| format!("btls server: private key der: {e}"))?;
+        builder.set_private_key(&key).map_err(|e| format!("btls server: set key: {e}"))?;
+        builder.check_private_key().map_err(|e| format!("btls server: cert/key mismatch: {e}"))?;
+        for der in params.chain_ders {
+            let extra = btls::x509::X509::from_der(der)
+                .map_err(|e| format!("btls server: chain cert der: {e}"))?;
+            builder
+                .add_extra_chain_cert(extra)
+                .map_err(|e| format!("btls server: add chain cert: {e}"))?;
+        }
+    }
+    if !params.alpn_protos.is_empty() {
+        // BoringSSL 服务端只在设了 `SSL_CTX_set_alpn_select_cb` 时协商 ALPN
+        // （`ssl/extensions.cc:1464`：无回调即跳过整个扩展）——只写
+        // `SSL_CTX_set_alpn_protos` 会静默不协商。选择语义对齐 Go
+        // `Config.NextProtos`：按**服务端**偏好序取首个客户端也提供的协议；
+        // 客户端提供了但无一命中 ⇒ fatal alert（同 Go `negotiateALPN` 失败路径）。
+        let prefs = params.alpn_protos.to_vec();
+        builder.set_alpn_select_callback(move |_ssl, client_list| {
+            select_alpn(&prefs, client_list).ok_or(btls::ssl::AlpnError::ALERT_FATAL)
+        });
+    }
+    if let Some(v) = params.min_version {
+        builder
+            .set_min_proto_version(Some(v))
+            .map_err(|e| format!("btls server: set min version: {e}"))?;
+    }
+    if let Some(v) = params.max_version {
+        builder
+            .set_max_proto_version(Some(v))
+            .map_err(|e| format!("btls server: set max version: {e}"))?;
+    }
+    if let Some(names) = params.server_names {
+        let names = names.to_vec();
+        // Go `Config.RejectUnknownSni`：白名单外的 SNI 直接 alert，不发证书。
+        builder.set_servername_callback(move |ssl, _alert| {
+            match ssl.servername(btls::ssl::NameType::HOST_NAME) {
+                Some(sni) if sni_allowed(&names, sni) => Ok(()),
+                _ => Err(btls::ssl::SniError::ALERT_FATAL),
+            }
+        });
+    }
+    let ctx = builder.build();
+    if !params.ech_server_keys.is_empty() {
+        apply_ech_keys(ctx.as_ptr(), params.ech_server_keys)?;
+    }
+    Ok(ctx)
+}
+
+/// 按服务端偏好序在客户端 ALPN 列表里选协议（返回**客户端缓冲**的切片，BoringSSL 要求）。
+fn select_alpn<'a>(prefs: &[Vec<u8>], client_list: &'a [u8]) -> Option<&'a [u8]> {
+    for pref in prefs {
+        let mut rest = client_list;
+        while let Some((&len, tail)) = rest.split_first() {
+            let len = usize::from(len);
+            let (proto, next) = tail.split_at_checked(len)?;
+            if proto == pref.as_slice() {
+                return Some(proto);
+            }
+            rest = next;
+        }
+    }
+    None
+}
+
+/// SNI 是否命中白名单（精确或 `*.example.com` 通配，口径同 rustls 侧
+/// `CertSnapshot::select`；全小写比较）。
+fn sni_allowed(names: &[String], sni: &str) -> bool {
+    let lower = sni.to_lowercase();
+    let wildcard = match lower.find('.') {
+        Some(idx) => format!("*{}", &lower[idx..]),
+        None => String::from("*"),
+    };
+    names.iter().any(|n| n == &lower || n == &wildcard)
 }
 
 /// 在流上完成 btls 服务端握手。
@@ -250,7 +381,25 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let ctx = build_server_ssl_context(cert_der, key_der).map_err(io::Error::other)?;
-    let ssl = btls::ssl::Ssl::new(&ctx).map_err(|e| io::Error::other(e.to_string()))?;
+    accept_with_ctx(&ctx, stream).await
+}
+
+/// 同上，但在**装配期建好**的 `SslContext` 上握手（入站 acceptor 形态：ctx 只建一次，
+/// 每条连接只 `Ssl::new`，bd mdpl2）。
+///
+/// 对应 Go `tls.NewListener` 包 `tls.Config` 的复用语义（`Config` 装配期一次）。
+///
+/// # Errors
+/// - `Ssl::new` 失败（ctx 已失效）
+/// - 握手失败（alert/WANT 协议错误/IO 错误）→ io::Error
+pub async fn accept_with_ctx<S>(
+    ctx: &btls::ssl::SslContext,
+    stream: S,
+) -> io::Result<BtlsServerStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let ssl = btls::ssl::Ssl::new(ctx).map_err(|e| io::Error::other(e.to_string()))?;
     // SAFETY: ssl 为刚构造的合法 SSL；SSL_set_accept_state 仅把连接标记为
     // 服务端角色（btls 只在同步 SslStreamBuilder 上暴露此步，tokio 路径需
     // 在握手前直接设置）。
@@ -410,6 +559,9 @@ mod tests {
         let keys = crate::ech::pack_ech_server_keys(&priv_bytes, &config);
         let err = ech_build_err(&keys);
         assert!(err.contains("SSL_ECH_KEYS_add"), "got: {err}");
+        // 用户照 `xray tls ech`（Go 兼容 9 套件）配 `echServerKeys` 会撞这里 ⇒ 报错必须
+        // 指明 BoringSSL 只吃 HKDF-SHA256 keyset（换后端/降版本都解不了）。
+        assert!(err.contains("HKDF-SHA256"), "must hint the usable keyset, got: {err}");
     }
 
     /// 私钥不是 32B X25519 ⇒ 构造期 Err（Go 侧同位置由 `ecdh.PrivateKey` 解析拒）。

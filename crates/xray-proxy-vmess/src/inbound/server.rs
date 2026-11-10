@@ -162,7 +162,7 @@ pub async fn serve_vmess(
     listener: InboundTcpListener,
     ohm: Arc<SimpleOhm>,
     validator: Arc<TimedUserValidator>,
-    tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    tls: Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>,
     // sm80④：装配层传 policy_for_level(level).timeout.handshake（Go
     // server.go::Process SetReadDeadline(policy)）；测试可传短值。
     handshake_timeout: std::time::Duration,

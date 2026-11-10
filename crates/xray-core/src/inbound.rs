@@ -1495,8 +1495,8 @@ pub struct DokodemoTcpOptions {
     pub port_map: HashMap<String, String>,
     /// 跟随 iptables REDIRECT 原始目标（Linux `SO_ORIGINAL_DST`）+ TLS SNI 覆盖。
     pub follow_redirect: bool,
-    /// TLS acceptor（streamSettings `security:tls` 时）。
-    pub tls: Option<Arc<xray_transport::TlsAcceptor>>,
+    /// TLS acceptor（streamSettings `security:tls` 时；后端 rustls / btls 由装配期选路）。
+    pub tls: Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>,
 }
 
 /// 字符串解析为 [`Address`]：IPv4 → IPv6 → 域名。
@@ -1673,8 +1673,8 @@ pub async fn serve_dokodemo(
                 match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, acc.accept(stream)).await {
                     Ok(Ok(tls_stream)) => {
                         // SNI 覆盖：握手完成后的 ClientHello server_name
-                        // （rustls ServerConnection::server_name）。
-                        let sni = tls_stream.get_ref().1.server_name();
+                        // （rustls ServerConnection::server_name / btls SslRef::servername）。
+                        let sni = tls_stream.server_name();
                         match resolve_dokodemo_tcp_dest(
                             &opts,
                             local_ip,
@@ -3807,18 +3807,25 @@ fn drain_report(tag: &str, report: skeleton_infra::fx::ShutdownReport) {
 ///
 /// 对应 Go inbound listener 的 `tls.ConfigFromStreamSettings` → `tls.NewListener`。
 /// serve 函数 accept 后先做 TLS handshake 再处理协议数据。
+///
+/// 后端选路在 [`xray_tls::inbound_acceptor::build_inbound_acceptor`]：`echServerKeys`
+/// 非空 ⇒ btls（BoringSSL）acceptor，否则 rustls；btls 装配失败即配置期硬错
+/// （bd mdpl2，禁静默回退——那会让 ECH 配置静默失效）。
 pub(crate) fn build_tls_acceptor(
     stream_settings_json: Option<&serde_json::Value>,
-) -> std::io::Result<Option<Arc<xray_transport::TlsAcceptor>>> {
+) -> std::io::Result<Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>> {
     let settings = xray_transport::dialer::StreamSettings::from_json(stream_settings_json);
     if !settings.is_tls() {
         return Ok(None);
     }
-    let cfg = xray_tls::server_config::build_server_config(
+    let acceptor = xray_tls::inbound_acceptor::build_inbound_acceptor(
         &settings.security,
         settings.security_json.as_ref(),
     )?;
-    Ok(cfg.map(|c| Arc::new(xray_transport::TlsAcceptor::from(c))))
+    if let Some(acc) = &acceptor {
+        tracing::debug!(backend = acc.backend(), "inbound TLS acceptor available");
+    }
+    Ok(acceptor.map(Arc::new))
 }
 
 /// REALITY inbound 配置（从 `realitySettings` 解析）。
