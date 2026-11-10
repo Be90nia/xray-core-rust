@@ -33,7 +33,7 @@
   "proxy/blackhole/config.proto": "f603128ce3a8e9e8a1e8d30cfdbf5b494df70547b72b8e5ef36cd5e69e7fec90",
   "proxy/dns/config.proto": "84435d949dd3f6b334fcb40dd2ccf357f55dcd718e4fdcb69aabcac4bf379ca3",
   "proxy/dokodemo/config.proto": "38e0324277c2c81a36408cfbaffb8823b64c75b7a9289c2ad5477de13c3e8e47",
-  "proxy/freedom/config.proto": "6f8c8a43a702b6a92dd7ac029b534c62c373f9f4956471ea8cbc9d0751a2927a",
+  "proxy/freedom/config.proto": "0c128713771f4414377afc39a08a801208fa6630e7f192b58021a8aff0bacc7d",
   "proxy/http/config.proto": "fe3bbb5299cd78beaa9a1497fb1977ed0cf75e2540bd94018fb37bcc0ace5cda",
   "proxy/hysteria/account/config.proto": "f3b64dfb54383f3674aec80cb4655a68a4528e24872bb5bb90d72de329604f1d",
   "proxy/hysteria/config.proto": "fb3f4d30f4abbcba5a11858e919c0dac84d416065d6846fa739073aaf495ab3b",
