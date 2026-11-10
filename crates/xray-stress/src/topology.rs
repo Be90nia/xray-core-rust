@@ -568,7 +568,10 @@ pub async fn start_anytls_link(_echo_port: u16) -> Result<LinkHandles> {
         .map_err(|e| StressError::Rustls(format!("anytls server rustls config: {e}")))?;
     let server = xray_proxy_anytls::server::AnytlsMockServer::start_with_password(
         std::net::SocketAddr::from(([127, 0, 0, 1], proto_port)),
-        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls)),
+        // bd ozgh9：anytls 入站改持统一选路件（压测侧无 ECH ⇒ rustls 后端）。
+        std::sync::Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(
+            tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls)),
+        )),
         None, // mock 直连 echo（anytls crate e2e 同形态；dispatch 路径由客户端实例承载）
         Some(STRESS_ANYTLS_PASSWORD),
     )
