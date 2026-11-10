@@ -366,6 +366,8 @@ fn download_stage(
     downloader: &dyn AssetDownloader,
     asset: &GeodataAsset,
 ) -> Result<Stage, GeodataError> {
+    // 与串行 `downloader::download_one` 同口径：扩展名不在白名单 → 显式拒收。
+    asset.validate_extension()?;
     let target = downloader.resolve_target(&asset.file)?;
     let (_file, temp) = swap::temp_file(&target, ".tmp")?;
     drop(_file); // path 模式：下载 trait 自管 fd

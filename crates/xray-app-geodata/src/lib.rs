@@ -28,11 +28,11 @@ pub mod instance;
 pub mod loader;
 pub mod scheduler;
 pub mod swap;
-pub use config::{GeodataAsset, GeodataConfig};
+pub use config::{ALLOWED_ASSET_EXTENSIONS, GeodataAsset, GeodataConfig};
 pub use downloader::{
-    AssetDownloader, DefaultAssetDownloader, GeodataReloader, NoopReloader, RealAssetDownloader,
-    ReloadListener, clear_reload_listeners, download_assets, register_reload_listener,
-    reload_listener_count, reload_with_update,
+    AssetDownloader, DefaultAssetDownloader, GeodataReloader, MAX_DOWNLOAD_SIZE, NoopReloader,
+    RealAssetDownloader, ReloadListener, clear_reload_listeners, download_assets,
+    register_reload_listener, reload_listener_count, reload_with_update,
 };
 pub use error::{GeodataError, at_error, at_warning};
 pub use feature::GeodataFeature;

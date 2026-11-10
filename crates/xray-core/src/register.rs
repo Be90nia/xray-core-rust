@@ -1004,7 +1004,9 @@ fn geodata_factory() -> FeatureFactory {
 
 /// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go
 /// `infra/conf/geodata.go:48-71` Build() 语义校验：cron 非法 / asset url
-/// 非 https / asset file 本地缺失 → `ConfigInvalid` 硬错（bd onx4：启动期致命）。
+/// 非 https / asset 扩展名非 `.dat` / asset file 本地缺失 → `ConfigInvalid` 硬错
+/// （bd onx4：启动期致命）。asset 校验口径见
+/// [`xray_app_geodata::GeodataAsset::validate`]（单一来源）。
 /// cron 为空则原样放行（start 时不调度，与 Go `if config.cron == ""` 等价）。
 ///
 /// bd 3nt18 / bd 2bmns G-3：`geodata.outbound` 在 Rust 侧**无接线**
@@ -1029,25 +1031,25 @@ fn map_geodata_config(
     }
     let mut assets = Vec::new();
     for a in json_cfg.assets.unwrap_or_default() {
-        let url = a.url.unwrap_or_default();
-        let file = a.file.unwrap_or_default();
-        let host = url.strip_prefix("https://").unwrap_or("");
-        if host.is_empty() || host.starts_with('/') {
-            return Err(FeatureError::ConfigInvalid {
-                name: "geodata",
-                message: format!(
-                    "invalid geodata asset url: {}",
-                    xray_common::redact::redact_url(&url)
-                ),
-            });
-        }
-        if file.is_empty() || !default_asset_dir().join(&file).exists() {
+        let asset = xray_app_geodata::GeodataAsset {
+            url: a.url.unwrap_or_default(),
+            file: a.file.unwrap_or_default(),
+        };
+        // Go v26.11.9 `infra/conf/geodata.go` `validateHTTPS`（scheme 必须 https 且
+        // host 非空）+ `app/geodata/geodata.go` `New()`（扩展名必须 `.dat`，大小写
+        // 不敏感）。校验收敛在 `xray_app_geodata::GeodataAsset::validate`（单一来源；
+        // URL 已在 `InvalidAssetUrl` 内脱敏）。
+        asset
+            .validate()
+            .map_err(|e| FeatureError::ConfigInvalid { name: "geodata", message: e.to_string() })?;
+        let file = &asset.file;
+        if file.is_empty() || !default_asset_dir().join(file).exists() {
             return Err(FeatureError::ConfigInvalid {
                 name: "geodata",
                 message: format!("invalid geodata asset file: {file}"),
             });
         }
-        assets.push(xray_app_geodata::GeodataAsset { url, file });
+        assets.push(asset);
     }
     let config = xray_app_geodata::GeodataConfig {
         cron: json_cfg.cron.unwrap_or_default(),

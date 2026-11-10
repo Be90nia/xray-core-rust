@@ -94,6 +94,9 @@ fn download_one<D: AssetDownloader + ?Sized>(
     downloader: &D,
     asset: &GeodataAsset,
 ) -> Result<Stage, GeodataError> {
+    // Go `app/geodata/geodata.go` `New()`：资产文件扩展名必须 `.dat`（大小写不敏感）。
+    // 拒收 = 显式失败（fail-visible），**禁**静默跳过、**禁**降级为其他格式。
+    asset.validate_extension()?;
     let target = downloader.resolve_target(&asset.file)?;
     let target_str_suffix = ".tmp";
     let (_file, temp) = crate::swap::temp_file(&target, target_str_suffix)?;
@@ -158,9 +161,10 @@ impl GeodataReloader for NoopReloader {
 /// 对应 Go `downloader` + `idleConn` + `http.Client` 中"实际下字节"的子集：
 /// 不走 dispatcher dial（Go 走 tagged dialer）——这可由 trait 上层包装覆盖。当前实现：
 ///
-/// - 支持 `http://` 与 `https://`（rustls + webpki-roots 同步握手）
+/// - **只支持 `https://`**（rustls + webpki-roots 同步握手）：Go v26.11.9 `app/geodata/download.go`
+///   已删除非 TLS 客户端，只剩 `httpsClient` 单一路径
 /// - 跟随 redirect：Go `CheckRedirect` 语义（目标必须 https，最多 10 跳）
-/// - 单连接一次性 GET，Body 全读到 temp 文件
+/// - 单连接一次性 GET，Body 流式落 temp 文件，落盘字节受 [`MAX_DOWNLOAD_SIZE`] 限制
 /// - 默认 30s 超时（与 Go `idleTimeout` 对齐），可用 `with_timeout` 覆盖
 /// - 状态码非 2xx → `UnexpectedStatus`
 /// - 响应体为空 → `EmptyResponse`
@@ -170,6 +174,10 @@ pub struct RealAssetDownloader {
     /// 713x6：下载 deadline 时间源（P1-12 同款；生产 `SystemClock`，测试可注入
     /// `MockClock` 冻结时间线）。
     clock: Arc<dyn Clock>,
+    /// 下载体上限（字节）。缺省 [`MAX_DOWNLOAD_SIZE`]；测试可下调。
+    max_download_size: u64,
+    /// 额外信任根（自签 / 私有 CA）。缺省仅 webpki-roots。
+    extra_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl RealAssetDownloader {
@@ -178,7 +186,26 @@ impl RealAssetDownloader {
             asset_dir,
             timeout: std::time::Duration::from_secs(30),
             clock: Arc::new(SystemClock),
+            max_download_size: MAX_DOWNLOAD_SIZE,
+            extra_roots: Vec::new(),
         }
+    }
+
+    /// 下调下载体上限（字节）。生产用缺省 [`MAX_DOWNLOAD_SIZE`]；测试用小限额。
+    #[must_use]
+    pub fn with_max_download_size(mut self, max: u64) -> Self {
+        self.max_download_size = max;
+        self
+    }
+
+    /// 追加信任根（DER）。用于私有 CA / 自签源；缺省仅 webpki-roots。
+    #[must_use]
+    pub fn with_extra_root_cert(
+        mut self,
+        cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> Self {
+        self.extra_roots.push(cert);
+        self
     }
 
     /// 713x6：注入时钟（`new` 缺省 `SystemClock`，行为不变）。
@@ -197,14 +224,14 @@ impl RealAssetDownloader {
 
     fn parse_url(&self, url: &str) -> Result<ParsedUrl, GeodataError> {
         let url = url.trim();
+        // Go v26.11.9 `app/geodata/download.go`：非 TLS 客户端已删除，只剩 https
+        // 路径（`downloader.httpsClient` 单一 client）。故 http:// 一律拒收。
         let (scheme, rest) = if let Some(s) = url.strip_prefix("https://") {
             ("https", s)
-        } else if let Some(s) = url.strip_prefix("http://") {
-            ("http", s)
         } else {
             return Err(GeodataError::DownloadFailed {
                 url: url.to_string(),
-                reason: "unsupported scheme (only http/https)".into(),
+                reason: "scheme must be https".into(),
             });
         };
 
@@ -235,6 +262,14 @@ impl RealAssetDownloader {
 
 /// Go `CheckRedirect`：最多跟随 10 跳（第 11 跳报 `TooManyRedirects`）。
 const MAX_REDIRECTS: usize = 10;
+
+/// 下载体大小上限：256 MiB。
+///
+/// 对齐 Go v26.11.9 `app/geodata/download.go`：`maxDownloadSize int64 = 256 * 1024 * 1024`。
+/// Go 的两处判定：① `resp.ContentLength > maxDownloadSize` → 拒（头部即拒）；
+/// ② `io.Copy(writer, io.LimitReader(body, maxDownloadSize+1))` 后 `n > maxDownloadSize`
+/// → 拒（读到第 max+1 字节即中止）。故**恰好 256 MiB 允许**，超出 1 字节即拒。
+pub const MAX_DOWNLOAD_SIZE: u64 = 256 * 1024 * 1024;
 
 struct ParsedUrl {
     scheme: String,
@@ -301,63 +336,51 @@ impl RealAssetDownloader {
             path = parsed.path,
             host = parsed.host,
         );
-        // 713x6：TLS/TCP 两分支的 deadline 起点取自注入时钟（原 bd 39hko 挂账收口，
-        // 逐点 allow 已撤）。
-        let redirect = if parsed.scheme == "https" {
-            // pn8e: https 路径。rustls::Stream 仅借用 &mut conn + &mut tcp，故
-            // ClientConnection 须在 caller 栈上持有以延长 Stream 借用生命周期；
-            // https_handshake 内部用 `*conn = ClientConnection::new(...)` 重赋值。
-            // 用 ServerName::try_from 提前一次解析（失败也走同样错路径）。
-            let mut conn = rustls::ClientConnection::new(
-                Arc::new(
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(rustls::RootCertStore::empty())
-                        .with_no_client_auth(),
-                ),
-                rustls::pki_types::ServerName::try_from(parsed.host.clone()).map_err(|e| {
-                    GeodataError::DownloadFailed {
-                        url: url.to_string(),
-                        reason: format!("invalid server name for SNI: {e}"),
-                    }
-                })?,
-            )
-            .map_err(|e| GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!(
-                    "rustls ClientConnection (initial; will be overwritten by https_handshake): {e}"
-                ),
-            })?;
-            let mut tls = https_handshake(
-                &mut conn,
-                &mut tcp,
-                &parsed.host,
-                self.clock.as_ref(),
-                self.timeout,
-            )?;
-            tls.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("write request (tls): {e}"),
-            })?;
-            read_http_body(
-                tls,
-                url,
-                temp_path,
-                self.clock.as_ref(),
-                self.clock.now_instant() + self.timeout,
-            )?
-        } else {
-            tcp.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
-                url: url.to_string(),
-                reason: format!("write request: {e}"),
-            })?;
-            read_http_body(
-                tcp,
-                url,
-                temp_path,
-                self.clock.as_ref(),
-                self.clock.now_instant() + self.timeout,
-            )?
-        };
+        // 713x6：deadline 起点取自注入时钟（原 bd 39hko 挂账收口，逐点 allow 已撤）。
+        // Go v26.11.9 `app/geodata/download.go`：非 TLS 客户端已删除，只剩 https
+        // 单一路径，故此处无 http 分支（`parse_url` 亦拒绝 http://）。
+        // rustls::Stream 仅借用 &mut conn + &mut tcp，故 ClientConnection 须在
+        // caller 栈上持有以延长 Stream 借用生命周期；https_handshake 内部用
+        // `*conn = ClientConnection::new(...)` 重赋值。
+        let mut conn = rustls::ClientConnection::new(
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+            rustls::pki_types::ServerName::try_from(parsed.host.clone()).map_err(|e| {
+                GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("invalid server name for SNI: {e}"),
+                }
+            })?,
+        )
+        .map_err(|e| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!(
+                "rustls ClientConnection (initial; will be overwritten by https_handshake): {e}"
+            ),
+        })?;
+        let mut tls = https_handshake(
+            &mut conn,
+            &mut tcp,
+            &parsed.host,
+            self.clock.as_ref(),
+            self.timeout,
+            &self.extra_roots,
+        )?;
+        tls.write_all(req.as_bytes()).map_err(|e| GeodataError::DownloadFailed {
+            url: url.to_string(),
+            reason: format!("write request (tls): {e}"),
+        })?;
+        let redirect = read_http_body(
+            tls,
+            url,
+            temp_path,
+            self.clock.as_ref(),
+            self.clock.now_instant() + self.timeout,
+            self.max_download_size,
+        )?;
         match redirect {
             Some(location) => Ok(Some(parsed.resolve_location(url, &location)?)),
             None => Ok(None),
@@ -389,12 +412,17 @@ impl AssetDownloader for RealAssetDownloader {
 /// 解析状态行 + Content-Length，按协议规定读取 body 到 `temp_path`。
 ///
 /// 返回 `Some(Location)` 表示 3xx 需跟跳（未落盘），`None` 表示 body 已落盘。
+///
+/// `max_size` = 下载体上限（Go `maxDownloadSize`，默认 [`MAX_DOWNLOAD_SIZE`]）：
+/// ① `Content-Length > max_size` → 头部即拒；② 落盘字节累计 `> max_size` → 中止拒收
+/// （Go `io.LimitReader(body, max+1)` + `n > max` 的等价语义：恰好 max 允许，max+1 拒）。
 fn read_http_body<R: std::io::Read>(
     mut stream: R,
     url: &str,
     temp_path: &std::path::Path,
     clock: &dyn Clock,
     deadline: std::time::Instant,
+    max_size: u64,
 ) -> Result<Option<String>, GeodataError> {
     use std::io::Write;
 
@@ -474,12 +502,20 @@ fn read_http_body<R: std::io::Read>(
         return Err(GeodataError::UnexpectedStatus(status_code));
     }
 
+    // Go `app/geodata/download.go`：`resp.ContentLength > maxDownloadSize` → 头部即拒
+    // （未知长度 = -1，不触发本分支，落到下面的流式计数）。
+    if let Some(len) = content_length {
+        if len as u64 > max_size {
+            return Err(GeodataError::DownloadTooLarge { limit: max_size });
+        }
+    }
+
     let mut out = std::fs::File::create(temp_path).map_err(|e| GeodataError::DownloadFailed {
         url: url.to_string(),
         reason: format!("create temp file: {e}"),
     })?;
 
-    let mut total: usize = 0;
+    let mut total: u64 = 0;
     if let Some(len) = content_length {
         let mut remaining = len;
         let mut chunk = vec![0u8; 8192.min(len)];
@@ -488,9 +524,14 @@ fn read_http_body<R: std::io::Read>(
             match stream.read(&mut chunk[..to_read]) {
                 Ok(0) => break,
                 Ok(n) => {
+                    // Go `io.Copy(writer, io.LimitReader(body, max+1))` + `n > max → 拒`：
+                    // 恰好 max 允许，max+1 拒收。本仓落盘前即判（不把超限字节写进 temp）。
+                    if total + n as u64 > max_size {
+                        return Err(GeodataError::DownloadTooLarge { limit: max_size });
+                    }
                     out.write_all(&chunk[..n])?;
                     remaining -= n;
-                    total += n;
+                    total += n as u64;
                 },
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -512,8 +553,11 @@ fn read_http_body<R: std::io::Read>(
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if total + n as u64 > max_size {
+                        return Err(GeodataError::DownloadTooLarge { limit: max_size });
+                    }
                     out.write_all(&chunk[..n])?;
-                    total += n;
+                    total += n as u64;
                 },
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -557,6 +601,7 @@ fn https_handshake<'a>(
     host: &str,
     clock: &dyn Clock,
     timeout: std::time::Duration,
+    extra_roots: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<rustls::Stream<'a, rustls::ClientConnection, std::net::TcpStream>, GeodataError> {
     use rustls::{ClientConfig, pki_types::ServerName};
 
@@ -564,6 +609,12 @@ fn https_handshake<'a>(
 
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in extra_roots {
+        roots.add(cert.clone()).map_err(|e| GeodataError::DownloadFailed {
+            url: host.to_string(),
+            reason: format!("invalid extra root certificate: {e}"),
+        })?;
+    }
     let config =
         Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
     let server_name =
@@ -981,6 +1032,7 @@ mod tests {
             "localhost",
             &SystemClock,
             std::time::Duration::from_secs(5),
+            &[],
         ) {
             Ok(_) => panic!("self-signed cert must fail verification"),
             Err(e) => e,
@@ -992,5 +1044,213 @@ mod tests {
         assert!(!matches!(err, GeodataError::IdleTimeout), "改前症状（热旋到 IdleTimeout）: {err}");
         assert!(err.to_string().contains("rustls handshake"), "应为握手层错误: {err}");
         assert!(elapsed < std::time::Duration::from_secs(5), "握手必须立即推进，实际 {elapsed:?}");
+    }
+
+    // ===== bd dr0fu B-7：geodata 下载加固（对齐 Go v26.11.9 48f62b80）=====
+
+    /// Go v26.11.9 `app/geodata/download.go`：非 TLS 客户端已删除（只剩
+    /// `httpsClient`），故 http:// URL 一律拒收。
+    #[test]
+    fn parse_url_rejects_plain_http() {
+        let d = RealAssetDownloader::new(PathBuf::from("/var/geo"));
+        let err = match d.parse_url("http://example.com/geoip.dat") {
+            Ok(_) => panic!("http:// 必须拒收"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, GeodataError::DownloadFailed { .. }), "got {err:?}");
+        assert!(err.to_string().contains("https"), "错误信息应指明 https 约束: {err}");
+        // https 正常放行
+        assert!(d.parse_url("https://example.com/geoip.dat").is_ok());
+    }
+
+    /// Go `maxDownloadSize = 256 * 1024 * 1024`：上限常量口径。
+    #[test]
+    fn max_download_size_is_256_mib() {
+        assert_eq!(MAX_DOWNLOAD_SIZE, 256 * 1024 * 1024);
+    }
+
+    /// 本地回环 TLS server：回写固定 HTTP 响应（含 Content-Length 头）。
+    ///
+    /// 返回 `(addr, 自签证书)` —— 证书供 `with_extra_root_cert` 注入信任根。
+    fn spawn_tls_responder(
+        response: Vec<u8>,
+    ) -> (std::net::SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+        xray_common::ensure_default_crypto_provider();
+        // SAN = 127.0.0.1（IP SAN）：客户端 SNI 走 `ServerName::try_from("127.0.0.1")`
+        // → `ServerName::IpAddress`，webpki 走 IP SAN 校验路径。
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_cfg = std::sync::Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "测试：本地 TLS stub 服务器线程，随进程退出回收"
+        )]
+        std::thread::spawn(move || {
+            let Ok((mut tcp, _)) = listener.accept() else { return };
+            let mut conn = match rustls::ServerConnection::new(server_cfg) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if conn.complete_io(&mut tcp).is_err() {
+                return;
+            }
+            let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+            use std::io::{Read, Write};
+            // 读走请求（客户端写完 GET 后等响应），再回写响应。
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf);
+            let _ = tls.write_all(&response);
+            let _ = tls.flush();
+        });
+        (addr, cert_der)
+    }
+
+    /// Go `resp.ContentLength > maxDownloadSize` → 头部即拒（不下载 body）。
+    ///
+    /// 直接驱动 `read_http_body`（HTTP 响应字节流），无需真造 256 MiB 流量。
+    #[test]
+    fn read_http_body_rejects_content_length_over_limit() {
+        let dir = unique_dir("size_cl");
+        let temp = dir.join("out.tmp");
+        let body = vec![b'x'; 4096];
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+
+        let err = read_http_body(
+            std::io::Cursor::new(resp),
+            "https://example.com/geoip.dat",
+            &temp,
+            &SystemClock,
+            SystemClock.now_instant() + std::time::Duration::from_secs(5),
+            1024,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadTooLarge { limit: 1024 }), "got {err:?}");
+        // 拒收时不得留下半截文件内容被当成有效资产。
+        let written = std::fs::read(&temp).unwrap_or_default();
+        assert!(written.len() <= 1024, "超限 body 不得整段落盘，实际 {} 字节", written.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go `io.Copy(writer, io.LimitReader(body, max+1))` + `n > max → 拒`：
+    /// 恰好等于上限**允许**，超 1 字节拒收（无 Content-Length 的流式响应路径）。
+    #[test]
+    fn read_http_body_allows_exactly_limit_and_rejects_one_byte_over() {
+        let dir = unique_dir("size_edge");
+
+        // ① 恰好 1024 字节（无 Content-Length 头 → 走流式计数路径）→ 成功。
+        let temp = dir.join("exact.tmp");
+        let mut resp = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        resp.extend_from_slice(&vec![b'x'; 1024]);
+        read_http_body(
+            std::io::Cursor::new(resp),
+            "https://example.com/geoip.dat",
+            &temp,
+            &SystemClock,
+            SystemClock.now_instant() + std::time::Duration::from_secs(5),
+            1024,
+        )
+        .expect("恰好等于上限应放行");
+        assert_eq!(std::fs::read(&temp).unwrap().len(), 1024);
+
+        // ② 1025 字节（超 1 字节）→ 拒收。
+        let temp2 = dir.join("over.tmp");
+        let mut resp = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        resp.extend_from_slice(&vec![b'x'; 1025]);
+        let err = read_http_body(
+            std::io::Cursor::new(resp),
+            "https://example.com/geoip.dat",
+            &temp2,
+            &SystemClock,
+            SystemClock.now_instant() + std::time::Duration::from_secs(5),
+            1024,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadTooLarge { limit: 1024 }), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：超限 body（TLS 回环）被拒 —— 走真实 `download_to` 路径。
+    #[test]
+    fn download_rejects_body_larger_than_limit() {
+        let dir = unique_dir("size_e2e");
+        let body = vec![b'x'; 4096];
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+        let (addr, cert) = spawn_tls_responder(resp);
+
+        let dl = RealAssetDownloader::new(dir.clone())
+            .with_extra_root_cert(cert)
+            .with_max_download_size(1024);
+        let url = format!("https://127.0.0.1:{}/geoip.dat", addr.port());
+        let temp = dir.join("out.tmp");
+        let err = dl.download_to(&url, &temp).unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadTooLarge { limit: 1024 }), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常下载仍工作（TLS 回环，200 + body 落 temp 文件）。
+    #[test]
+    fn download_over_tls_succeeds_for_normal_payload() {
+        let dir = unique_dir("tls_ok");
+        let body = b"PAYLOAD-123".to_vec();
+        let mut resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        resp.extend_from_slice(&body);
+        let (addr, cert) = spawn_tls_responder(resp);
+
+        let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(cert);
+        let url = format!("https://127.0.0.1:{}/geoip.dat", addr.port());
+        let temp = dir.join("downloaded.tmp");
+        dl.download_to(&url, &temp).expect("https 下载应成功");
+        assert_eq!(std::fs::read(&temp).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go `app/geodata/geodata.go` `New()`：扩展名非 `.dat` → 拒收（fail-visible）。
+    #[test]
+    fn download_assets_rejects_non_dat_extension() {
+        let dir = unique_dir("ext_reject");
+        let dl = StubDownloader::new(dir.clone());
+        let assets = vec![GeodataAsset { url: "u1".into(), file: "asset.lua".into() }];
+        let err = download_assets(&dl, &assets).unwrap_err();
+        assert!(matches!(err, GeodataError::InvalidAssetExtension { .. }), "got {err:?}");
+        // 拒收 = 显式失败，且不产生任何 stage（禁静默跳过）。
+        assert!(dl.snapshot().is_empty(), "拒收前不得发起下载");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.dat` / `.DAT` 放行（Go `strings.EqualFold` 大小写不敏感）。
+    #[test]
+    fn download_assets_accepts_dat_extension_case_insensitively() {
+        let dir = unique_dir("ext_ok");
+        let dl = StubDownloader::new(dir.clone());
+        let assets = vec![
+            GeodataAsset { url: "u1".into(), file: "a.dat".into() },
+            GeodataAsset { url: "u2".into(), file: "b.DAT".into() },
+        ];
+        let stages = download_assets(&dl, &assets).unwrap();
+        assert_eq!(stages.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

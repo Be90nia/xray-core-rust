@@ -25,6 +25,19 @@ pub enum GeodataError {
     #[error("empty response body from {0}")]
     EmptyResponse(String),
 
+    /// 资产 URL 非法（Go `infra/conf/geodata.go` "invalid geodata asset url"）。
+    #[error("invalid geodata asset url: {url} (scheme must be https)")]
+    InvalidAssetUrl { url: String },
+
+    /// 下载体超过上限（Go `app/geodata/download.go` "geodata download exceeds 256 MiB"）。
+    #[error("geodata download exceeds size limit ({limit} bytes)")]
+    DownloadTooLarge { limit: u64 },
+
+    /// 资产文件扩展名不在白名单（Go `app/geodata/geodata.go` "geodata asset file
+    /// extension must be .dat"）。
+    #[error("geodata asset file extension must be .dat: {file}")]
+    InvalidAssetExtension { file: String },
+
     #[error("redirected to non-https URL: {0}")]
     InsecureRedirect(String),
 
