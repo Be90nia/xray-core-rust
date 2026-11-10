@@ -11,9 +11,11 @@
 //! - [`StackOptions`] — netstack 配置，对应 Go `stack.go::StackOptions`
 //! - [`Tun`] / [`Stack`] trait — 设备与协议栈抽象，对应 Go `tun.go::Tun` / `stack.go::Stack`
 //!
-//! 切片2 待办：`InterfaceUpdater`（依赖 `if-addrs` crate 或 platform-specific syscall）+
-//! 平台 TUN 设备实现（Linux /dev/net/tun、Windows wintun、macOS utun、FreeBSD tun）+
+//! 切片2 待办：平台 TUN 设备实现（Linux /dev/net/tun、Windows wintun、macOS utun、FreeBSD tun）+
 //! gVisor netstack / smoltcp-netstack 集成 + TCP/UDP 包处理。
+//!
+//! 网络接口动态查找（Go `InterfaceUpdater`）已落地：`sysroute::resolve_outbound_interface`
+//! 选卡，Windows 侧另由 `sysroute::notify` 在路由/接口变化时重选（票 67q6o）。
 
 use std::time::Duration;
 

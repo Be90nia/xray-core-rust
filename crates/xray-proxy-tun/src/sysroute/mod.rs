@@ -41,6 +41,9 @@ pub mod executor;
 /// weak host send 守卫（Go `tun_windows_outbound.go`）——仅 Windows。
 #[cfg(target_os = "windows")]
 pub mod guard;
+/// 运行期路由/接口变化通知（Go `tun_windows.go:344-359` 的两个回调）——仅 Windows。
+#[cfg(target_os = "windows")]
+pub(crate) mod notify;
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -279,8 +282,9 @@ pub fn select_outbound_interface(interfaces: &[Interface], tun_index: u32) -> Op
 // ===== 出站接口绑定（Go InterfaceUpdater + RegisterDialerController，handler.go:130-164）=====
 
 /// 出站绑定状态：物理网卡 `(索引, 名字)`。对应 Go `InterfaceUpdater.iface`
-/// （config.go:14-21；名字只用于日志，Go 的 `iface.Name`）。Go 在路由/链路变化时
-/// `Update()` 重选，Rust 无监控器，仅 Start 时选一次——动态重选留后续票。
+/// （config.go:14-21；名字只用于日志，Go 的 `iface.Name`）。Start 选一次，运行期
+/// 由路由/接口变化通知重选（Windows 侧 `notify::OutboundWatch`，Go 的
+/// `InterfaceUpdater.Update()`；其余平台尚无监控器，票 67q6o）。
 static OUTBOUND_IFACE: parking_lot::RwLock<Option<(u32, String)>> = parking_lot::RwLock::new(None);
 
 /// controller 进程级只注册一次的闸。Go 每次 Start 追加注册一个读同一包级
@@ -361,6 +365,20 @@ pub fn resolve_outbound_interface(
         ));
     }
     Ok((iface.name.clone(), iface.index))
+}
+
+/// 重选物理出口网卡并写全局绑定（启动与运行期通知共用；Go
+/// `InterfaceUpdater.Update()`，proxy/tun/config.go:28）。
+///
+/// 只做「枚举 → 解析 → 写状态」，失败原样返回：调用方决定是拒启动（`start`）还是
+/// 保留旧绑定（运行期通知，见 `notify::plan` 的 `Keep`）。
+pub(crate) fn reselect_outbound_interface(tun_index: u32, mode: &str) -> Result<(String, u32)> {
+    let interfaces = xray_common::net::interface::interfaces().map_err(|e| {
+        TunError::InterfaceUpdateFailed(format!("interface enumeration failed: {e}"))
+    })?;
+    let (name, index) = resolve_outbound_interface(&interfaces, tun_index, mode)?;
+    set_outbound_iface(Some((index, name.clone())));
+    Ok((name, index))
 }
 
 /// A4：按平台生成 DNS 计划（见 `dns_wanted` 的平台分派）。

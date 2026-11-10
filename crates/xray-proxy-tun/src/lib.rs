@@ -26,9 +26,9 @@
 //! - [`config::StackOptions`] — netstack 配置
 //! - [`config::Tun`] / [`config::Stack`] trait — 设备与协议栈抽象
 //!
-//! - 切片2 待办：`InterfaceUpdater`（网络接口动态查找）+ 平台 TUN 设备实现（Linux/Windows/Android
-//!   已接线；macOS/FreeBSD 未接线，`sysroute` 计划层对其显式拒绝启动，见
-//!   [`sysroute::Platform::Other`]，bd bv98n）+ gVisor netstack 集成 + TCP/UDP/ICMP 包处理
+//! - 切片2 待办：平台 TUN 设备实现（Linux/Windows/Android 已接线；macOS/FreeBSD 未接线，`sysroute`
+//!   计划层对其显式拒绝启动，见 [`sysroute::Platform::Other`]，bd bv98n）+ gVisor netstack 集成 +
+//!   TCP/UDP/ICMP 包处理
 //!   + UDP fullcone NAT。
 
 use std::sync::LazyLock;

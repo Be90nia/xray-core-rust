@@ -219,6 +219,12 @@ impl OutboundGuard {
         restore_locked(&mut st);
         st.stopped = true;
     }
+
+    /// 是否已 `restore`（停机窗）。运行期通知任务据此停手：守卫已恢复后再写出口
+    /// 绑定，只会给停机后的进程留一个错绑。
+    pub fn is_stopped(&self) -> bool {
+        self.state.lock().stopped
+    }
 }
 
 /// 关不掉一族的告警（Go `check` 的 `LogWarningInner`）。

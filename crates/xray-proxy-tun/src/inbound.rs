@@ -166,11 +166,13 @@ pub struct TunInboundHandler {
     /// 对应 Go `WindowsTun.wfp`（tun_windows.go:259，Close 时 `closeWFPEngine`）。
     #[cfg(target_os = "windows")]
     leak_filter: ParkMutex<Option<crate::wfp::sys::LeakFilterGuard>>,
-    /// weak host send 守卫（Windows 专有；Drop 即恢复）。
+    /// Windows 运行期出站维护（票 67q6o）：weak host send 守卫 + 路由/接口变化订阅。
     ///
-    /// 对应 Go `WindowsTun.guard`（tun_windows.go:258，Close 时 `guard.restore()`）。
+    /// 对应 Go `WindowsTun.{guard,cbr,cbi}`（tun_windows.go:258-260）。守卫与订阅
+    /// 同寿命（一个字段一处生命周期），避免「回调还在投递而守卫已恢复」的窗口：
+    /// `start` 建（首轮 check + 注册回调），`close`/`rollback_start` 停（反注册 → 恢复）。
     #[cfg(target_os = "windows")]
-    outbound_guard: ParkMutex<Option<crate::sysroute::guard::OutboundGuard>>,
+    outbound_watch: ParkMutex<Option<sysroute::notify::OutboundWatch>>,
 }
 
 impl TunInboundHandler {
@@ -214,7 +216,7 @@ impl TunInboundHandler {
             #[cfg(target_os = "windows")]
             leak_filter: ParkMutex::new(None),
             #[cfg(target_os = "windows")]
-            outbound_guard: ParkMutex::new(None),
+            outbound_watch: ParkMutex::new(None),
         })
     }
 
@@ -237,8 +239,11 @@ impl TunInboundHandler {
         sysroute::flush_adapter_addresses(&self.options);
         sysroute::set_outbound_iface(None);
         // weak host send 也回滚：启动失败即关 TUN，不能把网卡设置留在关着的状态。
+        // 反注册在前（会话 drop 顺序：订阅 → 守卫），否则回调还会重选/重写绑定。
         #[cfg(target_os = "windows")]
-        drop(self.outbound_guard.lock().take());
+        if let Some(watch) = self.outbound_watch.lock().take() {
+            watch.stop();
+        }
         *self.device.lock() = None;
         let _ = device.close();
     }
@@ -258,14 +263,38 @@ fn configure_outbound_iface(
     let tun_index = device.index().map_err(|e| format!("tun device index lookup failed: {e}"))?;
     let tun_index =
         u32::try_from(tun_index).map_err(|_| "tun interface index out of range".to_string())?;
-    let interfaces = xray_common::net::interface::interfaces()
-        .map_err(|e| format!("interface enumeration failed: {e}"))?;
-    let (name, index) = sysroute::resolve_outbound_interface(&interfaces, tun_index, mode)
+    // 与运行期通知同一口（重选 + 写绑定）：启动/换卡只差调用时机，不差实现。
+    let (name, index) = sysroute::reselect_outbound_interface(tun_index, mode)
         .map_err(|e| format!("outbound interface resolution failed: {e}"))?;
-    sysroute::set_outbound_iface(Some((index, name.clone())));
     sysroute::ensure_outbound_controller_registered();
     crate::TUN_LOG.info(format!("[tun] outbound interface: {name} (index {index})"));
     Ok(())
+}
+
+/// 建 Windows 运行期出站维护会话（Go `tun_windows.go:335-359`）：守卫首轮 check +
+/// 注册路由/接口变化回调，供 `start` 的托管任务消费。
+///
+/// 调用方已保证 `autoOutboundsInterface` 非空；索引取自设备（运行期不变，重选时
+/// 用它排除 TUN 自身）。
+#[cfg(target_os = "windows")]
+fn start_outbound_watch(
+    device: &TunDevice,
+    cfg: &StackOptions,
+    ipv4: bool,
+    ipv6: bool,
+) -> std::result::Result<sysroute::notify::OutboundWatch, String> {
+    let mode = cfg
+        .auto_outbounds_interface
+        .clone()
+        .ok_or_else(|| "autoOutboundsInterface missing".to_string())?;
+    let index = device.index().map_err(|e| format!("tun device index lookup failed: {e}"))?;
+    let tun_index =
+        u32::try_from(index).map_err(|_| "tun interface index out of range".to_string())?;
+    sysroute::notify::OutboundWatch::start(
+        tun_index,
+        mode,
+        sysroute::guard::OutboundGuard::new(ipv4, ipv6),
+    )
 }
 
 #[async_trait]
@@ -420,13 +449,17 @@ impl InboundHandler for TunInboundHandler {
                 }
             }
 
-            // weak host send 守卫（Go tun_windows.go:335-343）：只有绑定了出口网卡才
-            // 有意义（`autoOutboundsInterface` 缺省 = 不绑卡）。关不掉只告警。
+            // weak host send 守卫 + 运行期重选（Go tun_windows.go:335-359）：只有绑定了
+            // 出口网卡才有意义（`autoOutboundsInterface` 缺省 = 不绑卡）。守卫关不掉
+            // 只告警；回调注册失败则拒启动（Go Start 同样返回错误）。
             if cfg.auto_outbounds_interface.is_some() {
-                let guard = sysroute::guard::OutboundGuard::new(route4, route6);
-                let bound = sysroute::outbound_iface();
-                guard.check(bound.as_ref().map(|(index, name)| (*index, name.as_str())));
-                *self.outbound_guard.lock() = Some(guard);
+                match start_outbound_watch(&device, cfg, route4, route6) {
+                    Ok(watch) => *self.outbound_watch.lock() = Some(watch),
+                    Err(e) => {
+                        self.rollback_start(&device);
+                        return Err(InboundError::ListenError(e));
+                    },
+                }
             }
         }
 
@@ -450,6 +483,30 @@ impl InboundHandler for TunInboundHandler {
             return Err(InboundError::ListenError("tun: managed scope closed".into()));
         }
 
+        // Windows：路由/接口变化通知的消费任务（票 67q6o，Go tun_windows.go:344-359）。
+        // 回调线程只投递事件（sysroute::notify），重选出口网卡与重跑守卫在本任务里做
+        // ——枚举接口与写卡是阻塞 IO，放回调线程会卡住系统通知队列。空闲期不花任何
+        // 成本（只等通道），任务随 `close` 反注册（投递端释放 ⇒ recv None）自然结束。
+        #[cfg(target_os = "windows")]
+        if let Some((mut events, guard, tun_index, mode)) = self
+            .outbound_watch
+            .lock()
+            .as_mut()
+            .and_then(sysroute::notify::OutboundWatch::task_parts)
+        {
+            if scope
+                .spawn(async move {
+                    while let Some(kind) = events.recv().await {
+                        sysroute::notify::apply(kind, tun_index, &mode, &guard);
+                    }
+                })
+                .is_err()
+            {
+                self.rollback_start(&device);
+                return Err(InboundError::ListenError("tun: managed scope closed".into()));
+            }
+        }
+
         *self.scope.lock() = Some(scope);
         crate::TUN_LOG.info(format!("tun inbound started tag={}", self.tag));
         Ok(())
@@ -458,6 +515,15 @@ impl InboundHandler for TunInboundHandler {
     /// 关闭 TUN 设备 + 停止驱动 task。
     async fn close(&self) -> std::result::Result<(), InboundError> {
         self.started.store(false, Ordering::SeqCst);
+        // Windows 运行期维护先停（Go Close 的 `cbr/cbi.Unregister()` → `guard.restore()`，
+        // tun_windows.go:376-381）：反注册 ⇒ 不再有新通知，守卫恢复 ⇒ 关掉的 weak host
+        // send 开回来（否则用户的热点/共享永久失效）；投递端随之释放，消费任务自行退出
+        // （下方 drain 等它净）。**必须在 `set_outbound_iface(None)` 之前**：否则在途通知
+        // 会把绑定又写回去，停机后残留错绑。
+        #[cfg(target_os = "windows")]
+        if let Some(watch) = self.outbound_watch.lock().take() {
+            watch.stop();
+        }
         // 托管口收口（drain 三段：关闸 → abort 在途 → 等净）：driver loop 与全部
         // 派生任务一并停（含 TCP 中继/dispatch、UDP 会话/写回/sweeper）。任务全
         // abortable ⇒ 立即归零；报告由托管口自行落日志，此处只吸收值。
@@ -465,10 +531,6 @@ impl InboundHandler for TunInboundHandler {
         if let Some(scope) = scope {
             let _ = scope.drain(std::time::Duration::from_millis(100)).await;
         }
-        // weak host send 恢复（Go Close 的 `t.guard.restore()`，tun_windows.go:381）：
-        // 网关关掉的设置必须开回来，否则用户的热点/共享会永久失效。
-        #[cfg(target_os = "windows")]
-        drop(self.outbound_guard.lock().take());
         // 回滚 A3/A4 系统变更（对齐 Go Close：unsetSystemDNS → unsetSystemRoutes → 设备下线）。
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
