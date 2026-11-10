@@ -5956,117 +5956,126 @@ fn build_hysteria_tls_server_config(
 /// 从 inbound entry.data（JSON）解析 anytls TLS acceptor + 认证密码。
 ///
 /// JSON 格式：`{"cert":"...","key":"...","password":"..."}`（cert/key 为 PEM）。
-/// cert/key 缺省时用自签名证书（仅测试场景）；password 缺省时不校验客户端认证帧。
+/// password 缺省时不校验客户端认证帧。
 ///
-/// `stream_settings_json` 只在 `tlsSettings.echServerKeys` 非空时消费：那时后端必须是
-/// btls（rustls 0.23 无服务端 ECH，bd mdpl2），选路交给
-/// [`xray_tls::inbound_acceptor::build_inbound_acceptor`]（bd ozgh9）。无 ECH 时仍是
-/// 本函数自建的 rustls acceptor——**既有行为零变化**。
+/// 证书来源见 [`anytls_tls_settings`]：统一形态
+/// `streamSettings.tlsSettings.certificates[]` 优先，anytls 历史形态
+/// `settings.cert`/`settings.key` 为回退，两者皆无 ⇒ 自签（测试场景，启动期 WARN）。
+/// 装配统一走 [`xray_tls::inbound_acceptor::build_inbound_acceptor`]——`echServerKeys`
+/// 非空时它选 btls 后端（bd ozgh9），否则 rustls。
 pub(crate) fn parse_anytls_tls_acceptor(
     data: &[u8],
     stream_settings_json: Option<&serde_json::Value>,
 ) -> std::io::Result<(Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>, Option<String>)> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    // cert/key 与自签两条路径都构造 rustls ServerConfig，进程级 provider 必须先装
-    // （CI 场景 si 带 cert/key，走 cert 分支——漏装则启动期 panic）。
-    xray_common::ensure_default_crypto_provider();
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
     let password =
         v.get("password").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
-    // ECH 先判：配了 echServerKeys 就不能落 rustls（否则配置静默失效）。
-    if let Some(acceptor) = anytls_ech_acceptor(&v, stream_settings_json)? {
-        return Ok((acceptor, password));
-    }
-    // 尝试从配置读证书
-    let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) =
-        (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
-    {
-        let mut cert_reader = std::io::BufReader::new(cert_str.as_bytes());
-        #[allow(clippy::useless_conversion)] // 存量清零批次
-        let cert_pem = rustls_pemfile::certs(&mut cert_reader)
-            .into_iter()
-            .next()
-            .ok_or_else(|| std::io::Error::other("no cert in PEM"))?
-            .map_err(|e| std::io::Error::other(format!("parse cert PEM: {e}")))?;
-        let mut key_reader = std::io::BufReader::new(key_str.as_bytes());
-        let key_pem = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| std::io::Error::other(format!("parse key PEM: {e}")))?
-            .ok_or_else(|| std::io::Error::other("no key in PEM"))?;
-        (cert_pem, key_pem)
-    } else {
-        // ponytail: 无证书配置时用自签名证书（仅测试场景）
-        xray_common::ensure_default_crypto_provider();
-        let key_pair = rcgen::KeyPair::generate()
-            .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
-        let params = rcgen::CertificateParams::new(vec!["localhost".into()])
-            .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
-        let cert = params
-            .self_signed(&key_pair)
-            .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
-        (
-            #[allow(clippy::useless_conversion)] // 存量清零批次
-            CertificateDer::from(cert.der().clone()),
-            PrivateKeyDer::try_from(key_pair.serialize_der())
-                .map_err(|e| std::io::Error::other(format!("rcgen key der: {e}")))?,
-        )
-    };
-    #[allow(clippy::useless_conversion)] // 同上：既有接线形态
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.into()], key_der)
-        .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?;
-    Ok((
-        Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(Arc::new(config).into())),
-        password,
-    ))
-}
-
-/// `streamSettings.tlsSettings.echServerKeys` 非空时按统一选路装配 acceptor（btls 后端）。
-///
-/// `Ok(None)` = 没配 ECH（调用方走既有 rustls 路径，行为零变化）。
-///
-/// 证书来源：anytls 的历史形态把 PEM 放在 settings（`cert`/`key`），而 btls 从
-/// `tlsSettings` 取证书 ⇒ tlsSettings 无证书时补进去（自带则 tlsSettings 优先）。
-fn anytls_ech_acceptor(
-    settings: &serde_json::Value,
-    stream_settings_json: Option<&serde_json::Value>,
-) -> std::io::Result<Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>> {
-    let Some(stream) = stream_settings_json else { return Ok(None) };
-    let Some(tls) = stream.get("tlsSettings").filter(|v| v.is_object()) else { return Ok(None) };
+    let tls = anytls_tls_settings(&v, stream_settings_json)?;
+    // rustls 0.23 无服务端 ECH（bd mdpl2）：ECH 只能落 btls，而选路层对 `security: none`
+    // 返回 `Ok(None)`——不在这里拦就等于静默丢弃 ECH 配置。
     let ech_configured =
-        tls.get("echServerKeys").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
-    if !ech_configured {
-        return Ok(None);
-    }
-    let security = stream.get("security").and_then(|v| v.as_str()).unwrap_or_default();
-    if !security.eq_ignore_ascii_case("tls") {
-        // 选路层对 `none` 返回 `Ok(None)`：不在这里拦就等于静默丢弃 ECH 配置。
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "anytls inbound: tlsSettings.echServerKeys requires streamSettings.security \
-                 \"tls\", got {security:?}: only the btls TLS backend can register an ECH \
-                 keyset, and serving rustls would leave ECH clients without a decrypted \
-                 inner SNI"
-            ),
-        ));
-    }
-    let mut tls = tls.clone();
-    if tls.get("certificates").is_none() && tls.get("cert").is_none() {
-        for key in ["cert", "key"] {
-            if let Some(value) = settings.get(key) {
-                tls[key] = value.clone();
-            }
+        tls.get("echServerKeys").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty());
+    if ech_configured {
+        let security = stream_settings_json
+            .and_then(|s| s.get("security"))
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        if !security.eq_ignore_ascii_case("tls") {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "anytls inbound: tlsSettings.echServerKeys requires streamSettings.security \
+                     \"tls\", got {security:?}: only the btls TLS backend can register an ECH \
+                     keyset, and serving rustls would leave ECH clients without a decrypted \
+                     inner SNI"
+                ),
+            ));
         }
     }
     let acceptor = xray_tls::inbound_acceptor::build_inbound_acceptor("tls", Some(&tls))?
         .ok_or_else(|| {
-            std::io::Error::other(
-                "anytls inbound: echServerKeys configured but no TLS acceptor was assembled",
-            )
+            std::io::Error::other("anytls inbound: build_inbound_acceptor returned no acceptor")
         })?;
-    Ok(Some(Arc::new(acceptor)))
+    Ok((Arc::new(acceptor), password))
+}
+
+/// 判定并归一化 anytls 的证书来源，产出交给统一装配入口的 `tlsSettings`。
+///
+/// 优先级（统一形态在前：同仓 vless/trojan/vmess 都从 `tlsSettings` 取证书，anytls 曾是
+/// 唯一例外 ⇒ 用户按统一写法配置时证书被静默丢弃、起自签、客户端校验必失败）：
+///
+/// 1. `streamSettings.tlsSettings.certificates[]` 非空（内联 PEM 或 `certificateFile`）
+/// 2. `streamSettings.tlsSettings` 自身的顶层 `cert`+`key`
+/// 3. anytls 历史形态 `settings.cert`+`settings.key`（桥接为 tlsSettings 顶层 `cert`/`key`）
+/// 4. 都没有 ⇒ 现生成自签证书（测试场景）
+///
+/// 1/2 与 3 同时配 ⇒ 统一形态生效、历史形态被忽略，按 WARN 点名（禁静默）；3 只配一侧 ⇒
+/// 硬错（只写 cert 忘写 key 时若回退自签，客户端会永远验不过且无迹可循）。
+///
+/// 其余 `tlsSettings` 键（`alpn`/`minVersion`/`certificates[]` 多张 SNI/热重载）随后端原样生效。
+fn anytls_tls_settings(
+    settings: &serde_json::Value,
+    stream_settings_json: Option<&serde_json::Value>,
+) -> std::io::Result<serde_json::Value> {
+    let mut tls = stream_settings_json
+        .and_then(|s| s.get("tlsSettings"))
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let unified_has_cert =
+        tls.get("certificates").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty())
+            || tls.get("cert").is_some_and(|v| !v.is_null())
+            || tls.get("key").is_some_and(|v| !v.is_null());
+    let legacy_cert = settings.get("cert").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    let legacy_key = settings.get("key").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+    if unified_has_cert {
+        if legacy_cert.is_some() || legacy_key.is_some() {
+            tracing::warn!(
+                "anytls inbound: settings.cert / settings.key ignored — \
+                 streamSettings.tlsSettings already supplies the certificate"
+            );
+        }
+        return Ok(tls);
+    }
+    match (legacy_cert, legacy_key) {
+        (Some(cert), Some(key)) => {
+            tls["cert"] = cert.into();
+            tls["key"] = key.into();
+        },
+        (Some(_), None) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "anytls inbound: settings.cert without settings.key (the legacy settings form \
+                 needs both; alternatively configure streamSettings.tlsSettings.certificates[])",
+            ));
+        },
+        (None, Some(_)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "anytls inbound: settings.key without settings.cert (the legacy settings form \
+                 needs both; alternatively configure streamSettings.tlsSettings.certificates[])",
+            ));
+        },
+        (None, None) => {
+            // ponytail: 无证书配置时自签（仅测试场景）；真实部署请配 tlsSettings.certificates[]
+            let key_pair = rcgen::KeyPair::generate()
+                .map_err(|e| std::io::Error::other(format!("rcgen keypair: {e}")))?;
+            let params = rcgen::CertificateParams::new(vec!["localhost".into()])
+                .map_err(|e| std::io::Error::other(format!("rcgen params: {e}")))?;
+            let cert = params
+                .self_signed(&key_pair)
+                .map_err(|e| std::io::Error::other(format!("rcgen self_signed: {e}")))?;
+            tracing::warn!(
+                "anytls inbound: no certificate configured (settings.cert/key or \
+                 streamSettings.tlsSettings.certificates[]) — serving a generated self-signed \
+                 certificate; TLS clients will not verify it"
+            );
+            tls["cert"] = cert.pem().into();
+            tls["key"] = key_pair.serialize_pem().into();
+        },
+    }
+    Ok(tls)
 }
 
 /// 从 inbound entry.data + streamSettings 解析 naive 入站配置。
@@ -7213,6 +7222,111 @@ mod tests {
 
         let (_, pw) = parse_anytls_tls_acceptor(br#"{"password":""}"#, None).unwrap();
         assert_eq!(pw, None, "empty password must stay None");
+    }
+
+    /// bd a8ux1 行为矩阵：四种证书来源组合下**实际生效的叶子证书**。
+    ///
+    /// 断言靠真握手取 `peer_certificates()[0]`（不是「构造成功」）：统一形态
+    /// `tlsSettings.certificates[]` > `tlsSettings.cert/key` > anytls `settings.cert/key`
+    /// > 自签。改前 `tlsSettings.certificates[]` 整条被忽略 ⇒ 起自签、客户端校验必失败。
+    #[tokio::test]
+    async fn anytls_certificate_source_matrix() {
+        use tokio::io::AsyncReadExt as _;
+
+        /// 自签叶子证书：`certificates[]` 条目 + 叶子 DER（用于比对服务端实际发出的证书）。
+        fn leaf(cn: &str) -> (serde_json::Value, Vec<u8>) {
+            let key_pair = rcgen::KeyPair::generate().expect("keypair");
+            let params = rcgen::CertificateParams::new(vec![cn.to_string()]).expect("params");
+            let cert = params.self_signed(&key_pair).expect("self signed");
+            (
+                serde_json::json!({ "certificate": cert.pem(), "key": key_pair.serialize_pem() }),
+                cert.der().to_vec(),
+            )
+        }
+
+        /// 完成一次 TLS 握手，返回服务端在这条连接上实际出示的叶子证书。
+        async fn served_leaf(
+            acceptor: Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>,
+        ) -> Vec<u8> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let mut tls = acceptor.accept(tcp).await.expect("server handshake");
+                // 客户端取完对端证书才 drop ⇒ 这里读到 EOF 即收工，不让 task 提前关连接。
+                let mut buf = [0u8; 1];
+                let _ = tls.read(&mut buf).await;
+            });
+            let insecure = serde_json::json!({ "allowInsecure": true });
+            let cfg =
+                xray_tls::client_config::build_client_config("tls", Some(&insecure), "localhost")
+                    .expect("client config")
+                    .expect("tls client config");
+            let connector = tokio_rustls::TlsConnector::from(cfg);
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let sni = rustls::pki_types::ServerName::try_from("localhost").expect("sni");
+            let tls = connector.connect(sni, tcp).await.expect("client handshake");
+            let served = tls.get_ref().1.peer_certificates().expect("peer certs")[0].to_vec();
+            drop(tls);
+            let _ = server.await;
+            served
+        }
+
+        let (settings_entry, settings_der) = leaf("settings.example");
+        let (tls_entry, tls_der) = leaf("tls-settings.example");
+        assert_ne!(settings_der, tls_der, "fixture certs must differ");
+        // anytls 历史形态（interop_ci.py 同款）：PEM 放 settings，无 streamSettings。
+        let settings_only = serde_json::json!({
+            "cert": settings_entry["certificate"].clone(),
+            "key": settings_entry["key"].clone(),
+            "password": "pw",
+        });
+        let stream_unified = serde_json::json!({
+            "security": "tls",
+            "tlsSettings": { "certificates": [tls_entry.clone()] },
+        });
+
+        // ① 只配 settings.cert/key ⇒ 生效 settings 那张（既有行为不变）。
+        let (acceptor, _) =
+            parse_anytls_tls_acceptor(settings_only.to_string().as_bytes(), None).unwrap();
+        assert_eq!(
+            served_leaf(acceptor).await,
+            settings_der,
+            "settings.cert/key must still be served when tlsSettings carries no certificate"
+        );
+
+        // ② 只配 tlsSettings.certificates[] ⇒ 生效统一形态那张（改前落自签）。
+        let (acceptor, pw) =
+            parse_anytls_tls_acceptor(br#"{"password":"pw"}"#, Some(&stream_unified)).unwrap();
+        assert_eq!(pw.as_deref(), Some("pw"), "password parsing is independent of the cert source");
+        assert_eq!(
+            served_leaf(acceptor).await,
+            tls_der,
+            "streamSettings.tlsSettings.certificates[] must be served"
+        );
+
+        // ③ 两处都配 ⇒ 统一形态生效（settings.cert 被忽略，启动期 WARN 点名）。
+        let (acceptor, _) =
+            parse_anytls_tls_acceptor(settings_only.to_string().as_bytes(), Some(&stream_unified))
+                .unwrap();
+        assert_eq!(
+            served_leaf(acceptor).await,
+            tls_der,
+            "tlsSettings wins when both forms configure a certificate"
+        );
+
+        // ④ 都不配 ⇒ 自签（既非 settings 那张也非 tlsSettings 那张）。
+        let (acceptor, _) = parse_anytls_tls_acceptor(br#"{"password":"pw"}"#, None).unwrap();
+        let self_signed = served_leaf(acceptor).await;
+        assert_ne!(self_signed, settings_der, "no config must not serve the settings cert");
+        assert_ne!(self_signed, tls_der, "no config must not serve the tlsSettings cert");
+
+        // ⑤ 历史形态只配一侧 ⇒ 硬错（静默回退自签会让客户端永远验不过）。
+        let one_sided = serde_json::json!({ "cert": settings_entry["certificate"].clone() });
+        let err = parse_anytls_tls_acceptor(one_sided.to_string().as_bytes(), None)
+            .err()
+            .expect("settings.cert without settings.key must fail");
+        assert!(err.to_string().contains("settings.key"), "got: {err}");
     }
 
     /// BoringSSL 服务端可用的 ECH keyset（HKDF-SHA256-only，`echServerKeys` 的 base64 形态）。
