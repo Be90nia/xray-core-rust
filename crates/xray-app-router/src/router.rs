@@ -760,7 +760,7 @@ mod tests {
         list.encode_to_vec()
     }
 
-    fn geoip_rule() -> RoutingRule {
+    fn geoip_rule(file: &str) -> RoutingRule {
         use xray_proto::xray::{
             app::router::routing_rule::TargetTag,
             common::geodata::{GeoIpRule, IpRule, ip_rule::Value as IV},
@@ -770,8 +770,9 @@ mod tests {
             rule_tag: String::new(),
             ip: vec![IpRule {
                 value: Some(IV::Geoip(GeoIpRule {
-                    file: "geoip.dat".into(),
-                    code: "cn".into(),
+                    file: file.into(),
+                    // dat 条目按大写存（解析层 `rule_parser` 负责大写化）
+                    code: "CN".into(),
                     reverse_match: false,
                 })),
             }],
@@ -800,14 +801,17 @@ mod tests {
 
     #[test]
     fn test_e2e_geoip_rule_routes_by_cidr() {
-        use xray_geodata::loader::GeoDataLoader;
-        let dir = unique_dir("geoip");
-        std::fs::write(dir.join("geoip.dat"), make_geoip_dat()).unwrap();
-        let loader = Arc::new(GeoDataLoader::new(dir.clone()));
+        // geoip 资产由全局 `IP_REG` 在构造期解析（Go `condition.go:87`
+        // `IPReg.BuildIPMatcher`），datadir = `get_asset_dir()`，与 `geo_loader`
+        // 无关 ⇒ 资产写进资产目录，文件名带 pid 唯一化避免与其它用例的
+        // `geoip.dat`（xray-core e2e 会写 PRIVATE 条目）互踩。
+        let asset_dir = xray_common::platform::get_asset_dir();
+        std::fs::create_dir_all(&asset_dir).unwrap();
+        let file = format!("s4-router-geoip-{}.dat", std::process::id());
+        std::fs::write(asset_dir.join(&file), make_geoip_dat()).unwrap();
 
-        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
-        let r =
-            Router::init(&cfg, Arc::new(SimpleSelector::default()), None, Some(loader)).unwrap();
+        let cfg = Config { rule: vec![geoip_rule(&file)], ..Config::default() };
+        let r = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None).unwrap();
 
         // 命中 CN CIDR 192.168.0.0/16
         let hit = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
@@ -818,7 +822,7 @@ mod tests {
         let miss = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(matches!(r.pick_route(&miss), Err(RouterError::NoClue)));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(asset_dir.join(&file));
     }
 
     #[test]
@@ -848,31 +852,18 @@ mod tests {
     }
 
     #[test]
-    fn test_geo_rule_without_loader_skips_gracefully() {
-        // loader = None 时 GeoIP/GeoSite 变体 warn 并 skip，不 panic
-        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
-        // loader = None 时 GeoIP 变体被 skip，IPMatcher 收到空 vec 返回错（GeodataBuild）
-        let result = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None);
-        assert!(result.is_err(), "expected error when geoip rule present but no loader");
-    }
-
-    #[test]
-    fn test_geo_rule_with_loader_but_missing_dat_fails_closed() {
-        // bd il49：loader 在、geoip.dat 文件缺失 → GeodataBuild（fail-closed），
-        // 上游（xray-core wiring）据此拒启而非回退降级路由。
-        let dir = unique_dir("missing-dat");
-        let loader = Arc::new(GeoDataLoader::new(dir.clone()));
-
-        let cfg = Config { rule: vec![geoip_rule()], ..Config::default() };
-        let err = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, Some(loader))
+    fn test_geo_rule_with_missing_dat_fails_closed() {
+        // bd il49 / Go `BuildIPMatcher`：资产读不到 ⇒ 构造期 `GeodataBuild`
+        // （fail-closed），上游 wiring 据此拒启而非回退降级路由。
+        // 旧实现把 geoip 展开成 CIDR 且无 loader 时静默 skip，本用例即红。
+        let cfg = Config {
+            rule: vec![geoip_rule("s4-router-missing-geoip-never-exists.dat")],
+            ..Config::default()
+        };
+        let err = Router::init(&cfg, Arc::new(SimpleSelector::default()), None, None)
             .err()
-            .expect("expected init failure when geoip.dat missing");
-        assert!(
-            matches!(&err, RouterError::GeodataBuild(m) if m.contains("geoip.dat")),
-            "expected GeodataBuild naming geoip.dat, got: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
+            .expect("missing geoip asset must fail the build, not fall back to empty set");
+        assert!(matches!(err, RouterError::GeodataBuild(_)), "got: {err}");
     }
 
     // ── Balancer strategy 装配 ──

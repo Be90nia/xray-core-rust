@@ -8,10 +8,7 @@ use xray_common::net::{
     network::Network,
     port::{MemoryPortList, Port, PortRange},
 };
-use xray_geodata::{
-    loader::GeoDataLoader,
-    matcher::domain::{DomainRule as MatcherDomainRule, DomainType},
-};
+use xray_geodata::loader::GeoDataLoader;
 use xray_proto::xray::{app::router::RoutingRule, common::net::PortList};
 
 use crate::{
@@ -157,32 +154,36 @@ pub fn build_condition_with_pool(
         chan.add(Box::new(LocalOsMatcherCondition::new(&proto.local_os)));
     }
     if !proto.domain.is_empty() {
-        // hn4i：parse_proto_domain_rules 现可返回 Err（fail-closed）。
-        let rules = parse_proto_domain_rules(&proto.domain, geo_loader)?;
-        if !rules.is_empty() {
-            let cond = match pool {
-                Some(p) => DomainMatcherCondition::new_pooled(p, rules)?,
-                None => DomainMatcherCondition::new(rules)?,
-            };
-            chan.add(Box::new(cond));
-        }
+        // 域名规则交给域名注册表（Go `DomainReg.BuildDomainMatcher`，bd ochlx）：
+        // `geosite:` 的资产读取与展开只在注册表一处发生，重建沿用同一目录
+        // ⇒ 热更直接生效。资产/代号缺失 ⇒ 构造期 Err（拒启，禁静默空集）。
+        let datadir = geo_loader.map(GeoDataLoader::datadir);
+        let cond = match pool {
+            Some(p) => DomainMatcherCondition::new_pooled(
+                p,
+                proto.domain.clone(),
+                datadir.map(std::path::Path::to_path_buf),
+            )?,
+            None => DomainMatcherCondition::new(&proto.domain, datadir)?,
+        };
+        chan.add(Box::new(cond));
     }
 
     // Target IP
     if !proto.ip.is_empty() {
-        let rules = convert_proto_ip_rules(&proto.ip, geo_loader)?;
+        let rules = convert_proto_ip_rules(&proto.ip);
         chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Target)?));
     }
 
     // Source IP
     if !proto.source_ip.is_empty() {
-        let rules = convert_proto_ip_rules(&proto.source_ip, geo_loader)?;
+        let rules = convert_proto_ip_rules(&proto.source_ip);
         chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Source)?));
     }
 
     // Local IP
     if !proto.local_ip.is_empty() {
-        let rules = convert_proto_ip_rules(&proto.local_ip, geo_loader)?;
+        let rules = convert_proto_ip_rules(&proto.local_ip);
         chan.add(Box::new(IPMatcherCondition::new(rules, IpMatchAsType::Local)?));
     }
 
@@ -274,158 +275,44 @@ fn proto_network_to_native(v: i32) -> Option<Network> {
     }
 }
 
-/// proto Domain.Type (i32) → matcher DomainType。
-///
-/// 单一来源：转调 [`xray_geodata::matcher::domain::from_proto_type`]
-/// （pb `Substr=0/Regex=1/Domain=2/Full=3` → matcher `Full=0/Domain=1/Substr=2/Regex=3`）。
-fn proto_domain_type_to_matcher(v: i32) -> Option<DomainType> {
-    xray_geodata::matcher::domain::from_proto_type(v)
-}
-
-/// 将 proto DomainRule 列表解析为 matcher DomainRule 列表。
-///
-/// - `custom` 变体：直接转换。
-/// - `geosite` 变体：调用 geo_loader.load_site 加载文件中的 GeoSite 条目； loader 缺失时 warn 并
-///   skip。
-fn parse_proto_domain_rules(
-    proto_rules: &[xray_proto::xray::common::geodata::DomainRule],
-    geo_loader: Option<&GeoDataLoader>,
-) -> Result<Vec<MatcherDomainRule>, RouterError> {
-    use xray_proto::xray::common::geodata::domain_rule::Value as ProtoDV;
-    let mut out: Vec<MatcherDomainRule> = Vec::new();
-    for r in proto_rules {
-        let Some(value) = r.value.as_ref() else { continue };
-        match value {
-            ProtoDV::Custom(d) => {
-                let Some(dt) = proto_domain_type_to_matcher(d.r#type) else { continue };
-                let idx = (out.len() + 1) as u32;
-                out.push(MatcherDomainRule::new(dt, d.value.clone(), idx));
-            },
-            ProtoDV::Geosite(geosite_rule) => {
-                let Some(loader) = geo_loader else {
-                    // hn4i：fail-closed。无 loader → 配置错误，整条规则不能启用。
-                    return Err(RouterError::GeodataBuild(format!(
-                        "geosite rule present but no geo_loader configured: file={} code={}",
-                        geosite_rule.file, geosite_rule.code
-                    )));
-                };
-                {
-                    let rules = load_geosite_to_matcher_rules(geosite_rule, loader)?;
-                    out.extend(rules)
-                }
-            },
-        }
-    }
-    Ok(out)
-}
-
-/// 从 dat 文件加载 GeoSite 条目并转换为 matcher DomainRule 列表。
-///
-/// - `file` 为空时默认 `geosite.dat`。
-/// - `code` 转大写（与 dat 文件中存储格式一致）。
-/// - `attrs` 非空时按 `@` 分隔的属性 key 过滤 domain。
-fn load_geosite_to_matcher_rules(
-    geosite_rule: &xray_proto::xray::common::geodata::GeoSiteRule,
-    loader: &GeoDataLoader,
-) -> Result<Vec<MatcherDomainRule>, RouterError> {
-    let file =
-        if geosite_rule.file.is_empty() { "geosite.dat" } else { geosite_rule.file.as_str() };
-    let code = geosite_rule.code.to_uppercase();
-    let site = if geosite_rule.attrs.is_empty() {
-        loader
-            .load_site(file, &code)
-            .map_err(|e| RouterError::GeodataBuild(format!("load geosite {file}:{code}: {e}")))?
-    } else {
-        loader
-            .load_site_with_attrs(file, &code, &geosite_rule.attrs)
-            .map_err(|e| RouterError::GeodataBuild(format!("load geosite {file}:{code}: {e}")))?
-    };
-
-    Ok(site
-        .domain
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let dt = proto_domain_type_to_matcher(d.r#type).unwrap_or(DomainType::Full);
-            MatcherDomainRule::new(dt, d.value.clone(), (i + 1) as u32)
-        })
-        .collect())
-}
-
 /// 将 proto `IpRule` 列表（`xray.common.geodata`）转换为 xray-geodata 的
 /// `IpRule`（`xray.geodata`）。
 ///
-/// 两个 crate 各自构建 proto，生成同名不同类型。此函数字段级复制。
-/// - `Custom(CidrRule)` 变体：直接转换。
-/// - `Geoip(GeoIPRule)` 变体：调用 geo_loader.load_ip 加载文件中的 GeoIP 条目， 展开 CIDR
-///   列表为多个 Custom 变体；loader 缺失时 warn 并 skip。
+/// 两个 crate 各自构建 proto，生成同名不同类型。此函数**只做变体复制**：
+/// - `Custom(CidrRule)` / `Geoip(GeoIPRule)` 逐字段搬运，`geoip` 保持 tag 形态。
+///
+/// 资产解析不在这里做——`geoip` 由 [`IPMatcherCondition::new`] 登记进
+/// `IP_REG` 后在**构造期**查表（Go `condition.go:87` `IPReg.BuildIPMatcher`）：
+/// 提前展开成 CIDR 会丢 tag 身份，热更（`IpRegistry::reload`）无法就地重建。
+/// 反向匹配只取规则侧 `reverse_match`（Go 从不读资产里的 `GeoIP.ReverseMatch`）。
 fn convert_proto_ip_rules(
     proto_rules: &[xray_proto::xray::common::geodata::IpRule],
-    geo_loader: Option<&GeoDataLoader>,
-) -> Result<Vec<xray_geodata::pb::IpRule>, RouterError> {
+) -> Vec<xray_geodata::pb::IpRule> {
     use xray_proto::xray::common::geodata::ip_rule::Value as ProtoIV;
     let mut out = Vec::with_capacity(proto_rules.len());
     for r in proto_rules {
         let Some(value) = r.value.as_ref() else { continue };
-        match value {
+        let value = match value {
             ProtoIV::Custom(c) => {
-                let cidr = c
-                    .cidr
-                    .as_ref()
-                    .map(|cc| xray_geodata::pb::Cidr { ip: cc.ip.clone(), prefix: cc.prefix });
-                out.push(xray_geodata::pb::IpRule {
-                    value: Some(xray_geodata::pb::ip_rule::Value::Custom(
-                        xray_geodata::pb::CidrRule { cidr, reverse_match: c.reverse_match },
-                    )),
-                });
+                xray_geodata::pb::ip_rule::Value::Custom(xray_geodata::pb::CidrRule {
+                    cidr: c
+                        .cidr
+                        .as_ref()
+                        .map(|cc| xray_geodata::pb::Cidr { ip: cc.ip.clone(), prefix: cc.prefix }),
+                    reverse_match: c.reverse_match,
+                })
             },
-            ProtoIV::Geoip(geoip_rule) => {
-                let Some(loader) = geo_loader else {
-                    // hn4i：fail-closed（同 geosite）。无 loader 必须报错。
-                    return Err(RouterError::GeodataBuild(format!(
-                        "geoip rule present but no geo_loader configured: file={} code={}",
-                        geoip_rule.file, geoip_rule.code
-                    )));
-                };
-                match load_geoip_to_matcher_rules(geoip_rule, loader) {
-                    Ok(rules) => out.extend(rules),
-                    Err(e) => {
-                        // hn4i：fail-closed（同 geosite）。
-                        return Err(e);
-                    },
-                }
+            ProtoIV::Geoip(g) => {
+                xray_geodata::pb::ip_rule::Value::Geoip(xray_geodata::pb::GeoIpRule {
+                    file: g.file.clone(),
+                    code: g.code.clone(),
+                    reverse_match: g.reverse_match,
+                })
             },
-        }
+        };
+        out.push(xray_geodata::pb::IpRule { value: Some(value) });
     }
-    Ok(out)
-}
-
-/// 从 dat 文件加载 GeoIP 条目并展开为多个 Custom IpRule。
-///
-/// - `file` 为空时默认 `geoip.dat`。
-/// - `code` 转大写。
-/// - 反向匹配 = rule.reverse_match XOR geoip.reverse_match（与 Go 行为一致）。
-fn load_geoip_to_matcher_rules(
-    geoip_rule: &xray_proto::xray::common::geodata::GeoIpRule,
-    loader: &GeoDataLoader,
-) -> Result<Vec<xray_geodata::pb::IpRule>, RouterError> {
-    let file = if geoip_rule.file.is_empty() { "geoip.dat" } else { geoip_rule.file.as_str() };
-    let code = geoip_rule.code.to_uppercase();
-    let geoip = loader
-        .load_ip(file, &code)
-        .map_err(|e| RouterError::GeodataBuild(format!("load geoip {file}:{code}: {e}")))?;
-
-    let reverse = geoip_rule.reverse_match ^ geoip.reverse_match;
-    Ok(geoip
-        .cidr
-        .into_iter()
-        .map(|cidr| xray_geodata::pb::IpRule {
-            value: Some(xray_geodata::pb::ip_rule::Value::Custom(xray_geodata::pb::CidrRule {
-                cidr: Some(xray_geodata::pb::Cidr { ip: cidr.ip, prefix: cidr.prefix }),
-                reverse_match: reverse,
-            })),
-        })
-        .collect())
+    out
 }
 
 #[cfg(test)]
@@ -483,15 +370,6 @@ mod tests {
         assert_eq!(proto_network_to_native(2), Some(Network::TCP));
         assert_eq!(proto_network_to_native(3), Some(Network::UDP));
         assert_eq!(proto_network_to_native(4), Some(Network::Unix));
-    }
-
-    #[test]
-    fn test_proto_domain_type_mapping() {
-        use xray_geodata::matcher::domain::DomainType as MDT;
-        assert_eq!(proto_domain_type_to_matcher(0), Some(MDT::Substr));
-        assert_eq!(proto_domain_type_to_matcher(1), Some(MDT::Regex));
-        assert_eq!(proto_domain_type_to_matcher(2), Some(MDT::Domain));
-        assert_eq!(proto_domain_type_to_matcher(3), Some(MDT::Full));
     }
 
     #[test]

@@ -20,8 +20,9 @@
 //! - `WeightManager` 权重管理
 //! - `WebhookNotifier` 事件通知（含去重）
 //! - `Override` 平衡器目标覆盖
-//! - `Rule::build_rule(proto, balancers, geo_loader)`：`GeoDataLoader` 接入后 `geosite`/`geoip`
-//!   rule 变体从 dat 文件加载
+//! - `Rule::build_rule(proto, balancers, geo_loader)`：`geosite` 规则经 `GeoDataLoader` 从 dat
+//!   文件展开；`geoip` / `ext` / `ext-ip` 规则保持 tag 形态， 由
+//!   `xray_geodata::matcher::ip::IP_REG` 在 matcher 构造期解析并登记（热更可用）
 //!
 //! **IO 边界（trait + 真实实现）**：
 //! - `OutboundHandlerSelector`（Go `outbound.HandlerSelector`）：生产由

@@ -68,10 +68,10 @@ pub struct Client {
     /// 是否跳过 fallback。
     pub skip_fallback: bool,
     /// 期望 IP 匹配器（Go `expectedIPs geodata.IPMatcher`）。
-    /// ponytail: trait 已存在 `xray_geodata::matcher::ip::IPMatcher`，保留为可选。
-    pub expected_ips: Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>>,
+    /// Arc 形态：匹配器由 `IP_REG` 登记持有弱引用，client 持强引用到重装为止。
+    pub expected_ips: Option<Arc<dyn xray_geodata::matcher::ip::IPMatcher>>,
     /// 不期望 IP 匹配器。
-    pub unexpected_ips: Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>>,
+    pub unexpected_ips: Option<Arc<dyn xray_geodata::matcher::ip::IPMatcher>>,
     /// 标签（用于日志）。
     pub tag: String,
     /// 超时时长。
@@ -292,16 +292,20 @@ impl Client {
 
 /// 从 IP 规则列表构建匹配器。对应 Go `geodata.IPReg.BuildIPMatcher`：
 /// 规则列表为空 → None（无过滤）；构建失败 → 传播错误（启动报错）。
+///
+/// 走全局 `IP_REG`（Go 同）：`geoip:`/`ext:`/`ext-ip:` 在构造期从资产解析，
+/// 读资产失败即 `Err`，不静默退化成空集（空集会让 expected/unexpected 过滤整体
+/// 失效）；登记形态让 `IP_REG.reload()` 热更后同一 client 换结果。
 fn build_ip_matcher(
     rules: &[xray_geodata::pb::IpRule],
-) -> Result<Option<Box<dyn xray_geodata::matcher::ip::IPMatcher>>, DnsError> {
+) -> Result<Option<Arc<dyn xray_geodata::matcher::ip::IPMatcher>>, DnsError> {
     if rules.is_empty() {
         return Ok(None);
     }
-    Ok(Some(
-        xray_geodata::matcher::ip::build_optimized_ip_matcher(rules)
-            .map_err(|e| DnsError::WireFormat(format!("build ip matcher: {e}")))?,
-    ))
+    let matcher = xray_geodata::matcher::ip::IP_REG
+        .build_ip_matcher(rules)
+        .map_err(|e| DnsError::WireFormat(format!("build ip matcher: {e}")))?;
+    Ok(Some(matcher))
 }
 /// - `tls://IP[:port]` → DoT (默认 853)
 /// - `https://IP[:port][/path]` → DoH (默认 443, path 默认 /dns-query)
@@ -486,6 +490,25 @@ mod tests {
         let client = Client::new(ns, IpOption::all(), server).unwrap();
         assert_eq!(client.timeout, Duration::from_millis(1000));
         assert_eq!(client.tag, "gcp");
+    }
+
+    /// S4（bd snr4r）：`geoip` 类规则由全局 `IP_REG` 在构造期解析——资产读不到即
+    /// `Err`（Go `nameserver.go:115` 把 `BuildIPMatcher` 的 err 直接上抛），
+    /// 不退化成空集（空集会让 expected/unexpected 过滤整体失效且无日志）。
+    #[test]
+    fn build_ip_matcher_geoip_missing_asset_is_error_not_empty_set() {
+        let rule = xray_geodata::pb::IpRule {
+            value: Some(xray_geodata::pb::ip_rule::Value::Geoip(xray_geodata::pb::GeoIpRule {
+                file: "s4-dns-missing-geoip-never-exists.dat".into(),
+                code: "CN".into(),
+                reverse_match: false,
+            })),
+        };
+        let err = build_ip_matcher(&[rule]).err().expect("缺资产必须 Err，不得退化成空集");
+        assert!(err.to_string().contains("build ip matcher"), "got: {err}");
+
+        // 空规则 → None（无过滤），不是错误。
+        assert!(build_ip_matcher(&[]).unwrap().is_none());
     }
 
     #[test]

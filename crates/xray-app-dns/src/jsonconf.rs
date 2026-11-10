@@ -668,38 +668,28 @@ fn parse_hosts_key(
     parse_domain_rule_entries(s, xray_geodata::geosite::DomainType::Full, datadir, loader)
 }
 
-/// 解析 nameserver IP 规则字符串列表（CIDR / `!` 反向 / geoip 展开）。
+/// 解析 nameserver IP 规则字符串列表（CIDR / `!` 反向 / geoip tag）。
+///
+/// 只做「字符串 → proto `IpRule`」，`geoip:`/`ext:`/`ext-ip:` 保持 tag 形态交给
+/// `IP_REG.build_ip_matcher` 在**构造期**解析（Go `nameserver.go:115`
+/// `IPReg.BuildIPMatcher` 同路径）。此前在此把 geoip 展开成 CIDR 是绕开注册表的
+/// 旧路（`build_optimized_ip_matcher` 的 geoip 分支曾是空集 stub），展开还会丢
+/// tag 身份、热更无法就地重建。
 fn parse_ns_ip_rules(
     rules: &[String],
     datadir: &std::path::Path,
 ) -> Result<Vec<xray_geodata::pb::IpRule>, DnsError> {
-    use xray_geodata::pb::ip_rule::Value as IV;
-
     let mut out = Vec::with_capacity(rules.len());
     for s in rules {
-        let r = xray_geodata::rule_parser::parse_ip_rules(std::slice::from_ref(s), datadir)
-            .map_err(|e| DnsError::Features(xray_features::dns::DnsError::Other(e.to_string())))?;
-        for rule in r {
-            // geoip 条目展开为 Custom CIDR 列表（build_optimized_ip_matcher 的 geoip 分支为空
-            // stub）。
-            if let Some(IV::Geoip(g)) = rule.value.as_ref() {
-                let file = if g.file.is_empty() { "geoip.dat" } else { &g.file };
-                let loader = xray_geodata::loader::GeoDataLoader::new(datadir.to_path_buf());
-                let geo = loader.load_ip(file, &g.code).map_err(|e| {
-                    DnsError::Features(xray_features::dns::DnsError::Other(e.to_string()))
-                })?;
-                for cidr in geo.cidr {
-                    out.push(xray_geodata::pb::IpRule {
-                        value: Some(IV::Custom(xray_geodata::pb::CidrRule {
-                            cidr: Some(cidr),
-                            reverse_match: g.reverse_match,
-                        })),
-                    });
-                }
-            } else {
-                out.push(rule);
-            }
-        }
+        // 逐条包上下文：`LoaderError` 只带 IO 错不带路径，规则串里才有文件名
+        // （`ext-ip:geoip.dat:CN` 缺文件时必须能看出是哪个文件）。
+        let parsed = xray_geodata::rule_parser::parse_ip_rules(std::slice::from_ref(s), datadir)
+            .map_err(|e| {
+                DnsError::Features(xray_features::dns::DnsError::Other(format!(
+                    "parse nameserver ip rule {s}: {e}"
+                )))
+            })?;
+        out.extend(parsed);
     }
     Ok(out)
 }
@@ -1156,6 +1146,47 @@ mod tests {
         // per-NS 显式 false 覆盖全局 true。
         let overridden = mk(r#"{ "address": "1.1.1.1", "disableCache": false }"#);
         assert!(!overridden.server.is_disable_cache(), "per-NS disableCache=false 应覆盖全局 true");
+    }
+
+    /// S4（bd snr4r）：nameserver IP 规则不再在这里展开 geoip——`geoip:` / `ext:
+    /// / ext-ip:` 保持 tag 形态，资产解析交给 `IP_REG.build_ip_matcher`（Go
+    /// `nameserver.go:115` `IPReg.BuildIPMatcher`）。展开会丢 tag 身份，热更后
+    /// 无法按规则重建。
+    ///
+    /// 反向断言：把展开逻辑放回来 ⇒ `rules.len()` 变成 3（逐 CIDR）这里立刻红。
+    #[test]
+    fn ns_ip_rules_keep_geoip_tag_and_name_missing_asset() {
+        use prost::Message;
+        use xray_geodata::pb::{Cidr, GeoIp, GeoIpList};
+
+        let dir = std::env::temp_dir().join(format!("xray-dns-nsip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = GeoIpList {
+            entry: vec![GeoIp {
+                code: "CN".into(),
+                cidr: vec![
+                    Cidr { ip: vec![103, 0, 0, 0], prefix: 8 },
+                    Cidr { ip: vec![1, 0, 1, 0], prefix: 24 },
+                ],
+                reverse_match: false,
+            }],
+        };
+        std::fs::write(dir.join("geoip.dat"), list.encode_to_vec()).unwrap();
+
+        let rules = parse_ns_ip_rules(&["geoip:CN".into(), "10.0.0.0/8".into()], &dir).unwrap();
+        assert_eq!(rules.len(), 2, "geoip 只留一条 tag 规则（不再展开成逐条 CIDR）");
+        assert!(
+            matches!(rules[0].value, Some(xray_geodata::pb::ip_rule::Value::Geoip(_))),
+            "geoip 必须保持 tag 形态: {:?}",
+            rules[0]
+        );
+
+        // 缺文件：parse 期硬错，且消息点名文件（`LoaderError` 只带 IO 错）。
+        let err = parse_ns_ip_rules(&["ext-ip:s4-missing-geoip.dat:CN".into()], &dir).unwrap_err();
+        assert!(err.to_string().contains("s4-missing-geoip.dat"), "错误必须点名文件: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 7qxjj②：Go dns.go:89-92/142-145——per-server 无 `tag` 时 client tag 取

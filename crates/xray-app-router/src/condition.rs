@@ -16,6 +16,7 @@
 use std::{
     collections::HashMap,
     net::IpAddr,
+    path::{Path, PathBuf},
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -32,8 +33,8 @@ use xray_common::net::{
 };
 use xray_geodata::{
     matcher::{
-        domain::{DomainMatcher as GeoDomainMatcher, DomainRule as GeoDomainRule},
-        ip::{IPMatcher as GeoIPMatcher, build_optimized_ip_matcher},
+        domain::{DOMAIN_REG, DomainMatcher as GeoDomainMatcher, DynamicDomainMatcher},
+        ip::{IP_REG, IPMatcher as GeoIPMatcher},
     },
     pb::IpRule,
 };
@@ -105,46 +106,45 @@ impl Condition for &ConditionChan {
 ///
 /// 对应 Go `DomainMatcher`：包装 xray-geodata 的 `DomainMatcher` trait，
 /// `apply` 返回 `matcher.match_any(ctx.get_target_domain())`。
+///
+/// matcher 本体来自 [`DOMAIN_REG`]（Go `DomainReg.BuildDomainMatcher`）：`geosite:`
+/// 的资产读取与展开只在注册表一处发生，热更由 `DomainRegistry::reload` 换快照。
 pub struct DomainMatcherCondition {
-    matcher: Box<dyn GeoDomainMatcher>,
+    matcher: Arc<DynamicDomainMatcher>,
 }
 
 impl DomainMatcherCondition {
-    /// 从 geodata 解析后的 DomainRule 列表构造。
+    /// 串行构建：pb 规则原样交给注册表并登记（Go `condition.go:51-56`）。
     ///
-    /// 调用者负责把 proto `DomainRule`（oneof GeoSiteRule/Domain）转换为
-    /// geodata matcher 层的 `DomainRule`（含 DomainType + value）。
-    pub fn new(rules: Vec<GeoDomainRule>) -> Result<Self, RouterError> {
-        use xray_geodata::matcher::domain::MphDomainMatcher;
-        let matcher = MphDomainMatcher::build(&rules)
-            .map_err(|e| RouterError::GeodataBuild(e.to_string()))?;
-        Ok(Self { matcher: Box::new(matcher) })
+    /// `datadir`：消费方自持 loader 的资产目录（测试注入 / 自定义目录）；
+    /// `None` 用注册表默认目录（`get_asset_dir()`）。资产或代号缺失 ⇒ `Err`
+    /// （配置期拒启，禁静默空集）。
+    pub fn new(
+        rules: &[xray_proto::xray::common::geodata::DomainRule],
+        datadir: Option<&Path>,
+    ) -> Result<Self, RouterError> {
+        Ok(Self { matcher: build_in_registry(rules, datadir)? })
     }
 
-    /// 互喂版构建（xray-frame 任务书 P3-5）：`MphDomainMatcher::build` 在
-    /// [`RouterBuildPool`] worker 内执行（worker 借缓冲 → 跑纯内存 CPU 活 →
-    /// RAII 还），调用线程只等结果。与 [`Self::new`] 调同一 build 函数，同输入
-    /// 匹配行为逐位等价。
+    /// 互喂版构建（xray-frame 任务书 P3-5）：注册表构建在 [`RouterBuildPool`]
+    /// worker 内执行（geosite 展开 + 编译是 CPU 密集面），调用线程只等结果。
+    /// 与 [`Self::new`] 调同一构建路径，同输入匹配行为逐位等价。
     ///
-    /// 规则集经 `Arc` 共享：常规路径零拷贝；提交侧拒绝（队列满/shutdown）时
-    /// 池任务原样退还，本线程用同一 `Arc` 内联补位（CallerRuns 等价，不 panic）。
-    /// worker 内 panic 的任务不回传结果 → `recv` 报错上抛 = fail-visible（同
-    /// P1-2 geodata loader 收集面语义）。
+    /// 提交侧拒绝（队列满/shutdown）时任务原样退还，本线程内联补位
+    /// （CallerRuns 等价，不 panic）。worker 内 panic 的任务不回传结果 →
+    /// `recv` 报错上抛 = fail-visible（同 P1-2 geodata loader 收集面语义）。
     pub fn new_pooled(
         pool: &RouterBuildPool,
-        rules: Vec<GeoDomainRule>,
+        rules: Vec<xray_proto::xray::common::geodata::DomainRule>,
+        datadir: Option<PathBuf>,
     ) -> Result<Self, RouterError> {
-        use xray_geodata::matcher::domain::MphDomainMatcher;
-        let shared = Arc::new(rules);
+        let shared = Arc::new((rules, datadir));
         let (tx, rx) = mpsc::channel();
         let submitted = pool.submit({
             let shared = Arc::clone(&shared);
             let tx = tx.clone();
             move |_buf: &mut Vec<u8>| {
-                let _ = tx.send(
-                    MphDomainMatcher::build(shared.as_slice())
-                        .map_err(|e| RouterError::GeodataBuild(e.to_string())),
-                );
+                let _ = tx.send(build_in_registry(&shared.0, shared.1.as_deref()));
             }
         });
         drop(tx);
@@ -152,11 +152,54 @@ impl DomainMatcherCondition {
             Ok(()) => rx.recv().map_err(|_| {
                 RouterError::GeodataBuild("matcher build task lost: pool worker died".into())
             })??,
-            Err(_) => MphDomainMatcher::build(shared.as_slice())
-                .map_err(|e| RouterError::GeodataBuild(e.to_string()))?,
+            Err(_) => build_in_registry(&shared.0, shared.1.as_deref())?,
         };
-        Ok(Self { matcher: Box::new(matcher) })
+        Ok(Self { matcher })
     }
+}
+
+/// 经全局域名注册表构建并登记（Go `DomainReg.BuildDomainMatcher`）。
+fn build_in_registry(
+    rules: &[xray_proto::xray::common::geodata::DomainRule],
+    datadir: Option<&Path>,
+) -> Result<Arc<DynamicDomainMatcher>, RouterError> {
+    let converted: Vec<xray_geodata::pb::DomainRule> =
+        rules.iter().filter_map(to_geodata_domain_rule).collect();
+    let built = match datadir {
+        Some(dir) => DOMAIN_REG.build_domain_matcher_in(&converted, dir),
+        None => DOMAIN_REG.build_domain_matcher(&converted),
+    };
+    built.map_err(|e| RouterError::GeodataBuild(e.to_string()))
+}
+
+/// proto `DomainRule`（`xray.common.geodata`）→ `xray_geodata::pb::DomainRule`。
+///
+/// 两个 crate 各自构建 proto，生成同名不同类型，故只做变体复制（与
+/// `rule.rs` 里 proto `IpRule` 的转换同理由）。资产解析不在这里做：`geosite:`
+/// 保持 tag 形态交给注册表，热更才能就地重建。
+fn to_geodata_domain_rule(
+    rule: &xray_proto::xray::common::geodata::DomainRule,
+) -> Option<xray_geodata::pb::DomainRule> {
+    use xray_proto::xray::common::geodata::domain_rule::Value as Proto;
+    Some(xray_geodata::pb::DomainRule {
+        value: Some(match rule.value.as_ref()? {
+            // attribute 不参与匹配（属性过滤走 `GeoSiteRule.attrs`），不搬运。
+            Proto::Custom(d) => {
+                xray_geodata::pb::domain_rule::Value::Custom(xray_geodata::pb::Domain {
+                    r#type: d.r#type,
+                    value: d.value.clone(),
+                    attribute: Vec::new(),
+                })
+            },
+            Proto::Geosite(g) => {
+                xray_geodata::pb::domain_rule::Value::Geosite(xray_geodata::pb::GeoSiteRule {
+                    file: g.file.clone(),
+                    code: g.code.clone(),
+                    attrs: g.attrs.clone(),
+                })
+            },
+        }),
+    })
 }
 
 impl Condition for DomainMatcherCondition {
@@ -193,15 +236,21 @@ pub enum IpMatchAsType {
 /// 对应 Go `IPMatcher`：包装 xray-geodata 的 `IPMatcher`，
 /// `apply` 返回任一对应类型 IP 命中任一 CIDR。
 pub struct IPMatcherCondition {
-    matcher: Box<dyn GeoIPMatcher>,
+    matcher: Arc<dyn GeoIPMatcher>,
     as_type: IpMatchAsType,
 }
 
 impl IPMatcherCondition {
     /// 从 proto `IpRule` 列表构造。
+    ///
+    /// 对应 Go `IPMatcher`（`app/router/condition.go:86-90`）：规则经全局
+    /// `IP_REG` 登记后构造——`geoip:`/`ext:`/`ext-ip:` 在**构造期**从资产解析，
+    /// 读资产失败即 `Err`（Go `BuildIPMatcher` 返 err ⇒ 规则构建失败拒启，
+    /// 不退化成空集/全放行）。登记形态让 `IP_REG.reload()` 能就地换结果。
     pub fn new(rules: Vec<IpRule>, as_type: IpMatchAsType) -> Result<Self, RouterError> {
-        let matcher = build_optimized_ip_matcher(&rules)
-            .map_err(|e| RouterError::GeodataBuild(e.to_string()))?;
+        let matcher = IP_REG
+            .build_ip_matcher(&rules)
+            .map_err(|e| RouterError::GeodataBuild(format!("build ip matcher: {e}")))?;
         Ok(Self { matcher, as_type })
     }
 
@@ -1160,26 +1209,102 @@ mod tests {
 
     // ── DomainMatcher ──
 
+    /// 合成一条 `Custom` pb 规则（`xray.common.geodata.DomainRule`）。
+    fn proto_domain(
+        domain_type: xray_proto::xray::common::geodata::domain::Type,
+        value: &str,
+    ) -> xray_proto::xray::common::geodata::DomainRule {
+        use xray_proto::xray::common::geodata::{Domain, DomainRule, domain_rule};
+        DomainRule {
+            value: Some(domain_rule::Value::Custom(Domain {
+                r#type: domain_type as i32,
+                value: value.into(),
+                attribute: vec![],
+            })),
+        }
+    }
+
     #[test]
     fn test_domain_matcher_full() {
-        let rule = GeoDomainRule::full("example.com", 1);
-        let m = DomainMatcherCondition::new(vec![rule]).unwrap();
+        use xray_proto::xray::common::geodata::domain::Type as ProtoType;
+        let rules = [proto_domain(ProtoType::Full, "example.com")];
+        let m = DomainMatcherCondition::new(&rules, None).unwrap();
         assert!(m.apply(&ctx_target_domain("example.com")));
         assert!(!m.apply(&ctx_target_domain("not.match")));
     }
 
     #[test]
     fn test_domain_matcher_substr() {
-        let rule = GeoDomainRule::substr("example", 1);
-        let m = DomainMatcherCondition::new(vec![rule]).unwrap();
+        use xray_proto::xray::common::geodata::domain::Type as ProtoType;
+        let rules = [proto_domain(ProtoType::Substr, "example")];
+        let m = DomainMatcherCondition::new(&rules, None).unwrap();
         assert!(m.apply(&ctx_target_domain("my.example.io")));
     }
 
     #[test]
     fn test_domain_matcher_empty_domain_returns_false() {
-        let rule = GeoDomainRule::full("x", 1);
-        let m = DomainMatcherCondition::new(vec![rule]).unwrap();
+        use xray_proto::xray::common::geodata::domain::Type as ProtoType;
+        let rules = [proto_domain(ProtoType::Full, "x")];
+        let m = DomainMatcherCondition::new(&rules, None).unwrap();
         assert!(!m.apply(&ctx_target_domain("")));
+    }
+
+    /// `geosite:` 由注册表在构造期读资产展开（Go `DomainReg.BuildDomainMatcher`）：
+    /// 命中资产内域名；资产/代号缺失 ⇒ 构造期 Err（拒启，不是静默空集）。
+    ///
+    /// 热更换快照的断言在 `xray_geodata/tests/registry_reload.rs`
+    /// （注册表级，避免本用例触碰全局注册表）。
+    #[test]
+    fn test_domain_matcher_geosite_resolves_registry_asset() {
+        use prost::Message;
+        use xray_geodata::pb::{Domain, GeoSite, GeoSiteList};
+        use xray_proto::xray::common::geodata::{DomainRule, GeoSiteRule, domain_rule};
+
+        fn write_dat(dir: &Path, code: &str, domains: &[&str]) {
+            let list = GeoSiteList {
+                entry: vec![GeoSite {
+                    code: code.into(),
+                    domain: domains.iter().map(|d| Domain::full(d)).collect(),
+                }],
+            };
+            std::fs::write(dir.join("geosite.dat"), list.encode_to_vec()).unwrap();
+        }
+
+        fn geosite_rules(code: &str) -> Vec<DomainRule> {
+            vec![DomainRule {
+                value: Some(domain_rule::Value::Geosite(GeoSiteRule {
+                    // 小写：注册表自己归一成大写（dat 内存全大写）
+                    file: "geosite.dat".into(),
+                    code: code.to_lowercase(),
+                    attrs: String::new(),
+                })),
+            }]
+        }
+
+        let dir = std::env::temp_dir().join(format!("xray_router_geosite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_dat(&dir, "HOT", &["hot.example"]);
+
+        let m = DomainMatcherCondition::new(&geosite_rules("hot"), Some(&dir)).unwrap();
+        assert!(m.apply(&ctx_target_domain("hot.example")));
+        assert!(!m.apply(&ctx_target_domain("cold.example")));
+
+        fn expect_err(rules: &[DomainRule], dir: &Path) -> String {
+            DomainMatcherCondition::new(rules, Some(dir))
+                .map(|_| ())
+                .expect_err("geosite 资产/代号缺失必须在配置期报错")
+                .to_string()
+        }
+
+        // 代号不存在 ⇒ 构造期 Err（fail-visible）
+        let err = expect_err(&geosite_rules("nope"), &dir);
+        assert!(err.contains("load geosite"), "实际: {err}");
+
+        // 资产缺失 ⇒ 构造期 Err
+        std::fs::remove_file(dir.join("geosite.dat")).unwrap();
+        let err = expect_err(&geosite_rules("hot"), &dir);
+        assert!(err.contains("load geosite"), "实际: {err}");
     }
 
     // ── IPMatcher ──
@@ -1198,6 +1323,53 @@ mod tests {
         let miss = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
         assert!(m.apply(&hit));
         assert!(!m.apply(&miss));
+    }
+
+    /// geoip 规则由 `IpRegistry` 在**构造期**解析（Go `IPReg.BuildIPMatcher`）：
+    /// 资产内 IP 命中、资产外不命中；换 .dat 后 `reload()` 就地换结果（= `IP_REG.reload()`
+    /// 能改路由结果，matcher 句柄与规则都不用重建）。
+    ///
+    /// 用独立注册表注入 datadir（生产走全局 `IP_REG`，datadir 由资产目录固定）。
+    #[test]
+    fn test_ip_matcher_geoip_resolves_registry_and_reload() {
+        use xray_geodata::{
+            matcher::ip::IpRegistry,
+            pb::{Cidr, GeoIp, GeoIpList},
+            rule_parser::{DEFAULT_GEOIP_DAT, parse_ip_rules},
+        };
+
+        fn write_dat(dir: &std::path::Path, cidr: Cidr) {
+            let list = GeoIpList {
+                entry: vec![GeoIp { code: "CN".into(), cidr: vec![cidr], reverse_match: false }],
+            };
+            std::fs::write(dir.join(DEFAULT_GEOIP_DAT), prost::Message::encode_to_vec(&list))
+                .unwrap();
+        }
+
+        let dir = std::env::temp_dir().join(format!("xray-router-geoip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_dat(&dir, Cidr { ip: vec![103, 0, 0, 0], prefix: 8 });
+
+        let rules = parse_ip_rules(&["geoip:CN".to_string()], &dir).unwrap();
+        let registry = IpRegistry::with_datadir(dir.clone());
+        let m = IPMatcherCondition {
+            matcher: registry.build_ip_matcher(&rules).unwrap(),
+            as_type: IpMatchAsType::Target,
+        };
+
+        let in_cn = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(103, 1, 2, 3)));
+        let out_cn = RoutingData::new().with_target_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(m.apply(&in_cn), "资产内 IP 必须命中（旧实现空集 stub 即红）");
+        assert!(!m.apply(&out_cn), "资产外 IP 不得命中");
+
+        // 换资产：CN 段改成 8.8.8.0/24 → reload 后同一 matcher 结果随之变。
+        write_dat(&dir, Cidr { ip: vec![8, 8, 8, 0], prefix: 24 });
+        registry.reload().unwrap();
+        assert!(!m.apply(&in_cn), "reload 后旧段不再命中");
+        assert!(m.apply(&out_cn), "reload 后新段命中");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── PortMatcher ──

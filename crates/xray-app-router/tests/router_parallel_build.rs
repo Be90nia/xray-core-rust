@@ -20,19 +20,28 @@ use xray_app_router::{
     condition::{DomainMatcherCondition, RouterBuildPool},
     context::RoutingData,
 };
-use xray_geodata::matcher::domain::DomainRule;
+use xray_proto::xray::common::geodata::{
+    Domain, DomainRule, domain::Type as ProtoType, domain_rule,
+};
+
+fn custom(domain_type: ProtoType, value: String) -> DomainRule {
+    DomainRule {
+        value: Some(domain_rule::Value::Custom(Domain {
+            r#type: domain_type as i32,
+            value,
+            attribute: vec![],
+        })),
+    }
+}
 
 /// 合成规则集：full/domain/substr/regex 四型轮转（regex 占 1/4，是最贵的编译面）。
 fn make_rules(group: usize, count: usize) -> Vec<DomainRule> {
     (0..count)
-        .map(|i| {
-            let id = ((group * 1_000_000) + i) as u32;
-            match i % 4 {
-                0 => DomainRule::full(format!("full{group}.{i}.example.com"), id),
-                1 => DomainRule::domain(format!("grp{group}.sub{i}.example.org"), id),
-                2 => DomainRule::substr(format!("kw{group}-{i}"), id),
-                _ => DomainRule::regex(format!(r"^r{group}x{i}\d+\.net$"), id),
-            }
+        .map(|i| match i % 4 {
+            0 => custom(ProtoType::Full, format!("full{group}.{i}.example.com")),
+            1 => custom(ProtoType::Domain, format!("grp{group}.sub{i}.example.org")),
+            2 => custom(ProtoType::Substr, format!("kw{group}-{i}")),
+            _ => custom(ProtoType::Regex, format!(r"^r{group}x{i}\d+\.net$")),
         })
         .collect()
 }
@@ -42,10 +51,10 @@ fn make_rules(group: usize, count: usize) -> Vec<DomainRule> {
 #[test]
 fn pooled_build_matches_serial_exactly() {
     let rules = make_rules(7, 2000);
-    let serial = DomainMatcherCondition::new(rules.clone()).unwrap();
+    let serial = DomainMatcherCondition::new(&rules, None).unwrap();
 
     let pool = RouterBuildPool::new(2, 2, 8, Duration::from_secs(10));
-    let pooled = DomainMatcherCondition::new_pooled(&pool, rules).unwrap();
+    let pooled = DomainMatcherCondition::new_pooled(&pool, rules, None).unwrap();
     pool.shutdown_join();
 
     let mut probes: Vec<String> = (0..500)
@@ -78,7 +87,7 @@ fn pooled_build_is_not_slower_than_serial() {
     for _ in 0..3 {
         let t0 = Instant::now();
         for g in &groups {
-            drop(DomainMatcherCondition::new(g.clone()).unwrap());
+            drop(DomainMatcherCondition::new(g, None).unwrap());
         }
         serial_ms.push(t0.elapsed().as_millis());
 
@@ -89,7 +98,7 @@ fn pooled_build_is_not_slower_than_serial() {
             let tx = tx.clone();
             let g = g.clone();
             pool.submit(move |_| {
-                let _ = tx.send(DomainMatcherCondition::new(g).unwrap());
+                let _ = tx.send(DomainMatcherCondition::new(&g, None).unwrap());
             })
             .unwrap();
         }
@@ -107,6 +116,13 @@ fn pooled_build_is_not_slower_than_serial() {
         "build 4x2000 rules x3 rounds: serial median {s_med}ms (runs {serial_ms:?}), \
          pooled median {p_med}ms (runs {pooled_ms:?})"
     );
+    // 同机并行会污染时序（同文件其它 CPU 重用例 / 其它 crate 测试 / 同时在跑的编译）：
+    // 离散度 > 15% ⇒ 本测判断 CONTAMINATED，不比比值（同仓 A/B 门纪律）。
+    let contaminated = |runs: &[u128]| runs[2].saturating_sub(runs[0]) * 100 > runs[2] * 15;
+    if contaminated(&serial_ms) || contaminated(&pooled_ms) {
+        println!("CONTAMINATED: run-to-run spread > 15%, pooled/serial ratio not asserted");
+        return;
+    }
     assert!(
         p_med * 100 <= s_med * 105,
         "pooled median {p_med}ms must be <= serial median {s_med}ms * 1.05"
@@ -133,8 +149,8 @@ fn rejected_submit_falls_back_inline_without_panic() {
     pool.submit(|_| {}).unwrap();
 
     // 队列已满：再提交必被拒 → 内联补位，构建结果照常可用。
-    let rules = vec![DomainRule::full("inline.example.com", 1)];
-    let m = DomainMatcherCondition::new_pooled(&pool, rules).unwrap();
+    let rules = vec![custom(ProtoType::Full, "inline.example.com".to_string())];
+    let m = DomainMatcherCondition::new_pooled(&pool, rules, None).unwrap();
     assert!(m.apply(&RoutingData::new().with_target_domain("inline.example.com")));
     assert!(!m.apply(&RoutingData::new().with_target_domain("other.example.com")));
 
