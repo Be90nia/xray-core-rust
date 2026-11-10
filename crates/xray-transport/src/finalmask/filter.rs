@@ -32,17 +32,20 @@ use std::{
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_geodata::{
-    matcher::ip::{IPMatcher, build_optimized_ip_matcher},
-    pb::{CidrRule, IpRule, ip_rule::Value as IpRuleValue},
-    rule_parser::{cut_reverse_prefix, parse_cidr},
+    matcher::ip::{DynamicIPMatcher, IP_REG, IPMatcher, IpRegistry},
+    rule_parser::parse_ip_rules,
 };
 
 use super::{AsyncIo, ConnAddrs, Tcpmask, UdpIo, Udpmask, mask_err};
 
 /// 源 IP 判定策略（Go `filter` 结构体：`blocked` / `allowed` 两张 matcher 表）。
+///
+/// 持 [`DynamicIPMatcher`]（经 `IP_REG.build_ip_matcher` 登记）而非不登记的
+/// `Box<dyn IPMatcher>`：Go 的 filter 同样把 matcher 交给 `geodata.IPReg` 托管，
+/// `IPReg.Reload` 后（`ReloadBothRegistries`）过滤规则跟着资产一起热更新。
 pub struct FilterPolicy {
-    blocked: Option<Box<dyn IPMatcher>>,
-    allowed: Option<Box<dyn IPMatcher>>,
+    blocked: Option<Arc<DynamicIPMatcher>>,
+    allowed: Option<Arc<DynamicIPMatcher>>,
 }
 
 impl FilterPolicy {
@@ -79,8 +82,17 @@ impl FilterConfig {
     /// 两表皆空 → 恒透传掩码；单条规则非法 → 硬错（Go 在 `Build` 期即报错——
     /// 静默丢规则会把「拦一批」变成「一条没拦」或「全拦」）。
     pub fn from_rules(blocked: Option<&[String]>, allowed: Option<&[String]>) -> io::Result<Self> {
-        let blocked = build_matcher(blocked, "blockedSourceIPs")?;
-        let allowed = build_matcher(allowed, "allowedSourceIPs")?;
+        Self::from_rules_with(&IP_REG, blocked, allowed)
+    }
+
+    /// 指定注册表的形态（测试注入自定资产目录用；生产走 [`Self::from_rules`]）。
+    pub fn from_rules_with(
+        registry: &IpRegistry,
+        blocked: Option<&[String]>,
+        allowed: Option<&[String]>,
+    ) -> io::Result<Self> {
+        let blocked = build_matcher(registry, blocked, "blockedSourceIPs")?;
+        let allowed = build_matcher(registry, allowed, "allowedSourceIPs")?;
         if blocked.is_none() && allowed.is_none() {
             return Ok(Self { policy: None });
         }
@@ -89,38 +101,25 @@ impl FilterConfig {
 }
 
 /// 单表规则 → matcher（空表 = `None`，对应 Go 该字段 nil）。
-fn build_matcher(rules: Option<&[String]>, label: &str) -> io::Result<Option<Box<dyn IPMatcher>>> {
+///
+/// 规则串经 `geodata::rule_parser::parse_ip_rules`（`!` 反向 / CIDR / `geoip:` /
+/// `ext:` / `ext-ip:`），再用注册表构造——等价 Go
+/// `geodata.IPReg.BuildIPMatcher(c.BlockedSourceIps)`：资产缺失 / 代号不存在 ⇒
+/// 报错（Go 同，不静默退空集）。
+fn build_matcher(
+    registry: &IpRegistry,
+    rules: Option<&[String]>,
+    label: &str,
+) -> io::Result<Option<Arc<DynamicIPMatcher>>> {
     let Some(rules) = rules.filter(|rules| !rules.is_empty()) else {
         return Ok(None);
     };
-    let mut parsed = Vec::with_capacity(rules.len());
-    for rule in rules {
-        parsed.push(parse_ip_rule(rule, label)?);
-    }
-    build_optimized_ip_matcher(&parsed)
+    let parsed = parse_ip_rules(rules, registry.datadir())
+        .map_err(|e| mask_err(format!("finalmask: filter: \"{label}\": {e}")))?;
+    registry
+        .build_ip_matcher(&parsed)
         .map(Some)
         .map_err(|e| mask_err(format!("finalmask: filter: \"{label}\": {e}")))
-}
-
-/// 单条规则字符串 → proto `IpRule`（Go `geodata.ParseIPRules`：`!` 反向 + CIDR）。
-///
-/// `geoip:` / `ext:` / `ext-ip:` 显式拒绝：Go 由 `IPReg.BuildIPMatcher` 从 `.dat`
-/// 展开，本仓构造路径没有 geodata loader，matcher 的 `Geoip` 分支只能给出空集
-/// ——静默接受会让 blacklist 漏放（永不命中）、whitelist 全拒（永不满足）。
-fn parse_ip_rule(rule: &str, label: &str) -> io::Result<IpRule> {
-    let (rule_body, reverse) = cut_reverse_prefix(rule);
-    if ["geoip:", "ext:", "ext-ip:"].iter().any(|p| rule_body.starts_with(p)) {
-        return Err(mask_err(format!(
-            "finalmask: filter: \"{label}\": geoip/ext rule {:?} needs a geodata loader (not \
-             available here); expand it to explicit CIDRs",
-            rule_body
-        )));
-    }
-    let cidr = parse_cidr(rule_body)
-        .map_err(|e| mask_err(format!("finalmask: filter: \"{label}\": {rule:?}: {e}")))?;
-    Ok(IpRule {
-        value: Some(IpRuleValue::Custom(CidrRule { cidr: Some(cidr), reverse_match: reverse })),
-    })
 }
 
 impl std::fmt::Debug for FilterConfig {
@@ -347,16 +346,53 @@ mod tests {
         assert!(cfg.policy.as_ref().unwrap().rejects(peer("::ffff:10.1.2.3")));
     }
 
-    /// 非法规则 / geoip 规则一律硬错（禁静默丢规则后语义翻转）。
+    /// 非法 CIDR 仍硬错；`geoip:` / `ext-ip:` 规则**不再**被本地拒绝，而是交给
+    /// geodata 解析层（资产缺失时报可诊断的资产错误，带文件名）。
     #[test]
-    fn invalid_and_geoip_rules_reject_loudly() {
+    fn invalid_cidr_rejects_and_geoip_goes_to_geodata() {
         let one = |s: &str| vec![s.to_string()];
         let err = FilterConfig::from_rules(Some(&one("10.0.0.0/33")), None).unwrap_err();
         assert!(err.to_string().contains("blockedSourceIPs"), "{err}");
-        let err = FilterConfig::from_rules(None, Some(&one("geoip:cn"))).unwrap_err();
-        assert!(err.to_string().contains("geodata loader"), "{err}");
-        let err = FilterConfig::from_rules(Some(&one("ext:cn.dat:CN")), None).unwrap_err();
-        assert!(err.to_string().contains("geodata loader"), "{err}");
+        let err =
+            FilterConfig::from_rules(Some(&one("ext-ip:no-such-file.dat:CN")), None).unwrap_err();
+        let msg = err.to_string();
+        // 走的是资产加载层（Go 同错误形态：open xxx.dat 失败）；不再是旧的本地拒绝。
+        assert!(!msg.contains("geodata loader"), "不得再走旧的本地拒绝路径：{msg}");
+        assert!(msg.contains("文件") || msg.contains("IO"), "错误须来自资产加载层：{msg}");
+    }
+
+    /// 端到端（不依赖全局资产）：自定资产目录放 `geoip:CN` ⇒ filter 真按 geoip 拒绝
+    /// 来源。等价 Go `geodata.IPReg.BuildIPMatcher(c.BlockedSourceIps)`。
+    #[test]
+    fn geoip_rule_blocks_matching_source() {
+        let dir = tmp_dir("filter_geoip");
+        write_geoip_dat(&dir, ("CN", 103, 8));
+        let registry = IpRegistry::with_datadir(dir);
+        let one = |s: &str| vec![s.to_string()];
+        let cfg = FilterConfig::from_rules_with(&registry, Some(&one("geoip:CN")), None).unwrap();
+        let policy = cfg.policy.as_ref().unwrap();
+        assert!(policy.rejects(peer("103.1.2.3")), "geoip:CN 必须拦 CN 段来源");
+        assert!(!policy.rejects(peer("8.8.8.8")), "非 CN 段不得被拦");
+    }
+
+    fn tmp_dir(label: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("xray_transport_filter_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 最小 geoip.dat：`GeoIpList{ entry: [{country_code, cidr}] }` 的 prost 编码。
+    fn write_geoip_dat(dir: &std::path::Path, entry: (&str, u8, u32)) {
+        use prost::Message as _;
+        use xray_geodata::pb::{Cidr, GeoIp, GeoIpList};
+        let (code, first_octet, prefix) = entry;
+        let mut geo = GeoIp::new(code);
+        geo.cidr = vec![Cidr::new(vec![first_octet, 0, 0, 0], prefix)];
+        let list = GeoIpList::new().with_entry(geo);
+        let bytes = list.encode_to_vec();
+        std::fs::write(dir.join(xray_geodata::rule_parser::DEFAULT_GEOIP_DAT), bytes).unwrap();
     }
 
     /// ⑤ UDP：被拒来源的包不交给上层（`recv_from` 跳过并继续读）。

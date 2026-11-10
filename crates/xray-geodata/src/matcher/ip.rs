@@ -1649,6 +1649,12 @@ impl IpRegistry {
         Ok(())
     }
 
+    /// 本注册表的 geodata 资产目录（消费方解析 `geoip:` 规则时须与构造 matcher 的目录一致）。
+    #[must_use]
+    pub fn datadir(&self) -> &std::path::Path {
+        &self.datadir
+    }
+
     /// 当前登记的动态匹配器数量（含尚未清理的失效弱引用）。
     #[must_use]
     pub fn len(&self) -> usize {
