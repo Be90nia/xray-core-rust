@@ -2212,10 +2212,17 @@ mod tests {
             bbr_profile: "standard".into(),
             ..QuicConfig::default_for_hysteria()
         };
-        let conn = transport
-            .dial_and_authenticate(&dest, &qc, "test-secret", 3_000_000)
-            .await
-            .expect("dial + auth should succeed");
+        // 15s 上限（对齐兄弟用例 `hysteria_transport.rs:442-447` 既有写法；bd gqpck）：
+        // CI 高负载下服务端迟迟不应答时，不再烧满 30s QUIC 空闲窗才报
+        // 「h3 recv_response: Connection error: Timeout」（真实 CI 症状，quinn_adapter.rs:2214）
+        // ——失败更快、语义更准。**不放宽任何断言、不禁 ignore**。
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 3_000_000),
+        )
+        .await
+        .expect("no hang")
+        .expect("dial + auth should succeed");
 
         let stream = transport.open_stream(&conn).await.expect("open_stream");
         let isc =
