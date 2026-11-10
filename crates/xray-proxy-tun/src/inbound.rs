@@ -195,6 +195,11 @@ pub struct TunInboundHandler {
     /// 对应 Go `WindowsTun.wfp`（tun_windows.go:259，Close 时 `closeWFPEngine`）。
     #[cfg(target_os = "windows")]
     leak_filter: ParkMutex<Option<crate::wfp::sys::LeakFilterGuard>>,
+    /// weak host send 守卫（Windows 专有；Drop 即恢复）。
+    ///
+    /// 对应 Go `WindowsTun.guard`（tun_windows.go:258，Close 时 `guard.restore()`）。
+    #[cfg(target_os = "windows")]
+    outbound_guard: ParkMutex<Option<crate::sysroute::guard::OutboundGuard>>,
 }
 
 impl TunInboundHandler {
@@ -237,6 +242,8 @@ impl TunInboundHandler {
             applied_sysroute: ParkMutex::new(None),
             #[cfg(target_os = "windows")]
             leak_filter: ParkMutex::new(None),
+            #[cfg(target_os = "windows")]
+            outbound_guard: ParkMutex::new(None),
         })
     }
 
@@ -258,6 +265,9 @@ impl TunInboundHandler {
         #[cfg(target_os = "windows")]
         sysroute::flush_adapter_addresses(&self.options);
         sysroute::set_outbound_iface(None);
+        // weak host send 也回滚：启动失败即关 TUN，不能把网卡设置留在关着的状态。
+        #[cfg(target_os = "windows")]
+        drop(self.outbound_guard.lock().take());
         *self.device.lock() = None;
         let _ = device.close();
     }
@@ -281,7 +291,7 @@ fn configure_outbound_iface(
         .map_err(|e| format!("interface enumeration failed: {e}"))?;
     let (name, index) = sysroute::resolve_outbound_interface(&interfaces, tun_index, mode)
         .map_err(|e| format!("outbound interface resolution failed: {e}"))?;
-    sysroute::set_outbound_iface(Some(index));
+    sysroute::set_outbound_iface(Some((index, name.clone())));
     sysroute::ensure_outbound_controller_registered();
     crate::TUN_LOG.info(format!("[tun] outbound interface: {name} (index {index})"));
     Ok(())
@@ -408,6 +418,10 @@ impl InboundHandler for TunInboundHandler {
                              block_ipv4={block_ipv4} block_ipv6={block_ipv6}",
                             self.tag
                         ));
+                        // 覆盖集合（gateway + autoSystemRoutingTable）外的 DNS 服务器
+                        // 查询会被上面装的过滤器挡掉——逐条告警（Go tun_windows.go:326-330）。
+                        let applied = self.applied_sysroute.lock();
+                        sysroute::warn_dns_outside_tun(cfg, applied.as_ref());
                     },
                     Err(e) => {
                         self.rollback_start(&device);
@@ -417,6 +431,23 @@ impl InboundHandler for TunInboundHandler {
                         )));
                     },
                 }
+            }
+
+            // 缓存里可能还留着按旧 DNS 设置得到的答案（Go tun_windows.go:331-333）。
+            // 清不掉只是「可能多走一轮旧解析」，不阻塞启动。
+            if !cfg.dns.is_empty() || route4 || route6 {
+                if let Err(e) = sysroute::flush_dns_cache() {
+                    crate::TUN_LOG.info(format!("[tun] unable to flush DNS cache: {e}"));
+                }
+            }
+
+            // weak host send 守卫（Go tun_windows.go:335-343）：只有绑定了出口网卡才
+            // 有意义（`autoOutboundsInterface` 缺省 = 不绑卡）。关不掉只告警。
+            if cfg.auto_outbounds_interface.is_some() {
+                let guard = sysroute::guard::OutboundGuard::new(route4, route6);
+                let bound = sysroute::outbound_iface();
+                guard.check(bound.as_ref().map(|(index, name)| (*index, name.as_str())));
+                *self.outbound_guard.lock() = Some(guard);
             }
         }
 
@@ -455,6 +486,10 @@ impl InboundHandler for TunInboundHandler {
         if let Some(scope) = scope {
             let _ = scope.drain(std::time::Duration::from_millis(100)).await;
         }
+        // weak host send 恢复（Go Close 的 `t.guard.restore()`，tun_windows.go:381）：
+        // 网关关掉的设置必须开回来，否则用户的热点/共享会永久失效。
+        #[cfg(target_os = "windows")]
+        drop(self.outbound_guard.lock().take());
         // 回滚 A3/A4 系统变更（对齐 Go Close：unsetSystemDNS → unsetSystemRoutes → 设备下线）。
         if let Some(applied) = self.applied_sysroute.lock().take() {
             sysroute::revert(&applied);
@@ -473,6 +508,14 @@ impl InboundHandler for TunInboundHandler {
         drop(self.leak_filter.lock().take());
         if let Some(dev) = self.device.lock().take() {
             let _ = dev.close();
+        }
+        // Go Close 尾部（tun_windows.go:402-404）：配了 dns 或系统路由才清缓存，返回值
+        // 直接丢弃——停机路径上「清不掉」只影响旧解析残留，不值得一条 error。
+        #[cfg(target_os = "windows")]
+        if !self.options.dns.is_empty() || !self.options.auto_system_routing_table.is_empty() {
+            if let Err(e) = sysroute::flush_dns_cache() {
+                crate::TUN_LOG.debug(format!("[tun] unable to flush DNS cache: {e}"));
+            }
         }
         crate::TUN_LOG.info(format!("tun inbound closed tag={}", self.tag));
         Ok(())

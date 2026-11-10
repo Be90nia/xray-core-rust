@@ -38,6 +38,9 @@
 //!   TUN，不动物理网卡；无验证语义， 显式记日志跳过）。
 
 pub mod executor;
+/// weak host send 守卫（Go `tun_windows_outbound.go`）——仅 Windows。
+#[cfg(target_os = "windows")]
+pub mod guard;
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -275,20 +278,25 @@ pub fn select_outbound_interface(interfaces: &[Interface], tun_index: u32) -> Op
 
 // ===== 出站接口绑定（Go InterfaceUpdater + RegisterDialerController，handler.go:130-164）=====
 
-/// 出站绑定状态：物理网卡索引。对应 Go `InterfaceUpdater.iface`（config.go:14-21）
-/// 的最小版（只存 index）。Go 在路由/链路变化时 `Update()` 重选，Rust 无监控器，
-/// 仅 Start 时选一次——动态重选留后续票。
-static OUTBOUND_IFACE_INDEX: parking_lot::RwLock<Option<u32>> = parking_lot::RwLock::new(None);
+/// 出站绑定状态：物理网卡 `(索引, 名字)`。对应 Go `InterfaceUpdater.iface`
+/// （config.go:14-21；名字只用于日志，Go 的 `iface.Name`）。Go 在路由/链路变化时
+/// `Update()` 重选，Rust 无监控器，仅 Start 时选一次——动态重选留后续票。
+static OUTBOUND_IFACE: parking_lot::RwLock<Option<(u32, String)>> = parking_lot::RwLock::new(None);
 
 /// controller 进程级只注册一次的闸。Go 每次 Start 追加注册一个读同一包级
-/// `updater` 的闭包；Rust 状态收敛进 [`OUTBOUND_IFACE_INDEX`]，闭包无状态，
+/// `updater` 的闭包；Rust 状态收敛进 [`OUTBOUND_IFACE`]，闭包无状态，
 /// 重复注册只添冗余。
 static OUTBOUND_CONTROLLER_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// 更新出站绑定状态。`None` = 解除（TUN 关闭/回滚/换配置重启后，dialer
 /// controller 变 no-op，拨号回归系统路由表）。
-pub(crate) fn set_outbound_iface(index: Option<u32>) {
-    *OUTBOUND_IFACE_INDEX.write() = index;
+pub(crate) fn set_outbound_iface(iface: Option<(u32, String)>) {
+    *OUTBOUND_IFACE.write() = iface;
+}
+
+/// 当前绑定的物理网卡（[`guard`] 取网卡名做日志，Go `updater.Get()`）。
+pub(crate) fn outbound_iface() -> Option<(u32, String)> {
+    OUTBOUND_IFACE.read().clone()
 }
 
 /// 注册出站绑定 controller（幂等）。对应 Go `internet.RegisterDialerController`
@@ -310,12 +318,13 @@ fn iface_bind_decision(state: Option<u32>, dest: &SocketAddr) -> Option<u32> {
     state
 }
 
-/// 出站绑定 controller：读 [`OUTBOUND_IFACE_INDEX`]，跳过 loopback，把 socket
+/// 出站绑定 controller：读 [`OUTBOUND_IFACE`]，跳过 loopback，把 socket
 /// 绑到物理网卡（freedom 出站不再绕回 TUN 自身）。Go 关闭后仍绑最后一次
 /// 选中的 iface，此处清零后 no-op——语义差异（更干净）记录于报告。
 fn outbound_iface_controller() -> xray_transport::system_dialer::DialerController {
     std::sync::Arc::new(move |socket, dest| {
-        match iface_bind_decision(*OUTBOUND_IFACE_INDEX.read(), dest) {
+        let state = OUTBOUND_IFACE.read().as_ref().map(|(index, _)| *index);
+        match iface_bind_decision(state, dest) {
             None => Ok(()),
             Some(index) => {
                 xray_transport::sockopt::bind_socket_to_interface(socket, index, dest.is_ipv4())
@@ -897,6 +906,69 @@ pub(crate) fn flush_adapter_addresses(options: &StackOptions) {
             crate::TUN_LOG.warn(format!("tun adapter address cleanup failed: {cmd}: {e}"));
         }
     }
+}
+
+/// `dnsOutsideTUN` 的覆盖集合：gateway 全部 CIDR ∪ autoSystemRoutingTable 目的地
+/// （Go `tun_windows.go:326-330` 的 `covered` = `addresses` + `routesData` 目的地）。
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn dns_covered_prefixes(
+    options: &StackOptions,
+    applied: Option<&AppliedSystemChanges>,
+) -> Vec<(IpAddr, u8)> {
+    let mut covered: Vec<(IpAddr, u8)> =
+        options.gateway.iter().filter_map(|cidr| parse_ip_cidr(cidr)).collect();
+    if let Some(routes) = applied.and_then(|a| a.routes.as_ref()) {
+        covered.extend(routes.add.iter().map(|e| (e.destination, e.prefix)));
+    }
+    covered
+}
+
+/// 落在覆盖集合外的 DNS 服务器逐条告警：查询到不了 TUN，会被 WFP 阻断
+/// （Go `tun_windows.go:326-330` 的 `dnsOutsideTUN` + `LogWarning`）。
+///
+/// 生产调用点 = `TunInboundHandler::start`（WFP 装好之后）；本节公开亦供真机自检
+/// （`examples/tun_win_live.rs`）。
+#[cfg(target_os = "windows")]
+pub fn warn_dns_outside_tun(options: &StackOptions, applied: Option<&AppliedSystemChanges>) {
+    let mut servers = Vec::with_capacity(options.dns.len());
+    for entry in &options.dns {
+        match entry.parse::<IpAddr>() {
+            Ok(addr) => servers.push(addr),
+            // 解析不了就无法判断覆盖关系——不静默丢弃。
+            Err(e) => crate::TUN_LOG
+                .warn(format!("[tun] dns entry {entry:?} is not an IP address, skipped: {e}")),
+        }
+    }
+    let covered = dns_covered_prefixes(options, applied);
+    for server in crate::wfp::spec::dns_outside_tun(&servers, &covered) {
+        crate::TUN_LOG.warn(format!(
+            "[tun] DNS server {server} is in neither gateway nor autoSystemRoutingTable, so \
+             queries to it cannot go through the TUN and are blocked"
+        ));
+    }
+}
+
+/// 丢掉 Windows 已缓存的 DNS 应答（Go `flushDNSCache`，tun_windows_wfp.go:695-702）。
+///
+/// 返回 `Ok` = 系统已清缓存。失败**不致命**：Go 调用点只记日志（tun_windows.go:331-333
+/// `LogInfoInner`、:404 直接丢弃），启动/停机都不因此中止。
+#[cfg(target_os = "windows")]
+pub fn flush_dns_cache() -> std::result::Result<(), String> {
+    // SAFETY: 无参数、无返回值结构；`DnsFlushResolverCache` 是 dnsapi 的稳定导出
+    // （Go 同样调它——`windows.NewLazySystemDLL("dnsapi.dll")`）。
+    flush_result(unsafe { DnsFlushResolverCache() })
+}
+
+/// `DnsFlushResolverCache` 的返回值 → 结果（`FALSE` = 失败，Go 同判据）。
+#[cfg(any(target_os = "windows", test))]
+fn flush_result(ok: i32) -> std::result::Result<(), String> {
+    if ok == 0 { Err("DnsFlushResolverCache returned FALSE".to_string()) } else { Ok(()) }
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "dnsapi")]
+unsafe extern "system" {
+    fn DnsFlushResolverCache() -> i32;
 }
 
 #[cfg(test)]
@@ -1744,5 +1816,65 @@ mod tests {
         assert!(err.contains("dns rollback:"), "{err}");
         assert!(err.contains("route rollback:"), "DNS 首错不得跳过路由回滚：{err}");
         assert!(err.contains("xray-sysrollback-missing-route-rollback"), "{err}");
+    }
+
+    /// 覆盖集合 = gateway ∪ autoSystemRoutingTable 目的地（Go `covered`）。
+    #[test]
+    fn dns_covered_prefixes_union_of_gateway_and_routes() {
+        let options = StackOptions {
+            gateway: vec!["192.168.77.1/24".to_string(), "fd00::1/64".to_string()],
+            ..StackOptions::default()
+        };
+        let applied = AppliedSystemChanges {
+            routes: Some(RoutePlan {
+                platform: Platform::Windows,
+                interface: options.name.clone(),
+                interface_index: 7,
+                add: vec![RouteEntry {
+                    destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+                    prefix: 8,
+                    metric: 0,
+                }],
+                outbound_interface: None,
+            }),
+            dns: None,
+        };
+        let covered = dns_covered_prefixes(&options, Some(&applied));
+        assert_eq!(covered.len(), 3, "{covered:?}");
+        assert!(covered.contains(&(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)));
+        assert!(covered.contains(&(IpAddr::V4(Ipv4Addr::new(192, 168, 77, 1)), 24)));
+        // 没有路由计划时只剩 gateway。
+        assert_eq!(dns_covered_prefixes(&options, None).len(), 2);
+    }
+
+    /// 覆盖集合外的 DNS 会被 `dns_outside_tun` 挑出来（告警集合就是它）。
+    #[test]
+    fn dns_outside_covers_gateway_but_not_public_servers() {
+        let options = StackOptions {
+            gateway: vec!["192.168.77.1/24".to_string()],
+            ..StackOptions::default()
+        };
+        let covered = dns_covered_prefixes(&options, None);
+        let servers =
+            [IpAddr::V4(Ipv4Addr::new(192, 168, 77, 53)), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
+        let outside = crate::wfp::spec::dns_outside_tun(&servers, &covered);
+        assert_eq!(outside, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
+    }
+
+    /// ③ 真调 dnsapi：本机必然可清（清缓存不需管理员），且失败也只是一条 Err。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn flush_dns_cache_really_runs_without_panicking() {
+        match flush_dns_cache() {
+            Ok(()) => {},
+            Err(e) => assert!(e.contains("DnsFlushResolverCache"), "错误文本须可诊断：{e}"),
+        }
+    }
+
+    /// `FALSE` 映射成 Err（调用点只记日志，不中断启动/停机）。
+    #[test]
+    fn flush_result_maps_false_to_err() {
+        assert!(flush_result(0).is_err());
+        assert!(flush_result(1).is_ok());
     }
 }

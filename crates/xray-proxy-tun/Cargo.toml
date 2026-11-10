@@ -46,5 +46,12 @@ windows-sys = { workspace = true, features = [
   # 票 1qmer B-8：IPv6 能力探测读 HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters
   # 的 DisabledComponents（Go `ipv6Off()`，tun_windows.go:105-111）。
   "Win32_System_Registry",
+  # weak host send 守卫（票 172ew ④）：`MIB_IPINTERFACE_ROW` 的 WeakHostSend /
+  # ForwardingEnabled 字段定义挂在 WinSock feature 下（IpHelper mod 的 cfg 门）。
+  "Win32_Networking_WinSock",
 ] }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# 真机自检 example（examples/tun_win_live.rs）需要把 `TUN_LOG` 的告警打到控制台。
+tracing-subscriber = { workspace = true }

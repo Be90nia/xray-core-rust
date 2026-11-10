@@ -257,8 +257,10 @@ pub fn leak_filter_specs(input: &LeakFilterInput) -> Vec<FilterSpec> {
                 Condition::equal(Field::IpRemotePort, Value::U16(5355)),
             ];
             for layer in [Layer::AuthConnectV4, Layer::AuthConnectV6] {
-                // 另一版本被整体禁掉时，本版本才需要放行本地链路的 mDNS/LLMNR。
-                let local_link = if layer.is_ipv4() { !input.ipv6 } else { !input.ipv4 };
+                // 本族未被整体阻断时才放行本地链路的 mDNS/LLMNR（Go :434-436
+                // `{AuthConnectV4, !ipv4}, {AuthConnectV6, !ipv6}`：阻断该族即连本地链路
+                // 一起阻断，故判据只看本族）。
+                let local_link = if layer.is_ipv4() { !input.ipv4 } else { !input.ipv6 };
                 out.push(FilterSpec {
                     name: "Xray TUN: permit the DNS Client service through the TUN".to_string(),
                     layer,
@@ -576,20 +578,23 @@ mod tests {
         assert!(!leak_filter_specs(&nosd).iter().any(|s| s.name.contains("DNS Client service")));
     }
 
+    /// Go :434-436：`localLink` 由**本族**是否被整体阻断决定（v4 层看 `!ipv4`、v6 层看
+    /// `!ipv6`）。四个组合逐层断言——旧实现把两族判反，且只断言「有没有」查不出。
     #[test]
-    fn dns_client_mdns_permit_only_when_other_family_blocked() {
-        let mut i = input(true, true, true);
-        i.windows_build = 22621;
-        i.dns_client_sd = Some(vec![7]);
-        // 两族都被阻断 → 不放行本地链路 mDNS/LLMNR。
-        let specs = leak_filter_specs(&i);
-        assert!(!specs.iter().any(|s| s.name.contains("mDNS and LLMNR")));
-
-        // 只阻断 IPv4（ipv6 未阻断）→ IPv4 层需要放行 mDNS/LLMNR。
-        let mut i2 = input(true, true, false);
-        i2.windows_build = 22621;
-        i2.dns_client_sd = Some(vec![7]);
-        assert!(leak_filter_specs(&i2).iter().any(|s| s.name.contains("mDNS and LLMNR")));
+    fn dns_client_mdns_permit_follows_its_own_family() {
+        for (ipv4, ipv6) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut i = input(true, ipv4, ipv6);
+            i.windows_build = 22621;
+            i.dns_client_sd = Some(vec![7]);
+            let specs = leak_filter_specs(&i);
+            for v4_layer in [true, false] {
+                let want = if v4_layer { !ipv4 } else { !ipv6 };
+                let got = specs
+                    .iter()
+                    .any(|s| s.name.contains("mDNS and LLMNR") && s.layer.is_ipv4() == v4_layer);
+                assert_eq!(got, want, "ipv4={ipv4} ipv6={ipv6} v4_layer={v4_layer}");
+            }
+        }
     }
 
     #[test]
