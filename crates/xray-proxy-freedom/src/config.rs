@@ -11,7 +11,8 @@
 //! - **DestinationOverride**：强制覆盖目标地址（用于透明代理重定向）
 //! - **Fragment**：TCP 分片（绕过 SNI 审查）
 //! - **Noise**：填充噪声（绕过流量分析）
-//! - **FinalRules**：最终规则（Allow/Block 匹配 network + port + IP CIDR）
+//! - **FinalRules**：最终规则（Allow/Block 匹配 network + port + IP 规则：CIDR / `geoip:` / `ext:`
+//!   / `ext-ip:`，支持 `!` 反向）
 //!
 //! 默认规则：`defaultBlockPrivateRule`（阻止 RFC 1918 私有地址 + 保留段）+
 //! `defaultBlockAllRule`（阻止所有，用于 vless-reverse）。
@@ -19,7 +20,8 @@
 //! ## 切片边界（P6-5 切片1）
 //!
 //! 实现配置层 + FinalRule 逻辑匹配（network + port + IP CIDR）+ 默认 CIDR 常量。
-//! IP CIDR 匹配通过 `xray_geodata::matcher::ip::HeuristicIPMatcher` 实现。
+//! IP 匹配通过 `xray_geodata::matcher::ip` 实现：普通 CIDR 走 `HeuristicIPMatcher`，
+//! `geoip:` 等资产规则在**构造期**经 `IpRegistry`（`IP_REG`）解析并在 `reload()` 时热更。
 //! 默认 `defaultBlockPrivateRule` 使用 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建的
 //! 缓存 matcher（[`private_ip_matcher`]）。Handler/Process/dial 见 `handler.rs`。
 
@@ -159,6 +161,7 @@ impl DomainStrategy {
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::Path,
     sync::{Arc, LazyLock},
 };
 
@@ -168,7 +171,7 @@ use xray_common::net::{
     network::Network,
     port::{MemoryPortList, Port, PortRange},
 };
-use xray_geodata::matcher::ip::{HeuristicIPMatcher, IPMatcher};
+use xray_geodata::matcher::ip::{HeuristicIPMatcher, IP_REG, IPMatcher, IpRegistry};
 use xray_proto::xray::common::geodata::ip_rule;
 
 use crate::error::{FreedomError, Result};
@@ -479,7 +482,7 @@ pub struct FinalRuleConfig {
     /// 允许的网络类型（proto repeated enum → `Vec<i32>`）。
     pub networks: Vec<i32>,
     pub port_list: Option<xray_proto::xray::common::net::PortList>,
-    /// IP CIDR 规则（prost repeated message）。
+    /// IP 规则（prost repeated message）：Custom CIDR 或 Geoip（`file:code` 资产引用）。
     pub ip: Vec<xray_proto::xray::common::geodata::IpRule>,
     /// 阻断延时（proto `Range delay`，仅 block 规则有值）。
     pub delay: Option<Range>,
@@ -492,9 +495,17 @@ impl FinalRuleConfig {
     /// `FreedomFinalRuleConfig` + `Build` :252-320）。
     ///
     /// 形态：`{"action": "block", "network": "tcp,udp", "port": "443,80-90",
-    /// "ip": ["10.0.0.0/8"], "delay": "30-90" | {"from":30,"to":90},
+    /// "ip": ["10.0.0.0/8", "geoip:cn"], "delay": "30-90" | {"from":30,"to":90},
     /// "logLevel": "warning"}`；`blockDelay` 为弃用别名（优先于 `delay`）。
+    ///
+    /// `ip` 规则在此处即查资产（Go `ParseIPRules` 的 `checkFile`）：`geoip:` /
+    /// `ext:` / `ext-ip:` 的文件缺失或代号不存在 ⇒ 拒启。
     pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        Self::from_json_with_datadir(v, &xray_common::platform::get_asset_dir())
+    }
+
+    /// [`FinalRuleConfig::from_json`] 的显式资产目录形态（测试 / 非默认资产目录部署）。
+    pub fn from_json_with_datadir(v: &serde_json::Value, datadir: &Path) -> Result<Self> {
         let action = match v
             .get("action")
             .and_then(|a| a.as_str())
@@ -522,7 +533,7 @@ impl FinalRuleConfig {
             _ => None,
         };
         let ip = match v.get("ip") {
-            Some(ip) if !ip.is_null() => json_ip_rules(ip).map_err(|e| {
+            Some(ip) if !ip.is_null() => json_ip_rules(ip, datadir).map_err(|e| {
                 crate::error::FreedomError::InvalidConfig(format!("finalRule ip: {e}"))
             })?,
             _ => Vec::new(),
@@ -663,63 +674,105 @@ fn parse_port_range_str(s: &str) -> Option<(u32, u32)> {
     }
 }
 
-/// Go `StringList` IP 规则：`["10.0.0.0/8", "fc00::/7", "1.2.3.4"]` → proto `IpRule`
-/// 列表（Custom CIDR；裸 IP 视为 /32 或 /128）。
+/// Go `StringList` IP 规则：`["10.0.0.0/8", "geoip:cn", "!ext:custom.dat:XX"]` →
+/// proto `IpRule` 列表。
 ///
-/// 每个条目都必须可解析（Go `geodata.ParseIPRules` 对非法 IP / 非法前缀直接
-/// 报错 → 拒启）。旧实现 `filter_map(ok)` 丢项，丢空后 `ip = None` = **匹配所有
-/// 地址**——`ip:["not-an-ip"]` 会把一条精确规则翻转成全阻断（bd 5w5z0）。
+/// 逐条走 [`xray_geodata::rule_parser::parse_ip_rules`]（= Go `geodata.ParseIPRules`
+/// 同构）：`geoip:X` 展开成 `ext:geoip.dat:X`、`ext:`/`ext-ip:` 直取 `file:code`、
+/// 外层 `!` 与 code 内 `!` XOR 成 `reverse_match`、当场 `check_file` 校验资产与代号。
 ///
-/// `geoip:` 前缀规则本期不支持（Go 经 `geodata.IPReg` 装载资产）：显式报错拒启，
-/// 不得静默丢弃（丢空 = 匹配所有）。
+/// 每个条目都必须可解析（Go 对非法 IP / 非法前缀 / 资产缺失直接报错 → 拒启）。
+/// 旧实现 `filter_map(ok)` 丢项，丢空后 `ip = None` = **匹配所有**地址——
+/// `ip:["not-an-ip"]` 会把一条精确规则翻转成全阻断（bd 5w5z0）。
+/// 错误带规则原文（Go `illegal ip rule: <rule>` 同形），资产缺失时原文即含文件名。
 fn json_ip_rules(
     v: &serde_json::Value,
+    datadir: &Path,
 ) -> std::result::Result<Vec<xray_proto::xray::common::geodata::IpRule>, String> {
-    let items: Vec<&str> = match v {
-        serde_json::Value::String(s) => s.split(',').map(|t| t.trim()).collect(),
+    let items: Vec<String> = match v {
+        serde_json::Value::String(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
         serde_json::Value::Array(a) => a
             .iter()
             .map(|x| {
                 x.as_str()
-                    .map(|s| s.trim())
+                    .map(|s| s.trim().to_string())
                     .ok_or_else(|| format!("ip rule entry is not a string: {x}"))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?,
         other => return Err(format!("ip rules must be a string or array: {other}")),
     };
-    items
-        .into_iter()
-        .map(|s| {
-            if let Some(code) = s.strip_prefix("geoip:") {
-                return Err(format!(
-                    "geoip rule `geoip:{code}` is not supported in freedom finalRules \
-                     (asset loading unimplemented); use explicit CIDRs instead"
-                ));
-            }
-            let (ip_str, prefix) = match s.split_once('/') {
-                Some((ip, p)) => {
-                    (ip, Some(p.parse::<u32>().map_err(|_| format!("invalid CIDR prefix: {s}"))?))
+    let mut out = Vec::with_capacity(items.len());
+    for raw in items {
+        let parsed = xray_geodata::rule_parser::parse_ip_rules(std::slice::from_ref(&raw), datadir)
+            .map_err(|e| match e {
+                // 资产类失败（文件不存在/代号缺失）带上资产目录：`io::Error` 自身
+                // 不含路径（Go 的 `os.Open` 错误含），缺了就没法定位找哪个目录。
+                xray_geodata::rule_parser::RuleParserError::FileCheckFailed(_)
+                | xray_geodata::rule_parser::RuleParserError::Io(_) => {
+                    format!("illegal ip rule `{raw}` (asset dir {}): {e}", datadir.display())
                 },
-                None => (s, None),
-            };
-            let ip: IpAddr = ip_str.parse().map_err(|_| format!("invalid IP: {s}"))?;
-            // 无 `/` = 单地址（/32、/128）；显式 `/0` 保留 0（全匹配）。
-            let prefix = prefix.unwrap_or(match ip {
-                IpAddr::V4(_) => 32,
-                IpAddr::V6(_) => 128,
-            });
-            Ok(xray_proto::xray::common::geodata::IpRule {
-                value: Some(ip_rule::Value::Custom(xray_proto::xray::common::geodata::CidrRule {
-                    cidr: Some(xray_proto::xray::common::geodata::Cidr {
-                        ip: match ip {
-                            IpAddr::V4(v4) => v4.octets().to_vec(),
-                            IpAddr::V6(v6) => v6.octets().to_vec(),
-                        },
-                        prefix,
-                    }),
-                    reverse_match: false,
+                e => format!("illegal ip rule `{raw}`: {e}"),
+            })?;
+        out.extend(parsed.into_iter().map(geodata_ip_rule_to_proto));
+    }
+    Ok(out)
+}
+
+/// `xray_geodata::pb::IpRule` → proto `IpRule`（`xray.common.geodata`）。
+///
+/// 两个 crate 各自生成同名不同类型（Go 只有一份 proto，无此转换），字段级复制。
+fn geodata_ip_rule_to_proto(
+    rule: xray_geodata::pb::IpRule,
+) -> xray_proto::xray::common::geodata::IpRule {
+    use xray_geodata::pb;
+    let value = match rule.value {
+        None => None,
+        Some(pb::ip_rule::Value::Custom(c)) => {
+            Some(ip_rule::Value::Custom(xray_proto::xray::common::geodata::CidrRule {
+                cidr: c.cidr.map(|cidr| xray_proto::xray::common::geodata::Cidr {
+                    ip: cidr.ip,
+                    prefix: cidr.prefix,
+                }),
+                reverse_match: c.reverse_match,
+            }))
+        },
+        Some(pb::ip_rule::Value::Geoip(g)) => {
+            Some(ip_rule::Value::Geoip(xray_proto::xray::common::geodata::GeoIpRule {
+                file: g.file,
+                code: g.code,
+                reverse_match: g.reverse_match,
+            }))
+        },
+    };
+    xray_proto::xray::common::geodata::IpRule { value }
+}
+
+/// proto `IpRule` → `xray_geodata::pb::IpRule`（[`IpRegistry::build_ip_matcher`] 入参）。
+///
+/// 字段级复制，不做资产展开：`Geoip` 变体保持 `file:code` 形态交给注册表在
+/// 构造期解析——这样 `IP_REG.reload()` 能按各自 rules 重建（Go `DynamicIPMatcher.rules` 同）。
+fn to_geodata_ip_rules(
+    rules: &[xray_proto::xray::common::geodata::IpRule],
+) -> Vec<xray_geodata::pb::IpRule> {
+    use xray_geodata::pb;
+    rules
+        .iter()
+        .map(|r| pb::IpRule {
+            value: match r.value.as_ref() {
+                None => None,
+                Some(ip_rule::Value::Custom(c)) => Some(pb::ip_rule::Value::Custom(pb::CidrRule {
+                    cidr: c
+                        .cidr
+                        .as_ref()
+                        .map(|cidr| pb::Cidr { ip: cidr.ip.clone(), prefix: cidr.prefix }),
+                    reverse_match: c.reverse_match,
                 })),
-            })
+                Some(ip_rule::Value::Geoip(g)) => Some(pb::ip_rule::Value::Geoip(pb::GeoIpRule {
+                    file: g.file.clone(),
+                    code: g.code.clone(),
+                    reverse_match: g.reverse_match,
+                })),
+            },
         })
         .collect()
 }
@@ -978,7 +1031,16 @@ pub const DEFAULT_BLOCK_PRIVATE_CIDRS: &[&str] = &[
 
 impl FinalRule {
     /// 从 FinalRuleConfig 构造运行时规则。对应 Go `buildFinalRule`。
+    ///
+    /// `ip` 规则经全局 [`IP_REG`] 构建：`geoip:` / `ext:` / `ext-ip:` 的资产在
+    /// **构造期**读入并登记，`IP_REG.reload()` 可热更（Go `geodata.IPReg.BuildIPMatcher`
+    /// 同）。资产缺失 ⇒ `Err` 拒启，不静默退空集。
     pub fn build(config: &FinalRuleConfig) -> Result<Self> {
+        Self::build_with_registry(&IP_REG, config)
+    }
+
+    /// [`FinalRule::build`] 的显式注册表形态（测试 / 非默认资产目录部署）。
+    pub fn build_with_registry(registry: &IpRegistry, config: &FinalRuleConfig) -> Result<Self> {
         let network = if config.networks.is_empty() {
             ALL_NETWORKS
         } else {
@@ -998,7 +1060,7 @@ impl FinalRule {
             action: config.action,
             network,
             port,
-            ip: build_ip_matcher_from_rules(&config.ip)?,
+            ip: build_ip_matcher_from_rules(registry, &config.ip)?,
             delay: config.delay,
             log_level: config.log_level,
         })
@@ -1089,31 +1151,24 @@ fn to_mem_port_list(pl: &xray_proto::xray::common::net::PortList) -> MemoryPortL
     MemoryPortList::new(ranges)
 }
 
-/// 从 proto `IpRule` 列表构建 IP matcher（仅 Custom CIDR 变体）。
+/// 从 proto `IpRule` 列表构建 IP matcher。对应 Go `freedom.go:126-131`
+/// （`geodata.IPReg.BuildIPMatcher(config.Ip)`）。
 ///
-/// 非 Custom 变体（Geoip / Domain 等）本期不支持（需 geodata loader）：**硬错拒启**。
-/// 旧实现静默丢弃，丢空后 `None` = 匹配所有地址 → 规则语义翻转（bd 5w5z0）。
+/// 空规则 ⇒ `None`（= 匹配所有地址，Go 同：`len(config.Ip) > 0` 才建 matcher）。
+/// 正/负极性分组、同组 CIDR 合并、`geoip` 资产在构造期解析，全在注册表内部
+/// （`build_optimized_ip_matcher` 语义）—— 旧实现在此只取 Custom 变体、
+/// 丢掉 reverse 分组（bd 5w5z0 同族），并对 geoip 硬错。
 fn build_ip_matcher_from_rules(
+    registry: &IpRegistry,
     rules: &[xray_proto::xray::common::geodata::IpRule],
 ) -> Result<Option<Arc<dyn IPMatcher>>> {
-    let mut cidrs: Vec<xray_geodata::pb::Cidr> = Vec::with_capacity(rules.len());
-    for r in rules {
-        let Some(ip_rule::Value::Custom(c)) = &r.value else {
-            return Err(crate::error::FreedomError::InvalidConfig(
-                "finalRule ip: non-CIDR ip rule (geoip/domain) is not supported".into(),
-            ));
-        };
-        let Some(cidr) = c.cidr.as_ref() else {
-            return Err(crate::error::FreedomError::InvalidConfig(
-                "finalRule ip: CIDR rule without cidr payload".into(),
-            ));
-        };
-        cidrs.push(xray_geodata::pb::Cidr::new(cidr.ip.clone(), cidr.prefix));
-    }
-    if cidrs.is_empty() {
+    if rules.is_empty() {
         return Ok(None);
     }
-    Ok(Some(Arc::new(HeuristicIPMatcher::from_cidrs(&cidrs))))
+    let matcher = registry
+        .build_ip_matcher(&to_geodata_ip_rules(rules))
+        .map_err(|e| FreedomError::InvalidConfig(format!("finalRule ip: {e}")))?;
+    Ok(Some(matcher))
 }
 
 /// 缓存的私有 IP matcher（从 [`DEFAULT_BLOCK_PRIVATE_CIDRS`] 构建）。
@@ -1369,7 +1424,7 @@ mod tests {
             "action": "block", "ip": ["not-an-ip"]
         }))
         .unwrap_err();
-        assert!(e.to_string().contains("invalid IP"), "{e}");
+        assert!(e.to_string().contains("illegal ip rule `not-an-ip`"), "{e}");
 
         let e = FinalRuleConfig::from_json(&serde_json::json!({
             "action": "block", "port": "18500,bad-port"
@@ -1377,12 +1432,25 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().contains("invalid port range"), "{e}");
 
-        // geoip 变体未实现（需 geodata loader）→ 拒启，不得静默丢弃（丢空 = 匹配所有）
-        let e = FinalRuleConfig::from_json(&serde_json::json!({
-            "action": "block", "ip": ["geoip:cn"]
-        }))
+        // geoip/ext 规则在解析期查资产（Go `ParseIPRules` 的 `checkFile`）：
+        // 资产缺失/代号不存在 ⇒ 拒启（不得静默丢空 = 匹配所有）。用空目录注入保证
+        // 与机器上是否装了 geoip.dat 无关。
+        let empty = tmp_dir("freedom_no_asset");
+        let e = FinalRuleConfig::from_json_with_datadir(
+            &serde_json::json!({"action": "block", "ip": ["geoip:cn"]}),
+            &empty,
+        )
         .unwrap_err();
-        assert!(e.to_string().contains("geoip"), "{e}");
+        assert!(
+            e.to_string().contains("geoip:cn") && e.to_string().contains("asset dir"),
+            "错误须点名规则与资产目录: {e}"
+        );
+        let e = FinalRuleConfig::from_json_with_datadir(
+            &serde_json::json!({"action": "block", "ip": ["ext-ip:custom.dat:XX"]}),
+            &empty,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("custom.dat"), "错误须含文件名: {e}");
 
         // 合法配置照常（不误报）
         let c = FinalRuleConfig::from_json(&serde_json::json!({
@@ -1407,14 +1475,106 @@ mod tests {
         assert!(!rule.match_network(2), "UDP 不得被未知 token 命中");
     }
 
-    /// 运行期 matcher 构建：非 CIDR 变体（geoip）硬错，不得丢弃后变 None(=匹配所有)。
+    /// 合成 `geoip.dat`（`GeoIpList{ entry: [{code, cidr}] }` 的 prost 编码，与真实
+    /// 资产同形；写 `xray.geodata` 包 = `xray-geodata` 的 loader 读的那份）。
+    fn write_geoip_dat(dir: &std::path::Path, code: &str, cidrs: &[(Vec<u8>, u32)]) {
+        use prost::Message as _;
+        let mut entry = xray_geodata::pb::GeoIp::new(code);
+        entry.cidr = cidrs
+            .iter()
+            .map(|(ip, prefix)| xray_geodata::pb::Cidr::new(ip.clone(), *prefix))
+            .collect();
+        let list = xray_geodata::pb::GeoIpList::new().with_entry(entry);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(xray_geodata::rule_parser::DEFAULT_GEOIP_DAT),
+            list.encode_to_vec(),
+        )
+        .unwrap();
+    }
+
+    fn tmp_dir(label: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("xray_freedom_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `geoip:` 规则必须在**构造期**从资产解析并参与匹配（旧实现该变体硬错拒启）。
     #[test]
-    fn final_rule_geoip_ip_rule_rejected_at_build() {
-        use xray_proto::xray::common::geodata::{GeoIpRule, IpRule};
-        let c = FinalRuleConfig {
+    fn final_rule_geoip_rule_matches_asset_ips() {
+        let dir = tmp_dir("geoip_hit");
+        write_geoip_dat(&dir, "PRIVATE", &[(vec![10, 0, 0, 0], 8), (vec![172, 16, 0, 0], 12)]);
+
+        let cfg = FinalRuleConfig::from_json_with_datadir(
+            &serde_json::json!({"action": "block", "ip": ["geoip:private"]}),
+            &dir,
+        )
+        .expect("geoip rule parses when asset present");
+        match cfg.ip[0].value.as_ref() {
+            Some(ip_rule::Value::Geoip(g)) => {
+                assert_eq!((g.file.as_str(), g.code.as_str()), ("geoip.dat", "PRIVATE"));
+                assert!(!g.reverse_match);
+            },
+            other => panic!("expected Geoip rule, got {other:?}"),
+        }
+
+        let rule = FinalRule::build_with_registry(&IpRegistry::with_datadir(dir.clone()), &cfg)
+            .expect("build");
+        assert!(rule.apply(0, 80, Some("10.1.2.3".parse().unwrap())), "资产内 IP 命中");
+        assert!(rule.apply(0, 80, Some("172.20.0.1".parse().unwrap())), "资产内 IP 命中");
+        assert!(!rule.apply(0, 80, Some("8.8.8.8".parse().unwrap())), "资产外 IP 不命中");
+    }
+
+    /// `!geoip:` = 同组整组取反（Go `buildOptimizedIPMatcher` 的 neg 分组）：
+    /// 资产内不命中、资产外命中。`ext-ip:` 前缀与 `geoip:` 同构。
+    #[test]
+    fn final_rule_reversed_geoip_and_ext_ip_prefix() {
+        let dir = tmp_dir("geoip_rev");
+        write_geoip_dat(&dir, "PRIVATE", &[(vec![10, 0, 0, 0], 8)]);
+        let registry = IpRegistry::with_datadir(dir.clone());
+
+        for rule in ["!geoip:private", "!ext-ip:geoip.dat:private", "ext:geoip.dat:!PRIVATE"] {
+            let cfg = FinalRuleConfig::from_json_with_datadir(
+                &serde_json::json!({"action": "allow", "ip": [rule]}),
+                &dir,
+            )
+            .unwrap_or_else(|e| panic!("{rule}: {e}"));
+            let built = FinalRule::build_with_registry(&registry, &cfg).expect("build");
+            assert!(!built.match_ip(Some("10.1.2.3".parse().unwrap())), "{rule}: 组内不命中");
+            assert!(built.match_ip(Some("8.8.8.8".parse().unwrap())), "{rule}: 组外命中");
+        }
+    }
+
+    /// CIDR 的 `!` 反向必须生效（旧实现 parse 期就对 `!` 硬错，`reverse_match` 恒 false）。
+    ///
+    /// Go 语义 = pos/neg **各建一个子 matcher，最后取并集**（`HeuristicMultiIPMatcher`
+    /// = `any()`），不是集合差：`!x` 单独出现 = "除 x 外全部"，与正向组混合时
+    /// 排除项不能削减正向组（`ip_matcher.go:951-1013`）。
+    #[test]
+    fn final_rule_negated_cidr_reverses_group() {
+        let cfg = FinalRuleConfig::from_json(&serde_json::json!({
+            "action": "block", "ip": ["!192.168.1.0/24"]
+        }))
+        .expect("parse");
+        match cfg.ip[0].value.as_ref() {
+            Some(ip_rule::Value::Custom(c)) => assert!(c.reverse_match, "`!` 必须置 reverse_match"),
+            other => panic!("expected Custom rule, got {other:?}"),
+        }
+        let rule = FinalRule::build(&cfg).expect("build");
+        assert!(!rule.match_ip(Some("192.168.1.5".parse().unwrap())), "组内不命中");
+        assert!(rule.match_ip(Some("8.8.8.8".parse().unwrap())), "组外取反命中");
+    }
+
+    /// 构造期读资产失败 ⇒ `Err`（Go `BuildIPMatcher` 同，不静默退空集 = 全放行）。
+    #[test]
+    fn final_rule_geoip_missing_asset_refuses_to_build() {
+        let empty = tmp_dir("geoip_missing");
+        let cfg = FinalRuleConfig {
             action: RuleAction::Block,
-            ip: vec![IpRule {
-                value: Some(ip_rule::Value::Geoip(GeoIpRule {
+            ip: vec![xray_proto::xray::common::geodata::IpRule {
+                value: Some(ip_rule::Value::Geoip(xray_proto::xray::common::geodata::GeoIpRule {
                     file: String::new(),
                     code: "cn".into(),
                     reverse_match: false,
@@ -1422,8 +1582,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let e = FinalRule::build(&c).expect_err("geoip ip rule must be rejected");
-        assert!(e.to_string().contains("not supported"), "{e}");
+        let e = FinalRule::build_with_registry(&IpRegistry::with_datadir(empty), &cfg)
+            .expect_err("missing asset must fail the build");
+        assert!(e.to_string().contains("geoip"), "{e}");
     }
 
     // ===== fragment / noises JSON 解析（Go infra/conf/freedom.go） =====

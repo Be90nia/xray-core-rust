@@ -36,3 +36,6 @@ udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"
 [dev-dependencies]
 parking_lot = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
+# 测试合成最小 geoip.dat（GeoIpList 的 prost 编码）；已在依赖图内（xray-geodata 生产
+# 依赖），零新编译单元。
+prost = { workspace = true }
