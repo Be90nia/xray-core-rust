@@ -12,7 +12,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use prost::Message;
@@ -105,57 +105,31 @@ fn run_serial(datadir: &Path, reqs: &[LoadRequest]) -> Vec<Result<LoadedEntry, L
         .collect()
 }
 
-fn median(durs: &mut [Duration]) -> Duration {
-    durs.sort();
-    durs[durs.len() / 2]
-}
-
+/// 池化装载与串行装载**结果等价**，且池账本闭合（借用归零、无溢出丢弃、有空闲）。
+///
+/// 曾经这里断言「池化耗时 ≤ 串行 × 1.05」——那是**机器负载依赖**的断言：CI 上 137 个
+/// 测试并行时池化侧抢不到 CPU 就必然失败（2026-11-10 CI 实测）。耗时对比归
+/// `tools/loopback_alloc_bench.py`/A/B 门（CLAUDE.md §5），单测只守可复现的语义。
 #[test]
-fn pooled_startup_load_is_not_slower_than_serial() {
+fn pooled_startup_load_matches_serial_results_and_balances() {
     let dir = fixture_dir("perf");
     let reqs = reqs();
     let pool = GeodataLoadPool::new(2, 2, 32, Duration::from_secs(10));
 
-    let timed_serial = |reqs: &[LoadRequest]| -> Duration {
-        #[allow(clippy::disallowed_methods, reason = "测试：perf 对照断言计时")]
-        let t0 = Instant::now();
-        let rs = run_serial(&dir, reqs);
-        let elapsed = t0.elapsed();
-        assert_eq!(rs.len(), reqs.len());
-        for r in &rs {
-            r.as_ref().expect("serial load must succeed");
-        }
-        elapsed
-    };
-    let timed_pooled = |pool: &GeodataLoadPool, reqs: &[LoadRequest]| -> Duration {
-        #[allow(clippy::disallowed_methods, reason = "测试：perf 对照断言计时")]
-        let t0 = Instant::now();
-        let rs = pool.load_parallel(&dir, reqs);
-        let elapsed = t0.elapsed();
-        assert_eq!(rs.len(), reqs.len());
-        for r in &rs {
-            r.as_ref().expect("pooled load must succeed");
-        }
-        elapsed
-    };
+    let serial = run_serial(&dir, &reqs);
+    let pooled = pool.load_parallel(&dir, &reqs);
 
-    // 预热轮（FS 缓存），不计入
-    timed_serial(&reqs);
-    timed_pooled(&pool, &reqs);
-
-    // 交替 3 轮取中位数，降低窗口漂移影响
-    let mut serial = Vec::new();
-    let mut pooled = Vec::new();
-    for _ in 0..3 {
-        serial.push(timed_serial(&reqs));
-        pooled.push(timed_pooled(&pool, &reqs));
+    assert_eq!(pooled.len(), reqs.len());
+    for r in &serial {
+        r.as_ref().expect("serial load must succeed");
     }
-    let (s_med, p_med) = (median(&mut serial), median(&mut pooled));
-    println!("serial median: {s_med:?}, pooled median: {p_med:?}");
-    // ③ 断言：不得更慢（容忍 5% 抖动）
-    assert!(
-        p_med.as_nanos() * 100 <= s_med.as_nanos() * 105,
-        "pooled ({p_med:?}) must not be slower than serial ({s_med:?}) x 1.05"
+    for r in &pooled {
+        r.as_ref().expect("pooled load must succeed");
+    }
+    assert_eq!(
+        pooled.iter().map(|r| r.as_ref().unwrap()).collect::<Vec<_>>(),
+        serial.iter().map(|r| r.as_ref().unwrap()).collect::<Vec<_>>(),
+        "池化结果必须与串行逐条一致"
     );
 
     pool.shutdown_join();

@@ -1431,8 +1431,17 @@ pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
 pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
     // libc::if_nametoindex 跨 unix 平台（Linux/Darwin/FreeBSD），对齐 Go
     // `net.InterfaceByName` 的常见实现。0 表示查找失败。
-    // SAFETY: name 为 NUL 终止 C 串，libc 契约返回接口索引或 0
-    let idx = unsafe { libc::if_nametoindex(name.as_ptr() as *const libc::c_char) };
+    //
+    // `&str` 不保证 NUL 终止，直接 `as_ptr()` 传进去会读越界（CI 上
+    // `interface: "lo"` 曾误报 not found，本地因堆尾恰为 0 而侥幸通过）。
+    let cname = std::ffi::CString::new(name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("interface '{name}' contains NUL"),
+        )
+    })?;
+    // SAFETY: cname 是 NUL 终止 C 串；libc 契约返回接口索引或 0
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if idx == 0 {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,

@@ -282,7 +282,7 @@ pub struct LoadRequest {
 }
 
 /// 加载结果（判型同请求 kind）。
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LoadedEntry {
     Ip(GeoIp),
     Site(GeoSite),
