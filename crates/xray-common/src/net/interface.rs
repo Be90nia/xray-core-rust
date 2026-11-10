@@ -236,8 +236,9 @@ where
     N: Fn() -> Instant,
     E: Fn() -> io::Result<Vec<IpAddr>>,
 {
-    let is_fresh =
-        |entry: &LocalIpCacheEntry| now().saturating_duration_since(entry.refreshed_at) <= LOCAL_IP_TTL;
+    let is_fresh = |entry: &LocalIpCacheEntry| {
+        now().saturating_duration_since(entry.refreshed_at) <= LOCAL_IP_TTL
+    };
     let matches_ip = |entry: &LocalIpCacheEntry| entry.ips.contains(&ip);
 
     // 快路径：新鲜缓存 ⇒ 只读锁内判定（Go `localIPCache.Load()`）。
@@ -506,11 +507,7 @@ mod tests {
 
         assert!(!is_local_ip_with(&cache, ip, now, enumerate), "枚举失败 ⇒ false");
         assert!(!is_local_ip_with(&cache, ip, now, enumerate), "失败不落缓存 ⇒ 仍是 false");
-        assert_eq!(
-            enumerations.load(Ordering::Relaxed),
-            2,
-            "失败不入缓存：每次调用都必须重新枚举"
-        );
+        assert_eq!(enumerations.load(Ordering::Relaxed), 2, "失败不入缓存：每次调用都必须重新枚举");
 
         fail.set(false);
         assert!(is_local_ip_with(&cache, ip, now, enumerate), "恢复后枚举成功 ⇒ 命中");
