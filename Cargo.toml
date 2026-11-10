@@ -197,6 +197,9 @@ clap = { version = "4", features = ["derive"] }
 # 其他
 parking_lot = "0.12"
 dashmap = "6"
+# 无锁换 Arc 指针（xray-frame `hot_slot::HotSlot` 热替换快照底座）。已在依赖树内——
+# `ocsp-stapler` 传递引入，Cargo.lock 早有 1.9.2 ⇒ 不新增 crate 入图。
+arc-swap = "1.9"
 
 # gRPC over HTTP/2（对应 Go google.golang.org/grpc；xray-transport-grpc + xray-app-commander）
 tonic = "0.14"

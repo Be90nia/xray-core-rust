@@ -51,6 +51,9 @@ pub mod budget;
 // P3-1 S1 旁路查表面（dispatcher 中央 match 臂退役的查表骨架，契约 §P3-1）。
 pub mod dispatch;
 pub mod error;
+// 派生件 3（bd 9u35o）：热替换快照持有件——`arc-swap` 之上组合包装「无锁读 + 原子整体换
+// `Arc`」，供 geoip 注册表（bd hdgz9）与 TLS 证书热重载（bd 5ctu1）共用；udf 无等价件。
+pub mod hot_slot;
 pub mod lifecycle;
 pub mod logging;
 // 网络 socket 机制件（bd vqvn1 NEW-02）：Windows ICMP-unreachable 上报关闭的唯一
@@ -94,6 +97,7 @@ pub use deadline::{
 };
 pub use dispatch::{HandlerCapability, Lookup, lookup};
 pub use error::{LifecyclePhase, PluginError};
+pub use hot_slot::HotSlot;
 pub use lifecycle::{Phase, StartedPlugins, bring_up};
 pub use logging::{HotBuf, HotLog, LogFacade, init_from_env};
 pub use observe::{ObserveFields, ObserveSink, Stage, emit};

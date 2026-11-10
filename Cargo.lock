@@ -6114,6 +6114,7 @@ dependencies = [
 name = "xray-frame"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "log",
  "serde",

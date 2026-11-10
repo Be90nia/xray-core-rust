@@ -36,6 +36,9 @@ log = "0.4"
 #（alloc/release 原样调用、外侧记账——分配路径零改动，坑约束 12）。
 bytes = { workspace = true }
 xray-buf = { path = "../xray-buf" }
+# 热替换快照（hot_slot::HotSlot，bd 9u35o）：无锁读 + 原子整体换 Arc。已在依赖树内
+# （ocsp-stapler 传递引入），显式声明即固定直接依赖面，不新增 crate 入图。
+arc-swap = { workspace = true }
 
 # net::disable_icmp_unreachable_report（bd vqvn1 NEW-02）：WSAIoctl 关 Windows
 # ICMP-unreachable 上报的唯一实现。WSAIoctl 签名引用 OVERLAPPED ⇒ 该符号在
