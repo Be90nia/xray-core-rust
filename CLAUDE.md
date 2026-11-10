@@ -66,6 +66,7 @@ cargo doc --workspace --no-deps
 | `docs/research/xray-frame-*.md` | 盘点底料：主仓 53 crate 能力盘点 / udf 机制差距 / 池化归 udf / DNS 面 / inbound-outbound 面（本地文档）|
 | **`docs/architecture/xray-frame-udf功能域全景-2026-10-23.md`** | **udf 32 域全景 × 主仓覆盖对照**——udf 有什么/没什么/主仓哪些面能接管/10 个未接线高价值域/3 条反模式（造件选依托件前先查）|
 |**`docs/architecture/xray-frame-深度融合战役计划-2026-10-26.md` · `xray-frame-masque-契约级任务书-2026-10-30.md`**|**在飞规划**（未完成）——当前唯一仍有效的框架规划文档|
+|**`docs/architecture/xray-frame-masque-实施计划-2026-11-11.md`（bd 55yh7）· `xray-frame-xdrive-实施计划-2026-11-11.md`（bd hjtlk）**|**两条新能力的执行规划**（下游模型照此实施）——**核心是「现有件映射表」**（masque 23 行 / xdrive 28 行）：每行给出真实符号+路径+采用方式（直用/派生/提炼/新写+举证）+消费点；含「本仓已有不新写」清单（8 处 / 6 处）、架构归属判定（§3.5.5 三判据）、B0–B6 分批与每批可执行验收、工作量。**改动这两条能力前必须先读对应规划，禁凭印象新造机制**|
 |`docs/architecture/adr/`|**ADR 目录**（37vjq 立）——架构归属裁决五节体（ADR-0001 池派生件 / ADR-0002 登记簿拆分）+ 批次公共 API 记账表；造件归属争议先查此目录|
 
 ---
