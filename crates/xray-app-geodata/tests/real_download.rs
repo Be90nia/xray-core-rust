@@ -1,7 +1,10 @@
 //! Real AssetDownloader 真下载测试。
 //!
-//! 对应 Go `downloader.download` — 用 std::net TCP 写最小 HTTP/1.1 GET。
-//! 测试环境：loopback TcpListener 返回固定响应。
+//! 对应 Go `downloader.download` — 用 std::net TCP + rustls 写最小 HTTPS/1.1 GET。
+//! 测试环境：loopback TLS listener 返回固定响应。
+//!
+//! Go v26.11.9 `48f62b80` 同批把下载器的非 TLS 客户端删除（只剩 `httpsClient`），
+//! 其测试同步从 `httptest.NewServer` 换成 `httptest.NewTLSServer` —— 本文件同口径。
 
 // 集成测试夹具不在 `#[test]` 函数体内，根 clippy.toml 的 allow-unwrap-in-tests 覆盖不到。
 #![allow(clippy::unwrap_used, reason = "集成测试夹具不在 #[test] 函数体内")]
@@ -20,49 +23,111 @@ use xray_app_geodata::{
     downloader::{AssetDownloader, RealAssetDownloader},
 };
 
-/// 一次性 HTTP 服务器：accept 一个连接，回写固定 response。
+/// 一次性 TLS 服务器：accept 一个连接，回写固定 response。
+///
+/// 自签证书（SAN = 127.0.0.1 IP SAN）随返回值交给调用方经
+/// `RealAssetDownloader::with_extra_root_cert` 注入信任根（自签不在 webpki-roots 内）。
 struct OneShotServer {
     addr: std::net::SocketAddr,
+    cert: rustls::pki_types::CertificateDer<'static>,
     request_log: Arc<Mutex<Vec<String>>>,
 }
 
+/// 起一个自签证书（SAN = 127.0.0.1 IP SAN），返回证书与私钥。
+///
+/// 证书供客户端经 `with_extra_root_cert` 注入信任根（自签不在 webpki-roots 内）。
+fn self_signed()
+-> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
+    xray_common::ensure_default_crypto_provider();
+    let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+    let cert = key.cert.der().clone();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der()).unwrap();
+    (cert, key_der)
+}
+
+/// 自签 TLS server config。
+fn server_config(
+    cert: &rustls::pki_types::CertificateDer<'static>,
+    key_der: rustls::pki_types::PrivateKeyDer<'static>,
+) -> Arc<rustls::ServerConfig> {
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key_der)
+            .unwrap(),
+    )
+}
+
 fn spawn_server(body: Vec<u8>) -> OneShotServer {
+    let (cert, key_der) = self_signed();
+    let server_cfg = server_config(&cert, key_der);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = Arc::clone(&log);
     let body_for_thread = body.clone();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收"
-    )]
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 TLS stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1024];
-            let mut req = Vec::new();
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        req.extend_from_slice(&buf[..n]);
-                        if req.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    },
-                    Err(_) => break,
-                }
-            }
-            log_clone.lock().unwrap().push(String::from_utf8_lossy(&req).to_string());
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-                body_for_thread.len()
-            );
-            stream.write_all(resp.as_bytes()).unwrap();
-            stream.write_all(&body_for_thread).unwrap();
-            stream.flush().ok();
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let mut conn = match rustls::ServerConnection::new(server_cfg) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if conn.complete_io(&mut stream).is_err() {
+            return;
         }
+        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+        let mut buf = [0u8; 1024];
+        let mut req = Vec::new();
+        loop {
+            match tls.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    req.extend_from_slice(&buf[..n]);
+                    if req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                },
+                Err(_) => break,
+            }
+        }
+        log_clone.lock().unwrap().push(String::from_utf8_lossy(&req).to_string());
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+            body_for_thread.len()
+        );
+        tls.write_all(resp.as_bytes()).unwrap();
+        tls.write_all(&body_for_thread).unwrap();
+        tls.flush().ok();
     });
-    OneShotServer { addr, request_log: log }
+    OneShotServer { addr, cert, request_log: log }
+}
+
+/// 起一个只回写固定 response 的 TLS server（用于 404 / 3xx 等分支）。
+fn spawn_raw_server(
+    response: Vec<u8>,
+) -> (std::net::SocketAddr, rustls::pki_types::CertificateDer<'static>) {
+    let (cert, key_der) = self_signed();
+    let server_cfg = server_config(&cert, key_der);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 TLS stub 服务器线程，随进程退出回收")]
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let mut conn = match rustls::ServerConnection::new(server_cfg) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if conn.complete_io(&mut stream).is_err() {
+            return;
+        }
+        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+        let mut buf = [0u8; 1024];
+        let _ = tls.read(&mut buf);
+        tls.write_all(&response).unwrap();
+        tls.flush().ok();
+    });
+    (addr, cert)
 }
 
 #[allow(
@@ -81,12 +146,12 @@ fn unique_dir(name: &str) -> PathBuf {
 }
 
 #[test]
-fn real_downloader_fetches_via_loopback_http() {
+fn real_downloader_fetches_via_loopback_https() {
     let server = spawn_server(b"PAYLOAD-123".to_vec());
     let dir = unique_dir("loopback_ok");
-    let dl = RealAssetDownloader::new(dir.clone());
+    let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(server.cert.clone());
 
-    let url = format!("http://{}/geoip.dat", server.addr);
+    let url = format!("https://{}/geoip.dat", server.addr);
     let temp = dir.join("downloaded.tmp");
     dl.download_to(&url, &temp).expect("download ok");
 
@@ -100,25 +165,26 @@ fn real_downloader_fetches_via_loopback_http() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Go v26.11.9 `48f62b80` 删除非 TLS 客户端后：http:// URL 一律拒收。
+#[test]
+fn real_downloader_rejects_plain_http_url() {
+    let dir = unique_dir("plain_http_rejected");
+    let dl = RealAssetDownloader::new(dir.clone());
+    let url = "http://127.0.0.1:1/x.dat".to_string();
+    let temp = dir.join("x.tmp");
+    let err = dl.download_to(&url, &temp).unwrap_err();
+    assert!(err.to_string().contains("https"), "错误信息应指明 https 约束: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn real_downloader_errors_on_non_2xx() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收"
-    )]
-    thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 256];
-            let _ = stream.read(&mut buf);
-            stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
-            stream.flush().ok();
-        }
-    });
+    let (addr, cert) = spawn_raw_server(
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
     let dir = unique_dir("loopback_404");
-    let dl = RealAssetDownloader::new(dir.clone());
-    let url = format!("http://{}/x.dat", addr);
+    let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(cert);
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     let msg = err.to_string();
@@ -137,7 +203,7 @@ fn real_downloader_errors_on_connection_refused() {
     drop(listener);
     let dir = unique_dir("refused");
     let dl = RealAssetDownloader::new(dir.clone());
-    let url = format!("http://{}/x.dat", addr);
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     let msg = err.to_string();
@@ -168,27 +234,14 @@ fn real_downloader_resolve_rejects_empty() {
 #[test]
 fn real_downloader_follows_redirect_to_next_hop() {
     // 302 → https://127.0.0.1:1/f.dat：证明循环真按 Location 重新拨号（端口 1 必被拒）。
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收"
-    )]
-    thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            stream
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/f.dat\r\nContent-Length: 0\r\n\r\n",
-                )
-                .unwrap();
-            stream.flush().ok();
-        }
-    });
+    let (addr, cert) = spawn_raw_server(
+        b"HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:1/f.dat\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
     let dir = unique_dir("redirect_follow");
-    let dl = RealAssetDownloader::new(dir.clone()).with_timeout(Duration::from_millis(500));
-    let url = format!("http://{}/x.dat", addr);
+    let dl = RealAssetDownloader::new(dir.clone())
+        .with_extra_root_cert(cert)
+        .with_timeout(Duration::from_millis(500));
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     let msg = err.to_string();
@@ -199,27 +252,33 @@ fn real_downloader_follows_redirect_to_next_hop() {
 
 #[test]
 fn real_downloader_rejects_insecure_redirect() {
-    // Go CheckRedirect：目标 scheme != https → InsecureRedirect（http→http 也拒）。
+    // Go CheckRedirect：目标 scheme != https → InsecureRedirect（https→http 也拒）。
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收"
-    )]
+    let (cert, key_der) = self_signed();
+    let server_cfg = server_config(&cert, key_der);
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 TLS stub 服务器线程，随进程退出回收")]
     thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            let resp = format!(
-                "HTTP/1.1 301 Moved\r\nLocation: http://{addr}/plain.dat\r\nContent-Length: 0\r\n\r\n"
-            );
-            stream.write_all(resp.as_bytes()).unwrap();
-            stream.flush().ok();
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        let mut conn = match rustls::ServerConnection::new(server_cfg) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if conn.complete_io(&mut stream).is_err() {
+            return;
         }
+        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+        let mut buf = [0u8; 512];
+        let _ = tls.read(&mut buf);
+        let resp = format!(
+            "HTTP/1.1 301 Moved\r\nLocation: http://{addr}/plain.dat\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        tls.write_all(resp.as_bytes()).unwrap();
+        tls.flush().ok();
     });
     let dir = unique_dir("redirect_insecure");
-    let dl = RealAssetDownloader::new(dir.clone());
-    let url = format!("http://{}/x.dat", addr);
+    let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(cert);
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     assert!(matches!(err, GeodataError::InsecureRedirect(_)), "got {err:?}");
@@ -229,23 +288,12 @@ fn real_downloader_rejects_insecure_redirect() {
 #[test]
 fn real_downloader_rejects_redirect_without_location() {
     // 无 Location 的 3xx 无从跟随 → Go fetch 的 ">= 300 → unexpected status" 语义。
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收"
-    )]
-    thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 512];
-            let _ = stream.read(&mut buf);
-            stream.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n").unwrap();
-            stream.flush().ok();
-        }
-    });
+    let (addr, cert) = spawn_raw_server(
+        b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
     let dir = unique_dir("redirect_no_location");
-    let dl = RealAssetDownloader::new(dir.clone());
-    let url = format!("http://{}/x.dat", addr);
+    let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(cert);
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     let err = dl.download_to(&url, &temp).unwrap_err();
     assert!(matches!(err, GeodataError::UnexpectedStatus(304)), "got {err:?}");
@@ -256,7 +304,7 @@ fn real_downloader_rejects_redirect_without_location() {
 fn real_downloader_respects_request_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    #[allow(clippy::disallowed_methods, reason = "测试：本地 HTTP stub 服务器线程，随进程退出回收")]
+    #[allow(clippy::disallowed_methods, reason = "测试：本地 TLS stub 服务器线程，随进程退出回收")]
     let h = thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
             std::thread::sleep(Duration::from_secs(5));
@@ -265,7 +313,7 @@ fn real_downloader_respects_request_timeout() {
     });
     let dir = unique_dir("timeout");
     let dl = RealAssetDownloader::new(dir.clone()).with_timeout(Duration::from_millis(300));
-    let url = format!("http://{}/x.dat", addr);
+    let url = format!("https://{}/x.dat", addr);
     let temp = dir.join("x.tmp");
     #[allow(clippy::disallowed_methods, reason = "测试：timeout 断言计时起点")]
     let start = std::time::Instant::now();
