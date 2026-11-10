@@ -576,16 +576,17 @@ struct ProcessInfo {
 /// 通过 OS-specific 网络连接表反查 PID：
 /// - Linux：`/proc/net/{tcp,tcp6}`（TCP）或 `/proc/net/{udp,udp6}`（UDP）取 socket inode， 再扫描
 ///   `/proc/*/fd/*` 匹配 inode → PID
-/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 直接取 owning PID （UDP 表
-///   `GetExtendedUdpTable` 未接，见 `proc_windows`）
+/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)`（TCP）/
+///   `GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`（UDP）直接取 owning PID
 /// - 其他平台（macOS 等）：返回 `None`（进程匹配不生效，不影响路由）
 ///
 /// 匹配语义：`(source_ip, source_port)` 对应连接表中的 **local** endpoint
 /// （发起方 socket 的本地端，即 xray 看到的对端地址）。任一步失败返回 `None`
 /// （权限不足/不可达），仅令进程匹配不生效，不阻断路由决策。
 ///
-/// **UDP 能力为 Linux-only**：非 Linux 平台 UDP 反查恒 `None`（显式不可用，
-/// 不静默退化成 TCP 表查询——否则 UDP 命中的是同端口的 TCP socket，语义错误）。
+/// **UDP 能力 = Linux + Windows**（Go 同）：源地址非本机地址、或表中无对应行 ⇒ `None`，
+/// 不静默退化成 TCP 表查询——否则 UDP 命中的是同端口的 TCP socket，语义错误。
+/// macOS/FreeBSD 两协议均 `None`（Go `find_process_others.go` 不收）。
 fn find_process(
     network: Network,
     source_ip: std::net::IpAddr,
@@ -807,15 +808,17 @@ mod proc_windows {
     use windows_sys::Win32::{
         Foundation::CloseHandle,
         NetworkManagement::IpHelper::{
-            GetExtendedTcpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-            MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+            GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID,
+            MIB_TCP6TABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+            MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID,
+            MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
         },
         System::Threading::{
             OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
             QueryFullProcessImageNameW,
         },
     };
-    use xray_common::net::network::Network;
+    use xray_common::net::{interface::is_local_ip, network::Network};
 
     use super::ProcessInfo;
 
@@ -828,21 +831,31 @@ mod proc_windows {
         source_ip: IpAddr,
         source_port: u16,
     ) -> Option<ProcessInfo> {
-        // UDP 表（`GetExtendedUdpTable`）本仓未接 ⇒ UDP 显式不可用（返回 None = 条件不命中），
-        // 禁回落 TCP 表查询（那是另一个协议的 socket，命中即语义错误）。
-        if network != Network::TCP {
-            return None;
-        }
-        let pid = match source_ip {
-            IpAddr::V4(ip) => find_pid_v4(ip, source_port),
-            IpAddr::V6(ip) => find_pid_v6(ip, source_port),
+        let pid = match network {
+            Network::TCP => match source_ip {
+                IpAddr::V4(ip) => find_pid_v4(ip, source_port),
+                IpAddr::V6(ip) => find_pid_v6(ip, source_port),
+            },
+            Network::UDP => {
+                // 与 Linux 版（commit f385ec91 / Go `net.IsLocal`）同口径：源地址不是本机
+                // 地址 ⇒ 不是本机 socket 属主，条件不命中（不查表）。
+                if !is_local_ip(source_ip) {
+                    return None;
+                }
+                match source_ip {
+                    IpAddr::V4(ip) => find_udp_pid_v4(ip, source_port),
+                    IpAddr::V6(ip) => find_udp_pid_v6(ip, source_port),
+                }
+            },
+            // Go `FindProcess` 只接受 tcp/udp（其余 panic）；本仓按「条件不命中」处理。
+            Network::Unix => None,
         }?;
         read_process_info(pid)
     }
 
     fn find_pid_v4(ip: Ipv4Addr, port: u16) -> Option<u32> {
-        let buf = tcp_table(AF_INET)?;
-        // SAFETY: buf 为 Vec<u32>（align=4 ≥ 表结构对齐），由 tcp_table 按
+        let buf = transport_table(TableKind::Tcp, AF_INET)?;
+        // SAFETY: buf 为 Vec<u32>（align=4 ≥ 表结构对齐），由 transport_table 按
         // GetExtendedTcpTable 所需 size 分配并刚填充，布局即 MIB_TCPTABLE_OWNER_PID；
         // 行数按缓冲容量夹取（dwNumEntries 为内核回填，越界声明不得越缓冲读）。
         unsafe {
@@ -865,7 +878,7 @@ mod proc_windows {
     }
 
     fn find_pid_v6(ip: Ipv6Addr, port: u16) -> Option<u32> {
-        let buf = tcp_table(AF_INET6)?;
+        let buf = transport_table(TableKind::Tcp, AF_INET6)?;
         // SAFETY: 同 v4 路径：Vec<u32>（align=4）按所需 size 分配且刚填充，布局即
         // MIB_TCP6TABLE_OWNER_PID；行数按缓冲容量夹取（越界声明不越缓冲读）。
         unsafe {
@@ -888,28 +901,118 @@ mod proc_windows {
         None
     }
 
+    /// UDP 归属查询 v4（`GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`，对齐 Go
+    /// `find_process_windows.go` 的 `Network_UDP` 分支）。
+    ///
+    /// 两条与 TCP 不同的语义（Go 同款）：
+    /// - UDP 无连接状态 ⇒ 不校验 TCP 状态（Go `tcpState == -1`）；
+    /// - **Windows 在首个 `sendto` 前把未绑定地址的 socket 绑成 `0.0.0.0`**（Go 源码注释 "windows
+    ///   binds an unbound udp socket to 0.0.0.0/[::] while first sendto"）⇒ local
+    ///   地址为通配地址的行也算命中，否则首包前的 UDP socket 永远查不到。
+    ///
+    /// 命中序 = 表内行序首个命中（Go 一致；Linux 版是「精确优先、通配兜底」）。
+    fn find_udp_pid_v4(ip: Ipv4Addr, port: u16) -> Option<u32> {
+        let buf = transport_table(TableKind::Udp, AF_INET)?;
+        // SAFETY: 同 TCP 路径：Vec<u32>（align=4）按所需 size 分配且刚填充，布局即
+        // MIB_UDPTABLE_OWNER_PID；行数按缓冲容量夹取（越界声明不越缓冲读）。
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
+            let max_rows = (buf.len() * std::mem::size_of::<u32>() - std::mem::size_of::<u32>())
+                / std::mem::size_of::<MIB_UDPROW_OWNER_PID>();
+            let rows = std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(max_rows),
+            );
+            let want_addr = u32::from_be_bytes(ip.octets());
+            for row in rows {
+                let local = u32::from_be(row.dwLocalAddr);
+                // `local == 0` 即 0.0.0.0（首包前未绑定的通配地址）。
+                if ntohs(row.dwLocalPort) == port && (local == want_addr || local == 0) {
+                    return Some(row.dwOwningPid);
+                }
+            }
+        }
+        None
+    }
+
+    /// UDP 归属查询 v6（`MIB_UDP6ROW_OWNER_PID` 布局；通配兜底 = 全零 `::`）。
+    fn find_udp_pid_v6(ip: Ipv6Addr, port: u16) -> Option<u32> {
+        let buf = transport_table(TableKind::Udp, AF_INET6)?;
+        // SAFETY: 同 v6 TCP 路径：Vec<u32>（align=4）刚填充，布局即
+        // MIB_UDP6TABLE_OWNER_PID；行数按缓冲容量夹取。
+        unsafe {
+            let table = &*(buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID);
+            let max_rows = (buf.len() * std::mem::size_of::<u32>() - std::mem::size_of::<u32>())
+                / std::mem::size_of::<MIB_UDP6ROW_OWNER_PID>();
+            let rows = std::slice::from_raw_parts(
+                table.table.as_ptr(),
+                (table.dwNumEntries as usize).min(max_rows),
+            );
+            let octets = ip.octets();
+            // 全零 = `::`（首包前的通配绑定），也算命中。
+            let wildcard = [0u8; 16];
+            for row in rows {
+                if ntohs(row.dwLocalPort) == port
+                    && (row.ucLocalAddr == octets || row.ucLocalAddr == wildcard)
+                {
+                    return Some(row.dwOwningPid);
+                }
+            }
+        }
+        None
+    }
+
     /// 取低 16 位端口（网络字节序）转主机序。
     #[inline]
     fn ntohs(port_field: u32) -> u16 {
         u16::from_be((port_field & 0xFFFF) as u16)
     }
 
-    /// 调 `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 取整张表。
+    /// 归属表种类：两族 FFI 只差函数、行大小与表 class（`*_OWNER_PID`）。
+    #[derive(Clone, Copy)]
+    enum TableKind {
+        Tcp,
+        Udp,
+    }
+
+    /// 调 `GetExtended{Tcp,Udp}Table(…, OWNER_PID)` 取整张表。
     ///
     /// 返回 `Vec<u32>`（align=4）：表结构含 `u32` 字段，`Vec<u8>`（align=1）
     /// cast 结构体指针是形式对齐 UB（兄弟实现 portmap 同款修法）。
-    fn tcp_table(af: u32) -> Option<Vec<u32>> {
-        let row_bytes = if af == AF_INET {
-            std::mem::size_of::<MIB_TCPROW_OWNER_PID>()
-        } else {
-            std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>()
+    fn transport_table(kind: TableKind, af: u32) -> Option<Vec<u32>> {
+        let row_bytes = match (kind, af) {
+            (TableKind::Tcp, AF_INET) => std::mem::size_of::<MIB_TCPROW_OWNER_PID>(),
+            (TableKind::Tcp, _) => std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>(),
+            (TableKind::Udp, AF_INET) => std::mem::size_of::<MIB_UDPROW_OWNER_PID>(),
+            (TableKind::Udp, _) => std::mem::size_of::<MIB_UDP6ROW_OWNER_PID>(),
         };
         // SAFETY: 两段式 Win32 契约：首调 null buf 填 size，二调以该 size 分配
         // 的缓冲接收整表（Vec<u32> 保证对齐；尾部多留一行的 u32 余量）。
         unsafe {
             let mut size: u32 = 0;
             // 第一次取所需大小（返回 ERROR_INSUFFICIENT_BUFFER，size 被填入）。
-            GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, af, TCP_TABLE_OWNER_PID_ALL, 0);
+            match kind {
+                TableKind::Tcp => {
+                    GetExtendedTcpTable(
+                        std::ptr::null_mut(),
+                        &mut size,
+                        0,
+                        af,
+                        TCP_TABLE_OWNER_PID_ALL,
+                        0,
+                    );
+                },
+                TableKind::Udp => {
+                    GetExtendedUdpTable(
+                        std::ptr::null_mut(),
+                        &mut size,
+                        0,
+                        af,
+                        UDP_TABLE_OWNER_PID,
+                        0,
+                    );
+                },
+            }
             if size == 0 {
                 return None;
             }
@@ -918,14 +1021,24 @@ mod proc_windows {
                 size as usize / std::mem::size_of::<u32>()
                     + row_bytes / std::mem::size_of::<u32>()
             ];
-            let rc = GetExtendedTcpTable(
-                buf.as_mut_ptr() as *mut _,
-                &mut size,
-                0,
-                af,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            );
+            let rc = match kind {
+                TableKind::Tcp => GetExtendedTcpTable(
+                    buf.as_mut_ptr() as *mut _,
+                    &mut size,
+                    0,
+                    af,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                ),
+                TableKind::Udp => GetExtendedUdpTable(
+                    buf.as_mut_ptr() as *mut _,
+                    &mut size,
+                    0,
+                    af,
+                    UDP_TABLE_OWNER_PID,
+                    0,
+                ),
+            };
             (rc == NO_ERROR).then_some(buf)
         }
     }
@@ -1765,11 +1878,12 @@ mod tests {
     /// 端到端：**另一个进程**持有真实 UDP socket ⇒ UDP 反查到该进程的 PID 与名字。
     ///
     /// 子进程 = 本测试二进制自身（同一测试函数按环境变量分流），不依赖 python/lsof，
-    /// 覆盖完整链路：`/proc/net/udp` 取 inode → `/proc/*/fd` **跨进程**反查 PID
-    /// （Go `find_process_linux.go:104-176`）。子进程绑**通配地址** `0.0.0.0:0`——
-    /// UDP socket 常态，精确地址必然对不上，只能靠 Go 12b7f85d 的端口回落命中
-    /// （父进程按 `127.0.0.1:port` 查）。
-    #[cfg(target_os = "linux")]
+    /// 覆盖完整链路：Linux（`/proc/net/udp` 取 inode → `/proc/*/fd` 跨进程反查 PID，
+    /// Go `find_process_linux.go:104-176`）/ Windows（`GetExtendedUdpTable` 由表直出
+    /// PID，Go `find_process_windows.go`）。子进程绑**通配地址** `0.0.0.0:0`——
+    /// UDP socket 常态，精确地址必然对不上，只能靠端口回落命中（Linux：
+    /// Go 12b7f85d 的 `portFallback`；Windows：首包前绑 `0.0.0.0` 的兜底）。
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_find_process_resolves_udp_socket_in_other_process() {
         use std::{io::BufRead, process::Stdio};
@@ -1964,17 +2078,26 @@ mod tests {
         assert!(!called.get(), "Unix 网络不应触发进程反查");
     }
 
-    /// 非 Linux 平台：UDP 进程反查**显式不可用**（返回 None），不得回落 TCP 表。
+    /// 未实现平台（macOS/FreeBSD）：UDP 进程反查**显式不可用**（返回 None）。
     ///
-    /// Go 侧 UDP 表查询仅 Linux 有（`find_process_linux.go`）；Windows 的
-    /// `GetExtendedUdpTable` 本仓未接 ⇒ UDP 显式不可用；macOS/FreeBSD 全平台不支持。
-    #[cfg(not(target_os = "linux"))]
+    /// Go 侧进程反查仅 linux/windows（`find_process_others.go`）；本仓同口径——
+    /// 两个已实现平台各有正例（见 `test_find_process_resolves_udp_socket_in_other_process`）。
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     #[test]
     fn test_udp_process_lookup_unavailable_off_linux() {
         let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         assert!(
             find_process(Network::UDP, ip, 8080).is_none(),
-            "非 Linux 平台 UDP 进程反查应显式不可用（不得回落 TCP 表）"
+            "未支持平台的 UDP 进程反查应显式不可用（不得回落 TCP 表）"
         );
+    }
+
+    /// Windows：源地址非本机地址 ⇒ 不查表、返回 None（对齐 Go `net.IsLocal` 的
+    /// `ErrNotLocal` 与 Linux 版同口径）。`203.0.113.7` 属 TEST-NET-3 保留段。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_udp_lookup_non_local_source_returns_none() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        assert!(find_process(Network::UDP, ip, 53).is_none(), "非本机源地址不应命中");
     }
 }
