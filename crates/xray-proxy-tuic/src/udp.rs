@@ -17,8 +17,9 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -33,8 +34,9 @@ use crate::{
 /// uni 响应泵诊断门面（nn8os 2b 同型处置：tracing 宏 → LogFacade——本项目工具
 /// 链上 `disallowed_macros` 对 proc-macro 不认任何 allow（fn/stmt/文件顶三形态
 /// 实测无效），迁移为唯一关红路径。域 = "tuic"，target `xray_frame::tuic` +
-/// mask_secrets。只在泵关闭/响应未配对/帧解析错误分支发射；泵循环外取一次
-/// 引用（坑约束⑫热路径零每包开销）。
+/// mask_secrets。只在泵关闭/响应未配对/帧解析错误/**信箱字节上限命中丢弃**
+/// 分支发射；泵循环外取一次引用（坑约束⑫热路径零每包开销——丢弃分支本身
+/// 受 60s 限频闸约束，见 [`DROP_LOG_INTERVAL`]）。
 static UDP_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("tuic", vec![]));
 
 /// 默认 UDP 响应等待时长（mock server 等待 UDP echo）。
@@ -72,7 +74,99 @@ const DGRAM_INBOX_KEY_CAP: usize = 4096;
 /// 属主读取释放配额。8MiB ≈ 85 条满积压流（64 包 × 1.5KB MTU），正常多流
 /// 共享连接远达不到。`pub`：`xray-core` 内存账本（memory_budget）引用同一
 /// 常量，禁两份定义（§3.5.2）。
+///
+/// 命中不是静默的：整包丢弃**记账 + 限频 WARN**（bd l8vw3，见
+/// [`inbox_byte_cap_drop_counters`]）——否则生产只能看到「UDP 偶发不通」。
 pub const DGRAM_INBOX_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+/// 丢弃告警限频窗：窗口内至多一条 WARN。
+///
+/// 60s 与仓内既有限频窗同档（`xray-transport` fallback 失败留痕 60s 窗）。
+/// 计数闸（每 N 次一条）在此**不适用**：丢弃速率由对端决定、无上界——按次数
+/// 限频在高丢包率下仍是「N 包一条」的高频刷屏，故只按时间窗限频。
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 丢弃告警限频闸（窗口内至多一条 WARN）。
+///
+/// 单字段即可表达「窗口未开 / 窗口内 / 窗口已过」三态（`Option<Instant>`：
+/// `None` = 未开窗；`Some(start)` = 窗起点）。
+struct DropLogGate {
+    /// 当前窗口起点（`None` = 尚未发过 WARN，窗口未开）。
+    window_start: Option<Instant>,
+}
+
+/// 信箱字节上界命中的丢弃计量 + 限频闸（**进程级**单例）。
+///
+/// **为什么进程级而非信箱级**：① 信箱（[`DgramInbox`]）随连接消亡——连接一关
+/// 信箱级计数即随之蒸发，而生产要回答的恰恰是连接关掉之后的事后问题
+/// 「这进程一共丢了多少」；② 字节上界虽按信箱计，症状（UDP 偶发不通）是
+/// 进程级的，聚合口径才可对账；③ 限频闸同理必须全局——按信箱各限各的，
+/// 多连接并发放大 N 倍日志量（刷屏面）。
+struct InboxDropMeter {
+    /// 累计丢弃包数。
+    dropped_packets: AtomicU64,
+    /// 累计丢弃字节（[`packet_weight`] 口径：payload + 地址 wire 长度）。
+    dropped_bytes: AtomicU64,
+    /// 告警限频闸。
+    gate: parking_lot::Mutex<DropLogGate>,
+}
+
+impl InboxDropMeter {
+    fn new() -> Self {
+        Self {
+            dropped_packets: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
+            gate: parking_lot::Mutex::new(DropLogGate { window_start: None }),
+        }
+    }
+
+    /// 记一次「字节上界命中 ⇒ 整包丢弃」。
+    ///
+    /// 返回 `Some((累计包数, 累计字节))` = 本次应发 WARN（限频放行）；
+    /// `None` = 被限频抑制（计数照记——抑制的量仍在累计读数里查得到，不丢）。
+    fn note_drop(&self, weight: usize, now: Instant) -> Option<(u64, u64)> {
+        let packets = self.dropped_packets.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = self.dropped_bytes.fetch_add(weight as u64, Ordering::Relaxed) + weight as u64;
+        let mut gate = self.gate.lock();
+        if !gate.admit(now) {
+            return None;
+        }
+        Some((packets, bytes))
+    }
+
+    /// 累计读数（`(包数, 字节数)`）。
+    fn counters(&self) -> (u64, u64) {
+        (self.dropped_packets.load(Ordering::Relaxed), self.dropped_bytes.load(Ordering::Relaxed))
+    }
+}
+
+impl DropLogGate {
+    /// 判定本次是否放行一条 WARN：窗口未开 ⇒ 放行并开窗；窗口内 ⇒ 抑制；
+    /// 窗口已过（≥ [`DROP_LOG_INTERVAL`]）⇒ 滚动窗口并放行。
+    fn admit(&mut self, now: Instant) -> bool {
+        let expired = match self.window_start {
+            Some(start) => now.saturating_duration_since(start) >= DROP_LOG_INTERVAL,
+            None => true,
+        };
+        if !expired {
+            return false;
+        }
+        self.window_start = Some(now);
+        true
+    }
+}
+
+/// 进程级丢弃计量与限频闸（单例）。
+static DROP_METER: LazyLock<InboxDropMeter> = LazyLock::new(InboxDropMeter::new);
+
+/// 信箱字节上界命中丢弃的**进程级累计**计数：`(包数, 字节数)`。
+///
+/// 可读出口（bd l8vw3）：告警文案携带同源计数，本函数给出同源读数（供上层
+/// 自取；**不接** `xray-app-metrics`——协议 crate 不反向依赖应用指标面）。
+#[must_use]
+pub fn inbox_byte_cap_drop_counters() -> (u64, u64) {
+    DROP_METER.counters()
+}
 
 /// TUIC 客户端 UDP 关联句柄。
 ///
@@ -405,7 +499,14 @@ impl TuicUdpAssoc {
 
     /// 把别的 assoc 的回包转投其信箱（超上限丢最旧，UDP 有损语义）。
     fn stash_foreign_packet(&self, pkt: Packet) {
-        stash_foreign_packet_to(&self.inbox, pkt);
+        match stash_foreign_packet_to(&self.inbox, pkt) {
+            StashOutcome::Stashed => {},
+            // 键数上界：既有语义不变（本票只治字节上界的静默丢弃，见 bd l8vw3）。
+            StashOutcome::DroppedKeyCap => {},
+            // 字节上界命中 = 静默整包丢弃 ⇒ 必须留痕（记账 + 限频 WARN）：
+            // 否则生产只看到「UDP 偶发不通」，无从定位是信箱上限命中。
+            StashOutcome::DroppedByteCap { weight } => report_inbox_byte_cap_drop(weight),
+        }
     }
 
     /// 检查连接是否支持 DATAGRAM（native 模式可用性）。
@@ -423,17 +524,37 @@ fn packet_weight(pkt: &Packet) -> usize {
     pkt.data.len() + pkt.addr.encoded_len()
 }
 
+/// 信箱转投结局（[`stash_foreign_packet_to`] 的返回值）。
+///
+/// 丢弃是「静默丢弃」（UDP 有损语义），故显式化为枚举——调用方据此记账/告警
+/// （bd l8vw3：字节上界命中必须留痕，否则生产只见「UDP 偶发不通」）。
+///
+/// 键数上界命中（[`DroppedKeyCap`]）本票**不计数不告警**（票面只治字节上界），
+/// 但显式区分而非并入 `Stashed`——否则调用方与测试都分不清「已入信箱」与
+/// 「被丢弃」，下票要补键数上界留痕时直接加变体即可。
+#[derive(Debug, PartialEq, Eq)]
+enum StashOutcome {
+    /// 已入信箱。
+    Stashed,
+    /// 键数上界命中 → 整包丢弃（未命中键；字节口径不适用，见
+    /// [`DGRAM_INBOX_KEY_CAP`]）。
+    DroppedKeyCap,
+    /// 字节上界命中 → 整包丢弃（丢弃字节权重 = `weight`，见
+    /// [`DGRAM_INBOX_BYTE_CAP`]）。
+    DroppedByteCap { weight: usize },
+}
+
 /// [`TuicUdpAssoc::stash_foreign_packet`] 的纯函数体（可单测）：转投信箱，
 /// 超 [`DGRAM_INBOX_CAP`] 丢最旧；键数满 [`DGRAM_INBOX_KEY_CAP`] 或滞留字节满
 /// [`DGRAM_INBOX_BYTE_CAP`] 时整包丢弃（软上界退化，UDP 有损语义）。
-fn stash_foreign_packet_to(inbox: &DgramInbox, pkt: Packet) {
+fn stash_foreign_packet_to(inbox: &DgramInbox, pkt: Packet) -> StashOutcome {
     let mut inbox = inbox.lock();
     if inbox.map.len() >= DGRAM_INBOX_KEY_CAP && !inbox.map.contains_key(&pkt.assoc_id) {
-        return;
+        return StashOutcome::DroppedKeyCap;
     }
     let weight = packet_weight(&pkt);
     if inbox.retained_bytes.saturating_add(weight) > DGRAM_INBOX_BYTE_CAP {
-        return;
+        return StashOutcome::DroppedByteCap { weight };
     }
     // MutexGuard 不跨字段分裂借用（E0499）：map 借用（挤出最旧 + 入队）收进
     // 作用域块，挤出的权重带出后记账。
@@ -449,8 +570,43 @@ fn stash_foreign_packet_to(inbox: &DgramInbox, pkt: Packet) {
     };
     inbox.retained_bytes += weight;
     if let Some(w) = evicted_weight {
-        inbox.retained_bytes -= w;
+        release_retained_bytes(&mut inbox, w);
     }
+    StashOutcome::Stashed
+}
+
+/// 释放滞留字节配额（饱和减 + 调试断言记账未分叉）。
+///
+/// 记账分叉（释放量 > 账面）时 `usize` 下溢 ⇒ 账面变巨值 ⇒ 该 assoc 信箱
+/// **永久拒收**（其后每包都判超字节上界，永不自愈）。故出账走
+/// `saturating_sub`（不产生毒值），并在 debug 构建断言分叉不可达
+/// （bd prcze：今日无可达路径，属防御性）。
+fn release_retained_bytes(state: &mut DgramInboxState, bytes: usize) {
+    let before = state.retained_bytes;
+    state.retained_bytes = before.saturating_sub(bytes);
+    debug_assert!(before >= bytes, "retained_bytes 记账分叉：账面 {before} < 释放 {bytes}");
+}
+
+/// 字节上界命中的丢弃记账 + 限频 WARN（bd l8vw3）。
+///
+/// 限频：进程级单闸，窗口内至多一条（[`DROP_LOG_INTERVAL`]）——丢弃速率由
+/// 对端决定、无上界，逐包 WARN 即日志洪泛（CLAUDE.md §5）。被抑制的丢弃
+/// **照记计数**（[`inbox_byte_cap_drop_counters`] 读得到），证据不丢。
+///
+/// 时钟走进程级能力句柄 `xray_frame::compat::clock()`（ADR-2 面 2：ctx 结构性
+/// 不可达站点的唯一受管入口；本路径无 PluginContext 注入面，亦不引裸
+/// `Instant::now`——本 crate clippy 门禁禁裸时钟）。
+fn report_inbox_byte_cap_drop(weight: usize) {
+    let now = xray_frame::compat::clock().now_instant();
+    let Some((packets, bytes)) = DROP_METER.note_drop(weight, now) else {
+        return;
+    };
+    // 上限文案从常量推导（禁两份定义，§3.5.2）——按 MiB 取整展示，上限改动
+    // 文案自动跟随（当前 8MiB；非整 MiB 的上限会向下取整展示）。
+    UDP_LOG.warn(format!(
+        "tuic: TUIC 信箱字节上限 {cap_mib}MiB 命中 · 丢弃 {packets} 包 / {bytes} 字节（进程累计）",
+        cap_mib = DGRAM_INBOX_BYTE_CAP / (1024 * 1024),
+    ));
 }
 
 /// [`TuicUdpAssoc::take_inbox_packet`] 的纯函数体（可单测）：弹出属主队首并
@@ -463,7 +619,7 @@ fn take_inbox_packet_from(inbox: &DgramInbox, assoc_id: u16) -> Option<Packet> {
         (pkt, queue.is_empty())
     };
     if let Some(p) = &pkt {
-        inbox.retained_bytes -= packet_weight(p);
+        release_retained_bytes(&mut inbox, packet_weight(p));
     }
     if now_empty {
         inbox.map.remove(&assoc_id);
@@ -711,23 +867,23 @@ mod tests {
 
         // 填满 4096 个键（每键 1 包）
         for assoc in 0..DGRAM_INBOX_KEY_CAP as u16 {
-            stash_foreign_packet_to(&inbox, pkt(assoc, 1));
+            assert_eq!(stash_foreign_packet_to(&inbox, pkt(assoc, 1)), StashOutcome::Stashed);
         }
         assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP);
 
         // 未命中新键：整包丢弃（软上界满则退化）
-        stash_foreign_packet_to(&inbox, pkt(u16::MAX, 1));
+        assert_eq!(stash_foreign_packet_to(&inbox, pkt(u16::MAX, 1)), StashOutcome::DroppedKeyCap);
         assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP, "满后新键不得再占键");
         assert!(!inbox.lock().map.contains_key(&u16::MAX));
 
         // 已存在键：正常入队（键不受上界影响）
-        stash_foreign_packet_to(&inbox, pkt(0, 2));
+        assert_eq!(stash_foreign_packet_to(&inbox, pkt(0, 2)), StashOutcome::Stashed);
         assert_eq!(inbox.lock().map.len(), DGRAM_INBOX_KEY_CAP);
         assert_eq!(inbox.lock().map[&0].len(), 2, "已有键的包必须照常入队");
 
         // 单键积压上限（64）语义不变：第 65 包挤出最旧
         for i in 0..=DGRAM_INBOX_CAP as u16 {
-            stash_foreign_packet_to(&inbox, pkt(1, 10 + i));
+            assert_eq!(stash_foreign_packet_to(&inbox, pkt(1, 10 + i)), StashOutcome::Stashed);
         }
         let guard = inbox.lock();
         let q = &guard.map[&1];
@@ -750,7 +906,7 @@ mod tests {
         let small =
             |assoc: u16, id: u16| Packet::new(assoc, id, Address::None, Bytes::from_static(b"x"));
         for i in 0..=DGRAM_INBOX_CAP as u16 {
-            stash_foreign_packet_to(&inbox, small(7, 10 + i));
+            assert_eq!(stash_foreign_packet_to(&inbox, small(7, 10 + i)), StashOutcome::Stashed);
         }
         // guard 必须限制在本块内：parking_lot Mutex 非重入，活到函数尾会让
         // 后面的 stash_foreign_packet_to 再次 lock() ⇒ 自死锁（本次实测挂死）。
@@ -767,7 +923,18 @@ mod tests {
         let fit = DGRAM_INBOX_BYTE_CAP / big_weight;
         assert!(fit < DGRAM_INBOX_KEY_CAP, "测试前提：字节上界先于键数上界触发");
         for i in 0..(fit + 8) as u16 {
-            stash_foreign_packet_to(&inbox, big(i, 1));
+            let outcome = stash_foreign_packet_to(&inbox, big(i, 1));
+            if (i as usize) < fit {
+                assert_eq!(outcome, StashOutcome::Stashed, "预算内必须入队");
+            } else {
+                // bd l8vw3：字节上界命中必须**显式回报丢弃**（含字节权重）——
+                // 否则上层无从记账/告警，生产只看到「UDP 偶发不通」。
+                assert_eq!(
+                    outcome,
+                    StashOutcome::DroppedByteCap { weight: big_weight },
+                    "超字节上界的包必须回报整包丢弃"
+                );
+            }
         }
         {
             let st = inbox.lock();
@@ -783,5 +950,44 @@ mod tests {
         assert_eq!(inbox.lock().retained_bytes, (fit - 1) * big_weight, "读取释放配额");
         stash_foreign_packet_to(&inbox, big(u16::MAX, 2));
         assert_eq!(inbox.lock().map.len(), fit, "释放 1 键配额 ⇒ 恰好再收 1 键");
+    }
+
+    /// bd l8vw3：字节上界命中丢弃的**限频**语义（纯函数级，不触网）。
+    ///
+    /// 断言：① 首次命中必放行；② 窗口内后续命中被抑制（不刷屏）；③ 窗口
+    /// 过期后重新放行；④ 抑制期间计数照记（证据不丢）。
+    #[test]
+    fn inbox_drop_meter_counts_always_and_warns_rate_limited() {
+        let meter = InboxDropMeter::new();
+        let t0 = Instant::now();
+
+        // ① 首次命中：放行 + 计数
+        assert_eq!(meter.note_drop(100, t0), Some((1, 100)), "首次命中必须告警");
+
+        // ② 窗口内：抑制但计数照记
+        assert_eq!(meter.note_drop(50, t0), None, "窗口内必须抑制（禁刷屏）");
+        assert_eq!(meter.note_drop(50, t0), None, "窗口内必须抑制（禁刷屏）");
+        assert_eq!(meter.counters(), (3, 200), "被抑制的丢弃仍必须计数（证据不丢）");
+
+        // ③ 窗口过期：重新放行，且报的是累计值
+        let t1 = t0 + DROP_LOG_INTERVAL;
+        assert_eq!(meter.note_drop(25, t1), Some((4, 225)), "窗口过期必须重新放行");
+        assert_eq!(meter.counters(), (4, 225), "累计读数与告警口径一致");
+    }
+
+    /// bd prcze：滞留字节出账走 `saturating_sub`（下溢 ⇒ 该 assoc 信箱永久
+    /// 拒收：账面被绕成巨值后 `retained + weight > CAP` 恒真，包再也进不来）。
+    /// 正常出账逐字节精确；出账额等于账面时归零（边界，不越界）。
+    ///
+    /// 记账分叉（出账 > 账面）今日**不可达**，由 `debug_assert!` 在开发期
+    /// 喊出（debug 构建会 panic，故此处只测可达路径）。
+    #[test]
+    fn release_retained_bytes_decrements_exactly() {
+        let mut state = DgramInboxState { retained_bytes: 10, ..Default::default() };
+        release_retained_bytes(&mut state, 4);
+        assert_eq!(state.retained_bytes, 6, "正常出账逐字节精确");
+
+        release_retained_bytes(&mut state, 6);
+        assert_eq!(state.retained_bytes, 0, "出账额等于账面时归零（边界）");
     }
 }
