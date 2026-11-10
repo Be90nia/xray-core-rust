@@ -295,6 +295,10 @@ pub(crate) fn set_outbound_iface(iface: Option<(u32, String)>) {
 }
 
 /// 当前绑定的物理网卡（[`guard`] 取网卡名做日志，Go `updater.Get()`）。
+///
+/// 仅 Windows：唯一调用方是 `inbound.rs` 里 `#[cfg(target_os = "windows")]` 的守卫段，
+/// 不加门控会在 Linux/macOS 触发 `dead_code`（`#![deny(warnings)]` ⇒ CI 硬错）。
+#[cfg(target_os = "windows")]
 pub(crate) fn outbound_iface() -> Option<(u32, String)> {
     OUTBOUND_IFACE.read().clone()
 }
