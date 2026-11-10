@@ -709,8 +709,18 @@ pub(crate) async fn build_hysteria_inbound(
             .with_dispatcher(Some(Arc::new(HysteriaTcpDispatch(Arc::clone(&dispatch)))))
             .with_udp_dispatcher(Some(dispatch));
     tracing::info!(tag = %ib.tag, addr = %addr, users = multi.as_ref().map_or(0, |v| v.count()), "hysteria inbound listening");
+    handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))?;
+    // **保活持有 handler**（anytls/naive 同款，bd cv1af）：hysteria 的 QUIC accept 泵
+    // 住在 quic listener 自有 scope（owner = handler 的 slot → quic_listener → scope）。
+    // handler 提前 drop ⇒ scope owner 归零 ⇒ JoinSet drop abort 掉 accept 泵 ⇒
+    // quinn endpoint 释放 ⇒ **UDP 端口随之关闭**（日志仍打 listener started，实测
+    // bind 探测显示端口从未被占）。
+    // 与 tuic 的区别：tuic 的 accept 泵在组件级 fx scope（handler drop 不影响泵），
+    // hysteria 的泵在 listener 级 ⇒ 必须由 handler 保活。
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, async move {
-        handler.start().await.map_err(|e| std::io::Error::other(format!("{e}")))
+        let _keep = handler;
+        std::future::pending::<()>().await;
+        Ok(())
     })))
 }
 
