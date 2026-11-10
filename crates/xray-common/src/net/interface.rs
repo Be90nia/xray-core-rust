@@ -13,9 +13,12 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::RwLock,
+    time::{Duration, Instant},
 };
 
 use if_addrs::{IfAddr, get_if_addrs};
+use skeleton::clock::{Clock, SystemClock};
 
 /// 接口单播地址（ip + 掩码），对应 Go `*net.IPNet`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -185,13 +188,84 @@ pub fn interface_addrs() -> io::Result<Vec<InterfaceAddr>> {
 ///
 /// Go 语义：遍历 `net.InterfaceAddrs()`，与每个 `*net.IPNet` 的 **IP 精确相等** 即判为
 /// 本机（比的是 `ipnet.IP.Equal(ip)`，非「落在该网段内」的包含判定）。
-/// 接口枚举失败 → `false`（Go 返回 error，调用方 `FindProcess` 即失败 → 进程不匹配）。
+/// 枚举失败 → `false`（Go 返回 error，调用方 `FindProcess` 即失败 → 进程不匹配）。
 ///
-/// 用途：`xray-app-router` 的进程反查（UDP 场景按「通配地址 + 同端口」回落时，
-/// 须先确认源地址是本机地址，否则远端对端会被误挂到本机同端口 socket 上）。
+/// 缓存（Go `localIPCache` 等价，bd psbp1-A2）：枚举结果按 **1 分钟 TTL** 进程级缓存
+/// （`net.go:24-52`：`atomic.Pointer` + `time.Since(lastUpdate) > time.Minute` 才重枚举）；
+/// **枚举成功才写缓存**，失败不落盘 ⇒ 下次调用仍重试。消费面 = `xray-app-router`
+/// 进程反查的 TCP/UDP 共同前置门——配了 `process` 路由规则时每连接的决策不再逐次
+/// `getifaddrs`（Go 同款：每分钟至多一次枚举）。
 #[must_use]
 pub fn is_local_ip(ip: IpAddr) -> bool {
-    interface_addrs().is_ok_and(|addrs| addrs.iter().any(|a| a.ip() == ip))
+    // 取时走 `skeleton::clock` 端口（同 `protocol/time.rs` / `log` 的自由函数形态，
+    // 禁裸 `Instant::now`）；枚举函数为内部实现细节，公开 API 与判定语义不变。
+    is_local_ip_with(&LOCAL_IP_CACHE, ip, || SystemClock.now_instant(), interface_ips)
+}
+
+/// 枚举全部接口的单播地址（仅 IP 平铺；Go `IsLocal` 消费的正是 `ipnet.IP`）。
+fn interface_ips() -> io::Result<Vec<IpAddr>> {
+    Ok(get_if_addrs()?.iter().map(|raw| raw.addr.ip()).collect())
+}
+
+/// Go `localIPCacheEntry`（`common/net/net.go:19-23`）等价物：上次枚举的本机接口
+/// 地址集 + 采集时刻（单调钟 `Instant`，只做相对比较，不受墙钟回拨影响）。
+struct LocalIpCacheEntry {
+    refreshed_at: Instant,
+    ips: Vec<IpAddr>,
+}
+
+/// 缓存 TTL：对齐 Go `localIPCache` 的 1 分钟（`net.go:31`
+/// `time.Since(entry.lastUpdate) > time.Minute` 才重枚举）。
+const LOCAL_IP_TTL: Duration = Duration::from_secs(60);
+
+/// 进程级缓存（Go `localIPCache` 的 `atomic.Pointer` 在本仓的 RwLock 等价形态）。
+static LOCAL_IP_CACHE: RwLock<Option<LocalIpCacheEntry>> = RwLock::new(None);
+
+/// `is_local_ip` 的可注入内核（同文件测试用，公开 API 不变）：`cache` / `now` /
+/// `enumerate` 全注入。语义对齐 Go `IsLocal`（`net.go:31-52`）：
+/// 缓存新鲜（`now - refreshed_at <= LOCAL_IP_TTL`）⇒ 直接比对；过期/缺失 ⇒ 重枚举，
+/// 且**枚举成功才写缓存**——Go 枚举失败即返回 error（缓存保持原样），本仓同口径
+/// 返回 `false` 且不更新 `refreshed_at`（下次调用仍会重试，不复用过期数据）。
+fn is_local_ip_with<N, E>(
+    cache: &RwLock<Option<LocalIpCacheEntry>>,
+    ip: IpAddr,
+    now: N,
+    enumerate: E,
+) -> bool
+where
+    N: Fn() -> Instant,
+    E: Fn() -> io::Result<Vec<IpAddr>>,
+{
+    let is_fresh =
+        |entry: &LocalIpCacheEntry| now().saturating_duration_since(entry.refreshed_at) <= LOCAL_IP_TTL;
+    let matches_ip = |entry: &LocalIpCacheEntry| entry.ips.contains(&ip);
+
+    // 快路径：新鲜缓存 ⇒ 只读锁内判定（Go `localIPCache.Load()`）。
+    let guard = cache.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        if is_fresh(entry) {
+            return matches_ip(entry);
+        }
+    }
+    drop(guard);
+
+    // 慢路径：过期/缺失 ⇒ 写锁内二次核对（并发下另一线程可能已刷新），仍过期才枚举。
+    // 枚举期间持有写锁：并发调用串行收敛到单次 getifaddrs（每 TTL 至多一次），
+    // 无锁内重入。锁毒化（持有线程 panic）⇒ 取余留数据继续，不让观测面永久卡死。
+    let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        if is_fresh(entry) {
+            return matches_ip(entry);
+        }
+    }
+    match enumerate() {
+        Ok(ips) => {
+            let hit = ips.contains(&ip);
+            *guard = Some(LocalIpCacheEntry { refreshed_at: now(), ips });
+            hit
+        },
+        Err(_) => false,
+    }
 }
 
 /// 返回所有网络接口，对应 Go `net.Interfaces`（按名字+索引聚合多地址接口）。
@@ -346,5 +420,111 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── is_local_ip 缓存（Go localIPCache TTL 等价，bd psbp1-A2）──
+    // 全走注入内核 `is_local_ip_with`：假枚举计数 + 冻结/可推进时钟，不依赖真实网卡。
+
+    /// TTL 内重复查询必须命中缓存：同一 IP 连续两次调用只枚举一次。
+    #[test]
+    fn is_local_ip_cache_hits_within_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache: RwLock<Option<LocalIpCacheEntry>> = RwLock::new(None);
+        let enumerations = AtomicUsize::new(0);
+        let enumerate = || {
+            enumerations.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))])
+        };
+        // 时钟冻结在采集时刻 ⇒ 缓存永远新鲜。
+        let base = SystemClock.now_instant();
+        let now = || base;
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "缓存地址必须命中");
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "第二次调用仍须命中");
+        assert_eq!(
+            enumerations.load(Ordering::Relaxed),
+            1,
+            "TTL 内重复查询必须命中缓存（只枚举一次）"
+        );
+    }
+
+    /// TTL 过期必须重枚举：把「上次更新时间」推进到 >60s 后第三次调用重新枚举，
+    /// 且新结果在新的 TTL 窗口内继续命中（不再枚举）。
+    #[test]
+    fn is_local_ip_cache_refreshes_after_ttl_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache: RwLock<Option<LocalIpCacheEntry>> = RwLock::new(None);
+        let enumerations = AtomicUsize::new(0);
+        let enumerate = || {
+            enumerations.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))])
+        };
+        let base = SystemClock.now_instant();
+        // 可推进时钟：翻旗后时钟跳到 base + TTL + 1s（越过过期线，不 sleep）。
+        let past_ttl = std::cell::Cell::new(false);
+        let now = || {
+            if past_ttl.get() {
+                base + Duration::from_secs(LOCAL_IP_TTL.as_secs() + 1)
+            } else {
+                base
+            }
+        };
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "冷启动必须枚举并命中");
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "TTL 内第二次调用命中缓存");
+        assert_eq!(enumerations.load(Ordering::Relaxed), 1, "TTL 内不得重枚举");
+
+        past_ttl.set(true);
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "过期后必须重枚举再命中");
+        assert_eq!(enumerations.load(Ordering::Relaxed), 2, "越过 TTL 必须重新枚举");
+    }
+
+    /// 枚举失败不入缓存：失败 ⇒ `false` 且下次调用仍重试（Go `InterfaceAddrs()`
+    /// 失败即返回 err、缓存不落盘的同口径）；恢复成功后才落缓存并停止重试。
+    #[test]
+    fn is_local_ip_enumeration_failure_is_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache: RwLock<Option<LocalIpCacheEntry>> = RwLock::new(None);
+        let enumerations = AtomicUsize::new(0);
+        let fail = std::cell::Cell::new(true);
+        let enumerate = || {
+            enumerations.fetch_add(1, Ordering::Relaxed);
+            if fail.get() {
+                Err(io::Error::other("getifaddrs 注入失败"))
+            } else {
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))])
+            }
+        };
+        let base = SystemClock.now_instant();
+        let now = || base;
+        let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+
+        assert!(!is_local_ip_with(&cache, ip, now, enumerate), "枚举失败 ⇒ false");
+        assert!(!is_local_ip_with(&cache, ip, now, enumerate), "失败不落缓存 ⇒ 仍是 false");
+        assert_eq!(
+            enumerations.load(Ordering::Relaxed),
+            2,
+            "失败不入缓存：每次调用都必须重新枚举"
+        );
+
+        fail.set(false);
+        assert!(is_local_ip_with(&cache, ip, now, enumerate), "恢复后枚举成功 ⇒ 命中");
+        assert_eq!(enumerations.load(Ordering::Relaxed), 3);
+    }
+
+    /// 公开口冒烟（走真实进程级缓存静态）：loopback 必判本机，TEST-NET-3 必非本机。
+    /// 判定语义（IP 精确相等）未因缓存改动。
+    #[test]
+    fn is_local_ip_global_cache_resolves_loopback() {
+        assert!(is_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), "127.0.0.1 必为本机地址");
+        assert!(
+            !is_local_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            "TEST-NET-3 保留段必非本机地址"
+        );
     }
 }

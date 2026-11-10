@@ -2867,10 +2867,15 @@ mod tests {
         assert_eq!(meter.rejected_total(), 5, "累计计数必须覆盖两类");
     }
 
+    /// 闸关计数是**进程级单例**（`CLOSED_SCOPE_METER`）⇒ 任何「读 before 再断言 before+1」
+    /// 的用例必须串行，否则同进程并行测试互相污染（bd 77h4v：偶现 2≠1）。
+    static CLOSED_SCOPE_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// accept 环闸关早检（bd 9tots）：连接被立即拒（对端 EOF）且计数，
     /// 不经 spawn 口（无 compat 拒发 WARN 路径）。
     #[tokio::test]
     async fn serve_vless_closed_scope_rejects_connection_and_counts() {
+        let _counter_guard = CLOSED_SCOPE_COUNTER_LOCK.lock().await;
         let ctx = test_plugin_ctx();
         ctx.arm_scope().close();
         assert!(ctx.arm_scope().is_closed(), "前置：scope 必须已关闸");
@@ -2906,6 +2911,7 @@ mod tests {
     /// 会话早于 idle deadline 收尾且计数。
     #[tokio::test]
     async fn udp_relay_closed_scope_ends_session_and_counts() {
+        let _counter_guard = CLOSED_SCOPE_COUNTER_LOCK.lock().await;
         let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(SilentUdpHandler);
         let (_client_out, server_read, server_write, _client_in, decoded) = udp_relay_fixture();
         let ctx = test_plugin_ctx();

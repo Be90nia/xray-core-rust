@@ -584,7 +584,10 @@ struct ProcessInfo {
 /// （发起方 socket 的本地端，即 xray 看到的对端地址）。任一步失败返回 `None`
 /// （权限不足/不可达），仅令进程匹配不生效，不阻断路由决策。
 ///
-/// **UDP 能力 = Linux + Windows**（Go 同）：源地址非本机地址、或表中无对应行 ⇒ `None`，
+/// **前置门（TCP/UDP 同）**：源地址必须是本机地址（Go `net.IsLocal`），否则 `None`
+/// 不查表——远端目标按端口查表会命中本机恰好同端口的 socket（假命中）。
+///
+/// **UDP 能力 = Linux + Windows**（Go 同）：表中无对应行 ⇒ `None`，
 /// 不静默退化成 TCP 表查询——否则 UDP 命中的是同端口的 TCP socket，语义错误。
 /// macOS/FreeBSD 两协议均 `None`（Go `find_process_others.go` 不收）。
 fn find_process(
@@ -714,6 +717,12 @@ mod proc_linux {
         source_ip: IpAddr,
         source_port: u16,
     ) -> Option<ProcessInfo> {
+        // Go `FindProcess`（find_process_linux.go）在协议分支之前先做 `IsLocal`：
+        // 源地址非本机 ⇒ `ErrNotLocal`，TCP/UDP 同一门。否则远端目标会按端口命中
+        // 本机恰好同端口的 socket（假命中）。
+        if !is_local_ip(source_ip) {
+            return None;
+        }
         let inode = find_socket_inode(network, source_ip, source_port)?;
         let pid = find_pid_by_inode(inode)?;
         read_process_info(pid)
@@ -739,15 +748,11 @@ mod proc_linux {
 
     /// UDP 进程反查（Go v26.11.9 / commit 12b7f85d 语义）。
     ///
-    /// 与 TCP 的差异（均为上游修复点）：
-    /// 1. **源地址必须是本机地址**（Go `net.IsLocal`）——否则 `ErrNotLocal`，条件不命中；
-    /// 2. **两张表都查**：`/proc/net/udp` + `/proc/net/udp6`（Go `procFiles` 列表）；
-    /// 3. **端口回落**：精确 local endpoint 对不上时，回落到「通配地址（`0.0.0.0`/`::`）
+    /// 与 TCP 的差异（均为上游修复点；本机地址门在 `find_process` 入口，两协议共用）：
+    /// 1. **两张表都查**：`/proc/net/udp` + `/proc/net/udp6`（Go `procFiles` 列表）；
+    /// 2. **端口回落**：精确 local endpoint 对不上时，回落到「通配地址（`0.0.0.0`/`::`）
     ///    + 同端口」的 socket——UDP socket 常绑通配地址（Go `portFallback`）。
     fn find_udp_socket_inode(source_ip: IpAddr, source_port: u16) -> Option<u64> {
-        if !is_local_ip(source_ip) {
-            return None;
-        }
         // Go：v4 源先 udp 后 udp6；v6 源先 udp6 后 udp。
         let (first, second) = match source_ip {
             IpAddr::V4(_) => ("/proc/net/udp", "/proc/net/udp6"),
@@ -831,21 +836,20 @@ mod proc_windows {
         source_ip: IpAddr,
         source_port: u16,
     ) -> Option<ProcessInfo> {
+        // Go `FindProcess`（find_process_windows.go）在协议分支之前先做 `IsLocal`：
+        // 源地址非本机 ⇒ `ErrNotLocal`，TCP/UDP 同一门。否则远端目标会按端口命中
+        // 本机恰好同端口的 socket（假命中）。
+        if !is_local_ip(source_ip) {
+            return None;
+        }
         let pid = match network {
             Network::TCP => match source_ip {
                 IpAddr::V4(ip) => find_pid_v4(ip, source_port),
                 IpAddr::V6(ip) => find_pid_v6(ip, source_port),
             },
-            Network::UDP => {
-                // 与 Linux 版（commit f385ec91 / Go `net.IsLocal`）同口径：源地址不是本机
-                // 地址 ⇒ 不是本机 socket 属主，条件不命中（不查表）。
-                if !is_local_ip(source_ip) {
-                    return None;
-                }
-                match source_ip {
-                    IpAddr::V4(ip) => find_udp_pid_v4(ip, source_port),
-                    IpAddr::V6(ip) => find_udp_pid_v6(ip, source_port),
-                }
+            Network::UDP => match source_ip {
+                IpAddr::V4(ip) => find_udp_pid_v4(ip, source_port),
+                IpAddr::V6(ip) => find_udp_pid_v6(ip, source_port),
             },
             // Go `FindProcess` 只接受 tcp/udp（其余 panic）；本仓按「条件不命中」处理。
             Network::Unix => None,
@@ -2092,12 +2096,17 @@ mod tests {
         );
     }
 
-    /// Windows：源地址非本机地址 ⇒ 不查表、返回 None（对齐 Go `net.IsLocal` 的
-    /// `ErrNotLocal` 与 Linux 版同口径）。`203.0.113.7` 属 TEST-NET-3 保留段。
-    #[cfg(target_os = "windows")]
+    /// `process` 条件本机门（Go `net.IsLocal`，TCP/UDP 同门）：远端源地址 ⇒ 不查表、返回
+    /// `None`。`203.0.113.7` 属 TEST-NET-3 保留段，任何主机都不会拥有它。
+    ///
+    /// 「本机目标 ⇒ 反查」由真机用例覆盖：TCP 见 `test_find_process_resolves_self_connection`，
+    /// UDP 见 `test_find_process_resolves_udp_socket_in_other_process`（若门误拒本机地址，
+    /// 那两个用例必挂）。
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
-    fn test_windows_udp_lookup_non_local_source_returns_none() {
+    fn test_process_lookup_non_local_source_returns_none() {
         let ip = std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        assert!(find_process(Network::UDP, ip, 53).is_none(), "非本机源地址不应命中");
+        assert!(find_process(Network::TCP, ip, 53).is_none(), "远端目标 ⇒ TCP 不得反查");
+        assert!(find_process(Network::UDP, ip, 53).is_none(), "远端目标 ⇒ UDP 不得反查");
     }
 }
