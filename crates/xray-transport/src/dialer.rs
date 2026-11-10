@@ -231,12 +231,15 @@ impl StreamSettings {
         }
     }
 
-    /// 启动期 sockopt 数值校验（对齐 Go 解码期硬错）。
+    /// 启动期 sockopt 校验（对齐 Go 解码期硬错）。
+    ///
+    /// 参数是 `streamSettings.sockopt` **子对象**（不是整个 `streamSettings`；
+    /// 取法 `stream_settings_json.and_then(|v| v.get("sockopt"))`）。
     ///
     /// Go `SocketConfig.Build`（infra/conf/transport_sockopt.go:70-84）对
     /// `tcpFastOpen` 非 bool/数字类型硬错；int32 字段越界在 `json.Unmarshal`
     /// 解码期即报错。Rust 此前 `as i32`/`as u32` 静默回绕、非法类型静默忽略，
-    /// 此处在装配期对齐为拒启。
+    /// 此处在装配期对齐为拒启。`interface` 名解析失败同样在此拒启（bd fop51）。
     pub fn validate_sockopt_json(v: Option<&serde_json::Value>) -> std::io::Result<()> {
         const I32_MIN: i64 = i32::MIN as i64;
         const I32_MAX: i64 = i32::MAX as i64;
@@ -299,6 +302,24 @@ impl StreamSettings {
                 "sockopt: invalid TcpKeepAliveIdle or TcpKeepAliveInterval value: \
                  {ka_idle} {ka_interval}"
             )));
+        }
+        // `interface`：名字解析不出来 = 拒启。Go 逐平台核过——windows
+        // sockopt_windows.go:36-39 "failed to find the interface"、darwin
+        // sockopt_darwin.go:136-140/226-230 "failed to get interface <name>"、
+        // linux sockopt_linux.go:23-27 BindToDevice 失败 "failed to set Interface"
+        // 全是硬错（无 warn 路径）。只有 freebsd 例外：sockopt_freebsd.go 的
+        // apply*SocketOptions 完全不读 `Interface`（Go 静默忽略该字段），故 freebsd
+        // 不校验，保持「Go 能起的配置能起」。
+        // 注：`socket_options()` 里仍保留 warn 降级，那是 programmatic 构造面
+        // （不经过此门）的兜底；生产装配必经本函数，故不会静默不绑网卡。
+        #[cfg(not(target_os = "freebsd"))]
+        if let Some(name) = obj.get("interface").and_then(|v| v.as_str()).filter(|n| !n.is_empty())
+        {
+            crate::sockopt::resolve_interface_index(name).map_err(|e| {
+                std::io::Error::other(format!(
+                    "sockopt.interface: failed to get interface {name}: {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -405,12 +426,14 @@ impl StreamSettings {
             opts.dialer_proxy = v.to_string();
         }
         // sockopt.interface → bind_if_index（Go `SocketConfig.Interface` 字段 21，
-        // JSON 键 `interface`/`Interface`，infra/conf/transport_sockopt.go:51；
-        // Go 各平台 apply*SocketOptions 通过 net.InterfaceByName 解析为 interface index
-        // 后填到 IP_BOUND_IF/SO_BINDTODEVICE/IP_UNICAST_IF 等 setsockopt。Rust 端
-        // 提前在 JSON 解析阶段做 name→index 解析，失败时 warn 并保留 bind_if_index=0
-        // 行为对齐 Go `errors.New("failed to get interface ...") -> 返回错` 的宽容
-        // 形态：返回的 Result 让调用方决定 warn 还是硬错；此处降级为 warn+忽略。
+        // JSON 键 `interface`，infra/conf/transport_sockopt.go:51；Go 各平台
+        // apply*SocketOptions 通过 net.InterfaceByName 解析为 interface index 后填到
+        // IP_BOUND_IF/SO_BINDTODEVICE/IP_UNICAST_IF 等 setsockopt）。Rust 端提前在
+        // JSON 解析阶段做 name→index 解析，避免 connect/accept 高频路径上 syscall。
+        //
+        // 解析失败在装配期已被 [`Self::validate_sockopt_json`] 硬拒（bd fop51，
+        // 对齐 Go 三平台硬错），这里的 warn 降级只剩 programmatic 构造面
+        // （不经配置门的直接构造）可达，属兜底而非生产路径。
         if let Some(v) = obj.get("interface").and_then(|v| v.as_str()) {
             use crate::sockopt::resolve_interface_index;
             match resolve_interface_index(v) {
@@ -915,7 +938,9 @@ mod transport_cache_tests {
             "interface={} 应解析为该适配器索引",
             iface.name
         );
-        // 不存在的网卡名 → 不静默取 0（warn 路径保留，索引仍为 0 = 不绑定）。
+        // 不存在的网卡名：`socket_options()` 这一层（programmatic 构造面）仍降级
+        // warn + 索引 0；生产装配必经 `validate_sockopt_json` 硬拒（bd fop51，
+        // 见 `validate_sockopt_json_rejects_unknown_interface`）。
         s.sockopt_json = Some(serde_json::json!({ "interface": "no-such-adapter-doubj" }));
         assert_eq!(s.socket_options().bind_if_index, 0);
     }
@@ -1032,6 +1057,53 @@ mod transport_cache_tests {
         // 缺省/null。
         assert!(StreamSettings::validate_sockopt_json(None).is_ok());
         assert!(StreamSettings::validate_sockopt_json(Some(&serde_json::Value::Null)).is_ok());
+    }
+
+    /// bd fop51：`sockopt.interface` 名字解析失败 ⇒ 装配期 Err（Go windows
+    /// sockopt_windows.go:36-39 "failed to find the interface"、darwin :136-140
+    /// "failed to get interface <name>"、linux :23-27 BindToDevice 失败，全是硬错）。
+    /// 消息必须能定位到写错的那个名字。
+    #[test]
+    fn validate_sockopt_json_rejects_unknown_interface() {
+        use super::StreamSettings;
+        let obj = serde_json::json!({ "interface": "no-such-nic-xyz" });
+        let err = StreamSettings::validate_sockopt_json(Some(&obj))
+            .expect_err("unknown interface must reject at assembly");
+        assert!(err.to_string().contains("no-such-nic-xyz"), "{err}");
+    }
+
+    /// 不回归：`interface` 未配置 / 空串（Go `config.Interface != ""` 门）仍放行。
+    #[test]
+    fn validate_sockopt_json_accepts_absent_or_empty_interface() {
+        use super::StreamSettings;
+        assert!(StreamSettings::validate_sockopt_json(Some(&serde_json::json!({}))).is_ok());
+        assert!(
+            StreamSettings::validate_sockopt_json(Some(&serde_json::json!({ "interface": "" })))
+                .is_ok()
+        );
+        assert!(StreamSettings::validate_sockopt_json(None).is_ok());
+    }
+
+    /// 真实存在网卡名放行：windows 取首个枚举适配器，linux `lo`，macOS `lo0`。
+    /// freebsd 不在此测：Go `sockopt_freebsd.go` 根本不读 `Interface`，本仓同样不校验。
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn validate_sockopt_json_accepts_existing_interface() {
+        use super::StreamSettings;
+        #[cfg(windows)]
+        let name = xray_common::net::interface::interfaces()
+            .expect("enumerate adapters")
+            .into_iter()
+            .find(|i| i.index > 0)
+            .expect("at least one adapter with an ifindex")
+            .name;
+        #[cfg(target_os = "linux")]
+        let name = String::from("lo");
+        #[cfg(target_os = "macos")]
+        let name = String::from("lo0");
+        let obj = serde_json::json!({ "interface": name });
+        StreamSettings::validate_sockopt_json(Some(&obj))
+            .unwrap_or_else(|e| panic!("interface={name} 应放行：{e}"));
     }
 
     /// 票 037f：domainStrategy / addressPortStrategy 非法值装配期硬错（对齐 Go

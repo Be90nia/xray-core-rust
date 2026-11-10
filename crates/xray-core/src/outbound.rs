@@ -804,9 +804,12 @@ pub(crate) fn build_protocol_handler(
         ob.target_strategy.as_deref().and_then(parse_target_strategy).filter(|s| s.has_strategy());
     // sendThrough（bd 7zc）：outbound 顶层字段 → 源地址规格（Go xray.go:287-301）
     let send_through = parse_send_through(&ob.send_through)?;
-    // sockopt 数值/类型启动期硬错（Go 解码期语义）。
-    xray_transport::dialer::StreamSettings::validate_sockopt_json(ob.stream_settings_json.as_ref())
-        .map_err(|e| BuildError::Parse(e.to_string()))?;
+    // sockopt 数值/类型启动期硬错（Go 解码期语义；参数须是 `streamSettings.sockopt`
+    // 子对象，传整个 streamSettings 会让本门恒空转，bd fop51 顺带修）。
+    xray_transport::dialer::StreamSettings::validate_sockopt_json(
+        ob.stream_settings_json.as_ref().and_then(|v| v.get("sockopt")),
+    )
+    .map_err(|e| BuildError::Parse(e.to_string()))?;
 
     // T4.2 phase 4 / W1-1a：构造走 xray-frame PluginRegistry（唯一路径，旧 match
     // 已删）。注册表值转发 phase 1 同一构造函数；未命中 = 未支持协议，显式

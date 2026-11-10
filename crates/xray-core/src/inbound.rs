@@ -4655,9 +4655,11 @@ pub(crate) async fn spawn_one_inbound(
         return build_inbound(ctor.stream, ib, ohm, policy, shutdown_token, "", &settings, api)
             .await;
     }
-    // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。
+    // sockopt 数值/类型启动期硬错（Go 解码期语义；tcp/unix 监听分支共用）。参数须是
+    // `streamSettings.sockopt` 子对象——传整个 streamSettings 会让本门恒空转（键全在
+    // `sockopt` 下，bd fop51 顺带修）。
     xray_transport::dialer::StreamSettings::validate_sockopt_json(
-        ib.stream_settings_json.as_ref(),
+        ib.stream_settings_json.as_ref().and_then(|v| v.get("sockopt")),
     )?;
 
     let listen = ib.listen.as_deref().unwrap_or("0.0.0.0");
