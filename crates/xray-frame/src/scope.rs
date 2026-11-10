@@ -876,6 +876,53 @@ mod tests {
         assert_eq!(scope.in_flight(), 0, "任务结束后在途归零");
     }
 
+    /// ADR-0004 §2.9 G2 / bd bbvuo（**受理路径真入账**，审计 P2-1 核心缺口）：
+    /// **泵形态**——组件内 accept 环只持 [`ScopeRef`] 弱引用（B2 破环形态），
+    /// 每受理一条连接经 `ScopeRef::spawn` 下发进组件账本。断言链：
+    /// ①停机前受理 ⇒ `in_flight` 0→N（**真入账**：受理环改回裸 spawn 此处必红）；
+    /// ②关闸后泵仍受理（停机竞态窗口）⇒ 拒发**计数递增**、新连接不入账；
+    /// ③已受理的在途任务不被 abort（关闸档，照常跑完）；④收尾归零。
+    #[tokio::test]
+    async fn accept_pump_via_scope_ref_counts_rejects_and_keeps_in_flight() {
+        let owner = ComponentScope::new("accept-pump");
+        let pump = owner.downgrade();
+
+        // ① 泵受理 2 条「连接」：任务挂起等服务（oneshot 放行，无睡眠余量面），
+        // 经弱引用句柄下发 → 必须真入账本。
+        let mut conns = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            releases.push(release_tx);
+            conns.push(
+                pump.spawn(async move {
+                    let _ = release_rx.await;
+                })
+                .expect("停机前受理必入账"),
+            );
+        }
+        assert_eq!(owner.in_flight(), 2, "受理路径真入账（受理环改裸 spawn 此处必红）");
+
+        // ② 停机第一步关闸（关闸档），泵不知情继续受理。
+        owner.close_gate();
+        for _ in 0..3 {
+            assert!(pump.spawn(std::future::pending::<()>()).is_err(), "关闸后受理必拒");
+        }
+        assert_eq!(owner.rejected_spawns(), 3, "拒发必须逐条计入聚合计数");
+        assert_eq!(owner.in_flight(), 2, "拒发不入账、已受理的在途不受影响");
+
+        // ③ 放行在途：任务照常跑完（若被 abort，join 必 Err 而非 Ok）。
+        for release_tx in releases {
+            let _ = release_tx.send(());
+        }
+        for conn in conns {
+            assert_eq!(conn.join().await, Ok(()), "关闸不得 abort 在途任务");
+        }
+
+        // ④ join 唤醒必晚于归零（udf FlightGuard 与结果落账同一 poll），零残留。
+        assert_eq!(owner.in_flight(), 0);
+    }
+
     /// ADR-0004 §2.6 A3：**排空是唯一「在途归零」保证**——`drain()` 返回 udf
     /// `ShutdownReport{ panicked, timed_out }`；`timed_out > 0` 走 error 级上报。
     ///

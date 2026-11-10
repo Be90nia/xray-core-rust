@@ -40,8 +40,12 @@ async fn spawn_joins_value_through_scope() {
     assert_eq!(spawned.join().await.expect("task ok"), 42);
 }
 
+/// ② 透传层特有语义（A2 收敛，bd bbvuo）：闸的作用面 = 仅 spawn 托管口——
+/// 拒发错误原样透传 udf `ScopeClosed`（零包装、不裹 PluginError）；而
+/// `with_deadline` 是纯 timeout 形态、不经 accepting 闸，闸关后照常透传值。
+/// 机制级「关闸拒发 + 在途不 abort」由 src/scope.rs A2 canonical 覆盖。
 #[tokio::test]
-async fn spawn_after_close_is_scope_closed() {
+async fn gate_close_shuts_only_the_spawn_face() {
     let fx = ArmScope::new();
     fx.close();
     let ctx = PluginContext::new(
@@ -54,10 +58,15 @@ async fn spawn_after_close_is_scope_closed() {
         LogFacade::new("stub", vec![]),
         Arc::new(xray_frame::AuditHandle::new(xray_frame::DEFAULT_AUDIT_RING_CAP)),
     );
-    assert!(matches!(
-        ctx.spawn(async {}),
-        Err(ScopeClosed) // 闸关拒新 spawn（fx.rs:264 契约透传）
-    ));
+    assert!(matches!(ctx.spawn(async {}), Err(ScopeClosed)));
+
+    // 闸关不波及其他托管面：with_deadline 照常透传值（作用面独立的负向锚——
+    // 若有人把闸检查错误地加进 with_deadline，此处必红）。
+    let value = ctx
+        .with_deadline(async { 21 * 2 }, Duration::from_secs(1))
+        .await
+        .expect("with_deadline 不经 accepting 闸，闸关后照常");
+    assert_eq!(value, 42);
 }
 
 #[tokio::test]

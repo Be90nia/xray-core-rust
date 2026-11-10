@@ -11,7 +11,7 @@ use skeleton_infra::fx::{ScopeClosed, cancel_pair, expect_idle};
 use xray_frame::{
     context::{PluginContext, derive_fingerprint},
     logging::LogFacade,
-    scope::ArmScope,
+    scope::{ArmScope, ConnScope},
 };
 
 const FIXED_ADDR: &str = "127.0.0.1:10808";
@@ -44,15 +44,34 @@ async fn spawn_joins_value_and_expect_idle_passes() {
     expect_idle(fx.fx());
 }
 
-/// ② 闸关拒新：close 后 ctx.spawn → Err(ScopeClosed)（fail-closed 显式，
-/// 禁静默丢弃 future）。
+/// ② ArmScope.close 的本层独有语义（A2 收敛，bd bbvuo）：close = 关闸 + watch
+/// 广播**复合**——udf `FxScope::close` 零通知、`ComponentScope::close_gate` 无
+/// 广播，广播级联只在本层存在：`child_of` 子 scope 事件驱动级联（在途任务收
+/// 取消形状 `None`、与完成可区分；取消令牌置位；子闸不关——子闸归子自己的
+/// close）。机制级「关闸拒发 + 在途不 abort」由 src/scope.rs A2 canonical
+/// （close_gate_rejects_new_spawns_but_keeps_in_flight）覆盖，此处不重复断言。
 #[tokio::test]
-async fn spawn_after_close_is_scope_closed() {
+async fn close_broadcasts_and_cascades_to_child_scope() {
     let fx = ArmScope::new();
-    let ctx = ctx_with(Arc::clone(&fx));
+    let child = ConnScope::child_of(&fx);
+    let observe = child.spawn(std::future::pending::<()>()).expect("子 scope 新建即 accepting");
+
     fx.close();
-    assert!(fx.is_closed());
-    assert!(matches!(ctx.spawn(async {}), Err(ScopeClosed)));
+    // 事件驱动级联（监视任务挂 watch `changed()`，无定时器）：纯让渡等监视任务
+    // 跑一拍——无睡眠余量问题（CI timer 饿死面，bd P2-6 同款回避）。
+    for _ in 0..200 {
+        if child.token().is_cancelled() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(child.token().is_cancelled(), "父关必须经广播级联取消子 scope");
+    assert_eq!(
+        observe.join().await,
+        Ok(None),
+        "在途任务收取消形状 None（与完成可区分，禁静默当成功）"
+    );
+    assert!(!child.is_closed(), "级联只走取消通道，不关子闸（子闸归子自己的 close）");
 }
 
 /// ③ close 放行在途：闸关后已 spawn 任务照常收值；收值即净，expect_idle 通过
