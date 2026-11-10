@@ -278,6 +278,8 @@ xray-frame/ipstack（移动来源 = wireguard netstack.rs，语义键同名）
 
 ### B6 —— h3 模式（**阻塞，待决策**，4–6 人日）
 
+> **PM 裁定（2026-11-11，已生效）**：本批 **M3 押后，暂不 vendor**（选 ③）。依据：h2 路径已覆盖协议全功能；`vendor/h3` 需跟随上游 breaking 长期维护（0.0.8 的 `ext::Protocol` 是闭集，`proto` 还挂在 `i-implement-a-third-party-backend-*` feature 下），维护成本 > 收益。**M3 在 M2 收口后重新评估**：若届时 h3 上游已支持 `connect-ip` 则直接升级；若仍闭集且确有 h3 需求，再走 ADR-M4 + `vendor/h3`（与 `vendor/quinn-proto` 同款先例）。**禁现在 vendor**。
+
 前置条件：`h3` crate 能表达 `:protocol=connect-ip`。当前 `h3-0.0.8/src/ext.rs` 的 `ProtocolInner` 是闭集（仅 `WebTransport`/`ConnectUdp`），**0.0.8 已是 crates.io 最新**。三个选项（需 PM 拍板，见 §7 R11 + ADR 建议 ADR-M4）：① `vendor/h3` patch（增 `ConnectIp` 变体 + `Protocol::from_static`），代价≈2 人日 + 上游追赶债；② 自写 QUIC DATAGRAM 承载（Go h3 分支走 QUIC DATAGRAM 而非胶囊，`conn.go:673-683`），代价高且违「禁造轮子」；③ 押后到 h3 上游支持（本仓 h3 主要用于 splithttp，升级需复测）。
 
 ---
