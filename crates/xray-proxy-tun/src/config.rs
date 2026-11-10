@@ -126,8 +126,10 @@ pub struct StackOptions {
     /// （Go config.proto field 9；Linux/FreeBSD 语义，Windows 运行时忽略——Go 同）。
     /// Rust proto 镜像为 7 字段（bd v5g）未含此键，仅 JSON 入。
     pub auto_system_dns_to_gateway: bool,
-    /// Windows WFP 泄漏阻断开关。JSON `"autoSystemWfpBlockLeak"`，合法值
-    /// `"dns"` / `"misconfigtun"`（Go infra/conf/tun.go:28,42-49，值统一小写）。
+    /// Windows WFP 泄漏阻断开关。JSON `"autoSystemWfpBlockLeak"`，值文法见
+    /// [`crate::wfp::leak`]（`dns` / `windnsclient` / `misconfigtun` / `all` /
+    /// `allexceptlan` / `icmp` / `tcp` / `udp` + 端口 + CIDR）；存的是展开后的规范写法
+    /// （Go infra/conf/tun.go 的 `ExpandWfpBlockLeak`），未知值拒启。
     /// Rust proto 镜像为 7 字段（bd v5g）未含此键，仅 JSON 入。
     pub auto_system_wfp_block_leak: Vec<String>,
 }
@@ -195,8 +197,10 @@ impl StackOptions {
         if let Some(b) = v.get("autoSystemDnsToGateway").and_then(|x| x.as_bool()) {
             opts.auto_system_dns_to_gateway = b;
         }
-        // autoSystemWfpBlockLeak（Go tun.go:28，Windows WFP 防泄漏过滤器，合法值
-        // "dns"/"misconfigtun"）：值统一小写，其它值按 Go 同款报错（Go tun.go:42-49）。
+        // autoSystemWfpBlockLeak（Go tun.go:26-49，Windows WFP 防泄漏过滤器）：值文法
+        // 见 `wfp::leak`（`dns`/`misconfigtun`/`all`/`allexceptlan`/`windnsclient`/
+        // `icmp`/`tcp`/`udp` + 端口 + CIDR）。未知值拒启（fail-visible）；合法值按 Go
+        // 展开成规范写法后存（`dns` → 53/853/windnsclient，CIDR 归一，端口归一）。
         // 空数组/null 在 Go 侧同为无操作，放行；非数组类型手误按"已设置"拒启
         // （bd zl5t 惯例）。
         if let Some(w) = v.get("autoSystemWfpBlockLeak").filter(|x| !x.is_null()) {
@@ -204,17 +208,8 @@ impl StackOptions {
                 TunError::InvalidConfig("autoSystemWfpBlockLeak: expected string array".into())
             })?;
             let raw = str_list(arr, "autoSystemWfpBlockLeak")?;
-            let mut leaks = Vec::with_capacity(raw.len());
-            for value in raw {
-                let leak = value.to_lowercase();
-                if !matches!(leak.as_str(), "dns" | "misconfigtun") {
-                    return Err(TunError::InvalidConfig(format!(
-                        "unknown autoSystemWfpBlockLeak value: {leak}"
-                    )));
-                }
-                leaks.push(leak);
-            }
-            opts.auto_system_wfp_block_leak = leaks;
+            opts.auto_system_wfp_block_leak =
+                crate::wfp::leak::expand(&raw).map_err(TunError::InvalidConfig)?;
         }
         // 平台交叉校验（Go tun.go:51-60）：Windows 上非空须有 autoSystemRoutingTable，
         // 含 "dns" 须有 dns 列表。非 Windows：WFP 是 Windows 专有机制，非空即拒
@@ -226,9 +221,15 @@ impl StackOptions {
                     "autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set".into(),
                 ));
             }
-            if opts.auto_system_wfp_block_leak.iter().any(|l| l == "dns") && opts.dns.is_empty() {
+            // 把系统的 DNS 留在 TUN 内（53 / 853 / windnsclient / all / …）就需要 TUN
+            // 自己的 DNS 服务器（Go tun.go:54-56）。
+            if crate::wfp::leak::blocks_system_dns(&opts.auto_system_wfp_block_leak)
+                && opts.dns.is_empty()
+            {
                 return Err(TunError::InvalidConfig(
-                    "autoSystemWfpBlockLeak \"dns\" needs dns to be set".into(),
+                    "autoSystemWfpBlockLeak \"all\", \"allexceptlan\", \"dns\", \"windnsclient\", \
+                     or TCP or UDP port 53, needs dns to be set"
+                        .into(),
                 ));
             }
         }
@@ -612,24 +613,42 @@ mod tests {
         assert!(StackOptions::parse_json(b"{}").is_ok());
     }
 
-    /// Windows 平台：合法值 + 必备设置 → 解析成功（值统一小写）。
-    /// Go infra/conf/tun.go:42-49（小写归一）+ :52-60（交叉校验）。
+    /// Windows 平台：合法值 + 必备设置 → 解析成功（值按 Go 展开）。
+    /// Go infra/conf/tun.go:40-60（ExpandWfpBlockLeak + 交叉校验）。
     #[cfg(windows)]
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（StackOptions 无 Debug，禁 expect_err）
     fn parse_json_wfp_block_leak_windows_platform_rules() {
-        // Go tun_test.go:30-32 同款输入（大小写归一 + 两值并存）
+        // Go tun_test.go:30-32 同款输入（大小写归一 + dns 展开）
         let opts = StackOptions::parse_json(
             br#"{"dns":["1.1.1.1"],"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["DNS","MisconfigTun"]}"#,
         )
         .unwrap();
-        assert_eq!(opts.auto_system_wfp_block_leak, vec!["dns", "misconfigtun"]);
+        assert_eq!(
+            opts.auto_system_wfp_block_leak,
+            vec!["53", "853", "windnsclient", "misconfigtun"]
+        );
         // 仅 misconfigtun：不需 dns 列表
         let opts = StackOptions::parse_json(
             br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["misconfigtun"]}"#,
         )
         .unwrap();
         assert_eq!(opts.auto_system_wfp_block_leak, vec!["misconfigtun"]);
+        // 新文法：CIDR + 端口区间 + 全端口归一（Go tun_test.go:55-57 同款输入）
+        let opts = StackOptions::parse_json(
+            br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["1.1.1.1/24:TCP/853","[2001:DB8::/32]:udp/10-20","[::/0]:ICMP","853"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            opts.auto_system_wfp_block_leak,
+            vec!["1.1.1.0/24:tcp/853", "[2001:db8::/32]:udp/10-20", "[::/0]:icmp", "853"]
+        );
+        // `tcp/1-65535` 与 `tcp` 同义；`tcp` 覆盖 53，故需要 dns 列表。
+        let opts = StackOptions::parse_json(
+            br#"{"dns":["1.1.1.1"],"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["tcp/1-65535","udp/1-65535"]}"#,
+        )
+        .unwrap();
+        assert_eq!(opts.auto_system_wfp_block_leak, vec!["tcp", "udp"]);
         // 非空但缺 autoSystemRoutingTable → 拒（Go tun.go:53-55）
         let err = StackOptions::parse_json(br#"{"autoSystemWfpBlockLeak":["misconfigtun"]}"#)
             .err()
@@ -639,14 +658,17 @@ mod tests {
             msg.contains("autoSystemWfpBlockLeak needs autoSystemRoutingTable to be set"),
             "{msg}"
         );
-        // 含 dns 但缺 dns 列表 → 拒（Go tun.go:56-58）
-        let err = StackOptions::parse_json(
-            br#"{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["dns"]}"#,
-        )
-        .err()
-        .expect("dns leak without dns list must reject");
-        let msg = err.to_string();
-        assert!(msg.contains("autoSystemWfpBlockLeak \"dns\" needs dns to be set"), "{msg}");
+        // 把系统 DNS 留在 TUN 内但缺 dns 列表 → 拒（Go tun.go:56-58）：端口写法同样命中
+        for value in ["dns", "udp/53", "windnsclient", "all", "allexceptlan"] {
+            let json = format!(
+                r#"{{"autoSystemRoutingTable":["0.0.0.0/0"],"autoSystemWfpBlockLeak":["{value}"]}}"#
+            );
+            let err = StackOptions::parse_json(json.as_bytes())
+                .err()
+                .unwrap_or_else(|| panic!("{value} 缺 dns 列表必须拒"));
+            let msg = err.to_string();
+            assert!(msg.contains("needs dns to be set"), "{value}: {msg}");
+        }
     }
 
     /// 非 Windows 平台：WFP 是 Windows 专有机制，非空即报错（票 5std M7：

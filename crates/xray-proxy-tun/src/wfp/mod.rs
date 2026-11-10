@@ -6,13 +6,15 @@
 //!   RAII，关闭即删除。
 //!
 //! 配置入口是 `StackOptions::auto_system_wfp_block_leak`（对应 Go
-//! `infra/conf/tun.go:28`，合法值 `dns` / `misconfigtun`）。
+//! `infra/conf/tun.go` 的 `AutoSystemWfpBlockLeak`）：值文法与展开见 [`leak`]。
 
+pub mod leak;
 pub mod spec;
 
 #[cfg(windows)]
 pub mod sys;
 
+pub use leak::{Leak, Prefix, blocks_system_dns, describe, expand, new_leak_filters};
 pub use spec::{
     Condition, Field, FilterSpec, Layer, LeakFilterInput, MatchType, Value, dns_outside_tun,
     leak_filter_specs,

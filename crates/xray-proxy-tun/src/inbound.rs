@@ -108,29 +108,11 @@ const RELAY_POLL_MS: u64 = 5;
 
 // ===== Windows WFP 泄漏阻断（Go proxy/tun/tun_windows.go:254-272）=====
 //
-// 纯函数（flag 映射 / 路由族判定 / 错误文本）放这里便于任意平台单测；实际
-// 安装调用在 `start()` 的 `#[cfg(target_os = "windows")]` 段内。
+// 值文法与 `newLeakFilters` 等价物在 `wfp::leak`；纯函数（路由族判定 / 错误文本）
+// 放这里便于任意平台单测，实际安装调用在 `start()` 的
+// `#[cfg(target_os = "windows")]` 段内。
 // 非 Windows 平台 config 层已对非空 `autoSystemWfpBlockLeak` 拒启
 // （config.rs），此处不做任何事。
-
-/// Go `tun_windows.go:254-257` 的泄漏阻断 flag 映射。
-///
-/// - `block_dns` = leaks 含 `"dns"` 且 dns 已配置（Go `len(dns) > 0`）；
-/// - `block_ipv4` = leaks 含 `"misconfigtun"` 且该版本没有路由指向 TUN；
-/// - `block_ipv6` = 同上，v6 版本。
-///
-/// `leaks` 的取值已由 config 层统一小写（config.rs，对齐 Go infra/conf/tun.go:42-49）。
-#[cfg(any(target_os = "windows", test))]
-fn leak_block_flags(
-    leaks: &[String],
-    dns_configured: bool,
-    route4: bool,
-    route6: bool,
-) -> (bool, bool, bool) {
-    let has_dns = leaks.iter().any(|l| l == "dns");
-    let has_misconfigtun = leaks.iter().any(|l| l == "misconfigtun");
-    (has_dns && dns_configured, has_misconfigtun && !route4, has_misconfigtun && !route6)
-}
 
 /// 路由计划里各 IP 版本是否有路由指向 TUN（Go `tun_windows.go:127-133`：按
 /// 路由表条目的地址族置位 route4 / route6——**不是**只认默认路由）。
@@ -144,23 +126,12 @@ fn route_families(plan: Option<&crate::sysroute::RoutePlan>) -> (bool, bool) {
     (route4, route6)
 }
 
-/// WFP 阻断失败时的错误文本（Go `tun_windows.go:260-272`：被阻断项按
-/// DNS → IPv4 → IPv6 顺序用 " and " 拼接）。
+/// WFP 阻断失败时的错误文本（Go `tun_windows.go`：被挡在 TUN 之外的值按
+/// `leakFilters.String()` 的写法逗号拼接）。
 #[cfg(any(target_os = "windows", test))]
-fn wfp_block_error_message(block_dns: bool, block_ipv4: bool, block_ipv6: bool) -> String {
-    let mut blocked = Vec::new();
-    if block_dns {
-        blocked.push("DNS");
-    }
-    if block_ipv4 {
-        blocked.push("IPv4");
-    }
-    if block_ipv6 {
-        blocked.push("IPv6");
-    }
+fn wfp_block_error_message(blocked: &str) -> String {
     format!(
-        "unable to block {} outside the TUN (remove autoSystemWfpBlockLeak to run without)",
-        blocked.join(" and ")
+        "unable to block {blocked} outside the TUN (remove autoSystemWfpBlockLeak to run without)"
     )
 }
 
@@ -377,21 +348,31 @@ impl InboundHandler for TunInboundHandler {
         }
 
         // Windows：WFP 泄漏阻断过滤器（Go tun_windows.go:254-272）——系统路由就绪
-        // 后才装：路由指向 TUN 的版本不阻断，无路由的版本禁出站。
-        // 装不上宁可无 TUN 也不泄漏（Go 同：启动失败）。
+        // 后才装：路由指向 TUN 的版本交给其它值，`misconfigtun` 只作用于没有路由的
+        // 版本。装不上宁可无 TUN 也不泄漏（Go 同：启动失败）。
         #[cfg(target_os = "windows")]
         {
             let (route4, route6) = {
                 let applied = self.applied_sysroute.lock();
                 route_families(applied.as_ref().and_then(|a| a.routes.as_ref()))
             };
-            let (block_dns, block_ipv4, block_ipv6) = leak_block_flags(
-                &cfg.auto_system_wfp_block_leak,
-                !cfg.dns.is_empty(),
-                route4,
-                route6,
-            );
-            if (route4 || route6) && (block_dns || block_ipv4 || block_ipv6) {
+            let mut block =
+                crate::wfp::leak::new_leak_filters(&cfg.auto_system_wfp_block_leak, route4, route6);
+            if route4 || route6 {
+                // Windows 11 / Server 2022 之前 DNS Client 服务只查 53 端口，
+                // 那版本不需要它这一族过滤器。
+                if block.iter().any(|leak| leak.name == "windnsclient")
+                    && !crate::wfp::sys::dns_client_uses_any_port()
+                {
+                    block.retain(|leak| leak.name != "windnsclient");
+                    crate::TUN_LOG.info(
+                        "[tun] windnsclient skipped: before Windows 11 and Server 2022, the DNS \
+                         Client service only queries port 53",
+                    );
+                }
+            }
+            let blocked = crate::wfp::leak::describe(&block);
+            if (route4 || route6) && !blocked.is_empty() {
                 // 过滤器绑定 TUN 接口索引（Go 用 wintun adapter 的 LUID；
                 // Rust 侧 `wfp::sys::install` 由索引换算 LUID）。
                 let if_index = match device.index() {
@@ -409,13 +390,11 @@ impl InboundHandler for TunInboundHandler {
                         return Err(e);
                     },
                 };
-                match crate::wfp::sys::install(if_index, block_dns, block_ipv4, block_ipv6) {
+                match crate::wfp::sys::install(if_index, &block) {
                     Ok(guard) => {
                         *self.leak_filter.lock() = Some(guard);
                         crate::TUN_LOG.info(format!(
-                            "[tun] outside the TUN, blocked DNS: {block_dns}, blocked IPv4: \
-                             {block_ipv4}, blocked IPv6: {block_ipv6} tag={} block_dns={block_dns} \
-                             block_ipv4={block_ipv4} block_ipv6={block_ipv6}",
+                            "[tun] blocked outside the TUN: {blocked} tag={} blocked={blocked}",
                             self.tag
                         ));
                         // 覆盖集合（gateway + autoSystemRoutingTable）外的 DNS 服务器
@@ -427,7 +406,7 @@ impl InboundHandler for TunInboundHandler {
                         self.rollback_start(&device);
                         return Err(InboundError::ListenError(format!(
                             "{}: {e}",
-                            wfp_block_error_message(block_dns, block_ipv4, block_ipv6)
+                            wfp_block_error_message(&blocked)
                         )));
                     },
                 }
@@ -2669,122 +2648,16 @@ mod tests {
         assert_eq!(received, payload, "uplink payload must arrive byte-exact");
     }
 
-    /// Go tun_windows.go:254-257 映射的表驱动单测。
-    ///
-    /// 语义：`dns` 需 dns 已配置才阻断；`misconfigtun` 逐版本阻断——该版本
-    /// 没有路由指向 TUN 才阻断（route4/route6 = 该版本是否有路由）。
+    /// WFP 阻断失败时的错误文本：Go 把 `leakFilters.String()` 原样拼进文案。
     #[test]
-    fn leak_block_flags_table() {
-        /// 一个用例：输入 → 期望的三个阻断 flag。
-        struct Case {
-            leaks: &'static [&'static str],
-            dns_configured: bool,
-            route4: bool,
-            route6: bool,
-            want: (bool, bool, bool),
-        }
-        let cases = [
-            // 空列表 → 全不阻断
-            Case {
-                leaks: &[],
-                dns_configured: true,
-                route4: true,
-                route6: true,
-                want: (false, false, false),
-            },
-            // 仅 dns：dns 已配置才阻断 DNS
-            Case {
-                leaks: &["dns"],
-                dns_configured: true,
-                route4: true,
-                route6: true,
-                want: (true, false, false),
-            },
-            Case {
-                leaks: &["dns"],
-                dns_configured: false,
-                route4: true,
-                route6: true,
-                want: (false, false, false),
-            },
-            // 仅 misconfigtun：逐版本，有路由的版本不阻断
-            Case {
-                leaks: &["misconfigtun"],
-                dns_configured: true,
-                route4: true,
-                route6: true,
-                want: (false, false, false),
-            },
-            Case {
-                leaks: &["misconfigtun"],
-                dns_configured: true,
-                route4: true,
-                route6: false,
-                want: (false, false, true),
-            },
-            Case {
-                leaks: &["misconfigtun"],
-                dns_configured: true,
-                route4: false,
-                route6: true,
-                want: (false, true, false),
-            },
-            Case {
-                leaks: &["misconfigtun"],
-                dns_configured: true,
-                route4: false,
-                route6: false,
-                want: (false, true, true),
-            },
-            // 混合
-            Case {
-                leaks: &["dns", "misconfigtun"],
-                dns_configured: true,
-                route4: true,
-                route6: false,
-                want: (true, false, true),
-            },
-            Case {
-                leaks: &["dns", "misconfigtun"],
-                dns_configured: false,
-                route4: false,
-                route6: false,
-                want: (false, true, true),
-            },
-        ];
-        for c in &cases {
-            let leaks: Vec<String> = c.leaks.iter().map(|s| (*s).to_string()).collect();
-            assert_eq!(
-                leak_block_flags(&leaks, c.dns_configured, c.route4, c.route6),
-                c.want,
-                "leaks={:?} dns_configured={} route4={} route6={}",
-                c.leaks,
-                c.dns_configured,
-                c.route4,
-                c.route6
-            );
-        }
-    }
-
-    /// WFP 阻断失败时的错误文本：Go 按 DNS → IPv4 → IPv6 顺序列出被阻断项。
-    #[test]
-    fn wfp_block_error_message_lists_blocked_items() {
-        let msg = wfp_block_error_message(true, true, false);
-        assert!(
-            msg.contains(
-                "unable to block DNS and IPv4 outside the TUN (remove autoSystemWfpBlockLeak to run without)"
-            ),
-            "{msg}"
-        );
-        // Go 顺序：DNS → IPv4 → IPv6
+    fn wfp_block_error_message_lists_blocked_values() {
         assert_eq!(
-            wfp_block_error_message(true, true, true),
-            "unable to block DNS and IPv4 and IPv6 outside the TUN (remove autoSystemWfpBlockLeak to run without)"
+            wfp_block_error_message("53, misconfigtun"),
+            "unable to block 53, misconfigtun outside the TUN (remove autoSystemWfpBlockLeak to run without)"
         );
-        // 仅 IPv6 被阻断
         assert_eq!(
-            wfp_block_error_message(false, false, true),
-            "unable to block IPv6 outside the TUN (remove autoSystemWfpBlockLeak to run without)"
+            wfp_block_error_message("[::/0]:misconfigtun"),
+            "unable to block [::/0]:misconfigtun outside the TUN (remove autoSystemWfpBlockLeak to run without)"
         );
     }
 

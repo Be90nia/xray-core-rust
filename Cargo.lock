@@ -6242,6 +6242,7 @@ dependencies = [
  "xray-features",
  "xray-frame",
  "xray-proxy-freedom",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -6538,6 +6539,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tun-rs",
  "uuid",
  "windows-sys 0.59.0",

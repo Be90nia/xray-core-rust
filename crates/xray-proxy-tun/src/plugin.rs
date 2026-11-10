@@ -283,7 +283,11 @@ mod tests {
         assert_eq!(opts.auto_outbounds_interface.as_deref(), Some("auto"));
         assert!(opts.auto_system_dns_to_gateway);
         if cfg!(windows) {
-            assert_eq!(opts.auto_system_wfp_block_leak, vec!["dns".to_string()]);
+            // 值按 Go `ExpandWfpBlockLeak` 展开后存（`dns` → 53/853/windnsclient）。
+            assert_eq!(
+                opts.auto_system_wfp_block_leak,
+                vec!["53".to_string(), "853".to_string(), "windnsclient".to_string()]
+            );
         } else {
             assert!(opts.auto_system_wfp_block_leak.is_empty(), "非 Windows 平台该键不可用");
         }

@@ -34,7 +34,10 @@ use windows_sys::{
     core::{GUID, PWSTR},
 };
 
-use super::spec::{DNS_CLIENT_SID, LeakFilterInput, WINDOWS_DOH_DNS_BUILD, leak_filter_specs};
+use super::{
+    leak::Leak,
+    spec::{DNS_CLIENT_SID, LeakFilterInput, WINDOWS_DOH_DNS_BUILD, leak_filter_specs},
+};
 
 /// `RPC_C_AUTHN_WINNT`（Go `rpcCAuthnWinNT`，:35）。
 const RPC_C_AUTHN_WINNT: u32 = 10;
@@ -57,31 +60,20 @@ impl Drop for LeakFilterGuard {
 /// 安装泄漏阻断过滤器。
 ///
 /// - `tun_if_index`：TUN 接口索引（由 `tun-rs` 的 `if_index()` 给出）→ 换算成 LUID；
-/// - `dns` / `ipv4` / `ipv6`：分别阻断 DNS / IPv4 / IPv6 泄漏（Go `tun_windows.go:254-257`）。
+/// - `block`：要挡在 TUN 之外的连接（[`super::leak::new_leak_filters`] 的输出）。
 ///
 /// # Errors
 ///
 /// 权限不足、引擎打开失败、过滤器添加失败等，返回可诊断错误文本。
-pub fn install(
-    tun_if_index: u32,
-    dns: bool,
-    ipv4: bool,
-    ipv6: bool,
-) -> Result<LeakFilterGuard, String> {
+pub fn install(tun_if_index: u32, block: &[Leak]) -> Result<LeakFilterGuard, String> {
     let tun_luid = interface_luid(tun_if_index)?;
-    install_with_luid(tun_luid, dns, ipv4, ipv6)
+    install_with_luid(tun_luid, block)
 }
 
 /// 以**已知 LUID** 安装（接口索引已换算好的场景；也用于真机自检时用哑 LUID）。
-pub fn install_with_luid(
-    tun_luid: u64,
-    dns: bool,
-    ipv4: bool,
-    ipv6: bool,
-) -> Result<LeakFilterGuard, String> {
+pub fn install_with_luid(tun_luid: u64, block: &[Leak]) -> Result<LeakFilterGuard, String> {
     let app_id = current_exe_app_id()?;
-    let build = windows_build();
-    let dns_client_sd = if dns && build >= WINDOWS_DOH_DNS_BUILD {
+    let dns_client_sd = if block.iter().any(|leak| leak.name == "windnsclient") {
         Some(dns_client_security_descriptor()?)
     } else {
         None
@@ -89,13 +81,17 @@ pub fn install_with_luid(
     let specs = leak_filter_specs(&LeakFilterInput {
         tun_luid,
         app_id,
-        dns,
-        ipv4,
-        ipv6,
-        windows_build: build,
+        block: block.to_vec(),
         dns_client_sd,
     });
     install_specs(&specs)
+}
+
+/// DNS Client 服务是否可能用任意端口：Windows 11 / Server 2022（build 20348）起走
+/// DoH/DoT。老版本只查 53 端口，故调用方把 `windnsclient` 从 block 里剔掉（Go 同）。
+#[must_use]
+pub fn dns_client_uses_any_port() -> bool {
+    windows_build() >= WINDOWS_DOH_DNS_BUILD
 }
 
 /// 打开动态会话引擎（Go `openWFPEngine`，:222）。
@@ -218,6 +214,12 @@ struct CondArena {
     u64s: Vec<Box<u64>>,
     /// 16 字节地址。
     arrays: Vec<Box<wfp::FWP_BYTE_ARRAY16>>,
+    /// IPv4 地址 + 掩码（条件以指针引用）。
+    v4_masks: Vec<Box<wfp::FWP_V4_ADDR_AND_MASK>>,
+    /// IPv6 地址 + 前缀长度。
+    v6_masks: Vec<Box<wfp::FWP_V6_ADDR_AND_MASK>>,
+    /// 端口区间（`FWP_RANGE0`）。
+    ranges: Vec<Box<wfp::FWP_RANGE0>>,
 }
 
 impl CondArena {
@@ -246,6 +248,38 @@ impl CondArena {
         let mut boxed = Box::new(wfp::FWP_BYTE_ARRAY16 { byteArray16: value });
         let ptr = &mut *boxed as *mut wfp::FWP_BYTE_ARRAY16;
         self.arrays.push(boxed);
+        ptr
+    }
+
+    /// 分配一个 IPv4 地址 + 掩码（`FWP_V4_ADDR_AND_MASK`），返回稳定指针。
+    fn v4_addr_mask(&mut self, addr: u32, mask: u32) -> *mut wfp::FWP_V4_ADDR_AND_MASK {
+        let mut boxed = Box::new(wfp::FWP_V4_ADDR_AND_MASK { addr, mask });
+        let ptr = &mut *boxed as *mut wfp::FWP_V4_ADDR_AND_MASK;
+        self.v4_masks.push(boxed);
+        ptr
+    }
+
+    /// 分配一个 IPv6 地址 + 前缀长度（`FWP_V6_ADDR_AND_MASK`），返回稳定指针。
+    fn v6_addr_mask(
+        &mut self,
+        addr: [u8; 16],
+        prefix_length: u8,
+    ) -> *mut wfp::FWP_V6_ADDR_AND_MASK {
+        let mut boxed = Box::new(wfp::FWP_V6_ADDR_AND_MASK { addr, prefixLength: prefix_length });
+        let ptr = &mut *boxed as *mut wfp::FWP_V6_ADDR_AND_MASK;
+        self.v6_masks.push(boxed);
+        ptr
+    }
+
+    /// 分配一个端口区间（`FWP_RANGE0`：两端是内联的 `FWP_VALUE0`），返回稳定指针。
+    fn port_range(&mut self, low: u16, high: u16) -> *mut wfp::FWP_RANGE0 {
+        let value = |port: u16| wfp::FWP_VALUE0 {
+            r#type: wfp::FWP_UINT16,
+            Anonymous: wfp::FWP_VALUE0_0 { uint16: port },
+        };
+        let mut boxed = Box::new(wfp::FWP_RANGE0 { valueLow: value(low), valueHigh: value(high) });
+        let ptr = &mut *boxed as *mut wfp::FWP_RANGE0;
+        self.ranges.push(boxed);
         ptr
     }
 }
@@ -285,12 +319,25 @@ fn build_conditions(
                     let p = arena.array16(*a);
                     (wfp::FWP_BYTE_ARRAY16_TYPE, wfp::FWP_CONDITION_VALUE0_0 { byteArray16: p })
                 },
+                super::spec::Value::PortRange { low, high } => {
+                    let p = arena.port_range(*low, *high);
+                    (wfp::FWP_RANGE_TYPE, wfp::FWP_CONDITION_VALUE0_0 { rangeValue: p })
+                },
+                super::spec::Value::V4AddrMask { addr, mask } => {
+                    let p = arena.v4_addr_mask(*addr, *mask);
+                    (wfp::FWP_V4_ADDR_MASK, wfp::FWP_CONDITION_VALUE0_0 { v4AddrMask: p })
+                },
+                super::spec::Value::V6AddrMask { addr, prefix_length } => {
+                    let p = arena.v6_addr_mask(*addr, *prefix_length);
+                    (wfp::FWP_V6_ADDR_MASK, wfp::FWP_CONDITION_VALUE0_0 { v6AddrMask: p })
+                },
             };
             wfp::FWPM_FILTER_CONDITION0 {
                 fieldKey: field_guid(c.field),
                 matchType: match c.match_type {
                     super::spec::MatchType::Equal => wfp::FWP_MATCH_EQUAL,
                     super::spec::MatchType::FlagsAllSet => wfp::FWP_MATCH_FLAGS_ALL_SET,
+                    super::spec::MatchType::Range => wfp::FWP_MATCH_RANGE,
                 },
                 conditionValue: wfp::FWP_CONDITION_VALUE0 { r#type: ty, Anonymous: anon },
             }
@@ -428,5 +475,50 @@ fn check(status: u32, what: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{what} failed with status 0x{status:08x}"))
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod tests {
+    use std::mem::{offset_of, size_of};
+
+    use super::wfp;
+
+    /// 传给 fwpuclnt.dll 的结构体布局必须与 MSVC 的产出一致（Go `TestWFPStructLayout`
+    /// 同款 64 位期望值）——新增条件类型时最容易挑错 size / 对齐，而错了只有真机
+    /// 装过滤器时才暴露。
+    #[test]
+    fn new_wfp_struct_layouts_match_go() {
+        assert_eq!(
+            (size_of::<wfp::FWP_RANGE0>(), offset_of!(wfp::FWP_RANGE0, valueHigh)),
+            (32, 16),
+            "FWP_RANGE0"
+        );
+        assert_eq!(
+            (size_of::<wfp::FWP_V4_ADDR_AND_MASK>(), offset_of!(wfp::FWP_V4_ADDR_AND_MASK, mask)),
+            (8, 4),
+            "FWP_V4_ADDR_AND_MASK"
+        );
+        assert_eq!(
+            (
+                size_of::<wfp::FWP_V6_ADDR_AND_MASK>(),
+                offset_of!(wfp::FWP_V6_ADDR_AND_MASK, prefixLength),
+            ),
+            (17, 16),
+            "FWP_V6_ADDR_AND_MASK"
+        );
+        assert_eq!(
+            (size_of::<wfp::FWP_VALUE0>(), offset_of!(wfp::FWP_VALUE0, Anonymous)),
+            (16, 8),
+            "FWP_VALUE0"
+        );
+        assert_eq!(
+            (
+                size_of::<wfp::FWPM_FILTER_CONDITION0>(),
+                offset_of!(wfp::FWPM_FILTER_CONDITION0, conditionValue),
+            ),
+            (40, 24),
+            "FWPM_FILTER_CONDITION0"
+        );
     }
 }

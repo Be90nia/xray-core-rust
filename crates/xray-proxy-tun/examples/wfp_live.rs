@@ -82,9 +82,25 @@ fn main() {
     let luid = real_luid.unwrap_or(0x1122_3344_5566_7788);
     log.line(&format!("tun luid = 0x{luid:016x} (real={})", real_luid.is_some()));
 
-    // dns/ipv4/ipv6 三类全开 → 覆盖全部条件类型（appid blob / 端口 u16 / LUID u64 /
-    // 安全描述符 blob / u8 / u32 / addr16）。
-    let guard = match xray_proxy_tun::wfp::sys::install_with_luid(luid, true, true, true) {
+    // 全类值 → 覆盖全部条件类型（appid blob / 端口 u16 / 端口区间 / 地址+掩码 /
+    // LUID u64 / 安全描述符 blob / u8 / u32 / addr16）。两个版本都没有路由时
+    // `misconfigtun` 才落在两个版本上。
+    let values: Vec<String> = [
+        "dns",
+        "allexceptlan",
+        "all",
+        "udp/10-20",
+        "1.1.1.0/24:tcp/853",
+        "[2000::/3]:icmp",
+        "misconfigtun",
+    ]
+    .iter()
+    .map(|value| (*value).to_string())
+    .collect();
+    let leaks = xray_proxy_tun::wfp::leak::expand(&values).expect("示例值是合法值");
+    let block = xray_proxy_tun::wfp::leak::new_leak_filters(&leaks, false, false);
+    log.line(&format!("block: {}", xray_proxy_tun::wfp::leak::describe(&block)));
+    let guard = match xray_proxy_tun::wfp::sys::install_with_luid(luid, &block) {
         Ok(g) => {
             log.line("install: OK (engine+transaction+sublayer+filters committed)");
             g
