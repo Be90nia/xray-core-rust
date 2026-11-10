@@ -14,6 +14,9 @@ xray-frame = { path = "../xray-frame" }
 xray-crypto = { path = "../xray-crypto" }
 # xdns ResolverConfig 无损承载 Go ResolverProto 的 tls_config/quic_config 生成类型
 xray-proto = { path = "../xray-proto" }
+# finalmask `filter`：复用既有 IPMatcher（Go `filter` 同样 import common/geodata，
+# `geodata.IPReg.BuildIPMatcher` 的等价物）。xray-geodata 只依赖 xray-common ⇒ 无环。
+xray-geodata = { path = "../xray-geodata" }
 # xdns Go wire 互操作测试（proto Config decode/encode）
 prost = { workspace = true }
 thiserror = "1"

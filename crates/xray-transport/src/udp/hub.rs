@@ -792,4 +792,33 @@ mod tests {
         assert_eq!(packet.source, client_addr);
         assert!(packet.target.is_none());
     }
+
+    /// udpmask `filter`（源 IP 准入）：hub 侧 `recv_from` 里被拒来源的包不投递，
+    /// 白名单命中的来源正常投递。来源恒为本机 127.0.0.1。
+    #[tokio::test]
+    async fn udp_hub_udpmask_filter_drops_rejected_source() {
+        use crate::finalmask::build_udpmask_manager_from_json;
+
+        async fn delivered(settings: serde_json::Value) -> bool {
+            let fm = serde_json::json!({"udp": [{"type": "filter", "settings": settings}]});
+            let mgr = build_udpmask_manager_from_json(Some(&fm)).expect("manager");
+            let hub = UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], Some(mgr))
+                .await
+                .expect("listen with udpmask");
+            let hub_addr = hub.local_addr().expect("local_addr");
+            let mut rx = hub.receive();
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind client");
+            client.send_to(b"probe", hub_addr).await.expect("client send_to");
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await.is_ok()
+        }
+
+        // ① 白名单含本机来源 ⇒ 投递。
+        assert!(delivered(serde_json::json!({"allowedSourceIPs": ["127.0.0.1"]})).await);
+        // ② 白名单不含本机来源 ⇒ 丢弃。
+        assert!(!delivered(serde_json::json!({"allowedSourceIPs": ["192.0.2.0/24"]})).await);
+        // ③ 黑名单命中本机来源 ⇒ 丢弃。
+        assert!(!delivered(serde_json::json!({"blockedSourceIPs": ["127.0.0.0/8"]})).await);
+        // ④ 两表皆空 ⇒ 投递（不包装）。
+        assert!(delivered(serde_json::json!({})).await);
+    }
 }

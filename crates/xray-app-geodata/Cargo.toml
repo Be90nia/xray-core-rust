@@ -32,6 +32,9 @@ tracing = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
+# bd 1qmer B-6：gzip 响应体流式解压（Go `gzip.NewReader(br)`）。workspace 既有依赖
+# （rust_backend = miniz_oxide 纯 Rust），零新 crate 入图。
+flate2 = { workspace = true }
 
 [dev-dependencies]
 xray-geodata = { path = "../xray-geodata" }

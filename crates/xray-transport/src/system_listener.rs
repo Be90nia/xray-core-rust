@@ -1938,4 +1938,44 @@ mod tcpmask_tests {
         let _ = client.shutdown().await;
         server.await.expect("server task");
     }
+
+    /// `filter` 掩码走真实监听路径（`accept_masked` → `apply_tcpmasks`，`addrs.remote`
+    /// 必须是真实 peer）：白名单命中放行、未命中拒（服务端读到 EOF）。来源恒为本机
+    /// 127.0.0.1（客户端不绑地址）。
+    #[tokio::test]
+    async fn filter_source_policy_applied_on_accept_path() {
+        async fn accepted_reads(settings: serde_json::Value) -> std::io::Result<Vec<u8>> {
+            let mask =
+                manager(serde_json::json!({"tcp": [{"type": "filter", "settings": settings}]}));
+            let listener = InboundTcpListener::bind("127.0.0.1:0", SocketOptions::default())
+                .await
+                .expect("bind")
+                .with_tcpmask_manager(Some(mask));
+            let addr = listener.local_addr().expect("local_addr");
+            #[allow(clippy::disallowed_methods, reason = "测试：listener server 任务")]
+            let server = tokio::spawn(async move {
+                let (mut conn, _peer) = listener.accept_masked().await.expect("accept_masked");
+                let mut buf = [0u8; 2];
+                conn.read_exact(&mut buf).await.map(|_| buf.to_vec())
+            });
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            // 被拒时服务端包装期已 close 底层连接：对端写可能 EPIPE，判定只看服务端读到什么。
+            let _ = client.write_all(b"hi").await;
+            server.await.expect("server task")
+        }
+
+        // ① 白名单含本机来源（裸 IP 形态）⇒ 放行且数据送达。
+        let settings = serde_json::json!({"allowedSourceIPs": ["127.0.0.1"]});
+        assert_eq!(accepted_reads(settings).await.expect("allowlisted"), b"hi");
+        // ② 白名单不含本机来源 ⇒ 拒。
+        let settings = serde_json::json!({"allowedSourceIPs": ["192.0.2.0/24"]});
+        let err = accepted_reads(settings).await.expect_err("not allowlisted");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // ③ 黑名单命中本机来源 ⇒ 拒。
+        let settings = serde_json::json!({"blockedSourceIPs": ["127.0.0.0/8"]});
+        let err = accepted_reads(settings).await.expect_err("blocked");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // ④ 两表皆空 ⇒ 恒放行（不包装）。
+        assert_eq!(accepted_reads(serde_json::json!({})).await.expect("empty policy"), b"hi");
+    }
 }

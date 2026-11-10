@@ -416,6 +416,10 @@ impl AssetDownloader for RealAssetDownloader {
 /// `max_size` = 下载体上限（Go `maxDownloadSize`，默认 [`MAX_DOWNLOAD_SIZE`]）：
 /// ① `Content-Length > max_size` → 头部即拒；② 落盘字节累计 `> max_size` → 中止拒收
 /// （Go `io.LimitReader(body, max+1)` + `n > max` 的等价语义：恰好 max 允许，max+1 拒）。
+///
+/// gzip：body 前两字节为 `1f 8b` 时流式解压后落盘（Go `gzip.NewReader(br)`），
+/// 此时 ② 的上限作用在**解压后**字节。内存上界与 body 大小无关：8 KiB 读缓冲 +
+/// 解码器自带 8 KiB BufReader + 32 KiB inflate 窗口。
 fn read_http_body<R: std::io::Read>(
     mut stream: R,
     url: &str,
@@ -424,7 +428,8 @@ fn read_http_body<R: std::io::Read>(
     deadline: std::time::Instant,
     max_size: u64,
 ) -> Result<Option<String>, GeodataError> {
-    use std::io::Write;
+    // gzip 分支的 `Cursor::take` / `Chain` 需要 `Read` 的扩展方法在 scope 内。
+    use std::io::Read;
 
     // 读 headers 到 \r\n\r\n。
     let mut header_buf = Vec::with_capacity(512);
@@ -515,70 +520,123 @@ fn read_http_body<R: std::io::Read>(
         reason: format!("create temp file: {e}"),
     })?;
 
-    let mut total: u64 = 0;
-    if let Some(len) = content_length {
-        let mut remaining = len;
-        let mut chunk = vec![0u8; 8192.min(len)];
-        while remaining > 0 {
-            let to_read = chunk.len().min(remaining);
-            match stream.read(&mut chunk[..to_read]) {
-                Ok(0) => break,
-                Ok(n) => {
-                    // Go `io.Copy(writer, io.LimitReader(body, max+1))` + `n > max → 拒`：
-                    // 恰好 max 允许，max+1 拒收。本仓落盘前即判（不把超限字节写进 temp）。
-                    if total + n as u64 > max_size {
-                        return Err(GeodataError::DownloadTooLarge { limit: max_size });
-                    }
-                    out.write_all(&chunk[..n])?;
-                    remaining -= n;
-                    total += n as u64;
-                },
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return Err(GeodataError::IdleTimeout);
-                },
-                Err(e) => {
-                    return Err(GeodataError::DownloadFailed {
-                        url: url.to_string(),
-                        reason: format!("read body: {e}"),
-                    });
-                },
-            }
+    // gzip magic 探测（Go `br.Peek(2)`；判定条件 `len(header) == 2 && 1f 8b`）：
+    // 只看前两字节，与文件名/URL 后缀无关。不足 2 字节 → 按非 gzip 处理。
+    let mut head = [0u8; 2];
+    let mut head_len = 0usize;
+    while head_len < head.len() {
+        if clock.now_instant() > deadline {
+            return Err(GeodataError::IdleTimeout);
         }
-    } else {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if total + n as u64 > max_size {
-                        return Err(GeodataError::DownloadTooLarge { limit: max_size });
-                    }
-                    out.write_all(&chunk[..n])?;
-                    total += n as u64;
-                },
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    break;
-                },
-                Err(e) => {
-                    return Err(GeodataError::DownloadFailed {
-                        url: url.to_string(),
-                        reason: format!("read body: {e}"),
-                    });
-                },
-            }
+        match stream.read(&mut head[head_len..]) {
+            Ok(0) => break,
+            Ok(n) => head_len += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(GeodataError::IdleTimeout);
+            },
+            Err(e) => {
+                return Err(GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("read body head: {e}"),
+                });
+            },
         }
     }
+    let is_gzip = head[..head_len] == [0x1f_u8, 0x8b];
+    // 已 peek 的字节接回 body 流（Go 侧由 bufio.Reader 天然回填）。
+    let mut body = std::io::Cursor::new(head).take(head_len as u64).chain(stream);
+
+    let total = if is_gzip {
+        // 上限作用在**解压后**字节（Go `io.LimitReader(zr, max+1)`）：防解压炸弹。
+        // 截断/损坏的 gzip 由解码器报错（footer EOF → `unexpected end of file`），
+        // 半截 temp 文件由 `download_one` 在错误路径删掉，不会静默当资产用。
+        //
+        // 用单 member `GzDecoder`：读完本 member footer 即返 Ok(0)，不再向底层流多读
+        // 一次。Go `gzip.Reader` 缺省 Multistream 会再探下一 member，但那要越过 body
+        // 末尾再读 —— rustls 在无 close_notify 的 EOF 上报错（Go `crypto/tls` 视为正常
+        // EOF），多 member 探测会把正常响应变成错误。geodata 资产是单 member gzip。
+        let mut decoder = flate2::read::GzDecoder::new(&mut body);
+        copy_body(&mut decoder, &mut out, url, max_size, None, OnTimeout::Fail)?
+    } else {
+        let on_timeout = if content_length.is_some() { OnTimeout::Fail } else { OnTimeout::Eof };
+        copy_body(&mut body, &mut out, url, max_size, content_length, on_timeout)?
+    };
 
     if total == 0 {
         return Err(GeodataError::EmptyResponse(url.to_string()));
     }
     Ok(None)
+}
+
+/// 读 body 时遇到 `WouldBlock` / `TimedOut`（socket 读超时）的语义。
+enum OnTimeout {
+    /// 中止（数据不完整：已知 Content-Length，或正在解压的 gzip 流）。
+    Fail,
+    /// 视为 body 结束（历史行为：未知长度的明文流）。
+    Eof,
+}
+
+/// 把 `reader` 流式写到 `out`，返回落盘字节数。
+///
+/// Go `io.Copy(writer, io.LimitReader(body, max+1))` + `n > max → 拒` 的等价语义：
+/// 恰好 `max_size` 允许，超 1 字节即拒（超限字节不写进 temp）。
+/// `content_length` 只用于把单次读取上界钳在该长度内；未知长度或解压后的 gzip 流
+/// 传 `None`（此时读到 EOF 为止）。
+///
+/// 内存上界：固定 8 KiB 栈缓冲，与 body 大小无关。
+fn copy_body<R: std::io::Read>(
+    reader: &mut R,
+    out: &mut std::fs::File,
+    url: &str,
+    max_size: u64,
+    content_length: Option<usize>,
+    on_timeout: OnTimeout,
+) -> Result<u64, GeodataError> {
+    use std::io::Write;
+
+    let mut chunk = [0u8; 8192];
+    let mut remaining = content_length;
+    let mut total: u64 = 0;
+    loop {
+        let want = match remaining {
+            Some(0) => break,
+            Some(r) => r.min(chunk.len()),
+            None => chunk.len(),
+        };
+        match reader.read(&mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                if total + n as u64 > max_size {
+                    return Err(GeodataError::DownloadTooLarge { limit: max_size });
+                }
+                out.write_all(&chunk[..n])?;
+                total += n as u64;
+                if let Some(r) = remaining.as_mut() {
+                    *r -= n;
+                }
+            },
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                match on_timeout {
+                    OnTimeout::Fail => return Err(GeodataError::IdleTimeout),
+                    OnTimeout::Eof => break,
+                }
+            },
+            Err(e) => {
+                return Err(GeodataError::DownloadFailed {
+                    url: url.to_string(),
+                    reason: format!("read body: {e}"),
+                });
+            },
+        }
+    }
+    Ok(total)
 }
 
 /// rustls 0.23 同步 TLS 握手：吃 std TCP，包成 `rustls::Stream<ClientConnection, TcpStream>`。
@@ -1251,6 +1309,128 @@ mod tests {
         ];
         let stages = download_assets(&dl, &assets).unwrap();
         assert_eq!(stages.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试用 gzip 压缩（Go 侧用 `compress/gzip`）。
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// 拼一个 200 响应（`content_length` = 是否带 Content-Length 头）。
+    fn response(body: &[u8], with_content_length: bool) -> Vec<u8> {
+        let mut resp = if with_content_length {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes()
+        } else {
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec()
+        };
+        resp.extend_from_slice(body);
+        resp
+    }
+
+    fn body_into(resp: Vec<u8>, temp: &std::path::Path, max_size: u64) -> Result<(), GeodataError> {
+        read_http_body(
+            std::io::Cursor::new(resp),
+            "https://example.com/geoip.dat",
+            temp,
+            &SystemClock,
+            SystemClock.now_instant() + std::time::Duration::from_secs(5),
+            max_size,
+        )
+        .map(|_| ())
+    }
+
+    /// 非 gzip body 原样落盘（前两字节 peek 后必须把这两个字节接回流，不得吞字节）。
+    #[test]
+    fn read_http_body_passes_through_non_gzip_body() {
+        let dir = unique_dir("gz_none");
+        let temp = dir.join("out.tmp");
+        let payload = b"NOT-GZIP-PAYLOAD-0123456789".to_vec();
+        for with_cl in [true, false] {
+            body_into(response(&payload, with_cl), &temp, 1024).expect("非 gzip 应原样落盘");
+            assert_eq!(std::fs::read(&temp).unwrap(), payload, "with_content_length={with_cl}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gzip body 解压后落盘（Go `gzip.NewReader(br)`）。
+    #[test]
+    fn read_http_body_decompresses_gzip_body() {
+        let dir = unique_dir("gz_ok");
+        let temp = dir.join("out.tmp");
+        let plain = b"GZIP-PAYLOAD-0123456789".repeat(64);
+        let packed = gzip(&plain);
+        assert!(packed.starts_with(&[0x1f, 0x8b]));
+        body_into(response(&packed, true), &temp, 1024 * 1024).expect("gzip 应解压落盘");
+        assert_eq!(std::fs::read(&temp).unwrap(), plain);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上限作用在**解压后**字节（Go `io.LimitReader(zr, max+1)`）：压缩体远小于上限
+    /// 也要拒 —— 防解压炸弹。
+    #[test]
+    fn read_http_body_rejects_gzip_expanding_over_limit() {
+        let dir = unique_dir("gz_bomb");
+        let temp = dir.join("out.tmp");
+        let plain = vec![b'x'; 4096];
+        let packed = gzip(&plain);
+        assert!(
+            packed.len() < 1024,
+            "压缩体必须小于上限，才能真正验到解压后计数，实际 {}",
+            packed.len()
+        );
+        let err = body_into(response(&packed, true), &temp, 1024).unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadTooLarge { limit: 1024 }), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空 body → `empty response body`（Go `n == 0` 判定）。
+    #[test]
+    fn read_http_body_rejects_empty_body() {
+        let dir = unique_dir("empty_body");
+        let temp = dir.join("out.tmp");
+        let err = body_into(response(b"", false), &temp, 1024).unwrap_err();
+        assert!(matches!(err, GeodataError::EmptyResponse(_)), "got {err:?}");
+        // 合法但解压后为空的 gzip 同样按空 body 处理（Go 计数在解压后）。
+        let empty_gz = gzip(b"");
+        let err = body_into(response(&empty_gz, true), &temp, 1024).unwrap_err();
+        assert!(matches!(err, GeodataError::EmptyResponse(_)), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 截断的 gzip → 报错（禁静默写半截文件）。
+    #[test]
+    fn read_http_body_rejects_truncated_gzip() {
+        let dir = unique_dir("gz_trunc");
+        let temp = dir.join("out.tmp");
+        let packed = gzip(&b"GZIP-PAYLOAD-0123456789".repeat(64));
+        let cut = packed.len() / 2;
+        let err = body_into(response(&packed[..cut], true), &temp, 1024 * 1024).unwrap_err();
+        assert!(matches!(err, GeodataError::DownloadFailed { .. }), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 端到端：gzip 响应经真实 `download_to`（TLS 回环）解压落盘 —— 证明 gzip 分支
+    /// 接在生产下载入口上（`fetch_once` → `read_http_body`）。
+    #[test]
+    fn download_over_tls_decompresses_gzip_payload() {
+        let dir = unique_dir("gz_e2e");
+        let plain = b"GZIP-E2E-PAYLOAD-".repeat(32);
+        let packed = gzip(&plain);
+        let (addr, cert) = spawn_tls_responder(response(&packed, true));
+
+        let dl = RealAssetDownloader::new(dir.clone()).with_extra_root_cert(cert);
+        let url = format!("https://127.0.0.1:{}/geoip.dat", addr.port());
+        let temp = dir.join("gzipped.tmp");
+        dl.download_to(&url, &temp).expect("gzip https 下载应成功");
+        assert_eq!(std::fs::read(&temp).unwrap(), plain);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5686,6 +5686,7 @@ dependencies = [
 name = "xray-app-geodata"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "parking_lot",
  "prost",
  "rcgen 0.13.2",
@@ -6806,6 +6807,7 @@ dependencies = [
  "xray-crypto",
  "xray-features",
  "xray-frame",
+ "xray-geodata",
  "xray-proto",
 ]
 

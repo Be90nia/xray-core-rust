@@ -35,6 +35,7 @@ use tokio::{
 // hot-log 归口（能力收敛方案 §2 面 4）: PacketIoConn 每包收发队列满/关闭记录
 // —— 经 crate::HOT_LOG 栈缓冲门面（先过滤后格式化，级别未命中零格式化零分配）
 pub mod custom;
+pub mod filter;
 pub mod fragment;
 pub mod mkcp;
 pub mod noise;
@@ -897,6 +898,7 @@ pub fn build_udpmask_manager(config: &FinalmaskConfig) -> io::Result<UdpmaskMana
 ///   intervallocal/intervalremote/perconnremote + remoteIPs 前缀随机 + remotePorts
 ///   轮换，interval>=5s 双层校验）
 /// - `header-custom` —— `custom::Config`（自定义 UDP 头，`mode`=prefix/standalone）
+/// - `filter` —— `filter::FilterConfig`（源 IP 准入，服务端 `recv_from` 丢包）
 ///
 /// 未知 mask 类型返回 `InvalidInput`（不静默丢配置）。`None` 或空 `udp` 数组返回
 /// 空 manager（无 mask 行为不变）。
@@ -974,6 +976,8 @@ fn build_udpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Udpmask>
             let (udp, udp_standalone) = build_custom_udp(&settings)?;
             Ok(Box::new(custom::Config { udp, udp_standalone, ..custom::Config::default() }))
         },
+        // 源 IP 准入（Go `filter`）：Go 侧同时是 UDPMask 与 TCPMask。
+        "filter" => build_filter_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
         // 票 4kq9：client-only 连接级包装（Go udphop/config.go WrapPacketConnServer
         // 报 client only，server 侧同构拒绝；interval>=5 双层校验在模块内）。
         "udphop" => build_udphop_config(&settings).map(|c| Box::new(c) as Box<dyn Udpmask>),
@@ -1036,6 +1040,8 @@ fn build_mkcp_legacy_udpmask(settings: &serde_json::Value) -> io::Result<Box<dyn
 /// - `sudoku` —— `SudokuConfig`（与 UDP 同一配置形态）
 /// - `xmc` —— `xmc::Config`（Minecraft 握手伪装，profiles + password 派生 RSA）
 /// - `header-custom` —— `custom::Config`（自定义 TCP 序列 clients/servers/errors）
+/// - `filter` —— `filter::FilterConfig`（源 IP 准入，服务端 accept 后拒；排首位 即为最外层，见
+///   [`filter`] 模块注释）
 ///
 /// 未知 mask 类型返回 `InvalidInput`。`None` / 缺失 `tcp` 键 / 空数组 → 空 manager。
 ///
@@ -1074,6 +1080,7 @@ fn build_tcpmask_entry(entry: &serde_json::Value) -> io::Result<Box<dyn Tcpmask>
             Box::new(custom::Config { tcp: Some(tcp), ..custom::Config::default() })
                 as Box<dyn Tcpmask>
         }),
+        "filter" => build_filter_config(&settings).map(|c| Box::new(c) as Box<dyn Tcpmask>),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("finalmask: unsupported tcp mask type {other:?}"),
@@ -1407,6 +1414,53 @@ fn build_custom_udp(
     };
     let cfg = custom::UDPConfig { client: read_items("client")?, server: read_items("server")? };
     Ok(if mode == "standalone" { (None, Some(cfg)) } else { (Some(cfg), None) })
+}
+
+/// Go `Filter.Build`（`infra/conf/transport_finalmask.go:107-114`）→ [`filter::FilterConfig`]。
+///
+/// 键名取 Go 的 `blockedSourceIPs` / `allowedSourceIPs`，兼收 proto 字段名
+/// `blocked_source_ips` / `allowed_source_ips`（同 `fragment` 的双名惯例）。
+/// 规则字符串由 [`filter::FilterConfig::from_rules`] 解析（`!` 反向 / CIDR / 非法硬错）。
+///
+/// **未知键硬错**：filter 是安全控制，键名写错（如 `blockedSourceIp`）若被静默忽略
+/// = 以为拦了实际全放行——与 bd 5w5z0（规则被静默丢弃后语义翻转）同族。
+fn build_filter_config(settings: &serde_json::Value) -> io::Result<filter::FilterConfig> {
+    let blocked_keys = ["blockedSourceIPs", "blocked_source_ips"];
+    let allowed_keys = ["allowedSourceIPs", "allowed_source_ips"];
+    if !settings.is_null() {
+        let obj = settings
+            .as_object()
+            .ok_or_else(|| mask_err("finalmask: filter: \"settings\" must be an object"))?;
+        for key in obj.keys() {
+            if !blocked_keys.contains(&key.as_str()) && !allowed_keys.contains(&key.as_str()) {
+                return Err(mask_err(format!(
+                    "finalmask: filter: unknown settings key {key:?} (expected \"blockedSourceIPs\" \
+                     / \"allowedSourceIPs\")"
+                )));
+            }
+        }
+    }
+    let read_rules = |keys: &[&str; 2], label: &str| -> io::Result<Option<Vec<String>>> {
+        let Some(value) = keys.iter().find_map(|key| settings.get(key)) else {
+            return Ok(None);
+        };
+        let items = value.as_array().ok_or_else(|| {
+            mask_err(format!("finalmask: filter: \"{label}\" must be an array of IP rules"))
+        })?;
+        items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    mask_err(format!("finalmask: filter: \"{label}\" entries must be strings"))
+                })
+            })
+            .collect::<io::Result<Vec<String>>>()
+            .map(Some)
+    };
+    filter::FilterConfig::from_rules(
+        read_rules(&blocked_keys, "blockedSourceIPs")?.as_deref(),
+        read_rules(&allowed_keys, "allowedSourceIPs")?.as_deref(),
+    )
 }
 
 /// Go `NoiseMask.Build` → `noise::NoiseConfig`。
@@ -2938,10 +2992,11 @@ mod tests {
                 {"type":"xdns","settings":{"domains":[{"names":["t.example.com"],"types":[16]}],"resolvers":[{"addrs":["1.1.1.1:53"]}]}},
                 {"type":"xicmp","settings":{"ips":["10.0.0.1"]}},
                 {"type":"realm","settings":{"url":"realm://t@h.example.com/i","stunServers":["s.example.com:3478"]}},
-                {"type":"header-custom","settings":{"client":[]}}
+                {"type":"header-custom","settings":{"client":[]}},
+                {"type":"filter","settings":{"blockedSourceIPs":["192.0.2.0/24"]}}
             ]}"#);
         let mgr = build_udpmask_manager_from_json(Some(&json)).unwrap();
-        assert_eq!(mgr.udpmasks.len(), 6);
+        assert_eq!(mgr.udpmasks.len(), 7);
     }
 
     /// Go Salamander.PacketSize（transport_finalmask.go:747-760）：to>0 切 Gecko
@@ -3061,10 +3116,35 @@ mod tests {
                 {"type":"sudoku","settings":{"password":"p"}},
                 {"type":"xmc","settings":{"password":"mc-pass","hostname":"h",
                     "profiles":[{"username":"steve_1","uuid":"069a79f4-44e9-4726-a5be-fca90e38aaf5","texturesValue":"v","texturesSignature":"s"}]}},
-                {"type":"header-custom","settings":{"clients":[]}}
+                {"type":"header-custom","settings":{"clients":[]}},
+                {"type":"filter","settings":{"allowedSourceIPs":["192.0.2.0/24"]}}
             ]}"#);
         let mgr = build_tcpmask_manager_from_json(Some(&json)).unwrap();
-        assert_eq!(mgr.tcpmasks.len(), 4);
+        assert_eq!(mgr.tcpmasks.len(), 5);
+    }
+
+    /// Go `Filter.Build`（`transport_finalmask.go:107-114`）：Go 原名与 proto 字段名
+    /// 都认；空表 / 缺键 = 该表 nil；未知键与非法规则一律硬错（filter 是安全控制，
+    /// 静默丢表 = 以为拦了实际全放行，bd 5w5z0 同族）。
+    #[test]
+    fn filter_config_parses_keys_and_rejects_unknown() {
+        for s in [
+            r#"{"blockedSourceIPs":["192.0.2.0/24"]}"#,
+            r#"{"blocked_source_ips":["192.0.2.0/24"]}"#,
+            r#"{"allowedSourceIPs":["198.51.100.0/24"]}"#,
+            r#"{"blockedSourceIPs":["192.0.2.0/24"],"allowedSourceIPs":["198.51.100.0/24"]}"#,
+            r#"{"blockedSourceIPs":[],"allowedSourceIPs":[]}"#,
+            "{}",
+        ] {
+            build_filter_config(&fm(s)).unwrap_or_else(|e| panic!("{s} should parse: {e}"));
+        }
+        // 未知键硬错（`blockedSourceIp` 少个 S 是"整表被静默丢弃"的典型笔误）。
+        let err = build_filter_config(&fm(r#"{"blockedSourceIp":["192.0.2.0/24"]}"#)).unwrap_err();
+        assert!(err.to_string().contains("unknown settings key"), "{err}");
+        // 类型错 / 非法规则硬错。
+        assert!(build_filter_config(&fm(r#"{"blockedSourceIPs":"192.0.2.0/24"}"#)).is_err());
+        assert!(build_filter_config(&fm(r#"{"blockedSourceIPs":[24]}"#)).is_err());
+        assert!(build_filter_config(&fm(r#"{"blockedSourceIPs":["192.0.2.0/33"]}"#)).is_err());
     }
 
     #[test]
