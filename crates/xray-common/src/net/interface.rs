@@ -181,6 +181,19 @@ pub fn interface_addrs() -> io::Result<Vec<InterfaceAddr>> {
     Ok(get_if_addrs()?.iter().map(|raw| convert_addr(&raw.addr)).collect())
 }
 
+/// 判断 IP 是否为本机接口地址，对应 Go `common/net/net.go` `IsLocal`。
+///
+/// Go 语义：遍历 `net.InterfaceAddrs()`，与每个 `*net.IPNet` 的 **IP 精确相等** 即判为
+/// 本机（比的是 `ipnet.IP.Equal(ip)`，非「落在该网段内」的包含判定）。
+/// 接口枚举失败 → `false`（Go 返回 error，调用方 `FindProcess` 即失败 → 进程不匹配）。
+///
+/// 用途：`xray-app-router` 的进程反查（UDP 场景按「通配地址 + 同端口」回落时，
+/// 须先确认源地址是本机地址，否则远端对端会被误挂到本机同端口 socket 上）。
+#[must_use]
+pub fn is_local_ip(ip: IpAddr) -> bool {
+    interface_addrs().is_ok_and(|addrs| addrs.iter().any(|a| a.ip() == ip))
+}
+
 /// 返回所有网络接口，对应 Go `net.Interfaces`（按名字+索引聚合多地址接口）。
 ///
 /// # Errors

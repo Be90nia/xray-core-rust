@@ -521,31 +521,40 @@ struct ProcessInfo {
     pid: u32,
 }
 
-/// 根据源地址和端口查找对应进程。
+/// 根据网络类型、源地址和端口查找对应进程。
 ///
 /// 对应 Go `net.FindProcess(network, srcIP, srcPort, dstIP, dstPort)`。
 /// 通过 OS-specific 网络连接表反查 PID：
-/// - Linux：`/proc/net/tcp`(+`tcp6`) 取 socket inode，再扫描 `/proc/*/fd/*` 匹配 inode → PID
-/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 直接取 owning PID
+/// - Linux：`/proc/net/{tcp,tcp6}`（TCP）或 `/proc/net/{udp,udp6}`（UDP）取 socket inode， 再扫描
+///   `/proc/*/fd/*` 匹配 inode → PID
+/// - Windows：`GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL)` 直接取 owning PID （UDP 表
+///   `GetExtendedUdpTable` 未接，见 `proc_windows`）
 /// - 其他平台（macOS 等）：返回 `None`（进程匹配不生效，不影响路由）
 ///
 /// 匹配语义：`(source_ip, source_port)` 对应连接表中的 **local** endpoint
 /// （发起方 socket 的本地端，即 xray 看到的对端地址）。任一步失败返回 `None`
 /// （权限不足/不可达），仅令进程匹配不生效，不阻断路由决策。
-fn find_process(source_ip: std::net::IpAddr, source_port: u16) -> Option<ProcessInfo> {
+///
+/// **UDP 能力为 Linux-only**：非 Linux 平台 UDP 反查恒 `None`（显式不可用，
+/// 不静默退化成 TCP 表查询——否则 UDP 命中的是同端口的 TCP socket，语义错误）。
+fn find_process(
+    network: Network,
+    source_ip: std::net::IpAddr,
+    source_port: u16,
+) -> Option<ProcessInfo> {
     #[cfg(target_os = "linux")]
     {
-        proc_linux::find_process(source_ip, source_port)
+        proc_linux::find_process(network, source_ip, source_port)
     }
     #[cfg(target_os = "windows")]
     {
-        proc_windows::find_process(source_ip, source_port)
+        proc_windows::find_process(network, source_ip, source_port)
     }
     // macOS/FreeBSD：对齐 Go find_process_others.go——明确不支持进程反查
     // （lsof/procstat 方案在 CI 环境时序不可控，Go 语义仅 linux/windows）。
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        let _ = (source_ip, source_port);
+        let _ = (network, source_ip, source_port);
         None
     }
 }
@@ -578,11 +587,12 @@ mod proc_parse {
         }
     }
 
-    /// 解析 `/proc/net/tcp`(或 `tcp6`) 的单行 → (local_ip, local_port, inode)。
+    /// 解析 `/proc/net/{tcp,tcp6,udp,udp6}` 的单行 → (local_ip, local_port, inode)。
     ///
     /// 行格式（跳过表头）：`sl local:port remote:port st tx:rx tr retr uid timeout inode ...`
+    /// 四张表列序一致（Go `find_process_linux.go` 对 tcp/udp 共用 `fields[1]`/`fields[9]`）。
     /// `inode == 0` 表示该 socket 无属主（TIME_WAIT 等），跳过。
-    pub(super) fn parse_tcp_line(line: &str) -> Option<(IpAddr, u16, u64)> {
+    pub(super) fn parse_socket_line(line: &str) -> Option<(IpAddr, u16, u64)> {
         let mut f = line.split_whitespace();
         let _sl = f.next()?;
         let local = f.next()?;
@@ -602,6 +612,42 @@ mod proc_parse {
         let ip = parse_hex_ip(ip_hex)?;
         Some((ip, port, inode))
     }
+
+    /// 在若干张 `/proc/net/*` 表文本中查找匹配 `(target_ip, target_port)` 的 socket inode。
+    ///
+    /// 语义对齐 Go `findInodeInFiles`（`common/net/find_process_linux.go`，v26.11.9 /
+    /// commit 12b7f85d「Routing: Fix Linux UDP `process`」）：
+    /// - **精确匹配**（socket 的 local endpoint == 目标 ip:port）：命中即返回，跨表按序
+    ///   先命中先返回；
+    /// - **端口回落**（`allow_port_fallback`，仅 UDP 开启）：无精确匹配时，回落到 「local
+    ///   地址为通配地址（`0.0.0.0` / `::`）且端口相同」的 socket——UDP socket
+    ///   常绑通配地址，精确地址对不上（Go `portFallback`）。
+    ///
+    /// 回落候选按 Go 语义**后者覆盖前者**（Go 每次命中即覆写 `onlyMatchedPort`）。
+    ///
+    /// 纯函数（表文本由调用方注入）⇒ 跨平台可单测，不依赖真 `/proc`。
+    pub(super) fn find_inode_in_tables(
+        tables: &[&str],
+        target_ip: IpAddr,
+        target_port: u16,
+        allow_port_fallback: bool,
+    ) -> Option<u64> {
+        let mut fallback: Option<u64> = None;
+        for table in tables {
+            for line in table.lines() {
+                let Some((ip, port, inode)) = parse_socket_line(line) else {
+                    continue;
+                };
+                if ip == target_ip && port == target_port {
+                    return Some(inode);
+                }
+                if allow_port_fallback && port == target_port && ip.is_unspecified() {
+                    fallback = Some(inode);
+                }
+            }
+        }
+        fallback
+    }
 }
 
 /// Linux `/proc` 实现。
@@ -609,25 +655,58 @@ mod proc_parse {
 mod proc_linux {
     use std::{fs, net::IpAddr};
 
-    use super::{ProcessInfo, proc_parse::parse_tcp_line};
+    use xray_common::net::{interface::is_local_ip, network::Network};
 
-    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
-        let inode = find_socket_inode(source_ip, source_port)?;
+    use super::{ProcessInfo, proc_parse::find_inode_in_tables};
+
+    pub(super) fn find_process(
+        network: Network,
+        source_ip: IpAddr,
+        source_port: u16,
+    ) -> Option<ProcessInfo> {
+        let inode = find_socket_inode(network, source_ip, source_port)?;
         let pid = find_pid_by_inode(inode)?;
         read_process_info(pid)
     }
 
-    /// 在 `/proc/net/tcp`(+`tcp6`) 中查找 local endpoint 匹配的 socket inode。
-    fn find_socket_inode(source_ip: IpAddr, source_port: u16) -> Option<u64> {
-        let file = match source_ip {
-            IpAddr::V4(_) => "/proc/net/tcp",
-            IpAddr::V6(_) => "/proc/net/tcp6",
+    /// 按协议族查 `/proc/net/*` 表，取 local endpoint 匹配的 socket inode。
+    fn find_socket_inode(network: Network, source_ip: IpAddr, source_port: u16) -> Option<u64> {
+        match network {
+            Network::TCP => {
+                // TCP：单表（按地址族）+ 精确匹配（Go `find_process_linux.go` tcp 分支）。
+                let file = match source_ip {
+                    IpAddr::V4(_) => "/proc/net/tcp",
+                    IpAddr::V6(_) => "/proc/net/tcp6",
+                };
+                let content = fs::read_to_string(file).ok()?;
+                find_inode_in_tables(&[&content], source_ip, source_port, false)
+            },
+            Network::UDP => find_udp_socket_inode(source_ip, source_port),
+            // Go `FindProcess` 只接受 tcp/udp，其余 panic；本仓按「条件不命中」处理。
+            Network::Unix => None,
+        }
+    }
+
+    /// UDP 进程反查（Go v26.11.9 / commit 12b7f85d 语义）。
+    ///
+    /// 与 TCP 的差异（均为上游修复点）：
+    /// 1. **源地址必须是本机地址**（Go `net.IsLocal`）——否则 `ErrNotLocal`，条件不命中；
+    /// 2. **两张表都查**：`/proc/net/udp` + `/proc/net/udp6`（Go `procFiles` 列表）；
+    /// 3. **端口回落**：精确 local endpoint 对不上时，回落到「通配地址（`0.0.0.0`/`::`）
+    ///    + 同端口」的 socket——UDP socket 常绑通配地址（Go `portFallback`）。
+    fn find_udp_socket_inode(source_ip: IpAddr, source_port: u16) -> Option<u64> {
+        if !is_local_ip(source_ip) {
+            return None;
+        }
+        // Go：v4 源先 udp 后 udp6；v6 源先 udp6 后 udp。
+        let (first, second) = match source_ip {
+            IpAddr::V4(_) => ("/proc/net/udp", "/proc/net/udp6"),
+            IpAddr::V6(_) => ("/proc/net/udp6", "/proc/net/udp"),
         };
-        let content = fs::read_to_string(file).ok()?;
-        content.lines().skip(1).find_map(|line| {
-            let (ip, port, inode) = parse_tcp_line(line)?;
-            (ip == source_ip && port == source_port).then_some(inode)
-        })
+        let first_content = fs::read_to_string(first).ok()?;
+        let second_content = fs::read_to_string(second).ok();
+        let tables = [first_content.as_str(), second_content.as_deref().unwrap_or_default()];
+        find_inode_in_tables(&tables, source_ip, source_port, true)
     }
 
     /// 扫描 `/proc/*/fd/*`，找到拥有该 socket inode 的 PID。
@@ -687,6 +766,7 @@ mod proc_windows {
             QueryFullProcessImageNameW,
         },
     };
+    use xray_common::net::network::Network;
 
     use super::ProcessInfo;
 
@@ -694,7 +774,16 @@ mod proc_windows {
     const AF_INET6: u32 = 23;
     const NO_ERROR: u32 = 0;
 
-    pub(super) fn find_process(source_ip: IpAddr, source_port: u16) -> Option<ProcessInfo> {
+    pub(super) fn find_process(
+        network: Network,
+        source_ip: IpAddr,
+        source_port: u16,
+    ) -> Option<ProcessInfo> {
+        // UDP 表（`GetExtendedUdpTable`）本仓未接 ⇒ UDP 显式不可用（返回 None = 条件不命中），
+        // 禁回落 TCP 表查询（那是另一个协议的 socket，命中即语义错误）。
+        if network != Network::TCP {
+            return None;
+        }
         let pid = match source_ip {
             IpAddr::V4(ip) => find_pid_v4(ip, source_port),
             IpAddr::V6(ip) => find_pid_v6(ip, source_port),
@@ -906,12 +995,30 @@ impl ProcessNameMatcherCondition {
 
     /// `apply`：查询源进程并匹配配置。
     fn apply(&self, ctx: &dyn RoutingContext) -> bool {
+        self.apply_with(ctx, find_process)
+    }
+
+    /// `apply` 的可注入查找版本（测试用）：`lookup` 代替平台进程反查。
+    ///
+    /// 网络维度取 `ctx.get_network()`（Go `routing.Context.GetNetwork` = 出站目标
+    /// 网络，condition.go:349-357）：TCP 查 TCP 连接表，UDP 查 UDP 连接表，
+    /// 其余（Unix 等）直接不匹配（Go `default: return false`）。
+    fn apply_with(
+        &self,
+        ctx: &dyn RoutingContext,
+        lookup: impl Fn(Network, IpAddr, u16) -> Option<ProcessInfo>,
+    ) -> bool {
+        let network = match ctx.get_network() {
+            Network::TCP => Network::TCP,
+            Network::UDP => Network::UDP,
+            Network::Unix => return false,
+        };
         let source_ips = ctx.get_source_ips();
         let source_port = ctx.get_source_port().value();
         // 尝试按源地址查找进程
         let source_ip = source_ips.first().copied();
         if let Some(ip) = source_ip {
-            if let Some(info) = find_process(ip, source_port) {
+            if let Some(info) = lookup(network, ip, source_port) {
                 return self.matches_info(&info);
             }
         }
@@ -1427,22 +1534,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tcp_line_established() {
+    fn test_parse_socket_line_established() {
         // local=127.0.0.1:8080(0x1F90)，inode=12345
         let line = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 \
                     00:00000000 00000000     0        0 12345 1 0000000000000000";
-        let (ip, port, inode) = proc_parse::parse_tcp_line(line).expect("应解析成功");
+        let (ip, port, inode) = proc_parse::parse_socket_line(line).expect("应解析成功");
         assert_eq!(ip, std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         assert_eq!(port, 8080);
         assert_eq!(inode, 12345);
     }
 
     #[test]
-    fn test_parse_tcp_line_zero_inode_skipped() {
+    fn test_parse_socket_line_zero_inode_skipped() {
         // inode=0（TIME_WAIT 等无属主 socket）应返回 None
         let line = "   1: 0100007F:0050 00000000:0000 06 00000000:00000000 \
                     00:00000000 00000000     0        0 0 1 0000000000000000";
-        assert!(proc_parse::parse_tcp_line(line).is_none());
+        assert!(proc_parse::parse_socket_line(line).is_none());
     }
 
     #[test]
@@ -1459,7 +1566,7 @@ mod tests {
         // 连接表更新可能有微小延迟，重试若干次。
         let mut info = None;
         for _ in 0..20 {
-            info = find_process(local.ip(), local.port());
+            info = find_process(Network::TCP, local.ip(), local.port());
             if info.is_some() {
                 break;
             }
@@ -1481,5 +1588,151 @@ mod tests {
 
         drop(server);
         drop(client);
+    }
+
+    // ── Linux UDP process 条件（Go 12b7f85d「Routing: Fix Linux UDP `process`」）──
+
+    /// `/proc/net/udp` 表样例（表头 + 两行 socket）。
+    ///
+    /// 行格式与 `/proc/net/tcp` 同序（Go 对 tcp/udp 共用 `fields[1]`/`fields[9]`）。
+    /// 第 1 行 local = `0100007F:1F90`（127.0.0.1:8080）；第 2 行 local =
+    /// `00000000:0050`（通配地址 0.0.0.0:80）——UDP socket 常绑通配地址，
+    /// 精确 local 地址对不上，只能按端口回落（Go `portFallback`）。
+    const UDP_TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+         0: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11111 1 0000000000000000\n\
+         1: 00000000:0050 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 22222 1 0000000000000000\n";
+
+    /// `/proc/net/udp6` 表样例（local = `::1`）。
+    const UDP6_TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+         0: 00000000000000000000000001000000:1F91 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 33333 1 0000000000000000\n";
+
+    /// UDP 精确命中：local 地址 == (源 IP, 源端口)。
+    #[test]
+    fn test_find_inode_in_tables_udp_exact_match() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let inode = proc_parse::find_inode_in_tables(&[UDP_TABLE], ip, 8080, true)
+            .expect("应精确命中 127.0.0.1:8080");
+        assert_eq!(inode, 11111);
+    }
+
+    /// UDP 端口回落命中：local 地址为通配地址（0.0.0.0）+ 同端口。
+    /// Go 12b7f85d 的核心修复点（UDP socket 绑通配地址时精确匹配必然失败）。
+    #[test]
+    fn test_find_inode_in_tables_udp_wildcard_port_fallback() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        // 源端口 80 ⇒ local 0.0.0.0:80 通配行命中（inode 22222）。
+        let inode = proc_parse::find_inode_in_tables(&[UDP_TABLE], ip, 80, true)
+            .expect("应按通配地址 + 端口回落命中");
+        assert_eq!(inode, 22222);
+    }
+
+    /// 回落**仅在允许时**生效（TCP 路径不允许回落，Go 只给 udp 设 portFallback）。
+    #[test]
+    fn test_find_inode_in_tables_no_fallback_when_disallowed() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert!(
+            proc_parse::find_inode_in_tables(&[UDP_TABLE], ip, 80, false).is_none(),
+            "不允许回落时不得命中通配行"
+        );
+    }
+
+    /// 未命中：表中无对应 local endpoint ⇒ None（不静默取错 socket）。
+    #[test]
+    fn test_find_inode_in_tables_no_match_returns_none() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert!(proc_parse::find_inode_in_tables(&[UDP_TABLE], ip, 9999, true).is_none());
+    }
+
+    /// 两张表都查（Go `procFiles` 列表：udp + udp6）。
+    #[test]
+    fn test_find_inode_in_tables_scans_both_udp_tables() {
+        let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let inode = proc_parse::find_inode_in_tables(&[UDP_TABLE, UDP6_TABLE], ip, 8081, true)
+            .expect("udp6 表中的 ::1:8081 应命中");
+        assert_eq!(inode, 33333);
+    }
+
+    /// 精确命中优先于端口回落（Go：精确命中先 return，回落只作兜底）。
+    #[test]
+    fn test_find_inode_in_tables_exact_match_beats_fallback() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        // 同一端口既出现在通配行也出现在精确行 ⇒ 取精确行。
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+             0: 00000000:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11111 1 0000000000000000\n\
+             1: 0100007F:1F90 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 44444 1 0000000000000000\n";
+        let inode =
+            proc_parse::find_inode_in_tables(&[table], ip, 8080, true).expect("精确行应命中");
+        assert_eq!(inode, 44444, "精确匹配优先于端口回落");
+    }
+
+    /// 条件层：UDP 上下文 ⇒ 走 UDP 查找（命中用例）。
+    ///
+    /// 注入查找函数验证「网络维度被正确传给查找层」，不依赖真 /proc。
+    #[test]
+    fn test_process_matcher_udp_context_hits() {
+        let m = ProcessNameMatcherCondition::new(vec!["myapp".into()]);
+        let ctx = RoutingData::new()
+            .with_network(Network::UDP)
+            .with_source_ip(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .with_source_port(Port::new(8080));
+        // 闭包是 `Fn`（非 FnMut）⇒ 用内部可变性记录被传入的网络维度。
+        let seen_network = std::cell::RefCell::new(None);
+        let hit = m.apply_with(&ctx, |network, _ip, _port| {
+            *seen_network.borrow_mut() = Some(network);
+            Some(ProcessInfo {
+                name: "myapp".to_string(),
+                exe_path: "/usr/bin/myapp".to_string(),
+                pid: 4242,
+            })
+        });
+        assert!(hit, "UDP 上下文应命中进程名");
+        assert_eq!(*seen_network.borrow(), Some(Network::UDP), "查找层应收到 UDP 网络维度");
+    }
+
+    /// 条件层：不命中用例（查找层返回 None ⇒ 条件不匹配）。
+    #[test]
+    fn test_process_matcher_udp_context_miss() {
+        let m = ProcessNameMatcherCondition::new(vec!["myapp".into()]);
+        let ctx = RoutingData::new()
+            .with_network(Network::UDP)
+            .with_source_ip(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .with_source_port(Port::new(8080));
+        let hit = m.apply_with(&ctx, |_network, _ip, _port| None);
+        assert!(!hit, "查找层未命中 ⇒ 条件不匹配（Go：FindProcess 失败即不匹配）");
+    }
+
+    /// 条件层：Unix 网络 ⇒ 直接不匹配（Go condition.go:355-356 `default: return false`）。
+    #[test]
+    fn test_process_matcher_unix_network_never_matches() {
+        let m = ProcessNameMatcherCondition::new(vec!["myapp".into()]);
+        let ctx = RoutingData::new()
+            .with_network(Network::Unix)
+            .with_source_ip(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .with_source_port(Port::new(8080));
+        let called = std::cell::Cell::new(false);
+        let hit = m.apply_with(&ctx, |_network, _ip, _port| {
+            called.set(true);
+            Some(ProcessInfo {
+                name: "myapp".to_string(),
+                exe_path: "/usr/bin/myapp".to_string(),
+                pid: 4242,
+            })
+        });
+        assert!(!hit, "Unix 网络应直接不匹配");
+        assert!(!called.get(), "Unix 网络不应触发进程反查");
+    }
+
+    /// 非 Linux 平台：UDP 进程反查**显式不可用**（返回 None），不得回落 TCP 表。
+    ///
+    /// Go 侧 UDP 表查询仅 Linux 有（`find_process_linux.go`）；Windows 的
+    /// `GetExtendedUdpTable` 本仓未接 ⇒ UDP 显式不可用；macOS/FreeBSD 全平台不支持。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_udp_process_lookup_unavailable_off_linux() {
+        let ip = std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        assert!(
+            find_process(Network::UDP, ip, 8080).is_none(),
+            "非 Linux 平台 UDP 进程反查应显式不可用（不得回落 TCP 表）"
+        );
     }
 }
