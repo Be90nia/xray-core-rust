@@ -82,6 +82,10 @@ pub struct QuicParamsConfig {
     pub max_idle_timeout: i64,
     pub keep_alive_period: i64,
     pub disable_path_mtu_discovery: bool,
+    /// `disableGSO`（Go `QuicParams.DisableGSO`，`transport_finalmask.go:1192`）：
+    /// `true` → quinn `TransportConfig::enable_segmentation_offload(false)`
+    /// （消费点：splithttp H3 客户端/服务端、xdns DoH3）。
+    pub disable_gso: bool,
     pub max_incoming_streams: i64,
 }
 
@@ -215,12 +219,15 @@ pub fn parse_quic_params_config(
              \"disablePathMTUDiscovery\" (MTU uppercase)",
         );
     }
-    // Go QuicParamsConfig 另有 disableChromeParrot/disableGSO/disableStatelessReset
-    // （transport_finalmask.go:1191,1192,1194；消费 dialer.go/hub.go 的 quic-go
-    // Transport 旋钮）。quinn 无等价旋钮（ChromeParrot 是 quic-go 内部 parrot、
-    // GSO 自动、StatelessResetKey 未设）——true 的意图 Rust 天然满足、false 为
-    // 能力级差异，键级无语义可保（同 xray-transport-hysteria/src/quic_params.rs
-    // 登记口径），故不读取不报错。
+    // `disableGSO` 真接（quinn 有 `TransportConfig::enable_segmentation_offload`）。
+    // 另两键 quinn 无等价旋钮 ⇒ 逐键 WARN 点名 + 原因，禁纯静默（bd doubj）：
+    // - `disableStatelessReset`：quinn-proto 端点恒发 stateless reset，无关闭开关 （仅
+    //   `EndpointConfig::min_reset_interval` 可调）；
+    // - `disableChromeParrot=false`（要求 Chrome 指纹模拟）：quinn 无 quic-go 的 parrot， 仅 xdns
+    //   DoH3 以零长 connection ID 近似。
+    for msg in unsupported_quic_param_warnings(obj) {
+        crate::LOG.warn(msg);
+    }
     Ok(Some(QuicParamsConfig {
         congestion: get_str("congestion"),
         debug: get_bool("debug"),
@@ -237,8 +244,40 @@ pub fn parse_quic_params_config(
         // Go 键名是 `disablePathMTUDiscovery`（MTU 全大写，transport_finalmask.go:1188）；
         // 旧拼写 `disablePathMtuDiscovery` 不是 Go 键，按未知键 warn（bd x0f0r W1）。
         disable_path_mtu_discovery: get_bool("disablePathMTUDiscovery"),
+        disable_gso: get_bool("disableGSO"),
         max_incoming_streams: get_i64("maxIncomingStreams"),
     }))
+}
+
+/// `quicParams` 里 quinn 无等价旋钮、只能 WARN 的键（bd doubj）。
+///
+/// 只对**用户显式要求而本栈做不到**的取值报警，避免与 Go 零值同义时刷噪音：
+/// - `disableStatelessReset: true` —— 要求不发 stateless reset；
+/// - `disableChromeParrot: false`（显式写出）—— 要求 Chrome 指纹模拟。
+///
+/// 返回文案由调用方 `LOG.warn` 逐条打出；独立成函数是为了让「WARN 可见」可断言。
+fn unsupported_quic_param_warnings(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let as_bool = |k: &str| obj.get(k).and_then(serde_json::Value::as_bool);
+    let mut out = Vec::new();
+    if as_bool("disableStatelessReset") == Some(true) {
+        out.push(
+            "finalmask.quicParams.disableStatelessReset=true is not applied: quinn-proto always \
+             sends stateless resets (no disable knob; only EndpointConfig::min_reset_interval \
+             is tunable)"
+                .to_string(),
+        );
+    }
+    if as_bool("disableChromeParrot") == Some(false) {
+        out.push(
+            "finalmask.quicParams.disableChromeParrot=false is not applied: quinn has no \
+             quic-go Chrome parrot; only xdns DoH3 approximates it with zero-length connection \
+             IDs"
+            .to_string(),
+        );
+    }
+    out
 }
 
 fn parse_download_settings(
@@ -425,6 +464,40 @@ mod tests {
         })))
         .unwrap();
         assert!(!m.quic_params.unwrap().disable_path_mtu_discovery);
+    }
+
+    /// bd doubj ①：`disableGSO` 真接（→ `disable_gso` → quinn
+    /// `enable_segmentation_offload(false)`，消费点三处已接线）。
+    #[test]
+    fn quic_params_disable_gso_parsed() {
+        let m = to_memory_stream_config(Some(&json!({
+            "finalmask": {"quicParams": {"disableGSO": true}}
+        })))
+        .unwrap();
+        assert!(m.quic_params.unwrap().disable_gso);
+        // 未配置 = false（quinn 缺省开 GSO，与 Go 零值同义）。
+        let m = to_memory_stream_config(Some(&json!({"finalmask": {"quicParams": {}}}))).unwrap();
+        assert!(!m.quic_params.unwrap().disable_gso);
+    }
+
+    /// bd doubj ②③：quinn 无等价旋钮的两键必须 WARN 点名（禁纯静默），
+    /// 且只对「显式要求而做不到」的取值报——与 Go 零值同义时不刷噪音。
+    #[test]
+    fn quic_params_unsupported_keys_warn() {
+        let warns = |v: serde_json::Value| {
+            super::unsupported_quic_param_warnings(v.as_object().expect("object"))
+        };
+        let w = warns(json!({"disableStatelessReset": true, "disableChromeParrot": false}));
+        assert_eq!(w.len(), 2, "两键各一条 WARN：{w:?}");
+        assert!(w[0].contains("disableStatelessReset"), "{w:?}");
+        assert!(w[1].contains("disableChromeParrot"), "{w:?}");
+        // 与 Go 零值同义（不发 reset 是 Go 的 false；parrot 是 Go 的 false→要模拟，
+        // 故 `disableChromeParrot:true` 也被本栈天然满足）⇒ 零 WARN。
+        assert!(warns(json!({"disableStatelessReset": false})).is_empty());
+        assert!(warns(json!({"disableChromeParrot": true})).is_empty());
+        assert!(warns(json!({})).is_empty());
+        // `disableGSO` 走真接路径，不进 WARN 列表。
+        assert!(warns(json!({"disableGSO": true})).is_empty());
     }
 
     // ===== DownloadSettings 解析（bd 44s 第 4 块）=====

@@ -5480,9 +5480,23 @@ fn json_port(v: Option<&serde_json::Value>, field: &str) -> std::io::Result<Opti
     })
 }
 
+/// `network` / `allowedNetwork` 值 → 网络名列表。
+/// 值语法对齐 Go `NetworkList.UnmarshalJSON`（infra/conf/common.go:91-109）：
+/// 字符串数组或逗号分隔串两种形态，其余形态 → 空列表（Go 报 "unknown format"）。
+fn parse_network_list(v: &serde_json::Value) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_ascii_lowercase();
+    if let Some(s) = v.as_str() {
+        return s.split(',').map(norm).filter(|x| !x.is_empty()).collect();
+    }
+    v.as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).map(norm).collect())
+        .unwrap_or_default()
+}
+
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
 /// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
-/// `network` 可选（默认 `"tcp"`）；`followRedirect` 可选（默认 `false`）；
+/// `network` / `allowedNetwork` 可选（两者皆缺默认 `"tcp"`；`network` 优先，
+/// 值支持逗号串与字符串数组）；`followRedirect` 可选（默认 `false`）；
 /// `address`/`port` 可选（Go dokodemo.go:26-31：address→RewriteAddress、
 /// port→RewritePort 独立生效；followRedirect 透明代理时目标取 SO_ORIGINAL_DST）。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
@@ -5491,10 +5505,18 @@ pub(crate) fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoIn
         .map_err(|e| std::io::Error::other(format!("dokodemo inbound settings JSON: {e}")))?;
     let address = v.get("address").and_then(|x| x.as_str()).map(parse_address_str);
     let port = json_port(v.get("port"), "dokodemo inbound port")?;
-    // network：逗号分隔，默认 tcp。对应 Go allowed_networks。
-    let network_str = v.get("network").and_then(|x| x.as_str()).unwrap_or("tcp");
-    let allow_tcp = network_str.contains("tcp");
-    let allow_udp = network_str.contains("udp");
+    // 两键语义按 Go `infra/conf/dokodemo.go:23-25`：`network` 在场即**覆盖**
+    // `allowedNetwork`（`if v.Network != nil { v.AllowedNetwork = v.Network }`，
+    // 不是并集）；两者皆缺 → Go `NetworkList.Build()` 兜底 TCP。此前只读 `network`，
+    // 写 `allowedNetwork:"udp"` 的配置静默退化成 TCP-only（服务端真断点）。
+    let networks = v
+        .get("network")
+        .filter(|x| !x.is_null())
+        .or_else(|| v.get("allowedNetwork").filter(|x| !x.is_null()))
+        .map(parse_network_list)
+        .unwrap_or_else(|| vec!["tcp".to_string()]);
+    let allow_tcp = networks.iter().any(|n| n == "tcp");
+    let allow_udp = networks.iter().any(|n| n == "udp");
     let follow_redirect = v.get("followRedirect").and_then(|x| x.as_bool()).unwrap_or(false);
 
     // portMap：监听端口 → "host:port"（Go infra/conf/dokodemo.go:17，值校验 L39-43
@@ -12207,6 +12229,41 @@ mod tests {
         let data = serde_json::to_vec(&settings).unwrap();
         let s = super::parse_dokodemo_settings(&data).unwrap();
         assert!(s.allow_tcp);
+        assert!(s.allow_udp);
+    }
+
+    /// Go `infra/conf/dokodemo.go:23-25`：`allowedNetwork` 是独立键，缺 `network` 时生效。
+    /// 修复前只读 `network` ⇒ 此配置静默退化成 TCP-only（服务端真断点）。
+    #[test]
+    fn parse_dokodemo_settings_allowed_network_only() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 53,
+            "allowedNetwork": "udp" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(!s.allow_tcp, "allowedNetwork=udp 不得再放行 TCP");
+        assert!(s.allow_udp, "allowedNetwork=udp 必须放行 UDP");
+        assert!(s.dest.as_ref().unwrap().is_udp());
+    }
+
+    /// Go 同源语义：`network` 在场**覆盖** `allowedNetwork`（不是并集）。
+    #[test]
+    fn parse_dokodemo_settings_network_overrides_allowed_network() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80,
+            "network": "tcp", "allowedNetwork": "udp" });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(s.allow_tcp);
+        assert!(!s.allow_udp, "network 覆盖 allowedNetwork：UDP 必须关闭");
+    }
+
+    /// 值语法同 Go `NetworkList`：字符串数组形态也收（common.go:91-109）。
+    #[test]
+    fn parse_dokodemo_settings_allowed_network_array() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 53,
+            "allowedNetwork": ["udp"] });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert!(!s.allow_tcp);
         assert!(s.allow_udp);
     }
 

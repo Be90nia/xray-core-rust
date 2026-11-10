@@ -17,6 +17,7 @@
 //! | `congestion` "" / `reno` | 不动，就地用 quinn 缺省 CUBIC（Go 同样不改 quic-go 缺省） |
 //! | `congestion` `bbr` | quinn 内建 BBR（`quinn::congestion::BbrConfig`） |
 //! | `disableChromeParrot` | false（Go 缺省）= 零长 CID（Go `ZeroLengthConnectionIDGenerator`） |
+//! | `disableGSO` | true → `enable_segmentation_offload(false)`（quinn 缺省开 GSO；Go `resolver_doh.go:80`） |
 //!
 //! ## 与 Go 的差异（bd lf69h）
 //!
@@ -32,8 +33,9 @@
 //!    会话离场（超时/传输错误/被新会话顶替/resolver 关闭）一律 RAII 显式 CONNECTION_CLOSE（bd
 //!    0x4tl：Go `context.AfterFunc(qc.Context(), tr.Close)` 对位—— 禁把连接留给服务端干等 idle
 //!    timeout）。
-//! 5. **`disableGSO` / `disableStatelessReset` / `debug`**：quinn 无对应旋钮（GSO 自动、 无
-//!    stateless-reset key、`debug` 只影响 hysteria 控制器日志环境变量）⇒ 键接受、无效果。
+//! 5. **`disableStatelessReset` / `debug`**：quinn 无对应旋钮（端点恒发 stateless reset， 无
+//!    stateless-reset key 可关；`debug` 只影响 hysteria 控制器日志环境变量）⇒ 键接受、无效果。
+//!    `disableGSO` 已接线（见映射表）。
 
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -86,6 +88,8 @@ pub(crate) struct QuicOptions {
     max_incoming_streams: u64,
     /// `disableChromeParrot`（false = 零长 CID）。
     disable_chrome_parrot: bool,
+    /// `disableGSO`（Go `resolver_doh.go:80` 的 `quic.Transport{DisableGSO}`）。
+    disable_gso: bool,
 }
 
 impl QuicOptions {
@@ -117,6 +121,7 @@ impl QuicOptions {
             max_idle_timeout: p.max_idle_timeout,
             keep_alive_period: p.keep_alive_period,
             disable_path_mtu_discovery: p.disable_path_mtu_discovery,
+            disable_gso: p.disable_gso,
             max_incoming_streams: p.max_incoming_streams,
             debug: false,
         };
@@ -171,6 +176,7 @@ impl QuicOptions {
             keep_alive_period: seconds(qp.keep_alive_period),
             disable_path_mtu_discovery: qp.disable_path_mtu_discovery,
             max_incoming_streams: u64::try_from(qp.max_incoming_streams).unwrap_or(0),
+            disable_gso: qp.disable_gso,
             disable_chrome_parrot,
         })
     }
@@ -207,6 +213,9 @@ impl QuicOptions {
         transport.keep_alive_interval(self.keep_alive_period);
         if self.disable_path_mtu_discovery {
             transport.mtu_discovery_config(None);
+        }
+        if self.disable_gso {
+            transport.enable_segmentation_offload(false);
         }
         Ok(transport)
     }

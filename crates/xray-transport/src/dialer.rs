@@ -312,9 +312,8 @@ impl StreamSettings {
     /// `addressPortStrategy` / `trustedXForwardedFor` / `tcpWindowClamp` / `tcpMaxSeg` /
     /// `penetrate` / `tcpUserTimeout`（毫秒）/ `customSockopt` / `receiveBufferSize` /
     /// `sendBufferSize`（本仓库 opt-in，Go 无此字段）。
-    /// 缺省字段用 [`SocketOptions::default`]。Go `interface`（接口名字符串）JSON 暂不
-    /// 解析（[`SocketOptions::bind_if_index`](crate::sockopt::SocketOptions) 字段已备，
-    /// 尚无 JSON 入口）。
+    /// 缺省字段用 [`SocketOptions::default`]。`interface`（接口名字符串，Go
+    /// `SocketConfig.Interface`）在本处解析为 `bind_if_index`（见下方解析段）。
     #[must_use]
     pub fn socket_options(&self) -> SocketOptions {
         let mut opts = SocketOptions::default();
@@ -897,6 +896,30 @@ mod transport_cache_tests {
         assert!(o.tproxy);
         assert!(o.reuse_port);
     }
+    /// Windows：`sockopt.interface` 在配置解析期解析为 `bind_if_index`
+    /// （Go `InterfaceByName` + `IP_UNICAST_IF`）。修复前 Windows 侧
+    /// `resolve_interface_index` 恒 `Unsupported` ⇒ 该键 warn 后被静默丢弃。
+    #[cfg(windows)]
+    #[test]
+    fn socket_options_resolves_interface_name_on_windows() {
+        let iface = xray_common::net::interface::interfaces()
+            .expect("enumerate adapters")
+            .into_iter()
+            .find(|i| i.index > 0)
+            .expect("at least one adapter with an ifindex");
+        let mut s = StreamSettings::tcp();
+        s.sockopt_json = Some(serde_json::json!({ "interface": iface.name }));
+        assert_eq!(
+            s.socket_options().bind_if_index,
+            iface.index,
+            "interface={} 应解析为该适配器索引",
+            iface.name
+        );
+        // 不存在的网卡名 → 不静默取 0（warn 路径保留，索引仍为 0 = 不绑定）。
+        s.sockopt_json = Some(serde_json::json!({ "interface": "no-such-adapter-doubj" }));
+        assert_eq!(s.socket_options().bind_if_index, 0);
+    }
+
     #[test]
     fn socket_options_defaults_without_json() {
         let s = StreamSettings::tcp();

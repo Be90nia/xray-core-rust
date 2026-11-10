@@ -1422,8 +1422,8 @@ pub fn set_ip_recvorigdstaddr(_fd: i32) -> std::io::Result<()> {
 ///
 /// Go 端在每个平台 `apply*SocketOptions` 内调 `InterfaceByName`；失败时
 /// `errors.New("failed to get interface ...")`.Base(err)` 启动期硬拒。
-/// Rust 端提前到 JSON 解析阶段（dialer.rs:246）以一次性解析、避免在
-/// accept/connect 高频路径上 syscall。
+/// Rust 端提前到 JSON 解析阶段（`dialer::StreamSettings::socket_options`）以一次性解析、
+/// 避免在 accept/connect 高频路径上 syscall。
 #[cfg(unix)]
 pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
     // libc::if_nametoindex 跨 unix 平台（Linux/Darwin/FreeBSD），对齐 Go
@@ -1440,15 +1440,35 @@ pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
     }
 }
 
-/// Windows 平台 placeholder：当前通过 `customSockopt` 走 IP_UNICAST_IF 路径，
-/// 真实名字解析（GetAdaptersAddresses）后续 batch 接入。
-#[cfg(not(unix))]
+/// Windows：`net.InterfaceByName` 对位——`GetAdaptersAddresses` 按 FriendlyName
+/// 精确匹配取 IfIndex（Go `net/interface_windows.go` 同源：Name=FriendlyName、
+/// Index=IfIndex）。复用本仓 `xray_common::net::interface`（if-addrs 后端即同一 API）。
+///
+/// 双栈适配器的 v4/v6 索引可能不同，而 Go 用同一个 `IfIndex` 喂 `IP_UNICAST_IF`
+/// 与 `IPV6_UNICAST_IF`（sockopt_windows.go:46-60），故优先取带 v4 地址的条目。
+#[cfg(windows)]
+pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
+    use xray_common::net::interface::{InterfaceAddr, interfaces};
+
+    let mut fallback = None;
+    for iface in interfaces()?.into_iter().filter(|i| i.name == name && i.index > 0) {
+        if iface.addresses.iter().any(|a| matches!(a, InterfaceAddr::V4(_))) {
+            return Ok(iface.index);
+        }
+        fallback.get_or_insert(iface.index);
+    }
+    fallback.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, format!("interface '{name}' not found"))
+    })
+}
+
+/// 其余非 unix 平台（wasm 等）无对应系统调用。
+#[cfg(not(any(unix, windows)))]
 pub fn resolve_interface_index(name: &str) -> std::io::Result<u32> {
     let _ = name;
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "interface name → index resolution not yet implemented on Windows; \
-         use raw interface index in customSockopt or unicastInterface workaround",
+        "interface name → index resolution is not available on this platform",
     ))
 }
 

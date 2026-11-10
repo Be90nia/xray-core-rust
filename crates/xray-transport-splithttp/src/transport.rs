@@ -943,6 +943,10 @@ fn build_h3_server_transport_config(
         if qp.disable_path_mtu_discovery {
             tc.mtu_discovery_config(None);
         }
+        // Go `hub.go:504` `quic.Transport{DisableGSO: quicParams.DisableGSO}`。
+        if qp.disable_gso {
+            tc.enable_segmentation_offload(false);
+        }
     }
     tc.stream_receive_window(
         quinn::VarInt::from_u64(stream_win)

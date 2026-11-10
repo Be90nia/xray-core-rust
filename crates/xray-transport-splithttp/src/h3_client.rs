@@ -395,6 +395,11 @@ fn build_h3_transport_config(
         None => transport_config.max_idle_timeout(None),
     };
     transport_config.keep_alive_interval(h3_keep_alive_period(config, quic_params));
+    // Go `dialer.go:221` `quic.Transport{DisableGSO: quicParams.DisableGSO}`；quinn 对位旋钮
+    // 是 `TransportConfig::enable_segmentation_offload`（缺省开）。
+    if quic_params.is_some_and(|qp| qp.disable_gso) {
+        transport_config.enable_segmentation_offload(false);
+    }
     // CC 接线（Go dialer.go:161-164 + 239-246）：quicParams 缺省也默认 BBR。
     let cc_slot =
         xray_transport_quic::congestion_swappable::install_swappable_cc(&mut transport_config);

@@ -84,20 +84,6 @@ impl SniffingRequest {
         Ok(req)
     }
 
-    /// 判断域名是否命中"排除域名"列表。
-    ///
-    /// 对应 Go `request.ExcludeForDomain.MatchAny(domain)`。
-    /// 当前用 `contains` 子串匹配（与 P4-3 dispatcher 同模式），
-    /// 真实 matcher（前缀/正则/完整匹配）待 xray-geodata 暴露 API 后接入。
-    #[must_use]
-    pub fn matches_domain_excluded(&self, domain: &str) -> bool {
-        if self.exclude_for_domain.is_empty() {
-            return false;
-        }
-        let domain_lower = domain.to_lowercase();
-        self.exclude_for_domain.iter().any(|excl| domain_lower.contains(&excl.to_lowercase()))
-    }
-
     /// 判断 IP 是否命中"排除 IP"列表（CIDR contains 判断）。
     ///
     /// 对应 Go `request.ExcludeForIP.Match(ip)`。
@@ -257,22 +243,6 @@ mod tests {
 
         let req = SniffingRequest::from_proto(Some(&cfg)).unwrap();
         assert!(req.exclude_for_ip.is_empty());
-    }
-
-    #[test]
-    fn matches_domain_excluded_substring_case_insensitive() {
-        let mut req = SniffingRequest::default();
-        req.exclude_for_domain = vec!["evil.com".to_string()];
-
-        assert!(req.matches_domain_excluded("www.EVIL.COM"));
-        assert!(req.matches_domain_excluded("evil.com.evil.com"));
-        assert!(!req.matches_domain_excluded("good.org"));
-    }
-
-    #[test]
-    fn matches_domain_excluded_empty_list() {
-        let req = SniffingRequest::default();
-        assert!(!req.matches_domain_excluded("anything.com"));
     }
 
     #[test]
