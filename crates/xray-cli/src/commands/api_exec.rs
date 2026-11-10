@@ -1061,7 +1061,7 @@ mod tests {
     /// **真实命令树** `crates/xray-cli/src/bin/xray.rs`（那里 `AddRule(AddRuleArgs)` /
     /// `BalancerInfo(BalancerInfoArgs)` 是带位置参数的子命令），用 `Cli::try_parse_from`
     /// 断言 `configs` / `balancers` 的多值与单值兼容。
-
+    ///
     /// Go `main/commands/all/api/rules_add.go`（上游 38f09025）：首个请求沿用
     /// `--append` 标志值，其后一律 true ⇒ 多文件时后者追加合并而非覆盖。
     #[test]
