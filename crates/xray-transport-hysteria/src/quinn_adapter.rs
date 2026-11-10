@@ -20,7 +20,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::Context,
 };
 
@@ -383,6 +386,10 @@ pub struct QuinnQuicListener {
     /// 关闸档）；无 drain 面 ⇒ 不得声称 abort 在途（Drop-abort 时点不确定，
     /// 仅为实现事实，非契约保证）。
     scope: xray_frame::scope::ComponentScope,
+    /// 显式关闭标志（bd gqpck）：`close()` 置位后 accept 泵退出属预期；未置位而泵
+    /// 退出 = endpoint 自己死了（driver/IO 崩溃），端口仍绑定但永不 accept ——
+    /// 该形态此前与「主动 close」不可区分，故静默（H-A1）。
+    closing: Arc<AtomicBool>,
 }
 
 impl QuinnQuicListener {
@@ -390,9 +397,10 @@ impl QuinnQuicListener {
     pub fn new(
         endpoint: quinn::Endpoint,
         scope: xray_frame::scope::ComponentScope,
+        closing: Arc<AtomicBool>,
     ) -> Option<Self> {
         let local_addr = endpoint.local_addr().ok()?;
-        Some(Self { endpoint, local_addr, scope })
+        Some(Self { endpoint, local_addr, scope, closing })
     }
 }
 
@@ -422,6 +430,8 @@ impl HysteriaQuicListener for QuinnQuicListener {
         // 连接任务账本关闸（transport 族关闸档，ADR-0004 §2.2 Q1）：停机后拒新
         // 任务；在途任务不由此口 abort（Drop-abort 时点不确定，仅为实现事实）。
         self.scope.close_gate();
+        // 先置位再关 endpoint：泵因 accept→None 退出时据此判定「预期关闭」（bd gqpck）。
+        self.closing.store(true, Ordering::Release);
         Box::pin(async move {
             ep.close(VarInt::from_u32(0), b"");
             Ok(())
@@ -574,6 +584,7 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                 endpoint.local_addr().map(|a| a.to_string()).unwrap_or_default()
             ));
             let ep = endpoint.clone();
+            let closing = Arc::new(AtomicBool::new(false));
             spawn_gated_hysteria_accept(
                 ep,
                 gate,
@@ -587,9 +598,10 @@ impl HysteriaListenerFactory for QuinnListenerFactory {
                 static_auth,
                 udp_idle_timeout,
                 &scope,
+                Arc::clone(&closing),
             );
 
-            let listener = QuinnQuicListener::new(endpoint, scope).ok_or_else(|| {
+            let listener = QuinnQuicListener::new(endpoint, scope, closing).ok_or_else(|| {
                 crate::error::HysteriaError::Io(io::Error::other("local_addr failed"))
             })?;
             Ok(Arc::new(listener) as Arc<dyn HysteriaQuicListener>)
@@ -623,6 +635,9 @@ fn spawn_gated_hysteria_accept(
     // 关闸档，ADR-0004 §2.2 Q1）。**借引用**：账本 owner 住 listener 字段；任务体
     // 若持 owner 强引用即成自引用环，账本强引用永不归零、收口恒不可达。
     scope: &xray_frame::scope::ComponentScope,
+    // bd gqpck：显式 close 标志（listener.close() 置位），用于区分「主动关」与
+    // 「endpoint 自己死了」，两者在 `ep.accept()==None` 时不可区分。
+    closing: Arc<AtomicBool>,
 ) {
     let local = ep.local_addr().unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 0)));
     // 泵住在本账本里（bd 29sgj）⇒ 泵体只持弱引用句柄（B2 破环）。
@@ -692,6 +707,14 @@ fn spawn_gated_hysteria_accept(
                     pump_scope.rejected_spawns()
                 ));
             }
+        }
+        // bd gqpck / H-A1：`ep.accept()` 返 None 有两条来源——`close()` 主动关
+        // （`closing` 已置位）与 endpoint driver 自己死了（未置位）。后者此前与
+        // 前者不可区分 ⇒ 端口仍绑定、永不 accept、零日志。这里必须发声。
+        if !closing.load(Ordering::Acquire) {
+            crate::LOG.error(format!(
+                "tag=hysteria local={local} hysteria quic: accept 循环意外退出（endpoint 未被显式 close）——UDP 端口仍绑定但不再接受连接；疑 endpoint driver/IO 崩溃，见 quinn tracing"
+            ));
         }
     });
 }
@@ -2712,6 +2735,106 @@ mod tests {
         }
     }
 
+    /// 造一个真 QUIC 监听泵（生产同构装配），返回可操作的 [`QuinnQuicListener`]。
+    ///
+    /// 泵已 spawn；`endpoint` 副本留在 listener 里（生产形态），泵持另一 clone。
+    async fn spawn_gqpck_listener(
+        label: &str,
+    ) -> (QuinnQuicListener, Arc<std::sync::Mutex<Vec<String>>>) {
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        ensure_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let mut server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap();
+        let mut template = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        let (tc, _slot) = build_hysteria_transport_config(&QuicConfig::default_for_hysteria());
+        template.transport_config(Arc::new(tc));
+        let std_sock = xray_transport::sockopt::bind_udp_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &xray_transport::sockopt::SocketOptions::default(),
+        )
+        .expect("bind udp endpoint");
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(template.clone()),
+            std_sock,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .expect("server endpoint");
+
+        let scope = xray_frame::scope::ComponentScope::new(format!("hysteria-quinn:{label}"));
+        let closing = Arc::new(AtomicBool::new(false));
+        spawn_gated_hysteria_accept(
+            endpoint.clone(),
+            HandshakeGate::new(4),
+            template,
+            QuicConfig::default_for_hysteria(),
+            None,
+            Arc::new(|_| {}),
+            None,
+            Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+            crate::hub::MasqType::NotFound.build_handler(),
+            "gqpck-secret".into(),
+            Duration::from_secs(60),
+            &scope,
+            Arc::clone(&closing),
+        );
+        let listener = QuinnQuicListener::new(endpoint, scope, closing).expect("local_addr");
+        (listener, logs)
+    }
+
+    /// 轮询等待 accept 泵退出（泵是本账本里的任务 ⇒ 退出后 in_flight 归零）。
+    async fn wait_pump_exit(listener: &QuinnQuicListener) {
+        for _ in 0..100 {
+            if listener.scope.in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("accept 泵在 2s 内未退出");
+    }
+
+    /// bd gqpck / H-A1 正向：`close()` 主动关 ⇒ 泵退出**不得**报「意外退出」。
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_pump_silent_on_explicit_close() {
+        let (listener, logs) = spawn_gqpck_listener("explicit-close").await;
+        let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        listener.close().await.expect("close");
+        wait_pump_exit(&listener).await;
+        let got = logs.lock().unwrap();
+        assert!(
+            !got.iter().any(|m| m.contains("意外退出")),
+            "显式 close 不得报意外退出，实际: {got:?}"
+        );
+    }
+
+    /// bd gqpck / H-A1 反向（本修复核心）：endpoint 自己死（绕过 `close()`）⇒
+    /// 必须 error 留痕。修复前该路径与主动 close 不可区分 ⇒ 静默（端口仍绑定、
+    /// 永不 accept、零日志）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn accept_pump_reports_unexpected_endpoint_death() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let (listener, logs) = spawn_gqpck_listener("unexpected-death").await;
+        let _guard = tracing::subscriber::set_default(CaptureLogs(Arc::clone(&logs)));
+        // 直接关 endpoint，**不经** listener.close()（因此不放 closing 标志）。
+        listener.endpoint.close(VarInt::from_u32(0), b"simulated driver death");
+        wait_pump_exit(&listener).await;
+        assert!(!listener.closing.load(AtomicOrdering::Acquire), "本用例故意不置位 closing 标志");
+        let got = logs.lock().unwrap();
+        assert!(
+            got.iter().any(|m| m.contains("意外退出")),
+            "endpoint 非显式关闭导致的泵退出必须留痕，实际: {got:?}"
+        );
+    }
+
     /// 行为断言（jcnjb⑤，rd8yj① 判据）：hysteria accept 泵的握手闸必须在
     /// 握手窗超时后**真实释放**许可——许可被占满整窗、窗后回到可再取。
     ///
@@ -2778,6 +2901,7 @@ mod tests {
             "test-secret".into(),
             Duration::from_secs(300),
             &accept_scope,
+            Arc::new(AtomicBool::new(false)),
         );
 
         // 永挂验证器客户端：占住唯一名额（entered ⇒ 服务器已接纳、许可已被占）。
@@ -2903,6 +3027,7 @@ mod tests {
         let listener = QuinnQuicListener::new(
             quinn::Endpoint::client("127.0.0.1:0".parse().expect("addr")).expect("endpoint"),
             xray_frame::scope::ComponentScope::new("hysteria-quinn:a2-test"),
+            Arc::new(AtomicBool::new(false)),
         )
         .expect("local_addr");
 
