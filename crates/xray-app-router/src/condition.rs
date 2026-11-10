@@ -1762,6 +1762,76 @@ mod tests {
         drop(client);
     }
 
+    /// 端到端：**另一个进程**持有真实 UDP socket ⇒ UDP 反查到该进程的 PID 与名字。
+    ///
+    /// 子进程 = 本测试二进制自身（同一测试函数按环境变量分流），不依赖 python/lsof，
+    /// 覆盖完整链路：`/proc/net/udp` 取 inode → `/proc/*/fd` **跨进程**反查 PID
+    /// （Go `find_process_linux.go:104-176`）。子进程绑**通配地址** `0.0.0.0:0`——
+    /// UDP socket 常态，精确地址必然对不上，只能靠 Go 12b7f85d 的端口回落命中
+    /// （父进程按 `127.0.0.1:port` 查）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_find_process_resolves_udp_socket_in_other_process() {
+        use std::{io::BufRead, process::Stdio};
+
+        const CHILD_ENV: &str = "XRAY_ROUTER_UDP_E2E_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // 子进程：绑真实 UDP socket（通配地址），输出端口后存活等父进程杀掉。
+            // 直写 stdout 而非 println!（crate 级 deny(clippy::print_stdout)）。
+            let sock = std::net::UdpSocket::bind("0.0.0.0:0").expect("子进程绑定 UDP");
+            let port = sock.local_addr().expect("取端口").port();
+            std::io::Write::write_all(
+                &mut std::io::stdout(),
+                format!("UDP_E2E_PORT={port}\n").as_bytes(),
+            )
+            .expect("输出端口");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--nocapture", "test_find_process_resolves_udp_socket_in_other_process"])
+            .env(CHILD_ENV, "1")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("应能启动子进程");
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let port: u16 = loop {
+            let line = lines.next().expect("子进程应打印端口").expect("读子进程输出");
+            if let Some(rest) = line.strip_prefix("UDP_E2E_PORT=") {
+                break rest.trim().parse().expect("端口应为十进制数字");
+            }
+        };
+
+        let ip = std::net::IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut info = None;
+        for _ in 0..50 {
+            info = find_process(Network::UDP, ip, port);
+            if info.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let info = info.expect("应反查到持有该 UDP socket 的子进程");
+        assert_eq!(info.pid, child_pid, "应解析到子进程 PID");
+        assert!(!info.name.is_empty(), "子进程名不应为空");
+
+        // 子进程已退出 ⇒ 该端口无属主，必须明确返回 None（不静默取别的 socket）。
+        let mut released = false;
+        for _ in 0..50 {
+            if find_process(Network::UDP, ip, port).is_none() {
+                released = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(released, "子进程退出后同端口应无属主 ⇒ None");
+    }
+
     // ── Linux UDP process 条件（Go 12b7f85d「Routing: Fix Linux UDP `process`」）──
 
     /// `/proc/net/udp` 表样例（表头 + 两行 socket）。
