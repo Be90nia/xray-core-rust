@@ -551,3 +551,55 @@ mod blocking_pool_tests {
         });
     }
 }
+
+// ===== bd dxecd B-10：CLI 多值参数（Go `api adrules c1.json c2.json` / `api bi b1 b2`）=====
+#[cfg(test)]
+mod b10_multi_arg_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// 多配置文件：Go `main/commands/all/api/rules_add.go` 接受 `c1.json [c2.json]...`。
+    #[test]
+    fn add_rule_accepts_multiple_config_files() {
+        let cli = Cli::try_parse_from(["xray", "api", "add-rule", "c1.json", "c2.json", "c3.json"])
+            .expect("多配置文件必须可解析");
+        let Some(Command::Api { command: ApiCommand::AddRule(a) }) = cli.command else {
+            panic!("应是 api add-rule")
+        };
+        assert_eq!(a.configs, vec!["c1.json", "c2.json", "c3.json"]);
+    }
+
+    /// 向后兼容：单配置文件用法（Go `adrules c1.json`）必须仍可用。
+    #[test]
+    fn add_rule_single_config_file_still_works() {
+        let cli = Cli::try_parse_from(["xray", "api", "add-rule", "c1.json"])
+            .expect("单配置文件必须可解析");
+        let Some(Command::Api { command: ApiCommand::AddRule(a) }) = cli.command else {
+            panic!("应是 api add-rule")
+        };
+        assert_eq!(a.configs, vec!["c1.json"]);
+    }
+
+    /// 多 tag：Go `main/commands/all/api/balancer_info.go` 接受 `b1 [b2]...`。
+    #[test]
+    fn balancer_info_accepts_multiple_tags() {
+        let cli = Cli::try_parse_from(["xray", "api", "balancer-info", "b1", "b2"])
+            .expect("多 tag 必须可解析");
+        let Some(Command::Api { command: ApiCommand::BalancerInfo(a) }) = cli.command else {
+            panic!("应是 api balancer-info")
+        };
+        assert_eq!(a.balancers, vec!["b1", "b2"]);
+    }
+
+    /// 向后兼容：单 tag 用法必须仍可用。
+    #[test]
+    fn balancer_info_single_tag_still_works() {
+        let cli =
+            Cli::try_parse_from(["xray", "api", "balancer-info", "b1"]).expect("单 tag 必须可解析");
+        let Some(Command::Api { command: ApiCommand::BalancerInfo(a) }) = cli.command else {
+            panic!("应是 api balancer-info")
+        };
+        assert_eq!(a.balancers, vec!["b1"]);
+    }
+}
