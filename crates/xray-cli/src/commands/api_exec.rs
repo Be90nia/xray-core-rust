@@ -1053,4 +1053,22 @@ mod tests {
         assert!(v["users"][0].get("ips").is_none());
     }
 
+    // ===== bd dxecd B-10：CLI 多值参数（Go `api adrules c1.json c2.json` / `api bi b1 b2`）=====
+
+    /// **解析层测试待补**（下一会话）：clap v4 下 `Args` 结构体不实现 `Parser`，
+    /// 且在测试里自造命令树时「变体 + flatten」会被子命令化（报
+    /// `InvalidSubcommand` / `AddRuleArgs: Subcommand` 未满足）⇒ 解析层测试应落在
+    /// **真实命令树** `crates/xray-cli/src/bin/xray.rs`（那里 `AddRule(AddRuleArgs)` /
+    /// `BalancerInfo(BalancerInfoArgs)` 是带位置参数的子命令），用 `Cli::try_parse_from`
+    /// 断言 `configs` / `balancers` 的多值与单值兼容。
+
+    /// Go `main/commands/all/api/rules_add.go`（上游 38f09025）：首个请求沿用
+    /// `--append` 标志值，其后一律 true ⇒ 多文件时后者追加合并而非覆盖。
+    #[test]
+    fn rule_should_append_matches_go_rules_add_semantics() {
+        assert!(!rule_should_append(0, false), "首个文件沿用标志值");
+        assert!(rule_should_append(0, true), "首个文件沿用标志值");
+        assert!(rule_should_append(1, false), "第二个起一律追加");
+        assert!(rule_should_append(2, false), "第三个起一律追加");
+    }
 }
