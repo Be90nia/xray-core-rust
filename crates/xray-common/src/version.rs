@@ -9,10 +9,12 @@
 pub const VERSION_X: u8 = 26;
 
 /// 次版本号。对应 Go `Version_y`。
-pub const VERSION_Y: u8 = 10;
+pub const VERSION_Y: u8 = 11;
 
 /// 修订号。对应 Go `Version_z`。
 ///
-/// 对拍基准是 Go v26.10.17（CLAUDE.md §0）；写成 11 会让 `"min": "26.10.17"`
-/// 这类 Go 侧合法配置在装配期被自己判为不满足而拒启（bd 5uhaj）。
-pub const VERSION_Z: u8 = 17;
+/// 对拍基准是 Go v26.11.9（CLAUDE.md §0）。版本三元组整体必须 **≥ 基准**：
+/// 本端版本低于 `"min": "26.10.17"` 这类 Go 侧合法配置的下限时，配置会在装配期
+/// 被本端版本门判为不满足而拒启（bd 5uhaj）。比较是逐段数值比较
+/// （`xray_app_version::compare_versions`），不是字符串字典序。
+pub const VERSION_Z: u8 = 9;

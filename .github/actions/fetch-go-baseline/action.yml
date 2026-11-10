@@ -1,14 +1,13 @@
 name: 'Fetch Go baseline (pinned commit build)'
 description: >-
   取得「裁定基准」Go Xray 二进制（bd t3wtj：基准版本收敛到本文件一处）。
-  基准 = v26.10.17（commit 92ccc939aaf4f8965f369cf0b142e005aeaa11d5）。
-  **为什么不是下载 release asset**：上游从未为 26.10.17 发布二进制（releases 列表与
-  tags 双双查无此项——存在的只有 26.9.9 / 26.9.30 / 26.10.21 / 26.10.31）。而 26.9.9
-  已按 CLAUDE.md §0 降级为「仅解释上游改了什么、不得用于裁定」，26.10.21 会把上游新增项
-  误判成本仓缺口。→ 唯一能拿到 26.10.17 二进制的途径 = 按 commit 取源码构建。
-  完整性锚点因此从「release asset 的 sha256」换成「commit sha（不可变）+ go.sum 模块校验和」，
-  并在构建后断言 `xray version` 输出确为基准版本号（错版本立即红）。
-  升级基准 = 改本文件 env 两行（VERSION + COMMIT）+ 跑一次 CI。
+  基准 = v26.11.9（commit 676eaf66f8f05d4d558ee7a74b4736623d3feeb9）。
+  **为什么按 commit 构建**：v26.10.17 上游从未发布二进制（releases 与 tags 双双查无）；
+  v26.11.9 上游**已**发布 release 资产（Xray-linux-64.zip 等），可改走 asset 路线
+  （CI 更快，但需恢复按平台的 asset 映射表 + sha256 校验）——本轮取最小改动，
+  沿用 commit 构建；升级基准 = 改本文件 env 两行（VERSION + COMMIT）+ 跑一次 CI。
+  完整性锚点 = 「commit sha（不可变）+ go.sum 模块校验和」+ 构建后断言
+  `xray version` 输出确为基准版本号（错版本立即红）。
 
 inputs:
   out:
@@ -19,8 +18,8 @@ inputs:
 runs:
   using: composite
   steps:
-    # 26.10.17 的 go.mod 声明 `go 1.27`：低版本 go 会尝试 GOTOOLCHAIN 自动下载
-    # （CI 允许，但多一次网络依赖与失败面），故显式装同代工具链。
+    # 26.11.9 的 go.mod 声明 `go 1.27`（与 26.10.17 同代）：低版本 go 会尝试
+    # GOTOOLCHAIN 自动下载（CI 允许，但多一次网络依赖与失败面），故显式装同代工具链。
     - name: Install Go toolchain
       uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
       with:
@@ -30,8 +29,8 @@ runs:
     - name: Build Go baseline from pinned commit
       shell: bash
       env:
-        BASELINE_VERSION: '26.10.17'
-        BASELINE_COMMIT: '92ccc939aaf4f8965f369cf0b142e005aeaa11d5'
+        BASELINE_VERSION: '26.11.9'
+        BASELINE_COMMIT: '676eaf66f8f05d4d558ee7a74b4736623d3feeb9'
         OUT: ${{ inputs.out }}
       run: |
         set -euo pipefail

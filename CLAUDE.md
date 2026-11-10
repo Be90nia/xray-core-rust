@@ -8,7 +8,7 @@
 
 ## 0. 项目一句话
 
-**Xray-core-rust** = Go Xray-core **v26.10.17** Rust 复刻（起点 v26.9.9；**对拍裁定基准 = 26.10.17**，源码 `D:/Project/Xray-core` @ `92ccc939`，26.9.9 仅用于解释「上游改了什么」不得用于裁定；上游已达 26.10.21，**待 10.17 全量复刻完成后**再讨论提升，禁提前把 10.21 新增项当缺口），私有仓 `github.com/Be90nia/xray-core-rust`，master `ceb6a487`（`feature/framework` 领先 695 commit，`7b336a12` 实测），CI 10 门，32/32 协议全通，crates/ 下 804 个 `.rs` ≈ 36.4 万行 Rust，55 个 crate 条目（54 自建 + `udf-frame` 外部仓工作副本）。
+**Xray-core-rust** = Go Xray-core **v26.11.9** Rust 复刻（起点 v26.9.9；**对拍裁定基准 = 26.11.9**，源码 `D:/Project/Xray-core` @ `676eaf66`，Go 仓已 checkout 到该 tag；上一轮基准 26.10.17 @ `92ccc939` 与起点 26.9.9 仅用于解释「上游改了什么」不得用于裁定；**2026-11-10 基准由 26.10.17 升到 26.11.9**，增量 = 66 commit / 217 文件 / +10453 −1491 ⇒ 该增量内的上游新增能力**按能力缺口单独登记，禁提前当本仓缺陷**），私有仓 `github.com/Be90nia/xray-core-rust`，master `ceb6a487`（`feature/framework` 领先 695 commit，`7b336a12` 实测），CI 10 门，32/32 协议全通，crates/ 下 804 个 `.rs` ≈ 36.4 万行 Rust，55 个 crate 条目（54 自建 + `udf-frame` 外部仓工作副本）。
 
 ---
 
