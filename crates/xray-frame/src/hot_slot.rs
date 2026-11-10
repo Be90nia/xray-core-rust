@@ -30,8 +30,11 @@
 //!
 //! - **读**（[`HotSlot::current`]）：一次原子读 + 一次引用计数自增，**零锁零分配**。返回的 `Arc<T>`
 //!   可跨线程 / 跨 `.await` 持有；旧值活到最后一个 `Arc` 落地为止。
-//! - **写**（[`HotSlot::replace`]）：单次原子换指针，对**所有后续** `current()` 立即可见；
-//!   替换点上若已无读者，旧值当场释放。
+//! - **同步作用域读**（[`HotSlot::with`]）：一次纯原子 load（**无**引用计数自增），闭包内借用
+//!   `&T`，`Guard` 不外泄。**同步热路径**（每包 / 每连接匹配）用它；要 owned `Arc<T>` 时用
+//!   [`HotSlot::current`]。两者实测量级见测试 `read_cost_magnitude`。
+//! - **写**（[`HotSlot::replace`]）：单次原子换指针，对**所有后续** `current()` / `with()`
+//!   立即可见； 替换点上若已无读者，旧值当场释放。
 //! - **不提供**部分更新 / `&mut T` / 按 key 增删：`T` 只以 `Arc<T>` 整体进出。`T` 不要求 `Clone`
 //!   （只换指针，不克隆内容）。
 //! - **无后台线程、无定时器、无锁**：旧值释放时机完全由 `Arc` 引用计数决定。
@@ -43,7 +46,8 @@
 //! async yield points"*）——本仓任务全在 tokio 上跨线程迁移，跨 `.await` 是常态。且 `Guard` 无法
 //! 再变成 `Arc<T>`，而 TLS 握手要 owned `Arc<ServerConfig>`。代价仅是一次读多写少 cacheline 上的
 //! refcount 自增，相对 IP 前缀匹配（数十 ns 起）与一次握手（数十 µs 起）在噪声内
-//! （实测量级见测试 `current_cost_magnitude`）。
+//! （实测量级见测试 `read_cost_magnitude`；同步热路径改用 [`HotSlot::with`] 可完全
+//! 省掉这次自增）。
 //!
 //! # 与 `xray_frame::reload` 的分工
 //!
@@ -71,6 +75,20 @@ impl<T> HotSlot<T> {
     #[must_use]
     pub fn current(&self) -> Arc<T> {
         self.inner.load_full()
+    }
+
+    /// 同步作用域读：闭包内借用当前快照，**Guard 不外泄**。
+    ///
+    /// 成本 = 一次纯原子 load（**无**引用计数自增）——比 [`HotSlot::current`] 省掉一次
+    /// 共享 cacheline 的 RMW（两者实测量级见测试 `read_cost_magnitude`）。用于**同步
+    /// 热路径**（每包 / 每连接匹配）；需要 owned `Arc<T>`（跨 `.await` 持有、存进数据
+    /// 结构、交给别的线程）时仍用 [`HotSlot::current`]。
+    ///
+    /// 闭包只拿到 `&T`，arc-swap 的 `Guard` 在 `with` 返回时即释放——天然满足其
+    /// 「Guard 不得存进数据结构 / 不得跨 async yield point」的限制。
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let guard = self.inner.load();
+        f(&guard)
     }
 
     /// 整体替换（原子可见）；旧值随最后一个 `Arc` 释放。
@@ -143,6 +161,57 @@ mod tests {
     }
 
     #[test]
+    fn with_sees_replacement_and_releases_old_value() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let slot = HotSlot::new(Arc::new(Tracked { id: 1, drops: Arc::clone(&drops) }));
+
+        assert_eq!(slot.with(|t| t.id), 1);
+        slot.replace(Arc::new(Tracked { id: 2, drops: Arc::clone(&drops) }));
+        assert_eq!(slot.with(|t| t.id), 2, "with 必须看到替换后的新值");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "with 返回即释放旧值（Guard 不外泄）");
+    }
+
+    #[test]
+    fn with_concurrent_read_and_replace_never_tears() {
+        const READERS: usize = 4;
+        const WRITES: u64 = 20_000;
+
+        let slot = Arc::new(HotSlot::new(Arc::new(Pair { seq: 0, mirror: 0 })));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    let mut reads = 0u64;
+                    let mut last = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        // 快照必须整体可见（不撕裂），且单调不回退。
+                        last = slot.with(|p| {
+                            assert_eq!(p.seq, p.mirror, "快照撕裂：seq/mirror 不一致");
+                            assert!(p.seq >= last, "快照回退：{} → {}", last, p.seq);
+                            p.seq
+                        });
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        for seq in 1..=WRITES {
+            slot.replace(Arc::new(Pair { seq, mirror: seq }));
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let total_reads: u64 =
+            readers.into_iter().map(|h| h.join().expect("reader 未 panic")).sum();
+        assert!(total_reads > 0, "并发读者一个读都没跑");
+        assert_eq!(slot.with(|p| p.seq), WRITES, "写入序收敛后最终读必须是最后写入值");
+    }
+
+    #[test]
     fn old_value_lives_while_reader_holds_it() {
         let drops = Arc::new(AtomicUsize::new(0));
         let slot = HotSlot::new(Arc::new(Tracked { id: 1, drops: Arc::clone(&drops) }));
@@ -201,7 +270,7 @@ mod tests {
         reason = "取证数字须打印（--nocapture 人眼核对），同 q1r4q 先例"
     )]
     #[test]
-    fn current_cost_magnitude() {
+    fn read_cost_magnitude() {
         const ITERS: usize = 1_000_000;
         let slot = HotSlot::new(Arc::new(41u64));
 
@@ -211,6 +280,15 @@ mod tests {
             acc = acc.wrapping_add(*std::hint::black_box(slot.current()));
         }
         let ns_per_op = start.elapsed().as_nanos() as f64 / ITERS as f64;
+        std::hint::black_box(acc);
+
+        // 同步作用域读：纯原子 load，无 refcount。
+        let start = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..ITERS {
+            acc = acc.wrapping_add(slot.with(|v| *std::hint::black_box(v)));
+        }
+        let ns_per_with = start.elapsed().as_nanos() as f64 / ITERS as f64;
         std::hint::black_box(acc);
 
         // 参照：裸 `Arc::clone` 一次（= 本件的 refcount 自增成本本体）。
@@ -225,9 +303,10 @@ mod tests {
         std::hint::black_box(acc);
 
         println!(
-            "HotSlot::current ≈ {ns_per_op:.2} ns/op；裸 Arc::clone ≈ {ns_per_clone:.2} ns/op\
-             （{ITERS} 次迭代）"
+            "HotSlot::current ≈ {ns_per_op:.2} ns/op；HotSlot::with ≈ {ns_per_with:.2} ns/op；\
+             裸 Arc::clone ≈ {ns_per_clone:.2} ns/op（{ITERS} 次迭代）"
         );
         assert!(ns_per_op < 1000.0, "读侧量级异常：{ns_per_op:.2} ns/op");
+        assert!(ns_per_with < 1000.0, "with 量级异常：{ns_per_with:.2} ns/op");
     }
 }

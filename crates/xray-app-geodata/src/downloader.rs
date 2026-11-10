@@ -763,30 +763,29 @@ pub fn reload_listener_count() -> usize {
 /// 热更监听（bd 2bmns G-2：路由规则重建）。
 ///
 /// 对应 Go `app/geodata/geodata.go:88-90 reload() = IPReg.Reload() + DomainReg.Reload()`。
-/// `IP_REG`/`DOMAIN_REG` 只有注册进去的 matcher 才会被重建（本仓路由 matcher 是
-/// 本地的，故这两步对路由恒为空操作——真正的路由刷新走 `RELOAD_LISTENERS`）。
+/// `IP_REG`/`DOMAIN_REG` 只有登记进去的 matcher 才会被重建（本仓路由 matcher 是
+/// 本地的，故注册表这一步对路由本身不生效——路由刷新走 `RELOAD_LISTENERS`）。
 pub struct ReloadBothRegistries;
 
 impl GeodataReloader for ReloadBothRegistries {
     fn reload(&self) -> Result<(), GeodataError> {
-        use xray_geodata::{
-            matcher::{domain::DOMAIN_REG, ip::IP_REG},
-            pb::IpRule,
-        };
+        use xray_geodata::matcher::{domain::DOMAIN_REG, ip::IP_REG};
 
-        // ponytail: 空 rules reload — 调用 reload_with 让 reg 内的 matcher 状态被原子切换。
-        // 在没有新规则源时此调用等价于"标记 reload 已执行"。
-        // 待 geodata loader 接通后，这里替换为"从 loader 缓存取新 rules"。
-        if let Err(e) = IP_REG.reload_with(&[] as &[IpRule]) {
+        // IP 侧：真 reload——每个已登记 matcher 用**自己的 rules** 从新资产重建
+        //（bd hdgz9：旧 `reload_with(&[])` 是假成功标记，且 Go 无「同一份新规则
+        // 覆盖所有 matcher」语义）。任一条失败 ⇒ 整次热更失败（不半切）。
+        if let Err(e) = IP_REG.reload() {
             tracing::warn!(target: "xray_app_geodata", "IP_REG.reload failed: {e}");
             return Err(GeodataError::ReloadFailed(format!("IP_REG: {e}")));
         }
+        // ponytail: 域名侧仍是「空规则覆盖」——域名侧的世代热换归 S5 票，
+        // 迁到 `DOMAIN_REG.reload()` 时删掉这一段。
         if let Err(e) = DOMAIN_REG.reload_with(Vec::new()) {
             tracing::warn!(target: "xray_app_geodata", "DOMAIN_REG.reload failed: {e}");
             return Err(GeodataError::ReloadFailed(format!("DOMAIN_REG: {e}")));
         }
-        // bd 2bmns G-2：注册表的 matcher 是空的，真正的派生消费方（路由规则）
-        // 由监听方自行从新 `.dat` 重新派生。任一失败 → 整次热更失败。
+        // bd 2bmns G-2：真正的派生消费方（路由规则）由监听方自行从新 `.dat` 重新
+        // 派生。任一失败 → 整次热更失败。
         let listeners: Vec<ReloadListener> = RELOAD_LISTENERS.lock().clone();
         for (idx, listener) in listeners.iter().enumerate() {
             if let Err(e) = listener() {

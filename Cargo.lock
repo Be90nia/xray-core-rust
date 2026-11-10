@@ -6141,6 +6141,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "xray-common",
+ "xray-frame",
 ]
 
 [[package]]

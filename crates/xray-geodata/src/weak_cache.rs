@@ -101,6 +101,15 @@ where
         arc
     }
 
+    /// 升级表中全部仍存活的弱引用（顺带清理已失效条目）。
+    ///
+    /// 对应 Go `WeakCacheMap.Range`（`IPRegistry.Reload` 遍历登记簿用）。
+    pub fn upgrade_all(&self) -> Vec<Arc<V>> {
+        let mut guard = self.inner.lock();
+        guard.retain(|_, w| w.strong_count() > 0);
+        guard.values().filter_map(Weak::upgrade).collect()
+    }
+
     /// 内部表条目数（含已失效弱引用），仅供监控/调试。
     #[must_use]
     pub fn len(&self) -> usize {

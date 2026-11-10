@@ -8,6 +8,10 @@ description = "GeoIP and GeoSite data types, loading and matching"
 
 [dependencies]
 xray-common = { path = "../xray-common" }
+# 热替换快照持有件 `HotSlot`（无锁读 + 原子整体换 Arc，bd 9u35o）：IP 注册表的
+# 世代工厂与动态 matcher 快照共用，禁本 crate 另写 arc-swap/RwLock 版本。
+# 方向：骨架在下、领域库在上——xray-frame 不依赖 geodata，无环。
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
