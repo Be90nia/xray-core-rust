@@ -9,8 +9,12 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use skeleton_infra::fx::FxScope;
@@ -1001,6 +1005,128 @@ pub(crate) async fn build_freedom_inbound(
     })))
 }
 
+// ============ arm scope 闸关拒发观测（bd 9tots） ============
+//
+// 停机闸关后的新连接丢弃原先逐站 warn（9ka5w §1.2 未改清单的另一半）：统一为
+// 「预期丢弃 = DEBUG + 计数；泵逃逸 = 限频 WARN」。计数器 file 级自持
+// （AtomicU64）——ArmScope 本体在 `xray-frame/src/scope.rs`（他仓所有，只读），
+// 机制不上浮：本文件 4 站共享同一单例。
+
+/// 停机排空竞态判窗：闸关后泵随排空 abort 终止（udf 三段：关闸→abort→等净；
+/// 本 crate 排空档 5s），拒发只应落在首拒附近的竞态窗；判窗（10s ≈ 2× 排空
+/// 档）过后仍见新拒发 = 泵逃逸（owner 已消失而泵仍在受理）。
+const REJECT_ANOMALY_GRACE: Duration = Duration::from_secs(10);
+
+/// 泵逃逸 WARN 限频窗（60s 滚动，首击必报；与 tuic `DROP_LOG_INTERVAL` /
+/// fallback `FAIL_LOG_WINDOW` 同档，不新造档位）。
+const REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// 一次闸关拒发的分档结论。
+#[derive(Debug, Clone, Copy)]
+enum RejectVerdict {
+    /// 停机排空竞态（预期）→ 站点落 DEBUG。
+    DrainRace { rejected: u64 },
+    /// 泵逃逸（owner 已消失而泵仍在受理）→ `emit=true` 限频放行一条 WARN
+    /// （文案含 `lifecycle anomaly, not shutdown`）；`emit=false` 抑制期落 DEBUG。
+    PumpEscaped { rejected: u64, emit: bool },
+}
+
+/// 泵逃逸限频闸（窗口内至多一条 WARN；首击必报——`None` = 尚未报过）。
+#[derive(Default)]
+struct RejectTimeline {
+    /// 首次拒发时刻（判窗锚点）。
+    first_reject: Option<Instant>,
+    /// 上一条泵逃逸 WARN 时刻（限频窗锚点）。
+    last_anomaly_log: Option<Instant>,
+}
+
+/// arm scope 拒发账本：无条件计数（限频只压日志不压证据）+ 判窗/限频锚。
+struct ArmRejectMeter {
+    rejected: AtomicU64,
+    timeline: parking_lot::Mutex<RejectTimeline>,
+}
+
+impl ArmRejectMeter {
+    fn new() -> Self {
+        Self {
+            rejected: AtomicU64::new(0),
+            timeline: parking_lot::Mutex::new(RejectTimeline::default()),
+        }
+    }
+
+    /// 记一次闸关拒发（`now` 由调用方给 `std::time::Instant`；测试用合成时间驱动）。
+    fn record(&self, now: Instant) -> RejectVerdict {
+        let rejected = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut tl = self.timeline.lock();
+        let first = tl.first_reject.get_or_insert(now);
+        if now.saturating_duration_since(*first) < REJECT_ANOMALY_GRACE {
+            return RejectVerdict::DrainRace { rejected };
+        }
+        let emit = match tl.last_anomaly_log {
+            Some(last) => now.saturating_duration_since(last) >= REJECT_LOG_WINDOW,
+            None => true,
+        };
+        if emit {
+            tl.last_anomaly_log = Some(now);
+        }
+        RejectVerdict::PumpEscaped { rejected, emit }
+    }
+
+    /// 累计拒发数（聚合读数，禁逐包日志）。测试读数口（生产读数 = 日志行尾
+    /// `rejected N`）——非 test 构建无调用方，随 accessor 一起 cfg(test) 门控。
+    #[cfg(test)]
+    fn rejected_total(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+}
+
+/// 进程级拒发账本（本文件 4 站共享单例）。
+static TRANSPORT_REJECT_METER: LazyLock<ArmRejectMeter> = LazyLock::new(ArmRejectMeter::new);
+
+/// 进程级累计闸关拒发连接数（测试读数口）。生产读数 = 各档位日志行尾
+/// `rejected N`（`mod arm_builders` 私有 ⇒ 无外部读口；公开 accessor 需
+/// lib.rs re-export，非本票文件面，留待消费方出现时另批）。
+#[cfg(test)]
+#[must_use]
+pub(crate) fn transport_closed_scope_rejected_conns() -> u64 {
+    TRANSPORT_REJECT_METER.rejected_total()
+}
+
+/// 闸关拒新连接的统一观测口（4 站共用）：计数 + 分档日志。预期（排空竞态）=
+/// DEBUG；泵逃逸 = 限频 WARN（文案含 `lifecycle anomaly, not shutdown`）。
+/// 时钟：`compat::clock()` 返回裸 `std::time::Instant`（限频诊断信号非 wire 值，
+/// 无需可注入时钟；本站闭包无 ctx 形参，此为 ADR-2 面 2 受管口）。
+fn record_closed_scope_reject(label: &'static str, peer: Option<std::net::SocketAddr>) {
+    let now = xray_frame::compat::clock().now_instant();
+    let (warn, line) = match TRANSPORT_REJECT_METER.record(now) {
+        RejectVerdict::DrainRace { rejected } => (
+            false,
+            format!(
+                "{label}: arm scope closed at shutdown, dropping connection (drain race, rejected {rejected})"
+            ),
+        ),
+        RejectVerdict::PumpEscaped { rejected, emit: true } => (
+            true,
+            format!(
+                "{label}: arm scope closed at shutdown, dropping connection — lifecycle anomaly, not shutdown (rejected {rejected})"
+            ),
+        ),
+        RejectVerdict::PumpEscaped { rejected, emit: false } => (
+            false,
+            format!(
+                "{label}: arm scope closed at shutdown, dropping connection (lifecycle anomaly, not shutdown; log suppressed, rejected {rejected})"
+            ),
+        ),
+    };
+    // `tracing::event!` 的 level 位要求 const（tracing-0.1.44 E0435 实证）→ 字面量宏臂分派。
+    match (warn, peer) {
+        (true, Some(peer)) => tracing::warn!(peer = %peer, "{line}"),
+        (true, None) => tracing::warn!("{line}"),
+        (false, Some(peer)) => tracing::debug!(peer = %peer, "{line}"),
+        (false, None) => tracing::debug!("{line}"),
+    }
+}
+
 // ============ transport 分支 ConnHandler 共享构造（bd lfrg） ============
 //
 // TCP（`spawn_transport_listener_inbound`）与 unix（`spawn_unix_transport_inbound`）
@@ -1037,6 +1163,13 @@ pub(crate) fn vless_transport_on_conn(
         let fallbacks = fallbacks.clone();
         let options = options.clone();
         let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // 闸关早检（bd 9tots）：预期拒发不经 spawn 口 ⇒ compat 拒发 WARN 不触发
+        // （9ka5w 同款早返回）；conn 随闭包返回 drop，对端读 EOF（与 spawn 拒发
+        // 同结局）。早检与 spawn 间的 TOCTOU 极小窗走下方 Err 分支，同口径计数。
+        if plugin_ctx.arm_scope().is_closed() {
+            record_closed_scope_reject("vless transport", Some(peer));
+            return;
+        }
         // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
         // spawn 面与任务体各持一份（闭包是 Fn，不可把捕获值移出）。
         let task_ctx = Arc::clone(&plugin_ctx);
@@ -1062,8 +1195,8 @@ pub(crate) fn vless_transport_on_conn(
             }
         });
         if spawned.is_err() {
-            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
-            tracing::warn!(peer = %peer, "vless transport: arm scope closed at shutdown, dropping connection");
+            // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+            record_closed_scope_reject("vless transport", Some(peer));
         }
     }))
 }
@@ -1093,6 +1226,13 @@ pub(crate) fn trojan_transport_on_conn(
         let handler = Arc::clone(&handler);
         let fb_policy = fallbacks.clone();
         let (peer, local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // 闸关早检（bd 9tots）：预期拒发不经 spawn 口 ⇒ compat 拒发 WARN 不触发
+        // （9ka5w 同款早返回）；conn 随闭包返回 drop，对端读 EOF（与 spawn 拒发
+        // 同结局）。早检与 spawn 间的 TOCTOU 极小窗走下方 Err 分支，同口径计数。
+        if plugin_ctx.arm_scope().is_closed() {
+            record_closed_scope_reject("trojan transport", Some(peer));
+            return;
+        }
         // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
         let spawned = plugin_ctx.spawn(async move {
             xray_proxy_trojan::serve_trojan_conn(
@@ -1109,8 +1249,8 @@ pub(crate) fn trojan_transport_on_conn(
             .await;
         });
         if spawned.is_err() {
-            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
-            tracing::warn!(peer = %peer, "trojan transport: arm scope closed at shutdown, dropping connection");
+            // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+            record_closed_scope_reject("trojan transport", Some(peer));
         }
     }))
 }
@@ -1146,6 +1286,13 @@ pub(crate) fn vmess_transport_on_conn(
         let validator = Arc::clone(&validator);
         let history = Arc::clone(&history);
         let (peer, _local) = transport_conn_addrs(conn.as_ref(), fallback_addr);
+        // 闸关早检（bd 9tots）：预期拒发不经 spawn 口 ⇒ compat 拒发 WARN 不触发
+        // （9ka5w 同款早返回）；conn 随闭包返回 drop，对端读 EOF（与 spawn 拒发
+        // 同结局）。早检与 spawn 间的 TOCTOU 极小窗走下方 Err 分支，同口径计数。
+        if plugin_ctx.arm_scope().is_closed() {
+            record_closed_scope_reject("vmess transport", Some(peer));
+            return;
+        }
         // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
         let spawned = plugin_ctx.spawn(async move {
             if let Err(e) = xray_proxy_vmess::handle_vmess_connection(
@@ -1158,8 +1305,8 @@ pub(crate) fn vmess_transport_on_conn(
             }
         });
         if spawned.is_err() {
-            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
-            tracing::warn!(peer = %peer, "vmess transport: arm scope closed at shutdown, dropping connection");
+            // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+            record_closed_scope_reject("vmess transport", Some(peer));
         }
     }))
 }
@@ -1184,6 +1331,14 @@ pub(crate) fn ss_transport_on_conn(
     let hs_timeout = handshake_timeout_for(policy, 0);
     let plugin_ctx = Arc::clone(plugin_ctx);
     Ok(Arc::new(move |conn| {
+        // 闸关早检（bd 9tots）：预期拒发不经 spawn 口 ⇒ compat 拒发 WARN 不触发
+        // （9ka5w 同款早返回）；conn 随闭包返回 drop，对端读 EOF（与 spawn 拒发
+        // 同结局）。早检与 spawn 间的 TOCTOU 极小窗走下方 Err 分支，同口径计数。
+        // （本臂无 peer 解包面，观测行不带 peer 字段。）
+        if plugin_ctx.arm_scope().is_closed() {
+            record_closed_scope_reject("ss transport", None);
+            return;
+        }
         let mode = mode.clone();
         let handler = Arc::clone(&handler);
         // §3.5.6 ①类：连接任务归本 inbound 的 arm scope，停机随 scope 取消。
@@ -1191,8 +1346,8 @@ pub(crate) fn ss_transport_on_conn(
             ss_mode_conn_pipeline(mode, handler, conn, hs_timeout).await;
         });
         if spawned.is_err() {
-            // 停机期拒新连接：连接随 drop 关闭，留可诊断日志（禁静默丢）。
-            tracing::warn!("ss transport: arm scope closed at shutdown, dropping connection");
+            // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+            record_closed_scope_reject("ss transport", None);
         }
     }))
 }
@@ -1844,7 +1999,8 @@ mod transport_on_conn_shutdown_tests {
     //! §3.5.6 ①类验收（审计 2026-11-08 code-quality / architecture）：四条
     //! transport on_conn 臂的连接任务改经 `PluginContext::spawn` 托管后，
     //! arm scope 已关时的**新连接必须被拒并留日志**——不静默丢、也不复用
-    //! 已关 scope 假装成功。
+    //! 已关 scope 假装成功。bd 9tots 起日志口径 = 预期丢弃 DEBUG 档 + 计数
+    //! （泵逃逸才限频 WARN）。
     use std::time::Duration;
 
     use tokio::io::AsyncReadExt;
@@ -1878,11 +2034,13 @@ mod transport_on_conn_shutdown_tests {
     }
 
     /// tracing 事件捕获（同 `inbound.rs` `WarnCapture` 口径：无 tracing-subscriber 依赖）。
+    /// bd 9tots 起预期拒发落 DEBUG → 捕获阈值同步降到 DEBUG，行首带级别标记
+    /// 供「不得刷 WARN」断言。
     #[derive(Clone, Default)]
     struct WarnCapture(Arc<parking_lot::Mutex<Vec<String>>>);
     impl tracing::Subscriber for WarnCapture {
         fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
-            meta.level() <= &tracing::Level::WARN
+            meta.level() <= &tracing::Level::DEBUG
         }
 
         fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -1910,7 +2068,7 @@ mod transport_on_conn_shutdown_tests {
             }
             let mut v = Fmt(String::new());
             event.record(&mut v);
-            self.0.lock().push(v.0);
+            self.0.lock().push(format!("[{}] {}", event.metadata().level(), v.0));
         }
 
         fn enter(&self, _span: &tracing::span::Id) {}
@@ -1919,7 +2077,7 @@ mod transport_on_conn_shutdown_tests {
     }
 
     #[tokio::test]
-    async fn closed_arm_scope_rejects_new_connection_and_warns() {
+    async fn closed_arm_scope_rejects_connection_logs_debug_and_counts() {
         let ohm = freedom_ohm();
         let ib = trojan_ib();
         let arm = Arc::new(xray_frame::PluginContext::for_plugin("trojan"));
@@ -1940,6 +2098,7 @@ mod transport_on_conn_shutdown_tests {
         arm.arm_scope().close();
         assert!(arm.arm_scope().is_closed(), "关闸后 accepting 闸必须为关");
 
+        let before = transport_closed_scope_rejected_conns();
         let capture = WarnCapture::default();
         let (mut peer, server) = tokio::io::duplex(64);
         tracing::subscriber::with_default(capture.clone(), || {
@@ -1948,6 +2107,13 @@ mod transport_on_conn_shutdown_tests {
 
         let lines = capture.0.lock().join("\n");
         assert!(lines.contains("arm scope closed at shutdown"), "必须留诊断日志: {lines:?}");
+        assert!(lines.contains("[DEBUG]"), "预期拒发必须落 DEBUG 档（9tots）: {lines:?}");
+        assert!(!lines.contains("[WARN]"), "排空竞态不得刷 WARN（9tots 口径）: {lines:?}");
+        assert_eq!(
+            transport_closed_scope_rejected_conns(),
+            before + 1,
+            "闸关拒发必须计数: {lines:?}"
+        );
         assert_eq!(arm.arm_scope().fx().in_flight(), 0, "关闸后不得再入 scope");
 
         // 被拒连接必须 drop（不是静默挂住）：对端读到 EOF。
@@ -1957,5 +2123,35 @@ mod transport_on_conn_shutdown_tests {
             .expect("被拒连接必须立即关闭（peer 读不得超时）")
             .expect("read");
         assert_eq!(n, 0, "被拒连接必须 drop（peer 读 EOF）");
+    }
+
+    /// 判窗与限频的分类账本（bd 9tots）：合成时间线驱动**本地**实例，
+    /// 不触全局单例（防测试间互染）。
+    #[test]
+    fn reject_meter_classifies_drain_race_and_pump_escape() {
+        let meter = ArmRejectMeter::new();
+        let t0 = std::time::Instant::now();
+        // 判窗内：预期排空竞态
+        assert!(matches!(meter.record(t0), RejectVerdict::DrainRace { rejected: 1 }));
+        assert!(matches!(
+            meter.record(t0 + Duration::from_secs(9)),
+            RejectVerdict::DrainRace { rejected: 2 }
+        ));
+        // 判窗外首条：泵逃逸，首击必报
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE),
+            RejectVerdict::PumpEscaped { rejected: 3, emit: true }
+        ));
+        // 限频窗内：抑制但计数照记
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE + Duration::from_secs(1)),
+            RejectVerdict::PumpEscaped { rejected: 4, emit: false }
+        ));
+        // 限频窗过期：重新放行
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE + Duration::from_secs(1) + REJECT_LOG_WINDOW),
+            RejectVerdict::PumpEscaped { rejected: 5, emit: true }
+        ));
+        assert_eq!(meter.rejected_total(), 5, "累计计数必须覆盖两类");
     }
 }

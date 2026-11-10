@@ -20,7 +20,13 @@
 //! - Rvs：`inbound.go:625-630` → `Reverse.NewMux`（本批次仅注册表查找 + 转发，完整 worker 在其他
 //!   issue）
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
@@ -48,6 +54,112 @@ use crate::{
 /// 非逐包热路径；vision splice 数据面 raw tracing 另行红线登记于
 /// encryption/vision_conn.rs）。
 static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("vless", vec![]));
+
+// ── arm scope 闸关拒发观测（bd 9tots）──
+//
+// serve_vless accept 环与 udp relay uplink 两站的闸关拒发原先逐站 warn；统一为
+// 「预期丢弃 = DEBUG + 计数；泵逃逸 = 限频 WARN」。账本 file 级自持
+// （AtomicU64）——ArmScope 本体在 `xray-frame/src/scope.rs`（他仓所有，只读），
+// 机制不上浮：两站共享同一单例。
+
+/// 停机排空竞态判窗：闸关后泵随排空 abort 终止（udf 三段：关闸→abort→等净；
+/// xray-core 排空档 5s），拒发只应落在首拒附近的竞态窗；判窗（10s ≈ 2× 排空
+/// 档）过后仍见新拒发 = 泵逃逸（owner 已消失而泵仍在受理）。
+const REJECT_ANOMALY_GRACE: Duration = Duration::from_secs(10);
+
+/// 泵逃逸 WARN 限频窗（60s 滚动，首击必报；与 tuic `DROP_LOG_INTERVAL` /
+/// fallback `FAIL_LOG_WINDOW` 同档，不新造档位）。
+const REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+
+/// 一次闸关拒发的分档结论。
+#[derive(Debug, Clone, Copy)]
+enum RejectVerdict {
+    /// 停机排空竞态（预期）→ 站点落 DEBUG。
+    DrainRace { rejected: u64 },
+    /// 泵逃逸（owner 已消失而泵仍在受理）→ `emit=true` 限频放行一条 WARN
+    /// （文案含 `lifecycle anomaly, not shutdown`）；`emit=false` 抑制期落 DEBUG。
+    PumpEscaped { rejected: u64, emit: bool },
+}
+
+/// 泵逃逸限频闸（窗口内至多一条 WARN；首击必报——`None` = 尚未报过）。
+#[derive(Default)]
+struct RejectTimeline {
+    /// 首次拒发时刻（判窗锚点）。
+    first_reject: Option<Instant>,
+    /// 上一条泵逃逸 WARN 时刻（限频窗锚点）。
+    last_anomaly_log: Option<Instant>,
+}
+
+/// arm scope 拒发账本：无条件计数（限频只压日志不压证据）+ 判窗/限频锚。
+struct ArmRejectMeter {
+    rejected: AtomicU64,
+    timeline: parking_lot::Mutex<RejectTimeline>,
+}
+
+impl ArmRejectMeter {
+    fn new() -> Self {
+        Self {
+            rejected: AtomicU64::new(0),
+            timeline: parking_lot::Mutex::new(RejectTimeline::default()),
+        }
+    }
+
+    /// 记一次闸关拒发（`now` 由调用方给 `std::time::Instant`；测试用合成时间驱动）。
+    fn record(&self, now: Instant) -> RejectVerdict {
+        let rejected = self.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut tl = self.timeline.lock();
+        let first = tl.first_reject.get_or_insert(now);
+        if now.saturating_duration_since(*first) < REJECT_ANOMALY_GRACE {
+            return RejectVerdict::DrainRace { rejected };
+        }
+        let emit = match tl.last_anomaly_log {
+            Some(last) => now.saturating_duration_since(last) >= REJECT_LOG_WINDOW,
+            None => true,
+        };
+        if emit {
+            tl.last_anomaly_log = Some(now);
+        }
+        RejectVerdict::PumpEscaped { rejected, emit }
+    }
+
+    /// 累计拒发数（聚合读数，禁逐包日志）。
+    fn rejected_total(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+}
+
+/// 进程级拒发账本（accept 环 + udp uplink 共享单例）。
+static CLOSED_SCOPE_METER: LazyLock<ArmRejectMeter> = LazyLock::new(ArmRejectMeter::new);
+
+/// 进程级累计闸关拒发连接数（排空竞态 + 泵逃逸合计；聚合读数，禁逐包日志）。
+#[must_use]
+pub fn closed_scope_rejected_conns() -> u64 {
+    CLOSED_SCOPE_METER.rejected_total()
+}
+
+/// 闸关拒发统一观测口（accept 环 + udp uplink 共用）：计数 + 分档日志。
+/// `base` = 事件短语（站点文案前缀），`peer` 有则附注行尾。
+/// 时钟：`compat::clock()` 返回裸 `std::time::Instant`（限频诊断信号非 wire 值，
+/// 无需可注入时钟；helper 无 ctx 形参，此为 ADR-2 面 2 受管口）。
+fn record_closed_scope_reject(base: &str, peer: Option<String>) {
+    let now = xray_frame::compat::clock().now_instant();
+    let note = peer.map(|p| format!(" peer={p}")).unwrap_or_default();
+    match CLOSED_SCOPE_METER.record(now) {
+        RejectVerdict::DrainRace { rejected } => {
+            INBOUND_LOG.debug(format!("{base} (drain race, rejected {rejected}){note}"));
+        },
+        RejectVerdict::PumpEscaped { rejected, emit: true } => {
+            INBOUND_LOG.warn(format!(
+                "{base} — lifecycle anomaly, not shutdown (rejected {rejected}){note}"
+            ));
+        },
+        RejectVerdict::PumpEscaped { rejected, emit: false } => {
+            INBOUND_LOG.debug(format!(
+                "{base} (lifecycle anomaly, not shutdown; log suppressed, rejected {rejected}){note}"
+            ));
+        },
+    }
+}
 
 /// VLESS inbound 协议族接入选项（feature flags）。
 /// 对应 Go `proxy/vless/inbound/inbound.go::Handler` 的可选特性：
@@ -136,6 +248,17 @@ pub async fn serve_vless(
             },
         };
 
+        // 闸关早检（bd 9tots）：预期丢弃不经 spawn 口 ⇒ compat 拒发 WARN 不触发
+        // （9ka5w 同款早返回）；连接随迭代收尾 drop 关闭。泵逃逸由账本判窗并
+        // 限频 WARN。
+        if plugin_ctx.arm_scope().is_closed() {
+            record_closed_scope_reject(
+                "vless: arm scope closed at shutdown, dropping connection",
+                Some(peer.to_string()),
+            );
+            continue;
+        }
+
         let handler = Arc::clone(&handler);
         let validator = Arc::clone(&validator);
         let tls = tls.clone();
@@ -219,9 +342,11 @@ pub async fn serve_vless(
             }
         });
         if spawned.is_err() {
-            INBOUND_LOG.warn(format!(
-                "vless: arm scope closed at shutdown, dropping connection peer={peer}"
-            ));
+            // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+            record_closed_scope_reject(
+                "vless: arm scope closed at shutdown, dropping connection",
+                Some(peer.to_string()),
+            );
         }
     }
 }
@@ -758,21 +883,34 @@ where
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     // §3.5.6 ①类：uplink 拆分任务归本 inbound 的 arm scope，停机随 scope 取消；
     // 闸关即不拆（up_rx 立即 EOF → 会话自然收尾），留可诊断日志（禁静默）。
-    let uplink = match plugin_ctx.spawn(async move {
-        // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
-        while let Ok(pkt) = read_length_packet(&mut reader).await {
-            if up_tx.send(pkt).await.is_err() {
-                break; // relay 已退出
+    let uplink = if plugin_ctx.arm_scope().is_closed() {
+        // 闸关早检（bd 9tots）：不经 spawn 口绕开 compat 拒发 WARN；up_tx 立即
+        // drop ⇒ up_rx EOF，会话收尾与 spawn 拒发路径一致。
+        drop(up_tx);
+        record_closed_scope_reject(
+            "vless udp relay: arm scope closed at shutdown, uplink not spawned",
+            None,
+        );
+        None
+    } else {
+        match plugin_ctx.spawn(async move {
+            // while let：Ok 继续、Err（EOF/IO）即退出（clippy while_let_loop 同构改写）
+            while let Ok(pkt) = read_length_packet(&mut reader).await {
+                if up_tx.send(pkt).await.is_err() {
+                    break; // relay 已退出
+                }
             }
+        }) {
+            Ok(handle) => Some(handle),
+            Err(_) => {
+                // TOCTOU 极小窗（早检后闸才关）：同口径计数 + 分档日志（预期=DEBUG）。
+                record_closed_scope_reject(
+                    "vless udp relay: arm scope closed at shutdown, uplink not spawned",
+                    None,
+                );
+                None
+            },
         }
-    }) {
-        Ok(handle) => Some(handle),
-        Err(_) => {
-            INBOUND_LOG.warn(
-                "vless udp relay: arm scope closed at shutdown, uplink not spawned".to_string(),
-            );
-            None
-        },
     };
 
     // 双方向并发泵 + 滑动 idle deadline：每轮循环重建 sleep_until，任一方向
@@ -2699,5 +2837,105 @@ mod tests {
             .expect("relay task must end on client EOF")
             .expect("join relay task");
         assert!(result.is_ok(), "EOF teardown must be clean: {result:?}");
+    }
+
+    // ── bd 9tots：闸关拒发的档位与计数 ──
+
+    /// 判窗与限频的分类账本：合成时间线驱动**本地**实例，不触全局单例
+    /// （防测试间互染）。
+    #[test]
+    fn reject_meter_classifies_drain_race_and_pump_escape() {
+        let meter = ArmRejectMeter::new();
+        let t0 = std::time::Instant::now();
+        // 判窗内：预期排空竞态
+        assert!(matches!(meter.record(t0), RejectVerdict::DrainRace { rejected: 1 }));
+        assert!(matches!(
+            meter.record(t0 + Duration::from_secs(9)),
+            RejectVerdict::DrainRace { rejected: 2 }
+        ));
+        // 判窗外首条：泵逃逸，首击必报
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE),
+            RejectVerdict::PumpEscaped { rejected: 3, emit: true }
+        ));
+        // 限频窗内：抑制但计数照记
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE + Duration::from_secs(1)),
+            RejectVerdict::PumpEscaped { rejected: 4, emit: false }
+        ));
+        // 限频窗过期：重新放行
+        assert!(matches!(
+            meter.record(t0 + REJECT_ANOMALY_GRACE + Duration::from_secs(1) + REJECT_LOG_WINDOW),
+            RejectVerdict::PumpEscaped { rejected: 5, emit: true }
+        ));
+        assert_eq!(meter.rejected_total(), 5, "累计计数必须覆盖两类");
+    }
+
+    /// accept 环闸关早检（bd 9tots）：连接被立即拒（对端 EOF）且计数，
+    /// 不经 spawn 口（无 compat 拒发 WARN 路径）。
+    #[tokio::test]
+    async fn serve_vless_closed_scope_rejects_connection_and_counts() {
+        let ctx = test_plugin_ctx();
+        ctx.arm_scope().close();
+        assert!(ctx.arm_scope().is_closed(), "前置：scope 必须已关闸");
+
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        let (_uuid, validator) = make_validator_with_user();
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("vless-closed-scope-reject", async move {
+            let _ = serve_vless(listener, ohm, validator, None, None, None, ctx).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let before = closed_scope_rejected_conns();
+        let mut probe = [0u8; 1];
+        // 服务端 record 先于 conn drop（同一 task 顺序执行）⇒ EOF 到达前必已计数
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut probe))
+            .await
+            .expect("闸关连接必须立即被拒（读不得超时）")
+            .expect("read");
+        assert_eq!(n, 0, "闸关连接必须 drop（对端读 EOF）");
+        assert_eq!(closed_scope_rejected_conns(), before + 1, "闸关拒发必须计数");
+    }
+
+    /// udp relay 闸关早检（bd 9tots）：uplink 不拆（up_tx 立即 drop ⇒ EOF），
+    /// 会话早于 idle deadline 收尾且计数。
+    #[tokio::test]
+    async fn udp_relay_closed_scope_ends_session_and_counts() {
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> = Arc::new(SilentUdpHandler);
+        let (_client_out, server_read, server_write, _client_in, decoded) = udp_relay_fixture();
+        let ctx = test_plugin_ctx();
+        ctx.arm_scope().close();
+        let before = closed_scope_rejected_conns();
+
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_udp_relay(
+                server_read,
+                server_write,
+                &decoded,
+                &handler,
+                udp_idle_timeout(),
+                &ctx,
+            ),
+        )
+        .await
+        .expect("闸关会话必须立即收尾（挂起 = up_tx 未随早检 drop）");
+        assert!(result.is_ok(), "闸关收尾必须干净: {result:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "闸关路径必须早于 idle deadline 收尾，took {elapsed:?}"
+        );
+        assert_eq!(closed_scope_rejected_conns(), before + 1, "闸关拒发必须计数");
     }
 }
