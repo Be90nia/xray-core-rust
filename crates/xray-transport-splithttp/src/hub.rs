@@ -254,7 +254,10 @@ impl HubListener {
                 })
                 .is_err()
             {
-                crate::LOG.debug("splithttp hub: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "splithttp hub: scope closed at shutdown, connection dropped — rejected {}",
+                    hub_scope.rejected_spawns()
+                ));
             }
         }
     }

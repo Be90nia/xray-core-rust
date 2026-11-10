@@ -978,7 +978,10 @@ fn spawn_udp_session_sweeper(sessions: UdpSessions, scope: &xray_frame::scope::S
         })
         .is_err()
     {
-        crate::TUN_LOG.warn("tun udp sweeper: managed scope closed, sweeper not started");
+        crate::TUN_LOG.debug(format!(
+            "tun udp sweeper: managed scope closed (shutdown), sweeper not started — rejected {}",
+            scope.rejected_spawns()
+        ));
     }
 }
 
@@ -1064,7 +1067,10 @@ fn spawn_udp_session_task(
     )) {
         Ok(handle) => handle,
         Err(_) => {
-            crate::TUN_LOG.warn("tun udp: managed scope closed, session not started");
+            crate::TUN_LOG.debug(format!(
+                "tun udp: managed scope closed (shutdown), session not started — rejected {}",
+                scope.rejected_spawns()
+            ));
             return;
         },
     };
@@ -1083,7 +1089,10 @@ fn spawn_udp_session_task(
         })
         .is_err()
     {
-        crate::TUN_LOG.warn("tun udp: managed scope closed, reply writer not started");
+        crate::TUN_LOG.debug(format!(
+            "tun udp: managed scope closed (shutdown), reply writer not started — rejected {}",
+            scope.rejected_spawns()
+        ));
     }
 }
 
@@ -1276,7 +1285,10 @@ async fn accept_tcp_connection(
     };
     // §3.5.6 ①类：中继与 dispatch 任务归 tun 组件托管口（close 三段排空即 abort）。
     if scope.spawn(relay.run()).is_err() {
-        crate::TUN_LOG.warn("tun tcp: managed scope closed, relay not started");
+        crate::TUN_LOG.debug(format!(
+            "tun tcp: managed scope closed (shutdown), relay not started — rejected {}",
+            scope.rejected_spawns()
+        ));
         netstack.lock().await.remove_socket(event.handle);
         return;
     }
@@ -1289,7 +1301,10 @@ async fn accept_tcp_connection(
         })
         .is_err()
     {
-        crate::TUN_LOG.warn("tun tcp: managed scope closed, dispatch not started");
+        crate::TUN_LOG.debug(format!(
+            "tun tcp: managed scope closed (shutdown), dispatch not started — rejected {}",
+            scope.rejected_spawns()
+        ));
     }
 }
 

@@ -514,8 +514,10 @@ fn spawn_x_padding_stream(
             })
             .is_err()
         {
-            crate::LOG
-                .debug("splithttp hub: scope closed at shutdown, x-padding stream not started");
+            crate::LOG.debug(format!(
+                "splithttp hub: scope closed at shutdown, x-padding stream not started — rejected {}",
+                ctx.sessions.scope().rejected_spawns()
+            ));
         }
     }
     tokio_stream::wrappers::ReceiverStream::new(rx)

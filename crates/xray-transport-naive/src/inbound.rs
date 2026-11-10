@@ -234,9 +234,10 @@ impl InboundHandler for NaiveInboundHandler {
                             }
                         });
                         if spawned.is_err() {
-                            crate::LOG.debug(
-                                "naive inbound: scope closed at shutdown, connection dropped",
-                            );
+                            crate::LOG.debug(format!(
+                                "naive inbound: scope closed at shutdown, connection dropped — rejected {}",
+                                accept_scope.rejected_spawns()
+                            ));
                         }
                     },
                     Err(e) => {
@@ -344,14 +345,19 @@ async fn handle_request(
                 let _ = dispatch.dispatch(&dest, link).await;
             });
             if spawned.is_err() {
-                crate::LOG.debug("naive tunnel: scope closed at shutdown, tunnel not dispatched");
+                crate::LOG.debug(format!(
+                    "naive tunnel: scope closed at shutdown, tunnel not dispatched — rejected {}",
+                    scope.rejected_spawns()
+                ));
             }
         },
         None => {
             // §3.5.6 ①类：mock relay 同归连接 scope。
             if scope.spawn(relay_mock_direct(host.clone(), port, upgrade, padded)).is_err() {
-                crate::LOG
-                    .debug("naive mock relay: scope closed at shutdown, relay not dispatched");
+                crate::LOG.debug(format!(
+                    "naive mock relay: scope closed at shutdown, relay not dispatched — rejected {}",
+                    scope.rejected_spawns()
+                ));
             }
         },
     }

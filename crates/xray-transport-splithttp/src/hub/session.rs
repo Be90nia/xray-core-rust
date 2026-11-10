@@ -178,7 +178,10 @@ impl SessionMap {
             })
             .is_err()
         {
-            crate::LOG.debug("splithttp hub: scope closed at shutdown, session reap not armed");
+            crate::LOG.debug(format!(
+                "splithttp hub: scope closed at shutdown, session reap not armed — rejected {}",
+                self.scope.rejected_spawns()
+            ));
         }
 
         Ok(session)

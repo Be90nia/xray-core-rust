@@ -689,7 +689,10 @@ fn spawn_gated_hysteria_accept(
                 })
                 .is_err()
             {
-                crate::LOG.debug("hysteria quic: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "hysteria quic: scope closed at shutdown, connection dropped — rejected {}",
+                    scope.rejected_spawns()
+                ));
             }
         }
     });
@@ -1064,8 +1067,10 @@ async fn h3_auth(
                         })
                         .is_err()
                     {
-                        crate::LOG
-                            .debug("hysteria h3 auth: scope closed at shutdown, state not held");
+                        crate::LOG.debug(format!(
+                            "hysteria h3 auth: scope closed at shutdown, state not held — rejected {}",
+                            scope.rejected_spawns()
+                        ));
                     }
                     return Some(client_down);
                 }

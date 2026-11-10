@@ -161,7 +161,10 @@ async fn listen_hysteria(
                 })
                 .is_err()
             {
-                crate::LOG.debug("hysteria: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "hysteria: scope closed at shutdown, connection dropped — rejected {}",
+                    conn_scope.rejected_spawns()
+                ));
             }
         }
     });

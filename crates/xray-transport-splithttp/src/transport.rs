@@ -308,7 +308,10 @@ async fn listen_tcp(
                 })
                 .is_err()
             {
-                crate::LOG.debug("splithttp: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "splithttp: scope closed at shutdown, connection dropped — rejected {}",
+                    hub_scope.rejected_spawns()
+                ));
             }
         }
     });
@@ -419,7 +422,10 @@ pub async fn listen_unix_splithttp(
                 })
                 .is_err()
             {
-                crate::LOG.debug("splithttp unix: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "splithttp unix: scope closed at shutdown, connection dropped — rejected {}",
+                    hub_scope.rejected_spawns()
+                ));
             }
         }
     });
@@ -1056,7 +1062,10 @@ fn spawn_h3_accept(
                 serve_h3_conn(conn, ctx).await;
             });
             if spawned.is_err() {
-                crate::LOG.debug("splithttp h3: scope closed at shutdown, connection dropped");
+                crate::LOG.debug(format!(
+                    "splithttp h3: scope closed at shutdown, connection dropped — rejected {}",
+                    hub_scope.rejected_spawns()
+                ));
             }
         }
     });

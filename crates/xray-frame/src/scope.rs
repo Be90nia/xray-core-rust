@@ -35,7 +35,10 @@
 
 use std::{
     future::Future,
-    sync::{Arc, LazyLock, Weak, atomic::AtomicUsize},
+    sync::{
+        Arc, LazyLock, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -350,6 +353,23 @@ impl std::fmt::Debug for ArmScopeRegistry {
     }
 }
 
+/// 停机期拒发的**聚合计数**（bd 9ka5w）：账本的两种拒发口（闸已关 / 账本已随
+/// owner 消失）共用一份，句柄克隆共享同一计数（`Arc` 不持账本强引用）。
+///
+/// 计数的意义：预期丢弃统一走 DEBUG、不刷 WARN ⇒ 生产排障需要一个**常驻**的
+/// 聚合信号；[`ComponentScope::rejected_spawns`] / [`ScopeRef::rejected_spawns`]
+/// 读本件，站点 DEBUG 行带该值（禁逐包/逐批新增日志，洪泛面在站点侧不在本件）。
+#[derive(Default)]
+struct RejectCounts {
+    /// 累计拒发数（两类口合计）。
+    rejected: AtomicU64,
+    /// 闸曾关（`close_gate` / `drain`）：弱引用句柄升级失败时用它区分
+    /// 「停机竞态」（owner 先关闸再 drop）与「生命周期异常」（owner 未关闸就死）。
+    gate_closed: AtomicBool,
+    /// 异常形态 WARN 已报（限频一次；后续同类只计数）。
+    anomaly_reported: AtomicBool,
+}
+
 /// 账本的**弱引用句柄**（ADR-0004 §2.2 Q4 形态① · PM P4）：传给「住在该账本里」
 /// 的任务体用——只持 `Weak`，**不延长账本寿命** ⇒ 破自引用环。强引用形态
 /// （把 [`ComponentScope`] 克隆进自己托管的任务体）= ADR §2.7 反模式 3，禁。
@@ -357,8 +377,12 @@ impl std::fmt::Debug for ArmScopeRegistry {
 /// 用途：任务体内需要再 spawn（driver 派生 TCP 中继 / UDP 会话、hub 每连接任务
 /// 派生子任务 …）时，**只能**经本件；owner 强引用只留在组件字段 / stop 面。
 ///
-/// 拒发口径与 [`ComponentScope::spawn`] 一致（fail-visible）：升级失败（账本已
-/// 随最后一个强引用消失）⇒ `Err(ScopeClosed)` + 一条 warn，禁静默丢任务。
+/// 拒发口径（bd 9ka5w；ADR-0004 B2 破环后的两种形态）：
+/// - **账本仍在、闸已关**（停机期预期丢弃）⇒ `Err(ScopeClosed)` + 计数；**不在此
+///   处落日志**（站点按自己的域标签落 DEBUG，带 [`Self::rejected_spawns`] 读数）。
+/// - **账本已随 owner 消失**而泵仍在 spawn（B2 破环新形态）⇒ `Err(ScopeClosed)` +
+///   计数；闸关过（停机竞态）同样按预期丢弃；闸没关过 = **生命周期异常**（非 停机）⇒ 一条限频
+///   WARN（`anomaly_reported` 置位后只报一次，后续只计数， 防刷屏）。
 #[derive(Clone)]
 pub struct ScopeRef {
     /// 账本弱引用（升级失败 = 账本已消失，见 [`Self::spawn`]）。
@@ -367,6 +391,8 @@ pub struct ScopeRef {
     label: Arc<str>,
     /// 收割节流计数：与账本共享同一份（克隆计数，不持账本强引用）。
     tick: Arc<AtomicUsize>,
+    /// 拒发聚合计数：与创建它的 [`ComponentScope`] 共享（账本消失后仍可读）。
+    counts: Arc<RejectCounts>,
 }
 
 impl ScopeRef {
@@ -376,9 +402,24 @@ impl ScopeRef {
         F: Future<Output = ()> + Send + 'static,
     {
         let Some(scope) = self.inner.upgrade() else {
-            scope_log().warn(format!("{}: spawn rejected (ledger dropped)", self.label));
+            // 账本强引用已归零（owner 已 drop）——本形态只有 B2 破环后才存在：泵
+            // 还活在，账本没了。闸关过 = 停机竞态（预期）；没关过 = 生命周期异常。
+            let n = self.counts.rejected.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.counts.gate_closed.load(Ordering::Acquire)
+                && !self.counts.anomaly_reported.swap(true, Ordering::Relaxed)
+            {
+                scope_log().warn(format!(
+                    "{}: task ledger gone (owner dropped) while accept pump kept spawning — \
+                     lifecycle anomaly, not shutdown; further rejects only counted (rejected {n})",
+                    self.label
+                ));
+            }
             return Err(ScopeClosed);
         };
+        if scope.is_closed() {
+            self.counts.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(ScopeClosed);
+        }
         crate::compat::spawn_reaping_ticked(
             &scope,
             &scope_log(),
@@ -386,6 +427,13 @@ impl ScopeRef {
             Some(&self.tick),
             fut,
         )
+    }
+
+    /// 停机期拒发累计数（本账本，所有句柄共享同一读数）：站点 DEBUG 行带此值，
+    /// 禁新增逐包日志。
+    #[must_use]
+    pub fn rejected_spawns(&self) -> u64 {
+        self.counts.rejected.load(Ordering::Relaxed)
     }
 }
 
@@ -453,7 +501,10 @@ impl ScopeRef {
 /// **⑨ 诊断面（ADR §2.3 + PM P6）**——[`live_refs`](Self::live_refs) 是 A4
 /// 「环已破」的**唯一可证伪锚**（只看「stop 后 `in_flight == 0`」证伪力不足：环
 /// 存在时 `drain` 仍能归零 ⇒ 断言假绿）；标 `#[doc(hidden)]` = 诊断用、非稳定
-/// API，未来若 udf 提供等价能力则随上游收敛删除。
+/// API，未来若 udf 提供等价能力则随上游收敛删除。**停机期拒发**（bd 9ka5w）另由
+/// [`rejected_spawns`](Self::rejected_spawns) 聚合计数承担：预期丢弃由站点落
+/// DEBUG（带该读数），唯一 WARN = 「账本已随 owner 消失而闸从未关过」的**生命周期
+/// 异常**（限频一次，见 [`ScopeRef::spawn`]）——**禁**用 WARN 把正常停机刷成噪音。
 #[derive(Clone)]
 pub struct ComponentScope {
     /// 日志域标识（拼进每条报告；`Arc<str>` 便于克隆进 'static future）。
@@ -466,6 +517,8 @@ pub struct ComponentScope {
     /// 收割节流计数（O29）：随本件共享（克隆同一份），每
     /// [`crate::compat::REAP_EVERY`] 次 spawn 摊一次 `try_reap`。
     tick: Arc<AtomicUsize>,
+    /// 拒发聚合计数（bd 9ka5w）：与 [`ScopeRef`] 句柄共享同一份，账本消失后仍可读。
+    counts: Arc<RejectCounts>,
 }
 
 impl ComponentScope {
@@ -476,10 +529,15 @@ impl ComponentScope {
             scope: Arc::new(FxScope::new()),
             log: scope_log(),
             tick: Arc::new(AtomicUsize::new(0)),
+            counts: Arc::new(RejectCounts::default()),
         }
     }
 
-    /// 托管 spawn：闸已关（拒发）时记 warn 并回 `Err(ScopeClosed)`（禁静默放弃）。
+    /// 托管 spawn：闸已关（拒发）时**计数**并回 `Err(ScopeClosed)`（禁静默放弃）。
+    ///
+    /// 停机期拒发是预期事件 ⇒ 本件不落 WARN（旧行为每拒一次 warn 一条，把正常停机
+    /// 刷成噪音，bd 9ka5w）；可观测性由 [`Self::rejected_spawns`] 计数 + 站点
+    /// 自己的 DEBUG 行承担。
     ///
     /// 走 [`crate::compat::spawn_reaping_ticked`]（udf `try_reap` + 入集，收割按本
     /// 账本的 `tick` 摊薄）：已完成条目出集，panic 载荷落日志（udf `task_body`
@@ -488,6 +546,11 @@ impl ComponentScope {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        // 闸关 = 预期拒发：直接计数返回，不走 compat 的拒发 warn（口径统一 DEBUG）。
+        if self.scope.is_closed() {
+            self.counts.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(ScopeClosed);
+        }
         crate::compat::spawn_reaping_ticked(
             &self.scope,
             &self.log,
@@ -523,6 +586,7 @@ impl ComponentScope {
             inner: Arc::downgrade(&self.scope),
             label: Arc::clone(&self.label),
             tick: Arc::clone(&self.tick),
+            counts: Arc::clone(&self.counts),
         }
     }
 
@@ -531,7 +595,15 @@ impl ComponentScope {
     /// **不断在途、不等净、不 abort**（ADR-0004 §2.2 Q2）。语义 = Go
     /// `listener.Close()`。要「在途归零」只能用 [`Self::drain`]。
     pub fn close_gate(&self) {
+        self.counts.gate_closed.store(true, Ordering::Release);
         self.scope.close();
+    }
+
+    /// 停机期拒发累计数（本账本，所有句柄共享同一读数）：预期丢弃统一 DEBUG，
+    /// 本计数是**常驻聚合可观测锚**（bd 9ka5w）；禁为观测新增逐包/逐批日志。
+    #[must_use]
+    pub fn rejected_spawns(&self) -> u64 {
+        self.counts.rejected.load(Ordering::Relaxed)
     }
 
     /// **排空**（异步三段：关闸 → abort 在途 → 等净，带 timeout）。
@@ -541,6 +613,9 @@ impl ComponentScope {
     /// `timed_out > 0` + 一条 error 上报（禁静默）；成功 = 一条 info 报告
     /// （`drained N`）。返回 udf `ShutdownReport` 供调用方断言。
     pub async fn drain(&self, timeout: Duration) -> ShutdownReport {
+        // 排空内含关闸（udf `shutdown_timeout` 第一步）⇒ 同 `close_gate` 标记闸关，
+        // 否则排空后 owner drop 的拒发会被误判成「未关闸就死」的生命周期异常。
+        self.counts.gate_closed.store(true, Ordering::Release);
         let pending = self.scope.in_flight();
         let report = self.scope.shutdown_timeout(timeout).await;
         for msg in &report.panicked {
@@ -621,6 +696,64 @@ mod tests {
         };
         let spawned = handle.spawn(async {});
         assert!(matches!(spawned, Err(ScopeClosed)), "账本已消失必须拒发");
+    }
+
+    /// bd 9ka5w：停机期拒发**聚合计数**（预期丢弃统一 DEBUG ⇒ 计数是常驻观测锚）。
+    /// 强 / 弱两类句柄读同一份计数。
+    #[tokio::test]
+    async fn gate_rejections_are_counted() {
+        let owner = ComponentScope::new("test-reject-count");
+        let handle = owner.downgrade();
+        owner.close_gate();
+        assert!(handle.spawn(async {}).is_err(), "关闸后弱引用句柄同样拒发");
+        assert!(owner.spawn(async {}).is_err(), "关闸后强引用句柄拒发");
+        assert_eq!(owner.rejected_spawns(), 2, "两类句柄拒发必须累计到同一计数");
+        assert_eq!(handle.rejected_spawns(), 2, "弱引用句柄读同一份计数");
+    }
+
+    /// bd 9ka5w：ADR-0004 B2 破环后的新形态——**owner 先死而泵仍在 spawn**：
+    /// ①闸从未关过 = 生命周期异常（非停机）⇒ 限频 **一条** warn；②闸关过 = 停机
+    /// 竞态（预期丢弃）⇒ 不再报警；两类都计数（限频只压日志，不压信号）。
+    #[test]
+    fn ledger_gone_reports_anomaly_once_and_counts() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            // 线程局部订阅器：本文件所有日志面（`scope_log()` → tracing）都在本线程。
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+
+            // ① 未关闸就 drop owner ⇒ 异常形态，连拒两次只报一条 warn。
+            let anomaly = {
+                let owner = ComponentScope::new("test-ledger-gone");
+                let handle = owner.downgrade();
+                drop(owner);
+                handle
+            };
+            assert!(anomaly.spawn(async {}).is_err(), "账本已消失必须拒发");
+            assert!(anomaly.spawn(async {}).is_err(), "第二次同样拒发");
+            assert_eq!(anomaly.rejected_spawns(), 2, "限频只压日志，计数照累");
+
+            // ② 关闸后 drop owner ⇒ 停机竞态（预期丢弃）：计数但不报异常。
+            let shutdown = {
+                let owner = ComponentScope::new("test-ledger-gone-closed");
+                let handle = owner.downgrade();
+                owner.close_gate();
+                drop(owner);
+                handle
+            };
+            assert!(shutdown.spawn(async {}).is_err());
+            assert_eq!(shutdown.rejected_spawns(), 1);
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert_eq!(
+            lines.matches("lifecycle anomaly, not shutdown").count(),
+            1,
+            "异常形态只报一次（闸关过的停机竞态不再报警）: {lines:?}"
+        );
+        assert!(lines.contains("test-ledger-gone"), "报告必须带域标识: {lines:?}");
     }
 
     /// bd il9lh MW-5：同 tag 连续登记 K 次 → 表内恒 1 条（修前 = K 条永久条目），
