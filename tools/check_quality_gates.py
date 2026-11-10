@@ -37,8 +37,9 @@ bd st3l1/s4xsk 的 `#[ignore]` 登记 + bd xosi9 的 ②类 spawn 登记）：
                     .rs 注释/doc 与 docs/**/*.md 禁「drop/丢弃/归零 … 即/=/⇒ …
                     abort」伪 Drop-abort 断言（A5；白名单 = ADR-0004 自身 + 正确
                     口吻/禁令引文行）；crates/** 禁 `compat::ManagedScope` 残留
-                    （B1' 收口）；同文件 JoinSet+ComponentScope 并存仅 WARN
-                    （A6，人工确认是否双账本）。CI 的 quality-gates job 只跑扫描
+                    （B1' 收口）；同文件以类型用法并存 JoinSet+ComponentScope =
+                    双账本红（A6，bd n06e1：注释/字符串剔除、use 导入不算持有）。
+                    CI 的 quality-gates job 只跑扫描
                     面——self-test 由 `check_quality_gates.py --self-test`（含 (g)
                     段）或 `check_scope_claims.py --self-test` 本地跑。
 

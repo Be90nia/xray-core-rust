@@ -14,9 +14,13 @@
   (2) B1' 旧件残留：`crates/**` 出现 `compat::ManagedScope` ⇒ 红（B1' 删旧类型后
       `grep -rn "compat::ManagedScope" crates` 归零，ADR-0004 §2.5 B1'）。
       B1' 落地前本项在本树为红属预期——红点即 B1' 待收口清单。
-  (3) A6 单账本（报告级，不红）：同一 `.rs` 同时出现 `JoinSet` 与
-      `ComponentScope` ⇒ WARN（需人工确认是否双账本；JoinSet 可能是无关注册表，
-      自动红会误伤）。
+  (3) A6 单账本：同一 `.rs` 同时**以类型用法**持有 `JoinSet` 与
+      `ComponentScope` ⇒ 红（真双账本 = ADR-0004 §2.7 打回项）。
+      判据（bd n06e1）：只认**类型位置**上的用法（构造 `T::new(` / 泛型 `T<` `T>`
+      / 类型标注 `: T`、`: path::T`），且判定面是**代码面**——注释与字符串字面量
+      剔除，`use` 导入不算持有（导入 ≠ 账本）。旧判据按纯文本搜 `JoinSet`，
+      把文档注释里解释 udf「JoinSet drop ⇒ abort」机制的散文提及当成持有账本
+      ⇒ 6 个文件 6/6 全误报、长期带 6 条噪音。
 
 用法（房规 check_lock_across_await.py）：
   python tools/check_scope_claims.py             # 全树跑，退出码非零 = 红
@@ -125,8 +129,18 @@ def _comment_block(lines: list[str], idx: int) -> str:
     return "\n".join(lines[top:bot + 1])
 
 
-def extract_rust_comments(src: str) -> str:
-    """逐字符保留注释（`//` 与 `/* */`），其余（代码/字符串）置换为空格。
+def _blank(text: str) -> str:
+    """非换行字符全置换为空格，换行保留（保持行号对齐）。"""
+    return "".join(ch if ch == "\n" else " " for ch in text)
+
+
+def _scan_rust(src: str, *, keep_comments: bool) -> str:
+    """逐字符扫描 Rust 源，产出两个等长视图之一。
+
+    `keep_comments=True` → **注释面**：只保留注释（`//` 与 `/* */`），其余
+    （代码/字符串）置换为空格——A5 伪断言判定面（断言只长在注释里）。
+    `keep_comments=False` → **代码面**：只保留代码，注释与字符串字面量置换为
+    空格——A6 类型用法判定面（代码面里出现的类型名才是真用法）。
 
     位置与换行不变 ⇒ 命中行号与原文对齐（房规：剥离函数不位移）。
     覆盖普通字符串、字符字面量与原始字符串 r"…" / r#"…"#（其中的 // 不是注释）。
@@ -141,13 +155,13 @@ def extract_rust_comments(src: str) -> str:
             if c == "/" and src.startswith("//", i):
                 j = src.find("\n", i)
                 j = n if j < 0 else j
-                out.append(src[i:j])
+                out.append(src[i:j] if keep_comments else _blank(src[i:j]))
                 i = j
                 continue
             if c == "/" and src.startswith("/*", i):
                 j = src.find("*/", i + 2)
                 j = n if j < 0 else j + 2
-                out.append(src[i:j])
+                out.append(src[i:j] if keep_comments else _blank(src[i:j]))
                 i = j
                 continue
             if c == '"':
@@ -155,14 +169,14 @@ def extract_rust_comments(src: str) -> str:
             elif c == "'":
                 state = "byte_char"
             elif c == "r":
-                # r"…" / r#…"…"#（r 后只跟 " 或 # 时才可能是原始字符串）
+                # r"…" / r#"…"# 原始字符串
                 k = i + 1
                 while k < n and src[k] == "#":
                     k += 1
                 if k < n and src[k] == '"' and k > i + 1 or (k == i + 1 and k < n and src[k] == '"'):
                     state = "raw"
                     raw_hashes = k - (i + 1)
-            out.append(c if c == "\n" else " ")
+            out.append(c if c == "\n" or not keep_comments else " ")
             i += 1
         elif state == "str":
             if c == "\\":
@@ -193,12 +207,60 @@ def extract_rust_comments(src: str) -> str:
     return "".join(out)
 
 
+def extract_rust_comments(src: str) -> str:
+    """注释面：逐字符保留注释（`//` 与 `/* */`），其余（代码/字符串）置换为空格。
+
+    位置与换行不变 ⇒ 命中行号与原文对齐（房规：剥离函数不位移）。
+    """
+    return _scan_rust(src, keep_comments=True)
+
+
+def extract_rust_code(src: str) -> str:
+    """代码面：保留代码，**注释与字符串字面量内容**置换为空格。
+
+    位置与换行不变 ⇒ 命中行号与原文对齐。A6 双账本判据的判定面——散文提及
+    （注释里解释 udf 机制）与日志文案里的类型名都不算「持有该类型」。
+    """
+    return _scan_rust(src, keep_comments=False)
+
+
+# `use` 导入语句：导入 ≠ 持有账本（`use tokio::task::JoinSet;` 只是把类型名拉进
+# 作用域）。判据要在类型位置上找用法，故先把 use 语句整条从判定面剔除。
+# `[^;]*` 跨行（Rust 的 use 语句可多行），`;` 终止 ⇒ 不会吃掉后续语句。
+_USE_STMT = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?use\b[^;]*;")
+
+
+def strip_use_statements(code: str) -> str:
+    """从代码面剔除 `use` 语句（内容置空格，换行保留）。"""
+    return _USE_STMT.sub(lambda m: _blank(m.group(0)), code)
+
+
 # ---------------------------------------------------------------------------
 # (2) B1' 旧件残留 + (3) A6 双账本
 # ---------------------------------------------------------------------------
 
 MANAGED_SCOPE_RESIDUE = "compat::ManagedScope"
 LEDGER_TOKENS = ("JoinSet", "ComponentScope")
+
+
+def type_use_pattern(token: str) -> re.Pattern[str]:
+    """类型用法判据：token 出现在**类型位置**才算持有该类型。
+
+    四种形态（bd n06e1 定案）：
+      ① 构造：`T::new(`；
+      ② 泛型实例：`T<`（如 `JoinSet<(usize, ...)>`）；
+      ③ 泛型实参：`T>`（如 `Vec<JoinSet>`）；
+      ④ 类型标注：`: T` / `: path::T`（字段、局部变量、参数、返回值绑定）。
+    散文提及（注释）与字符串文案不算（判定面是代码面）；`use` 导入也不算
+    （导入 ≠ 持有账本，见 strip_use_statements）。
+    """
+    t = re.escape(token)
+    return re.compile(
+        rf"(?<![\w]){t}\s*::\s*new\s*\("
+        rf"|(?<![\w]){t}\s*<"
+        rf"|(?<![\w]){t}\s*>"
+        rf"|:\s*(?:&\s*)?(?:mut\s+)?(?:[\w:]+::)*{t}\b"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,23 +375,34 @@ def scan_managed_scope_residue(root: Path) -> list[dict]:
 
 
 def scan_dual_ledger(root: Path) -> list[dict]:
-    """A6 报告级：同一 .rs 同时出现 JoinSet 与 ComponentScope ⇒ WARN。"""
+    """A6 报告级：同一 .rs 同时**以类型用法**持有 JoinSet 与 ComponentScope ⇒ WARN。
+
+    判据（bd n06e1）：只认类型位置上的用法，且判定面是**代码面**（注释与字符串
+    字面量剔除）——文档注释里解释 udf「JoinSet drop ⇒ abort」机制的散文提及不是
+    持有账本（那 6 个文件命中 8 行全此类 ⇒ 6/6 全误报）。
+    """
     warns: list[dict] = []
     for p in rust_files(root):
-        text = p.read_text(encoding="utf-8")
-        present = [t for t in LEDGER_TOKENS if t in text]
+        code = strip_use_statements(extract_rust_code(p.read_text(encoding="utf-8")))
+        present = [t for t in LEDGER_TOKENS if type_use_pattern(t).search(code)]
         if len(present) == len(LEDGER_TOKENS):
             warns.append({"file": rel(root, p)})
     return warns
 
 
 def gate(root: Path) -> tuple[bool, str]:
-    """红 = A5 伪断言或 B1' 残留任一命中；A6 只 WARN 不红。"""
+    """红 = A5 伪断言 / B1' 残留 / A6 双账本任一命中。
+
+    A6（bd n06e1）：判据 = 同一 `.rs` **以类型用法**同时持有 `JoinSet` 与
+    `ComponentScope`（注释与字符串剔除、`use` 导入不算）——旧判据按纯文本匹配，
+    把文档注释里解释 udf 机制的散文提及当成持有账本 ⇒ 6/6 全误报。判据收紧后
+    命中即真双账本（ADR-0004 §2.7 打回项），故可红。
+    """
     claims, claim_notes = _scan_claims(root)
     residue = scan_managed_scope_residue(root)
     dual = scan_dual_ledger(root)
     lines: list[str] = []
-    ok = not claims and not residue
+    ok = not claims and not residue and not dual
     if claims:
         lines.append(f"(g1) A5 伪 Drop-abort 断言 {len(claims)} 处（注释/doc 不得声称 Drop 兜底中止，ADR-0004 §2.2 Q3）：")
         lines += [f"  RED  {h['file']}:{h['line']}  {h['snippet']}" for h in claims]
@@ -347,10 +420,10 @@ def gate(root: Path) -> tuple[bool, str]:
     else:
         lines.append("OK (g2) B1' 旧件残留：`compat::ManagedScope` 0 命中")
     if dual:
-        lines.append(f"(g3) A6 双账本嫌疑 {len(dual)} 处（报告级，需人工确认是否同一组件两本账）：")
-        lines += [f"  WARN  {w['file']}  JoinSet 与 ComponentScope 并存" for w in dual]
+        lines.append(f"(g3) A6 双账本 {len(dual)} 处（同一 .rs 同时以类型用法持有 JoinSet 与 ComponentScope = ADR-0004 §2.7 打回项）：")
+        lines += [f"  RED  {w['file']}  JoinSet 与 ComponentScope 同文件并存" for w in dual]
     else:
-        lines.append("OK (g3) A6 双账本嫌疑：0 处")
+        lines.append("OK (g3) A6 双账本：0 处")
     return ok, "\n".join(lines)
 
 
@@ -411,6 +484,19 @@ def cmd_self_test() -> int:
             "pub struct D { js: JoinSet, sc: ComponentScope }\n",
             encoding="utf-8",
         )
+        # bd n06e1 反例：JoinSet 只在文档注释里被提及（解释 udf 机制），代码面无
+        # 类型用法 ⇒ 不得判为双账本（旧判据按纯文本匹配 ⇒ 这类文件 6/6 全误报）。
+        (rs_dir / "prose_only.rs").write_text(
+            "/// 旧件口径：JoinSet drop ⇒ abort 全组（udf 语义，实现事实）。\n"
+            "pub struct P { sc: ComponentScope }\n",
+            encoding="utf-8",
+        )
+        # bd n06e1 反例：只有 use 导入（导入 ≠ 持有账本）⇒ 不得判为双账本。
+        (rs_dir / "import_only.rs").write_text(
+            "use tokio::task::JoinSet;\n"
+            "use xray_frame::scope::ComponentScope;\n",
+            encoding="utf-8",
+        )
         (docs_dir / "bad.md").write_text(
             "# 旧文档\n\nscope 句柄丢弃即 abort 在途任务，停机无忧。\n",
             encoding="utf-8",
@@ -452,21 +538,26 @@ def cmd_self_test() -> int:
               any(h["file"] == "crates/demo/src/residue.rs" for h in residue))
 
         dual = scan_dual_ledger(root)
-        check("(g3) JoinSet+ComponentScope 并存必须 WARN",
+        check("(g3) 同文件以类型用法持有 JoinSet+ComponentScope 必须报",
               any(w["file"] == "crates/demo/src/dual_ledger.rs" for w in dual))
+        check("(g3) JoinSet 仅见于文档注释 ⇒ 不得报（bd n06e1 反例）",
+              not any(w["file"] == "crates/demo/src/prose_only.rs" for w in dual))
+        check("(g3) 仅有 use 导入 ⇒ 不得报（导入 ≠ 持有账本）",
+              not any(w["file"] == "crates/demo/src/import_only.rs" for w in dual))
 
         ok_gate, _ = gate(root)
-        check("(g) 有 A5/B1' 命中 ⇒ 门必须红", not ok_gate)
+        check("(g) 有 A5/B1'/A6 命中 ⇒ 门必须红", not ok_gate)
 
-        # 删掉违规 ⇒ 绿（A6 WARN 不影响退出码）
+        # 删掉违规 ⇒ 绿
         (rs_dir / "bad_claim.rs").write_text("pub struct A;\n", encoding="utf-8")
         (rs_dir / "residue.rs").write_text("pub struct C;\n", encoding="utf-8")
+        (rs_dir / "dual_ledger.rs").write_text("pub struct D;\n", encoding="utf-8")
         (docs_dir / "bad.md").write_text("# 旧文档\n", encoding="utf-8")
         ok_gate2, msg2 = gate(root)
-        check("(g) 违规清零 ⇒ 门必须绿（A6 仅 WARN 不红）", ok_gate2)
-        check("(g) 绿态仍报 A6 WARN", "WARN" in msg2)
+        check("(g) 违规清零 ⇒ 门必须绿", ok_gate2)
+        check("(g) 绿态 (g3) 零命中", "(g3) A6 双账本：0 处" in msg2)
         # 绿态 note 确定数：mechanism.rs + negation.rs 各 1（ok_tone/ban_quote 走
-        # tone 静默，adr 目录 skip，bad.md/bad_claim/residue 已清零）。
+        # tone 静默，adr 目录 skip，bad.md/bad_claim/residue/dual_ledger 已清零）。
         check("(g) 绿态 note 非静默（恰 2 处放行可见）", msg2.count("note  ") == 2)
 
     print("SELF-TEST:", "PASS" if ok else "FAIL")
@@ -481,7 +572,7 @@ def cmd_list(root: Path) -> int:
     for h in scan_managed_scope_residue(root):
         print(f"RED   {h['file']}:{h['line']}  [residue]  {h['snippet']}")
     for w in scan_dual_ledger(root):
-        print(f"WARN  {w['file']}  JoinSet 与 ComponentScope 并存（A6 人工确认）")
+        print(f"RED   {w['file']}  JoinSet 与 ComponentScope 同文件并存（A6 双账本）")
     return 0
 
 
@@ -500,9 +591,9 @@ def main() -> int:
     ok, msg = gate(args.root)
     print(msg)
     if not ok:
-        print("\nscope-claims 门 FAIL：A5 伪断言 / B1' 残留未清零")
+        print("\nscope-claims 门 FAIL：A5 伪断言 / B1' 残留 / A6 双账本未清零")
         return 1
-    print("\nscope-claims 门 PASS：(g1) 伪 Drop-abort 断言 / (g2) compat::ManagedScope 残留 / (g3) 双账本嫌疑")
+    print("\nscope-claims 门 PASS：(g1) 伪 Drop-abort 断言 / (g2) compat::ManagedScope 残留 / (g3) A6 双账本")
     return 0
 
 

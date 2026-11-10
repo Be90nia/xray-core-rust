@@ -193,6 +193,8 @@ impl ComponentScope {
 
 **过渡期并存说明（PM 批次边界改判）**：B0' 期间 `xray_frame::compat::ManagedScope` 与 `xray_frame::scope::ComponentScope` **并存**，用于避开与在飞代理（zct77）的同文件并发冲突。**并存属实施中间态，不是本 ADR 的终态设计**——终态由 **B1'** 收口：删旧类型 + `grep` 归零，符合「只扩展不 fork / 不留兼容别名」纪律。
 
+**日志 target 变更备注（bd jlp8y，2026-11-10 运维标注）**：B1 迁移把组件 scope 面日志从旧 `ManagedScope`（target `xray_frame::compat`）换到 `ComponentScope` 自有门面（`scope.rs` `scope_log()` → `LogFacade::new("scope")`，target **`xray_frame::scope`**；spawn 拒发 / 任务 panic 上报都在此 target）。既有按 `xray_frame::compat` 配置的日志过滤规则/看板需同步切换。注意 `xray_frame::compat` target 本身**未删**：`compat::spawn` 进程级收割锚与未 `install` 站点的 fallback 门面（`compat.rs` `LogFacade::new("compat")`）仍走它——两 target 并存，组件 scope 事件只认 `::scope`。日志档位与拒发计数语义：0785320e（bd 9ka5w：账本已关 ⇒ DEBUG+计数，lifecycle 异常限频 WARN）。
+
 ### 2.6 断言与不变量（必须可观测）
 
 | 编号 | 不变量 | 可观测锚 | 判定命令形态 |
