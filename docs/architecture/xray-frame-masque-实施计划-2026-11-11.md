@@ -216,6 +216,12 @@ xray-frame/ipstack（移动来源 = wireguard netstack.rs，语义键同名）
 
 ### B0 —— U1 spike：hyper extended CONNECT 全链路（**第一批第一件事**，0.5 人日）
 
+> **B0 风险已部分前置消除（2026-11-11 PM 复核，锁定版本实测）**：`~/.cargo/registry/src/*/hyper-1.10.1`
+> 中 `src/server/conn/http2.rs` 存在 `pub fn enable_connect_protocol`，`src/ext/mod.rs` 存在
+> `struct Protocol` + `from_static`；`hyper-util-0.1.20/src/server/conn/auto/mod.rs` 也透传
+> `enable_connect_protocol`。⇒ API 面**存在**，B0 只剩「运行时全链路是否真通」一项（`Upgraded` + 双向字节 +
+> 非空 body 拒绝）。若 spike 仍失败，回退 raw `h2` 0.4.19（已预核）。
+
 | 步骤 | 内容 |
 |---|---|
 | B0.1 | 建 crate 骨架：`crates/xray-transport-masque/{Cargo.toml,src/lib.rs}` + 根 `Cargo.toml` members 一行（依赖面：hyper/hyper-util/http/http-body-util/tokio/bytes/xray-buf/xray-common/xray-transport/xray-tls/xray-proto/xray-frame —— **不引 h3**，varint 走上浮件） |
