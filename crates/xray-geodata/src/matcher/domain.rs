@@ -30,16 +30,27 @@
 //! - [`DomainType::from_i32`] 是**matcher 自编号**解析器，**不要**喂 pb 值。
 //! - 禁在两套编号间 `as i32` 互转；pb 枚举的 `as i32`（如 `Type::Full as i32` = 3）是 pb 编号，
 //!   只用于构造 pb 消息。
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
+use xray_frame::HotSlot;
 
 use super::{
     DomainMatcher as DomainMatcherImpl, FullMatcher, Matcher, MatcherError, MatcherGroup,
     MatcherSet, MatcherType,
     matcher_groups::{MPHMatcherGroup, SimpleMatcherGroup},
 };
-use crate::weak_cache::WeakCacheMap;
+use crate::{
+    loader::{GeoDataLoader, LoaderError},
+    rule_parser::DEFAULT_GEOSITE_DAT,
+    weak_cache::WeakCacheMap,
+};
 
 /// 域名规则类型。
 ///
@@ -494,115 +505,195 @@ fn build_compact_inner(rules: &[DomainRule]) -> Result<CompactDomainMatcher, Mat
 
 // ===== DynamicDomainMatcher =====
 
+/// 动态域名匹配器的当前快照。
+///
+/// 对应 Go `domainMatcherState`：快照整体原子换，没有部分更新。
+struct DomainMatcherState {
+    matcher: Box<dyn DomainMatcher>,
+}
+
 /// 动态域名匹配器。
 ///
-/// 对应 Go 版本 `DynamicDomainMatcher`，支持运行时更新规则
+/// 对应 Go `DynamicDomainMatcher`（`domain_registry.go:75-105`）：`state` 是当前
+/// 快照，匹配只做一次原子读（零锁）；`rules` / `datadir` 是重建原料——
+/// [`DomainRegistry::reload`] 按**每个 matcher 自己的**规则与资产目录重建。
 pub struct DynamicDomainMatcher {
-    state: parking_lot::RwLock<Option<Box<dyn DomainMatcher>>>,
-    rules: Mutex<Vec<DomainRule>>,
+    /// 构建时的 pb 规则（`Geosite` 变体原样保留：展开推迟到每次重建，Go `d.rules`）。
+    rules: Vec<crate::pb::DomainRule>,
+    datadir: PathBuf,
+    state: HotSlot<DomainMatcherState>,
+    /// 控制面写互斥（Go 无显式锁：`state.Store` 原子；这里串行化快照替换）。
+    sync: Mutex<()>,
 }
 
 impl DynamicDomainMatcher {
-    /// 创建新的动态域名匹配器。
-    #[must_use]
-    pub fn new() -> Self {
-        Self { state: parking_lot::RwLock::new(None), rules: Mutex::new(Vec::new()) }
+    fn new(
+        rules: Vec<crate::pb::DomainRule>,
+        initial: Box<dyn DomainMatcher>,
+        datadir: PathBuf,
+    ) -> Self {
+        Self {
+            rules,
+            datadir,
+            state: HotSlot::new(Arc::new(DomainMatcherState { matcher: initial })),
+            sync: Mutex::new(()),
+        }
     }
 
-    /// 设置规则并重建匹配器。
-    pub fn set_rules(
-        &self,
-        rules: Vec<DomainRule>,
-        factory: &dyn DomainMatcherFactory,
-    ) -> Result<(), MatcherError> {
-        let matcher = factory.build_matcher(&rules)?;
-        *self.rules.lock() = rules;
-        *self.state.write() = Some(matcher);
-        Ok(())
-    }
-
-    /// 更新匹配器状态。
-    pub fn update(&self, matcher: Box<dyn DomainMatcher>) {
-        *self.state.write() = Some(matcher);
-    }
-}
-
-impl Default for DynamicDomainMatcher {
-    fn default() -> Self {
-        Self::new()
+    /// 热替换内部快照（Go `DynamicDomainMatcher.Reload`）。
+    fn replace(&self, fresh: Box<dyn DomainMatcher>) {
+        let _guard = self.sync.lock();
+        self.state.replace(Arc::new(DomainMatcherState { matcher: fresh }));
     }
 }
 
 impl DomainMatcher for DynamicDomainMatcher {
+    // per-match 读走 `HotSlot::with`（一次纯原子 load、无 refcount），与 Go
+    // `d.state.Load()` 同成本。
     fn match_domain(&self, input: &str) -> Vec<u32> {
-        let guard = self.state.read();
-        match guard.as_ref() {
-            Some(m) => m.match_domain(input),
-            None => Vec::new(),
-        }
+        self.state.with(|s| s.matcher.match_domain(input))
     }
 
     fn match_any(&self, input: &str) -> bool {
-        let guard = self.state.read();
-        match guard.as_ref() {
-            Some(m) => m.match_any(input),
-            None => false,
-        }
+        self.state.with(|s| s.matcher.match_any(input))
     }
 }
 
 impl std::fmt::Debug for DynamicDomainMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let has_state = self.state.read().is_some();
-        f.debug_struct("DynamicDomainMatcher").field("has_state", &has_state).finish()
+        f.debug_struct("DynamicDomainMatcher")
+            .field("rules", &self.rules.len())
+            .field("datadir", &self.datadir)
+            .finish()
     }
 }
 
 // ===== DomainRegistry =====
 
-/// 域名匹配器注册表。
+/// 域名匹配器构建错误。
+#[derive(Debug, thiserror::Error)]
+pub enum BuildDomainMatcherError {
+    /// 规则列表为空 / 展开后无可编译条目（Go `BuildMatcher` 的 `empty domain rule list`）
+    #[error("empty domain rule list")]
+    EmptyRules,
+
+    /// 资产文件 / 代号加载失败（`geosite:` 代号不存在、dat 缺失）
+    #[error("load geosite: {0}")]
+    Loader(#[from] LoaderError),
+
+    /// 未知 pb `Domain.Type`
+    #[error("unknown domain type: {0}")]
+    UnknownType(i32),
+
+    /// 规则编译失败（正则）
+    #[error("matcher: {0}")]
+    Matcher(#[from] MatcherError),
+}
+
+/// 域名匹配器注册表（世代热换 + 弱表登记）。
 ///
-/// 对应 Go 版本 `DomainRegistry`，管理多个动态域名匹配器。
+/// 对应 Go `DomainRegistry`（`common/geodata/domain_registry.go:13-73`）：
+/// - [`Self::build_domain_matcher`] 吃 pb `DomainRule`（含 `Geosite`），**构造期** 展开 + 编译（Go
+///   `DomainReg.BuildDomainMatcher`），产物登记进弱表；
+/// - [`Self::reload`] 换新世代工厂 + 逐 matcher 用**自己的**规则重建 + 原子换快照； 任一条失败 ⇒
+///   整体 `Err`，不半切（Go `DomainReg.Reload`）；
+/// - 消费方丢 `Arc` 即从弱表回收（无后台线程）。
 pub struct DomainRegistry {
-    factory: Box<dyn DomainMatcherFactory>,
-    matchers: Mutex<Vec<Arc<DynamicDomainMatcher>>>,
+    /// 默认资产目录（[`Self::build_domain_matcher`] 用）。
+    datadir: PathBuf,
+    /// 当前世代工厂：`reload` 换世代 ⇒ 工厂内弱缓存失效、matcher 全量重建。
+    factory: HotSlot<MphDomainMatcherFactory>,
+    /// 弱引用登记簿（Go `WeakCacheMap[uuid, *DynamicDomainMatcher]`）。
+    matchers: WeakCacheMap<u64, DynamicDomainMatcher>,
+    /// 登记序号（单调 `u64` 代替 Go 的 `uuid.New()`）。
+    next_id: AtomicU64,
+    /// 登记 / 热换互斥（Go `mu`）。
+    sync: Mutex<()>,
 }
 
 impl DomainRegistry {
-    /// 创建新的域名匹配器注册表。
-    pub fn new(factory: Box<dyn DomainMatcherFactory>) -> Self {
-        Self { factory, matchers: Mutex::new(Vec::new()) }
+    /// 默认资产目录 = [`xray_common::platform::get_asset_dir`]。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_datadir(xray_common::platform::get_asset_dir())
     }
 
-    /// 添加规则并创建新的动态匹配器。
-    ///
-    /// 返回新匹配器的 Arc 引用（用于 reload 时触达同一实例）。
-    pub fn add_rules(
-        &self,
-        rules: Vec<DomainRule>,
-    ) -> Result<Arc<DynamicDomainMatcher>, MatcherError> {
-        let matcher = Arc::new(DynamicDomainMatcher::new());
-        matcher.set_rules(rules, self.factory.as_ref())?;
-        let mut matchers = self.matchers.lock();
-        matchers.push(Arc::clone(&matcher));
-        Ok(matcher)
-    }
-
-    /// 查询指定索引的匹配器。
-    pub fn get_matcher(&self, idx: usize) -> Option<DomainRegistryGuard<'_>> {
-        let guard = self.matchers.lock();
-        if idx < guard.len() {
-            drop(guard);
-            Some(DomainRegistryGuard { registry: self, index: idx })
-        } else {
-            None
+    /// 指定 geodata 资产目录（自定义资产 / 测试注入）。
+    #[must_use]
+    pub fn with_datadir(datadir: PathBuf) -> Self {
+        Self {
+            factory: HotSlot::new(Arc::new(MphDomainMatcherFactory::new())),
+            datadir,
+            matchers: WeakCacheMap::new(),
+            next_id: AtomicU64::new(0),
+            sync: Mutex::new(()),
         }
     }
 
-    /// 返回匹配器数量。
+    /// 构建并登记一个动态域名匹配器（Go `DomainRegistry.BuildDomainMatcher`）。
+    ///
+    /// 构造期读资产 / 展开 geosite 失败 ⇒ `Err`（不登记）；消费方持 `Arc`，
+    /// drop 即从弱表回收。
+    pub fn build_domain_matcher(
+        &self,
+        rules: &[crate::pb::DomainRule],
+    ) -> Result<Arc<DynamicDomainMatcher>, BuildDomainMatcherError> {
+        self.build_domain_matcher_in(rules, &self.datadir)
+    }
+
+    /// 同 [`Self::build_domain_matcher`]，资产目录显式给定。
+    ///
+    /// 消费方自持 loader（如 router 的注入 datadir）时用；登记后 [`Self::reload`]
+    /// 仍用同一目录重建。
+    pub fn build_domain_matcher_in(
+        &self,
+        rules: &[crate::pb::DomainRule],
+        datadir: &Path,
+    ) -> Result<Arc<DynamicDomainMatcher>, BuildDomainMatcherError> {
+        let _guard = self.sync.lock();
+        let factory = self.factory.current();
+        let initial = build_with_factory(&factory, rules, datadir)?;
+
+        let matcher =
+            Arc::new(DynamicDomainMatcher::new(rules.to_vec(), initial, datadir.to_path_buf()));
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.matchers.store(id, Arc::clone(&matcher));
+        Ok(matcher)
+    }
+
+    /// 逐 matcher 用**自己的**规则与资产目录重建（Go `DomainRegistry.Reload`）。
+    ///
+    /// 失败语义：任一 matcher 重建失败 ⇒ 立即 `Err`，**不切换**任何快照与世代
+    /// （Go 同：错误在切换循环之前返回）。
+    pub fn reload(&self) -> Result<(), BuildDomainMatcherError> {
+        let _guard = self.sync.lock();
+        let registered = self.matchers.upgrade_all();
+
+        let factory = MphDomainMatcherFactory::new();
+        let mut reloaded = Vec::with_capacity(registered.len());
+        for matcher in &registered {
+            reloaded.push((
+                Arc::clone(matcher),
+                build_with_factory(&factory, &matcher.rules, &matcher.datadir)?,
+            ));
+        }
+        for (matcher, fresh) in reloaded {
+            matcher.replace(fresh);
+        }
+        self.factory.replace(Arc::new(factory));
+        Ok(())
+    }
+
+    /// 本注册表的默认资产目录（消费方解析 `geosite:` 时须与构造 matcher 的目录一致）。
+    #[must_use]
+    pub fn datadir(&self) -> &Path {
+        &self.datadir
+    }
+
+    /// 当前登记的 matcher 数量（含尚未清理的失效弱引用）。
     #[must_use]
     pub fn len(&self) -> usize {
-        self.matchers.lock().len()
+        self.matchers.len()
     }
 
     /// 是否为空。
@@ -610,22 +701,11 @@ impl DomainRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
 
-    /// 用新规则重建所有匹配器（原子热切换）。
-    ///
-    /// 对应 Go `DomainRegistry.Reload`：每个 entry 用 new_rules 重建。
-    pub fn reload_with(&self, new_rules: Vec<DomainRule>) -> Result<(), MatcherError> {
-        let factory = self.factory.as_ref();
-        // 拷出 matcher 引用，避免长持锁。
-        let matchers: Vec<Arc<DynamicDomainMatcher>> = {
-            let g = self.matchers.lock();
-            g.iter().cloned().collect()
-        };
-
-        for m in &matchers {
-            m.set_rules(new_rules.clone(), factory)?;
-        }
-        Ok(())
+impl Default for DomainRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -635,34 +715,83 @@ impl std::fmt::Debug for DomainRegistry {
     }
 }
 
-/// 域名注册表匹配器守卫。
+/// pb `DomainRule`（含 `Geosite`）→ 匹配器，经给定世代工厂编译。
 ///
-/// 提供对注册表中指定索引匹配器的访问。
-pub struct DomainRegistryGuard<'a> {
-    registry: &'a DomainRegistry,
-    index: usize,
-}
+/// 对应 Go `MphDomainMatcherFactory.BuildMatcher`（`domain_matcher.go:60-99`）：
+/// - `Custom` → 编译一条，规则 ID = 该条在列表中的下标（Go `uint32(i)`）；
+/// - `Geosite` → 经 dat 展开，**同一 tag 的所有域名共用该条下标**（Go 同）；
+/// - `Geosite` 代号 / 文件缺失 ⇒ `Err`（Go `loadSite` err ⇒ BuildMatcher err ⇒ 拒启）；
+/// - dat 内单条目类型未知或正则非法 ⇒ 跳过该条并留痕（Go `loadSiteMatchers`
+///   log-and-skip：资产里的坏条目不该让整份配置拒启）。
+fn build_with_factory(
+    factory: &MphDomainMatcherFactory,
+    rules: &[crate::pb::DomainRule],
+    datadir: &Path,
+) -> Result<Box<dyn DomainMatcher>, BuildDomainMatcherError> {
+    use crate::pb::domain_rule::Value as PbValue;
 
-impl<'a> DomainRegistryGuard<'a> {
-    /// 使用匹配器执行匹配。
-    pub fn match_domain(&self, input: &str) -> Vec<u32> {
-        let guard = self.registry.matchers.lock();
-        guard[self.index].match_domain(input)
+    if rules.is_empty() {
+        return Err(BuildDomainMatcherError::EmptyRules);
     }
-
-    /// 使用匹配器执行存在性检查。
-    pub fn match_any(&self, input: &str) -> bool {
-        let guard = self.registry.matchers.lock();
-        guard[self.index].match_any(input)
+    let loader = GeoDataLoader::new(datadir.to_path_buf());
+    let mut expanded: Vec<DomainRule> = Vec::with_capacity(rules.len());
+    for (i, rule) in rules.iter().enumerate() {
+        let rule_id = i as u32;
+        match rule.value.as_ref() {
+            Some(PbValue::Custom(d)) => {
+                let domain_type = from_proto_type(d.r#type)
+                    .ok_or(BuildDomainMatcherError::UnknownType(d.r#type))?;
+                expanded.push(DomainRule::new(domain_type, d.value.clone(), rule_id));
+            },
+            Some(PbValue::Geosite(g)) => {
+                let file = if g.file.is_empty() { DEFAULT_GEOSITE_DAT } else { g.file.as_str() };
+                // dat 内 code 全大写、attribute key 全小写；配置路径（pb 直填）未必
+                // 归一（Go 只在 `ParseDomainRule` 归一），故注册表自己归一一次。
+                let code = g.code.to_uppercase();
+                let attrs = g.attrs.to_lowercase();
+                let site = if attrs.is_empty() {
+                    loader.load_site(file, &code)?
+                } else {
+                    loader.load_site_with_attrs(file, &code, &attrs)?
+                };
+                for d in &site.domain {
+                    let Some(domain_type) = from_proto_type(d.r#type) else {
+                        xray_common::log::warning(format!(
+                            "geodata: ignore invalid geosite entry, unknown type {}, {file}:{code} value={}",
+                            d.r#type, d.value
+                        ));
+                        continue;
+                    };
+                    let candidate = DomainRule::new(domain_type, d.value.clone(), rule_id);
+                    // 预校验一次：正则条目编译失败即跳过该条（Go 同粒度），
+                    // Custom 条目仍由 `build_matcher` 硬错。
+                    if let Err(e) = parse_domain(&candidate) {
+                        xray_common::log::warning(format!(
+                            "geodata: ignore invalid geosite entry, {file}:{code} value={} error={e}",
+                            d.value
+                        ));
+                        continue;
+                    }
+                    expanded.push(candidate);
+                }
+            },
+            // Go 对 nil value 直接 panic；这里跳过并留痕（配置解析产物不会走到）。
+            None => xray_common::log::warning(format!("geodata: domain rule #{i} has no value")),
+        }
     }
+    if expanded.is_empty() {
+        return Err(BuildDomainMatcherError::EmptyRules);
+    }
+    Ok(factory.build_matcher(&expanded)?)
 }
 
 /// 全局域名注册表实例。
 ///
-/// 对应 Go `commongeodata.DomainReg`。Routing 层在 reload 时通过此处
-/// 触达所有已注册的域名 matcher。如需 per-instance registry，优先本地 `new()`。
-pub static DOMAIN_REG: std::sync::LazyLock<DomainRegistry> =
-    std::sync::LazyLock::new(|| DomainRegistry::new(Box::new(MphDomainMatcherFactory::new())));
+/// 对应 Go `commongeodata.DomainReg`：资产目录 = [`xray_common::platform::get_asset_dir`]，
+/// 热更落盘后由 `xray-app-geodata` 的 `ReloadBothRegistries` 触发
+/// [`DomainRegistry::reload`]。如需独立资产目录（测试/多实例），用
+/// [`DomainRegistry::with_datadir`]。
+pub static DOMAIN_REG: LazyLock<DomainRegistry> = LazyLock::new(DomainRegistry::new);
 // ===== 工厂辅助：WeakCacheMap 缓存键 + Arc→Box 包装 =====
 
 /// 由 [`DomainRule`] 列表派生稳定的字符串缓存键。
@@ -940,64 +1069,122 @@ mod tests {
         assert!(matcher.match_any("sub.test.org"));
     }
 
-    // ----- DynamicDomainMatcher 测试 -----
-
-    #[test]
-    fn test_dynamic_matcher_initial_state() {
-        let dm = DynamicDomainMatcher::new();
-        assert!(!dm.match_any("anything.com"));
-        assert!(dm.match_domain("anything.com").is_empty());
-    }
-
-    #[test]
-    fn test_dynamic_matcher_set_rules() {
-        let dm = DynamicDomainMatcher::new();
-        let factory = MphDomainMatcherFactory::new();
-        let rules = vec![DomainRule::full("example.com", 1)];
-        dm.set_rules(rules, &factory).unwrap();
-        assert!(dm.match_any("example.com"));
-        assert!(!dm.match_any("other.com"));
-    }
-
-    #[test]
-    fn test_dynamic_matcher_update() {
-        let dm = DynamicDomainMatcher::new();
-        let matcher = MphDomainMatcher::build(&[DomainRule::domain("test.org", 5)]).unwrap();
-        dm.update(Box::new(matcher));
-        assert!(dm.match_any("sub.test.org"));
-        assert_eq!(dm.match_domain("sub.test.org"), vec![5u32]);
-    }
-
     // ----- DomainRegistry 测试 -----
 
+    /// 合成一条 `Custom` pb 规则。
+    fn pb_custom(domain_type: crate::pb::domain::Type, value: &str) -> crate::pb::DomainRule {
+        crate::pb::DomainRule {
+            value: Some(crate::pb::domain_rule::Value::Custom(crate::pb::Domain::new(
+                domain_type as i32,
+                value,
+            ))),
+        }
+    }
+
+    fn temp_datadir(label: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("xray_geodata_domain_{label}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 写一份只含 `HOT` 条目的 `geosite.dat`。
+    fn write_geosite_dat(dir: &Path, domains: Vec<crate::pb::Domain>) {
+        use prost::Message;
+        let list = crate::pb::GeoSiteList {
+            entry: vec![crate::pb::GeoSite { code: "HOT".to_string(), domain: domains }],
+        };
+        std::fs::write(dir.join(DEFAULT_GEOSITE_DAT), list.encode_to_vec()).unwrap();
+    }
+
     #[test]
-    fn test_domain_registry_add_and_match() {
-        let registry = DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()));
-        let _idx = registry.add_rules(vec![DomainRule::full("example.com", 1)]).unwrap();
+    fn test_domain_registry_build_and_match() {
+        let registry = DomainRegistry::new();
+        let matcher = registry
+            .build_domain_matcher(&[pb_custom(crate::pb::domain::Type::Full, "example.com")])
+            .unwrap();
         assert_eq!(registry.len(), 1);
-
-        let guard = registry.get_matcher(0).unwrap();
-        assert!(guard.match_any("example.com"));
-        assert!(!guard.match_any("other.com"));
+        assert!(matcher.match_any("example.com"));
+        assert!(!matcher.match_any("other.com"));
+        // 规则 ID = pb 列表下标（Go `uint32(i)`）
+        assert_eq!(matcher.match_domain("example.com"), vec![0u32]);
     }
 
     #[test]
-    fn test_domain_registry_multiple_matchers() {
-        let registry = DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()));
-        registry.add_rules(vec![DomainRule::full("a.com", 1)]).unwrap();
-        registry.add_rules(vec![DomainRule::domain("b.org", 2)]).unwrap();
-        assert_eq!(registry.len(), 2);
-
-        let g0 = registry.get_matcher(0).unwrap();
-        assert!(g0.match_any("a.com"));
-
-        let g1 = registry.get_matcher(1).unwrap();
-        assert!(g1.match_any("sub.b.org"));
+    fn test_domain_registry_missing_geosite_is_error() {
+        let dir = temp_datadir("missing");
+        let registry = DomainRegistry::with_datadir(dir.clone());
+        let rules = [crate::pb::DomainRule {
+            value: Some(crate::pb::domain_rule::Value::Geosite(crate::pb::GeoSiteRule {
+                file: DEFAULT_GEOSITE_DAT.to_string(),
+                code: "HOT".to_string(),
+                attrs: String::new(),
+            })),
+        }];
+        // 资产缺失 ⇒ 构造期 Err（Go `loadSite` err ⇒ 拒启），不是静默空集
+        assert!(matches!(
+            registry.build_domain_matcher(&rules),
+            Err(BuildDomainMatcherError::Loader(_))
+        ));
+        // 资产在但代号不存在 ⇒ 同样 Err
+        write_geosite_dat(&dir, vec![crate::pb::Domain::full("a.example")]);
+        assert!(registry.build_domain_matcher(&rules).is_ok());
+        let missing_code = [crate::pb::DomainRule {
+            value: Some(crate::pb::domain_rule::Value::Geosite(crate::pb::GeoSiteRule {
+                file: DEFAULT_GEOSITE_DAT.to_string(),
+                code: "NOPE".to_string(),
+                attrs: String::new(),
+            })),
+        }];
+        assert!(matches!(
+            registry.build_domain_matcher(&missing_code),
+            Err(BuildDomainMatcherError::Loader(_))
+        ));
     }
 
     #[test]
-    fn test_domain_registry_out_of_bounds() {
-        let registry = DomainRegistry::new(Box::new(MphDomainMatcherFactory::new()));
-        assert!(registry.get_matcher(0).is_none());
+    fn test_domain_registry_empty_rules_is_error() {
+        let registry = DomainRegistry::new();
+        assert!(matches!(
+            registry.build_domain_matcher(&[]),
+            Err(BuildDomainMatcherError::EmptyRules)
+        ));
+    }
+
+    /// geosite 展开：同 tag 的所有域名共用该条规则的下标（Go `loadSiteMatchers`），
+    /// dat 内非法条目跳过而非整份拒启。
+    #[test]
+    fn test_domain_registry_expands_geosite_with_shared_rule_id() {
+        let dir = temp_datadir("expand");
+        write_geosite_dat(
+            &dir,
+            vec![
+                crate::pb::Domain::new(crate::pb::domain::Type::Full, "a.example"),
+                crate::pb::Domain::new(crate::pb::domain::Type::Domain, "b.example"),
+                // 未知类型 99 → 跳过该条（非致命）
+                crate::pb::Domain::new(99i32, "skip.example"),
+                // 正则非法 → 跳过该条（非致命）
+                crate::pb::Domain::new(crate::pb::domain::Type::Regex, "a(b"),
+            ],
+        );
+        let registry = DomainRegistry::with_datadir(dir.clone());
+        let matcher = registry
+            .build_domain_matcher(&[
+                crate::pb::DomainRule {
+                    value: Some(crate::pb::domain_rule::Value::Geosite(crate::pb::GeoSiteRule {
+                        file: DEFAULT_GEOSITE_DAT.to_string(),
+                        code: "HOT".to_string(),
+                        attrs: String::new(),
+                    })),
+                },
+                pb_custom(crate::pb::domain::Type::Full, "custom.example"),
+            ])
+            .unwrap();
+
+        assert_eq!(matcher.match_domain("a.example"), vec![0u32]);
+        assert_eq!(matcher.match_domain("sub.b.example"), vec![0u32]);
+        assert_eq!(matcher.match_domain("custom.example"), vec![1u32]);
+        assert!(matcher.match_domain("skip.example").is_empty(), "非法条目必须跳过");
     }
 }

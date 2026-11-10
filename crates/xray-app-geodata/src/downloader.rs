@@ -729,10 +729,9 @@ fn https_handshake<'a>(
 
 /// geodata 热更完成后的派生消费方回调（bd 2bmns G-2）。
 ///
-/// 谁在热更后必须重建自己的 geodata 派生状态，谁注册一个：路由的
-/// geosite/geoip matcher 是装配期从 `.dat` 文件**本地构建**的（`xray-app-router`
-/// 不经 `DOMAIN_REG`/`IP_REG`），只有让装配面重新从文件派生一次，热更才真正
-/// 反映到路由匹配。回调失败 = 热更失败（fail-visible，不静默留旧规则）。
+/// 注册表只重建**登记过**的 matcher；仍在装配期从 `.dat` 本地派生的状态
+/// （如整条路由规则链重建）由一个回调处理：谁在热更后必须重建自己的派生状态，
+/// 谁注册一个。回调失败 = 热更失败（fail-visible，不静默留旧规则）。
 pub type ReloadListener = Arc<dyn Fn() -> Result<(), GeodataError> + Send + Sync>;
 
 /// 全进程热更监听表。
@@ -763,8 +762,9 @@ pub fn reload_listener_count() -> usize {
 /// 热更监听（bd 2bmns G-2：路由规则重建）。
 ///
 /// 对应 Go `app/geodata/geodata.go:88-90 reload() = IPReg.Reload() + DomainReg.Reload()`。
-/// `IP_REG`/`DOMAIN_REG` 只有登记进去的 matcher 才会被重建（本仓路由 matcher 是
-/// 本地的，故注册表这一步对路由本身不生效——路由刷新走 `RELOAD_LISTENERS`）。
+/// `IP_REG`/`DOMAIN_REG` 只有登记进去的 matcher 才会被重建——域名侧路由 matcher
+/// 已经由 `DOMAIN_REG.build_domain_matcher` 登记（bd ochlx），热更直接生效；
+/// 未登记的派生状态仍靠 `RELOAD_LISTENERS`（bd 2bmns G-2）。
 pub struct ReloadBothRegistries;
 
 impl GeodataReloader for ReloadBothRegistries {
@@ -778,9 +778,10 @@ impl GeodataReloader for ReloadBothRegistries {
             tracing::warn!(target: "xray_app_geodata", "IP_REG.reload failed: {e}");
             return Err(GeodataError::ReloadFailed(format!("IP_REG: {e}")));
         }
-        // ponytail: 域名侧仍是「空规则覆盖」——域名侧的世代热换归 S5 票，
-        // 迁到 `DOMAIN_REG.reload()` 时删掉这一段。
-        if let Err(e) = DOMAIN_REG.reload_with(Vec::new()) {
+        // 域名侧：真 reload——每个已登记 matcher 用**自己的 pb 规则 + 资产目录**
+        // 重建（bd ochlx：旧 `reload_with(Vec::new())` 是假成功标记，Go 无「同一份
+        // 新规则覆盖所有 matcher」语义）。任一条失败 ⇒ 整次热更失败（不半切）。
+        if let Err(e) = DOMAIN_REG.reload() {
             tracing::warn!(target: "xray_app_geodata", "DOMAIN_REG.reload failed: {e}");
             return Err(GeodataError::ReloadFailed(format!("DOMAIN_REG: {e}")));
         }

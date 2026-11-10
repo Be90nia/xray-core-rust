@@ -177,6 +177,13 @@ impl GeoDataLoader {
         Self { datadir }
     }
 
+    /// 本加载器使用的 geodata 资产目录（注册表登记 matcher 时须带上同一目录，
+    /// `reload` 才能读到同一处资产）。
+    #[must_use]
+    pub fn datadir(&self) -> &std::path::Path {
+        &self.datadir
+    }
+
     /// 检查 dat 文件中是否存在指定代码的条目。
     ///
     /// 对应 Go 版本 `checkFile`。
