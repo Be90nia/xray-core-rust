@@ -62,9 +62,11 @@ bd st3l1/s4xsk 的 `#[ignore]` 登记 + bd xosi9 的 ②类 spawn 登记）：
   (h) ②类 spawn 登记（bd xosi9 / CLAUDE.md §3.5.6）：生产面每处
                     `tokio::spawn` / `tokio::task::spawn` / `std::thread::spawn`
                     必须有覆盖它的 `#[allow(clippy::disallowed_methods, reason=…)]`
-                    （逐站紧邻，行距 ≤ 60），或该文件在 SPAWN_FILE_LEVEL_REGISTRY
-                    内用 `#![allow]` 覆盖；reason 命中模板串（`任务必须长于组件` /
-                    「进程级+数据面逐包泵+公开契约外返」三连）视为无理由。
+                    （逐站，**必须与 spawn 同一函数体内**——bd fx93f 裁定：行距
+                    临近会被跨 fn 的陈旧 allow 蹭过），或该文件在
+                    SPAWN_FILE_LEVEL_REGISTRY 内用 `#![allow]` 覆盖；reason 命中
+                    模板串（`任务必须长于组件` / 「进程级+数据面逐包泵+公开契约外返」
+                    三连）视为无理由。
                     `#![cfg_attr(test, allow(…))]` 不覆盖生产面。
 """
 
@@ -841,21 +843,118 @@ ALLOW_DISALLOWED_METHODS = re.compile(
     r"(#!?)\[\s*allow\s*\(([^\[\]]*?clippy::disallowed_methods[^\[\]]*?)\)\s*\]", re.S
 )
 REASON_STR = re.compile(r'reason\s*=\s*"((?:[^"\\]|\\.)*)"')
-# 逐站 allow 与 spawn 的最大行距（跨 fn 的陈旧 allow 不得顺带覆盖）。
-SPAWN_ALLOW_MAX_LINES = 60
 # 模板理由指纹：命中即视为「无实义理由」。
 SPAWN_TEMPLATE_REASON = ("任务必须长于组件",)
 SPAWN_TEMPLATE_TRIPLE = ("进程级", "数据面逐包泵", "公开契约外返")
 
 # 文件级 allow 登记簿：只有本表列出的文件才允许用文件级 allow 覆盖生产 spawn
-# （每项写清为何无法逐站：站点数超 clippy.toml 分层阈值，且理由已在文件头成立）。
+# （每项写清为何无法逐站：站点数超分层阈值，且理由已在文件头成立）。
+# ⚠️ 值里**禁写站点处数**——处数由工具数出来（gate (h) 输出逐文件计数，bd fx93f：
+# 手写「8 处」与实际数不符，说明手写数字一旦漂移就是假账）。
 SPAWN_FILE_LEVEL_REGISTRY: dict[str, str] = {
     "crates/xray-transport-grpc/src/transport.rs": (
-        "文件级 allow 覆盖 8 处生产 spawn（h2 conn driver / accept / close_notify / "
-        "ping_pong / duplex 泵），超 clippy.toml 20 处/文件分层阈值；寿命随 h2 连接"
-        "（bd a5r4j/lzzja/hj3jf）"
+        "文件级 allow 覆盖该文件全部生产 spawn（h2 conn driver / accept / close_notify / "
+        "ping_pong / duplex 泵），超层阈值（>20 处/文件挂文件头，见 crate clippy.toml）；"
+        "寿命随 h2 连接（bd a5r4j/lzzja/hj3jf）"
     ),
 }
+
+
+FN_HEAD = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+# fn 项前缀（属性之后）：可见性 + 限定符，到 `fn` 关键字为止。
+FN_ITEM_PREFIX = re.compile(
+    r"\s*(?:pub(?:\s*\([^()]*\))?\s+)?(?:(?:const|async|unsafe|extern)\s+)*fn\s+"
+)
+
+
+def matching_brace(cleaned: str, open_idx: int) -> int | None:
+    """`{` 配对的 `}` 下标（cleaned 已掏空注释/字符串 ⇒ 花括号只在代码面）。"""
+    depth = 0
+    for j in range(open_idx, len(cleaned)):
+        if cleaned[j] == "{":
+            depth += 1
+        elif cleaned[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def fn_body_scopes(cleaned: str) -> list[tuple[int, int, int, str]]:
+    """全部函数体跨度 `(`fn` 偏移, 体开 `{` 偏移, 体闭 `}` 偏移, 函数名)`。
+
+    签名里的 `(`/`[` 组必须跳过——形参 `[u8; 8]` 的 `;` 不是项结束（bd fx93f：
+    按「首个 `;`」判会漏掉整只 fn，其内 spawn 变成「函数外」）。`fn f();`
+    （trait/impl 声明）在括号组之外先遇 `;` ⇒ 跳过。
+    """
+    scopes: list[tuple[int, int, int, str]] = []
+    for m in FN_HEAD.finditer(cleaned):
+        j, depth = m.end(), 0
+        while j < len(cleaned):
+            c = cleaned[j]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth = max(0, depth - 1)
+            elif depth == 0 and c in "{;":
+                break
+            j += 1
+        if j >= len(cleaned) or cleaned[j] == ";":
+            continue
+        close = matching_brace(cleaned, j)
+        if close is not None:
+            scopes.append((m.start(), j, close, m.group(1)))
+    return scopes
+
+
+def enclosing_fn(
+    scopes: list[tuple[int, int, int, str]], pos: int
+) -> tuple[int, int, int, str] | None:
+    """包含 pos 的最内层函数体；None = 函数外（模块级 const/static/宏体）。"""
+    best = None
+    for scope in scopes:
+        if scope[1] < pos < scope[2] and (best is None or scope[1] > best[1]):
+            best = scope
+    return best
+
+
+def allow_owner(
+    scopes: list[tuple[int, int, int, str]], cleaned: str, start: int, end: int
+) -> tuple[int, int, int, str] | None:
+    """逐站 allow 归属的函数体。
+
+    两种形态：① 属性直接挂在 fn/方法上（`#[allow] fn f()`，含 `impl` 里的方法）⇒
+    归属该 fn；② 属性挂在函数体内的语句上 ⇒ 归属所在 fn。函数外的常量/静态块
+    属性（如宏体）⇒ None。
+    """
+    j = end
+    while j < len(cleaned):
+        if cleaned[j].isspace():
+            j += 1
+        elif cleaned[j] == "#":
+            # 跳过紧随其后的其它属性（`#[inline]` 等）
+            k = cleaned.find("[", j)
+            if k == -1:
+                return enclosing_fn(scopes, start)
+            depth = 0
+            while k < len(cleaned):
+                if cleaned[k] == "[":
+                    depth += 1
+                elif cleaned[k] == "]":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            j = k + 1
+        else:
+            break
+    m = FN_ITEM_PREFIX.match(cleaned[j:j + 400])
+    if m is not None:
+        head = j + m.group(0).rfind("fn")
+        for scope in scopes:
+            if scope[0] == head:
+                return scope
+    return enclosing_fn(scopes, start)
 
 
 def spawn_reason_is_template(reason: str) -> bool:
@@ -872,12 +971,16 @@ def scan_spawn_registrations(
 ) -> list[dict]:
     """生产面 spawn 调用 × 覆盖它的 disallowed_methods allow（(h) 门命中面）。
 
-    覆盖判据（优先序）：① 同一文件内位于 spawn 之前、行距 ≤ SPAWN_ALLOW_MAX_LINES
-    的逐站 `#[allow(…)]`；② 文件级 `#![allow(…)]`（恒覆盖全文，但只认登记簿内的
-    文件）；③ 只有更远的逐站 allow ⇒ STALE_ALLOW（跨 fn 的陈旧 allow 不得顺带覆盖）。
+    覆盖判据（优先序）：① 同一文件、**同一函数体**内位于 spawn 之前的逐站
+    `#[allow(…)]`（bd fx93f：行距临近不算——`transport.rs:357` 曾借 59 行外另一
+    函数的 reason 过门；属性直接挂在 fn/方法上则归属该 fn，见 `allow_owner`）；
+    ② 文件级 `#![allow(…)]`（恒覆盖全文，但只认登记簿内的文件）；③ 只有别的函数
+    的逐站 allow ⇒ STALE_ALLOW（跨 fn 的陈旧 allow 不得顺带覆盖）。函数外（模块级
+    const/static/宏体）的 spawn 无「同一函数体」可言，逐站 allow 一律不认 ⇒ 落在
+    ②/③/裸 spawn 判定上（宁淹不错）。
 
     位置口径：命中在 `strip_comments_and_strings + strip_cfg_test_blocks` 的文本上定位
-    （字符串被掏空 ⇒ 字符串里的花括号不干扰 cfg(test) 块配对）；reason 原文按同一字符
+    （字符串被掏空 ⇒ 字符串里的花括号不干扰函数体配对）；reason 原文按同一字符
     偏移回**原始源码**取（两次剥离都是原位掏空，偏移不变）。
     """
     registry = SPAWN_FILE_LEVEL_REGISTRY if registry is None else registry
@@ -894,6 +997,7 @@ def scan_spawn_registrations(
         cleaned = strip_cfg_test_blocks(strip_comments_and_strings(src))[0]
         if "spawn" not in cleaned:
             continue
+        scopes = fn_body_scopes(cleaned)
         allows = []
         for m in ALLOW_DISALLOWED_METHODS.finditer(cleaned):
             # 属性体（含 reason 原文）从原文本同偏移取。
@@ -904,6 +1008,7 @@ def scan_spawn_registrations(
             allows.append(
                 {
                     "start": m.start(),
+                    "end": m.end(),
                     "line": line_of(cleaned, m.start()),
                     "inner": m.group(1) == "#!",
                     "reason": rm.group(1) if rm else "",
@@ -911,8 +1016,15 @@ def scan_spawn_registrations(
             )
         for m in SPAWN_CALL.finditer(cleaned):
             line = line_of(cleaned, m.start())
+            host = enclosing_fn(scopes, m.start())
             prev = [a for a in allows if a["start"] < m.start()]
-            near = [a for a in prev if not a["inner"] and line - a["line"] <= SPAWN_ALLOW_MAX_LINES]
+            near = [
+                a
+                for a in prev
+                if not a["inner"]
+                and host is not None
+                and allow_owner(scopes, cleaned, a["start"], a["end"]) == host
+            ]
             inner = [a for a in prev if a["inner"]]
             if near:
                 a, kind = near[-1], "ADJACENT"
@@ -1085,23 +1197,30 @@ def gate_h(root: Path, registry: dict[str, str] | None = None) -> tuple[bool, st
         in ("UNREGISTERED", "FILE_LEVEL_UNREGISTERED", "STALE_ALLOW", "TEMPLATE_REASON")
     ]
     file_level = [h for h in hits if h["kind"] == "FILE_LEVEL_REGISTERED"]
-    file_level_files = sorted({h["file"] for h in file_level})
+    file_level_counts = {
+        f: sum(1 for h in file_level if h["file"] == f)
+        for f in sorted({h["file"] for h in file_level})
+    }
+    file_level_desc = "; ".join(f"{f}={n}" for f, n in file_level_counts.items()) or "无"
     if bad:
         lines = [f"FAIL (h) ②类 spawn 登记门：未登记/理由无效 {len(bad)} 处（生产 spawn 共 {len(hits)}）："]
         for h in bad:
             where = f"  allow@{h['allow']}" if h["allow"] else "  无 allow"
             lines.append(f"  {h['file']}:{h['line']}  {h['kind']}{where}")
+            if h["kind"] == "STALE_ALLOW":
+                lines.append("    → 该 allow 属另一个函数体（或函数外）；逐站 allow 必须写在 spawn 所在函数体内")
             if h["kind"] == "TEMPLATE_REASON":
                 lines.append("    → reason 只是分类枚举复述；改写为该站自己的寿命/不可托管理由（§3.5.6 ②类三项，禁自造子类）")
         lines.append(
-            "    → 逐站补 `#[allow(clippy::disallowed_methods, reason = \"…\")]`（紧邻 spawn）；"
+            "    → 逐站补 `#[allow(clippy::disallowed_methods, reason = \"…\")]`"
+            "（写在 spawn 所在函数体内）；"
             "①类站点写 `①类待迁移（bd xosi9 改判）：…；目标托管口 = …`"
         )
         return False, "\n".join(lines)
     return True, (
         f"OK (h) ②类 spawn 登记门：生产 spawn {len(hits)} 处全部登记"
         f"（逐站 allow {len(hits) - len(file_level)} / 文件级登记 {len(file_level)} 处"
-        f"：{'; '.join(file_level_files) or '无'}；模板理由 0）"
+        f"：{file_level_desc}；模板理由 0）"
     )
 
 
@@ -1399,6 +1518,29 @@ def cmd_self_test() -> int:
             "fn f() {\n    tokio::spawn(async {});\n}\n",
             encoding="utf-8",
         )
+        # bd fx93f：allow 归属按**函数体**判定（旧行距 ≤60 的窗口能蹭 59 行外另一
+        # 函数的 reason——transport.rs:357 即此形态）。
+        (src / "spawn_cross_fn.rs").write_text(
+            "fn backoff() {\n"
+            "    #[allow(clippy::disallowed_methods, reason = \"挂钟抖动：本函数无 clock 注入面\")]\n"
+            "    let _ = 0;\n"
+            "}\n"
+            "\n"
+            "async fn driver() {\n"
+            "    tokio::spawn(async {});\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        # 反向必须判绿：allow 与 spawn 同函数，中间隔块级嵌套（非「紧邻行」形态）。
+        (src / "spawn_same_fn.rs").write_text(
+            "fn pump() {\n"
+            "    #[allow(clippy::disallowed_methods, reason = \"逐包泵：寿命 = 该连接，EOF 即自终\")]\n"
+            "    if true {\n"
+            "        tokio::spawn(async {});\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
         spawn_hits = {h["file"]: h["kind"] for h in scan_spawn_registrations(troot, registry={})}
         check(
             "(h) 紧邻 allow（实义理由）放行",
@@ -1424,6 +1566,14 @@ def cmd_self_test() -> int:
         check(
             "(h) cfg_attr(test, allow(…)) 不覆盖生产 spawn",
             spawn_hits.get("crates/fx/src/spawn_testcfg.rs") == "UNREGISTERED",
+        )
+        check(
+            "(h) allow 在 A 函数 / spawn 在 B 函数 ⇒ STALE_ALLOW（bd fx93f）",
+            spawn_hits.get("crates/fx/src/spawn_cross_fn.rs") == "STALE_ALLOW",
+        )
+        check(
+            "(h) allow 与 spawn 同函数体（含块级嵌套）⇒ 放行（bd fx93f 反向例）",
+            spawn_hits.get("crates/fx/src/spawn_same_fn.rs") == "ADJACENT",
         )
         check("(h) 有违规 ⇒ 门必须红", not gate_h(troot, registry={})[0])
 
