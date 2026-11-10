@@ -147,6 +147,12 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # bd fu2ck：release 阶段冷编实测 >103 分钟仍未完（-j2，runner 4vCPU/16GB）。
+    # 根因不是「跑不完」，而是**本作业从未成功过** ⇒ Swatinem/rust-cache 只在作业
+    # 成功时保存 ⇒ release 产物每次都进不了缓存 ⇒ 每次都从零冷编 ⇒ 每次都超时，
+    # 自我锁死。给作业加上界（180min，实测冷编 ~140min）让它跑完并把缓存落下来；
+    # 之后各轮的 release 阶段走缓存（约 20min 量级）。
+    timeout-minutes: 180
     # bd k2hf7：xray-core inbound 深轮询链（serve_mixed → per-conn task → UDP
     # associate）在 debug 构建下距 std 默认 2MB 测试线程栈只剩一层透传帧（现役
     # 防线仅 xray-frame scope.rs ArmScope::spawn 的 #[inline(always)]，属编译期
@@ -154,9 +160,11 @@ jobs:
     # 被杀，非单测失败）。16MB = 8× 余量；代价只是线程栈虚拟预留、按需提交页。
     env:
       RUST_MIN_STACK: 16777216
-      # 2026-11-08 三次实证：`cargo test --workspace --release` 在编译 xray-integration-tests
-      # 期间被 runner SIGTERM(143) 提前终止（job 每次 ~24min；debug 步骤全绿、无 ENOSPC/OOM
+      # 2026-11-08 三次实证：`cargo test --workspace --release` 在 release 编译期
+      # 被 runner SIGTERM(143) 提前终止（job 每次 ~24min；debug 步骤全绿、无 ENOSPC/OOM
       # 日志、无 job 超时/并发取消）——按峰值内存/链接并发收敛为 2 路编译缓解。
+      # 注：旧注释写的「编译 xray-integration-tests 期间」指向的 crate **并不存在**
+      # （工作区无此成员，集成测试散在各 crate 的 tests/ 下）——已更正为「release 编译期」。
       # 不放宽任何断言与测试内容（仅编译并发）。
       CARGO_BUILD_JOBS: 2
     steps:
