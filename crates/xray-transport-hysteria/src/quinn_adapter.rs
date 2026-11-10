@@ -1445,6 +1445,29 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    /// E6 现场回显：Drop 时把捕获到的 tracing 日志刷到 stderr。
+    /// libtest 只展示失败用例的捕获输出 ⇒ 成功路径不可见（bd gqpck 取证用）。
+    struct LogDumpOnDrop(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Drop for LogDumpOnDrop {
+        // 失败现场必须走 stderr：libtest 只回显失败用例的捕获输出，写日志宏（xray_frame LOG）
+        // 反而被 sink 吞掉。
+        #[allow(
+            clippy::print_stderr,
+            reason = "测试：失败现场回显，libtest 只展示失败用例的 stderr"
+        )]
+        fn drop(&mut self) {
+            let logs = self.0.lock().expect("log capture lock");
+            if logs.is_empty() {
+                return;
+            }
+            eprintln!("---- tracing captured ({} lines) ----", logs.len());
+            for line in logs.iter() {
+                eprintln!("{line}");
+            }
+        }
+    }
+
     /// x2ywg 判别器：QUIC accept 循环 panic 后必须 error! 留痕（否则 endpoint
     /// clone 留在 listener 里 = 端口仍绑、永不 accept、零线索）。删掉
     /// [`spawn_supervised_accept_loop`] 里的 `supervise_accept_loop` → 本测试红。
@@ -2143,6 +2166,16 @@ mod tests {
         };
 
         ensure_crypto_provider();
+
+        // E6（bd gqpck 取证）：quinn 的 endpoint/连接 driver I/O 失败只走 `tracing::error!`，
+        // 本 crate 未装全局订阅者 ⇒ 失败现场零线索（「静默 Accept 死亡」无法与正常 close
+        // 区分）。线程局部 `set_default`：本用例是 current_thread runtime，客户端/服务端任务
+        // 与测试体同线程 ⇒ 事件不漏。Drop 时回显；libtest 只打印失败用例的捕获输出
+        // ⇒ 成功路径零噪音。
+        let e6_logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _e6_capture =
+            tracing::subscriber::set_default(CaptureLogs(std::sync::Arc::clone(&e6_logs)));
+        let _e6_dump = LogDumpOnDrop(std::sync::Arc::clone(&e6_logs));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = cert.cert.der().clone();

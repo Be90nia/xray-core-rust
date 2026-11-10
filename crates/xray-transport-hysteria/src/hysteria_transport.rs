@@ -15,10 +15,12 @@
 //! `transport/internet/hysteria/dialer.go`。
 
 use std::{
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use quinn::{
@@ -51,6 +53,40 @@ const STATUS_AUTH_OK: u16 = 233;
 /// Auth padding 最小/最大字节数。
 const AUTH_PADDING_MIN: usize = 256;
 const AUTH_PADDING_MAX: usize = 2048;
+
+/// 连接进入 connected 的时限（Go parity：quic-go `HandshakeIdleTimeout` 默认 5s，
+/// `internal/protocol/params.go` `DefaultHandshakeIdleTimeout`；`handshakeTimeout() = 2 * 它`）。
+///
+/// hysteria dialer 不覆盖该值——Go `dialer.go` 的 `&quic.Config{...}` 只设
+/// `MaxIdleTimeout`，故同场景 Go 5s 报错。quinn 无独立握手窗，本 crate 只下发
+/// `max_idle_timeout`（默认 30s）⇒ 服务端不应答时会静默烧满 30s 才以
+/// 「h3 recv_response: Connection error: Timeout」显现（真实 CI 症状，bd gqpck）。
+///
+/// **只约束「握手完成」，不约束 h3 auth**：0-RTT 与 1-RTT 一视同仁（0-RTT 只是提前发
+/// 数据，握手仍在后台完成）；auth 段与 Go 一致仅受 `max_idle_timeout` 约束（用户
+/// 100% 复刻铁律，防回退测试 `slow_auth_response_beyond_handshake_window_still_succeeds`）。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 握手窗超时（0-RTT / 1-RTT 两型入口共用）。
+fn handshake_timeout_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "phase=handshake hysteria QUIC handshake timeout after {HANDSHAKE_TIMEOUT:?} (Go quic-go HandshakeIdleTimeout default)"
+        ),
+    )
+}
+
+/// 握手窗：`connected` 类 future 必须 5s 内 resolve，否则报握手超时。
+/// 0-RTT / 1-RTT 两型入口共用（Go quic-go `HandshakeIdleTimeout` 对二者一视同仁）。
+async fn within_handshake_window<F: Future>(connected: F) -> Result<F::Output, io::Error> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, connected).await.map_err(|_| handshake_timeout_error())
+}
+
+/// 给既有错误补阶段标注（不改变错误类别与时长；CI 再出 30s Timeout 时可区分卡在握手还是 auth）。
+fn annotate_phase(phase: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("phase={phase} {e}"))
+}
 
 /// quinn + h3 实现的 [`HysteriaTransport`]。
 pub struct QuinnHysteriaTransport {
@@ -151,27 +187,73 @@ impl HysteriaTransport for QuinnHysteriaTransport {
             };
             endpoint.set_default_client_config(client_config);
 
-            // 2. QUIC 拨号（Go dialer.go:154 `tr.DialEarly` parity）：store 有会话票据时 into_0rtt
-            //    立即返回连接，h3 auth 在 0-RTT 中发出（省 1-RTT）；首连/禁用 resumption 时 Err →
-            //    正常等 1-RTT。0-RTT 被服务端拒绝时 auth 流报 ZeroRttRejected，dial
-            //    失败交上层重连——与 Go quic-go Err0RTTRejected → dial 返回 err → clientManager
-            //    重连同型，不加额外重试。
             let connecting = endpoint
                 .connect(dest_addr, &host)
                 .map_err(|e| io::Error::other(format!("quinn connect initiate: {e}")))?;
-            let conn = match connecting.into_0rtt() {
-                Ok((conn, _zero_rtt)) => {
+
+            // 2./3. QUIC 拨号 + h3 auth（Go dialer.go:154 `tr.DialEarly` parity）：
+            // store 有会话票据时 into_0rtt 立即返回连接，h3 auth 在 0-RTT 中发出（省 1-RTT）；
+            // 首连/禁用 resumption 时 Err → 正常等 1-RTT。0-RTT 被服务端拒绝时 auth 流报
+            // ZeroRttRejected，dial 失败交上层重连——与 Go quic-go Err0RTTRejected → dial
+            // 返回 err → clientManager 重连同型，不加额外重试。
+            //
+            // 握手窗与 auth 段按 Go 语义分开（用户 100% 复刻铁律）：
+            // - **连接进入 connected**：受 [`HANDSHAKE_TIMEOUT`]（5s，quic-go
+            //   `HandshakeIdleTimeout` 默认）约束——0-RTT 与 1-RTT 一视同仁（0-RTT 只是
+            //   提前发数据，握手仍在后台完成，quic-go 的超时照样计）。
+            // - **h3 POST /auth 的应答**：不受 5s 窗，只受 `max_idle_timeout`（30s）约束 —— Go
+            //   该段同样无专门窗 ⇒ auth 慢应答（>5s）不得被截断。
+            // 错误路径带 `phase=handshake` / `phase=auth` 标注：CI 再出 30s Timeout 时可
+            // 区分卡在哪一段（不改超时时长）。
+            let (conn, h3_keepalive) = match connecting.into_0rtt() {
+                Ok((conn, zero_rtt)) => {
                     crate::LOG.debug("hysteria dialing with 0-RTT attempt");
-                    conn
+                    // 0-RTT：auth 请求随 early data 发出，握手仍在后台完成 ⇒ 握手窗必须与
+                    // auth **并发**跑（先等握手再发 auth 会丢掉 0-RTT 提前发请求的语义）。
+                    // `zero_rtt`（into_0rtt 返回的 future）恰在握手完成时 resolve ⇒
+                    // - 握手先完成 ⇒ 转 auth（无握手段窗）；
+                    // - auth 先完成 ⇒ 应答以握手完成为前提，握手必然已完成，直接采信；
+                    // - 5s 内握手没完成 ⇒ 整个 dial 报握手超时（Go 同款）。
+                    // 0-RTT 是否被服务端接受与既有行为一致地不检查（诊断 §5.2 另立票）。
+                    // 内层块收窄 auth/handshake 对 conn 的借用，块结束即放行 conn 的 move。
+                    let h3 = {
+                        let auth = authenticate_via_h3(&conn, &auth_token, brutal_down_bps);
+                        tokio::pin!(auth);
+                        tokio::pin!(zero_rtt);
+                        let handshake = within_handshake_window(&mut zero_rtt);
+                        tokio::pin!(handshake);
+                        tokio::select! {
+                            hs = &mut handshake => match hs {
+                                // 握手完成 ⇒ 转 auth（无握手段窗；idle 30s 兜底，Go 同）
+                                Ok(_) => {
+                                    let r = auth.await;
+                                    r.map_err(|e| annotate_phase("auth", e))
+                                },
+                                // 握手窗先到 ⇒ Go 同款握手超时
+                                Err(e) => Err(e),
+                            },
+                            // auth 先完成 ⇒ 握手必已完成
+                            a = &mut auth => a.map_err(|e| annotate_phase("auth", e)),
+                        }
+                    };
+                    (conn, h3?)
                 },
                 Err(connecting) => {
-                    connecting.await.map_err(|e| io::Error::other(format!("quinn connect: {e}")))?
+                    // 1-RTT：`connecting.await` 即握手等待，套同一握手窗
+                    let conn = match within_handshake_window(connecting).await {
+                        // 已带 phase=handshake 标注
+                        Err(e) => return Err(e),
+                        Ok(conn) => conn,
+                    };
+                    let conn = conn.map_err(|e| {
+                        annotate_phase("handshake", io::Error::other(format!("quinn connect: {e}")))
+                    })?;
+                    let h3 = authenticate_via_h3(&conn, &auth_token, brutal_down_bps)
+                        .await
+                        .map_err(|e| annotate_phase("auth", e))?;
+                    (conn, h3)
                 },
             };
-
-            // 3. h3 client 发 POST /auth，返回保活项（driver + SendRequest）防止 h3 关闭 QUIC
-            //    连接。
-            let h3_keepalive = authenticate_via_h3(&conn, &auth_token, brutal_down_bps).await?;
 
             // 3.5 CC 协商（Go dialer.go:229-243 switch）：
             // down = 响应 Hysteria-CC-RX（服务端下行容量）。
@@ -365,12 +447,49 @@ mod tests {
         assert!(t.is_ok());
     }
 
-    /// 0-RTT 测试共用：自签证书 + QuinnListenerFactory server（auth="test-secret"）。
+    /// 0-RTT 测试共用验证器：auth == "test-secret" ⇒ "user"。
+    struct TestValidator;
+    impl crate::hub::AuthValidator for TestValidator {
+        fn validate(&self, auth: &str) -> Option<String> {
+            if auth == "test-secret" { Some("user".into()) } else { None }
+        }
+
+        fn count(&self) -> usize {
+            1
+        }
+    }
+
+    /// 慢验证器（防回退测试用）：auth 应答延迟 `delay` 才返回。
+    /// `AuthValidator::validate` 是 sync trait ⇒ 只能阻塞；测试跑在 multi_thread(2) 上，
+    /// 阻塞单个 worker 不冻结客户端任务（真实墙钟，模拟「服务端 auth 慢应答」）。
+    struct SlowValidator(std::time::Duration);
+    impl crate::hub::AuthValidator for SlowValidator {
+        fn validate(&self, auth: &str) -> Option<String> {
+            if auth == "test-secret" {
+                std::thread::sleep(self.0);
+                Some("user".into())
+            } else {
+                None
+            }
+        }
+
+        fn count(&self) -> usize {
+            1
+        }
+    }
+
+    /// 0-RTT 测试共用：自签证书（SAN = `sni`）+ QuinnListenerFactory server（auth="test-secret"）。
     /// 返回 (server_addr, listener, client_trust_anchors)；listener 须保活至断言结束。
-    async fn spawn_auth_server()
-    -> io::Result<(SocketAddr, Arc<dyn crate::hub::HysteriaQuicListener>, rustls::RootCertStore)>
+    ///
+    /// `sni` 由用例传入且**各用例唯一**：进程级 [`GLOBAL_CLIENT_SESSION_STORE`] 的 key
+    /// 只有 ServerName，而 `take_tls13_ticket` 取出即删 ⇒ 公有 SNI 会让并行用例互抢票据
+    /// （bd pfq9s H-B2）。证书 SAN 同步用该名，客户端走真实校验路径即可通过。
+    async fn spawn_auth_server(
+        sni: &str,
+        validator: Arc<dyn crate::hub::AuthValidator>,
+    ) -> io::Result<(SocketAddr, Arc<dyn crate::hub::HysteriaQuicListener>, rustls::RootCertStore)>
     {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec![sni.into()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let key_der =
             rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
@@ -385,17 +504,7 @@ mod tests {
         let factory = crate::quinn_adapter::QuinnListenerFactory::new(Arc::new(server_tls));
         let proto_config = Arc::new(crate::proto_config::Config::default());
         let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
-        struct TestValidator;
-        impl crate::hub::AuthValidator for TestValidator {
-            fn validate(&self, auth: &str) -> Option<String> {
-                if auth == "test-secret" { Some("user".into()) } else { None }
-            }
-
-            fn count(&self) -> usize {
-                1
-            }
-        }
-        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(TestValidator));
+        let validator = Some(validator);
         use crate::hub::HysteriaListenerFactory as _;
         let (stream_tx, _stream_rx) =
             tokio::sync::mpsc::unbounded_channel::<Arc<crate::conn::InterStreamConn>>();
@@ -424,7 +533,9 @@ mod tests {
     #[tokio::test]
     async fn resumption_disabled_transport_dials_via_1rtt_fallback() {
         ensure_crypto_provider();
-        let (addr, _listener, trust) = spawn_auth_server().await.unwrap();
+        const SNI: &str = "localhost-resumption-disabled";
+        let (addr, _listener, trust) =
+            spawn_auth_server(SNI, Arc::new(TestValidator)).await.unwrap();
 
         let client_tls =
             rustls::ClientConfig::builder().with_root_certificates(trust).with_no_client_auth();
@@ -437,7 +548,7 @@ mod tests {
         let transport = QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
             .expect("transport");
 
-        let dest = DialDestination { udp_addr: addr, host: "localhost".into() };
+        let dest = DialDestination { udp_addr: addr, host: SNI.into() };
         let qc = crate::dialer::QuicConfig::default_for_hysteria();
         tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -448,13 +559,165 @@ mod tests {
         .expect("1-RTT fallback dial + auth should succeed");
     }
 
+    /// 握手窗 Go parity（bd gqpck）：对端 UDP socket 在但从不回包 ⇒ 必须在
+    /// [`HANDSHAKE_TIMEOUT`]（Go quic-go `HandshakeIdleTimeout` 默认 5s）内报
+    /// `TimedOut` 且错误文本指明握手窗；不得烧满 30s `max_idle_timeout` 后才以
+    /// 「h3 recv_response: Connection error: Timeout」显现（真实 CI 症状）。
+    ///
+    /// 虚拟时钟（`start_paused` + 自动推进）：不真等 5s。
+    #[tokio::test(start_paused = true)]
+    async fn dial_reports_handshake_timeout_within_go_parity_window() {
+        ensure_crypto_provider();
+        // 假服务端：绑定但从不读/回包。端口未绑定会回 ICMP port unreachable，
+        // connect 会立刻失败 ⇒ 测不到「静默窗」。
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent server");
+        let addr = silent.local_addr().expect("silent server addr");
+
+        let client_tls = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let transport = QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+            .expect("transport");
+        let dest = DialDestination { udp_addr: addr, host: "localhost-silent".into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+
+        let started = tokio::time::Instant::now();
+        let err = transport
+            .dial_and_authenticate(&dest, &qc, "test-secret", 0)
+            .await
+            .err()
+            .expect("服务端静默必须报错而非挂到 idle 超时");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "error={err}");
+        assert!(
+            err.to_string().contains("QUIC handshake"),
+            "错误须点名 QUIC handshake（不是 h3 idle Timeout）：{err}"
+        );
+        assert!(err.to_string().contains("phase=handshake"), "错误须带握手阶段标注：{err}");
+        assert!(
+            elapsed >= HANDSHAKE_TIMEOUT && elapsed < HANDSHAKE_TIMEOUT * 2,
+            "握手窗应在 {HANDSHAKE_TIMEOUT:?} 触发（Go parity），实测 {elapsed:?}"
+        );
+    }
+
+    /// 0-RTT 分支「connected 窗」逻辑单测：永不 resolve 的假 future 必须在
+    /// [`HANDSHAKE_TIMEOUT`] 报 `phase=handshake` 超时——不依赖真 QUIC（Main 口径：
+    /// 集成层只测两型入口的收场，窗逻辑本身由本单测钉住）。
+    #[tokio::test(start_paused = true)]
+    async fn handshake_window_helper_times_out_pending_future() {
+        let started = tokio::time::Instant::now();
+        let err = within_handshake_window(std::future::pending::<bool>())
+            .await
+            .expect_err("永不 connected 必须在握手窗报超时");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "error={err}");
+        assert!(err.to_string().contains("phase=handshake"), "error={err}");
+        assert_eq!(started.elapsed(), HANDSHAKE_TIMEOUT, "窗值必须精确等于 5s");
+    }
+
+    /// 握手窗对 **0-RTT 入口**同样成立（Go：`HandshakeIdleTimeout` 对 0-RTT 的后台握手
+    /// 照样计）：先与真服务端完成一次拨号播种票据（store 只按 ServerName 键），再对
+    /// 「绑定但静默」的假服务端用**同一 SNI** 拨号 ⇒ `into_0rtt` 命中票据走 0-RTT 分支，
+    /// 握手在后台 ⇒ 必须在 [`HANDSHAKE_TIMEOUT`] 内报 `phase=handshake` 超时。
+    ///
+    /// 注：若 rustls 票据不可复用而回退 1-RTT，本用例退化为上一用例的复检（断言不变）；
+    /// 0-RTT 分支与 1-RTT 分支共用同一 [`HANDSHAKE_TIMEOUT`] 与错误构造。
+    #[tokio::test(start_paused = true)]
+    async fn zero_rtt_dial_handshake_window_fires_within_go_parity_window() {
+        ensure_crypto_provider();
+        const SNI: &str = "localhost-0rtt-window";
+        let (addr, _listener, trust) =
+            spawn_auth_server(SNI, Arc::new(TestValidator)).await.unwrap();
+        let dest = DialDestination { udp_addr: addr, host: SNI.into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+
+        let client_tls =
+            rustls::ClientConfig::builder().with_root_certificates(trust).with_no_client_auth();
+        let transport = QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+            .expect("transport");
+
+        // ① 播种票据（连接保活到用例尾，见 second_dial_uses_0rtt_* 的 H-B1 注释）
+        let seed = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
+        )
+        .await
+        .expect("no hang")
+        .expect("seeding dial should succeed");
+
+        // ② 假服务端：绑定但静默；同 SNI ⇒ into_0rtt 命中票据
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind silent server");
+        let silent_addr = silent.local_addr().expect("silent server addr");
+        let silent_dest = DialDestination { udp_addr: silent_addr, host: SNI.into() };
+
+        let started = tokio::time::Instant::now();
+        let err = transport
+            .dial_and_authenticate(&silent_dest, &qc, "test-secret", 0)
+            .await
+            .err()
+            .expect("静默服务端下 0-RTT 握手必须 5s 内报错");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "error={err}");
+        assert!(
+            err.to_string().contains("phase=handshake"),
+            "0-RTT 入口的超时须带握手阶段标注：{err}"
+        );
+        assert!(
+            elapsed <= HANDSHAKE_TIMEOUT + std::time::Duration::from_millis(500),
+            "总耗时必须 ≤ 握手窗 + 500ms 容差（不得烧满 idle 30s），实测 {elapsed:?}"
+        );
+
+        seed.close_with_error(crate::config::CLOSE_ERR_CODE_OK, "test done");
+    }
+
+    /// 防回退（用户「100% 复刻」铁律）：**auth 段不得被握手段 5s 窗约束**——Go 的
+    /// h3 POST /auth 应答只受 `MaxIdleTimeout`（30s）约束。服务端在握手完成后延迟 6s
+    /// 才回 /auth ⇒ 拨号必须成功；若有人把 auth 罩回 5s 窗，本用例以 TimedOut 红。
+    ///
+    /// 慢响应型必须走真实墙钟（暂停时钟下真实完成窗口会被 timer 跳步吞掉）⇒ 本用例
+    /// 真实耗时 ~6s；延迟用阻塞 sleep（`AuthValidator::validate` 是 sync trait），跑在
+    /// multi_thread(2) 上只冻一个 worker。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_auth_response_beyond_handshake_window_still_succeeds() {
+        ensure_crypto_provider();
+        const SNI: &str = "localhost-slow-auth";
+        const AUTH_DELAY: Duration = Duration::from_secs(6);
+        let (addr, _listener, trust) =
+            spawn_auth_server(SNI, Arc::new(SlowValidator(AUTH_DELAY))).await.unwrap();
+
+        let client_tls =
+            rustls::ClientConfig::builder().with_root_certificates(trust).with_no_client_auth();
+        let transport = QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+            .expect("transport");
+        let dest = DialDestination { udp_addr: addr, host: SNI.into() };
+        let qc = crate::dialer::QuicConfig::default_for_hysteria();
+
+        let started = xray_frame::compat::clock().now_instant();
+        let _conn = tokio::time::timeout(
+            Duration::from_secs(25),
+            transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
+        )
+        .await
+        .expect("no hang")
+        .expect("慢 auth（6s > 5s 握手窗）必须成功——auth 段不得被握手窗截断");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= AUTH_DELAY,
+            "拨号应等待服务端 {AUTH_DELAY:?} 慢应答（证明 auth 段无 5s 截断），实测 {elapsed:?}"
+        );
+    }
+
     /// 0-RTT 臂：首次拨号为会话缓存播种票据；二次拨号 into_0rtt 可用且服务端接受
     /// （quinn 服务端默认处理 0-RTT），0-RTT 路径上 h3 auth 完整走通。
     #[tokio::test]
     async fn second_dial_uses_0rtt_after_first_dial_seeds_ticket() {
         ensure_crypto_provider();
-        let (addr, _listener, trust) = spawn_auth_server().await.unwrap();
-        let dest = DialDestination { udp_addr: addr, host: "localhost".into() };
+        const SNI: &str = "localhost-0rtt-seed";
+        let (addr, _listener, trust) =
+            spawn_auth_server(SNI, Arc::new(TestValidator)).await.unwrap();
+        let dest = DialDestination { udp_addr: addr, host: SNI.into() };
         let qc = crate::dialer::QuicConfig::default_for_hysteria();
 
         let client_tls =
@@ -464,8 +727,11 @@ mod tests {
                 .expect("transport"),
         );
 
-        // 首连：播种票据（无票据时 into_0rtt Err → 1-RTT，成功即回退无损）
-        tokio::time::timeout(
+        // 首连：播种票据（无票据时 into_0rtt Err → 1-RTT，成功即回退无损）。
+        // **必须保活到本用例结束**：NewSessionTicket 由服务端在握手完成后异步发出，实测
+        // 落到共享 store 比本函数的返回**晚 1.4–2.1ms**（bd pfq9s 探针，5/5 次）；连接一旦
+        // drop 即关闭 QUIC，晚到的票据再也进不了 store（H-B1）。
+        let seed = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             transport.dial_and_authenticate(&dest, &qc, "test-secret", 0),
         )
@@ -475,9 +741,9 @@ mod tests {
 
         // 白盒：与 dial_and_authenticate 同构的 client config（共享 store + 同 transport
         // config——传输参数与首连一致才不会被服务端拒 0-RTT），直接断言 into_0rtt 状态。
-        // NewSessionTicket 在握手完成后由服务端异步发出，auth 响应返回时可能仍在路上；
-        // 轮询重拨直至票据落入共享 store（确定性等待条件，非时序假设）。每次探测连接
-        // 本身也会收取票据，加速落库。
+        // 票据唯一来源是上面**保活的播种连接**：探测连接握手完成后立刻 close，而 NST 比
+        // 握手完成晚到（实测 dial 返回后 1.4–2.1ms，bd pfq9s 探针）⇒ 探测连接收不到票据。
+        // 故这里只是**确定性等待条件**：轮询到 store 里有票为止。
         let probe = tokio::time::timeout(std::time::Duration::from_secs(20), async {
             loop {
                 let mut cfg = transport.client_config.clone();
@@ -487,7 +753,7 @@ mod tests {
                 cfg.transport_config(Arc::new(transport_cfg));
                 let mut ep = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
                 ep.set_default_client_config(cfg);
-                let connecting = ep.connect(addr, "localhost").expect("connect initiate");
+                let connecting = ep.connect(addr, SNI).expect("connect initiate");
                 match connecting.into_0rtt() {
                     Ok((conn, zero_rtt)) => break (conn, zero_rtt),
                     Err(connecting) => {
@@ -516,5 +782,7 @@ mod tests {
         .await
         .expect("no hang")
         .expect("second dial (0-RTT) + auth should succeed");
+
+        seed.close_with_error(crate::config::CLOSE_ERR_CODE_OK, "test done");
     }
 }
