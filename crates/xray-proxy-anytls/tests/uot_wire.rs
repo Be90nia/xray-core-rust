@@ -23,7 +23,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream},
     net::UdpSocket,
 };
-use tokio_rustls::TlsAcceptor;
 use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager,
     default::{DialBridge, SimpleOhm},
@@ -36,6 +35,7 @@ use xray_buf::{
 };
 use xray_common::net::{address::Address, destination::Destination, network::Network, port::Port};
 use xray_proxy_anytls::{AnytlsMockServer, client::AnytlsClient, dispatcher::make_dial_fn};
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 
 /// 单次用例的墙钟上限：本仓无 per-test 超时，挂死形态会让整个 `--test` 跑到超时被 kill。
 const CASE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -233,7 +233,7 @@ async fn uot_client_server_udp_roundtrip() {
     // 3. anytls 服务端（UoT 分支走 serve_uot_session）
     let server = AnytlsMockServer::start_with_password(
         "127.0.0.1:0".parse().unwrap(),
-        TlsAcceptor::from(Arc::new(server_config)),
+        Arc::new(InboundTlsAcceptor::Rustls(Arc::new(server_config).into())),
         Some(dispatch),
         Some(PASSWORD),
     )

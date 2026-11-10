@@ -18,7 +18,6 @@ use std::{
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::PrivateKeyDer;
 use serde_json::json;
-use tokio_rustls::TlsAcceptor;
 use xray_features::inbound::InboundHandler;
 use xray_frame::{
     ClauseId, Plugin, PluginDep, PluginError,
@@ -26,11 +25,12 @@ use xray_frame::{
     assert_plugin_contract,
 };
 use xray_proxy_anytls::AnytlsPlugin;
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 
 static INIT_CRYPTO: Once = Once::new();
 
 /// 自签证书 acceptor（构造面探针用；证书链语义沿用 inbound.rs 单测的既有做法）。
-fn make_tls_acceptor() -> TlsAcceptor {
+fn make_tls_acceptor() -> std::sync::Arc<InboundTlsAcceptor> {
     INIT_CRYPTO.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
@@ -42,7 +42,7 @@ fn make_tls_acceptor() -> TlsAcceptor {
         .with_no_client_auth()
         .with_single_cert(vec![cert.der().to_owned()], key_der)
         .expect("rustls server config");
-    TlsAcceptor::from(Arc::new(config))
+    Arc::new(InboundTlsAcceptor::Rustls(Arc::new(config).into()))
 }
 
 fn framework_options() -> FrameworkOptions {

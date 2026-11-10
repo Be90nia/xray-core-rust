@@ -837,7 +837,8 @@ pub(crate) async fn build_anytls_inbound(
     let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("parse addr: {e}"))
     })?;
-    let (tls_acceptor, password) = parse_anytls_tls_acceptor(&ib.entry.data)?;
+    let (tls_acceptor, password) =
+        parse_anytls_tls_acceptor(&ib.entry.data, ib.stream_settings_json.as_ref())?;
     // bd b5e77：缺 dispatcher 时 anytls 服务端退回 mock 直连分支——TCP 绕过
     // router（不烘焙 DNS/fake-IP/路由规则），UoT 直接拒会话。故与 hysteria/tuic
     // 同款 fail-visible：无默认出站 = 启动期硬错，禁静默退回直连。

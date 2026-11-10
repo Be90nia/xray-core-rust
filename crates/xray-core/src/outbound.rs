@@ -4577,7 +4577,7 @@ mod tests {
 
         // 自签证书服务端（inbound 既有 helper，SAN = localhost）。
         let (acceptor, _pw) =
-            crate::inbound::parse_anytls_tls_acceptor(b"{}").expect("self-signed acceptor");
+            crate::inbound::parse_anytls_tls_acceptor(b"{}", None).expect("self-signed acceptor");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let server = tokio::spawn(async move {

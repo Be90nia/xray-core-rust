@@ -28,7 +28,6 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
 use xray_app_dispatcher::{DispatchHandler, udp_session::XudpWireConn};
 use xray_buf::io::{new_reader, new_writer};
 use xray_common::{
@@ -36,6 +35,9 @@ use xray_common::{
     padding::validate_padding_len,
 };
 use xray_frame::LogFacade;
+// 入站 TLS acceptor 后端二选一（rustls / btls，bd ozgh9）：握手与后续读都走
+// `InboundTlsStream` 的统一访问器，本文件不再直接摸 rustls 类型。
+use xray_tls::inbound_acceptor::{InboundTlsAcceptor, InboundTlsStream};
 use xray_transport::link::Link;
 
 use crate::{
@@ -96,7 +98,7 @@ impl AnytlsMockServer {
     /// 直连 TCP（仅供 loopback 测试）。
     pub async fn start(
         bind_addr: SocketAddr,
-        tls_acceptor: TlsAcceptor,
+        tls_acceptor: Arc<InboundTlsAcceptor>,
         dispatch: Option<Arc<dyn DispatchHandler>>,
     ) -> Result<Self> {
         Self::start_with_password(bind_addr, tls_acceptor, dispatch, None).await
@@ -109,7 +111,7 @@ impl AnytlsMockServer {
     /// `password` 为 None 时不校验（与既有 mock 行为一致，仅按帧格式读掉）。
     pub async fn start_with_password(
         bind_addr: SocketAddr,
-        tls_acceptor: TlsAcceptor,
+        tls_acceptor: Arc<InboundTlsAcceptor>,
         dispatch: Option<Arc<dyn DispatchHandler>>,
         password: Option<&str>,
     ) -> Result<Self> {
@@ -141,7 +143,7 @@ impl AnytlsMockServer {
 
 async fn serve_loop(
     listener: TcpListener,
-    tls_acceptor: TlsAcceptor,
+    tls_acceptor: Arc<InboundTlsAcceptor>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     expected_password_sha256: Option<[u8; 32]>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -177,7 +179,7 @@ async fn serve_loop(
 
 async fn handle_conn(
     tcp: TcpStream,
-    tls_acceptor: TlsAcceptor,
+    tls_acceptor: Arc<InboundTlsAcceptor>,
     dispatch: Option<Arc<dyn DispatchHandler>>,
     expected_password_sha256: Option<[u8; 32]>,
     fx: Arc<FxScope>,
@@ -224,7 +226,7 @@ async fn handle_conn(
     // 握手 deadline 预算（bd 23vrp）：Budget 统一入口——绝对时刻（tokio Instant）
     // 不再出现在本文件，虚拟推进语义由 BudgetDeadline::timeout 保留。
     let handshake_deadline = xray_frame::deadline::Budget::tokio().deadline(handshake_timeout());
-    let mut tls: TlsStream<TcpStream> =
+    let mut tls: InboundTlsStream<TcpStream> =
         match handshake_deadline.timeout(tls_acceptor.accept(tcp)).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
@@ -661,7 +663,7 @@ mod tests {
         let (cfg, cert_der) = make_server_config();
         let server = AnytlsMockServer::start_with_password(
             "127.0.0.1:0".parse().unwrap(),
-            TlsAcceptor::from(Arc::new(cfg)),
+            Arc::new(InboundTlsAcceptor::Rustls(Arc::new(cfg).into())),
             None,
             password,
         )

@@ -5957,15 +5957,27 @@ fn build_hysteria_tls_server_config(
 ///
 /// JSON 格式：`{"cert":"...","key":"...","password":"..."}`（cert/key 为 PEM）。
 /// cert/key 缺省时用自签名证书（仅测试场景）；password 缺省时不校验客户端认证帧。
+///
+/// `stream_settings_json` 只在 `tlsSettings.echServerKeys` 非空时消费：那时后端必须是
+/// btls（rustls 0.23 无服务端 ECH，bd mdpl2），选路交给
+/// [`xray_tls::inbound_acceptor::build_inbound_acceptor`]（bd ozgh9）。无 ECH 时仍是
+/// 本函数自建的 rustls acceptor——**既有行为零变化**。
 pub(crate) fn parse_anytls_tls_acceptor(
     data: &[u8],
-) -> std::io::Result<(tokio_rustls::TlsAcceptor, Option<String>)> {
+    stream_settings_json: Option<&serde_json::Value>,
+) -> std::io::Result<(Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>, Option<String>)> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     // cert/key 与自签两条路径都构造 rustls ServerConfig，进程级 provider 必须先装
     // （CI 场景 si 带 cert/key，走 cert 分支——漏装则启动期 panic）。
     xray_common::ensure_default_crypto_provider();
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("anytls inbound settings JSON: {e}")))?;
+    let password =
+        v.get("password").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
+    // ECH 先判：配了 echServerKeys 就不能落 rustls（否则配置静默失效）。
+    if let Some(acceptor) = anytls_ech_acceptor(&v, stream_settings_json)? {
+        return Ok((acceptor, password));
+    }
     // 尝试从配置读证书
     let (cert_der, key_der) = if let (Some(cert_str), Some(key_str)) =
         (v.get("cert").and_then(|x| x.as_str()), v.get("key").and_then(|x| x.as_str()))
@@ -6004,9 +6016,57 @@ pub(crate) fn parse_anytls_tls_acceptor(
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.into()], key_der)
         .map_err(|e| std::io::Error::other(format!("rustls server config: {e}")))?;
-    let password =
-        v.get("password").and_then(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from);
-    Ok((tokio_rustls::TlsAcceptor::from(Arc::new(config)), password))
+    Ok((
+        Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(Arc::new(config).into())),
+        password,
+    ))
+}
+
+/// `streamSettings.tlsSettings.echServerKeys` 非空时按统一选路装配 acceptor（btls 后端）。
+///
+/// `Ok(None)` = 没配 ECH（调用方走既有 rustls 路径，行为零变化）。
+///
+/// 证书来源：anytls 的历史形态把 PEM 放在 settings（`cert`/`key`），而 btls 从
+/// `tlsSettings` 取证书 ⇒ tlsSettings 无证书时补进去（自带则 tlsSettings 优先）。
+fn anytls_ech_acceptor(
+    settings: &serde_json::Value,
+    stream_settings_json: Option<&serde_json::Value>,
+) -> std::io::Result<Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>> {
+    let Some(stream) = stream_settings_json else { return Ok(None) };
+    let Some(tls) = stream.get("tlsSettings").filter(|v| v.is_object()) else { return Ok(None) };
+    let ech_configured =
+        tls.get("echServerKeys").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty());
+    if !ech_configured {
+        return Ok(None);
+    }
+    let security = stream.get("security").and_then(|v| v.as_str()).unwrap_or_default();
+    if !security.eq_ignore_ascii_case("tls") {
+        // 选路层对 `none` 返回 `Ok(None)`：不在这里拦就等于静默丢弃 ECH 配置。
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "anytls inbound: tlsSettings.echServerKeys requires streamSettings.security \
+                 \"tls\", got {security:?}: only the btls TLS backend can register an ECH \
+                 keyset, and serving rustls would leave ECH clients without a decrypted \
+                 inner SNI"
+            ),
+        ));
+    }
+    let mut tls = tls.clone();
+    if tls.get("certificates").is_none() && tls.get("cert").is_none() {
+        for key in ["cert", "key"] {
+            if let Some(value) = settings.get(key) {
+                tls[key] = value.clone();
+            }
+        }
+    }
+    let acceptor = xray_tls::inbound_acceptor::build_inbound_acceptor("tls", Some(&tls))?
+        .ok_or_else(|| {
+            std::io::Error::other(
+                "anytls inbound: echServerKeys configured but no TLS acceptor was assembled",
+            )
+        })?;
+    Ok(Some(Arc::new(acceptor)))
 }
 
 /// 从 inbound entry.data + streamSettings 解析 naive 入站配置。
@@ -7143,15 +7203,75 @@ mod tests {
     /// Some；缺省/空串为 None（不校验）；cert/key 缺省走自签（测试场景）。
     #[test]
     fn parse_anytls_tls_acceptor_password() {
-        let (acceptor, pw) = parse_anytls_tls_acceptor(br#"{"password":"s3cret"}"#).unwrap();
+        let (acceptor, pw) = parse_anytls_tls_acceptor(br#"{"password":"s3cret"}"#, None).unwrap();
         assert_eq!(pw.as_deref(), Some("s3cret"));
-        let _ = acceptor; // 自签构造成功即合法
+        // 无 ECH ⇒ 仍是既有 rustls 路径（零行为变化）。
+        assert_eq!(acceptor.backend(), "rustls");
 
-        let (_, pw) = parse_anytls_tls_acceptor(b"{}").unwrap();
+        let (_, pw) = parse_anytls_tls_acceptor(b"{}", None).unwrap();
         assert_eq!(pw, None, "missing password must stay None");
 
-        let (_, pw) = parse_anytls_tls_acceptor(br#"{"password":""}"#).unwrap();
+        let (_, pw) = parse_anytls_tls_acceptor(br#"{"password":""}"#, None).unwrap();
         assert_eq!(pw, None, "empty password must stay None");
+    }
+
+    /// BoringSSL 服务端可用的 ECH keyset（HKDF-SHA256-only，`echServerKeys` 的 base64 形态）。
+    #[cfg(not(target_os = "ios"))]
+    fn ech_server_keys_b64() -> String {
+        use base64::Engine as _;
+        let (config, priv_bytes) = xray_tls::ech::generate_ech_key_set_sha256("public.example");
+        base64::engine::general_purpose::STANDARD
+            .encode(xray_tls::ech::pack_ech_server_keys(&priv_bytes, &config))
+    }
+
+    /// bd ozgh9：`tlsSettings.echServerKeys` 非空 ⇒ anytls 走 btls 后端（ECH 真能用）。
+    /// 证书仍取 anytls 的 settings 形态（`cert`/`key` PEM）——装配前补进 tlsSettings。
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn parse_anytls_tls_acceptor_routes_ech_to_btls() {
+        let ech = ech_server_keys_b64();
+        let key_pair = rcgen::KeyPair::generate().expect("keypair");
+        let params = rcgen::CertificateParams::new(vec!["inner.example".into()]).expect("params");
+        let cert = params.self_signed(&key_pair).expect("self signed");
+        let settings = serde_json::json!({
+            "cert": cert.pem(),
+            "key": key_pair.serialize_pem(),
+            "password": "s3cret",
+        });
+        let stream = serde_json::json!({
+            "security": "tls",
+            "tlsSettings": { "echServerKeys": ech },
+        });
+        let (acceptor, pw) =
+            parse_anytls_tls_acceptor(settings.to_string().as_bytes(), Some(&stream)).unwrap();
+        assert_eq!(acceptor.backend(), "btls", "echServerKeys must select the btls backend");
+        assert_eq!(pw.as_deref(), Some("s3cret"), "password parsing is independent of ECH");
+
+        // 空串 = 未配置（Go proto 零值）⇒ 仍 rustls。
+        let stream_no_ech = serde_json::json!({
+            "security": "tls",
+            "tlsSettings": { "echServerKeys": "" },
+        });
+        let (acceptor, _) =
+            parse_anytls_tls_acceptor(settings.to_string().as_bytes(), Some(&stream_no_ech))
+                .unwrap();
+        assert_eq!(acceptor.backend(), "rustls", "empty echServerKeys must not switch backend");
+    }
+
+    /// ECH 配在非 tls 安全层上 ⇒ 硬错（静默退回 rustls 会让 ECH 配置无声失效）。
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn parse_anytls_tls_acceptor_rejects_ech_without_tls_security() {
+        let ech = ech_server_keys_b64();
+        let stream = serde_json::json!({
+            "security": "none",
+            "tlsSettings": { "echServerKeys": ech },
+        });
+        let err = parse_anytls_tls_acceptor(b"{}", Some(&stream))
+            .err()
+            .expect("echServerKeys without security:tls must fail");
+        assert!(err.to_string().contains("echServerKeys"), "got: {err}");
+        assert!(err.to_string().contains("security"), "must name the offending setting: {err}");
     }
 
     /// ect：`hysteriaSettings.masquerade` JSON → proxy HysteriaConfig.masq

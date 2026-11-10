@@ -22,12 +22,15 @@
 //! udf 判定（A7，非通用件）：TLS 会话多路复用 + SOCKS5 目标地址 + 认证帧是协议方向件
 //! ——按 CLAUDE.md §3.5.3「带领域方向的件不进 udf-frame」，留主仓最近消费方；无提炼候选。
 
-use std::{net::SocketAddr, sync::OnceLock};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
-use tokio_rustls::TlsAcceptor;
 use xray_frame::{
     ClauseId, Lifecycle, Plugin, PluginContext, PluginContract, PluginDep, PluginError,
 };
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 
 use crate::inbound::AnytlsInboundHandler;
 
@@ -96,7 +99,7 @@ impl AnytlsPlugin {
         &self,
         tag: &str,
         bind_addr: SocketAddr,
-        tls_acceptor: TlsAcceptor,
+        tls_acceptor: Arc<InboundTlsAcceptor>,
     ) -> Result<AnytlsInboundHandler, PluginError> {
         let password = self.built_password()?.map(str::to_owned);
         Ok(AnytlsInboundHandler::new(tag, bind_addr, tls_acceptor).with_password(password))

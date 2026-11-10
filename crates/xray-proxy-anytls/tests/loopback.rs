@@ -22,12 +22,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use tokio_rustls::TlsAcceptor;
 use xray_proxy_anytls::{
     client::{AnytlsClient, ClientConfig},
     server::AnytlsMockServer,
     socks::SocksAddr,
 };
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 
 /// 简单 echo TCP server，返回收到的字节。
 async fn start_echo_server() -> SocketAddr {
@@ -87,7 +87,7 @@ async fn loopback_echo_works() {
 
     // 2. 自签证书 + server config
     let (server_config, cert_der) = make_server_config();
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let tls_acceptor = Arc::new(InboundTlsAcceptor::Rustls(Arc::new(server_config).into()));
 
     // 3. 起 anytls mock server
     let anytls_server =
@@ -130,7 +130,7 @@ async fn loopback_large_payload() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let echo_addr = start_echo_server().await;
     let (server_config, cert_der) = make_server_config();
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let tls_acceptor = Arc::new(InboundTlsAcceptor::Rustls(Arc::new(server_config).into()));
     let anytls_server =
         AnytlsMockServer::start("127.0.0.1:0".parse().unwrap(), tls_acceptor, None).await.unwrap();
     let anytls_addr = anytls_server.local_addr;

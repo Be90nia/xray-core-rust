@@ -5,7 +5,8 @@
 //! ## 流程
 //!
 //! 1. `InboundHandler::start` 被调用
-//! 2. 启动 TCP listener + TLS acceptor（[`tokio_rustls::TlsAcceptor`]）
+//! 2. 启动 TCP listener + TLS acceptor（[`xray_tls::inbound_acceptor::InboundTlsAcceptor`]： rustls
+//!    / btls 后端由装配期选路，`echServerKeys` 走 btls——bd ozgh9）
 //! 3. 每个新 TLS conn 经 anytls server session 处理：读 SOCKS5 target → `dispatch = Some` 走
 //!    [`xray_app_dispatcher::DispatchHandler::dispatch`]， `dispatch = None` 保留 mock
 //!    直连（loopback 测试）
@@ -27,6 +28,7 @@ use tokio::sync::Mutex;
 use xray_app_dispatcher::DispatchHandler;
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_frame::LogFacade;
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 
 use crate::server::AnytlsMockServer;
 
@@ -42,7 +44,7 @@ static INBOUND_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("anytl
 pub struct AnytlsInboundHandler {
     tag: String,
     bind_addr: SocketAddr,
-    tls_acceptor: tokio_rustls::TlsAcceptor,
+    tls_acceptor: Arc<InboundTlsAcceptor>,
     /// 出站 dispatch（Some 时 session 流量经 router 分发；None 直连目标——mock）。
     dispatch: Option<Arc<dyn DispatchHandler>>,
     /// 认证密码（anytls protocol Authentication：Some 时校验客户端 auth 帧的
@@ -69,7 +71,7 @@ impl AnytlsInboundHandler {
     pub fn new(
         tag: impl Into<String>,
         bind_addr: SocketAddr,
-        tls_acceptor: tokio_rustls::TlsAcceptor,
+        tls_acceptor: Arc<InboundTlsAcceptor>,
     ) -> Self {
         Self {
             tag: tag.into(),
@@ -196,12 +198,12 @@ mod tests {
         });
     }
 
-    fn make_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+    fn make_tls_acceptor() -> std::sync::Arc<InboundTlsAcceptor> {
         make_tls_acceptor_with_cert().0
     }
 
     /// 自签证书 acceptor + 证书 DER（供 client root store 信任）。
-    fn make_tls_acceptor_with_cert() -> (tokio_rustls::TlsAcceptor, Vec<u8>) {
+    fn make_tls_acceptor_with_cert() -> (std::sync::Arc<InboundTlsAcceptor>, Vec<u8>) {
         init_crypto();
         let key_pair = KeyPair::generate().unwrap();
         let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
@@ -215,7 +217,7 @@ mod tests {
             .with_single_cert(vec![cert_der.clone()], key_der)
             .unwrap();
 
-        (tokio_rustls::TlsAcceptor::from(Arc::new(config)), cert_der.to_vec())
+        (Arc::new(InboundTlsAcceptor::Rustls(Arc::new(config).into())), cert_der.to_vec())
     }
 
     fn make_handler() -> AnytlsInboundHandler {

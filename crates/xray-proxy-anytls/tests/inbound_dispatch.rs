@@ -23,7 +23,6 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
-use tokio_rustls::TlsAcceptor;
 use xray_app_dispatcher::{
     OutboundHandlerManager,
     default::{DialBridge, SimpleOhm},
@@ -34,6 +33,7 @@ use xray_proxy_anytls::{
     inbound::AnytlsInboundHandler,
     socks::SocksAddr,
 };
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 async fn start_echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -91,7 +91,7 @@ async fn inbound_dispatches_via_router() {
 
     // 2. TLS acceptor（自签证书）
     let (server_config, cert_der) = make_server_config();
-    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let tls_acceptor = Arc::new(InboundTlsAcceptor::Rustls(Arc::new(server_config).into()));
 
     // 3. dispatcher + DialBridge(freedom) —— 模拟生产 router
     let ohm = Arc::new(SimpleOhm::new());

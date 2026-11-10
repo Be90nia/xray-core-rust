@@ -8,6 +8,9 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
+# 入站 TLS acceptor 后端由 xray-tls 统一选路（rustls / btls，`echServerKeys` 必需后者，
+# bd mdpl2/ozgh9）——`InboundTlsAcceptor` 的家在那里，生产面必须生产依赖（同 vless/trojan/vmess）。
+xray-tls = { path = "../xray-tls" }
 xray-buf = { path = "../xray-buf" }
 xray-app-dispatcher = { path = "../xray-app-dispatcher" }
 thiserror = { workspace = true }

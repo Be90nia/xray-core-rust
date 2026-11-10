@@ -13,13 +13,13 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use rustls::{ClientConfig as RustlsClientConfig, ServerConfig as RustlsServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsAcceptor;
 use xray_features::dns::{DnsClient, DnsError, IpOption};
 use xray_proxy_anytls::{
     client::{AnytlsClient, ClientConfig},
     server::AnytlsMockServer,
     socks::SocksAddr,
 };
+use xray_tls::inbound_acceptor::InboundTlsAcceptor;
 use xray_transport::{
     sockopt::{DomainStrategy, SocketOptions},
     system_dialer::set_dns_client,
@@ -104,7 +104,7 @@ async fn dial_routes_through_dial_system_and_carries_sockopt() {
     let (server_config, cert_der) = make_server_config("anytls.test");
     let anytls_server = AnytlsMockServer::start(
         "127.0.0.1:0".parse().unwrap(),
-        TlsAcceptor::from(Arc::new(server_config)),
+        Arc::new(InboundTlsAcceptor::Rustls(Arc::new(server_config).into())),
         None,
     )
     .await
