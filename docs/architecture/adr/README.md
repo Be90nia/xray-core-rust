@@ -27,6 +27,7 @@
 | [ADR-0002](adr-0002-memory-budget-ownership-split.md) | 装配面登记簿：常量簿上浮 `xray-frame::budget`，预算门留 xray-core | Accepted | 2026-11-06 |
 | [ADR-0003](adr-0003-frame-net-socket-ioctl-not-promoted.md) | socket ioctl 去重件落 `xray-frame::net`，不上浮 udf、不下沉 transport | Accepted | 2026-11-08 |
 | [ADR-0004](adr-0004-component-scope-holder-contract.md) | 组件 scope 持有件统一契约：`ComponentScope` 落 xray-frame（close 只关闸 / drain 才 abort / Drop 不作保证） | Accepted | 2026-11-09 |
+| [ADR-0005](adr-0005-ipstack-ownership-wireguard-vs-tun.md) | 用户态 IP 栈归属：wireguard 版进 `xray-frame::ipstack`，tun 版保留为 TUN 专属扩展（不合并；债从三份降两份） | Accepted | 2026-11-11 |
 
 ## 附件
 
