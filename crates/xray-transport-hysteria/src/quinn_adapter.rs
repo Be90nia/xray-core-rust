@@ -2171,8 +2171,9 @@ mod tests {
     /// 验证协商代码路径（头解析 + apply_negotiated + adapter 热切换）不破坏
     /// 数据面。算法选择语义由 quinn_bridge 单测钉死。
     ///
-    /// 带宽必须用现实量级：Brutal 窗口 = 2×bps×rtt，回环 RTT 亚毫秒下小带宽
-    /// 会把窗口钳到 1 MTU（1200B）导致 quinn 发送停滞（Go quic-go 同数学）。
+    /// 带宽取现实量级以覆盖「非钳底」路径（窗口 = 2×bps×rtt ≫ MTU）。钳底路径
+    /// （小带宽 × 亚毫秒 RTT）由 `listener_factory_brutal_low_bandwidth_roundtrip`
+    /// 覆盖：钳底本身不再导致停滞（bd gqpck 的窗口语义桥，见 quinn_bridge.rs）。
     // 原 `#[ignore]`（"CI Linux × rustc 1.99 brutal 协商 h3 超时"）已拆（2026-11-08）：
     // 该失败在 Linux 不复现——WSL Ubuntu 上本用例连跑 10/10 通过（0.02s/次），其引用的
     // CI run 在本仓不可解析（404，且不在该日 79 条 run 内），当初三条猜测（rustc 1.99 /
@@ -2298,6 +2299,124 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         isc.read(&mut got).await.expect("client read echo");
         assert_eq!(&got, payload, "echo roundtrip with Brutal negotiated both sides");
+
+        let _ = listener.close().await;
+    }
+
+    /// 回归（bd gqpck）：**低带宽 Brutal 不得死锁**。
+    ///
+    /// Brutal 的拥塞窗 = 2×bps×smoothed_rtt，下限恒为 max_datagram_size（Go
+    /// `brutal.go:79-90` 同式）；而 quinn 的发送闸是严格式
+    /// `in_flight + bytes_to_send >= window()`（`vendor/quinn-proto/src/connection/mod.rs`），
+    /// Go 的对应闸是 `bytesInFlight <= cwnd`（天然允许再发一个包）。桥接层若原样把 cwnd
+    /// 报作 window，窗口落到 MTU 下限时 quinn 一个数据报都发不出 —— Brutal 的 cwnd 不随
+    /// ACK 增长 ⇒ 永久停滞（CI 真实症状：`blocked by congestion control` 空转 30s 后
+    /// `client read echo: quinn read: connection lost`）。
+    ///
+    /// 带宽取校验下限 65536 B/s（`quic_params`：BrutalUp/Down 最小 65536）⇒
+    /// 2×65536×回环 rtt 必然 < MTU（阈值 11ms）⇒ 窗口必落在下限，与 CI「smoothed_rtt
+    /// 衰减到阈值以下」同构。
+    #[tokio::test]
+    async fn listener_factory_brutal_low_bandwidth_roundtrip() {
+        use std::sync::Arc;
+
+        use crate::{
+            dialer::{DialDestination, HysteriaTransport, QuicConfig},
+            hysteria_transport::QuinnHysteriaTransport,
+        };
+
+        ensure_crypto_provider();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_tls = rustls::server::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+
+        // 校验下限带宽（65536 B/s = 512 kbps）。
+        const LOW_BPS: u64 = 65_536;
+
+        let factory = QuinnListenerFactory::new(Arc::new(server_tls));
+        let proto_config = Arc::new(crate::proto_config::Config::default());
+        let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams {
+            congestion: String::new(),
+            brutal_up: LOW_BPS,
+            brutal_down: LOW_BPS,
+            ..Default::default()
+        });
+        struct TestValidator;
+        impl crate::hub::AuthValidator for TestValidator {
+            fn validate(&self, auth: &str) -> Option<String> {
+                if auth == "test-secret" { Some("user".into()) } else { None }
+            }
+
+            fn count(&self) -> usize {
+                1
+            }
+        }
+        let validator: Option<Arc<dyn crate::hub::AuthValidator>> = Some(Arc::new(TestValidator));
+        let (stream_tx, mut stream_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Arc<InterStreamConn>>();
+        let on_new_conn: Arc<dyn Fn(Arc<InterStreamConn>) + Send + Sync> = Arc::new(move |s| {
+            let _ = stream_tx.send(s);
+        });
+        let listener = factory
+            .listen(
+                "127.0.0.1:0".parse().unwrap(),
+                proto_config,
+                quic_params,
+                crate::hub::MasqType::NotFound,
+                validator,
+                on_new_conn,
+                None,
+            )
+            .await
+            .expect("listen should succeed");
+        let server_addr = listener.local_addr();
+
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let transport = Arc::new(
+            QuinnHysteriaTransport::new(client_tls, "0.0.0.0:0".parse().unwrap())
+                .expect("transport"),
+        );
+        let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
+        let qc = QuicConfig {
+            congestion: String::new(),
+            brutal_up: LOW_BPS,
+            bbr_profile: "standard".into(),
+            ..QuicConfig::default_for_hysteria()
+        };
+
+        let payload = b"hello brutal!";
+        // 数据面 10s 上限：修前窗口落在 MTU 下限 ⇒ 零包可发 ⇒ 停滞到 QUIC 30s 空闲
+        // 超时才报错；此处提前、明确地断言「低带宽也必须通」。
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let conn = transport
+                .dial_and_authenticate(&dest, &qc, "test-secret", LOW_BPS)
+                .await
+                .expect("dial + auth should succeed");
+            let stream = transport.open_stream(&conn).await.expect("open_stream");
+            let isc =
+                Arc::new(InterStreamConn::new(stream, conn.local_addr(), conn.remote_addr(), true));
+            isc.write(payload).await.expect("client write");
+
+            let server_isc = stream_rx.recv().await.expect("server should receive stream");
+            let mut buf = vec![0u8; payload.len()];
+            server_isc.read(&mut buf).await.expect("server read");
+            server_isc.write(&buf).await.expect("server echo write");
+
+            let mut got = vec![0u8; payload.len()];
+            isc.read(&mut got).await.expect("client read echo");
+            assert_eq!(&got, payload, "echo roundtrip with low-bandwidth Brutal");
+        })
+        .await
+        .expect("low-bandwidth Brutal must not deadlock (10s)");
 
         let _ = listener.close().await;
     }

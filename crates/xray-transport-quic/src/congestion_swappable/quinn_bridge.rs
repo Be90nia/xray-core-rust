@@ -466,7 +466,17 @@ impl Controller for QuinnCCAdapter {
     fn window(&self) -> u64 {
         let st = self.slot.state.lock();
         match &st.active {
-            Some(cc) => cc.congestion_window().max(0) as u64,
+            // 语义桥（bd gqpck）：Go 的发送闸是 `bytesInFlight <= cwnd`
+            // （quic-go `internal/ackhandler/sent_packet_handler.go` `SendMode` +
+            // `brutal.go` `CanSend`），天生允许在途量再超一个数据报；quinn 的闸是严格式
+            // `in_flight + bytes_to_send >= window()`（`vendor/quinn-proto/src/connection/mod.rs`
+            // poll_transmit）——即 window 必须**大于**「在途量 + 下一个数据报」才发得出去。
+            // Brutal 的 cwnd 下限恒为 max_datagram_size（Go `brutal.go` GetCongestionWindow
+            // 同式）且固定速率发送器**不随 ACK 增长** ⇒ 原样透传时 cwnd==MTU 会让 quinn
+            // 零包可发 = 永久停滞（不是延迟，只能等 max_idle_timeout 收场）。
+            // 生产面：低带宽 × 低 RTT（`2×bps×rtt < MTU`，如 LAN 上 brutalUp 取 64KB/s 级）
+            // 必然踩中。+mtu 补齐 Go 的许可量 ⇒ 保证在途至少一个数据报可推进。
+            Some(cc) => (cc.congestion_window() + i64::from(st.mtu)).max(0) as u64,
             None => st.fallback.window(),
         }
     }
@@ -594,24 +604,26 @@ mod tests {
         let adapter = QuinnCCAdapter { slot: Arc::new(slot) };
         assert_eq!(adapter.window(), 1452);
 
-        // 切到 Brutal(1 MB/s)：无 RTT 样本时窗口回落 10240（brutal.rs 语义）。
+        // 切到 Brutal(1 MB/s)：无 RTT 样本时 cwnd 回落 10240（brutal.rs 语义）；
+        // 桥接窗口 = cwnd + 一个数据报（`QuinnCCAdapter::window` 语义桥，MTU 默认 1200）。
         apply_brutal(&adapter.slot, 1_000_000, false);
-        assert_eq!(adapter.window(), 10_240);
+        assert_eq!(adapter.window(), 10_240 + 1200);
 
-        // RTT 喂样后窗口 = 2×bps×rtt（100ms RTT，ack_rate=1 → 200_000 字节）。
+        // RTT 喂样后 cwnd = 2×bps×rtt（100ms RTT，ack_rate=1 → 200_000 字节）。
         adapter
             .slot
             .rtt
             .update(std::time::Duration::from_millis(100), std::time::Duration::from_millis(100));
-        assert_eq!(adapter.window(), 200_000);
+        assert_eq!(adapter.window(), 200_000 + 1200);
     }
 
     /// s8ti 契约：亚毫秒 RTT 钳窗口语义——回环/床测必须 MB/s 级带宽。
     ///
     /// Brutal 窗口 = 2×bps×rtt（Go quic-go 同数学）：10 MB/s × 1ms 回环 RTT
     /// → 20_000 B ≫ 1 MTU（1200B），数据面正常；若带宽过小（KB/s 级）×亚毫秒
-    /// RTT，窗口数学值低于 1 MTU 被钳底 → quinn 发送停滞。TUIC 经共享槽接入
-    /// Brutal 时配置带宽必须遵守此量级（同 hysteria_transport.rs 床测注释）。
+    /// RTT，窗口数学值低于 1 MTU 被钳底——钳底后不再停滞（见下条
+    /// `brutal_window_at_floor_still_admits_one_datagram` 的语义桥），只是速率
+    /// 退化为「一个数据报 / RTT」。TUIC 经共享槽接入 Brutal 时仍按此量级配带宽。
     #[test]
     fn brutal_window_with_mbps_bandwidth_at_submillisecond_rtt_exceeds_mtu() {
         let slot = HysteriaCCSlot::new();
@@ -621,6 +633,39 @@ mod tests {
         slot.rtt.update(std::time::Duration::from_millis(1), std::time::Duration::from_millis(1));
         // 数学：2 × 10_000_000 bps × 0.001 s = 20_000 字节 ≫ 1 MTU。
         assert_eq!(slot.current_window(), 20_000);
+    }
+
+    /// bd gqpck 契约：**窗口下限也必须允许在途一个数据报**。
+    ///
+    /// quinn 的发送闸是严格式 `in_flight + bytes_to_send >= window()`
+    /// （`vendor/quinn-proto/src/connection/mod.rs` poll_transmit），而 Brutal 的 cwnd
+    /// 下限恒 = max_datagram_size 且固定速率发送器不随 ACK 增长 ⇒ 桥接层若原样透传，
+    /// `2×bps×rtt < MTU` 的路径（下限带宽 × 亚毫秒 RTT）会让连接零包可发、永久停滞到
+    /// max_idle_timeout。本测试用配置校验允许的最小带宽钉死该不变量。
+    #[test]
+    fn brutal_window_at_floor_still_admits_one_datagram() {
+        use quinn_proto::congestion::Controller as _;
+
+        let mut adapter = QuinnCCAdapter { slot: Arc::new(HysteriaCCSlot::new()) };
+        // 512 kbps（quic_params 的 brutalUp/brutalDown 最小允许值）⇒
+        // cwnd = 2×65536×50µs ≈ 6 字节 → 钳到 MTU 下限。
+        apply_brutal(&adapter.slot, 65_536, false);
+        adapter
+            .slot
+            .rtt
+            .update(std::time::Duration::from_micros(50), std::time::Duration::from_micros(50));
+        assert_eq!(adapter.slot.current_window(), 1200, "cwnd 钳到 max_datagram_size 下限");
+
+        // quinn 闸：空连接发一个 MTU 大小的包必须满足 `0 + mtu < window`。
+        assert!(
+            adapter.window() > 1200,
+            "下限 cwnd 时 window 必须允许在途一个数据报，否则零包可发：{}",
+            adapter.window()
+        );
+
+        // MTUD 抬到 1472 后同不变量仍须成立（mtu 参与桥接量）。
+        adapter.on_mtu_update(1472);
+        assert!(adapter.window() > 1472, "MTU 抬升后仍须允许一个数据报");
     }
 
     /// 模拟 quinn 建连：factory build 一次（fallback 由占位换成真控制器）。
@@ -686,9 +731,9 @@ mod tests {
         // CUBIC 初始窗口 = 14720.clamp(2*1200, 10*1200) = 12000（quinn 语义）。
         assert_eq!(adapter.window(), 12_000);
 
-        // 切 Brutal 后窗口立即变为 Brutal 语义。
+        // 切 Brutal 后窗口立即变为 Brutal 语义（cwnd 10240 + 一个数据报 1200）。
         apply_brutal(&adapter.slot, 100_000, false);
-        assert_eq!(adapter.window(), 10_240);
+        assert_eq!(adapter.window(), 10_240 + 1200);
     }
 
     #[test]
@@ -714,14 +759,15 @@ mod tests {
             assert_eq!(st.book.total_bytes, 600);
         }
         adapter.on_mtu_update(1400);
-        assert_eq!(adapter.window(), 10_240);
+        // 桥接窗口 = cwnd 10240 + 一个数据报（此处 MTU 已抬到 1400）。
+        assert_eq!(adapter.window(), 10_240 + 1400);
 
         // clone_box 共享 slot：切换对 clone 生效（path migration 语义）。
         let cloned = adapter.clone_box();
         apply_brutal(&slot, 2_000_000, false);
         // 2MB/s 无 RTT → 仍是 10240 floor；喂 RTT 后 = 2×2MB/s×50ms。
         slot.rtt.update(std::time::Duration::from_millis(50), std::time::Duration::from_millis(50));
-        assert_eq!(cloned.window(), 200_000);
+        assert_eq!(cloned.window(), 200_000 + 1400);
     }
 
     #[test]
