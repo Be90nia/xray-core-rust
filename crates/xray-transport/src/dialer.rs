@@ -11,7 +11,10 @@
 
 use std::{future::Future, io, net::IpAddr, pin::Pin};
 
-use xray_common::{errors::removed_feature_message, net::destination::Destination};
+use xray_common::{
+    errors::removed_feature_message,
+    net::{address::Address, destination::Destination},
+};
 
 use crate::connection::Connection;
 
@@ -114,6 +117,23 @@ pub struct StreamSettings {
     pub sockopt_json: Option<serde_json::Value>,
     /// Finalmask 流量伪装配置 JSON（对应 Go `finalmask` 字段，本仓库 finalmask 模块）。
     pub finalmask_json: Option<serde_json::Value>,
+    /// fronting 连接目标（Go `StreamConfig.Address`/`Port` → `MemoryStreamConfig.Destination`，
+    /// transport_internet.go:51-52 + memory_settings.go:39-44）。仅 xdrive fronting 消费
+    /// （bd hjtlk B1）；缺省 `None` ⇒ 既有 transport 行为零变化。
+    pub fronting: Option<(Address, u16)>,
+}
+
+/// `streamSettings.address` + `port` → fronting 目标（Go `memory_settings.go:39-44` 的
+/// `MemoryStreamConfig.Destination` 语义：address 非空即建 Destination，port 缺省 0）。
+///
+/// 返回 `None`：address 缺失/为空（Go 同款：Address 为 nil 不建 Destination）。port 越界
+/// 落 0——xray-conf lint 硬拒（Go 是 JSON unmarshal 硬错），此处运行时宽容。`Address`
+/// 的 `FromStr` 对任意非空串返回 `Domain`（Go `net.ParseAddress` 同款），`filter` 已保非空。
+pub(crate) fn parse_fronting(v: &serde_json::Value) -> Option<(Address, u16)> {
+    let addr = v.get("address").and_then(|a| a.as_str()).filter(|s| !s.is_empty())?;
+    let port =
+        v.get("port").and_then(|p| p.as_u64()).and_then(|p| u16::try_from(p).ok()).unwrap_or(0);
+    addr.parse::<Address>().ok().map(|address| (address, port))
 }
 
 impl StreamSettings {
@@ -127,6 +147,7 @@ impl StreamSettings {
             security_json: None,
             sockopt_json: None,
             finalmask_json: None,
+            fronting: None,
         }
     }
 
@@ -199,7 +220,16 @@ impl StreamSettings {
         // Socket 选项（`sockopt`）与 finalmask 流量伪装配置。
         let sockopt_json = v.get("sockopt").cloned();
         let finalmask_json = v.get("finalmask").cloned();
-        Self { protocol, security, transport_json, security_json, sockopt_json, finalmask_json }
+        let fronting = parse_fronting(v);
+        Self {
+            protocol,
+            security,
+            transport_json,
+            security_json,
+            sockopt_json,
+            finalmask_json,
+            fronting,
+        }
     }
 
     /// 是否启用 TLS（`security == "tls"` 或 `security == "reality"`，大小写不敏感
@@ -814,6 +844,45 @@ mod transport_cache_tests {
         // 缺省不变
         let d = StreamSettings::from_json(Some(&serde_json::json!({})));
         assert_eq!((d.protocol.as_str(), d.security.as_str()), ("tcp", ""));
+    }
+
+    /// bd hjtlk B0/R1：fronting 缺省 `None`——不含 address/port 的既有 JSON 解析结果
+    /// 零变化（其他 transport 不受新字段影响）。
+    #[test]
+    fn from_json_fronting_defaults_to_none() {
+        let s = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "ws", "security": "tls", "wsSettings": {"path": "/x"},
+            "tlsSettings": {"serverName": "s.example.com"}
+        })));
+        assert_eq!(s.protocol, "ws");
+        assert_eq!(s.security, "tls");
+        assert!(s.transport_json.is_some());
+        assert!(s.security_json.is_some());
+        assert!(s.fronting.is_none());
+        assert!(StreamSettings::from_json(None).fronting.is_none());
+        // 仅 port 无 address → Go 侧 Address nil 不建 Destination ⇒ None。
+        let p = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "xdrive", "port": 8443
+        })));
+        assert!(p.fronting.is_none());
+    }
+
+    /// fronting 解析：address+port → `Some((addr, port))`；仅 address → port 0
+    /// （Go memory_settings.go:39-44：Address 非 nil 即建 Destination，Port 缺省 0）。
+    #[test]
+    fn from_json_fronting_parses_address_port() {
+        let s = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "xdrive", "address": "front.example.com", "port": 8443
+        })));
+        assert_eq!(s.fronting, Some((Address::new_domain("front.example.com"), 8443)));
+
+        let ip = StreamSettings::from_json(Some(&serde_json::json!({
+            "network": "xdrive", "address": "127.0.0.1"
+        })));
+        assert_eq!(
+            ip.fronting.map(|(a, p)| (a.to_string(), p)),
+            Some(("127.0.0.1".to_string(), 0))
+        );
     }
 
     #[test]

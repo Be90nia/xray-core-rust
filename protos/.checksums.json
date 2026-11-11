@@ -81,5 +81,5 @@
   "transport/internet/tls/config.proto": "2d2270ade42d3d6c508a77a22b784dd3f084dd92137d5e5762e1116cd6f563c0",
   "transport/internet/udp/config.proto": "a4d1719e452fb9f7747a56a89019850895bcfb36c9eb9a7a7bf736f12acc5053",
   "transport/internet/websocket/config.proto": "8554d546b40cee8290acf02ba21a82d2e8c44349fc48af0ec415d0460e92fa07",
-  "transport/internet/xdrive/config.proto": "2cdbdae0ad490fc3888d644d859fcc41544e9ba5514e10f97510f541c7575175"
+  "transport/internet/xdrive/config.proto": "de808cf20e10d8f76b1b41545af93a5dcf1974e9002bff538f51a067bd0447a7"
 }

@@ -29,6 +29,8 @@
 
 use std::io;
 
+use xray_common::net::address::Address;
+
 /// 单条 mask 描述（对应 Go `infra/conf.Mask{Type, Settings}`）。
 ///
 /// 与 Go `[]TypedMessage` 的差别：Rust 端全程 JSON，没有 protobuf 序列化，
@@ -113,6 +115,9 @@ pub struct MemoryStreamConfig {
     pub udpmask_manager: Option<UdpmaskManagerConfig>,
     pub quic_params: Option<QuicParamsConfig>,
     pub download_settings: Option<DownloadSettingsConfig>,
+    /// fronting 目标（Go `MemoryStreamConfig.Destination`，memory_settings.go:39-44）。
+    /// 仅 xdrive fronting 消费（bd hjtlk B1）；缺省 `None` ⇒ 既有 transport 零变化。
+    pub fronting: Option<(Address, u16)>,
 }
 
 /// JSON → [`MemoryStreamConfig`] 转换器（对应 Go `ToMemoryStreamConfig`）。
@@ -146,6 +151,9 @@ pub fn to_memory_stream_config(json: Option<&serde_json::Value>) -> io::Result<M
     let udpmask_manager = parse_udpmask_manager(finalmask.and_then(|f| f.get("udp")))?;
     let quic_params = parse_quic_params_config(finalmask.and_then(|f| f.get("quicParams")))?;
     let download_settings = parse_download_settings(obj.get("downloadSettings"))?;
+    // fronting（address/port → Destination，Go memory_settings.go:39-44）：复用
+    // dialer 的同一解析真源，防两处漂移。
+    let fronting = crate::dialer::parse_fronting(v);
     Ok(MemoryStreamConfig {
         protocol_name,
         security_type,
@@ -153,6 +161,7 @@ pub fn to_memory_stream_config(json: Option<&serde_json::Value>) -> io::Result<M
         udpmask_manager,
         quic_params,
         download_settings,
+        fronting,
     })
 }
 
@@ -328,6 +337,26 @@ mod tests {
         .expect("ok");
         assert_eq!(m.protocol_name, "splithttp");
         assert_eq!(m.security_type, "reality");
+    }
+
+    /// bd hjtlk B0：fronting 镜像（Go memory_settings.go:39-44）——address/port 进
+    /// `MemoryStreamConfig.fronting`，缺省 `None`（既有结构零漂移）。
+    #[test]
+    fn fronting_mirror_parses_address_port() {
+        let m = to_memory_stream_config(Some(&json!({
+            "network": "xdrive", "address": "front.example.com", "port": 8443
+        })))
+        .expect("ok");
+        assert_eq!(
+            m.fronting.map(|(a, p)| (a.to_string(), p)),
+            Some(("front.example.com".to_string(), 8443))
+        );
+
+        // 缺省：None（None 输入 / 无 address/port 的对象两态）。
+        let m = to_memory_stream_config(None).expect("ok");
+        assert!(m.fronting.is_none());
+        let m = to_memory_stream_config(Some(&json!({"network": "tcp"}))).expect("ok");
+        assert!(m.fronting.is_none());
     }
 
     // ===== TcpmaskManager 解析（bd 44s 第 1 块）=====

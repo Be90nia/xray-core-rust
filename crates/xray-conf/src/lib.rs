@@ -45,6 +45,7 @@ pub mod secrets;
 pub mod serial;
 pub mod toml_config;
 pub mod vformat;
+pub mod xdrive;
 pub mod yaml;
 pub use built::{BuiltConfig, BuiltEntry, BuiltInbound, BuiltOutbound};
 pub use common::{

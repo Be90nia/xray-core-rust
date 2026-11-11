@@ -220,6 +220,17 @@ impl LintStage<Config> for ValidationStage {
             if let Some(ss) = ib.stream_settings.as_ref() {
                 check_stream_strictness("inbound", &ib.tag, ss)?;
             }
+            // 5. xdrive transport 专项校验（Go infra/conf/xray.go:273-319 validateXDrive， bd hjtlk
+            //    B0）。非 xdrive 网络恒 Ok。
+            crate::xdrive::validate_xdrive(
+                "inbound",
+                &ib.tag,
+                &ib.protocol,
+                ib.settings.as_ref(),
+                ib.stream_settings.as_ref(),
+                None,
+                ib.port.as_ref(),
+            )?;
         }
         for ob in &cfg.outbound_configs {
             check_hysteria_protocol_version(
@@ -231,6 +242,16 @@ impl LintStage<Config> for ValidationStage {
             if let Some(ss) = ob.stream_settings.as_ref() {
                 check_stream_strictness("outbound", &ob.tag, ss)?;
             }
+            // 5. xdrive transport 专项校验（出站带 mux 面；Go :399 同款）。
+            crate::xdrive::validate_xdrive(
+                "outbound",
+                &ob.tag,
+                &ob.protocol,
+                ob.settings.as_ref(),
+                ob.stream_settings.as_ref(),
+                ob.mux.as_ref(),
+                None,
+            )?;
         }
 
         Ok(())
@@ -329,21 +350,18 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
         )));
     }
 
-    // 2c) 票 037f：Go 有 Rust 无的 streamSettings 键——出现即配置层硬错：
-    // - masqueSettings / xdriveSettings（transport_internet.go:68-69）：Rust 无 对应 transport。
-    // - address / port（:51-52）：Go 仅被 xdrive fronting 消费
-    //   （transport/internet/memory_settings.go:39-44），Rust MemoryStreamConfig 无 destination
-    //   字段，出现即静默丢。
-    for key in ["masqueSettings", "xdriveSettings", "address", "port"] {
-        if ss.get(key).is_some_and(|v| !v.is_null()) {
-            return Err(LintError::new(format!(
-                "{kind} '{tag}': streamSettings.{key} is not supported by this build \
-                 (masque/xdrive transports and fronting address are not implemented); \
-                 remove the key"
-            )));
-        }
+    // 2c) 票 037f：Go 有 Rust 无的 streamSettings 键——出现即配置层硬错。
+    //     bd hjtlk B0 放开 xdrive 面：`xdriveSettings`（B1 transport 消费）与
+    //     `address`/`port`（xdrive fronting，Go transport_internet.go:51-52 →
+    //     memory_settings.go:39-44）不再拒；`masqueSettings`/`network=masque` 仍拒
+    //     （masque 属票 55yh7，Rust 无对应 transport）。
+    if ss.get("masqueSettings").is_some_and(|v| !v.is_null()) {
+        return Err(LintError::new(format!(
+            "{kind} '{tag}': streamSettings.masqueSettings is not supported by this build \
+             (masque transport is not implemented); remove the key"
+        )));
     }
-    if matches!(net.to_ascii_lowercase().as_str(), "masque" | "xdrive") {
+    if net.eq_ignore_ascii_case("masque") {
         return Err(LintError::new(format!(
             "{kind} '{tag}': streamSettings.network=\"{net}\" is not implemented in this build"
         )));
@@ -823,9 +841,12 @@ mod tests {
         assert!(msg.contains("boolean"), "got: {msg}");
     }
 
-    /// 票 037f：Go 有 Rust 无的 streamSettings 顶层键（masqueSettings/
-    /// xdriveSettings/address/port）与 network=masque/xdrive——装配期硬错指名，
-    /// 不静默丢（此前整段被解析器忽略）。
+    /// 票 037f：Go 有 Rust 无的 streamSettings 顶层键（masqueSettings）与
+    /// network=masque——装配期硬错指名，不静默丢（此前整段被解析器忽略）。
+    /// bd hjtlk B0 更新：`xdriveSettings`/`network=xdrive`/`address`/`port` 已放开——
+    /// xdrive 改走 xdrive.rs 的 validateXDrive 专项校验（矩阵见 xdrive.rs 测试），
+    /// `address`/`port` 是 xdrive fronting 面（Go transport_internet.go:51-52）。
+    /// 本测试钉：masque 两项仍拒；xdrive/fronting 三形态放行。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（Config 无 Debug，禁 expect_err）
     fn strictness_rejects_masque_xdrive_and_fronting_keys() {
@@ -841,17 +862,33 @@ mod tests {
             }],
             ..Default::default()
         };
-        let cases = [
+        // masque 两项仍拒（55yh7）。
+        for (ss, needle) in [
             (json!({"network": "masque", "masqueSettings": {}}), "masqueSettings"),
-            (json!({"network": "xdrive", "xdriveSettings": {}}), "xdriveSettings"),
-            (json!({"network": "tcp", "address": "front.example.com"}), "address"),
-            (json!({"network": "tcp", "port": 8443}), "port"),
             (json!({"network": "masque"}), "network"),
-        ];
-        for (ss, needle) in cases {
-            let err = post_process(&mut mk(ss)).err().expect("must reject");
+        ] {
+            let err = post_process(&mut mk(ss)).err().expect("masque must reject");
             assert!(err.to_string().contains(needle), "needle={needle} got: {err}");
         }
+        // xdriveSettings 已放开：xdrive 出站需同时过 validateXDrive（mux + encryption）。
+        let enc = "mlkem768x25519plus.native.0rtt.GS1D3kYFox-0dmcTK1u-2LaiSB-iM_Kve8N4bT--DhE";
+        let mut xdrive = mk(json!({"network": "xdrive", "xdriveSettings": {"service": "local"}}));
+        xdrive.outbound_configs[0].settings = Some(json!({
+            "vnext": [{"address": "s.example.com", "port": 443,
+                        "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                                    "encryption": enc}]}]
+        }));
+        xdrive.outbound_configs[0].mux = Some(crate::config::MuxConfig {
+            enabled: true,
+            concurrency: 128,
+            ..Default::default()
+        });
+        post_process(&mut xdrive).expect("xdrive outbound with mux+encryption must pass");
+        // fronting address/port 挂普通 tcp 网络放行（Go 同款：仅 xdrive 消费，他 transport 忽略）。
+        post_process(&mut mk(json!({"network": "tcp", "address": "front.example.com"})))
+            .expect("fronting address must pass");
+        post_process(&mut mk(json!({"network": "tcp", "port": 8443})))
+            .expect("fronting port must pass");
         // 常规配置不受影响。
         post_process(&mut mk(json!({"network": "tcp", "security": "tls"})))
             .expect("plain tcp/tls must pass");
