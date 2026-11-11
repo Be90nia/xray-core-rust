@@ -30,6 +30,8 @@ members = [
     "crates/xray-transport-httpupgrade",
     "crates/xray-transport-quic",
     "crates/xray-transport-naive",
+    # MASQUE transport（RFC 9484 CONNECT-IP；bd 55yh7 B0+B1 批次）
+    "crates/xray-transport-masque",
     # Layer 4 - 应用服务
     "crates/xray-app-dns",
     "crates/xray-app-router",

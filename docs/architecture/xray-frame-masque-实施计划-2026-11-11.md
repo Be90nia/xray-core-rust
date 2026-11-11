@@ -391,7 +391,7 @@ D:/Project/tools/Wireshark/tshark.exe -r D:/tmp/masque-h3.pcapng -d udp.port==44
 
 | # | 风险 | 现状证据 | 处置 | 等级 |
 |---|---|---|---|---|
-| **R1** | hyper extended CONNECT 全链路未跑过 | 静态已核（`hyper-1.10.1` 上述三处 + `h2-0.4.19`）；本仓 `enable_connect_protocol` 全仓 0 命中 | **B0 spike 前置**；失败 → raw `h2` 兜底（+2 人日） | 高 |
+| **R1** | ~~hyper extended CONNECT 全链路未跑过~~ **已消解（2026-11-11 B0 spike 实测）** | 静态已核（`hyper-1.10.1` 上述三处 + `h2-0.4.19`）+ **运行时全链路四断言全过**：`cargo test -p xray-transport-masque --test h2_extended_connect_spike` = server 收到 `:protocol=connect-ip`+`:method=CONNECT`（ext extensions 面）、client `200`+`Upgraded`、双向 1KB 一致、非空 body → `Err`。实现形态 = auto server `.http2().enable_connect_protocol()` + client `ext::Protocol::from_static("connect-ip")` + `hyper::upgrade::on`；**两个实测坑**：①hyper `Upgraded` 只实现 `hyper::rt::{Read,Write}`（`upgrade.rs:166,176`），tokio 读写须 `hyper_util::rt::TokioIo` 适配；②hyper `send_request()` 返回 `impl Future`（`Result<Response<Incoming>, _>` 单层 await，非 0.14 的 ResponseFuture 二段式） | **已关闭**——raw `h2` 兜底**不需要**；证据 = `crates/xray-transport-masque/tests/h2_extended_connect_spike.rs`（B0 交付） | 已消解 |
 | **R2** | 单流载全部流量 → h2 流窗成全局瓶颈 | 历史 h2 窗钉战役（CLAUDE.md §5 enc8x） | B2 起用 16MiB send_buf / 32MiB 流窗；M2 加「隧道数 × 每隧道带宽」观测；**禁自造流控** | 中 |
 | **R3** | WARP 误入 M1 | `warp.go` 78 行、`WarpHost=cloudflareaccess.com` | 配置含 `warp` 即 `Err`（L5 装配门） | 低 |
 | **R4** | 与 splithttp/xhttp 命名混淆 | `dialer.rs:604 Masque => "masqueSettings"` 已对齐 Go | 零共享模块，只共享依赖与窗常量 | 低 |

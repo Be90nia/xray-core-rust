@@ -33,72 +33,11 @@ pub const MAX_PADDING_LENGTH: u64 = 4096;
 
 // ===== QUIC varint 读写 =====
 
-/// 读取 QUIC varint（对应 Go `quicvarint.Read`）。
-///
-/// 从 reader 逐字节读取，解析 1/2/4/8 字节 varint。
-pub fn read_varint<R: Read>(r: &mut R) -> io::Result<u64> {
-    let mut first = [0u8; 1];
-    r.read_exact(&mut first)?;
-    let prefix = first[0] >> 6;
-    match prefix {
-        0 => Ok(u64::from(first[0])),
-        _ => {
-            let mask: u8 = 0x3F;
-            let len = 1usize << prefix;
-            let mut buf = vec![0u8; len - 1];
-            r.read_exact(&mut buf)?;
-            let mut val = u64::from(first[0] & mask);
-            for &b in &buf {
-                val = (val << 8) | u64::from(b);
-            }
-            Ok(val)
-        },
-    }
-}
-
-/// 写入 QUIC varint 到 buf（对应 Go `varintPut`）。
-///
-/// 返回写入字节数。
-pub fn write_varint(buf: &mut [u8], v: u64) -> usize {
-    if v < (1 << 6) {
-        buf[0] = v as u8;
-        1
-    } else if v < (1 << 14) {
-        buf[0] = (v >> 8) as u8 | 0x40;
-        buf[1] = v as u8;
-        2
-    } else if v < (1 << 30) {
-        buf[0] = (v >> 24) as u8 | 0x80;
-        buf[1] = (v >> 16) as u8;
-        buf[2] = (v >> 8) as u8;
-        buf[3] = v as u8;
-        4
-    } else {
-        buf[0] = (v >> 56) as u8 | 0xC0;
-        buf[1] = (v >> 48) as u8;
-        buf[2] = (v >> 40) as u8;
-        buf[3] = (v >> 32) as u8;
-        buf[4] = (v >> 24) as u8;
-        buf[5] = (v >> 16) as u8;
-        buf[6] = (v >> 8) as u8;
-        buf[7] = v as u8;
-        8
-    }
-}
-
-/// 计算 varint 编码后字节数。
-#[must_use]
-pub fn varint_len(v: u64) -> usize {
-    if v < (1 << 6) {
-        1
-    } else if v < (1 << 14) {
-        2
-    } else if v < (1 << 30) {
-        4
-    } else {
-        8
-    }
-}
+// B1.5 上浮（纯移动零行为变化）：实现移至 `xray_transport::wire::varint`（件头
+// udf-promotion-candidate）；本模块 `pub use` 保持 `crate::protocol::read_varint`
+// 等既有路径不变（规划 docs/architecture/xray-frame-masque-实施计划-2026-11-11.md
+// §5 B1.5 / §4.1 判据 2）。
+pub use xray_transport::wire::varint::{read_varint, varint_len, write_varint};
 
 /// 按块读丢弃 `n` 字节（不按 `n` 预分配堆缓冲）。
 ///
@@ -441,18 +380,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn varint_roundtrip() {
-        let cases = [0u64, 63, 64, 16383, 16384, 1_073_741_823, 0x401];
-        for &v in &cases {
-            let mut buf = vec![0u8; 8];
-            let n = write_varint(&mut buf, v);
-            let mut cursor = io::Cursor::new(&buf[..n]);
-            let decoded = read_varint(&mut cursor).expect("varint decode should succeed");
-            assert_eq!(decoded, v, "varint roundtrip failed for {v}");
-        }
-    }
-
-    #[test]
     fn tcp_request_roundtrip() {
         let addr = "example.com:443";
         let mut buf = Vec::new();
@@ -541,16 +468,6 @@ mod tests {
         let mut d = Defragger::new();
         let r = d.feed(m).expect("single frag should return");
         assert_eq!(r.data, vec![1]);
-    }
-
-    #[test]
-    fn varint_len_matches_write() {
-        let cases = [0u64, 63, 64, 16383, 16384];
-        for &v in &cases {
-            let mut buf = vec![0u8; 8];
-            let n = write_varint(&mut buf, v);
-            assert_eq!(varint_len(v), n, "varint_len mismatch for {v}");
-        }
     }
 
     // ===== varint 限幅回归（超限帧被拒） =====

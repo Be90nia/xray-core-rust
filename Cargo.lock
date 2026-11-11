@@ -6001,6 +6001,7 @@ dependencies = [
  "xray-features",
  "xray-frame",
  "xray-geodata",
+ "xray-proxy-vless",
 ]
 
 [[package]]
@@ -6915,6 +6916,24 @@ dependencies = [
  "xray-frame",
  "xray-proto",
  "xray-tls",
+ "xray-transport",
+]
+
+[[package]]
+name = "xray-transport-masque"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "xray-common",
+ "xray-proto",
  "xray-transport",
 ]
 
