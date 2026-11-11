@@ -69,6 +69,8 @@ xray-transport-kcp = { path = "../xray-transport-kcp" }
 xray-transport-splithttp = { path = "../xray-transport-splithttp" }
 xray-transport-naive = { path = "../xray-transport-naive" }
 xray-transport-websocket = { path = "../xray-transport-websocket" }
+# xdrive 传输族注册（bd hjtlk B1：register_all_transports 两行接线）
+xray-transport-xdrive = { path = "../xray-transport-xdrive" }
 xray-app-commander = { path = "../xray-app-commander" }
 xray-app-dns = { path = "../xray-app-dns" }
 xray-app-geodata = { path = "../xray-app-geodata" }

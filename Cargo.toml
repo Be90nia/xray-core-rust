@@ -32,6 +32,8 @@ members = [
     "crates/xray-transport-naive",
     # MASQUE transport（RFC 9484 CONNECT-IP；bd 55yh7 B0+B1 批次）
     "crates/xray-transport-masque",
+    # xdrive 传输族（对象存储承载的 VLESS 传输；bd hjtlk B1）
+    "crates/xray-transport-xdrive",
     # Layer 4 - 应用服务
     "crates/xray-app-dns",
     "crates/xray-app-router",

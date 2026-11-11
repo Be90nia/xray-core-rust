@@ -1,0 +1,30 @@
+[package]
+name = "xray-transport-xdrive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# xdrive 传输族（bd hjtlk B1）：对象存储承载的 VLESS 传输层——本地文件后端 +
+# 分段 WAL + Conn/Listener/Dial。对应 Go `transport/internet/xdrive/` @ `676eaf66`。
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-transport = { path = "../xray-transport" }
+xray-frame = { path = "../xray-frame" }
+# clock 契约（Clock/SystemClock）与 std_ext 散件（fsx 原子写/遍历、encode hex、
+# id::RandomId 会话 ID）。path 形态同各消费方（udf-frame 仓内工作副本即改即用）。
+udf-skeleton = { path = "../udf-frame/skeleton" }
+# cancel_pair/CancelToken/ScopeClosed（fx 域取消对；tokio feature = fx 域本体）。
+udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
+udf-std-ext = { path = "../udf-frame/std-ext", features = ["random"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+# share_key 内容摘要（storage.go sha256；禁用 std_ext::hash——那是 FNV-1a/XXH64
+# 非加密摘要）。版本与 xray-proxy-ss 既有依赖一致。
+sha2 = "0.10"
+
+# bd g3cr 同款：生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "deny"

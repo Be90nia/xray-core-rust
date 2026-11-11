@@ -4465,6 +4465,7 @@ pub(crate) fn is_transport_listener_protocol(protocol: &str) -> bool {
             | "httpupgrade"
             | "splithttp"
             | "xhttp"
+            | "xdrive"
     )
 }
 

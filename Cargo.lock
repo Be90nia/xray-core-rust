@@ -6080,6 +6080,7 @@ dependencies = [
  "xray-transport-splithttp",
  "xray-transport-tcp",
  "xray-transport-websocket",
+ "xray-transport-xdrive",
  "xray-xudp",
 ]
 
@@ -6121,6 +6122,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "smoltcp",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -6929,11 +6931,14 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rcgen 0.13.2",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "xray-common",
+ "xray-frame",
  "xray-proto",
+ "xray-tls",
  "xray-transport",
 ]
 
@@ -7080,6 +7085,23 @@ dependencies = [
  "xray-frame",
  "xray-proto",
  "xray-tls",
+ "xray-transport",
+]
+
+[[package]]
+name = "xray-transport-xdrive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "udf-skeleton",
+ "udf-skeleton-infra",
+ "udf-std-ext",
+ "xray-common",
+ "xray-frame",
  "xray-transport",
 ]
 

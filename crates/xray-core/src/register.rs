@@ -137,6 +137,10 @@ pub fn register_all_transports() {
     reg(&mut failed, "splithttp dialer", xray_transport_splithttp::register::register_dialer());
     reg(&mut failed, "splithttp listener", xray_transport_splithttp::register::register_listener());
 
+    // xdrive（对象存储承载传输；bd hjtlk B1）
+    reg(&mut failed, "xdrive dialer", xray_transport_xdrive::register::register_dialer());
+    reg(&mut failed, "xdrive listener", xray_transport_xdrive::register::register_listener());
+
     // mKCP
     //
     // finalmask 语义注（o54c）：mKCP 不走异步 `UdpmaskManager`（PacketConn 包装），
@@ -1116,6 +1120,27 @@ mod tests {
                 "unix listener for {proto:?} not registered by register_all_transports"
             );
         }
+    }
+
+    /// xdrive 接线证明（bd hjtlk 门 B1 验收②）：生产注册面
+    /// `register_all_transports` 之后，dialer/listener 注册表必须可见 xdrive，
+    /// 且入站分派白名单必须放行 `xdrive`（不加则 xdrive 入站静默落裸 TCP 分支）。
+    #[test]
+    fn xdrive_transports_registered_and_whitelisted() {
+        super::register_all_transports();
+        assert!(
+            xray_transport::dialer::get_transport_dialer("xdrive").is_some(),
+            "xdrive dialer not registered by register_all_transports"
+        );
+        assert!(
+            xray_transport::listener_registry::get_transport_listener("xdrive").is_some(),
+            "xdrive listener not registered by register_all_transports"
+        );
+        assert!(
+            crate::inbound::is_transport_listener_protocol("xdrive"),
+            "is_transport_listener_protocol must accept \"xdrive\""
+        );
+        assert!(!crate::inbound::is_transport_listener_protocol("xdive"));
     }
 
     use super::*;
