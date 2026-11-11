@@ -524,6 +524,10 @@ async fn handle_request(
             Ok(Answer::Accept) => {
                 // 200 + Capsule-Protocol（Go connectip.Proxy.Proxy 响应头同值）；
                 // upgrade IO 异步转交 ServerConn::accept。
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "①类待迁移（bd xosi9 改判）：hub 每连接 upgrade 泵——已 accept 隧道的 hyper upgrade IO 异步转交 ServerConn.accept；寿命 = ServerConn（隧道本体），随隧道关闭/503 兜底收敛；目标托管口 = ComponentScope（宿主 listener scope）"
+                )]
                 tokio::spawn(async move {
                     match upgrade.await {
                         Ok(io) => {

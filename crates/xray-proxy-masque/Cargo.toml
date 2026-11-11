@@ -30,6 +30,11 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rcgen = "0.13"
+# B5 安全实证 + 双 seed e2e（owned 测试面）：真 freedom 默认规则链
+# （get_default_rule_type("masque")=BlockPrivate 端到端）+ 服务端 TLS 自签证书
+# pin 计算（xray_tls::certificate/pin；transport-masque 同款）。零新三方。
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+xray-tls = { path = "../xray-tls" }
 
 # bd g3cr：生产代码零 unwrap（测试代码由 root clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

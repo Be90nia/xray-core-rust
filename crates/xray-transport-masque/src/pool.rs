@@ -182,14 +182,14 @@ mod tests {
     #[test]
     fn network_address_rejected() {
         // 10.0.0.0/24：前缀地址 = 网络地址 → 拒。
-        let e = AddressPool::new(prefix("10.0.0.0", 24)).err().expect("network addr must reject");
+        let e = AddressPool::new(prefix("10.0.0.0", 24)).expect_err("network addr must reject");
         assert!(e.to_string().contains("not a host address"), "got: {e}");
     }
 
     #[test]
     fn v4_broadcast_rejected() {
         // 10.0.0.255/24：服务器地址 = v4 广播 → 拒。
-        let e = AddressPool::new(prefix("10.0.0.255", 24)).err().expect("broadcast must reject");
+        let e = AddressPool::new(prefix("10.0.0.255", 24)).expect_err("broadcast must reject");
         assert!(e.to_string().contains("not a host address"), "got: {e}");
     }
 
@@ -212,7 +212,7 @@ mod tests {
         // 10.0.0.1 != 10.0.0.0 → Go 也通过，分配时 server==first 恒跳过 → 池空。
         // （Go 池空由 allocate 循环终止保证，不构造期拒绝。）
         // /32 v4：server=任意主机位不存在 → 前缀地址即网络地址已拒。
-        let e = AddressPool::new(prefix("10.0.0.5", 32)).err().expect("/32 must reject");
+        let e = AddressPool::new(prefix("10.0.0.5", 32)).expect_err("/32 must reject");
         assert!(e.to_string().contains("not a host address"), "got: {e}");
     }
 

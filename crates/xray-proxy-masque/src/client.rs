@@ -2,9 +2,9 @@
 //! dispatcher 桥形态，规划 B4.3）。
 //!
 //! 流程（DialFn 闭包）：拨 CONNECT-IP 隧道（`xray-transport-masque::dialer::dial`，
-//! finalmask→TLS→h2→establish）→ 隧道栈（[`PacketStack`]，地址 = 会话分配结果）
-//! + 双泵（下行 `recv_packet → ingest_rx`；上行轮询 `drain_tx → send_packet`）
-//! → 目标拨号：TCP = 栈内 connect + [`StackTcpRelay`]；UDP = 栈内 socket +
+//! finalmask→TLS→h2→establish）→ 隧道栈（[`PacketStack`]，地址 = 会话分配结果）。
+//! 双泵：下行 `recv_packet → ingest_rx`，上行轮询 `drain_tx → send_packet`。
+//! 目标拨号：TCP = 栈内 connect + [`StackTcpRelay`]；UDP = 栈内 socket +
 //! XUDP 帧约定（dispatcher UDP link 语义）；域名 = 隧道内 DNS（remoteDNS）。
 //!
 //! `shortcut:`（规划 R15/非目标 5）：每 outbound 连接一条隧道（Go 用 xmux
@@ -66,11 +66,13 @@ pub fn parse_client_settings(v: &serde_json::Value) -> Result<MasqueClientSettin
     Ok(MasqueClientSettings { address, port, remote_dns })
 }
 
+/// DNS 缓存条目：(解析结果 IP 列表, TTL 秒, 写入时刻)。
+type DnsCacheEntry = (Vec<IpAddr>, u32, std::time::Instant);
+
 /// 域名解析 TTL 缓存（Go `Handler.cache` 形态；容量宽松兜底——挤出 = 下次
 /// miss 重查，语义无害）。时间源 = compat clock。
 struct DnsCache {
-    entries:
-        std::sync::Mutex<std::collections::HashMap<String, (Vec<IpAddr>, u32, std::time::Instant)>>,
+    entries: std::sync::Mutex<std::collections::HashMap<String, DnsCacheEntry>>,
 }
 
 const DNS_CACHE_CAP: usize = 1024;
@@ -281,12 +283,12 @@ pub fn make_masque_dial_fn(
                 Address::Domain(domain) => {
                     let has_v4 = local.iter().any(|a| a.is_ipv4());
                     let has_v6 = local.iter().any(|a| a.is_ipv6());
-                    let ips = match dns_cache.get(&domain) {
+                    let ips = match dns_cache.get(domain) {
                         Some(ips) => ips,
                         None => {
                             let (ips, ttl) = dns::resolve_domain_in_tunnel(
                                 &stack,
-                                &domain,
+                                domain,
                                 has_v4,
                                 has_v6,
                                 &remote_dns,
@@ -297,7 +299,7 @@ pub fn make_masque_dial_fn(
                                     "masque: DNS lookup for {domain} returned no usable address"
                                 ));
                             }
-                            dns_cache.put(&domain, ips.clone(), ttl);
+                            dns_cache.put(domain, ips.clone(), ttl);
                             ips
                         },
                     };

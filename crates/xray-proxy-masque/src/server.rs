@@ -251,8 +251,11 @@ impl MasqueServer {
             pools.push(std::sync::Mutex::new(pool));
         }
         // 本机栈地址 = 各池服务器自身地址（Go CreateNetTUN(local, nil, mtu, s)）。
+        // B5 回归锚（b5_e2e）：前缀长度必须取地址族位长（32/128）——曾误传 u8::MAX，
+        // smoltcp `IpCidr::new` 对 v4/v6 上限断言（wire/ipv4.rs:114）即 panic，
+        // 任何真装配路径（serve/任意 v4 池入站）必炸。
         let cidrs: Vec<smoltcp::wire::IpCidr> =
-            local.iter().map(|a| ip_to_cidr(*a, u8::MAX)).collect();
+            local.iter().map(|a| ip_to_cidr(*a, ip_bit_len(*a))).collect();
         let stack = Arc::new(tokio::sync::Mutex::new(PacketStack::new(&cidrs, settings.mtu)));
         let server = Arc::new(Self {
             tag,

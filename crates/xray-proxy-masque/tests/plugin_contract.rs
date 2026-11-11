@@ -77,8 +77,7 @@ async fn missing_address_fails_fast_at_build() {
         .register(Arc::new(MasquePlugin::new()) as Arc<dyn Plugin>)
         .expect("register")
         .build()
-        .err()
-        .expect("缺 address 必须 build Err");
+        .expect_err("缺 address 必须 build Err");
     assert!(err.to_string().contains("address"), "错误须指名 address：{err}");
 }
 
@@ -90,8 +89,7 @@ async fn missing_users_fails_fast_at_build() {
         .register(Arc::new(MasquePlugin::new()) as Arc<dyn Plugin>)
         .expect("register")
         .build()
-        .err()
-        .expect("缺 users 必须 build Err");
+        .expect_err("缺 users 必须 build Err");
     assert!(err.to_string().contains("users"), "错误须指名 users：{err}");
 }
 
@@ -106,8 +104,7 @@ async fn empty_users_fails_fast_at_build() {
         .register(Arc::new(MasquePlugin::new()) as Arc<dyn Plugin>)
         .expect("register")
         .build()
-        .err()
-        .expect("空 users 必须 build Err（任务书验收 1；Go 不拒——本仓 fail-visible）");
+        .expect_err("空 users 必须 build Err（任务书验收 1；Go 不拒——本仓 fail-visible）");
     assert!(err.to_string().contains("users"), "错误须指名 users：{err}");
 }
 
@@ -131,11 +128,9 @@ async fn valid_server_section_builds() {
 #[test]
 fn client_settings_negative() {
     let e = xray_proxy_masque::client::parse_client_settings(&json!({}))
-        .err()
-        .expect("缺 address 必须拒");
+        .expect_err("缺 address 必须拒");
     assert!(e.contains("address"), "got: {e}");
     let e = xray_proxy_masque::client::parse_client_settings(&json!({ "address": "127.0.0.1" }))
-        .err()
-        .expect("缺 port 必须拒");
+        .expect_err("缺 port 必须拒");
     assert!(e.contains("port"), "got: {e}");
 }

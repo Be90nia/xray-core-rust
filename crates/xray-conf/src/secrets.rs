@@ -19,7 +19,7 @@
 //!
 //! 覆盖族（bd k0hdi 补全，原始 settings JSON 面——这些协议没有 conf 层结构体，
 //! 或凭据键藏在 `accounts`/`users`/`servers` 嵌套里，见 `collect_generic`）：
-//! anytls / tuic / naive / wireguard / hysteria / socks(含 mixed) / http。
+//! anytls / tuic / naive / wireguard / hysteria / socks(含 mixed) / http / masque。
 
 use serde_json::Value;
 
@@ -112,6 +112,7 @@ fn collect_outbound(entry: &BuiltEntry, out: &mut Vec<String>) {
 ///   （两侧公钥是公开材料，不进掩码）
 /// - hysteria：`auth` + `users[].auth`（`clients` 旧名）+ `servers[].auth|password`
 /// - socks/mixed/http：`user`/`pass`（顶层、`accounts[]`/`users[]`、`servers[].users[]`）
+/// - masque：`users[].pass`（`clients` 别名；`email` 是日志面可记身份，不收）
 fn collect_generic(protocol: &str, v: &Value, out: &mut Vec<String>) {
     match protocol {
         "anytls" => push_key(v, "password", out),
@@ -127,6 +128,14 @@ fn collect_generic(protocol: &str, v: &Value, out: &mut Vec<String>) {
                 push_key(user, "name", out);
                 push_key(user, "pass", out);
             });
+        },
+        // masque：服务端 `users[].pass`（`clients` 为 Go 别名键）。只收 `pass`——
+        // `email` 是日志面刻意可记的身份字段（B4 SecretMasking 口径：401 只记
+        // email），不是秘密；Basic 凭据对的秘密半边 = pass。
+        "masque" => {
+            for key in ["users", "clients"] {
+                for_each(v, key, |user| push_key(user, "pass", out));
+            }
         },
         "wireguard" => {
             for key in ["secretKey", "secret_key"] {
@@ -342,6 +351,34 @@ mod tests {
     fn masks_anytls_password() {
         let secrets = secrets_of("anytls", serde_json::json!({ "password": "anytls-pw" }), true);
         assert_eq!(secrets, ["anytls-pw"]);
+    }
+
+    // ---- B4 遗留③（bd 55yh7 U4）：masque users[].pass 进掩码收集面 ----
+
+    #[test]
+    fn masks_masque_user_pass_and_skips_email() {
+        // Go MasqueServerConfig 形：users[].{email,pass}；clients 为 Go 别名键。
+        let secrets = secrets_of(
+            "masque",
+            serde_json::json!({
+                "users": [
+                    { "email": "u1@example.com", "pass": "masque-secret-1" },
+                    { "email": "u2@example.com", "pass": "masque-secret-2" }
+                ]
+            }),
+            true,
+        );
+        // email 是日志面刻意可记的身份字段（B4 口径），不进掩码表。
+        assert_eq!(secrets, ["masque-secret-1", "masque-secret-2"]);
+        // clients 别名键同语义。
+        let secrets = secrets_of(
+            "masque",
+            serde_json::json!({
+                "clients": [{ "email": "u@example.com", "pass": "masque-pw-alias" }]
+            }),
+            true,
+        );
+        assert_eq!(secrets, ["masque-pw-alias"]);
     }
 
     #[test]

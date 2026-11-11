@@ -195,7 +195,7 @@ async fn dns_query_via_stack(
     let handle = {
         let mut s = stack.lock().await;
         let h = s.add_udp_socket();
-        let bound = s.with_udp_socket(h, |sock| relay::bind_ephemeral(sock));
+        let bound = s.with_udp_socket(h, relay::bind_ephemeral);
         let sent = bound && s.with_udp_socket(h, |sock| sock.send_slice(query, server_ep).is_ok());
         s.poll(smoltcp::time::Instant::now());
         if !sent {
@@ -209,13 +209,12 @@ async fn dns_query_via_stack(
         let received = {
             let mut s = stack.lock().await;
             s.poll(smoltcp::time::Instant::now());
-            let r = s.with_udp_socket(handle, |sock| {
+            s.with_udp_socket(handle, |sock| {
                 let mut scratch = vec![0u8; 4096];
                 sock.recv_slice(&mut scratch)
                     .ok()
                     .map(|(n, meta)| (scratch[..n].to_vec(), meta.endpoint))
-            });
-            r
+            })
         };
         if let Some((payload, ep)) = received {
             if ep == server_ep {
