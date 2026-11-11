@@ -55,10 +55,12 @@ static WG_CLAUSES: &[ClauseId] = &[
     ClauseId::HotPathFreeze,
 ];
 
-/// 协议专属条款（差异表 §2.2 第 14 行 + 本单派单契约：数据面冻结红线）。
+/// 协议专属条款（差异表 §2.2 第 14 行 + 本单派单契约：数据面冻结红线；
+/// masque B3 后 netstack 本体已提炼至 xray-frame::ipstack，冻结形态 =
+/// re-export）。
 static WG_EXTRA: &[(&str, &str)] = &[(
     "WG-TUN-FROZEN",
-    "WG 数据面（boringtun+smoltcp 重栈）一行不改；integration_wireguard_dataplane 是红线级回归",
+    "netstack 已提炼至 xray-frame，本 crate 经 re-export 冻结；WG 数据面其余部分（boringtun 重栈）一行不改；integration_wireguard_dataplane 是红线级回归",
 )];
 
 static WG_CONTRACT: PluginContract =
@@ -146,7 +148,8 @@ impl Plugin for WireguardPlugin {
 /// 连接级 driver task（WG 协议 pump + netstack poll + accept loop）的托管
 /// （坑约束 5/6 运行时半边）属 [`WireguardInboundHandler`] 实例面（既有行为，
 /// close = join abort；FxScope/ShutdownCoordinator 接线随 P3 入口收口统一迁移）。
-/// 数据面 pump/netstack 本体在 WG-TUN-FROZEN 冻结范围内，禁在此层包装。
+/// 数据面 pump 在 WG-TUN-FROZEN 冻结范围内（netstack 本体已提炼至
+/// xray-frame::ipstack，本 crate 经 re-export 冻结），禁在此层包装。
 pub struct WireguardLifecycle;
 
 impl Lifecycle for WireguardLifecycle {

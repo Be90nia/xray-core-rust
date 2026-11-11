@@ -39,6 +39,9 @@ xray-buf = { path = "../xray-buf" }
 # 热替换快照（hot_slot::HotSlot，bd 9u35o）：无锁读 + 原子整体换 Arc。已在依赖树内
 # （ocsp-stapler 传递引入），显式声明即固定直接依赖面，不新增 crate 入图。
 arc-swap = { workspace = true }
+# ipstack 机制件（masque B3 净移动自 xray-proxy-wireguard/netstack）：workspace
+# 已有（同版同 feature 面，零新第三方），特征面由 workspace 定义统一供给。
+smoltcp = { workspace = true }
 
 # net::disable_icmp_unreachable_report（bd vqvn1 NEW-02）：WSAIoctl 关 Windows
 # ICMP-unreachable 上报的唯一实现。WSAIoctl 签名引用 OVERLAPPED ⇒ 该符号在

@@ -54,6 +54,12 @@ pub mod error;
 // 派生件 3（bd 9u35o）：热替换快照持有件——`arc-swap` 之上组合包装「无锁读 + 原子整体换
 // `Arc`」，供 geoip 注册表（bd hdgz9）与 TLS 证书热重载（bd 5ctu1）共用；udf 无等价件。
 pub mod hot_slot;
+// smoltcp 用户态 IP 栈机制件（masque B3 净移动，PM 2026-11-11 裁定：移动 +
+// re-export，实施计划 §4.2/§5 B3）：IP 包 ↔ TCP/UDP socket 桥，自
+// xray-proxy-wireguard/netstack 原样搬入（PacketStack = 原 WgNetStack 仅改名）；
+// wireguard 侧与未来 masque 经 re-export 消费（xray-proxy-tun 的同源副本本票未
+// 收编，另立 bd 票）。
+pub mod ipstack;
 pub mod lifecycle;
 pub mod logging;
 // 网络 socket 机制件（bd vqvn1 NEW-02）：Windows ICMP-unreachable 上报关闭的唯一

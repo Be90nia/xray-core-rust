@@ -91,6 +91,16 @@ fn contract_surface_declares_all_applicable_and_extra() {
     assert_eq!(contract.extra.len(), 1, "协议专属条款一条（数据面冻结）");
     assert_eq!(contract.extra[0].0, "WG-TUN-FROZEN");
     assert!(!contract.extra[0].1.is_empty());
+    // masque B3 同步：netstack 本体已提炼至 xray-frame::ipstack，冻结文案必须
+    // 声明 re-export 形态（回退成旧「一行不改」口径即失败）。
+    assert!(
+        contract.extra[0].1.contains("re-export"),
+        "WG-TUN-FROZEN 文案须声明 netstack 经 re-export 冻结"
+    );
+    assert!(
+        contract.extra[0].1.contains("integration_wireguard_dataplane"),
+        "红线级回归测试指引不得从条款文案中丢失"
+    );
 }
 
 /// 完整装配链：段路由解析 → bring_up 三相 → 停机报告干净；
