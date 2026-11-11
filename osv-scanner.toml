@@ -14,6 +14,10 @@
 # 修复版 rustls-webpki 0.103.16 + webpki-roots 0.26.11，豁免空转）；新增
 # block-buffer 0.12.0 的 GHSA-qwgh-2vcv-g2f7（RustSec 未收录 → 只有 osv 面能挂；
 # 0.12.1 已修且 semver 兼容，待工具链升级窗口 bump 后删除本条）。
+# 2026-11-11（bd gqpck 收尾轮）：osv 库更新新增 RUSTSEC-2026-0486（rustix 1.1.4
+# xattr 零长缓冲把未写字节标记为已初始化 / aliases GHSA-jh2m-fhpj-3vr7）。该条**有修复版**
+# （1.1.6）⇒ 按本文件一贯口径走依赖 bump 消除（cargo update -p rustix --precise 1.1.6），
+# **不登记豁免**。bump 后 osv 面复扫仅余上述 5 条已登记项。
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "paste 1.0.15 unmaintained, proc-macro only, no fix; tracked by reports/fix-lbxx.md"
