@@ -264,7 +264,11 @@ async fn accept_loop(listener: TcpListener, state: Arc<Mutex<MockState>>) {
     }
 }
 
-/// mock 服务端句柄：`state` 供断言/注入，drop 即 abort 所有连接与 accept 循环。
+/// mock 服务端句柄：`state` 供断言/注入。
+///
+/// 连接与 accept 任务挂在 `JoinSet`，由**本夹具自己的 `Drop` 显式调用 `abort_all()`** 清理——
+/// 那是夹具主动发起的动作，不依赖框架「Drop 保证中止」语义（ADR-0004 §2.2 Q3）；各用例的
+/// 结论也不建立在清理是否发生之上。
 struct MockServer {
     state: Arc<Mutex<MockState>>,
     port: u16,
