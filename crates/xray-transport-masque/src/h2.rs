@@ -60,12 +60,12 @@ pub async fn connect_h2(
         .handshake::<_, Full<Bytes>>(TokioIo::new(io))
         .await
         .map_err(|e| hyper_err("h2 handshake", e))?;
-    // ①类待迁移（bd xosi9 改判）：hyper h2 连接驱动任务（GOAWAY/EOF 侦听 + 帧泵）；
-    // 寿命 = ConnectIpSession（close/Drop 中止即释放底层 TCP fd）；目标托管口 =
-    // xray_frame::scope::ComponentScope（B4 隧道宿主接线）。
+    // ②豁免（§3.5.6 ②-数据面逐包泵）：hyper h2 连接驱动（GOAWAY/EOF 侦听 + 帧泵），
+    // 随 h2 连接 EOF 自终；寿命不越 ConnectIpSession（同形态登记见
+    // xray-transport-naive/src/dial.rs）。
     #[allow(
         clippy::disallowed_methods,
-        reason = "①类待迁移（bd xosi9 改判）：hyper h2 连接驱动任务，寿命 = ConnectIpSession（close/Drop 中止）；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+        reason = "②豁免（§3.5.6 ②-数据面逐包泵）：hyper h2 连接驱动任务，随 h2 连接结束自终；寿命 = ConnectIpSession，close()/Drop 逐任务 abort"
     )]
     let driver = tokio::spawn(async move {
         if let Err(e) = connection.await {

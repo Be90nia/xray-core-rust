@@ -5,7 +5,7 @@
 //! `ignore_already_exists`）。
 //!
 //! - **dialer**：真实实现——拨 CONNECT-IP 隧道（`crate::dialer::dial`，含 finalmask/TLS/establish）→
-//!   [`PacketStreamConn`] 字节流适配（Go `masque.Conn` 的 `Read/Write = ReadPacket/WritePacket`
+//!   `PacketStreamConn` 字节流适配（Go `masque.Conn` 的 `Read/Write = ReadPacket/WritePacket`
 //!   裸透传语义）。 消费方 = 通用 transport 管线（如 `vless over masque`）；**proxy 层
 //!   `xray-proxy-masque` 不走本表**——它需要强类型 `ConnectIpSession`（Go 用 类型断言
 //!   `.(*masque.Conn)` 的地方，Rust 等价形态 = 直接调 `crate::dialer::dial`，语义等价）。
@@ -95,11 +95,11 @@ impl PacketStreamConn {
     /// 建适配并 spawn 双泵。必须 tokio runtime 内调用。
     fn spawn(mut session: crate::connect::ConnectIpSession) -> io::Result<Box<dyn Connection>> {
         let (client_side, mut relay_side) = tokio::io::duplex(64 * 1024);
-        // ①类待迁移（bd xosi9 改判）：裸流适配双泵；寿命 = 本 Connection（drop
-        // 即 abort 泵 + session Drop 中止写泵）；目标托管口 = 消费方任务 scope。
+        // ②豁免（§3.5.6 ②-数据面逐包泵）：裸流适配双泵（duplex ↔ 会话收发），
+        // 坑约束⑫；寿命 = 本 Connection 句柄——duplex 端随句柄关闭，泵读到 0 即自终。
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：PacketStreamConn 双泵，寿命 = Connection 句柄；目标托管口 = xray_frame::scope::ComponentScope（消费方任务宿主）"
+            reason = "②豁免（§3.5.6 ②-数据面逐包泵）：PacketStreamConn 裸流双泵，坑约束⑫；寿命 = Connection 句柄（duplex 关闭 ⇒ 泵读 0 自终，不停机编排面）"
         )]
         let pump = tokio::spawn(async move {
             let mut buf = vec![0u8; crate::connect::MIN_PACKET_SIZE.max(2048)];

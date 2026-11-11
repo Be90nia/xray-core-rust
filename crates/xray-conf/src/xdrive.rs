@@ -7,7 +7,7 @@
 //! 规则（与 Go 逐条对齐，文案逐字）：
 //! - 出站：① `flow` 拒 ② `encryption` 无 ENC 拒 ③ 非 reverse 时强制 mux 开启 （enabled 且
 //!   concurrency/xudpConcurrency 非负且 `xudpProxyUDP443 != "skip"`） ④ `testpre` 拒；reverse 自开
-//!   mux 是 ③ 的例外（Go `:294` 注释）。
+//!   mux 是 ③ 的例外（Go `:292`：`account.Reverse != nil` 即算，`"reverse": {}` 亦然）。
 //! - 入站：⑤ `decryption` 无 ENC 拒、任一 user `flow` 拒、多端口拒。
 //! - 其他协议：`the xdrive transport can only be used by VLESS`。
 //!
@@ -88,12 +88,11 @@ fn validate_outbound(
             "the xdrive transport needs VLESS \"encryption\", run \"xray vlessenc\" to get one",
         ));
     }
-    // ③ reverse 自开 mux（Go `:294-296` 例外分支），否则强制 mux 开启。
-    let reverse_set = user
-        .get("reverse")
-        .and_then(|r| r.get("tag"))
-        .and_then(|t| t.as_str())
-        .is_some_and(|t| !t.is_empty());
+    // ③ reverse 自开 mux（Go `:292` 例外分支），否则强制 mux 开启。
+    // Go 判据是 `account.Reverse == nil`（`*Reverse` 指针）：JSON 里 `"reverse"` 键存在
+    // 且非 `null` 即视为已配置——`"reverse": {}`（空对象、无 tag）同样免 mux；只有
+    // 缺键 / `null` 才回到强制 mux（bd hjtlk D7：本仓旧判据按 tag 非空，误拒 Go 合法配置）。
+    let reverse_set = user.get("reverse").is_some_and(|r| !r.is_null());
     if !reverse_set {
         let mux_ok = mux.is_some_and(|m| {
             m.enabled
@@ -315,26 +314,42 @@ mod tests {
 
     #[test]
     fn outbound_reverse_bypasses_mux() {
-        // Go `:294` 注释：reverse opens its own mux —— reverse 非空 + mux 未启用 → 通过。
+        // Go `:292`：`account.Reverse != nil` 即「已配 reverse，自开 mux」——mux 未启用 → 通过。
         let user = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC,
                                       "reverse": {"tag": "portal-tag"}}));
         assert!(
             validate_xdrive("outbound", "ob", "vless", Some(&user), Some(&xdrive_ss()), None, None)
                 .is_ok()
         );
-        // 空 tag = 无 reverse ⇒ mux 仍强制。
-        let empty_tag = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC,
-                                           "reverse": {"tag": ""}}));
+        // bd hjtlk D7：Go 判据是 `*Reverse` 指针 nil——`"reverse": {}`（空对象、无 tag）
+        // 非 nil ⇒ 免 mux。旧判据按 tag 非空，会把这条 Go 合法配置误拒。
+        let empty_obj = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC, "reverse": {}}));
+        assert!(
+            validate_xdrive(
+                "outbound",
+                "ob",
+                "vless",
+                Some(&empty_obj),
+                Some(&xdrive_ss()),
+                None,
+                None
+            )
+            .is_ok(),
+            "\"reverse\": {{}} 非 nil，必须免 mux"
+        );
+        // `"reverse": null` = Go 的 nil ⇒ 回到强制 mux。
+        let null_reverse =
+            vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC, "reverse": null}));
         let err = validate_xdrive(
             "outbound",
             "ob",
             "vless",
-            Some(&empty_tag),
+            Some(&null_reverse),
             Some(&xdrive_ss()),
             None,
             None,
         )
-        .expect_err("空 reverse tag 不能豁免 mux");
+        .expect_err("null reverse 等于未配置，mux 仍强制");
         assert!(err.to_string().contains("needs \"mux\" enabled"), "got: {err}");
     }
 

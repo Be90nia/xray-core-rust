@@ -2,7 +2,7 @@
 //!
 //! 层序（规划 §5 B2.6，Go `dialHTTP2:182-191` 同款）：TCP → **finalmask（TCP 后、
 //! TLS 前）** → TLS（指纹走 btls / 否则 rustls，同 splithttp/grpc 调用序）→
-//! ALPN=h2 硬校验 → [`crate::h2::connect_h2`] → [`crate::connect::establish`]。
+//! ALPN=h2 硬校验 → [`crate::h2::connect_h2`] → `crate::connect::establish`。
 //!
 //! 硬约束（extra 条款 `MASQUE-TLS-REQUIRED` / `MASQUE-H2-ONLY`）：`security=tls`
 //! 必选；用户 ALPN 必须显式含 `h2` 且不含 `h3`——Go `hub.go:47-50` 对 ALPN 缺省

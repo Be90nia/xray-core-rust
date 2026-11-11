@@ -211,6 +211,11 @@ FAILURE_TRACE_DEBUG_REGISTRY: dict[str, str] = {
         "（逐连接嗅探失败）、:198 逐包 `LogDebug`。真正的服务级失败（listener 错误、"
         "启动失败）已分别走 warn/error 且不在本表。"
     ),
+    "crates/xray-proxy-masque/src/dns.rs": (
+        "go-debug：隧道内 DNS 多 server / 双族顺序尝试的逐次失败——首个有答案的 server "
+        "收敛（Go dice first-hit 同形），最终无可用地址经「DNS lookup … returned no "
+        "usable address」上抛调用方；同族口径见 xray-app-dns/src/dial.rs 登记"
+    ),
     "crates/xray-stress/src/scenarios.rs": "go-debug：压测 harness 逐轮重连留痕（非产品面）",
     "crates/xray-tls/src/btls_client.rs": (
         "go-debug：SSL_set_session 失败 → 走 full handshake（无会话复用，功能不损）"
@@ -241,6 +246,12 @@ FAILURE_TRACE_DEBUG_REGISTRY: dict[str, str] = {
     ),
     "crates/xray-transport-hysteria/src/register.rs": (
         "go-debug：单连接级 accept 错误 → 继续监听"
+    ),
+    "crates/xray-transport-masque/src/hub.rs": (
+        "go-debug：TLS 握手失败（Go `transport/internet/masque/hub.go:210` "
+        "`errors.LogDebugInner`）与非 h2 协议协商（`hub.go:215` `errors.LogDebug`）——"
+        "单连接级、任意扫描器即可触发，提级即日志洪泛面；upgrade 失败 = 客户端在 200 "
+        "后离开，Go 同位无该日志（服务级失败已走 WARN：tcpmask wrap / 握手并发闸）"
     ),
     "crates/xray-transport-naive/src/dial.rs": "go-debug：h2 连接驱动结束（连接级终态）",
     "crates/xray-transport-naive/src/inbound.rs": (

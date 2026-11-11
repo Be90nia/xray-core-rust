@@ -50,7 +50,7 @@ xray-app-dispatcher = { path = "../xray-app-dispatcher", optional = true }
 # trait 三面均已在 default 闭包（xray-core 非可选依赖），optional 仅控命名空间。
 xray-transport = { path = "../xray-transport", optional = true }
 xray-buf = { path = "../xray-buf", optional = true }
-# B5 第三步：协议插件族（P2 批次 A/B 已插件化的 15 族；ss 未插件化故不在列）。
+# B5 第三步：协议插件族（P2 批次 A/B 已插件化的 16 族；ss 未插件化故不在列）。
 # 均已在 default 闭包（xray-core 依赖），optional 仅控命名空间，default 依赖图零变化。
 xray-proxy-socks = { path = "../xray-proxy-socks", optional = true }
 xray-proxy-http = { path = "../xray-proxy-http", optional = true }
@@ -68,6 +68,7 @@ xray-proxy-freedom = { path = "../xray-proxy-freedom", optional = true }
 xray-proxy-blackhole = { path = "../xray-proxy-blackhole", optional = true }
 xray-proxy-loopback = { path = "../xray-proxy-loopback", optional = true }
 xray-proxy-ss = { path = "../xray-proxy-ss", optional = true }
+xray-proxy-masque = { path = "../xray-proxy-masque", optional = true }
 
 [features]
 default = ["mimalloc"]
@@ -96,6 +97,7 @@ framework-assembly = [
     "dep:xray-proxy-blackhole",
     "dep:xray-proxy-loopback",
     "dep:xray-proxy-ss",
+    "dep:xray-proxy-masque",
 ]
 
 [dev-dependencies]

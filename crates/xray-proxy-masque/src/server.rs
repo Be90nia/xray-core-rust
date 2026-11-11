@@ -650,7 +650,8 @@ fn serve_address_request(
         }
     }
     if let Err(e) = writer.respond_assignments(assigned) {
-        LOG.debug(format!("masque: respond_assignments failed: {e}"));
+        // 写面已断 = 客户端拿不到地址分配，隧道不可用（非瞬断）。
+        LOG.warn(format!("masque: respond_assignments failed: {e}"));
     }
 }
 

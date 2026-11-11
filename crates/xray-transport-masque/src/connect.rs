@@ -53,9 +53,9 @@ pub(crate) fn h2_max_packet_size() -> usize {
 const QUEUE_CAPSULES: usize = 128;
 const QUEUE_DATAGRAMS: usize = 128;
 
-/// 防御性帧长上限：合法胶囊（DATAGRAM ≤ 64KB、地址/路由 ≤ 8192 条目 ≈ <200KB）
-/// 远低于此值；超限 = 协议违规（Go 读侧可流式跳过任意长度，本仓以显式上限替代，
-/// fail-visible）。超出即是解析器预算攻击。
+/// 防御性帧长上限 1MiB：合法胶囊（DATAGRAM 一颗 ≤ 64KiB、地址/路由表数百 KiB
+/// 量级）均远低于此值；超限 = 协议违规（Go 读侧可流式跳过任意长度，本仓以显式
+/// 上限替代，fail-visible）。超出即是解析器预算攻击。
 const MAX_FRAME_PAYLOAD: usize = 1 << 20;
 
 /// IP 协议号：ICMP / ICMPv6（Go conn.go:41-44）。
@@ -138,12 +138,12 @@ impl ConnectIpSession {
         let state: SharedState = Arc::new(Mutex::new(SessionState::default()));
         // 读泵需要写队列句柄（回应 ADDRESS_REQUEST）；先克隆再 move，原句柄留给 Self。
         let reader_cmd_tx = cmd_tx.clone();
-        // ①类待迁移（bd xosi9 改判）：capsule 读泵（解帧 → 验证 → 分发）；寿命 =
-        // ConnectIpSession（B4 接线时随隧道宿主经 ComponentScope 托管）；目标托管口 =
-        // xray_frame::scope::ComponentScope。
+        // ②豁免（§3.5.6 ②-数据面逐包泵）：CONNECT-IP 胶囊读泵（解帧 → 验证 → 分发），
+        // 坑约束⑫ 数据面零改动红线；取消语义 = close()/Drop 逐任务选择性 abort（读泵
+        // 中止、写泵先排空 Fin），托管口 close_gate/drain 只作用于整账本，表达不了该语义。
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：capsule 读泵，寿命 = ConnectIpSession 句柄持有；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+            reason = "②豁免（§3.5.6 ②-数据面逐包泵）：capsule 读泵，坑约束⑫；寿命 = ConnectIpSession，close()/Drop 逐任务 abort（选择性中止，托管口只有整账本闸/排空）"
         )]
         let reader_task = {
             let state = Arc::clone(&state);
@@ -153,15 +153,17 @@ impl ConnectIpSession {
                         .await;
                 match outcome {
                     Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
-                    Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
+                    // Go `connectip/conn.go:151` = `errors.LogInfoInner(… "reading capsules
+                    // failed")`。
+                    Err(e) => crate::LOG.info(format!("masque: capsule read failed: {e}")),
                 }
             })
         };
-        // ①类待迁移（bd xosi9 改判）：capsule 写泵（单 owner 写端）；寿命 =
-        // ConnectIpSession；目标托管口 = xray_frame::scope::ComponentScope。
+        // ②豁免（§3.5.6 ②-数据面逐包泵）：胶囊写泵（单 owner 写端）+ Fin 哨兵排空，
+        // 坑约束⑫；寿命 = ConnectIpSession，未 close 的 Drop 直接中止。
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：capsule 写泵（单 owner 写端 + Fin 哨兵），寿命 = ConnectIpSession；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+            reason = "②豁免（§3.5.6 ②-数据面逐包泵）：capsule 写泵（单 owner 写端 + Fin 哨兵），坑约束⑫；寿命 = ConnectIpSession，Drop 中止"
         )]
         let writer_task = tokio::spawn(write_loop(wr, cmd_rx));
         Self {
@@ -422,11 +424,11 @@ impl ConnectIpSession {
         let (request_tx, request_rx) = mpsc::channel(QUEUE_REQUESTS);
         let state: SharedState = Arc::new(Mutex::new(SessionState::default()));
         let reader_cmd_tx = cmd_tx.clone();
-        // ①类待迁移（bd xosi9 改判）：服务端 capsule 读泵；寿命 = ConnectIpSession
-        // 句柄持有；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）。
+        // ②豁免（§3.5.6 ②-数据面逐包泵）：服务端胶囊读泵，坑约束⑫；寿命 =
+        // ConnectIpSession，close()/Drop 逐任务选择性 abort（同客户端读泵）。
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：服务端 capsule 读泵，寿命 = ConnectIpSession 句柄持有；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+            reason = "②豁免（§3.5.6 ②-数据面逐包泵）：服务端 capsule 读泵，坑约束⑫；寿命 = ConnectIpSession，close()/Drop 逐任务 abort（选择性中止）"
         )]
         let reader_task = {
             let state = Arc::clone(&state);
@@ -443,14 +445,16 @@ impl ConnectIpSession {
                 .await;
                 match outcome {
                     Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
-                    Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
+                    // Go `connectip/conn.go:151` = `errors.LogInfoInner(… "reading capsules
+                    // failed")`。
+                    Err(e) => crate::LOG.info(format!("masque: capsule read failed: {e}")),
                 }
             })
         };
-        // ①类待迁移（bd xosi9 改判）：服务端 capsule 写泵；同上目标托管口。
+        // ②豁免（§3.5.6 ②-数据面逐包泵）：服务端胶囊写泵，坑约束⑫；同上寿命/中止语义。
         #[allow(
             clippy::disallowed_methods,
-            reason = "①类待迁移（bd xosi9 改判）：服务端 capsule 写泵（单 owner 写端 + Fin 哨兵），寿命 = ConnectIpSession；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+            reason = "②豁免（§3.5.6 ②-数据面逐包泵）：服务端 capsule 写泵（单 owner 写端 + Fin 哨兵），坑约束⑫；寿命 = ConnectIpSession，Drop 中止"
         )]
         let writer_task = tokio::spawn(write_loop(wr, cmd_rx));
         Self {

@@ -10,10 +10,10 @@
 //! 对象 id LRU 缓存（Go 无界 map → [`SyncLruCache`] 4096，miss 只多一次查询）、
 //! 全局限流冷却（403 rate-limit/429 → `cool()`，后续请求先等冷却窗）。
 //! 会话视图（Go `sessionStorage` → [`Storage::session`]）：走 XMUX 连接池的
-//! [`SessionTransport`]，inflight/reserved 双信号量每会话独立（Go `laneKey`
+//! `SessionTransport`，inflight/reserved 双信号量每会话独立（Go `laneKey`
 //! reserved 车道 = 槽位控制面，B5 槽位读写以 `lane=true` 调 [`DriveStorage`] 槽位方法）。
 //!
-//! 与 Go 的已声明偏差：① 请求取消走任务层（[`Storage`](crate::storage::Storage)
+//! 与 Go 的已声明偏差：① 请求取消走任务层（[`Storage`]
 //! 契约注释），无 per-call ctx——单飞等待不可提前取消（Go waiter 返回 ctx.Err
 //! 的分支不存在）；② SessionTransport 的停滞退役钩子（Go `sessionTransport.stalled`）
 //! 未接——client.rs 划归 B2 既有件不在本批领地，attempt 超时只计 `throttle`；

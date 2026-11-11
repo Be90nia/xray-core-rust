@@ -144,6 +144,13 @@ GUARD_ACROSS_AWAIT_REGISTRY: dict[str, str] = {
     "crates/xray-transport/src/finalmask/xicmp_sock.rs#rx": (
         "accepted：Mutex<Receiver> 独占读（raw ICMP 收包线程 → 单队列，取包必须独占）"
     ),
+    "crates/xray-transport-xdrive/src/drive.rs#_gate": (
+        "accepted：oauth2 token 单飞闸（Go flight.Do 等价面）——持锁跨 fetch_token().await "
+        "就是「并发 refresh 只发一次」本体，去掉即重复换 token；门内 double-check 后已释放"
+    ),
+    "crates/xray-transport-xdrive/src/template.rs#_gate": (
+        "accepted：模板后端 oauth2 token 单飞闸（同上，double-check 后持锁跨 token 请求）"
+    ),
 }
 
 

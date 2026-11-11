@@ -383,7 +383,7 @@ pub async fn listen_masque(
                     ) {
                         Ok(c) => c,
                         Err(e) => {
-                            LOG.debug(format!("masque hub: tcpmask wrap failed: {e}"));
+                            LOG.warn(format!("masque hub: tcpmask wrap failed: {e}"));
                             continue;
                         },
                     };
@@ -397,10 +397,10 @@ pub async fn listen_masque(
                 let gate = Arc::clone(&gate);
                 let acceptor = Arc::clone(&acceptor);
                 let matcher = Arc::clone(&matcher);
-                let spawn_ref = hub_scope_ref.clone();
-                let _ = spawn_ref.spawn(async move {
+                let conn_scope = hub_scope_ref.clone();
+                let _ = hub_scope_ref.spawn(async move {
                     let _permit = permit; // 握手窗随任务体释放
-                    serve_tls_conn(stream, peer, local, tls, matcher, gate, acceptor).await;
+                    serve_tls_conn(stream, peer, tls, matcher, gate, acceptor, conn_scope).await;
                 });
             }
         })
@@ -419,14 +419,17 @@ pub async fn listen_masque(
 }
 
 /// 单连接：TLS（10s 窗 + ALPN=h2 校验）→ 纯 h2 服务（extended CONNECT 打开）。
+///
+/// `scope` = hub 账本的弱引用句柄（[`xray_frame::scope::ScopeRef`]）：upgrade 泵
+/// 住本账本，故只传弱引用（ADR-0004 §2.2 Q4 形态①，禁自引用环）。
 async fn serve_tls_conn(
     stream: Box<dyn Connection>,
     peer: SocketAddr,
-    _local: SocketAddr,
     tls: tokio_rustls::TlsAcceptor,
     matcher: Arc<PathMatcher>,
     gate: TunnelGate,
     acceptor: Arc<dyn TunnelAcceptor>,
+    scope: xray_frame::scope::ScopeRef,
 ) {
     // TLS 握手（Go serveHTTP2Conn：HandshakeContext(http2HandshakeTimeout)）。
     let tls_stream = match xray_transport::tls_handshake_gate::accept_tls_with_timeout(
@@ -463,7 +466,8 @@ async fn serve_tls_conn(
         let matcher = Arc::clone(&matcher);
         let gate = Arc::clone(&gate);
         let acceptor = Arc::clone(&acceptor);
-        async move { handle_request(req, peer, matcher, gate, acceptor).await }
+        let scope = scope.clone();
+        async move { handle_request(req, peer, matcher, gate, acceptor, scope).await }
     });
     if let Err(e) = builder.serve_connection_with_upgrades(TokioIo::new(tls_stream), service).await
     {
@@ -480,6 +484,7 @@ async fn handle_request(
     matcher: Arc<PathMatcher>,
     gate: TunnelGate,
     acceptor: Arc<dyn TunnelAcceptor>,
+    scope: xray_frame::scope::ScopeRef,
 ) -> HyperResult {
     // 1) path 匹配（Go ServeHTTP 首段：不匹配 = 404）。
     if !matcher.matches(req.uri().path(), req.uri().query()) {
@@ -523,12 +528,8 @@ async fn handle_request(
         answer = answer_rx => match answer {
             Ok(Answer::Accept) => {
                 // 200 + Capsule-Protocol（Go connectip.Proxy.Proxy 响应头同值）；
-                // upgrade IO 异步转交 ServerConn::accept。
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "①类待迁移（bd xosi9 改判）：hub 每连接 upgrade 泵——已 accept 隧道的 hyper upgrade IO 异步转交 ServerConn.accept；寿命 = ServerConn（隧道本体），随隧道关闭/503 兜底收敛；目标托管口 = ComponentScope（宿主 listener scope）"
-                )]
-                tokio::spawn(async move {
+                // upgrade IO 异步转交 ServerConn::accept（§3.5.6 ①类：走 hub 账本）。
+                let _ = scope.spawn(async move {
                     match upgrade.await {
                         Ok(io) => {
                             let _ = io_tx.send(TokioIo::new(io)).await;

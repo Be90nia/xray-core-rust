@@ -11,9 +11,9 @@
 //! - **handler 桥**：从已 build 的插件族把每个配置条目转成 dispatcher 可调 handler，填
 //!   [`HandlerBridge`] 查表。出站两条路：插件缝族（freedom/vmess/vless/blackhole/loopback， 插件
 //!   build 态 → `dispatch_handler`/`dial_fn`/`handler`）与 core 单出站构建族
-//!   （trojan/http/socks/tuic/hysteria/anytls/wireguard/dns/tun——客户端解析在 xray-core 内部，经
-//!   pub `outbound::build_single_outbound` 复用）；入站 = `InboundDispatchHandler` （生产同款 tag
-//!   面）。转换失败逐条计数 + 日志（成功几个算几个），重复 tag 拒绝（不覆盖）；
+//!   （trojan/http/socks/tuic/hysteria/anytls/wireguard/dns/tun/masque——客户端解析在 xray-core
+//!   内部，经 pub `outbound::build_single_outbound` 复用）；入站 = `InboundDispatchHandler`
+//!   （生产同款 tag 面）。转换失败逐条计数 + 日志（成功几个算几个），重复 tag 拒绝（不覆盖）；
 //!   该族消费不了的条目级面（[`EntryFacet`]）在场即拒。代理链拆两态：应用层
 //!   （`proxySettings.tag`）插件缝族经 [`ChainSlot`] 装配后 late-bind（生产 `register_outbounds`
 //!   Phase 2 同款）；传输层（`sockopt.dialerProxy`）与 mux / sendThrough 仍拒（见
@@ -59,6 +59,7 @@ use xray_proxy_freedom::{
 use xray_proxy_http::HttpPlugin;
 use xray_proxy_hysteria::HysteriaPlugin;
 use xray_proxy_loopback::{LoopbackError, LoopbackPlugin, LoopbackSink};
+use xray_proxy_masque::plugin::MasquePlugin;
 use xray_proxy_socks::SocksPlugin;
 use xray_proxy_ss::SsPlugin;
 use xray_proxy_trojan::TrojanPlugin;
@@ -319,7 +320,7 @@ fn inbound_only<P: Plugin + Default + 'static>(protocol: &'static str) -> Regist
 }
 
 /// `xray-core` 单出站构建族（trojan/http/socks/tuic/hysteria/anytls/wireguard/
-/// dns/tun）：这些族的客户端配置解析在 xray-core 内部（`pub(crate)`
+/// dns/tun/masque）：这些族的客户端配置解析在 xray-core 内部（`pub(crate)`
 /// `parse_*_config` + `wrap_bridge`），P2 插件化只迁移了入站解析面；桥内重写解析
 /// = 第二份生产语义（漂移风险）。故复用 xray-core 的 **pub** 单出站构建入口
 /// [`xray_core::outbound::build_single_outbound`]（API 动态 AddOutbound 同款，
@@ -571,6 +572,10 @@ static FAMILY_CATALOG: &[(&str, FamilyFactory)] = &[
     }),
     ("blackhole", |_| Some(blackhole_family())),
     ("loopback", |_| Some(loopback_family())),
+    // masque：CONNECT-IP 客户端出站（transport + proxy 一体，wireguard/tun 同族）。
+    // 客户端配置解析与装配门（MASQUE-TLS-REQUIRED / MASQUE-H2-ONLY）在 xray-core
+    // `arm_builders`，故走 core 单出站构建族。
+    ("masque", |_| Some(core_outbound_family::<MasquePlugin>("masque"))),
 ];
 
 /// 协议目录：配置 `protocol` 串 → 插件族构造。目录只提供**构造器**，注册集 =

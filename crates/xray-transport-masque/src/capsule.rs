@@ -59,7 +59,7 @@ pub struct AddressRequestEntry {
     pub prefix: IpPrefix,
 }
 
-/// IP 前缀（Go `netip.Prefix`：addr 的主机位必须全 0，见 [`decode_prefix_entry`]）。
+/// IP 前缀（Go `netip.Prefix`：addr 的主机位必须全 0，见 `decode_prefix_entry`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpPrefix {
     /// 前缀地址。

@@ -5943,6 +5943,7 @@ dependencies = [
  "xray-proxy-http",
  "xray-proxy-hysteria",
  "xray-proxy-loopback",
+ "xray-proxy-masque",
  "xray-proxy-socks",
  "xray-proxy-ss",
  "xray-proxy-trojan",

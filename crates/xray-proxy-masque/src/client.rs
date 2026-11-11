@@ -4,7 +4,7 @@
 //! 流程（DialFn 闭包）：拨 CONNECT-IP 隧道（`xray-transport-masque::dialer::dial`，
 //! finalmask→TLS→h2→establish）→ 隧道栈（[`PacketStack`]，地址 = 会话分配结果）。
 //! 双泵：下行 `recv_packet → ingest_rx`，上行轮询 `drain_tx → send_packet`。
-//! 目标拨号：TCP = 栈内 connect + [`StackTcpRelay`]；UDP = 栈内 socket +
+//! 目标拨号：TCP = 栈内 connect + `StackTcpRelay`；UDP = 栈内 socket +
 //! XUDP 帧约定（dispatcher UDP link 语义）；域名 = 隧道内 DNS（remoteDNS）。
 //!
 //! `shortcut:`（规划 R15/非目标 5）：每 outbound 连接一条隧道（Go 用 xmux
@@ -260,18 +260,22 @@ pub fn make_masque_dial_fn(
                     loop {
                         timer.tick().await;
                         let Some(writer) = writer.as_mut() else { return };
-                        let mut s = up_stack.lock().await;
-                        s.poll(smoltcp::time::Instant::now());
-                        for pkt in s.drain_tx() {
+                        // 栈锁内只 poll + 取出出站包；写隧道（send_packet）在锁外，
+                        // 否则隧道写窗一堵就把栈互斥锁连同下行泵一起钉住。
+                        let out: Vec<Vec<u8>> = {
+                            let mut s = up_stack.lock().await;
+                            s.poll(smoltcp::time::Instant::now());
+                            s.drain_tx()
+                        };
+                        for pkt in out {
                             match writer.send_packet(&pkt).await {
                                 Ok(Some(icmp)) => {
-                                    s.ingest_rx(icmp);
+                                    up_stack.lock().await.ingest_rx(icmp);
                                 },
                                 Ok(None) => {},
                                 Err(_) => return,
                             }
                         }
-                        drop(s);
                     }
                 })
                 .map_err(|_| "masque: scope closed".to_string())?;

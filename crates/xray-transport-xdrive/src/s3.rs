@@ -56,7 +56,7 @@ const DRIVE_MAX_BACKOFF: Duration = Duration::from_secs(8);
 /// 单对象响应上限（Go `params.go maxSegmentBytes`；params.rs 同值私有，本地
 /// 常量避免跨模块扩公开面）。
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
-/// 非 2xx 响应体上限（Go `64 << 10`；错误 XML 足够）。
+/// 非 2xx 响应体上限（Go `64 << 10` = 64KiB；错误 XML 足够）。
 const ERROR_BODY_LIMIT: usize = 64 << 10;
 /// 对象 key 字节上限（Go `objectKey`）。
 const S3_KEY_MAX_BYTES: usize = 1024;
@@ -631,7 +631,7 @@ impl S3Storage {
     /// 的 `shared_storage` 去重）。
     ///
     /// # Errors
-    /// 校验失败（[`validate`]）、xmux/安全层配置非法。
+    /// 校验失败（`validate`）、xmux/安全层配置非法。
     pub fn new(settings: &StreamSettings, config: &Config) -> io::Result<Self> {
         let s3_json =
             config.s3.as_ref().ok_or_else(|| invalid(r#"service "s3" needs an "s3" object"#))?;

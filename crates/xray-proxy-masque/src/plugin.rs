@@ -4,8 +4,8 @@
 //! - **L1**：[`MasquePlugin`] 实现必选方法集（name/version/contract/lifecycle/build）。
 //! - **L2**：build 期经 `ctx.section()` 读 per-plugin 段做**装配校验**（users/address/ mtu 负向
 //!   fail-fast——坑约束 7 装配半边）；权威生产解析面 = xray-core 装配器 （arm_builders
-//!   `masque_entry`）经 [`server::parse_server_settings`] /
-//!   [`client::parse_client_settings`]，两者共用本 crate 解析（同规）。
+//!   `masque_entry`）经 [`crate::server::parse_server_settings`] /
+//!   [`crate::client::parse_client_settings`]，两者共用本 crate 解析（同规）。
 //! - **L3**：无裸能力（无 println/裸 spawn/裸 sleep）。
 //! - **L4**：`assert_plugin_contract!(MasquePlugin)`（tests/plugin_contract.rs）。
 //! - **L5**：装配门——缺 address / 空 users / 非 TLS / warp / 每族多前缀 → build `Err` → 整链
