@@ -513,18 +513,6 @@ impl XdriveHttpClient {
         }
     }
 
-    /// 关闭单元（Go `poolConn.Close`）：closing 立即生效，在途请求跑完后撤客户端。
-    /// 消费方 = 会话慢连接退役（Go `sessionTransport.stalled` → `poolConn.Close`），
-    /// 随 B4 drive 的 `do()` 接入。
-    #[allow(dead_code)] // B4 接线位：template 不消费退役路径（Go template 同款）
-    fn close(&self) {
-        let mut state = self.state.lock();
-        state.closing = true;
-        if state.inflight == 0 {
-            state.client = None;
-        }
-    }
-
     fn client(&self) -> Option<HyperClient> {
         self.state.lock().client.clone()
     }

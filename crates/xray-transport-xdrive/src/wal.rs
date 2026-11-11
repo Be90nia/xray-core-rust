@@ -77,7 +77,9 @@ struct WalWriterShared {
 impl WalWriterShared {
     fn finish_upload(&self) {
         let remaining = self.inflight.0.fetch_sub(1, Ordering::SeqCst) - 1;
-        let _ = self.inflight.1.send(remaining);
+        // `send_replace` 而非 `send`：无订阅者时 tokio `send` 回 Err 且不落值
+        // （关闭序订阅之前全程无订阅者），计数停在初值 0 → 提前落 `.end` 丢段。
+        self.inflight.1.send_replace(remaining);
     }
 }
 
@@ -154,9 +156,9 @@ impl WalWriter {
                 self.flush_locked(&mut state)?;
             }
         }
-        // 等在飞上传收净（Go wg.Wait；watch 变更唤醒，无轮询）。
+        // 等在飞上传收净（Go wg.Wait；watch 变更唤醒，无轮询）。计数以原子为准。
         let mut inflight_rx = self.shared.inflight.1.subscribe();
-        while *inflight_rx.borrow_and_update() > 0 {
+        while self.shared.inflight.0.load(Ordering::SeqCst) > 0 {
             if inflight_rx.changed().await.is_err() {
                 break; // 发送端已亡——防御性退出（本 writer 存活时不发生）
             }
@@ -189,7 +191,7 @@ impl WalWriter {
         state.held = 0;
 
         self.shared.inflight.0.fetch_add(1, Ordering::SeqCst);
-        let _ = self.shared.inflight.1.send(self.shared.inflight.0.load(Ordering::SeqCst));
+        self.shared.inflight.1.send_replace(self.shared.inflight.0.load(Ordering::SeqCst));
         let upload = wal_writer_upload(Arc::clone(&self.shared), seq, chunk);
         if let Err(e) = self.shared.tasks.spawn(upload) {
             // 托管口拒绝（scope 已关）：连接已在拆除，段不会落盘——按存储失败记账。

@@ -17,6 +17,8 @@
 //! 契约注释），无 per-call ctx——单飞等待不可提前取消（Go waiter 返回 ctx.Err
 //! 的分支不存在）；② SessionTransport 的停滞退役钩子（Go `sessionTransport.stalled`）
 //! 未接——client.rs 划归 B2 既有件不在本批领地，attempt 超时只计 `throttle`；
+//! 其唯一消费点 `PoolConn::close` 已随 B5 删除（死方法，bd hjtlk 注记：B6 接
+//! 钩子时随钩子重加）；
 //! ③ announce 读取的 1MiB body cap（Go `maxBodyKey`）无上层注入面，恒 32MiB
 //! cap 兜底；④ 子树删除并发 8 路以 8 分片 join 实现（Go goroutine + chan 信号量
 //! 等价面，first-error 语义保留）。
@@ -60,8 +62,9 @@ const DRIVE_BOUNDARY: &str = "xdrive-boundary";
 const DRIVE_PAGE_SIZE: u32 = 1000;
 /// reserved 车道并发（Go `driveReservedInflight`，槽位控制面）。
 const DRIVE_RESERVED_INFLIGHT: usize = 8;
-/// inline 上限（Go `driveInlineLimit`）：≤ 此值 Put 走 description 内联。
-const DRIVE_INLINE_LIMIT: usize = 12000;
+/// inline 上限（Go `driveInlineLimit`）：≤ 此值 Put 走 description 内联；环槽
+/// announce 的 `first` 内嵌也受此约束（Go Dial 同款）。
+pub(crate) const DRIVE_INLINE_LIMIT: usize = 12000;
 /// 单尝试退避上限（Go `driveMaxBackoff`）。
 const DRIVE_MAX_BACKOFF: Duration = Duration::from_secs(8);
 /// 重试初始退避（Go `driveInitialBackoff`，client.rs 常量为毫秒）。
@@ -70,8 +73,8 @@ const DRIVE_INITIAL_BACKOFF: Duration = Duration::from_millis(DRIVE_INITIAL_BACK
 const DRIVE_COOLDOWN: Duration = Duration::from_secs(2);
 /// 槽位读尝试上限（Go `driveSlotRead`）。
 const DRIVE_SLOT_READ: Duration = Duration::from_secs(3);
-/// 槽位写尝试上限（Go `driveSlotWrite`，仅无 body 的 description 更新）。
-#[allow(dead_code, reason = "B5 环形槽位经 set_slot 消费（Go slotStore 面），B4 先落实现")]
+/// 槽位写尝试上限（Go `driveSlotWrite`，仅无 body 的 description 更新；
+/// B5 经 [`SlotStore::set_slot`] 消费）。
 const DRIVE_SLOT_WRITE: Duration = Duration::from_secs(5);
 /// token 失败退避起点（Go `tokenRefreshBackoff`）。
 const TOKEN_REFRESH_BACKOFF: Duration = Duration::from_secs(30);
@@ -136,7 +139,7 @@ fn auth_error(code: &str) -> io::Error {
     io::Error::other(AuthError(code.to_string()))
 }
 
-fn is_auth_error(e: &io::Error) -> bool {
+pub(crate) fn is_auth_error(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|r| r.is::<AuthError>())
 }
 
@@ -801,7 +804,7 @@ impl DriveStorage {
 
     /// inline 读回（Go `getInline`）：description 的 base64 解码。
     async fn get_inline(&self, id: &str) -> io::Result<Vec<u8>> {
-        let description = self.read_description(id, false).await?;
+        let description = SlotStore::read_description(self, id, false).await?;
         if description.is_empty() {
             return Ok(Vec::new());
         }
@@ -838,112 +841,6 @@ impl DriveStorage {
             }
         }
         first
-    }
-
-    /// 槽位创建（Go `makeSlot`，`slotStore`）：空 description 建档取 id。
-    #[allow(dead_code, reason = "B5 环形槽位消费（Go slotStore 面），B4 先落实现")]
-    pub(crate) async fn make_slot(&self, name: &str, lane: bool) -> io::Result<String> {
-        let metadata = serde_json::json!({
-            "name": flatten(name),
-            "parents": [self.shared.folder],
-            "description": "",
-        });
-        let call = DriveCall {
-            content_type: "application/json; charset=UTF-8",
-            body: Some(Bytes::from(metadata.to_string())),
-            target: format!("{}?fields=id", self.shared.endpoints.files),
-            lane,
-            ..DriveCall::new(Method::POST, String::new())
-        };
-        let (status, payload) = self.do_request(&call).await?;
-        if status != StatusCode::OK.as_u16() {
-            return Err(io::Error::other(format!(
-                "Drive rejected the slot creation of {name} with {status}: {}",
-                String::from_utf8_lossy(&payload)
-            )));
-        }
-        let id = parse_upload_id(&payload)?;
-        if id.is_empty() {
-            return Err(io::Error::other(format!("Drive returned no id for {name}")));
-        }
-        self.remember_id(&flatten(name), &id);
-        Ok(id)
-    }
-
-    /// 槽位写（Go `setSlot`，`slotStore`）：description 必写；body 有则一并
-    /// multipart 上传。404 → NotFound。
-    #[allow(dead_code, reason = "B5 环形槽位消费（Go slotStore 面），B4 先落实现")]
-    pub(crate) async fn set_slot(
-        &self,
-        id: &str,
-        description: &str,
-        body: Option<&[u8]>,
-        lane: bool,
-    ) -> io::Result<()> {
-        let mut call = DriveCall::new(Method::PATCH, String::new());
-        if body.is_none() {
-            call.attempt_timeout = Some(DRIVE_SLOT_WRITE);
-        }
-        call.lane = lane;
-        let metadata = serde_json::json!({ "description": description }).to_string();
-        if let Some(data) = body {
-            call.content_type = "multipart/related; boundary=xdrive-boundary";
-            call.body = Some(Bytes::from(multipart_body(metadata.as_bytes(), data)));
-            call.target = format!(
-                "{}/{}?uploadType=multipart&fields=id&supportsAllDrives=true",
-                self.shared.endpoints.upload,
-                path_escape(id)
-            );
-        } else {
-            call.content_type = "application/json; charset=UTF-8";
-            call.body = Some(Bytes::from(metadata));
-            call.target = format!(
-                "{}/{}?fields=id&supportsAllDrives=true",
-                self.shared.endpoints.files,
-                path_escape(id)
-            );
-        }
-        let (status, payload) = self.do_request(&call).await?;
-        match status {
-            404 => Err(not_found()),
-            200 => Ok(()),
-            other => Err(io::Error::other(format!(
-                "Drive answered {other} for the update of {id}: {}",
-                String::from_utf8_lossy(&payload)
-            ))),
-        }
-    }
-
-    /// 槽位描述读（Go `readDescription`，`slotStore`；3s 尝试上限）。404 → NotFound。
-    pub(crate) async fn read_description(&self, id: &str, lane: bool) -> io::Result<String> {
-        let mut call = DriveCall::new(
-            Method::GET,
-            format!(
-                "{}/{}?fields=description&supportsAllDrives=true",
-                self.shared.endpoints.files,
-                path_escape(id)
-            ),
-        );
-        call.attempt_timeout = Some(DRIVE_SLOT_READ);
-        call.lane = lane;
-        let (status, payload) = self.do_request(&call).await?;
-        match status {
-            404 => Err(not_found()),
-            200 => {
-                let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
-                    io::Error::other(format!("failed to parse the description of {id}: {e}"))
-                })?;
-                Ok(parsed
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string())
-            },
-            other => Err(io::Error::other(format!(
-                "Drive answered {other} for the description of {id}: {}",
-                String::from_utf8_lossy(&payload)
-            ))),
-        }
     }
 
     /// 槽位体读（Go `readBody`，`slotStore`）。404 → NotFound。
@@ -1255,11 +1152,120 @@ impl Storage for DriveStorage {
     fn as_slot_store(&self) -> Option<&dyn SlotStore> {
         Some(self)
     }
+
+    fn slot_store(self: Arc<Self>) -> Option<Arc<dyn SlotStore>> {
+        Some(self)
+    }
 }
 
-/// 槽位能力标记（Go `slotStore` 接口断言面；四槽位方法为 [`DriveStorage`]
-/// 固有方法，B5 环形槽位按 trait 形态消费）。
-impl SlotStore for DriveStorage {}
+/// 槽位四方法（Go `slotStore` 接口的 Rust 实现；B4 落请求面、B5 上收 trait 并
+/// 由 `slots.rs` 环形槽位消费）。`lane` 进 reserved 车道（Go `laneKey`）。
+#[async_trait]
+impl SlotStore for DriveStorage {
+    async fn make_slot(&self, name: &str, lane: bool) -> io::Result<String> {
+        let metadata = serde_json::json!({
+            "name": flatten(name),
+            "parents": [self.shared.folder],
+            "description": "",
+        });
+        let call = DriveCall {
+            content_type: "application/json; charset=UTF-8",
+            body: Some(Bytes::from(metadata.to_string())),
+            target: format!("{}?fields=id", self.shared.endpoints.files),
+            lane,
+            ..DriveCall::new(Method::POST, String::new())
+        };
+        let (status, payload) = self.do_request(&call).await?;
+        if status != StatusCode::OK.as_u16() {
+            return Err(io::Error::other(format!(
+                "Drive rejected the slot creation of {name} with {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let id = parse_upload_id(&payload)?;
+        if id.is_empty() {
+            return Err(io::Error::other(format!("Drive returned no id for {name}")));
+        }
+        self.remember_id(&flatten(name), &id);
+        Ok(id)
+    }
+
+    async fn set_slot(
+        &self,
+        id: &str,
+        description: &str,
+        body: Option<&[u8]>,
+        lane: bool,
+    ) -> io::Result<()> {
+        let mut call = DriveCall::new(Method::PATCH, String::new());
+        if body.is_none() {
+            call.attempt_timeout = Some(DRIVE_SLOT_WRITE);
+        }
+        call.lane = lane;
+        let metadata = serde_json::json!({ "description": description }).to_string();
+        if let Some(data) = body {
+            call.content_type = "multipart/related; boundary=xdrive-boundary";
+            call.body = Some(Bytes::from(multipart_body(metadata.as_bytes(), data)));
+            call.target = format!(
+                "{}/{}?uploadType=multipart&fields=id&supportsAllDrives=true",
+                self.shared.endpoints.upload,
+                path_escape(id)
+            );
+        } else {
+            call.content_type = "application/json; charset=UTF-8";
+            call.body = Some(Bytes::from(metadata));
+            call.target = format!(
+                "{}/{}?fields=id&supportsAllDrives=true",
+                self.shared.endpoints.files,
+                path_escape(id)
+            );
+        }
+        let (status, payload) = self.do_request(&call).await?;
+        match status {
+            404 => Err(not_found()),
+            200 => Ok(()),
+            other => Err(io::Error::other(format!(
+                "Drive answered {other} for the update of {id}: {}",
+                String::from_utf8_lossy(&payload)
+            ))),
+        }
+    }
+
+    async fn read_description(&self, id: &str, lane: bool) -> io::Result<String> {
+        let mut call = DriveCall::new(
+            Method::GET,
+            format!(
+                "{}/{}?fields=description&supportsAllDrives=true",
+                self.shared.endpoints.files,
+                path_escape(id)
+            ),
+        );
+        call.attempt_timeout = Some(DRIVE_SLOT_READ);
+        call.lane = lane;
+        let (status, payload) = self.do_request(&call).await?;
+        match status {
+            404 => Err(not_found()),
+            200 => {
+                let parsed: serde_json::Value = serde_json::from_slice(&payload).map_err(|e| {
+                    io::Error::other(format!("failed to parse the description of {id}: {e}"))
+                })?;
+                Ok(parsed
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string())
+            },
+            other => Err(io::Error::other(format!(
+                "Drive answered {other} for the description of {id}: {}",
+                String::from_utf8_lossy(&payload)
+            ))),
+        }
+    }
+
+    async fn read_body(&self, id: &str) -> io::Result<Vec<u8>> {
+        self.read_body_by_id(id).await
+    }
+}
 
 #[cfg(test)]
 mod tests {

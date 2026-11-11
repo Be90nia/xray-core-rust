@@ -51,6 +51,7 @@ pub mod local;
 pub mod params;
 pub mod register;
 pub mod s3;
+pub mod slots;
 pub mod storage;
 pub mod template;
 pub mod wal;

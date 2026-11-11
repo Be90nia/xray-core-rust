@@ -1,8 +1,8 @@
 //! `Storage` 契约 + 构造分派 + 共享实例表。对应 Go `storage.go`。
 //!
 //! 归属（规划 §4.1）：对象名布局是 xdrive 的 wire 契约 → 协议方向件留本 crate。
-//! [`SlotStore`] 是 B5 环形槽位的 trait 形态（Go `slotStore`）；B1 仅落形态与
-//! 判定位，Drive 实现 B4 落、环形槽方法 B5 填。
+//! [`SlotStore`] 是 B5 环形槽位的 trait 形态（Go `slotStore`）；B4 落 Drive 实现、
+//! B5 填四方法并由 `slots.rs` 消费。
 
 use std::{collections::HashMap, io, sync::Arc};
 
@@ -51,15 +51,43 @@ pub trait Storage: Send + Sync {
     }
 
     /// 槽位能力判定位（Go `storage.(slotStore)` 类型断言的等价口）。
-    /// 仅 google-drive（B4）返回 `Some`。
+    /// 仅 google-drive 有槽位能力。
     fn as_slot_store(&self) -> Option<&dyn SlotStore> {
+        None
+    }
+
+    /// 槽位能力的所有权转移面（`as_slot_store` 的 Arc 形态）：环槽读写任务
+    /// 需要 `'static` 的槽位存储句柄（Go 把 `slotStore` 以引用传给
+    /// slotWriter/slotReader 的等价面）。仅 google-drive 覆写。
+    fn slot_store(self: Arc<Self>) -> Option<Arc<dyn SlotStore>> {
         None
     }
 }
 
-/// 环形槽位存储契约（Go `slotStore`）。B5 填 `makeRing`/`setSlot`/`getSlot`；
-/// B1 只落 trait 形态供 `Params::for_storage` 判定。
-pub trait SlotStore: Send + Sync {}
+/// 环形槽位存储契约（Go `slotStore`）：按 id 写读对象（description + body）。
+/// `lane=true` 走 Drive reserved 车道（Go `laneKey`，槽位控制面）；仅
+/// google-drive 实现（Go 实测 template/s3/local 均无 makeSlot/setSlot）。
+#[async_trait]
+pub trait SlotStore: Send + Sync {
+    /// 槽位创建（Go `makeSlot`）：空 description 建档，返回后端对象 id。
+    async fn make_slot(&self, name: &str, lane: bool) -> io::Result<String>;
+
+    /// 槽位写（Go `setSlot`）：description 必写；`body` 有则一并写入。
+    async fn set_slot(
+        &self,
+        id: &str,
+        description: &str,
+        body: Option<&[u8]>,
+        lane: bool,
+    ) -> io::Result<()>;
+
+    /// 槽位描述读（Go `readDescription`）；缺失 →
+    /// [`ErrorKind::NotFound`](std::io::ErrorKind)（[`is_not_found`] 判定）。
+    async fn read_description(&self, id: &str, lane: bool) -> io::Result<String>;
+
+    /// 槽位体读（Go `readBody`）；缺失 → NotFound。
+    async fn read_body(&self, id: &str) -> io::Result<Vec<u8>>;
+}
 
 /// 「对象不存在」哨兵（Go `errNotFound`）。
 pub fn not_found() -> io::Error {
