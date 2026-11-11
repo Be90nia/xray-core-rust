@@ -7122,6 +7122,9 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32fast",
+ "futures-util",
+ "h3",
+ "h3-quinn",
  "hmac",
  "http",
  "http-body",
@@ -7130,6 +7133,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "parking_lot",
+ "quinn",
  "regex",
  "rustls",
  "serde_json",
@@ -7144,6 +7148,7 @@ dependencies = [
  "xray-frame",
  "xray-tls",
  "xray-transport",
+ "xray-transport-quic",
  "xray-transport-splithttp",
 ]
 

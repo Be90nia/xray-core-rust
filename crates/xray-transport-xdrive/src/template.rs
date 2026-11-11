@@ -24,8 +24,8 @@ use xray_transport::{dialer::StreamSettings, retry::exponential_backoff_if};
 use crate::{
     client::{
         ClientCore, ConnPool, DRIVE_BACKOFF_BUDGET, DRIVE_INITIAL_BACKOFF_MS, DRIVE_MAX_ATTEMPTS,
-        DRIVE_MAX_INFLIGHT, DRIVE_TIMEOUT, HyperClient, MAX_TEMPLATE_CONCURRENCY, OutRequest,
-        SessionTransport, service_round_trip,
+        DRIVE_MAX_INFLIGHT, DRIVE_TIMEOUT, MAX_TEMPLATE_CONCURRENCY, OutRequest, SessionTransport,
+        UnitClient,
     },
     config::Config,
     jsonpath::{json_number, json_string},
@@ -301,7 +301,7 @@ struct TemplateShared {
     pool: Arc<ConnPool>,
     tmpl: StorageTemplate,
     /// token 端点独立客户端（Go `tokenClient`）。
-    token_client: HyperClient,
+    token_client: UnitClient,
     folder: String,
     secrets: Vec<String>,
     /// oauth2 token 缓存（Go `token`/`tokenExpiry`：单 token + 到期时刻，
@@ -322,10 +322,10 @@ pub struct TemplateStorage {
 
 #[allow(
     clippy::large_enum_variant,
-    reason = "基座独立 hyper 客户端（~344B）vs 会话传输句柄（32B）是 Go templateStorage 双形态的固有尺寸；单存储仅两实例，不装箱"
+    reason = "基座独立请求客户端 vs 会话传输句柄（32B）是 Go templateStorage 双形态的固有尺寸；单存储仅两实例，不装箱"
 )]
 enum Sink {
-    Base(HyperClient),
+    Base(UnitClient),
     Session(SessionTransport),
 }
 
@@ -354,19 +354,19 @@ impl TemplateStorage {
         let keepalive_period =
             crate::client::xdrive_xmux_config(config.xmux.as_ref(), &config.service, config.h3)?
                 .h_keep_alive_period;
-        let core = ClientCore::from_settings(settings, keepalive_period)?;
+        let core = ClientCore::from_settings(settings, keepalive_period, config.h3)?;
         let clock = xray_frame::compat::clock();
         Ok(Self {
             shared: Arc::new(TemplateShared {
                 pool,
-                token_client: crate::client::build_hyper_client(&core),
+                token_client: crate::client::build_unit_client(&core)?,
                 folder: config.remote_folder.clone(),
                 secrets: config.secrets.clone(),
                 token_cache: SyncTtlCache::new(clock, 1),
                 token_gate: tokio::sync::Mutex::new(()),
                 tmpl,
             }),
-            sink: Sink::Base(crate::client::build_hyper_client(&core)),
+            sink: Sink::Base(crate::client::build_unit_client(&core)?),
             inflight: Arc::new(Semaphore::new(conc)),
             conc,
         })
@@ -454,21 +454,23 @@ impl TemplateStorage {
             .token_url
             .parse()
             .map_err(|e| io::Error::other(format!("failed to build the token request: {e}")))?;
-        let (status, payload) = service_round_trip(
-            &self.shared.token_client,
-            OutRequest {
-                method: Method::POST,
-                uri,
-                headers: vec![(
-                    "Content-Type".to_string(),
-                    "application/x-www-form-urlencoded".to_string(),
-                )],
-                body: Some(form.into()),
-            },
-            DRIVE_TIMEOUT,
-        )
-        .await
-        .map_err(|e| io::Error::other(format!("failed to fetch the token: {e}")))?;
+        let (status, payload) = self
+            .shared
+            .token_client
+            .round_trip(
+                OutRequest {
+                    method: Method::POST,
+                    uri,
+                    headers: vec![(
+                        "Content-Type".to_string(),
+                        "application/x-www-form-urlencoded".to_string(),
+                    )],
+                    body: Some(form.into()),
+                },
+                DRIVE_TIMEOUT,
+            )
+            .await
+            .map_err(|e| io::Error::other(format!("failed to fetch the token: {e}")))?;
         if status != StatusCode::OK {
             return Err(io::Error::other(format!(
                 "the token endpoint answered {}: {}",
@@ -510,7 +512,7 @@ impl TemplateStorage {
     /// 发送面（Go `client.Do` 的两路：基座独立客户端 / 会话 XMUX 池）。
     async fn send(&self, req: OutRequest) -> io::Result<(StatusCode, Bytes)> {
         match &self.sink {
-            Sink::Base(client) => service_round_trip(client, req, DRIVE_TIMEOUT).await,
+            Sink::Base(client) => client.round_trip(req, DRIVE_TIMEOUT).await,
             Sink::Session(session) => session.round_trip(req, DRIVE_TIMEOUT).await,
         }
     }

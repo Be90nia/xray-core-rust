@@ -46,8 +46,8 @@ use xray_transport::dialer::StreamSettings;
 use crate::{
     client::{
         ClientCore, ConnPool, DRIVE_INITIAL_BACKOFF_MS, DRIVE_MAX_ATTEMPTS, DRIVE_MAX_INFLIGHT,
-        DRIVE_TIMEOUT, HyperClient, OutRequest, SessionTransport, build_hyper_client,
-        service_round_trip, xdrive_xmux_config,
+        DRIVE_TIMEOUT, OutRequest, SessionTransport, UnitClient, build_unit_client,
+        xdrive_xmux_config,
     },
     config::Config,
     storage::{Entry, SlotStore, Storage, is_not_found, not_found},
@@ -238,7 +238,7 @@ struct DriveShared {
     client_secret: String,
     refresh_token: String,
     /// token 端点独立客户端（Go `tokenClient`）。
-    token_client: HyperClient,
+    token_client: UnitClient,
     endpoints: Endpoints,
     token: parking_lot::Mutex<TokenState>,
     /// 取 token 单飞闸（Go `tokenMu` 持锁跨取 token 流程的 async 对应）。
@@ -265,7 +265,7 @@ pub struct DriveStorage {
     reason = "基座独立 hyper 客户端 vs 会话传输句柄是 Go driveStorage 双形态的固有尺寸；单存储仅两实例，不装箱"
 )]
 enum Sink {
-    Base(HyperClient),
+    Base(UnitClient),
     Session(SessionTransport),
 }
 
@@ -325,8 +325,8 @@ impl DriveStorage {
         let pool = Arc::new(ConnPool::new(settings, config)?);
         let keepalive = xdrive_xmux_config(config.xmux.as_ref(), &config.service, config.h3)?
             .h_keep_alive_period;
-        let core = ClientCore::from_settings(settings, keepalive)?;
-        let base_client = build_hyper_client(&core);
+        let core = ClientCore::from_settings(settings, keepalive, config.h3)?;
+        let base_client = build_unit_client(&core)?;
         Ok(Self::build_parts(
             pool,
             config.remote_folder.clone(),
@@ -344,7 +344,7 @@ impl DriveStorage {
         client_id: String,
         client_secret: String,
         refresh_token: String,
-        token_client: HyperClient,
+        token_client: UnitClient,
         endpoints: Endpoints,
     ) -> Self {
         let now = xray_frame::compat::clock().now_instant();
@@ -386,7 +386,7 @@ impl DriveStorage {
         }
         let req = OutRequest { method: call.method.clone(), uri, headers, body: call.body.clone() };
         match &self.sink {
-            Sink::Base(client) => service_round_trip(client, req, DRIVE_TIMEOUT).await,
+            Sink::Base(client) => client.round_trip(req, DRIVE_TIMEOUT).await,
             Sink::Session(session) => session.round_trip(req, DRIVE_TIMEOUT).await,
         }
     }
@@ -874,7 +874,7 @@ fn parse_upload_id(payload: &[u8]) -> io::Result<String> {
 
 /// token 端点一次取回（Go `fetchToken` 的自由函数面：前台与后台任务共用）。
 async fn fetch_token_via(
-    client: &HyperClient,
+    client: &UnitClient,
     token_url: &str,
     client_id: &str,
     client_secret: &str,
@@ -889,21 +889,21 @@ async fn fetch_token_via(
     let uri: Uri = token_url
         .parse()
         .map_err(|e| io::Error::other(format!("failed to build the token request: {e}")))?;
-    let (status, payload) = service_round_trip(
-        client,
-        OutRequest {
-            method: Method::POST,
-            uri,
-            headers: vec![(
-                "Content-Type".to_string(),
-                "application/x-www-form-urlencoded".to_string(),
-            )],
-            body: Some(form.into()),
-        },
-        DRIVE_TIMEOUT,
-    )
-    .await
-    .map_err(|e| io::Error::other(format!("failed to refresh the access token: {e}")))?;
+    let (status, payload) = client
+        .round_trip(
+            OutRequest {
+                method: Method::POST,
+                uri,
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "application/x-www-form-urlencoded".to_string(),
+                )],
+                body: Some(form.into()),
+            },
+            DRIVE_TIMEOUT,
+        )
+        .await
+        .map_err(|e| io::Error::other(format!("failed to refresh the access token: {e}")))?;
 
     if status != StatusCode::OK {
         let text = String::from_utf8_lossy(&payload);
@@ -934,7 +934,7 @@ async fn fetch_token_via(
 }
 
 /// `with_base_url` 需要的 token 客户端克隆面（hyper 客户端 Clone 廉价）。
-fn shared_token_client_of(shared: &DriveShared) -> HyperClient {
+fn shared_token_client_of(shared: &DriveShared) -> UnitClient {
     shared.token_client.clone()
 }
 

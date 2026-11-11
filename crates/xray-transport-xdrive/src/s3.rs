@@ -41,8 +41,8 @@ use xray_transport::dialer::StreamSettings;
 use crate::{
     client::{
         ClientCore, ConnPool, DRIVE_INITIAL_BACKOFF_MS, DRIVE_MAX_ATTEMPTS, DRIVE_MAX_INFLIGHT,
-        DRIVE_TIMEOUT, HyperClient, OutRequest, SessionTransport, build_hyper_client,
-        service_round_trip, xdrive_xmux_config,
+        DRIVE_TIMEOUT, OutRequest, SessionTransport, UnitClient, build_unit_client,
+        xdrive_xmux_config,
     },
     config::Config,
     storage::{Entry, Storage, not_found},
@@ -617,10 +617,10 @@ pub struct S3Storage {
 
 #[allow(
     clippy::large_enum_variant,
-    reason = "基座独立 hyper 客户端 vs 会话传输句柄是 Go s3Storage 双形态的固有尺寸；单存储仅两实例，不装箱"
+    reason = "基座独立请求客户端 vs 会话传输句柄是 Go s3Storage 双形态的固有尺寸；单存储仅两实例，不装箱"
 )]
 enum Sink {
-    Base(HyperClient),
+    Base(UnitClient),
     Session(SessionTransport),
 }
 
@@ -660,7 +660,7 @@ impl S3Storage {
         let pool = Arc::new(ConnPool::new(settings, config)?);
         let keepalive = xdrive_xmux_config(config.xmux.as_ref(), &config.service, config.h3)?
             .h_keep_alive_period;
-        let core = ClientCore::from_settings(settings, keepalive)?;
+        let core = ClientCore::from_settings(settings, keepalive, config.h3)?;
         Ok(Self {
             shared: Arc::new(S3Shared {
                 pool,
@@ -672,7 +672,7 @@ impl S3Storage {
                 secret_key: config.secrets[1].clone(),
                 token: config.secrets.get(2).cloned().unwrap_or_default(),
             }),
-            sink: Sink::Base(build_hyper_client(&core)),
+            sink: Sink::Base(build_unit_client(&core)?),
             inflight: Arc::new(Semaphore::new(DRIVE_MAX_INFLIGHT)),
         })
     }
@@ -702,7 +702,7 @@ impl S3Storage {
     /// 发送面（Go `client.Do` 两路）。
     async fn send(&self, req: OutRequest) -> io::Result<(StatusCode, bytes::Bytes)> {
         match &self.sink {
-            Sink::Base(client) => service_round_trip(client, req, DRIVE_TIMEOUT).await,
+            Sink::Base(client) => client.round_trip(req, DRIVE_TIMEOUT).await,
             Sink::Session(session) => session.round_trip(req, DRIVE_TIMEOUT).await,
         }
     }

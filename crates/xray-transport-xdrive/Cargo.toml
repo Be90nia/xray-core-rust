@@ -46,6 +46,14 @@ http-body = "1"
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 tower-service = "0.3"
+# h3 面（Go client.go 的 http3.Transport 分支）：h3 0.0.8 / h3-quinn 0.0.10 /
+# quinn 0.11 均已在 workspace 依赖树内（splithttp H3 / quic crate 同源），不新增图外 crate。
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+quinn = { workspace = true }
+futures-util = { workspace = true }
+# h3 driver 的 poll_close（与 splithttp h3_client 同款消费面）
+xray-transport-quic = { path = "../xray-transport-quic" }
 # template namesRegex（Go regexp 对应；1.12 已在依赖树内——tonic/tracing-subscriber
 # 传递引入，不新增 crate 入图）
 regex = "1"

@@ -14,8 +14,9 @@
 //! | `poolConn`（xmux 连接单元：closing/inflight/取消） | `XdriveHttpClient` |
 //! | `sessionTransport`（会话在池连接间迁移 + 慢连接退役） | `SessionTransport`（退役 `stalled` 钩子随 B4 drive 的 `do()` 接入——template 不消费，Go 同款） |
 //!
-//! 差异登记：h3 分支（`http3.Transport`）属 B6；btls uTLS 指纹出站随 B6 互操作轮
-//! 接入（B2 只走 rustls + 明文两路，Go 指纹仅在显式配置时启用）。
+//! 差异登记：h3 分支（Go `http3.Transport`）见 `crate::h3`——`tlsSettings.alpn ==
+//! ["h3"]` 时单元走 QUIC，h2/h1 走 hyper；btls uTLS 指纹出站仍只有 rustls
+//! 一路（Go 指纹仅在显式配置时启用）。
 
 use std::{
     future::Future,
@@ -66,7 +67,7 @@ pub(crate) const MAX_TEMPLATE_CONCURRENCY: usize = 256;
 const CHROME_H2_KEEP_ALIVE: Duration = Duration::from_secs(45);
 /// 请求体按 16KiB 帧推进（Go `progressBody.Read` 的 16<<10 上限：h2 一次读可达
 /// 512KiB，慢链路上会伪装成无进展）。
-const REQUEST_PROGRESS_CHUNK: usize = 16 << 10;
+pub(crate) const REQUEST_PROGRESS_CHUNK: usize = 16 << 10;
 /// 每池单元（= 每 xmux 连接）的空闲连接上界：h2 单连接复用语义的池面表达
 /// （Go `secure(1)` MaxConnsPerHost=1；h1 并发由池按需开连接、空闲只留一条）。
 const POOL_MAX_IDLE_PER_HOST: usize = 1;
@@ -87,23 +88,43 @@ pub(crate) struct OutRequest {
 // ── 停滞检测（Go serviceTransport + progressBody + stalled）─────────────────
 
 /// 「最近一次字节推进」时刻（时钟走 compat 端口，测试可注入）。select 看门狗
-/// 每步检查静默时长，超过 stall 即断（Go `errStalled`）。
-struct StallGuard {
+/// 每步检查静默时长，超过 stall 即断（Go `errStalled`）。h3 面复用同一守卫。
+pub(crate) struct StallGuard {
     clock: Arc<dyn Clock>,
     last: parking_lot::Mutex<std::time::Instant>,
 }
 
 impl StallGuard {
-    fn new(clock: Arc<dyn Clock>) -> Self {
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
         Self { last: parking_lot::Mutex::new(clock.now_instant()), clock }
     }
 
-    fn bump(&self) {
+    pub(crate) fn bump(&self) {
         *self.last.lock() = self.clock.now_instant();
     }
 
-    fn silence(&self) -> Duration {
+    pub(crate) fn silence(&self) -> Duration {
         self.clock.now_instant().saturating_duration_since(*self.last.lock())
+    }
+}
+
+/// 一个等待步骤套上停滞看门狗（h3 面用：每步 `await` 单独成点，与 h2 的
+/// `progressBody` 逐帧推进同口径）。
+pub(crate) async fn with_stall<T>(
+    fut: impl Future<Output = io::Result<T>>,
+    guard: &StallGuard,
+    stall: Duration,
+) -> io::Result<T> {
+    let mut fut = Box::pin(fut);
+    loop {
+        tokio::select! {
+            r = fut.as_mut() => return r,
+            _ = tokio::time::sleep(stall) => {
+                if guard.silence() >= stall {
+                    return Err(err_stalled());
+                }
+            },
+        }
     }
 }
 
@@ -138,7 +159,7 @@ impl http_body::Body for ProgressBody {
     }
 }
 
-fn err_stalled() -> io::Error {
+pub(crate) fn err_stalled() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "the request made no progress")
 }
 
@@ -218,17 +239,27 @@ pub(crate) struct ClientCore {
     pub(crate) fronting: Option<(Address, u16)>,
     /// h2 keep-alive PING 周期（Go `keepAlive`；None = 关，Go `HKeepAlivePeriod` <0）。
     pub(crate) keepalive: Option<Duration>,
+    /// h3 面（`tlsSettings.alpn == ["h3"]`，Go `newServiceClient` 的 h3 分支）。
+    pub(crate) h3: bool,
+    /// `finalmask.quicParams`（Go `streamSettings.QuicParams`；h3 的窗口/idle/CC 源）。
+    pub(crate) quic_params: Option<xray_transport::memory_settings::QuicParamsConfig>,
+    /// h3 PING 周期（Go `h3KeepAlive`：只在 `xmux.hKeepAlivePeriod > 0` 时才有值——
+    /// h3 缺省不发 keep-alive，见 client.go:130 注释）。
+    pub(crate) h3_keepalive: Option<Duration>,
 }
 
 impl ClientCore {
     /// 从流设置构造（Go `newServiceClient` 头段）。`h_keep_alive_period` 取
-    /// xmux 的 `HKeepAlivePeriod`（>0 覆盖 / <0 关闭 / 其余缺省 45s）。
+    /// xmux 的 `HKeepAlivePeriod`（>0 覆盖 / <0 关闭 / 其余缺省 45s）；`h3` 取
+    /// [`Config::h3`](crate::config::Config::h3)。
     ///
     /// # Errors
-    /// 安全层配置解析失败（[`xray_tls::client_config::build_client_config`]）。
+    /// 安全层配置解析失败（[`xray_tls::client_config::build_client_config`]）或
+    /// `finalmask.quicParams` 解析失败。
     pub(crate) fn from_settings(
         settings: &StreamSettings,
         h_keep_alive_period: i64,
+        h3: bool,
     ) -> io::Result<Self> {
         let tls = xray_tls::client_config::build_client_config(
             &settings.security,
@@ -240,7 +271,23 @@ impl ClientCore {
             p if p < 0 => None,
             _ => Some(CHROME_H2_KEEP_ALIVE),
         };
-        Ok(Self { tls, fronting: settings.fronting.clone(), keepalive })
+        // Go `h3KeepAlive = keepAlive` 只在 period > 0 分支内赋值；<0 / 缺省保持 0
+        //（⇒ quicParams.kKeepAlivePeriod 为 0 时 h3 不发 PING）。
+        let h3_keepalive = match h_keep_alive_period {
+            p if p > 0 => Some(Duration::from_secs(u64::try_from(p).unwrap_or(u64::MAX))),
+            _ => None,
+        };
+        let quic_params = xray_transport::memory_settings::parse_quic_params_config(
+            settings.finalmask_json.as_ref().and_then(|f| f.get("quicParams")),
+        )?;
+        Ok(Self {
+            tls,
+            fronting: settings.fronting.clone(),
+            keepalive,
+            h3,
+            quic_params,
+            h3_keepalive,
+        })
     }
 }
 
@@ -467,10 +514,79 @@ pub(crate) fn build_hyper_client(core: &ClientCore) -> HyperClient {
     client_builder.build(connector)
 }
 
+// ── 请求面分派（h2/h1 vs h3）─────────────────────────────────────────────
+
+/// 一个客户端单元：hyper（h2/h1）或 h3。Go 形态 = `newServiceClient` 末尾按
+/// `tlsConfig.NextProtocol == ["h3"]` 二选一（`secureTransport` 或 `http3.Transport`）。
+///
+/// 两个 variant 都装箱：单元数量 = 池单元数（冷路径，非每请求），换来 enum 尺寸恒定
+/// ——否则 hyper 客户端（~数十字节以上）与 `Arc` 差过 `large_enum_variant` 阈值。
+#[derive(Clone)]
+pub(crate) enum UnitClient {
+    Hyper(Box<HyperClient>),
+    H3(Arc<crate::h3::H3Client>),
+}
+
+impl UnitClient {
+    /// 一条请求（Go `RoundTrip`）：两条路同语义同停滞口径。
+    ///
+    /// # Errors
+    /// 连接/协议错误或停滞。
+    pub(crate) async fn round_trip(
+        &self,
+        req: OutRequest,
+        stall: Duration,
+    ) -> io::Result<(StatusCode, Bytes)> {
+        match self {
+            Self::Hyper(client) => service_round_trip(client, req, stall).await,
+            Self::H3(client) => client.round_trip(req, stall).await,
+        }
+    }
+}
+
+/// 单元装配模板：把**唯一可失败**的 h3 参数校验（TLS/quicParams）提到构造期——
+/// xmux 的单元工厂闭包不可失败。
+#[derive(Clone)]
+pub(crate) enum UnitTemplate {
+    Hyper(Box<ClientCore>),
+    H3(Arc<crate::h3::H3Params>),
+}
+
+impl UnitTemplate {
+    /// # Errors
+    /// h3 但缺 TLS 设置，或 `quicParams` 非法（CC/窗口）。
+    pub(crate) fn new(core: &ClientCore) -> io::Result<Self> {
+        if core.h3 {
+            Ok(Self::H3(Arc::new(crate::h3::H3Params::new(core)?)))
+        } else {
+            Ok(Self::Hyper(Box::new(core.clone())))
+        }
+    }
+
+    /// 产出一个单元（h3 参数共享、连接表逐单元独立——同 Go 每单元一个 client）。
+    fn unit(&self) -> UnitClient {
+        match self {
+            Self::Hyper(core) => UnitClient::Hyper(Box::new(build_hyper_client(core))),
+            Self::H3(params) => {
+                UnitClient::H3(Arc::new(crate::h3::H3Client::new(Arc::clone(params))))
+            },
+        }
+    }
+}
+
+/// 一次性单元（token 端点 / 基座直连面；Go 同一个 `newServiceClient` 产出的 client）。
+///
+/// # Errors
+/// 同 [`UnitTemplate::new`]。
+pub(crate) fn build_unit_client(core: &ClientCore) -> io::Result<UnitClient> {
+    Ok(UnitTemplate::new(core)?.unit())
+}
+
 // ── xmux 连接单元（Go poolConn）───────────────────────────────────────────
 
-/// xmux 池连接单元：每单元一个 hyper 客户端（≈ 一条 h2 连接），closing/inflight
-/// 记账对齐 Go `poolConn`（IsClosed=closing 立即真；取消面 = inflight 归零才撤客户端）。
+/// xmux 池连接单元：每单元一个请求面客户端（≈ 一条 h2 连接 / 一条 h3 连接），
+/// closing/inflight 记账对齐 Go `poolConn`（IsClosed=closing 立即真；取消面 =
+/// inflight 归零才撤客户端）。
 pub(crate) struct XdriveHttpClient {
     state: parking_lot::Mutex<PoolConnState>,
     /// 单元出生时刻（hMaxReusableSecs 的近似退役判定：Go sessionTransport 读
@@ -481,16 +597,16 @@ pub(crate) struct XdriveHttpClient {
 }
 
 struct PoolConnState {
-    client: Option<HyperClient>,
+    client: Option<UnitClient>,
     inflight: usize,
     closing: bool,
 }
 
 impl XdriveHttpClient {
-    fn new(core: &ClientCore, reuse_limit: Option<Duration>, clock: Arc<dyn Clock>) -> Self {
+    fn new(template: &UnitTemplate, reuse_limit: Option<Duration>, clock: Arc<dyn Clock>) -> Self {
         Self {
             state: parking_lot::Mutex::new(PoolConnState {
-                client: Some(build_hyper_client(core)),
+                client: Some(template.unit()),
                 inflight: 0,
                 closing: false,
             }),
@@ -513,7 +629,7 @@ impl XdriveHttpClient {
         }
     }
 
-    fn client(&self) -> Option<HyperClient> {
+    fn client(&self) -> Option<UnitClient> {
         self.state.lock().client.clone()
     }
 
@@ -543,10 +659,10 @@ impl ConnPool {
     /// 一次完成、闭包只做装配，工厂闭包不可失败）。
     ///
     /// # Errors
-    /// 安全层配置解析失败。
+    /// 安全层配置解析失败，或 h3 面参数非法（`UnitTemplate::new`）。
     pub(crate) fn new(settings: &StreamSettings, config: &Config) -> io::Result<Self> {
         let xmux = xdrive_xmux_config(config.xmux.as_ref(), &config.service, config.h3)?;
-        let core = ClientCore::from_settings(settings, xmux.h_keep_alive_period)?;
+        let core = ClientCore::from_settings(settings, xmux.h_keep_alive_period, config.h3)?;
         Self::with_core(core, xmux)
     }
 
@@ -554,6 +670,8 @@ impl ConnPool {
     /// 复用同一核建独立客户端，免重复解析 TLS 配置）。
     pub(crate) fn with_core(core: ClientCore, xmux: XmuxConfig) -> io::Result<Self> {
         let clock = xray_frame::compat::clock();
+        // 单元工厂不可失败 ⇒ h3 参数校验（TLS/quicParams）在池外一次完成。
+        let template = UnitTemplate::new(&core)?;
         // Go newXmuxClient 对 hMaxReusableSecs 逐单元采样；此处同分布自采样
         // （XmuxClient 私有字段不可见，见 [`XdriveHttpClient::born`] 的偏差登记）。
         let sample_xmux = xmux.clone();
@@ -561,7 +679,7 @@ impl ConnPool {
             let secs = sample_xmux.normalized_h_max_reusable_secs().rand();
             let reuse_limit =
                 (secs > 0).then(|| Duration::from_secs(u64::try_from(secs).unwrap_or(u64::MAX)));
-            XdriveHttpClient::new(&core, reuse_limit, Arc::clone(&clock))
+            XdriveHttpClient::new(&template, reuse_limit, Arc::clone(&clock))
         }));
         Ok(Self { xmux })
     }
@@ -707,14 +825,14 @@ impl SessionTransport {
         };
         let conn = &client.conn;
 
-        let hyper_client = match conn.client() {
+        let unit_client = match conn.client() {
             Some(client) => client,
             None => {
                 conn.finish();
                 return Err(io::Error::other("the session is closed"));
             },
         };
-        let result = service_round_trip(&hyper_client, req, stall).await;
+        let result = unit_client.round_trip(req, stall).await;
         // served 标记（退役判定输入）随 B4 stalled 钩子接入。
         conn.finish();
         result
@@ -779,14 +897,27 @@ mod tests {
         let settings = StreamSettings::tcp();
         // 缺省 45s（ChromeH2KeepAlivePeriod）。
         assert_eq!(
-            ClientCore::from_settings(&settings, 0).unwrap().keepalive,
+            ClientCore::from_settings(&settings, 0, false).unwrap().keepalive,
             Some(CHROME_H2_KEEP_ALIVE)
         );
         // >0 覆盖 / <0 关闭（Go HKeepAlivePeriod 语义）。
         assert_eq!(
-            ClientCore::from_settings(&settings, 60).unwrap().keepalive,
+            ClientCore::from_settings(&settings, 60, false).unwrap().keepalive,
             Some(Duration::from_secs(60))
         );
-        assert_eq!(ClientCore::from_settings(&settings, -1).unwrap().keepalive, None);
+        assert_eq!(ClientCore::from_settings(&settings, -1, false).unwrap().keepalive, None);
+    }
+
+    #[test]
+    fn h3_keepalive_only_when_xmux_period_is_positive() {
+        // Go `h3KeepAlive = keepAlive` 只在 period > 0 分支内赋值：缺省/<0 ⇒ 发 0（无
+        // QUIC PING；client.go:130「h3 keeps alive only when asked to」）。
+        let settings = StreamSettings::tcp();
+        assert_eq!(ClientCore::from_settings(&settings, 0, true).unwrap().h3_keepalive, None);
+        assert_eq!(ClientCore::from_settings(&settings, -1, true).unwrap().h3_keepalive, None);
+        assert_eq!(
+            ClientCore::from_settings(&settings, 30, true).unwrap().h3_keepalive,
+            Some(Duration::from_secs(30))
+        );
     }
 }
