@@ -44,10 +44,13 @@ pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
 pub mod client;
 pub mod config;
 pub mod conn;
+// B4：google-drive 后端（bd hjtlk；模块声明与 B3 的 s3 同排期落位）。
+pub mod drive;
 pub(crate) mod jsonpath;
 pub mod local;
 pub mod params;
 pub mod register;
+pub mod s3;
 pub mod storage;
 pub mod template;
 pub mod wal;
@@ -55,6 +58,7 @@ pub mod xdrive;
 
 pub use config::Config;
 pub use conn::Conn;
+pub use drive::DriveStorage;
 pub use local::LocalStorage;
 pub use params::Params;
 pub use register::{register_dialer, register_listener};

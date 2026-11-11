@@ -79,21 +79,51 @@ pub fn is_not_found(e: &io::Error) -> bool {
 pub fn new_storage(
     settings: &xray_transport::dialer::StreamSettings,
 ) -> io::Result<Arc<dyn Storage>> {
+    // Go `testStorageFactory`：测试替换后端工厂（生产恒 None）。
+    let factory = TEST_FACTORY.read().clone();
+    if let Some(factory) = factory {
+        return factory(settings);
+    }
     let config = Config::from_settings(settings)?;
     match config.service.as_str() {
         "local" => Ok(Arc::new(LocalStorage::new(&config.remote_folder)?)),
+        "google-drive" | "Google Drive" => shared_storage(Some(settings), &config, || {
+            Ok(Arc::new(crate::drive::DriveStorage::new(settings, &config)?))
+        }),
         "template" => shared_storage(Some(settings), &config, || {
             Ok(Arc::new(crate::template::TemplateStorage::new(settings, &config)?))
         }),
-        // Go 对四种后端之外的 service 恒报 unsupported；s3/google-drive 未实现，
-        // 如实点名等待批次。
-        "s3" | "google-drive" | "Google Drive" => Err(io::Error::other(format!(
-            "unsupported service: {} (xdrive {} backend not implemented yet; bd hjtlk)",
-            config.service,
-            if config.service == "s3" { "B3" } else { "B4" }
-        ))),
+        // s3 分派臂：XdriveB3 移交（bd hjtlk B3；构造在 S3Storage::new 内 fail-visible）。
+        "s3" => shared_storage(Some(settings), &config, || {
+            Ok(Arc::new(crate::s3::S3Storage::new(settings, &config)?))
+        }),
         other => Err(io::Error::other(format!("unsupported service: {other}"))),
     }
+}
+
+// ── 测试替换工厂（Go `testStorageFactory`）────────────────────────────────
+//
+// Go：`atomic.Pointer[func(config) (Storage, error)]`，nil in production。Rust 面
+// 以进程级 RwLock<Option<Arc<dyn Fn>>> 承载；仅集成测试注入（dial/serve →
+// new_storage 的入口替换），`reset_test_storage_factory` 收尾恢复。
+
+type TestStorageFactory = Arc<
+    dyn Fn(&xray_transport::dialer::StreamSettings) -> io::Result<Arc<dyn Storage>> + Send + Sync,
+>;
+
+static TEST_FACTORY: std::sync::LazyLock<parking_lot::RwLock<Option<TestStorageFactory>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(None));
+
+/// 注册测试替换工厂（Go `testStorageFactory.Store` 的等价面；仅测试注入）。
+#[doc(hidden)]
+pub fn set_test_storage_factory(factory: TestStorageFactory) {
+    *TEST_FACTORY.write() = Some(factory);
+}
+
+/// 撤销测试替换工厂（Go 测试 cleanup 恢复 nil 的等价面）。
+#[doc(hidden)]
+pub fn reset_test_storage_factory() {
+    *TEST_FACTORY.write() = None;
 }
 
 /// 会话存储（Go `sessionStorage`）：云后端返回会话视图（走 XMUX 连接池），

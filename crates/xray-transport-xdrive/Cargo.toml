@@ -30,6 +30,8 @@ async-trait = { workspace = true }
 # share_key 内容摘要（storage.go sha256；禁用 std_ext::hash——那是 FNV-1a/XXH64
 # 非加密摘要）。版本与 xray-proxy-ss 既有依赖一致。
 sha2 = "0.10"
+# SigV4 签名（s3.go；hmac 0.12 与 ss/trojan/vmess/reality 四 crate 同版本）。
+hmac = "0.12"
 
 # HTTP 客户端栈（Go client.go 的 hyper 对应面：legacy Client + 连接池 + ALPN h2/h1）
 hyper = { workspace = true }

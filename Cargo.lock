@@ -6060,6 +6060,7 @@ dependencies = [
  "xray-proxy-http",
  "xray-proxy-hysteria",
  "xray-proxy-loopback",
+ "xray-proxy-masque",
  "xray-proxy-socks",
  "xray-proxy-ss",
  "xray-proxy-trojan",
@@ -6075,6 +6076,7 @@ dependencies = [
  "xray-transport-httpupgrade",
  "xray-transport-hysteria",
  "xray-transport-kcp",
+ "xray-transport-masque",
  "xray-transport-naive",
  "xray-transport-quic",
  "xray-transport-splithttp",
@@ -6404,6 +6406,26 @@ dependencies = [
  "xray-frame",
  "xray-proto",
  "xray-transport",
+]
+
+[[package]]
+name = "xray-proxy-masque"
+version = "0.1.0"
+dependencies = [
+ "rand 0.9.4",
+ "rcgen 0.13.2",
+ "serde_json",
+ "smoltcp",
+ "thiserror 2.0.18",
+ "tokio",
+ "udf-skeleton-infra",
+ "xray-app-dispatcher",
+ "xray-buf",
+ "xray-common",
+ "xray-frame",
+ "xray-transport",
+ "xray-transport-masque",
+ "xray-xudp",
 ]
 
 [[package]]
@@ -6935,6 +6957,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "xray-common",
  "xray-frame",
  "xray-proto",
@@ -7093,16 +7116,30 @@ name = "xray-transport-xdrive"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "hmac",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "parking_lot",
+ "regex",
+ "rustls",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-rustls",
+ "tower-service",
  "udf-skeleton",
  "udf-skeleton-infra",
  "udf-std-ext",
  "xray-common",
  "xray-frame",
+ "xray-tls",
  "xray-transport",
+ "xray-transport-splithttp",
 ]
 
 [[package]]
