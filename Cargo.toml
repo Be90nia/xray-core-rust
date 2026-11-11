@@ -66,6 +66,8 @@ members = [
     "crates/xray-proxy-anytls",
     "crates/xray-proxy-tuic",
     "crates/xray-proxy-hysteria",
+    # MASQUE proxy（CONNECT-IP 服务端/客户端；bd 55yh7 B4 批次）
+    "crates/xray-proxy-masque",
 
     # Layer 6 - 配置
     "crates/xray-conf",

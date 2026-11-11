@@ -1,0 +1,36 @@
+[package]
+name = "xray-proxy-masque"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# MASQUE proxy（RFC 9484 CONNECT-IP；Go proxy/masque/ 直译形态）。
+# B4 批次：server（Basic 认证 + 地址分配 + 包路由 + 栈桥）+ client（隧道内
+# 目标拨号）+ plugin（契约声明）。协议内核（胶囊/h2/地址池/hub）在
+# xray-transport-masque；本 crate 是薄适配（规划 §4.3 层边界）。
+[dependencies]
+xray-common = { path = "../xray-common" }
+xray-transport = { path = "../xray-transport" }
+xray-transport-masque = { path = "../xray-transport-masque" }
+xray-frame = { path = "../xray-frame" }
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-buf = { path = "../xray-buf" }
+xray-xudp = { path = "../xray-xudp" }
+# UDP 临时端口绑定（bind_ephemeral）/ 目标随机取一（Go dice.Roll 同款）
+rand = { workspace = true }
+# B4：泵句柄类型 Spawned（ComponentScope::spawn 透传 udf 面；wireguard 同款 path 依赖）
+skeleton-infra = { path = "../udf-frame/skeleton-infra", package = "udf-skeleton-infra", features = ["tokio"] }
+# 栈桥类型面（smoltcp socket/endpoint；PacketStack 同源依赖，零新三方）
+smoltcp = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+rcgen = "0.13"
+
+# bd g3cr：生产代码零 unwrap（测试代码由 root clippy.toml allow-unwrap-in-tests 豁免）
+[lints.clippy]
+unwrap_used = "warn"

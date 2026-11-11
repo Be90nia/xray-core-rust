@@ -271,6 +271,8 @@ pub(crate) static INBOUND_CTORS: &[(&str, InboundCtor)] = &[
     ("inbound:tuic", tcp(inbound::tuic_entry)),
     ("inbound:naive", tcp(inbound::naive_entry)),
     ("inbound:wireguard", tcp(inbound::wireguard_entry)),
+    // masque inbound（CONNECT-IP 服务端；transport+proxy 一体，wireguard 同族）。
+    ("inbound:masque", tcp(inbound::masque_entry)),
     // Rust 独占协议（bd 1ksxu D5 拍板：保留 + 显式标注 Go 不兼容）。
     // 证据：Go 26.10.17 `infra/conf/xray.go:28-39` 的 inbound 协议表**没有** dns
     // （`dns` 只存在于同文件 :42-56 的 outbound 表）；同一份 `{"protocol":"dns"}`
@@ -310,6 +312,8 @@ pub(crate) static OUTBOUND_CTORS: &[(&str, OutboundBuilder)] = &[
     ("outbound:anytls", outbound::anytls_entry),
     ("outbound:tuic", outbound::tuic_entry),
     ("outbound:wireguard", outbound::wireguard_entry),
+    // masque outbound（CONNECT-IP 客户端；隧道内目标拨号）。
+    ("outbound:masque", outbound::masque_entry),
     ("outbound:dns", outbound::dns_entry),
     ("outbound:loopback", outbound::loopback_entry),
     ("outbound:http", outbound::http_entry),

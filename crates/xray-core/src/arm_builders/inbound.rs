@@ -908,6 +908,56 @@ pub(crate) async fn build_naive_inbound(
     })))
 }
 
+// masque inbound：CONNECT-IP 服务端（transport+proxy 一体，wireguard 同族）——
+// users/address 从 proxy settings 解析，hub（TLS+h2+gate）由 xray-proxy-masque
+// 一体装配；B4.5 装配负向（缺 address / 空 users / 非 TLS）在 parse/serve 内
+// fail-visible。
+pub(crate) async fn build_masque_inbound(
+    ib: &BuiltInbound,
+    ohm: Arc<SimpleOhm>,
+    shutdown_token: CancellationToken,
+    addr: &str,
+    plugin_ctx: std::sync::Arc<xray_frame::PluginContext>,
+) -> std::io::Result<Option<JoinHandle<()>>> {
+    let raw: serde_json::Value = serde_json::from_slice(&ib.entry.data)
+        .map_err(|e| std::io::Error::other(format!("masque inbound settings: {e}")))?;
+    let server_settings =
+        xray_proxy_masque::server::parse_server_settings(&raw).map_err(std::io::Error::other)?;
+    let settings =
+        xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
+    // 装配门 MASQUE-TLS-REQUIRED（extra 条款；hub 内部同判——装配期先行报语义清晰）。
+    if settings.security != "tls" {
+        return Err(std::io::Error::other("masque inbound requires \"security\": \"tls\""));
+    }
+    let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("parse addr: {e}"))
+    })?;
+    let dispatch = ohm.get_default_handler().ok_or_else(|| {
+        std::io::Error::other("masque inbound requires a default outbound handler")
+    })?;
+    let sockopt = settings.socket_options();
+    let scope = xray_frame::scope::ComponentScope::new(format!("masque-inbound-{}", ib.tag));
+    let (listener, server) = xray_proxy_masque::server::serve(
+        bind_addr,
+        ib.tag.clone(),
+        server_settings,
+        dispatch,
+        scope,
+        settings,
+        sockopt,
+    )
+    .await?;
+    tracing::info!(tag = %ib.tag, addr = %addr, "masque inbound listening (h2)");
+
+    // 停机面：token cancel → 关 listener（accept 闸）+ 关 server scope（隧道泵）。
+    Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token.clone(), async move {
+        shutdown_token.cancelled().await;
+        let _ = listener.close();
+        server.close();
+        Ok(())
+    })))
+}
+
 // wireguard inbound：WireguardInboundHandler impl InboundHandler
 pub(crate) async fn build_wireguard_inbound(
     ib: &BuiltInbound,
@@ -1860,6 +1910,16 @@ pub(crate) fn tuic_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
 
 pub(crate) fn naive_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
     Box::pin(build_naive_inbound(
+        ctx.ib,
+        ctx.ohm,
+        ctx.shutdown_token,
+        ctx.addr,
+        Arc::new(ctx.plugin_ctx),
+    ))
+}
+
+pub(crate) fn masque_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
+    Box::pin(build_masque_inbound(
         ctx.ib,
         ctx.ohm,
         ctx.shutdown_token,

@@ -599,6 +599,64 @@ pub(crate) fn build_wireguard_outbound(
 }
 
 #[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
+pub(crate) fn build_masque_outbound(
+    ob: &BuiltOutbound,
+    plugin_ctx: Arc<xray_frame::PluginContext>,
+    proxy_chain_tag: Option<String>,
+    target_strategy: Option<DomainStrategy>,
+    dns: Option<&Arc<xray_app_dns::DnsService>>,
+    policy_manager: Option<&dyn xray_features::policy::PolicyManager>,
+    send_through: Option<&xray_transport::system_dialer::SendThroughSpec>,
+) -> std::result::Result<
+    (Arc<dyn DispatchHandler>, Option<Arc<DialBridge>>, Option<String>),
+    BuildError,
+> {
+    // 装配负向（B4.5 验收）：缺 address/port → Err（Go MasqueClientConfig.Build 同判）。
+    let raw: serde_json::Value = serde_json::from_slice(&ob.entry.data)
+        .map_err(|e| BuildError::from(format!("masque outbound settings: {e}")))?;
+    let client =
+        xray_proxy_masque::client::parse_client_settings(&raw).map_err(BuildError::from)?;
+    let transport_settings =
+        xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+    // 装配门 MASQUE-TLS-REQUIRED / MASQUE-H2-ONLY（extra 条款）：security=tls
+    // 必选；用户 ALPN 必须显式含 h2（Go hub.go:47-50 的 ALPN 缺省 = h3 语义，
+    // 本仓 h3 押后——缺省即 fail-visible，不静默）。
+    if transport_settings.security != "tls" {
+        return Err(BuildError::from("masque outbound requires \"security\": \"tls\"".to_string()));
+    }
+    let alpn_ok = transport_settings
+        .security_json
+        .as_ref()
+        .and_then(|t| t.get("alpn"))
+        .and_then(|a| a.as_array())
+        .is_some_and(|list| list.iter().any(|v| v.as_str() == Some("h2")));
+    if !alpn_ok {
+        return Err(BuildError::from(
+            "masque outbound requires tlsSettings.alpn to explicitly contain \"h2\" \
+             (h3 is not implemented in this build)"
+                .to_string(),
+        ));
+    }
+    let sockopt = transport_settings.socket_options();
+    let dial_fn = xray_proxy_masque::client::make_masque_dial_fn(
+        client,
+        transport_settings,
+        sockopt,
+        plugin_ctx,
+    );
+    wrap_bridge(
+        ob.tag.clone(),
+        dial_fn,
+        &proxy_chain_tag,
+        target_strategy,
+        dns,
+        send_through,
+        0,
+        policy_manager,
+    )
+}
+
+#[allow(clippy::type_complexity)] // 返回三组件装配形态（与 wrap_bridge 同型）
 pub(crate) fn build_dns_outbound(
     ob: &BuiltOutbound,
     dns: Option<&Arc<xray_app_dns::DnsService>>,
@@ -855,6 +913,18 @@ pub(crate) fn anytls_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
 
 pub(crate) fn tuic_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
     build_tuic_outbound(
+        ctx.ob,
+        Arc::new(ctx.plugin_ctx),
+        ctx.proxy_chain_tag,
+        ctx.target_strategy,
+        ctx.dns,
+        ctx.policy_manager,
+        ctx.send_through,
+    )
+}
+
+pub(crate) fn masque_entry<'a, 'b>(ctx: OutboundCtx<'a, 'b>) -> OutboundResult {
+    build_masque_outbound(
         ctx.ob,
         Arc::new(ctx.plugin_ctx),
         ctx.proxy_chain_tag,

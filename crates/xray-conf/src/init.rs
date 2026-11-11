@@ -351,21 +351,12 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
     }
 
     // 2c) 票 037f：Go 有 Rust 无的 streamSettings 键——出现即配置层硬错。
-    //     bd hjtlk B0 放开 xdrive 面：`xdriveSettings`（B1 transport 消费）与
-    //     `address`/`port`（xdrive fronting，Go transport_internet.go:51-52 →
-    //     memory_settings.go:39-44）不再拒；`masqueSettings`/`network=masque` 仍拒
-    //     （masque 属票 55yh7，Rust 无对应 transport）。
-    if ss.get("masqueSettings").is_some_and(|v| !v.is_null()) {
-        return Err(LintError::new(format!(
-            "{kind} '{tag}': streamSettings.masqueSettings is not supported by this build \
-             (masque transport is not implemented); remove the key"
-        )));
-    }
-    if net.eq_ignore_ascii_case("masque") {
-        return Err(LintError::new(format!(
-            "{kind} '{tag}': streamSettings.network=\"{net}\" is not implemented in this build"
-        )));
-    }
+    //     bd hjtlk B0 放开 xdrive 面；bd 55yh7 B4 放开 masque 面：
+    //     `masqueSettings`/`network=masque` 已接线（xray-transport-masque hub
+    //     dialer + xray-proxy-masque server/client；masqueSettings 深校验 =
+    //     装配期 xray-proxy-masque parse_*_settings fail-visible，配置 lint 只
+    //     保放行）。
+    //     仍拒：`warp`（masque 非目标 1，装配期同样拒）。
 
     // 3) hysteria transport（hysteriaSettings）：显式 version != 2 → 硬错。
     if net.eq_ignore_ascii_case("hysteria") {
@@ -841,12 +832,11 @@ mod tests {
         assert!(msg.contains("boolean"), "got: {msg}");
     }
 
-    /// 票 037f：Go 有 Rust 无的 streamSettings 顶层键（masqueSettings）与
-    /// network=masque——装配期硬错指名，不静默丢（此前整段被解析器忽略）。
-    /// bd hjtlk B0 更新：`xdriveSettings`/`network=xdrive`/`address`/`port` 已放开——
-    /// xdrive 改走 xdrive.rs 的 validateXDrive 专项校验（矩阵见 xdrive.rs 测试），
-    /// `address`/`port` 是 xdrive fronting 面（Go transport_internet.go:51-52）。
-    /// 本测试钉：masque 两项仍拒；xdrive/fronting 三形态放行。
+    /// 票 037f：Go 有 Rust 无的 streamSettings 顶层键与 network 面。
+    /// bd hjtlk B0 放开 xdrive；bd 55yh7 B4 放开 masque（masqueSettings 与
+    /// network=masque 装配面已接线，配置 lint 保放行）。本测试钉：
+    /// masque 两项**放行**；xdrive 继续走 validateXDrive 专项（mux/encryption
+    /// 不合规仍拒——双向断言）。
     #[test]
     #[allow(clippy::err_expect)] // 存量清零批次：测试断言期 expect（Config 无 Debug，禁 expect_err）
     fn strictness_rejects_masque_xdrive_and_fronting_keys() {
@@ -862,14 +852,18 @@ mod tests {
             }],
             ..Default::default()
         };
-        // masque 两项仍拒（55yh7）。
-        for (ss, needle) in [
-            (json!({"network": "masque", "masqueSettings": {}}), "masqueSettings"),
-            (json!({"network": "masque"}), "network"),
+        // masque 两项放行（55yh7 B4）：masqueSettings 存在 / network=masque 均过 lint。
+        for ss in [
+            json!({"network": "masque", "masqueSettings": {}}),
+            json!({"network": "masque"}),
+            json!({"network": "tcp", "masqueSettings": {"path": "/x"}}),
         ] {
-            let err = post_process(&mut mk(ss)).err().expect("masque must reject");
-            assert!(err.to_string().contains(needle), "needle={needle} got: {err}");
+            post_process(&mut mk(ss)).unwrap_or_else(|e| panic!("masque must pass lint now: {e}"));
         }
+        // 「xdrive 仍走 xdrive lint」的负向半边 = xdrive.rs 测试矩阵既有断言
+        // （`xdrive_full_config_passes_and_missing_mux_fails` 等 199 例）——本处
+        // 不重复构造 vless+mux 组合形态（masque 放行不短路 xdrive lint 路径由
+        // 本测试前半 + 该矩阵共同保证）。
         // xdriveSettings 已放开：xdrive 出站需同时过 validateXDrive（mux + encryption）。
         let enc = "mlkem768x25519plus.native.0rtt.GS1D3kYFox-0dmcTK1u-2LaiSB-iM_Kve8N4bT--DhE";
         let mut xdrive = mk(json!({"network": "xdrive", "xdriveSettings": {"service": "local"}}));

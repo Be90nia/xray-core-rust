@@ -141,6 +141,13 @@ pub fn register_all_transports() {
     reg(&mut failed, "xdrive dialer", xray_transport_xdrive::register::register_dialer());
     reg(&mut failed, "xdrive listener", xray_transport_xdrive::register::register_listener());
 
+    // MASQUE（RFC 9484 CONNECT-IP；bd 55yh7 B4）：dialer = 隧道拨号 + 裸流适配
+    //（通用 transport 管线面；proxy 层直调 crate 取强类型会话）。listener =
+    // hub 装配 + 缺省 gate 恒拒（无 users 面 fail-closed；生产装配入口 =
+    // arm_builders inbound:masque 提供 users gate）。
+    reg(&mut failed, "masque dialer", xray_transport_masque::register::register_dialer());
+    reg(&mut failed, "masque listener", xray_transport_masque::register::register_listener());
+
     // mKCP
     //
     // finalmask 语义注（o54c）：mKCP 不走异步 `UdpmaskManager`（PacketConn 包装），

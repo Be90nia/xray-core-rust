@@ -388,6 +388,12 @@ pub fn budget_report_with(
             ),
             splithttp * SPLITHTTP_ENDPOINT_BOOKED_BYTES,
         ),
+        // bd 55yh7 B4（R14）：masque 单隧道 16MiB send_buf（惰性分配，装配期
+        // 不可数）——上限面登记防回档，与同值常量的账本锚（bd sgdwm/PM-05）同源。
+        (
+            format!("per masque tunnel {H2_MAX_SEND_BUF_PER_CONN_BYTES}B h2 send_buf cap"),
+            H2_MAX_SEND_BUF_PER_CONN_BYTES,
+        ),
         (
             format!("per DoH3 resolver {DOH3_SESSION_SOCKET_BOOKED_BYTES}B socket"),
             DOH3_SESSION_SOCKET_BOOKED_BYTES,

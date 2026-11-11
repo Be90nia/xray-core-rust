@@ -34,8 +34,8 @@ use xray_transport::wire::varint::read_varint;
 
 use crate::{
     capsule::{
-        self, AssignedAddress, Capsule, IpPrefix, IpRoute, MAX_CAPSULE_PAYLOAD, decode_capsule,
-        encode_capsule,
+        self, AddressRequestEntry, AssignedAddress, Capsule, IpPrefix, IpRoute,
+        MAX_CAPSULE_PAYLOAD, decode_capsule, encode_capsule,
     },
     error::{MasqueError, Result},
 };
@@ -94,6 +94,11 @@ pub struct ConnectIpSession {
     cmd_tx: mpsc::Sender<WriteCmd>,
     packet_rx: mpsc::Receiver<Vec<u8>>,
     assignment_rx: mpsc::Receiver<Vec<AssignedAddress>>,
+    /// 服务端模式：客户端地址请求队列（`recv_address_request` 消费；客户端模式恒 None）。
+    request_rx: Option<mpsc::Receiver<Vec<AddressRequestEntry>>>,
+    /// 共享验证态（与读泵同源：服务端 `assign_addresses`/`advertise_route` 更新，
+    /// 读泵消费校验入站包）。
+    state: SharedState,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
     driver_task: Option<JoinHandle<()>>,
@@ -130,7 +135,8 @@ impl ConnectIpSession {
         let reader_task = {
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                let outcome = read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx).await;
+                let outcome =
+                    read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx, None).await;
                 match outcome {
                     Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
                     Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
@@ -148,6 +154,8 @@ impl ConnectIpSession {
             cmd_tx,
             packet_rx,
             assignment_rx,
+            request_rx: None,
+            state,
             reader_task,
             writer_task,
             driver_task: Some(driver),
@@ -202,27 +210,7 @@ impl ConnectIpSession {
     /// 用户态栈（Go h3 写侧 `composeICMPTooLargePacket` 语义）；`None` = 已入队或
     /// 包不合法被丢弃（Go `composeDatagram` 失败 = debug 日志 + 静默丢弃）。
     pub async fn send_packet(&mut self, packet: &[u8]) -> Result<Option<Vec<u8>>> {
-        if self.closed {
-            return Err(closed_err());
-        }
-        if packet.len() > self.max_packet_size {
-            return compose_icmp_packet_too_big(packet, self.max_packet_size).map(Some);
-        }
-        let data = match compose_datagram(packet) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::LOG.debug(format!(
-                    "masque: dropping proxied packet ({} bytes) that can't be proxied: {e}",
-                    packet.len()
-                ));
-                return Ok(None);
-            },
-        };
-        let frame = encode_capsule(&Capsule::Datagram(data))?;
-        // Go WritePacket → c.write：直写流（同步阻塞语义）；本仓经写泵队列，
-        // 满即背压（与 Go 流窗满阻塞等价）。
-        self.cmd_tx.send(WriteCmd::Frame(frame)).await.map_err(|_| closed_err())?;
-        Ok(None)
+        self.writer()?.send_packet(packet).await
     }
 
     /// 接收下一个合法入站 IP 包（已过验证态；Go `ReadPacket` 的整包形态）。
@@ -271,6 +259,22 @@ impl Drop for ConnectIpSession {
 }
 
 impl ConnectIpSession {
+    /// 写面克隆句柄（服务端多泵形态：读泵独占会话收发面，写泵/地址请求泵经
+    /// [`SessionWriter`] 共享写端——cmd_tx 是 mpsc 克隆面，Go `Conn.queueWrite`
+    /// 的 mu 串行等价）。
+    ///
+    /// 会话已关 = Err；克隆句柄存活期间会话写泵不会退出（Drop 兜底 abort）。
+    pub fn writer(&self) -> Result<SessionWriter> {
+        if self.closed {
+            return Err(closed_err());
+        }
+        Ok(SessionWriter {
+            cmd_tx: self.cmd_tx.clone(),
+            state: Arc::clone(&self.state),
+            max_packet_size: self.max_packet_size,
+        })
+    }
+
     fn queue_frame(&mut self, frame: Vec<u8>) -> Result<()> {
         // Go queueWrite：非阻塞入队，满 = 协议违规关连接（errCapsuleLimit）。
         if self.cmd_tx.try_send(WriteCmd::Frame(frame)).is_err() {
@@ -278,6 +282,212 @@ impl ConnectIpSession {
             return Err(MasqueError::Protocol("masque: capsule queue full".into()));
         }
         Ok(())
+    }
+}
+
+/// 会话写面（`ConnectIpSession::writer` 产物）：发送胶囊帧的共享句柄。
+///
+/// 服务端形态下与读泵并存：读泵独占 `packet_rx/request_rx/assignment_rx`，
+/// 写面（地址分配/路由通告/请求回应/数据包出站）经本句柄从多个泵任务并发
+/// 投递（mpsc 串行化）。会话关闭（`Fin`/abort）后所有投递失败 = `closed_err`。
+#[derive(Debug)]
+pub struct SessionWriter {
+    cmd_tx: mpsc::Sender<WriteCmd>,
+    state: SharedState,
+    max_packet_size: usize,
+}
+
+impl SessionWriter {
+    /// 发送一个 IP 包（语义同 [`ConnectIpSession::send_packet`]）。
+    pub async fn send_packet(&mut self, packet: &[u8]) -> Result<Option<Vec<u8>>> {
+        if packet.len() > self.max_packet_size {
+            return compose_icmp_packet_too_big(packet, self.max_packet_size).map(Some);
+        }
+        let data = match compose_datagram(packet) {
+            Ok(d) => d,
+            Err(e) => {
+                crate::LOG.debug(format!(
+                    "masque: dropping proxied packet ({} bytes) that can't be proxied: {e}",
+                    packet.len()
+                ));
+                return Ok(None);
+            },
+        };
+        let frame = encode_capsule(&Capsule::Datagram(data))?;
+        // Go WritePacket → c.write：直写流（同步阻塞语义）；本仓经写泵队列，
+        // 满即背压（与 Go 流窗满阻塞等价）。
+        self.cmd_tx.send(WriteCmd::Frame(frame)).await.map_err(|_| closed_err())?;
+        Ok(None)
+    }
+
+    /// 服务端主动地址分配（Go `AssignAddresses`；会话层包装的写面形态）。
+    pub fn assign_addresses(&mut self, prefixes: &[IpPrefix]) -> Result<()> {
+        let entries: Vec<AssignedAddress> =
+            prefixes.iter().map(|p| AssignedAddress { request_id: 0, prefix: p.clone() }).collect();
+        let frame = encode_capsule(&Capsule::AddressAssign(entries))?;
+        self.queue_frame(frame)?;
+        // 验证态 peer = 非拒绝条目（Go sendAddressAssignment 尾段）。
+        let mut st = self.state.lock().map_err(|_| poisoned_err())?;
+        st.peer = Some(prefixes.to_vec());
+        Ok(())
+    }
+
+    /// 路由通告（Go `AdvertiseRoute`；会话层包装的写面形态）。
+    pub fn advertise_route(&mut self, routes: &[IpRoute]) -> Result<()> {
+        for (i, route) in routes.iter().enumerate() {
+            validate_route(route)
+                .map_err(|e| MasqueError::Protocol(format!("masque: invalid route {i}: {e}")))?;
+            if i > 0 {
+                check_route_order(&routes[i - 1], route).map_err(|e| {
+                    MasqueError::Protocol(format!("masque: invalid route {i}: {e}"))
+                })?;
+            }
+        }
+        let frame = encode_capsule(&Capsule::RouteAdvertisement(routes.to_vec()))?;
+        self.queue_frame(frame)?;
+        let mut st = self.state.lock().map_err(|_| poisoned_err())?;
+        st.routes = routes.to_vec();
+        Ok(())
+    }
+
+    /// 回应客户端地址请求（Go `AddressRequest.Respond`）：条目回显请求 ID +
+    /// 对应分配前缀；不可满足条目 = 同族拒绝前缀（`0.0.0.0/32`/`::/128`），
+    /// 额外分配（additional）条目 request_id = 0。与 Go 的差异：验证态 peer
+    /// 不随 Respond 更新（分配地址恒由 [`Self::assign_addresses`] 设定，Respond
+    /// 条目 ⊆ 已分配集合，净语义一致）。
+    pub fn respond_assignments(&mut self, entries: Vec<AssignedAddress>) -> Result<()> {
+        let frame = encode_capsule(&Capsule::AddressAssign(entries))?;
+        self.queue_frame(frame)
+    }
+
+    fn queue_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        // Go queueWrite：非阻塞入队，满 = 协议违规关连接（errCapsuleLimit）。
+        if self.cmd_tx.try_send(WriteCmd::Frame(frame)).is_err() {
+            return Err(MasqueError::Protocol("masque: capsule queue full".into()));
+        }
+        Ok(())
+    }
+}
+
+/// 服务端读泵的 ADDRESS_REQUEST 队列上界（Go `addressRequests` 通道同界 128）。
+const QUEUE_REQUESTS: usize = QUEUE_CAPSULES;
+
+impl ConnectIpSession {
+    /// 服务端形态构造（B4：hub accept 后）：读泵对 ADDRESS_REQUEST 投递到内部
+    /// 通道（不自动拒绝回应——回应由服务端 proxy 层按分配结果经
+    /// [`Self::respond_assignments`] 完成，Go `serveAddressRequests` →
+    /// `AddressRequest.Respond`）。其余读侧行为与客户端模式对称（Go `Conn`
+    /// 两端共用同一结构）。
+    ///
+    /// 与客户端形态的差异：无独立 h2 driver 任务——服务端连接驱动 =
+    /// hub 的 `serve_connection` future（流 EOF 即连接回收，无 fd 滞留面），
+    /// `driver_task` 恒 `None`。
+    ///
+    /// 必须在 tokio runtime 上下文内调用（内部 spawn 读/写泵）。
+    pub fn server_session(io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static) -> Self {
+        let (rd, wr) = tokio::io::split(io);
+        let (cmd_tx, cmd_rx) = mpsc::channel(QUEUE_CAPSULES);
+        let (packet_tx, packet_rx) = mpsc::channel(QUEUE_DATAGRAMS);
+        let (assignment_tx, assignment_rx) = mpsc::channel(QUEUE_CAPSULES);
+        let (request_tx, request_rx) = mpsc::channel(QUEUE_REQUESTS);
+        let state: SharedState = Arc::new(Mutex::new(SessionState::default()));
+        let reader_cmd_tx = cmd_tx.clone();
+        // ①类待迁移（bd xosi9 改判）：服务端 capsule 读泵；寿命 = ConnectIpSession
+        // 句柄持有；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "①类待迁移（bd xosi9 改判）：服务端 capsule 读泵，寿命 = ConnectIpSession 句柄持有；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+        )]
+        let reader_task = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let outcome =
+                    read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx, Some(request_tx))
+                        .await;
+                match outcome {
+                    Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
+                    Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
+                }
+            })
+        };
+        // ①类待迁移（bd xosi9 改判）：服务端 capsule 写泵；同上目标托管口。
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "①类待迁移（bd xosi9 改判）：服务端 capsule 写泵（单 owner 写端 + Fin 哨兵），寿命 = ConnectIpSession；目标托管口 = xray_frame::scope::ComponentScope（B4 隧道宿主接线）"
+        )]
+        let writer_task = tokio::spawn(write_loop(wr, cmd_rx));
+        Self {
+            cmd_tx,
+            packet_rx,
+            assignment_rx,
+            request_rx: Some(request_rx),
+            state,
+            reader_task,
+            writer_task,
+            driver_task: None,
+            max_packet_size: h2_max_packet_size(),
+            local_addrs: Vec::new(),
+            last_request_id: 0,
+            closed: false,
+        }
+    }
+
+    /// 服务端主动地址分配（Go `AssignAddresses` 写面形态；见 [`SessionWriter`]）。
+    pub fn assign_addresses(&mut self, prefixes: &[IpPrefix]) -> Result<()> {
+        self.writer()?.assign_addresses(prefixes)
+    }
+
+    /// 路由通告（Go `AdvertiseRoute` 写面形态；见 [`SessionWriter`]）。
+    pub fn advertise_route(&mut self, routes: &[IpRoute]) -> Result<()> {
+        self.writer()?.advertise_route(routes)
+    }
+
+    /// 取出服务端 ADDRESS_REQUEST 队列读端（`server_session` 产物独有；取出后
+    /// 恒 `None`）。消费形态 = 隧道读泵 `select!` 同时等 [`Self::recv_packet`] 与
+    /// 本通道（客户端模式恒 `None`）。会话已关 = `None`。
+    #[must_use]
+    pub fn take_request_rx(&mut self) -> Option<mpsc::Receiver<Vec<AddressRequestEntry>>> {
+        self.request_rx.take()
+    }
+
+    /// 回应客户端地址请求（Go `AddressRequest.Respond` 写面形态；见
+    /// [`SessionWriter::respond_assignments`]）。
+    pub fn respond_assignments(&mut self, entries: Vec<AssignedAddress>) -> Result<()> {
+        self.writer()?.respond_assignments(entries)
+    }
+}
+
+/// 路由条目校验（Go `IPRoute.validate`）：同族 + start ≤ end。zone/有效性在
+/// std 解析期已保证，不重复检查。
+fn validate_route(r: &IpRoute) -> std::result::Result<(), String> {
+    if r.start_ip.is_ipv4() != r.end_ip.is_ipv4() {
+        return Err(format!("IP address range {}-{} mixes IP versions", r.start_ip, r.end_ip));
+    }
+    if r.start_ip > r.end_ip {
+        return Err(format!("start IP {} is greater than end IP {}", r.start_ip, r.end_ip));
+    }
+    Ok(())
+}
+
+/// 相邻路由排序校验（Go `checkRouteOrder`）：按（族位长，协议号）升序，同组
+/// 区间严格递增不重叠。
+fn check_route_order(a: &IpRoute, b: &IpRoute) -> std::result::Result<(), String> {
+    let fa = usize::from(capsule::ip_bit_len(a.start_ip));
+    let fb = usize::from(capsule::ip_bit_len(b.start_ip));
+    let proto_a = u16::from(a.ip_protocol);
+    let proto_b = u16::from(b.ip_protocol);
+    match fa.cmp(&fb).then(proto_a.cmp(&proto_b)) {
+        std::cmp::Ordering::Greater => Err(format!(
+            "routes are not ordered by IP version and IP protocol: {}-{} (protocol {}) \
+             precedes {}-{} (protocol {})",
+            a.start_ip, a.end_ip, a.ip_protocol, b.start_ip, b.end_ip, b.ip_protocol
+        )),
+        std::cmp::Ordering::Equal if a.end_ip >= b.start_ip => Err(format!(
+            "IP address ranges {}-{} and {}-{} (protocol {}) overlap or are not in \
+             ascending order",
+            a.start_ip, a.end_ip, b.start_ip, b.end_ip, b.ip_protocol
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -293,6 +503,9 @@ async fn read_loop(
     packet_tx: mpsc::Sender<Vec<u8>>,
     assignment_tx: mpsc::Sender<Vec<AssignedAddress>>,
     cmd_tx: mpsc::Sender<WriteCmd>,
+    // 服务端模式：`Some` = ADDRESS_REQUEST 投递到该通道（Go `addressRequests`）；
+    // `None` = 客户端模式：读泵直接以同族拒绝前缀回应（Go 客户端外壳语义）。
+    request_tx: Option<mpsc::Sender<Vec<AddressRequestEntry>>>,
 ) -> Result<()> {
     loop {
         let (ty, payload) = read_frame(&mut rd).await?;
@@ -327,19 +540,32 @@ async fn read_loop(
                 }
             },
             Some(Capsule::AddressRequest(entries)) => {
-                // Go 客户端外壳 serveAddressRequests：对每个请求以同族拒绝前缀回应
-                // （`0.0.0.0/32` / `::/128`），request ID 原样回显（address.go Respond）。
-                let frame = encode_capsule(&Capsule::AddressAssign(
-                    entries
-                        .iter()
-                        .map(|e| AssignedAddress {
-                            request_id: e.request_id,
-                            prefix: reject_prefix_for(&e.prefix.addr),
-                        })
-                        .collect(),
-                ))?;
-                if cmd_tx.try_send(WriteCmd::Frame(frame)).is_err() {
-                    return Err(MasqueError::Protocol("masque: capsule queue full".into()));
+                match &request_tx {
+                    // 服务端模式：投递给上层 serve（Go `addressRequests` 通道，
+                    // 满队列 = errCapsuleLimit 关连接）。
+                    Some(tx) => {
+                        if tx.try_send(entries).is_err() {
+                            return Err(MasqueError::Protocol(
+                                "masque: address request queue full".into(),
+                            ));
+                        }
+                    },
+                    // 客户端模式：对每个请求以同族拒绝前缀回应（`0.0.0.0/32` /
+                    // `::/128`），request ID 原样回显（address.go Respond）。
+                    None => {
+                        let frame = encode_capsule(&Capsule::AddressAssign(
+                            entries
+                                .iter()
+                                .map(|e| AssignedAddress {
+                                    request_id: e.request_id,
+                                    prefix: reject_prefix_for(&e.prefix.addr),
+                                })
+                                .collect(),
+                        ))?;
+                        if cmd_tx.try_send(WriteCmd::Frame(frame)).is_err() {
+                            return Err(MasqueError::Protocol("masque: capsule queue full".into()));
+                        }
+                    },
                 }
             },
             Some(Capsule::RouteAdvertisement(routes)) => {
@@ -515,8 +741,8 @@ fn validate_incoming(packet: &[u8], state: &SharedState) -> bool {
     })
 }
 
-/// 前缀包含判定（Go `netip.Prefix.Contains`）。
-fn prefix_contains(p: &IpPrefix, ip: IpAddr) -> bool {
+/// 前缀包含判定（Go `netip.Prefix.Contains`；pool.rs 共用）。
+pub(crate) fn prefix_contains(p: &IpPrefix, ip: IpAddr) -> bool {
     let (p_oct, i_oct): ([u8; 16], [u8; 16]) = match (&p.addr, ip) {
         (IpAddr::V4(a), IpAddr::V4(b)) => (pad_octets(&a.octets()), pad_octets(&b.octets())),
         (IpAddr::V6(a), IpAddr::V6(b)) => (a.octets(), b.octets()),
@@ -536,8 +762,8 @@ fn pad_octets(v4: &[u8; 4]) -> [u8; 16] {
     out
 }
 
-/// 网络地址 → 首个主机地址（Go `Addr.Next()`）。
-fn next_addr(a: IpAddr) -> IpAddr {
+/// 网络地址 → 首个主机地址（Go `Addr.Next()`；pool.rs 共用）。
+pub(crate) fn next_addr(a: IpAddr) -> IpAddr {
     match a {
         IpAddr::V4(v) => {
             u32::from(v).checked_add(1).map_or(IpAddr::V4(v), |n| IpAddr::V4(n.into()))

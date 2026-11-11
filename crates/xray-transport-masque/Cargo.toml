@@ -27,6 +27,8 @@ bytes = { workspace = true }
 tokio = { workspace = true }
 # Basic 认证头（user/pass → Authorization；Go transport_method.go:877-880 同款）
 base64 = "0.22"
+# B4 hub：服务端 TLS acceptor（tokio_rustls::TlsAcceptor；xray-tls 产 rustls ServerConfig）
+tokio-rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

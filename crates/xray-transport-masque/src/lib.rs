@@ -48,6 +48,8 @@ pub mod connect;
 pub mod dialer;
 pub mod error;
 pub mod h2;
+pub mod hub;
+pub mod pool;
 pub mod register;
 
 pub use config::Config;

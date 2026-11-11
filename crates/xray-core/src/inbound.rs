@@ -4466,6 +4466,7 @@ pub(crate) fn is_transport_listener_protocol(protocol: &str) -> bool {
             | "splithttp"
             | "xhttp"
             | "xdrive"
+            | "masque"
     )
 }
 

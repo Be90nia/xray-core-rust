@@ -71,6 +71,9 @@ xray-transport-naive = { path = "../xray-transport-naive" }
 xray-transport-websocket = { path = "../xray-transport-websocket" }
 # xdrive 传输族注册（bd hjtlk B1：register_all_transports 两行接线）
 xray-transport-xdrive = { path = "../xray-transport-xdrive" }
+# MASQUE（RFC 9484 CONNECT-IP；bd 55yh7 B4：构造表两行 + 聚合口两行接线）
+xray-transport-masque = { path = "../xray-transport-masque" }
+xray-proxy-masque = { path = "../xray-proxy-masque" }
 xray-app-commander = { path = "../xray-app-commander" }
 xray-app-dns = { path = "../xray-app-dns" }
 xray-app-geodata = { path = "../xray-app-geodata" }
