@@ -23,7 +23,7 @@ use xray_transport::h2_window::{
 
 use crate::{
     config::Config,
-    connect::ConnectIpSession,
+    connect::{ConnectIpSession, Framing},
     error::{MasqueError, Result},
 };
 
@@ -74,8 +74,10 @@ pub async fn connect_h2(
     });
 
     // CONNECT-IP 请求（Go connectip/request.go NewRequest + establish 头合并）：
-    // :method=CONNECT + :protocol=connect-ip + 绝对 https URI + Capsule-Protocol: ?1
-    // + 空 body（hyper 对非空 CONNECT body 直接拒绝，client.rs:716-733）。
+    // :method=CONNECT + 绝对 https URI + 空 body（hyper 对非空 CONNECT body 直接拒绝，
+    // client.rs:716-733）。标准形态补 `:protocol=connect-ip` + `Capsule-Protocol: ?1`；
+    // WARP（Cloudflare）形态**不带** `:protocol`（Go `http2.go:48-52` 改走
+    // `Cf-Connect-Proto` 头），即普通 CONNECT。
     let uri = format!("https://{authority}{}", config.path);
     let mut req = Request::builder()
         .method(Method::CONNECT)
@@ -83,7 +85,9 @@ pub async fn connect_h2(
         .body(Full::new(Bytes::new()))
         .map_err(|e| MasqueError::Protocol(format!("masque: invalid request URI {uri:?}: {e}")))?;
     *req.headers_mut() = build_request_headers(config)?;
-    req.extensions_mut().insert(Protocol::from_static(CONNECT_IP_PROTOCOL));
+    if config.warp.is_none() {
+        req.extensions_mut().insert(Protocol::from_static(CONNECT_IP_PROTOCOL));
+    }
 
     let response =
         send_request.send_request(req).await.map_err(|e| hyper_err("CONNECT-IP request", e))?;
@@ -93,13 +97,28 @@ pub async fn connect_h2(
     }
     let upgraded =
         hyper::upgrade::on(response).await.map_err(|e| hyper_err("stream upgrade", e))?;
-    Ok(ConnectIpSession::new(TokioIo::new(upgraded), driver))
+    let framing = if config.warp.is_some() { Framing::Bare } else { Framing::Capsule };
+    Ok(ConnectIpSession::new(TokioIo::new(upgraded), driver, framing))
 }
 
 /// 请求头装配（Go `establish`：config.Headers 合并 + `setUserAgent`）。
+///
+/// WARP（Cloudflare）变体按 `connectip/http2.go:48-52` 改写：删 `Capsule-Protocol`，
+/// 加 `Cf-Connect-Proto: cf-connect-ip` + `Pq-Enabled: false`。
 fn build_request_headers(config: &Config) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
-    map.insert(HeaderName::from_static("capsule-protocol"), HeaderValue::from_static("?1"));
+    if config.warp.is_some() {
+        map.insert(
+            HeaderName::from_static("cf-connect-proto"),
+            HeaderValue::from_static(crate::warp::CLOUDFLARE_PROTOCOL),
+        );
+        map.insert(
+            HeaderName::from_static("pq-enabled"),
+            HeaderValue::from_static(crate::warp::PQ_ENABLED),
+        );
+    } else {
+        map.insert(HeaderName::from_static("capsule-protocol"), HeaderValue::from_static("?1"));
+    }
 
     // User-Agent 别名解析（Go dialer.go setUserAgent）：缺省 chrome；""/"golang"
     // 删除 UA；chrome/firefox/safari/edge/curl → 动态版本 UA；其余原样透传。

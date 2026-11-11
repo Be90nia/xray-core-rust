@@ -88,6 +88,16 @@ enum WriteCmd {
     Fin,
 }
 
+/// DATAGRAM 胶囊载荷形态。
+///
+/// - [`Framing::Capsule`]：RFC 9297 形态，载荷 = `contextID(0x00)` + IP 包；
+/// - [`Framing::Bare`]：WARP（Cloudflare）形态，载荷 = 裸 IP 包（Go `conn.go:667-671`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    Capsule,
+    Bare,
+}
+
 /// CONNECT-IP 客户端会话（一条 upgraded h2 流上的 IP 包收发面）。
 #[derive(Debug)]
 pub struct ConnectIpSession {
@@ -106,6 +116,7 @@ pub struct ConnectIpSession {
     /// establish 期确定的本端地址（每族一个；Go `masque.Conn.local`）。
     local_addrs: Vec<IpAddr>,
     last_request_id: u64,
+    framing: Framing,
     closed: bool,
 }
 
@@ -114,9 +125,11 @@ impl ConnectIpSession {
     ///
     /// `driver` 是 h2 连接驱动任务句柄（hyper `Connection` future）；会话关闭时随
     /// 之中止以释放底层 TCP fd（grpc 侧教训：driver 不回收 = fd 滞留）。
+    /// `framing` 决定 DATAGRAM 载荷形态（WARP = [`Framing::Bare`]）。
     pub(crate) fn new(
         io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
         driver: JoinHandle<()>,
+        framing: Framing,
     ) -> Self {
         let (rd, wr) = tokio::io::split(io);
         let (cmd_tx, cmd_rx) = mpsc::channel(QUEUE_CAPSULES);
@@ -136,7 +149,8 @@ impl ConnectIpSession {
             let state = Arc::clone(&state);
             tokio::spawn(async move {
                 let outcome =
-                    read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx, None).await;
+                    read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx, None, framing)
+                        .await;
                 match outcome {
                     Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
                     Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
@@ -162,7 +176,17 @@ impl ConnectIpSession {
             max_packet_size: h2_max_packet_size(),
             local_addrs: Vec::new(),
             last_request_id: 0,
+            framing,
             closed: false,
+        }
+    }
+
+    /// 直接设定本端地址与验证态（Go `Conn.SetAssignedAddresses`；WARP 静态地址形态，
+    /// 不发 ADDRESS_REQUEST）。
+    pub(crate) fn set_assigned_addresses(&mut self, prefixes: &[IpPrefix]) {
+        self.local_addrs = prefixes.iter().map(|p| p.addr).collect();
+        if let Ok(mut st) = self.state.lock() {
+            st.assigned = prefixes.to_vec();
         }
     }
 
@@ -272,6 +296,7 @@ impl ConnectIpSession {
             cmd_tx: self.cmd_tx.clone(),
             state: Arc::clone(&self.state),
             max_packet_size: self.max_packet_size,
+            framing: self.framing,
         })
     }
 
@@ -295,6 +320,7 @@ pub struct SessionWriter {
     cmd_tx: mpsc::Sender<WriteCmd>,
     state: SharedState,
     max_packet_size: usize,
+    framing: Framing,
 }
 
 impl SessionWriter {
@@ -313,7 +339,11 @@ impl SessionWriter {
                 return Ok(None);
             },
         };
-        let frame = encode_capsule(&Capsule::Datagram(data))?;
+        let frame = match self.framing {
+            Framing::Capsule => encode_capsule(&Capsule::Datagram(data))?,
+            // WARP：载荷即裸 IP 包，无 contextID 前缀（Go `conn.go:667-671`）。
+            Framing::Bare => crate::capsule::encode_bare_datagram(&data)?,
+        };
         // Go WritePacket → c.write：直写流（同步阻塞语义）；本仓经写泵队列，
         // 满即背压（与 Go 流窗满阻塞等价）。
         self.cmd_tx.send(WriteCmd::Frame(frame)).await.map_err(|_| closed_err())?;
@@ -401,9 +431,16 @@ impl ConnectIpSession {
         let reader_task = {
             let state = Arc::clone(&state);
             tokio::spawn(async move {
-                let outcome =
-                    read_loop(rd, state, packet_tx, assignment_tx, reader_cmd_tx, Some(request_tx))
-                        .await;
+                let outcome = read_loop(
+                    rd,
+                    state,
+                    packet_tx,
+                    assignment_tx,
+                    reader_cmd_tx,
+                    Some(request_tx),
+                    Framing::Capsule,
+                )
+                .await;
                 match outcome {
                     Ok(()) => crate::LOG.debug("masque: capsule stream closed by peer"),
                     Err(e) => crate::LOG.debug(format!("masque: capsule read failed: {e}")),
@@ -428,6 +465,7 @@ impl ConnectIpSession {
             max_packet_size: h2_max_packet_size(),
             local_addrs: Vec::new(),
             last_request_id: 0,
+            framing: Framing::Capsule,
             closed: false,
         }
     }
@@ -506,10 +544,15 @@ async fn read_loop(
     // 服务端模式：`Some` = ADDRESS_REQUEST 投递到该通道（Go `addressRequests`）；
     // `None` = 客户端模式：读泵直接以同族拒绝前缀回应（Go 客户端外壳语义）。
     request_tx: Option<mpsc::Sender<Vec<AddressRequestEntry>>>,
+    framing: Framing,
 ) -> Result<()> {
     loop {
         let (ty, payload) = read_frame(&mut rd).await?;
-        match decode_capsule(ty, &payload)? {
+        let capsule = match framing {
+            Framing::Capsule => decode_capsule(ty, &payload)?,
+            Framing::Bare => crate::capsule::decode_capsule_bare(ty, &payload)?,
+        };
+        match capsule {
             Some(Capsule::Datagram(packet)) => {
                 if !validate_incoming(&packet, &state) {
                     crate::LOG.debug(format!(
@@ -923,15 +966,23 @@ fn finish_checksum(mut sum: u32) -> u16 {
 
 // ===== establish（Go dialer.go establish 的客户端协商段） =====
 
-/// 地址协商：上限校验 → 请求 `0.0.0.0/32` + `::/128` → 等首个含本端地址的分配
-/// （Go dialer.go establish）。
-pub(crate) async fn establish(mut session: ConnectIpSession) -> Result<ConnectIpSession> {
+/// 地址协商：上限校验 → （标准）请求 `0.0.0.0/32` + `::/128` → 等首个含本端地址的分配；
+/// WARP 变体改用配置里的静态地址（Go dialer.go establish 的 `config.Warp != nil` 分支：
+/// `SetAssignedAddresses`，不发 ADDRESS_REQUEST）。
+pub(crate) async fn establish(
+    mut session: ConnectIpSession,
+    warp: Option<&crate::warp::Warp>,
+) -> Result<ConnectIpSession> {
     if session.max_packet_size < MIN_PACKET_SIZE {
         let n = session.max_packet_size;
         session.close();
         return Err(MasqueError::Protocol(format!(
             "masque: the tunnel can only carry {n}-byte packets, less than {MIN_PACKET_SIZE}"
         )));
+    }
+    if let Some(warp) = warp {
+        session.set_assigned_addresses(&warp.address);
+        return Ok(session);
     }
     session.request_addresses(&[
         IpPrefix { addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED), prefix_len: 32 },
@@ -992,6 +1043,7 @@ pub(crate) mod test_support {
             host: String::new(),
             path: crate::config::DEFAULT_PATH.to_string(),
             headers: HashMap::new(),
+            warp: None,
         }
     }
 

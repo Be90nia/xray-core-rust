@@ -15,7 +15,9 @@
 //! 已落地（B0+B1+B2）：
 //! - [`capsule`] — CONNECT-IP 胶囊编解码内核（RFC 9297 帧格式 + RFC 9484 四类胶囊 + 上限校验 +
 //!   未知类型跳过）
-//! - [`config`] — `masqueSettings` 解析（host/path/headers/user-pass + warp 拒绝）
+//! - [`config`] — `masqueSettings` 解析（host/path/headers/user-pass/warp）
+//! - [`warp`] — WARP 变体（Cloudflare）：自签客户端证书 + 端点公钥 pin + 静态地址
+//!   + Cloudflare 请求头 / draft setting 常量（Go `warp.go` 直译）
 //! - [`error`] — [`MasqueError`] 分类（ClauseId::ErrorClassifiedNoPanicEscape）
 //! - [`register`] — dialer/listener 注册管线（**本批不接聚合口**，规划 §5 B1.4）
 //! - [`h2`] — CONNECT-IP over h2 extended CONNECT 绑定（hyper，B2.1）
@@ -34,7 +36,8 @@
 //!
 //! - h2-only：`security=tls` 且 ALPN 缺省 → 硬错，不静默走 h3（extra 条款 `MASQUE-H2-ONLY`；Go
 //!   `hub.go:47-50` 的反向语义）。h3 批次押后（§7 R11）。
-//! - `warp` 配置出现即装配期 fail-visible 拒绝（非目标 1）。
+//! - `warp`（Cloudflare WARP 变体）已启用：证书/pin/静态地址/Cloudflare 头见 [`warp`]；
+//!   已知偏差（PKCS #1 SEC1 私钥、`warp`+`fingerprint` 组合）见该模块文档。
 
 /// B2 日志门面（规划 #21：target `xray_frame::transport::masque`；splithttp 同款
 /// LogFacade 形态。本批消费站点 = 胶囊丢弃/会话关闭的 debug 级留痕，无逐包热路径
@@ -51,6 +54,7 @@ pub mod h2;
 pub mod hub;
 pub mod pool;
 pub mod register;
+pub mod warp;
 
 pub use config::Config;
 pub use error::{MasqueError, Result};

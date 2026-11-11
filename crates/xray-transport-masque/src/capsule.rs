@@ -151,6 +151,21 @@ pub fn encode_capsule(c: &Capsule) -> Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// WARP（Cloudflare）变体的 DATAGRAM 帧：载荷 = 裸 IP 包，**无 contextID 前缀**
+/// （Go `conn.go:667-671` 的 `bare` 分支）。
+pub fn encode_bare_datagram(packet: &[u8]) -> Result<Vec<u8>> {
+    if packet.len() > MAX_CAPSULE_PAYLOAD {
+        return Err(MasqueError::Mtu);
+    }
+    let mut frame = Vec::with_capacity(
+        varint_len(CAPSULE_DATAGRAM) + varint_len(packet.len() as u64) + packet.len(),
+    );
+    frame.extend(varint_bytes(CAPSULE_DATAGRAM));
+    frame.extend(varint_bytes(packet.len() as u64));
+    frame.extend_from_slice(packet);
+    Ok(frame)
+}
+
 /// 解码一颗胶囊：`ty` + 裸载荷 → [`Capsule`]。
 ///
 /// 返回 `Ok(None)` = 按丢语义跳过（Go `conn.go:467-471,513-520`）：DATAGRAM 载荷超
@@ -191,6 +206,17 @@ pub fn decode_capsule(ty: u64, payload: &[u8]) -> Result<Option<Capsule>> {
         },
         _ => Ok(Some(Capsule::Unknown { ty, payload: payload.to_vec() })),
     }
+}
+
+/// WARP 变体的解帧入口：bare 模式下 DATAGRAM 载荷即裸 IP 包（无 contextID 前缀），
+/// 但首字节为 0 时仍按标准 varint 形态解析（Go `conn.go:512-521` 的 `bare` 分支）。
+pub fn decode_capsule_bare(ty: u64, payload: &[u8]) -> Result<Option<Capsule>> {
+    if ty == CAPSULE_DATAGRAM && !payload.is_empty() && payload[0] != 0 {
+        return Ok(
+            (payload.len() <= MAX_CAPSULE_PAYLOAD).then(|| Capsule::Datagram(payload.to_vec()))
+        );
+    }
+    decode_capsule(ty, payload)
 }
 
 // ===== 地址/路由条目编解码（Go capsule.go:48-56,76-83,145-152,262-277） =====

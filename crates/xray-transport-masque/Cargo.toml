@@ -29,11 +29,16 @@ tokio = { workspace = true }
 base64 = "0.22"
 # B4 hub：服务端 TLS acceptor（tokio_rustls::TlsAcceptor；xray-tls 产 rustls ServerConfig）
 tokio-rustls = { workspace = true }
+# WARP 变体（bd 2m30a）：Go `warp.go warpCertificate` 用既有 WARP 私钥现场签自签证书。
+# rcgen 本是本 crate dev-dep（xray-tls 生产依赖同款、Cargo.lock 内既有），生产面复用
+# 即免新增第三方；`time` 同源（xray-tls 依赖同版本），只为 NotBefore/NotAfter = now±。
+rcgen = "0.13"
+time = { version = "0.3", default-features = false, features = ["std"] }
+# WARP 客户端证书 + SPKI pin 验证器（`warp.rs`）；tokio-rustls 已间接依赖同一 rustls。
+rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-# TLS 回环互验 + Go 对拍服务端证书生成（自签 SAN localhost）
-rcgen = "0.13"
 
 # bd g3cr：生产代码零 unwrap（测试代码由 root clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

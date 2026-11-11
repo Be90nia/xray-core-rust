@@ -1,13 +1,16 @@
 //! `masqueSettings` 配置解析（Go `infra/conf/transport_method.go:806-901
 //! MasqueConfig.Build` + `transport/internet/masque/config.go:12 DefaultPath`）。
 //!
-//! B1 范围（规划 §5 B1.3）：host / path（缺省 + URI 模板展开）/ headers（token 校验 +
-//! 保留键拒绝）/ user+pass（→ `Authorization: Basic`，Go :874-880）；
-//! `warp` 出现即 Err（非目标 1，L5 装配门）；proto 侧 [`Config::from_proto`] 同判。
+//! 范围（规划 §5 B1.3 + bd 2m30a）：host / path（缺省 + URI 模板展开）/ headers（token
+//! 校验 + 保留键拒绝）/ user+pass（→ `Authorization: Basic`，Go :874-880）/ `warp`
+//! 变体（→ [`crate::warp`]，host/path 缺省落 WARP 值，Go :818-831）。
 
 use std::collections::HashMap;
 
-use crate::error::{MasqueError, Result};
+use crate::{
+    error::{MasqueError, Result},
+    warp::{WARP_HOST, WARP_PATH, Warp},
+};
 
 /// 缺省路径（Go `transport/internet/masque/config.go:12`；字面 `*` 原样发）。
 pub const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
@@ -21,37 +24,56 @@ pub struct Config {
     pub path: String,
     /// 附加请求头（已含 user/pass 推导出的 `Authorization`）。
     pub headers: HashMap<String, String>,
+    /// WARP 变体（Cloudflare）；`None` = 标准 CONNECT-IP。
+    pub warp: Option<Warp>,
 }
 
 impl Config {
     /// 解析 `masqueSettings` JSON（`None` → 缺省配置，与 Go `loadJSON(nil)` 等价）。
     ///
-    /// 校验顺序对齐 Go `Build()`：warp → path → host → headers → user/pass。
+    /// 校验顺序对齐 Go `Build()`：warp（含 user/pass 冲突）→ path → host → headers →
+    /// user/pass。
     pub fn from_json(v: Option<&serde_json::Value>) -> Result<Config> {
         let Some(v) = v else {
             return Ok(Config {
                 host: String::new(),
                 path: DEFAULT_PATH.to_string(),
                 headers: HashMap::new(),
+                warp: None,
             });
         };
         let obj = v.as_object().ok_or_else(|| {
             MasqueError::Protocol("masqueSettings: settings must be a JSON object".into())
         })?;
 
-        // 非目标 1（规划 §1.2）：WARP 变体（ECDSA 临时证书 + draft datagram setting）
-        // 不移植，配置出现即 fail-visible 拒绝。
-        if obj.get("warp").is_some_and(|w| !w.is_null()) {
-            return Err(MasqueError::Protocol("masqueSettings: \"warp\" is not supported".into()));
-        }
-
-        let path = normalize_path(obj.get("path").and_then(|p| p.as_str()).unwrap_or(""))?;
-
-        let host = obj.get("host").and_then(|h| h.as_str()).unwrap_or("").to_string();
-        validate_host(&host)?;
-
+        let mut host = obj.get("host").and_then(|h| h.as_str()).unwrap_or("").to_string();
+        let mut path = obj.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
         let user = obj.get("user").and_then(|u| u.as_str()).unwrap_or("");
         let pass = obj.get("pass").and_then(|p| p.as_str()).unwrap_or("");
+
+        // warp 段（Go transport_method.go:817-832）：与 user/pass 互斥；host/path 缺省
+        // 落 WARP 值；其余字段照常解析。
+        let warp = match obj.get("warp").filter(|w| !w.is_null()) {
+            Some(w) => {
+                if !user.is_empty() || !pass.is_empty() {
+                    return Err(MasqueError::Protocol(
+                        "masqueSettings: \"user\" and \"pass\" can't be used with \"warp\"".into(),
+                    ));
+                }
+                let parsed = Warp::from_json(w)?;
+                if host.is_empty() {
+                    host = WARP_HOST.to_string();
+                }
+                if path.is_empty() {
+                    path = WARP_PATH.to_string();
+                }
+                Some(parsed)
+            },
+            None => None,
+        };
+
+        let path = normalize_path(&path)?;
+        validate_host(&host)?;
 
         let mut headers = HashMap::new();
         if let Some(h) = obj.get("headers") {
@@ -104,21 +126,26 @@ impl Config {
             );
         }
 
-        Ok(Config { host, path, headers })
+        Ok(Config { host, path, headers, warp })
     }
 
-    /// 从 proto `Config` 构造（Go 侧 Build 产物已带终值；`warp` 出现即 Err）。
+    /// 从 proto `Config` 构造（Go 侧 Build 产物已带终值；`warp` 段再验一次）。
     pub fn from_proto(cfg: &xray_proto::transport::internet::masque::Config) -> Result<Config> {
-        if cfg.warp.is_some() {
-            return Err(MasqueError::Protocol(
-                "masque: proto config \"warp\" is not supported".into(),
-            ));
-        }
-        Ok(Config {
-            host: cfg.host.clone(),
-            path: if cfg.path.is_empty() { DEFAULT_PATH.to_string() } else { cfg.path.clone() },
-            headers: cfg.headers.clone(),
-        })
+        let warp = match &cfg.warp {
+            Some(w) => Some(Warp::from_proto(w)?),
+            None => None,
+        };
+        let host = if warp.is_some() && cfg.host.is_empty() {
+            WARP_HOST.to_string()
+        } else {
+            cfg.host.clone()
+        };
+        let path = match (warp.is_some(), cfg.path.is_empty()) {
+            (true, true) => WARP_PATH.to_string(),
+            (false, true) => DEFAULT_PATH.to_string(),
+            (_, false) => cfg.path.clone(),
+        };
+        Ok(Config { host, path, headers: cfg.headers.clone(), warp })
     }
 }
 
@@ -237,11 +264,48 @@ mod tests {
         assert_eq!(cfg.headers.get("X-Token").map(String::as_str), Some("a"));
     }
 
+    /// WARP 配置的密钥对（PKCS#8 / SPKI base64），供多个用例复用。
+    fn warp_keys() -> (String, String) {
+        use base64::Engine as _;
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate p256");
+        (
+            base64::engine::general_purpose::STANDARD.encode(key_pair.serialize_der()),
+            base64::engine::general_purpose::STANDARD.encode(key_pair.public_key_der()),
+        )
+    }
+
     #[test]
-    fn warp_is_rejected() {
-        let err = Config::from_json(Some(&json!({ "warp": { "privateKey": "k" } })))
-            .expect_err("warp must be rejected");
-        assert!(err.to_string().contains("warp"), "got {err}");
+    fn warp_is_accepted_and_defaults_host_path() {
+        // Go transport_method.go:818-832：warp 段可用；host/path 缺省落 WARP 值。
+        let (private_key, public_key) = warp_keys();
+        let cfg = Config::from_json(Some(&json!({
+            "warp": { "privateKey": private_key, "publicKey": public_key, "address": ["172.16.0.2"] }
+        })))
+        .expect("warp settings must parse");
+        assert_eq!(cfg.host, WARP_HOST);
+        assert_eq!(cfg.path, WARP_PATH);
+        let warp = cfg.warp.expect("warp present");
+        assert_eq!(warp.address.len(), 1);
+        assert_eq!(warp.local_addrs(), vec!["172.16.0.2".parse::<std::net::IpAddr>().expect("v4")]);
+    }
+
+    #[test]
+    fn warp_rejects_user_pass_and_bad_keys() {
+        let (private_key, public_key) = warp_keys();
+        let err = Config::from_json(Some(&json!({
+            "user": "u", "pass": "p",
+            "warp": { "privateKey": private_key, "publicKey": public_key, "address": ["172.16.0.2"] }
+        })))
+        .expect_err("user/pass + warp must be rejected");
+        assert!(err.to_string().contains("can't be used with \"warp\""), "got {err}");
+
+        // 缺 pin（publicKey）：装配期 Err（acceptance 2 的负向）。
+        let err = Config::from_json(Some(&json!({
+            "warp": { "privateKey": private_key, "address": ["172.16.0.2"] }
+        })))
+        .expect_err("warp without publicKey must be rejected");
+        assert!(err.to_string().contains("invalid \"publicKey\""), "got {err}");
     }
 
     #[test]
@@ -308,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn proto_warp_is_rejected_and_fields_copied() {
+    fn proto_warp_is_accepted_and_fields_copied() {
         let proto = xray_proto::transport::internet::masque::Config {
             host: "example.com:8443".into(),
             path: String::new(), // Go Build 产物恒非空；此处验证缺省兜底
@@ -320,12 +384,32 @@ mod tests {
         assert_eq!(cfg.host, "example.com:8443");
         assert_eq!(cfg.path, DEFAULT_PATH);
         assert_eq!(cfg.headers.get("X-Token").map(String::as_str), Some("a"));
+        assert!(cfg.warp.is_none());
 
+        // proto 侧 warp：可用；host/path 空时落 WARP 缺省（Go Build 已填，此处兜底）。
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("generate p256");
         let proto_warp = xray_proto::transport::internet::masque::Config {
-            warp: Some(xray_proto::transport::internet::masque::Warp::default()),
+            host: String::new(),
+            path: String::new(),
+            warp: Some(xray_proto::transport::internet::masque::Warp {
+                private_key: key_pair.serialize_der(),
+                public_key: key_pair.public_key_der(),
+                address: vec!["172.16.0.2".to_string()],
+            }),
             ..proto
         };
-        assert!(Config::from_proto(&proto_warp).is_err(), "proto warp must be rejected");
+        let cfg = Config::from_proto(&proto_warp).expect("proto warp should pass");
+        assert!(cfg.warp.is_some());
+        assert_eq!(cfg.host, WARP_HOST);
+        assert_eq!(cfg.path, WARP_PATH);
+
+        // 空 warp（手写 proto）仍 fail-visible。
+        let proto_empty = xray_proto::transport::internet::masque::Config {
+            warp: Some(xray_proto::transport::internet::masque::Warp::default()),
+            ..proto_warp
+        };
+        assert!(Config::from_proto(&proto_empty).is_err(), "empty proto warp must be rejected");
     }
 
     #[test]
