@@ -7,25 +7,31 @@ rust-version.workspace = true
 
 # MASQUE transport：RFC 9484 CONNECT-IP over HTTP/2 胶囊隧道
 # （对应 Go transport/internet/masque/ + transport/internet/masque/connectip/）。
-# B0+B1 批次依赖面只含本批实际消费件；B2（h2 绑定）起再补 hyper/hyper-util/
-# xray-tls/xray-frame/xray-buf（规划 §5 B0.1 依赖面按批次落地）。
+# B2 批次依赖面：hyper/hyper-util/h2 绑定（B0.1 规划面）、xray-tls（TLS(ALPN=h2)
+# 同 splithttp 调用序）、xray-frame（LOG 门面）；h3 不引（规划 §7 R11 押后）。
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
+xray-tls = { path = "../xray-tls" }
+# B2 日志门面：LogFacade（target = transport::masque），splithttp/grpc 同款
+xray-frame = { path = "../xray-frame" }
 thiserror = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
-# Basic 认证头（user/pass → Authorization；Go transport_method.go:877-880 同款）
-base64 = "0.22"
-
-# B0 U1 spike + B1 golden/config 测试面（B2 起 hyper/hyper-util 上移生产依赖）
-[dev-dependencies]
-tokio = { workspace = true }
+# B0 U1 spike + B2 h2 绑定（dev 面随生产依赖继承）
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+tokio = { workspace = true }
+# Basic 认证头（user/pass → Authorization；Go transport_method.go:877-880 同款）
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# TLS 回环互验 + Go 对拍服务端证书生成（自签 SAN localhost）
+rcgen = "0.13"
 
 # bd g3cr：生产代码零 unwrap（测试代码由 root clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

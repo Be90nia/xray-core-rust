@@ -40,6 +40,15 @@ pub struct AssignedAddress {
     pub prefix: IpPrefix,
 }
 
+impl AssignedAddress {
+    /// 拒绝判定（Go `capsule.go:42-44`）：前缀恰为 `0.0.0.0/32` 或 `::/128`。
+    /// 服务端以此形态回应不可满足的请求（Go `address.go:17-19`）。
+    pub fn is_rejected(&self) -> bool {
+        self.prefix == IpPrefix { addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED), prefix_len: 32 }
+            || self.prefix == IpPrefix { addr: IpAddr::V6(Ipv6Addr::UNSPECIFIED), prefix_len: 128 }
+    }
+}
+
 /// 地址请求条目（ADDRESS_REQUEST；Go `addressRequestCapsule` 的
 /// `RequestIDs[i]`+`Prefixes[i]` 平行切片，此处合并为条目）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,7 +286,7 @@ fn decode_prefix_entry(cur: &mut Cursor<&[u8]>) -> Result<IpPrefix> {
 }
 
 /// 被前缀覆盖外的低位是否全 0（Go `prefix != prefix.Masked()` 等价判定）。
-fn is_masked(addr: &IpAddr, prefix_len: u8) -> bool {
+pub(crate) fn is_masked(addr: &IpAddr, prefix_len: u8) -> bool {
     let octets: [u8; 16] = match addr {
         // v4 补零对齐到 16 字节：prefix_len ≤ 32 ⇒ 只会索引 0..=4，补零段不影响判定。
         IpAddr::V4(a) => {
@@ -391,7 +400,7 @@ fn ip_from_octets(bytes: &[u8]) -> IpAddr {
     }
 }
 
-fn ip_bit_len(addr: IpAddr) -> u8 {
+pub(crate) fn ip_bit_len(addr: IpAddr) -> u8 {
     match addr {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,

@@ -13,6 +13,10 @@
 //!
 //! hyper 1.x 的 `Upgraded` 只实现 `hyper::rt::{Read, Write}`（`upgrade.rs:166,176`），
 //! tokio 侧读写经 `hyper_util::rt::TokioIo` 适配。
+//!
+//! 测试基建 spawn 豁免（坑约束 #5）：本文件内的 `tokio::spawn` 均为测试 server/client
+//! 任务基建（spawn 三分类②「压测/测试基建」），随用随弃，无托管需求。
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 

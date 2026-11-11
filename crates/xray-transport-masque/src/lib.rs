@@ -12,15 +12,17 @@
 //!
 //! ## 本 crate 范围（规划 `docs/architecture/xray-frame-masque-实施计划-2026-11-11.md`）
 //!
-//! 已落地（B0+B1）：
+//! 已落地（B0+B1+B2）：
 //! - [`capsule`] — CONNECT-IP 胶囊编解码内核（RFC 9297 帧格式 + RFC 9484 四类胶囊 + 上限校验 +
 //!   未知类型跳过）
 //! - [`config`] — `masqueSettings` 解析（host/path/headers/user-pass + warp 拒绝）
 //! - [`error`] — [`MasqueError`] 分类（ClauseId::ErrorClassifiedNoPanicEscape）
 //! - [`register`] — dialer/listener 注册管线（**本批不接聚合口**，规划 §5 B1.4）
+//! - [`h2`] — CONNECT-IP over h2 extended CONNECT 绑定（hyper，B2.1）
+//! - [`connect`] — [`connect::ConnectIpSession`]（地址协商 / IP 包收发 / MTU-ICMP 回灌，B2.2）
+//! - [`dialer`] — 客户端拨号（finalmask 接线 + TLS(ALPN=h2) + establish，B2.6）
 //!
-//! 规划中未落地（B2-B4，不在本批）：`h2.rs`（CONNECT-IP over h2 绑定）、
-//! `connect.rs`（ConnectIpSession 会话）、`hub.rs`（服务端 accept）、`pool.rs`（地址池）。
+//! 规划中未落地（B4）：`hub.rs`（服务端 accept）、`pool.rs`（地址池）。
 //!
 //! ## udf 不适用判定（CLAUDE.md §3.5.5）
 //!
@@ -34,9 +36,18 @@
 //!   `hub.go:47-50` 的反向语义）。h3 批次押后（§7 R11）。
 //! - `warp` 配置出现即装配期 fail-visible 拒绝（非目标 1）。
 
+/// B2 日志门面（规划 #21：target `xray_frame::transport::masque`；splithttp 同款
+/// LogFacade 形态。本批消费站点 = 胶囊丢弃/会话关闭的 debug 级留痕，无逐包热路径
+/// 日志 → 不立 HOT_LOG）。
+pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
+    std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::masque", vec![]));
+
 pub mod capsule;
 pub mod config;
+pub mod connect;
+pub mod dialer;
 pub mod error;
+pub mod h2;
 pub mod register;
 
 pub use config::Config;

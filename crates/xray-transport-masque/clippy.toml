@@ -1,0 +1,17 @@
+# L3 静态闸（bd a5r4j/lzzja 家族模板，对齐 xray-transport-splithttp 同款；票 txmhr）：
+# 异步托管唯一口 = FxScope/PluginContext::spawn（坑约束 #5）。本 crate 是 h2 胶囊
+# 传输层：读泵/写泵/h2 连接驱动任务全部落在数据面（坑约束⑫ 热路径零改动）且 B2
+# 无 PluginContext 注入面——存量裸 spawn 逐点 #[allow(clippy::disallowed_methods)]
+# + 理由注释登记（①类待迁移模板，bd xosi9 改判）；托管裁决见 bd hj3jf（fx 可达即
+# spawn_tracked，否则逐点登记显式脱管）。
+# 注：per-crate clippy.toml 会替换 root 配置——root 键（allow-unwrap-in-tests）在此
+# 镜像维护（unwrap_used 由本 crate Cargo.toml [lints.clippy] 把守）。
+# 注：`path` 是被禁方法的 def path；`tokio::spawn` 单条即拦截两种书写形态
+# （tokio::spawn = tokio::task::spawn 的 re-export，探针实证）。
+allow-unwrap-in-tests = true
+
+disallowed-methods = [
+    { path = "tokio::spawn", reason = "裸 spawn 逃逸 FxScope 生命周期记账（坑约束 #5）：一律走 FxScope/PluginContext::spawn；本 crate 为 h2 胶囊传输层（读/写泵 + h2 连接驱动，数据面坑约束⑫）且 B2 无 PluginContext 注入面，存量调用逐点 #[allow(clippy::disallowed_methods)] + ①类待迁移理由登记（bd xosi9 改判）；托管裁决见 bd hj3jf" },
+    { path = "tokio::task::spawn", reason = "同 tokio::spawn（同 def-id 别名路径拼写，双登记 belt-and-braces；探针实测单独登记即覆盖两种调用形态）" },
+    { path = "std::thread::spawn", reason = "裸线程逃逸托管与停机编排（坑约束 #5/#6）：确需 OS 线程的场景逐点 #[allow(clippy::disallowed_methods)] + 理由注释登记" },
+]
