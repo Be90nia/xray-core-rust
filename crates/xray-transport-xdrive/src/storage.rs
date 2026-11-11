@@ -43,6 +43,13 @@ pub trait Storage: Send + Sync {
 
     async fn close(&self) -> io::Result<()>;
 
+    /// 会话视图（Go `sessionStorage`）：云后端返回绑定 XMUX 连接池的会话存储
+    /// （模板/token/缓存共享，连接面独立、`close` 归还池记账）；local 无连接
+    /// 面 → `None`（原样返回）。
+    fn session(&self) -> Option<Arc<dyn Storage>> {
+        None
+    }
+
     /// 槽位能力判定位（Go `storage.(slotStore)` 类型断言的等价口）。
     /// 仅 google-drive（B4）返回 `Some`。
     fn as_slot_store(&self) -> Option<&dyn SlotStore> {
@@ -67,33 +74,39 @@ pub fn is_not_found(e: &io::Error) -> bool {
 
 /// 按流设置构造后端（Go `newStorage`）。
 ///
-/// B1 只实现 `local`；`template`/`s3`/`google-drive` 随 B2/B3/B4 接入——
-/// 当前到达即显式失败（fail-visible，不静默退化）。
+/// `local` 直建；`template` 经共享实例表去重（Go `sharedStorage`）——dial/serve
+/// 同配置共享同一后端与 XMUX 连接池；`s3`/`google-drive` 随 B3/B4 接入。
 pub fn new_storage(
     settings: &xray_transport::dialer::StreamSettings,
 ) -> io::Result<Arc<dyn Storage>> {
     let config = Config::from_settings(settings)?;
     match config.service.as_str() {
         "local" => Ok(Arc::new(LocalStorage::new(&config.remote_folder)?)),
-        // Go 对四种后端之外的 service 恒报 unsupported；B1 前三种已知后端同样
-        // 未实现，如实点名等待批次。
-        "template" | "s3" | "google-drive" | "Google Drive" => Err(io::Error::other(format!(
+        "template" => shared_storage(Some(settings), &config, || {
+            Ok(Arc::new(crate::template::TemplateStorage::new(settings, &config)?))
+        }),
+        // Go 对四种后端之外的 service 恒报 unsupported；s3/google-drive 未实现，
+        // 如实点名等待批次。
+        "s3" | "google-drive" | "Google Drive" => Err(io::Error::other(format!(
             "unsupported service: {} (xdrive {} backend not implemented yet; bd hjtlk)",
             config.service,
-            match config.service.as_str() {
-                "template" => "B2",
-                "s3" => "B3",
-                _ => "B4",
-            }
+            if config.service == "s3" { "B3" } else { "B4" }
         ))),
         other => Err(io::Error::other(format!("unsupported service: {other}"))),
     }
 }
 
+/// 会话存储（Go `sessionStorage`）：云后端返回会话视图（走 XMUX 连接池），
+/// 其余原样返回（Dial 每会话、Listener 每接受连接各取一次）。
+#[must_use]
+pub fn session_storage(storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
+    storage.session().unwrap_or(storage)
+}
+
 // ── 共享实例表（Go `shared`/`sharedStorage`/`shareKey`/`resetSharedStorage`）──
 //
-// 云后端（B2+）按 share_key 进程级去重（token/连接复用）。B1 无云后端，本表暂无
-// 调用方——`pub` 面（B2 起由 new_storage 的分派臂消费），不在 B1 强行接线。
+// 云后端按 share_key 进程级去重（token/连接复用）：B2 起 `template` 分派臂消费
+// （`new_storage`），dial 与 serve 同配置共享同一后端实例与 XMUX 连接池。
 
 static SHARED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, Arc<dyn Storage>>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));

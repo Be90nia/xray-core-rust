@@ -33,20 +33,23 @@
 //!
 //! ## 任务托管（§3.5.6 ①类）
 //!
-//! WAL flush/reader/discard 循环挂每连接 [`ConnScope`]；listener 的
-//! accept/collect 循环挂组件级 [`ComponentScope`] + 显式取消令牌。禁裸 spawn。
+//! WAL flush/reader/discard 循环挂每连接 `SessionTasks`；listener 的
+//! accept/collect 循环挂组件级 [`xray_frame::scope::ComponentScope`] + 显式取消令牌。禁裸 spawn。
 
 /// 日志统一入口：域规范 target = `xray_frame::transport::xdrive`（同
 /// websocket/splithttp 各 crate 惯例）。
 pub(crate) static LOG: std::sync::LazyLock<xray_frame::logging::LogFacade> =
     std::sync::LazyLock::new(|| xray_frame::logging::LogFacade::new("transport::xdrive", vec![]));
 
+pub mod client;
 pub mod config;
 pub mod conn;
+pub(crate) mod jsonpath;
 pub mod local;
 pub mod params;
 pub mod register;
 pub mod storage;
+pub mod template;
 pub mod wal;
 pub mod xdrive;
 
@@ -55,6 +58,7 @@ pub use conn::Conn;
 pub use local::LocalStorage;
 pub use params::Params;
 pub use register::{register_dialer, register_listener};
-pub use storage::{Entry, SlotStore, Storage};
+pub use storage::{Entry, SlotStore, Storage, session_storage, shared_storage};
+pub use template::TemplateStorage;
 pub use wal::{WalReader, WalWriter};
 pub use xdrive::{dial, serve};

@@ -10,9 +10,15 @@ rust-version.workspace = true
 [dependencies]
 xray-common = { path = "../xray-common" }
 xray-transport = { path = "../xray-transport" }
+# XMUX 池（§3.5.2 白拿清单）：泛型 XmuxManager/XmuxConn/ManagerPool 直接消费，
+# 禁复制（规划 §5 B2；层间同型先例 = hysteria/splithttp → xray-transport-quic）。
+xray-transport-splithttp = { path = "../xray-transport-splithttp" }
+# TLS 客户端配置（build_client_config：security/tlsSettings → rustls ClientConfig）。
+xray-tls = { path = "../xray-tls" }
 xray-frame = { path = "../xray-frame" }
 # clock 契约（Clock/SystemClock）与 std_ext 散件（fsx 原子写/遍历、encode hex、
-# id::RandomId 会话 ID）。path 形态同各消费方（udf-frame 仓内工作副本即改即用）。
+# id::RandomId 会话 ID、cache SyncTtlCache oauth2 token）。path 形态同各消费方
+# （udf-frame 仓内工作副本即改即用）。
 udf-skeleton = { path = "../udf-frame/skeleton" }
 # cancel_pair/CancelToken/ScopeClosed（fx 域取消对；tokio feature = fx 域本体）。
 udf-skeleton-infra = { path = "../udf-frame/skeleton-infra", features = ["tokio"] }
@@ -24,6 +30,24 @@ async-trait = { workspace = true }
 # share_key 内容摘要（storage.go sha256；禁用 std_ext::hash——那是 FNV-1a/XXH64
 # 非加密摘要）。版本与 xray-proxy-ss 既有依赖一致。
 sha2 = "0.10"
+
+# HTTP 客户端栈（Go client.go 的 hyper 对应面：legacy Client + 连接池 + ALPN h2/h1）
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+http = { workspace = true }
+http-body = "1"
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tower-service = "0.3"
+# template namesRegex（Go regexp 对应；1.12 已在依赖树内——tonic/tracing-subscriber
+# 传递引入，不新增 crate 入图）
+regex = "1"
+
+[dev-dependencies]
+# xmux 复用锚的 TLS mock 服务端（tokio-rustls 已在 workspace 依赖树内）
+tokio-rustls = { workspace = true }
 
 # bd g3cr 同款：生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

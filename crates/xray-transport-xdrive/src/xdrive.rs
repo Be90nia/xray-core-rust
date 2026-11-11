@@ -25,7 +25,7 @@ use crate::{
     config::Config,
     conn::{Conn, SessionTasks},
     params::Params,
-    storage::{Storage, new_storage},
+    storage::{Storage, new_storage, session_storage},
 };
 
 pub(crate) const PROTOCOL_NAME: &str = "xdrive";
@@ -92,7 +92,7 @@ pub async fn dial(
 ) -> io::Result<Box<dyn Connection>> {
     let _ = (dest, sockopt);
     let config = Config::from_settings(settings)?;
-    let storage = new_storage(settings)?;
+    let storage = session_storage(new_storage(settings)?);
     let params = Params::for_storage(&config, storage.as_ref());
 
     let session = new_session_id()?;
@@ -246,10 +246,12 @@ impl Listener {
                 continue;
             }
             // B1：announce Inline 恒空、无 slotStore——不读载荷，直接 WAL Conn。
+            // 存储取会话视图（Go `newSessionConn` 的 sessionStorage：XMUX 连接池
+            // 会话面，close 归还池记账）。
             self.drop_object(&format!("{SESSIONS_DIR}/{entry}")).await;
             accepted = true;
             let conn = Conn::new_wal(
-                Arc::clone(&self.storage),
+                session_storage(Arc::clone(&self.storage)),
                 &downlink_prefix(&session),
                 &uplink_prefix(&session),
                 &self.params,
