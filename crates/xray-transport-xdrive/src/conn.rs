@@ -5,7 +5,8 @@
 //! 读阻塞由 WAL 空洞超时/环槽判停兜底，语义等价于 Go 未设 deadline 的调用面。
 //!
 //! 关闭序（Go `Close`）：writer 冲净 + 结尾标记 → 取消任务 → storage 收尾。
-//! `poll_shutdown` 驱动完整序；裸 `Drop` 兜底走同一 future（compat 托管口）。
+//! `poll_shutdown` 驱动完整序；裸 `Drop` 兜底续跑同一 future（compat 托管口）。
+//! 关闭序恰一次（Go `closeOnce`）：future 单一 owner（下方 `ShutdownState`）。
 
 use std::{
     io,
@@ -68,6 +69,16 @@ impl SessionTasks {
 /// 由外层 `parking_lot::Mutex` 保证，future 本体只需 Send）。
 type ShutdownFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 
+/// 关闭序状态（Go `Conn.closeOnce` 的 Rust 对应）：future 是**单一 owner**，
+/// `Drop` 只能续跑已建 future，禁重建——重建会二次 `writer.close` + 二次
+/// `storage.close`（云后端会话 close 被调两次，bd oso1c）。
+enum ShutdownState {
+    Pending,
+    Running(ShutdownFuture),
+    /// 已跑到 `Ready`：`Drop` 不得再驱动。
+    Done,
+}
+
 /// 双路管道（Go `Conn` 的 writer/reader 二元组）：WAL 分段路或环槽路。
 enum ConnPipe {
     Wal { writer: Arc<WalWriter>, reader: WalReader },
@@ -84,9 +95,9 @@ pub struct Conn {
     on_close: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// 上次读未消费完的段残余（Go `readBuf`）。
     read_buf: Vec<u8>,
-    /// `poll_shutdown` 的驱动状态（Go `Close` 的 async 化载体；Mutex 供
+    /// 关闭序状态（Go `Close` 的 async 化载体 + `closeOnce`；Mutex 供
     /// `Connection: Sync`——关闭 future 本体只需 Send）。
-    shutdown: parking_lot::Mutex<Option<ShutdownFuture>>,
+    shutdown: parking_lot::Mutex<ShutdownState>,
 }
 
 impl Conn {
@@ -109,7 +120,7 @@ impl Conn {
             tasks,
             on_close,
             read_buf: Vec::new(),
-            shutdown: parking_lot::Mutex::new(None),
+            shutdown: parking_lot::Mutex::new(ShutdownState::Pending),
         }
     }
 
@@ -153,7 +164,7 @@ impl Conn {
             tasks,
             on_close,
             read_buf: Vec::new(),
-            shutdown: parking_lot::Mutex::new(None),
+            shutdown: parking_lot::Mutex::new(ShutdownState::Pending),
         }
     }
 
@@ -259,15 +270,25 @@ impl AsyncWrite for Conn {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         // 先判断再独占构建（build 需要独占 self，须在持锁窗口外完成）。
-        let has = this.shutdown.lock().is_some();
-        if !has {
+        if matches!(*this.shutdown.lock(), ShutdownState::Pending) {
             let built = this.build_shutdown_future();
-            *this.shutdown.lock() = Some(built);
+            *this.shutdown.lock() = ShutdownState::Running(built);
         }
         let mut slot = this.shutdown.lock();
-        match slot.as_mut() {
-            Some(fut) => fut.as_mut().poll(cx),
-            None => Poll::Ready(Err(io::Error::other("xdrive conn: shutdown slot vanished"))),
+        match &mut *slot {
+            ShutdownState::Running(fut) => match fut.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    // 关闭序已跑完：Drop 不得再驱动（Go closeOnce 单次语义）。
+                    *slot = ShutdownState::Done;
+                    Poll::Ready(result)
+                },
+                Poll::Pending => Poll::Pending,
+            },
+            // 已关闭（Go `Close` 幂等：二次调用直接返回；首调已把错误交给调用方）。
+            ShutdownState::Done => Poll::Ready(Ok(())),
+            ShutdownState::Pending => {
+                Poll::Ready(Err(io::Error::other("xdrive conn: shutdown state vanished")))
+            },
         }
     }
 }
@@ -295,16 +316,26 @@ impl Connection for Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        // 裸丢弃（未经 poll_shutdown）：关闭序兜底——冲净缓冲 + 落结尾标记 +
-        // storage 收尾，**之后**才收任务面（tasks.close）。顺序不可反：环槽路
-        // 的 drain 依赖 flush_loop/upload 任务仍活着，先 close 会 abort 掉
-        // 冲净（Go `Close` 同序：writer.Close() 阻塞冲净在先）。runtime 已拆
-        //（进程停机尾段）时无从冲净，只能取消兜底。
+        // 裸丢弃：关闭序兜底——冲净缓冲 + 落结尾标记 + storage 收尾，**之后**
+        // 才收任务面（tasks.close）。顺序不可反：环槽路的 drain 依赖
+        // flush_loop/upload 任务仍活着，先 close 会 abort 掉冲净（Go `Close`
+        // 同序：writer.Close() 阻塞冲净在先）。runtime 已拆（进程停机尾段）时
+        // 无从冲净，只能取消兜底。
         if tokio::runtime::Handle::try_current().is_err() {
             self.tasks.close();
             return;
         }
-        let fut = self.build_shutdown_future();
+        // 关闭序单一 owner（Go closeOnce）：已建的 future 只续跑、禁重建——
+        // shutdown 已跑完则 Drop 什么都不做（旧实现重建会二次 close 云后端会话）。
+        let previous = {
+            let mut slot = self.shutdown.lock();
+            std::mem::replace(&mut *slot, ShutdownState::Done)
+        };
+        let fut = match previous {
+            ShutdownState::Pending => self.build_shutdown_future(),
+            ShutdownState::Running(fut) => fut,
+            ShutdownState::Done => return,
+        };
         let tasks = self.tasks.clone();
         let spawned = xray_frame::compat::spawn(async move {
             let _ = fut.await;
@@ -323,10 +354,15 @@ impl Drop for Conn {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::{config::Config, local::LocalStorage};
+    use crate::{config::Config, local::LocalStorage, storage::Entry};
 
     fn test_params() -> Params {
         Params::from_config(&Config {
@@ -337,6 +373,143 @@ mod tests {
             session_ttl_seconds: 60,
             ..Config::default()
         })
+    }
+
+    /// 会话 close 计数后端：真实 local 落盘 + `close()` 计数（不靠日志观测
+    /// 关闭序被驱动几次）。
+    struct CountingStorage {
+        inner: LocalStorage,
+        closes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CountingStorage {
+        async fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+            self.inner.put(name, data).await
+        }
+
+        async fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+            self.inner.get(name).await
+        }
+
+        async fn delete(&self, name: &str) -> io::Result<()> {
+            self.inner.delete(name).await
+        }
+
+        async fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn close(&self) -> io::Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.inner.close().await
+        }
+    }
+
+    fn counting_storage(tag: &str) -> (Arc<dyn Storage>, Arc<AtomicUsize>, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("xdrive-conn-{tag}-{}", std::process::id()));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let storage: Arc<dyn Storage> = Arc::new(CountingStorage {
+            inner: LocalStorage::new(root.to_string_lossy().as_ref()).unwrap(),
+            closes: Arc::clone(&closes),
+        });
+        (storage, closes, root)
+    }
+
+    /// 等关闭序在托管 spawn 里跑完（Drop 路径异步）：等不到即计数不足，判失败。
+    async fn wait_closed(counter: &AtomicUsize) {
+        for _ in 0..500 {
+            if counter.load(Ordering::SeqCst) >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "session close never ran");
+    }
+
+    /// 关闭序单一 owner（Go `closeOnce`）：shutdown 跑完 + 二次 shutdown 幂等 +
+    /// 随后 Drop，会话 close 恰一次。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_then_drop_closes_session_once() {
+        let (storage, closes, root) = counting_storage("close1");
+        let params = test_params();
+        let mut conn = Conn::new_wal(
+            storage,
+            "streams/t1/c2s",
+            "streams/t1/s2c",
+            &params,
+            "xdrive-test-close1",
+            None,
+        );
+        conn.write_all(b"hello").await.unwrap();
+
+        conn.shutdown().await.unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "shutdown must close session exactly once");
+        conn.shutdown().await.unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "repeated shutdown must not re-close");
+
+        drop(conn);
+        // Drop 曾重建关闭序 ⇒ 200ms 内计数会变 2。
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "drop after shutdown must not re-close");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 裸 Drop（未经 poll_shutdown）：兜底关闭序跑完，会话 close 恰一次。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_alone_closes_session_once() {
+        let (storage, closes, root) = counting_storage("close2");
+        let params = test_params();
+        let mut conn = Conn::new_wal(
+            storage,
+            "streams/t2/c2s",
+            "streams/t2/s2c",
+            &params,
+            "xdrive-test-close2",
+            None,
+        );
+        conn.write_all(b"hello").await.unwrap();
+
+        drop(conn);
+        wait_closed(&closes).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "drop must close session exactly once");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// shutdown 只 poll 一次（半途）就 Drop：Drop 续跑同一 future（不重建），
+    /// 会话 close 仍恰一次（覆盖 Drop 的 `Running` 分支）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_after_partial_shutdown_closes_session_once() {
+        let (storage, closes, root) = counting_storage("close3");
+        let params = test_params();
+        let mut conn = Conn::new_wal(
+            storage,
+            "streams/t3/c2s",
+            "streams/t3/s2c",
+            &params,
+            "xdrive-test-close3",
+            None,
+        );
+        // 跨多段写入 ⇒ 关闭序要等在飞上传收净，首轮 poll 大概率 Pending。
+        conn.write_all(&vec![7u8; 40_000]).await.unwrap();
+
+        let mut pinned = Box::pin(conn);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // 实测首轮恒 Pending（等 40KB 的在飞上传收净）⇒ 走到 Drop 的 `Running`
+        // 续跑分支；机器足够快时首轮即 Ready 也走同一断言（关闭序仍恰一次）。
+        if let Poll::Ready(result) = pinned.as_mut().poll_shutdown(&mut cx) {
+            result.unwrap();
+        }
+        drop(pinned);
+
+        wait_closed(&closes).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "partial shutdown then drop must close once");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// 同进程双 Conn 经 LocalStorage 往返：写侧 c2s → 读侧 c2s；EOF 经 `.end`。
