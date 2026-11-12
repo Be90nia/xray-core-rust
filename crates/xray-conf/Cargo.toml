@@ -28,6 +28,11 @@ udf-std-ext = { path = "../udf-frame/std-ext", features = ["json"] }
 # parse_server_decryption），禁另写一份。依赖方向 xray-conf → xray-proxy-vless 无环
 # （vless 不依赖本 crate），workspace 内已被 xray-core 构建，无增量编译成本。
 xray-proxy-vless = { path = "../xray-proxy-vless" }
+# G4 服务形状配置期拒启：复用 xray-transport-xdrive::Config::from_config_json 单源校验
+# （未知 service / drive 缺 3 secrets / template·s3 对象缺失），禁复制。依赖方向
+# xray-conf → xray-transport-xdrive 无环（transport 族不依赖本 crate）；同 vless 先例，
+# workspace 内已被 xray-core 构建。
+xray-transport-xdrive = { path = "../xray-transport-xdrive" }
 
 [dev-dependencies]
 # 3c 影子比对（票 xiuvr）：skeleton_infra::config::ConfigFile 对照旧装载路径。

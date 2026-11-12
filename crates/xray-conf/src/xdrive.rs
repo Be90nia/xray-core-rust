@@ -57,6 +57,14 @@ pub fn validate_xdrive(
             ));
         }
     }
+    // 服务形状配置期拒启（Go `XDriveConfig.Build` 的 service switch；G4）：未知
+    // service / drive 缺 3 secrets / template·s3 对象或必填字段缺失 ⇒ 配置装载即拒
+    // （旧时点差：Rust 拖到首连接的 storage 构造才失败）。校验单源在
+    // xray-transport-xdrive（禁复制）；错误前缀复用解析层既有形态。
+    if let Some(xdrive_json) = stream_settings.and_then(|ss| ss.get("xdriveSettings")) {
+        xray_transport_xdrive::Config::from_config_json(Some(xdrive_json))
+            .map_err(|e| lint_err(kind, tag, &e.to_string()))?;
+    }
     match kind {
         "outbound" => validate_outbound(kind, tag, settings, mux),
         "inbound" => validate_inbound(kind, tag, settings, ports),
@@ -208,6 +216,33 @@ mod tests {
 
     fn mux_ok() -> MuxConfig {
         MuxConfig { enabled: true, concurrency: 128, ..Default::default() }
+    }
+
+    // ===== G4：服务形状配置装载期拒启（Go XDriveConfig.Build 同款文案） =====
+
+    #[test]
+    fn service_shape_rejected_at_config_load() {
+        let user = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC}));
+        let mux = mux_ok();
+        // 未知 service。
+        let ss = json!({"network": "xdrive", "xdriveSettings": {"service": "Dropbox"}});
+        let err =
+            validate_xdrive("outbound", "ob", "vless", Some(&user), Some(&ss), Some(&mux), None)
+                .expect_err("未知 service 必须在配置装载期拒");
+        assert!(err.to_string().contains(r#"unknown "service": "Dropbox""#), "{err}");
+        // google-drive 缺 3 secrets。
+        let ss = json!({"network": "xdrive",
+            "xdriveSettings": {"service": "google-drive", "remoteFolder": "f", "secrets": ["a", "b"]}});
+        let err =
+            validate_xdrive("outbound", "ob", "vless", Some(&user), Some(&ss), Some(&mux), None)
+                .expect_err("drive 缺 3 secrets 必须在配置装载期拒");
+        assert!(err.to_string().contains("needs 3 secrets"), "{err}");
+        // s3 缺 s3 对象。
+        let ss = json!({"network": "xdrive", "xdriveSettings": {"service": "s3"}});
+        let err =
+            validate_xdrive("outbound", "ob", "vless", Some(&user), Some(&ss), Some(&mux), None)
+                .expect_err("s3 缺 s3 对象必须在配置装载期拒");
+        assert!(err.to_string().contains(r#"needs an "s3" object"#), "{err}");
     }
 
     // ===== 出站六规则矩阵（正/反） =====

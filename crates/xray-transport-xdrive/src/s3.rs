@@ -211,6 +211,15 @@ fn remote_folder(config: &Config) -> &str {
     config.remote_folder.strip_suffix('/').unwrap_or(&config.remote_folder)
 }
 
+/// 配置期校验入口（Go `XDriveConfig.Build` 在 conf 装载期调 `ValidateS3Config`
+/// 的等价面）：装配期由 [`crate::config::Config::from_config_json`] 消费；构造期
+/// [`S3Storage::new`] 保留同款校验（直构路径防线，语义不变）。
+pub(crate) fn validate_config(config: &Config) -> io::Result<()> {
+    let s3_json =
+        config.s3.as_ref().ok_or_else(|| invalid(r#"service "s3" needs an "s3" object"#))?;
+    validate(&parse_s3_settings(s3_json)?, config)
+}
+
 // ── endpoint 解析（Go url.Parse 校验 + base 构造的段重编码）─────────────────
 
 struct Endpoint {

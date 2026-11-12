@@ -124,6 +124,40 @@ impl Config {
             xmux: obj.get("xmux").cloned().filter(|v| !v.is_null()),
             h3: false,
         })
+        .and_then(|config| {
+            validate_service_shape(&config)?;
+            Ok(config)
+        })
+    }
+}
+
+/// 服务形状配置期校验（Go `XDriveConfig.Build` 的 service switch 直译，文案逐字）。
+///
+/// Go 在 conf 装载期（Build）即拒：未知 `service` / `google-drive` 缺 3 secrets /
+/// `template`·`s3` 对象缺失（`s3` 再过 `ValidateS3Config` 全量校验）。Rust 旧时点差：
+/// 这些检查拖延到首连接的 storage 构造，坏配置能启动成功。现经
+/// [`Config::from_config_json`] 在每次解析即拒（装配期 xray-conf lint 复用同一入口）。
+fn validate_service_shape(config: &Config) -> io::Result<()> {
+    match config.service.as_str() {
+        "local" => Ok(()),
+        "google-drive" | "Google Drive" => {
+            if config.secrets.len() != 3 {
+                return Err(invalid_settings(
+                    "Google Drive needs 3 secrets in order of ClientID, ClientSecret, RefreshToken",
+                ));
+            }
+            Ok(())
+        },
+        "template" => {
+            if config.template.is_none() {
+                return Err(invalid_settings(r#"service "template" needs a "template" object"#));
+            }
+            Ok(())
+        },
+        "s3" => crate::s3::validate_config(config),
+        other => Err(invalid_settings(&format!(
+            r#"unknown "service": "{other}", use "google-drive", "template", "s3" or "local""#
+        ))),
     }
 }
 
@@ -203,5 +237,74 @@ mod tests {
         let mut settings = settings_from(json);
         settings.security_json = Some(serde_json::json!({"alpn": ["h2", "h3"]}));
         assert!(!Config::from_settings(&settings).unwrap().h3);
+    }
+
+    // ── G4：服务形状配置期拒启（Go XDriveConfig.Build 同款文案）───────────────
+
+    #[test]
+    fn unknown_service_rejected_at_config_time() {
+        let err = Config::from_config_json(Some(
+            &serde_json::json!({"service": "Dropbox", "remoteFolder": "/tmp/x"}),
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"unknown "service": "Dropbox""#)
+                && msg.contains(r#"use "google-drive", "template", "s3" or "local""#),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn drive_missing_secrets_rejected_at_config_time() {
+        let err = Config::from_config_json(Some(&serde_json::json!(
+            {"service": "google-drive", "remoteFolder": "f", "secrets": ["a", "b"]}
+        )))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Google Drive needs 3 secrets in order of ClientID, ClientSecret, RefreshToken"
+            ),
+            "{}",
+            err
+        );
+        // 别名 "Google Drive"（Go 弃用警告 + fallthrough 同语义）同样 3 secrets 过闸。
+        assert!(
+            Config::from_config_json(Some(&serde_json::json!(
+                {"service": "Google Drive", "remoteFolder": "f", "secrets": ["a", "b", "c"]}
+            )))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn template_missing_object_rejected_at_config_time() {
+        let err = Config::from_config_json(Some(&serde_json::json!({"service": "template"})))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(r#"service "template" needs a "template" object"#),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn s3_missing_object_and_bad_fields_rejected_at_config_time() {
+        let err =
+            Config::from_config_json(Some(&serde_json::json!({"service": "s3"}))).unwrap_err();
+        assert!(err.to_string().contains(r#"service "s3" needs an "s3" object"#), "{}", err);
+        // 对象在场但必填字段畸形 → Go ValidateS3Config 同款文案（配置期即拒）。
+        let err = Config::from_config_json(Some(&serde_json::json!(
+            {"service": "s3", "remoteFolder": "streams", "secrets": ["ak", "sk"],
+             "s3": {"region": "us-east-1", "bucket": "b"}}
+        )))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "S3 endpoint must be an http(s) URL without credentials, query or fragment"
+            ),
+            "{}",
+            err
+        );
     }
 }
