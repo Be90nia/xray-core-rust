@@ -39,7 +39,7 @@ VERDICT: DONE
 
 ### 1.2 非目标（明确不做）
 
-1. **Cloudflare WARP 变体**（`warp.go` 78 行：ECDSA 临时证书 + 公钥 pin + 20 字节 CID + draft datagram setting `0x276`）——配置出现 `warp` 即装配期 fail-visible 拒绝。
+1. ~~**Cloudflare WARP 变体**~~ **已实现（h2 路径），L1 已验**（2026-11-12：真连 WARP CONNECT-IP 会话 + 隧道内 UDP DNS 往返，`reports/2026-11-12-masque-warp-nonmainland.md`；代码 = `xray-transport-masque` 的 [`warp`] 模块，配置经 `masqueSettings.warp` 启用）。
 2. **CONNECT-UDP（RFC 9298）本体**与 `connect-udp` `:protocol`——Xray 用 connect-ip，二者不共存（`connectip/request.go` 仅认 `connect-ip`）。
 3. **URI 模板形式的 IP flow forwarding**（Go 直接报错）+ 多跳 forwarding 链。
 4. **H3 模式的实现**——本规划只给「需 vendor patch h3」的决策与验收，不排进必做批次（§7 R11）。
@@ -370,7 +370,7 @@ cargo doc --workspace --no-deps                                    # CLAUDE.md �
 
 ```bash
 # A/B/C 三方向（C 另加 64KB 连续 IP 包往返不丢）
-cargo test -p xray-integration-tests --test masque_interop -- --ignored --nocapture
+cargo test -p xray-transport-masque --test connectip_go_interop -- --ignored --nocapture
 # 私有地址阻断实证：期望 freedom 日志 "blocked by final rule" 且目标端口零连接
 # 抓包残留
 python tools/masque_capsule_residue.py --pcap D:/tmp/masque.pcapng   # 期望 residue_frames=0
@@ -393,7 +393,7 @@ D:/Project/tools/Wireshark/tshark.exe -r D:/tmp/masque-h3.pcapng -d udp.port==44
 |---|---|---|---|---|
 | **R1** | ~~hyper extended CONNECT 全链路未跑过~~ **已消解（2026-11-11 B0 spike 实测）** | 静态已核（`hyper-1.10.1` 上述三处 + `h2-0.4.19`）+ **运行时全链路四断言全过**：`cargo test -p xray-transport-masque --test h2_extended_connect_spike` = server 收到 `:protocol=connect-ip`+`:method=CONNECT`（ext extensions 面）、client `200`+`Upgraded`、双向 1KB 一致、非空 body → `Err`。实现形态 = auto server `.http2().enable_connect_protocol()` + client `ext::Protocol::from_static("connect-ip")` + `hyper::upgrade::on`；**两个实测坑**：①hyper `Upgraded` 只实现 `hyper::rt::{Read,Write}`（`upgrade.rs:166,176`），tokio 读写须 `hyper_util::rt::TokioIo` 适配；②hyper `send_request()` 返回 `impl Future`（`Result<Response<Incoming>, _>` 单层 await，非 0.14 的 ResponseFuture 二段式） | **已关闭**——raw `h2` 兜底**不需要**；证据 = `crates/xray-transport-masque/tests/h2_extended_connect_spike.rs`（B0 交付） | 已消解 |
 | **R2** | 单流载全部流量 → h2 流窗成全局瓶颈 | 历史 h2 窗钉战役（CLAUDE.md §5 enc8x） | B2 起用 16MiB send_buf / 32MiB 流窗；M2 加「隧道数 × 每隧道带宽」观测；**禁自造流控** | 中 |
-| **R3** | WARP 误入 M1 | `warp.go` 78 行、`WarpHost=cloudflareaccess.com` | 配置含 `warp` 即 `Err`（L5 装配门） | 低 |
+| **R3** | WARP 误入 M1 | `warp.go` 78 行、`WarpHost=cloudflareaccess.com` | **已闭环（反转）**：WARP 已实现（h2 路径），L1 已验（`reports/2026-11-12-masque-warp-nonmainland.md`）；非目标 1 同步更新 | 已闭环 |
 | **R4** | 与 splithttp/xhttp 命名混淆 | `dialer.rs:604 Masque => "masqueSettings"` 已对齐 Go | 零共享模块，只共享依赖与窗常量 | 低 |
 | **R5** | 零 xray 语义部分误上浮 udf | §4.1 已判 | 胶囊/connect-ip 留 transport crate，件头写「udf 不适用」 | 中 |
 | **R6** | ipstack 提炼触红线 | PM 已裁定（§4.2） | B3 独立批次 + 门 B3-M；`xray-proxy-tun` 副本**未收编**（实测 1449 行，另立 bd 票） | 中（已缓解） |
@@ -402,9 +402,9 @@ D:/Project/tools/Wireshark/tshark.exe -r D:/tmp/masque-h3.pcapng -d udp.port==44
 | **R9** | **Go 服务端 ALPN 缺省即 h3** | `hub.go:47-50 serverVersions`：`h3 = contains(h3) \|\| !h2`（676eaf66 实测） | 所有互通配置**必须显式** `alpn:["h2"]`；Rust 侧 `security=tls` 且 ALPN 缺省 → 硬错（不静默） | **高（易踩）** |
 | **R10** | 地址池边界（网络/广播/服务器自身） | Go `pool.go:31-45` | 照抄三条校验 + 表驱动单测（QAS-2） | 中 |
 | **R11** | **h3 表达不了 `connect-ip`** | `h3-0.0.8/src/ext.rs:28-31`（`ProtocolInner` 仅 `WebTransport`/`ConnectUdp`，无 `from_static`）；0.0.8 = crates.io 最新 | h3 单独批次 + **ADR-M4 决策**：①`vendor/h3` patch ②自写 QUIC datagram（否决）③等上游 | **高（决定 M3 生死）** |
-| **R12** | finalmask 消费漏接（Go 4 处） | `dialer.go:163-164,84-85`；`hub.go:168-169,122-123` | B2.6 + B4.7 显式接线；配置含 finalmask 而未接线 → 不得静默（fail-visible） | 中 |
+| **R12** | finalmask 消费漏接（Go 4 处） | `dialer.go:163-164,84-85`；`hub.go:168-169,122-123` | **已完成**：client `dialer.rs`（`shared_tcpmask_manager_from_json` fail-visible 解析 + TLS 前包装，单测 `dial_fail_visible_on_bad_finalmask`）+ server `hub.rs`（listen 侧 `build_tcpmask_manager_from_json` + `wrap_conn_server_into_connection`）；h3 侧两处随 R11 押后 | 已闭环（h2 侧） |
 | **R13** | lint 放行与注册表不同步 | `xray-conf/src/init.rs:332-349` 现为 fail-closed | 放行与 `register_all_transports` **同批**（B4.4+B4.5），否则配置过 lint 却在拨号期 NotFound | 中 |
-| **R14** | 内存预算账本未登记 | `crates/xray-core/src/memory_budget.rs`（`H2_MAX_SEND_BUF_PER_CONN_BYTES` 等按协议入账） | B4.6 按「隧道数 × 16MiB」入硬账；装不下走降档 + WARN（不拒启） | 中 |
+| **R14** | 内存预算账本未登记 | `crates/xray-core/src/memory_budget.rs`（`H2_MAX_SEND_BUF_PER_CONN_BYTES` 等按协议入账） | **未做（缺口 G3，另票）**：masque 单隧道 16MiB send_buf 尚未入账；待做 = 按「隧道数 × 16MiB」入硬账；装不下走降档 + WARN（不拒启） | 中（open） |
 | **R15** | 不接 xmux 池 → 每连接一次 TLS+h2 握手 | Go 用 `splithttp.NewXmuxManager` 池化 | `shortcut:` 注释登记；M3 前若有 A/B 证据（握手占 TTFB 显著）→ 移动 `mux.rs` 至 `xray-frame::xmux` + re-export | 中 |
 | **R16** | 上游未稳定点 | 26.10.17→26.11.9 masque 零改动（本文 §0 #2） | 若下个基准再动 masque，重跑本文 §2.1/§2.3 取证 | 低 |
 | **R17** | 「上浮/提炼」批次混入逻辑改动 | 三处上浮：B3 ipstack、B1.5 varint、B2.4 h2 窗常量 | 三处统一用**门 B3-M 的「纯移动」机器判据**（§6）；出任何逻辑/常量变化即打回 | 中 |

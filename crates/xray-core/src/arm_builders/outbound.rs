@@ -618,6 +618,11 @@ pub(crate) fn build_masque_outbound(
         xray_proxy_masque::client::parse_client_settings(&raw).map_err(BuildError::from)?;
     let transport_settings =
         xray_transport::dialer::StreamSettings::from_json(ob.stream_settings_json.as_ref());
+    // 装配门「network 必须 masque」（Go proxy/masque/client.go:63-65 构造器类型
+    // 断言同文案：非 masque settings → "not masque transport"）。
+    if transport_settings.protocol != "masque" {
+        return Err(BuildError::from("not masque transport".to_string()));
+    }
     // 装配门 MASQUE-TLS-REQUIRED / MASQUE-H2-ONLY（extra 条款）：security=tls
     // 必选；用户 ALPN 必须显式含 h2（Go hub.go:47-50 的 ALPN 缺省 = h3 语义，
     // 本仓 h3 押后——缺省即 fail-visible，不静默）。

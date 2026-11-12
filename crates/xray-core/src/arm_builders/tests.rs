@@ -383,3 +383,48 @@ fn app_kind_without_factory_is_fatal() {
         Ok(_) => panic!("unknown app kind must reject the instance, not warn+skip"),
     }
 }
+
+// ============ bd anygg G1：network 必须 masque 装配门 ============
+
+/// 装配门「network 必须 masque」：`network:"tcp"` ⇒ build `Err` 且文案对齐 Go
+/// proxy/masque/client.go:64 构造器类型断言 `not masque transport`；正控
+/// `network:"masque"` 过门（后续 TLS/ALPN 门各自独立语义，不在此断言）。
+#[test]
+fn masque_outbound_rejects_non_masque_network() {
+    let negative = ob_of(
+        "masque",
+        &json!({"address": "127.0.0.1", "port": 443}),
+        Some(&json!({"network": "tcp", "security": "tls", "tlsSettings": {"alpn": ["h2"]}})),
+    );
+    let err = crate::arm_builders::outbound::build_masque_outbound(
+        &negative,
+        Arc::new(xray_frame::PluginContext::for_plugin("t-g1-negative")),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect_err("network=tcp under masque outbound must fail the assembly gate");
+    assert!(
+        err.to_string().contains("not masque transport"),
+        "error text must match Go proxy/masque/client.go:64, got: {err}"
+    );
+
+    let positive = ob_of(
+        "masque",
+        &json!({"address": "127.0.0.1", "port": 443}),
+        Some(&json!({"network": "masque", "security": "tls", "tlsSettings": {"alpn": ["h2"]}})),
+    );
+    let (handler, _bridge, _chain) = crate::arm_builders::outbound::build_masque_outbound(
+        &positive,
+        Arc::new(xray_frame::PluginContext::for_plugin("t-g1-positive")),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("network=masque must pass the assembly gate");
+    assert_eq!(handler.tag(), "t-arm-lookup");
+}

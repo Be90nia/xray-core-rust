@@ -19,12 +19,13 @@
 //! - [`warp`] — WARP 变体（Cloudflare）：自签客户端证书 + 端点公钥 pin + 静态地址
 //!   + Cloudflare 请求头 / draft setting 常量（Go `warp.go` 直译）
 //! - [`error`] — [`MasqueError`] 分类（ClauseId::ErrorClassifiedNoPanicEscape）
-//! - [`register`] — dialer/listener 注册管线（**本批不接聚合口**，规划 §5 B1.4）
+//! - [`register`] — dialer/listener 注册管线（已接聚合口：
+//!   `xray_core::register::register_all_transports` 消费 `register_dialer`/`register_listener`）
 //! - [`h2`] — CONNECT-IP over h2 extended CONNECT 绑定（hyper，B2.1）
 //! - [`connect`] — [`connect::ConnectIpSession`]（地址协商 / IP 包收发 / MTU-ICMP 回灌，B2.2）
 //! - [`dialer`] — 客户端拨号（finalmask 接线 + TLS(ALPN=h2) + establish，B2.6）
 //!
-//! 规划中未落地（B4）：`hub.rs`（服务端 accept）、`pool.rs`（地址池）。
+//! B4 已落地：[`hub`]（服务端 accept）+ [`pool`]（地址池）——规划 §5 B4 收口。
 //!
 //! ## udf 不适用判定（CLAUDE.md §3.5.5）
 //!

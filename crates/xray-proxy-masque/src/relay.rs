@@ -90,8 +90,14 @@ impl StackTcpRelay {
             let mut stack = self.stack.lock().await;
             stack.poll(smoltcp::time::Instant::now());
             let r = stack.with_tcp_socket(self.handle, |s| {
-                let n = s.recv_slice(scratch).unwrap_or(0);
-                (n, !s.is_active())
+                // EOF 判据 = `may_recv()`（smoltcp 0.12：Established/FinWait* 或
+                // rx_buffer 非空为真）。对端 FIN 后 socket 进 CloseWait——
+                // `is_active()` 在该态恒 true，拿它判 EOF 会把「对端已关」挂死
+                // 成永久等待（L2 e2e 1MiB 往返实锤：数据 1.6s 全到、EOF 永不
+                // 传播）。缓冲非空时 may_recv 仍真 → 先读尽数据，空 + CloseWait
+                // 才报关闭，恰好是「读满再 EOF」的 TCP 半关语义。
+                let n = if s.may_recv() { s.recv_slice(scratch).unwrap_or(0) } else { 0 };
+                (n, !s.may_recv())
             });
             stack.poll(smoltcp::time::Instant::now());
             r
@@ -174,25 +180,62 @@ pub(crate) fn endpoint_to_destination(
     ))
 }
 
-/// 等待 smoltcp TCP socket 连接建立（轮询，最多 5 秒；wireguard
-/// `wait_tcp_connected` 同款；时间源 = compat clock 端口）。
+/// 等待 smoltcp TCP socket 连接建立（轮询，最多 5 秒；判据对齐 wireguard
+/// `dispatcher.rs::wait_tcp_connected`：必须 `Established` 才算连上；时间源 =
+/// compat clock 端口）。
 pub(crate) async fn wait_tcp_connected(
     stack: &Arc<AsyncMutex<PacketStack>>,
     handle: smoltcp::iface::SocketHandle,
 ) -> bool {
     let deadline = xray_frame::compat::clock().now_instant() + Duration::from_secs(5);
     loop {
-        let (connected, active) = {
+        let state = {
             let mut s = stack.lock().await;
             s.poll(smoltcp::time::Instant::now());
-            s.with_tcp_socket(handle, |sock| (sock.is_open(), sock.is_active()))
+            s.with_tcp_socket(handle, |sock| sock.state())
         };
-        if connected && active {
+        // bd anygg G4：`is_open()` 对 SynSent 也返回 true（state != Closed 即真），
+        // 拿它判「已连接」会把握手中的半开当成功（数据写入 send_slice 恒 0）。
+        // 必须 `Established` 才返回 true；Closed/CloseWait = 对端已断/已关。
+        if state == smoltcp::socket::tcp::State::Established {
             return true;
         }
-        if !active || xray_frame::compat::clock().now_instant() >= deadline {
+        if state == smoltcp::socket::tcp::State::Closed
+            || state == smoltcp::socket::tcp::State::CloseWait
+            || xray_frame::compat::clock().now_instant() >= deadline
+        {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(RELAY_POLL_MS)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G4 半开误报回归：SynSent（SYN 已发、握手未完成）不得被判「已连接」。
+    /// 旧实现用 `is_open()`（state != Closed 即真）在 SynSent **立即**返回 true；
+    /// 修复后必须等 Established——无对端应答的栈永远停在 SynSent，短窗超时即证。
+    #[tokio::test]
+    async fn syn_sent_is_not_reported_connected() {
+        let cidrs = [smoltcp::wire::IpCidr::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(198, 18, 0, 2)),
+            32,
+        )];
+        let stack = Arc::new(AsyncMutex::new(PacketStack::new(&cidrs, 1280)));
+        let handle = stack.lock().await.add_tcp_socket();
+        let dst = smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 1));
+        {
+            let mut s = stack.lock().await;
+            s.tcp_connect(handle, dst, 80).expect("connect must queue SYN");
+        }
+        let reported =
+            tokio::time::timeout(Duration::from_millis(300), wait_tcp_connected(&stack, handle))
+                .await;
+        assert!(
+            reported.is_err(),
+            "SynSent must not be reported as connected (half-open false positive)"
+        );
     }
 }

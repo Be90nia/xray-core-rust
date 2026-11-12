@@ -356,7 +356,9 @@ fn check_stream_strictness(kind: &str, tag: &str, ss: &serde_json::Value) -> Res
     //     dialer + xray-proxy-masque server/client；masqueSettings 深校验 =
     //     装配期 xray-proxy-masque parse_*_settings fail-visible，配置 lint 只
     //     保放行）。
-    //     仍拒：`warp`（masque 非目标 1，装配期同样拒）。
+    //     `warp`（Cloudflare WARP 变体）已实现（h2 路径），L1 已验：
+    //     reports/2026-11-12-masque-warp-nonmainland.md（`xray-transport-masque`
+    //     `warp` 模块；masqueSettings.warp 经本 lint 放行）。
 
     // 3) hysteria transport（hysteriaSettings）：显式 version != 2 → 硬错。
     if net.eq_ignore_ascii_case("hysteria") {

@@ -33,8 +33,9 @@
 //!   [`InboundHandler`](xray_features::inbound::InboundHandler)
 //!
 //! 数据面已实装：TCP/UDP 双向经 smoltcp netstack ↔ dispatcher 桥接（`inbound` 收 +
-//! `dispatcher::make_wireguard_dial_fn` 发）。端到端验收见
-//! `tests/integration/wireguard_dataplane_test.rs`。
+//! `dispatcher::make_wireguard_dial_fn` 发）。端到端验收见本 crate
+//! `inbound.rs` / `dispatcher.rs` 的 `#[cfg(test)]` 数据面测试
+//! （`tunnel-tcp-end-to-end-echoes` / `tunnel-tcp-inbound-large-response-no-truncation` 等）。
 
 use std::sync::LazyLock;
 

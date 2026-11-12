@@ -490,6 +490,185 @@ async fn masque_inbound_private_target_blocked_without_dialing() {
     drop(open);
 }
 
+// ===== L2 代理线实证（bd anygg）：真实字节 ≥1MiB 往返 + 私有地址阻断 =====
+
+/// L2 真实字节门槛（规划 L2 判据：非 mock 的真实字节往返）。
+const L2_BODY_TOTAL: usize = 1 << 20;
+
+/// L2 HTTP origin body 的逐块生成器（确定性 pattern：全文件字节 = 偏移低 8 位），
+/// origin 与客户端断言共用——任何中间截断/改写都会在块比对处暴露。
+fn l2_body_block(seq: usize) -> [u8; 16384] {
+    let base = seq * 16384;
+    let mut b = [0u8; 16384];
+    for (i, byte) in b.iter_mut().enumerate() {
+        *byte = (base + i) as u8;
+    }
+    b
+}
+
+/// 本地 HTTP origin（真实 HTTP/1.1：读请求头至 `\r\n\r\n` → 200 + Content-Length
+/// 1MiB + Connection: close → 写满 body 后关闭）。
+async fn http_origin() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("origin bind");
+    let addr = listener.local_addr().expect("origin addr");
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepts);
+    // 测试基建任务（spawn 三分类②）：origin 监听，随用例生命周期。
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else { break };
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            head.extend_from_slice(&chunk[..n]);
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        },
+                    }
+                }
+                let ok_head =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nConnection: close\r\n\r\n";
+                if sock.write_all(ok_head).await.is_err() {
+                    return;
+                }
+                let mut seq = 0usize;
+                let mut sent = 0usize;
+                while sent < L2_BODY_TOTAL {
+                    let block = l2_body_block(seq);
+                    let take = block.len().min(L2_BODY_TOTAL - sent);
+                    if sock.write_all(&block[..take]).await.is_err() {
+                        return;
+                    }
+                    sent += take;
+                    seq += 1;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+/// 客户端 masque 拨号 → masque hub → dispatcher 桥 → 本地 HTTP origin 的真实
+/// 字节 ≥1MiB 往返（逐块比对，防截断/防改写）；同测试内私有地址阻断断言
+/// （`10.0.0.1:80` → freedom BlockPrivate 黑洞 + 零拨号，判别力 = origin canary）。
+#[tokio::test]
+async fn one_mib_http_roundtrip_and_private_block() {
+    let (origin_addr, origin_accepts) = http_origin().await;
+    let (dials_open, dial_open) = counting_dial(origin_addr);
+    let (dials_blocked, dial_blocked) = counting_dial(origin_addr);
+
+    let ctx_client = Arc::new(xray_frame::PluginContext::for_plugin("masque-l2-client"));
+    let ctx_bridge = Arc::new(xray_frame::PluginContext::for_plugin("masque-l2-bridge"));
+    // 正控桥：无默认规则（Go `inbound == nil`）——origin 目的（TEST-NET-3 公网
+    // 标签）被 intercept 拨到本地 origin（零真实外网流量）。
+    let open_bridge = FreedomDispatchBridge::from_bridge(
+        Arc::clone(&ctx_bridge),
+        Arc::new(DialBridge::new("freedom-out", dial_open)),
+    );
+    // 阻断桥：`masque-in` → BlockPrivate（生产 `inbound_default_rules` 同形）。
+    let blocked_bridge = FreedomDispatchBridge::from_bridge(
+        Arc::clone(&ctx_bridge),
+        Arc::new(DialBridge::new("freedom-out", dial_blocked)),
+    )
+    .with_inbound_default_rules(HashMap::from([(
+        "masque-in".to_string(),
+        xray_proxy_freedom::DefaultRuleType::BlockPrivate,
+    )]));
+
+    let open_srv = masque_server("masque-in", Arc::new(open_bridge)).await;
+    let blocked_srv = masque_server("masque-in", Arc::new(blocked_bridge)).await;
+    let client_open = masque_client(open_srv.port(), &open_srv.pin, &ctx_client);
+    let client_blocked = masque_client(blocked_srv.port(), &blocked_srv.pin, &ctx_client);
+
+    // A) 真实字节 1MiB：GET → masque 隧道 + dispatcher 桥 → origin → 逐块比对。
+    let dest_http = Destination::tcp(Address::ipv4(Ipv4Addr::new(203, 0, 113, 7)), Port::new(80));
+    let mut conn = tokio::time::timeout(Duration::from_secs(15), client_open(&dest_http))
+        .await
+        .expect("open dial must resolve")
+        .map_err(|e| format!("tunnel dial: {e}"))
+        .expect("open dial must succeed");
+    conn.write_all(b"GET /body HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("write GET through tunnel");
+    let mut raw = Vec::new();
+    let started = Instant::now();
+    let mut scratch = [0u8; 16384];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(30), conn.read(&mut scratch)).await {
+            Err(_) => panic!(
+                "[diag] read stalled at {} bytes after {}s; dials_open={} origin_accepts={}",
+                raw.len(),
+                started.elapsed().as_secs(),
+                dials_open.load(Ordering::SeqCst),
+                origin_accepts.load(Ordering::SeqCst)
+            ),
+            Ok(Err(e)) => panic!("read error after {} bytes: {e}", raw.len()),
+            Ok(Ok(0)) => break, // FIN
+            Ok(Ok(n)) => {
+                raw.extend_from_slice(&scratch[..n]);
+                if raw.len() % 262144 < n {
+                    println!("[diag] received {} bytes in {:?}", raw.len(), started.elapsed());
+                }
+            },
+        }
+    }
+    println!("[diag] total {} bytes in {:?}", raw.len(), started.elapsed());
+    let head_end =
+        raw.windows(4).position(|w| w == b"\r\n\r\n").expect("HTTP response head terminator");
+    let body = &raw[head_end + 4..];
+    assert!(
+        body.len() >= L2_BODY_TOTAL,
+        "roundtrip body must be >= 1MiB real bytes, got {} (raw {})",
+        body.len(),
+        raw.len()
+    );
+    for (i, chunk) in body.chunks(16384).enumerate() {
+        assert_eq!(chunk, &l2_body_block(i)[..chunk.len()], "body block {i} mismatch");
+    }
+    assert_eq!(dials_open.load(Ordering::SeqCst), 1, "open path must dial the origin exactly once");
+
+    // B) 私有地址阻断：`10.0.0.1:80` → BlockPrivate → 黑洞 + 零拨号。
+    let dest_private = Destination::tcp(Address::ipv4(Ipv4Addr::new(10, 0, 0, 1)), Port::new(80));
+    let dialed = tokio::time::timeout(Duration::from_secs(15), client_blocked(&dest_private))
+        .await
+        .expect("blocked dial must resolve")
+        .map_err(|e| format!("tunnel dial: {e}"));
+    if let Ok(mut conn) = dialed {
+        let _ = conn.write_all(b"l2-blocked-probe").await;
+        let mut probe = [0u8; 16];
+        match tokio::time::timeout(Duration::from_secs(2), conn.read(&mut probe)).await {
+            Err(_) | Ok(Ok(0)) | Ok(Err(_)) => {},
+            Ok(Ok(n)) => panic!("blackholed target must not return data, got {n} bytes"),
+        }
+    }
+    assert_eq!(
+        dials_blocked.load(Ordering::SeqCst),
+        0,
+        "10.0.0.1 must be blackholed by freedom default BlockPrivate with ZERO dials"
+    );
+    assert_eq!(
+        origin_accepts.load(Ordering::SeqCst),
+        1,
+        "origin must accept exactly the one open-path connection (block path never reached it)"
+    );
+
+    println!(
+        "门 L2 PASS: 1MiB real-byte HTTP roundtrip via masque tunnel + dispatch bridge; \
+         private target blackholed with 0 dials"
+    );
+
+    drop(conn);
+    drop(open_srv);
+    drop(blocked_srv);
+}
+
 // ===== 诊断探针：裸 TCP 握手过隧道（定位 dispatch 不触发的断点面） =====
 
 /// 裸 IPv4/TCP 包（真实校验和；flags: 0x02=SYN 0x10=ACK 0x12=SYN|ACK 0x18=ACK|PSH）。

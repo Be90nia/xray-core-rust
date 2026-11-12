@@ -8,8 +8,9 @@
 //!   [`crate::client::parse_client_settings`]，两者共用本 crate 解析（同规）。
 //! - **L3**：无裸能力（无 println/裸 spawn/裸 sleep）。
 //! - **L4**：`assert_plugin_contract!(MasquePlugin)`（tests/plugin_contract.rs）。
-//! - **L5**：装配门——缺 address / 空 users / 非 TLS / warp / 每族多前缀 → build `Err` → 整链
-//!   fail-visible（tests/plugin_contract.rs 装配负向）。
+//! - **L5**：装配门——缺 address / 空 users / 非 TLS / 每族多前缀 → build `Err` → 整链
+//!   fail-visible（tests/plugin_contract.rs 装配负向）。`warp` 不拒——WARP 变体已实现 （h2
+//!   路径，`xray-transport-masque::warp`；L1 已验 reports/2026-11-12-masque-warp-nonmainland.md）。
 
 use xray_frame::{
     PluginContext,

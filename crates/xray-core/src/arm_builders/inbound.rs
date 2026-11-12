@@ -925,6 +925,11 @@ pub(crate) async fn build_masque_inbound(
         xray_proxy_masque::server::parse_server_settings(&raw).map_err(std::io::Error::other)?;
     let settings =
         xray_transport::dialer::StreamSettings::from_json(ib.stream_settings_json.as_ref());
+    // 装配门「network 必须 masque」（Go proxy/masque/server.go:127-129 构造器类型
+    // 断言同文案：非 masque settings → "not masque transport"）。
+    if settings.protocol != "masque" {
+        return Err(std::io::Error::other("not masque transport"));
+    }
     // 装配门 MASQUE-TLS-REQUIRED（extra 条款；hub 内部同判——装配期先行报语义清晰）。
     if settings.security != "tls" {
         return Err(std::io::Error::other("masque inbound requires \"security\": \"tls\""));

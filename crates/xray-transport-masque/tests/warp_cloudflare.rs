@@ -11,14 +11,18 @@
 //! `creds.json` 由 `D:/tmp/warp-2026-11-11/register.py`（POST
 //! `api.cloudflareclient.com/v0i190905/reg`）
 //! + `enroll.py`（PATCH `reg/{id}` 登记 ECDSA P-256 公钥，`key_type=secp256r1`/`tun_type=masque`）
-//! 产出，字段：`client_priv_pkcs8_b64`（MASQUE
-//! 客户端私钥）、`enrolled_reg.config.interface.addresses` （静态 v4/v6）。**凭据不入库**。
+//!   产出，字段：`client_priv_pkcs8_b64`（MASQUE
+//!   客户端私钥）、`enrolled_reg.config.interface.addresses` （静态 v4/v6）。**凭据不入库**。
 //!
 //! 可选 env：
-//! - `WARP_ENDPOINT`：`ip:port`，缺省 `162.159.192.1:443`（usque `config/endpoints.go`
-//!   `DefaultEndpointH2V4 = 162.159.198.2` 在本机不可达，改打 engage anycast 443）。
+//! - `WARP_ENDPOINT`：`ip:port`，缺省 `162.159.198.2:443`（usque `config/endpoints.go`
+//!   `DefaultEndpointH2V4` = **WARP 免费版的 h2 端点**）。 ⚠️ 旧默认 `162.159.192.1`（engage
+//!   anycast）**不可用**：该端点只服务 `cloudflareclient.com` 证书族，CONNECT-IP 一律被 CF 判 **400
+//!   Bad Request** （2026-11-12 在 176 实测：Rust 与 Go 参考实现同样 400）。
 //! - `WARP_SPKI`：端点证书 SPKI base64（`warp.publicKey` 的 pin 目标）。缺省读 creds 的
-//!   `endpoint_spki_b64`；两者皆无 → 走 `allowInsecure`（只验 TLS 通道，不验端点身份）。
+//!   `endpoint_spki_b64`；两者皆无 → 走 `allowInsecure`（只验 TLS 通道，不验端点身份）。 ⚠️ pin
+//!   必须取自 **h2 端点 `162.159.198.2`**（证书 CN=`masque.cloudflareclient.com`， SPKI sha256 前缀
+//!   `eb591b36ab26`）；engage anycast 的证书族（`4c9b9a0b422a`）是另一把 钥，与之不通用。
 
 #![allow(clippy::disallowed_methods)]
 
@@ -143,7 +147,7 @@ async fn warp_tunnel_dns_roundtrip() {
         .filter(|s| !s.is_empty())
         .or_else(|| creds["endpoint_spki_b64"].as_str().map(str::to_string));
     let endpoint = std::env::var("WARP_ENDPOINT")
-        .unwrap_or_else(|_| "162.159.192.1:443".to_string())
+        .unwrap_or_else(|_| "162.159.198.2:443".to_string())
         .trim()
         .to_string();
     let (host, port) = endpoint.rsplit_once(':').expect("WARP_ENDPOINT as ip:port");

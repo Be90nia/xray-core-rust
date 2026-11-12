@@ -9,7 +9,7 @@
 //! 的解释是走 h3，本仓 h3 押后（规划 §7 R11/R9），缺省即 fail-visible 硬错。
 //!
 //! `dial` 由聚合口 `xray_core::register::register_all_transports()` 包装成
-//! [`xray_transport::dialer::TransportDialFn`] 注册（**本批不接聚合口**，规划 §5 B1.4）。
+//! [`xray_transport::dialer::TransportDialFn`] 注册（已接：`masque dialer` 键）。
 
 use std::time::Duration;
 
