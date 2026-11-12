@@ -50,6 +50,7 @@ use hyper_util::{
     },
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
+use parking_lot::Mutex;
 use rustls::{ClientConfig as RustlsClientConfig, pki_types::ServerName};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -420,6 +421,11 @@ pub struct DefaultDialerClient {
     pub client: HyperClient,
     /// 连接是否已关闭（任何 IO 错误后置 true，等价 Go `closed` 字段）。
     closed: Arc<AtomicBool>,
+    /// 「建连失败」回调（**池层注入**，bd m2mmm 评审 B2）。
+    ///
+    /// 本次**建连型**请求失败（非 200 / 传输错误）⇒ 通知池层归还取用预约并把
+    /// 该 client 标记为不可复用。缺省 = 无（非池化连接不需要）。
+    dial_failure: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// 每 host 空闲连接上界（bd cgmcj）。hyper-util legacy client 缺省
@@ -527,12 +533,37 @@ impl DefaultDialerClient {
             .http2_keep_alive_interval(crate::transport::H2_KEEP_ALIVE_INTERVAL)
             .http2_keep_alive_timeout(Duration::from_secs(15))
             .build(connector);
-        Self { config, client, closed: Arc::new(AtomicBool::new(false)) }
+        Self {
+            config,
+            client,
+            closed: Arc::new(AtomicBool::new(false)),
+            dial_failure: Mutex::new(None),
+        }
     }
 
     /// 连接是否已关闭。
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    /// 安装「建连失败」回调（池层注入，bd m2mmm 评审 B2）。
+    ///
+    /// 池层（[`crate::mux`]）在 client 入池时安装：本次**建连型**请求失败 ⇒ 归还
+    /// 取用预约 + 标记该 client 不可复用（下次取用即剪枝）。
+    pub fn set_dial_failure_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.dial_failure.lock() = Some(hook);
+    }
+
+    /// 通知「本次建连失败」（非 200 / 传输错误）。
+    ///
+    /// **只在建连型请求上触发**：拨号时同步等待响应的 POST（stream-up / stream-one）
+    /// 与请求构造失败。**不触发**于分包上传（[`Self::post_packet`]）与后台 lazy GET
+    /// 失败——那两条路径请求已建连成功，预约由连接关闭释放（否则会误减别人的预约）。
+    fn notify_dial_failure(&self) {
+        let hook = self.dial_failure.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// 把 [`RequestMeta`] 转换为 `hyper::Request<ReqBody>`，body 用 `Full<Bytes>`。
@@ -605,8 +636,15 @@ impl DefaultDialerClient {
         close: Option<CloseSignal>,
     ) -> Result<(DownloadBody, SocketAddr, SocketAddr)> {
         let is_get = body.is_none();
-        let meta = self.config.build_stream_request_meta(base_uri, session_id, body)?;
-        let req = Self::build_request(meta)?;
+        // 请求构造失败 ⇒ 拨号中止 ⇒ 预约无处释放（dialer 不会装 set_on_close）⇒ 通知池层。
+        let meta = self.config.build_stream_request_meta(base_uri, session_id, body).inspect_err(
+            |_| {
+                self.notify_dial_failure();
+            },
+        )?;
+        let req = Self::build_request(meta).inspect_err(|_| {
+            self.notify_dial_failure();
+        })?;
 
         if is_get {
             // stream-down GET：发出即返回。server 端（Go 26.9.9 hub `SetFlushNext`）
@@ -621,6 +659,8 @@ impl DefaultDialerClient {
         // body = Some（一次性 POST）：对齐 Go `PostPacket`，同步等响应。
         let resp = self.client.request(req).await.map_err(|e| {
             self.closed.store(true, Ordering::Relaxed);
+            // 传输错误 ⇒ 拨号中止 ⇒ 归还取用预约（否则幽灵预约滞留，bd m2mmm 评审 B2）。
+            self.notify_dial_failure();
             SplitHttpError::Hyper(e.to_string())
         })?;
 
@@ -628,6 +668,8 @@ impl DefaultDialerClient {
             // 读 status 后丢弃 body（drain）
             let status = resp.status();
             let _ = resp.into_body().collect().await;
+            // 非 200 ⇒ 拨号中止 ⇒ 归还取用预约 + 标记 client 不可复用。
+            self.notify_dial_failure();
             return Err(SplitHttpError::BadStatus(status.as_u16()));
         }
 
@@ -669,8 +711,12 @@ impl DefaultDialerClient {
         S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static,
     {
         // 1. 构造 RequestMeta（body 用空 Vec 占位走 POST 分支，实际 body 由 StreamBody 提供）
-        let mut meta =
-            self.config.build_stream_request_meta(base_uri, session_id, Some(Vec::new()))?;
+        let mut meta = self
+            .config
+            .build_stream_request_meta(base_uri, session_id, Some(Vec::new()))
+            .inspect_err(|_| {
+                self.notify_dial_failure();
+            })?;
         // body 不在 RequestMeta，清空（避免 Vec 与 BoxBody 语义混淆）
         meta.body = None;
 
@@ -680,7 +726,9 @@ impl DefaultDialerClient {
 
         // 2. 构造 hyper Request，body 用 StreamBody
         let streaming_body = make_stream_body(body_stream);
-        let mut req = Self::build_request_with_body(meta, streaming_body)?;
+        let mut req = Self::build_request_with_body(meta, streaming_body).inspect_err(|_| {
+            self.notify_dial_failure();
+        })?;
         // bd biuu5：明文 h1 流式上传必须带 `Connection: close`（Go dialer.go
         // `DisableKeepAlives: true` 等价）。Go h1 服务端未 EnableFullDuplex——未
         // 读完请求体不写响应，而 xhttp 上传体是永不结束的 chunked 流，keep-alive
@@ -699,6 +747,8 @@ impl DefaultDialerClient {
         // 3. 发送请求
         let resp = self.client.request(req).await.map_err(|e| {
             self.closed.store(true, Ordering::Relaxed);
+            // 传输错误 ⇒ 拨号中止 ⇒ 归还取用预约（bd m2mmm 评审 B2）。
+            self.notify_dial_failure();
             SplitHttpError::Hyper(e.to_string())
         })?;
 
@@ -727,6 +777,9 @@ impl DefaultDialerClient {
             if resp.status() != StatusCode::OK {
                 let status = resp.status();
                 let _ = resp.into_body().collect().await;
+                // 非 200 ⇒ 拨号中止 ⇒ 归还取用预约 + 标记 client 不可复用
+                // （bd m2mmm 评审 B2：失败路径不释放预约 ⇒ 幽灵预约永久滞留）。
+                self.notify_dial_failure();
                 return Err(SplitHttpError::BadStatus(status.as_u16()));
             }
             Ok((

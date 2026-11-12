@@ -545,10 +545,10 @@ fn parse_download_destination(
 
 /// 从 `splithttpSettings` JSON 解析为强类型 [`Config`]。
 ///
-/// `None` 或非 object 返回 [`Config::default`]。xHTTP 默认 xmux 预设
-/// （Go v26.7.28 transport_method.go:452）即使在 `None` 时也套用，
-/// 让 `parse_splithttp_config(None)` 与 `parse_splithttp_config(Some({"xmux":{}}))`
-/// 行为一致：maxConnections = 3（anti-TSPU）。
+/// `None` 或非 object 返回 [`Config::default`]。xHTTP 的 xmux 缺省预设
+/// （[`crate::config::default_xmux_config`]）即使在 `None` 时也套用，让
+/// `parse_splithttp_config(None)` 与 `parse_splithttp_config(Some({"xmux":{}}))`
+/// 行为一致：maxConcurrency = 1（每并发请求一条连接，bd m2mmm）。
 pub(crate) fn parse_splithttp_config(json: Option<&serde_json::Value>) -> io::Result<Config> {
     let obj = match json {
         None => return Ok(default_xhttp_config()),
@@ -616,10 +616,9 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         .unwrap_or_default();
 
     // xmux 子对象 → XmuxConfig
-    // ponytail: 与 Go v26.7.28 infra/conf/transport_method.go:452 对齐——
-    // 用户未提供 xmux（或提供空对象）时套默认预设：
-    // maxConnections {3,3}, hMaxRequestTimes {600,900}, hMaxReusableSecs {1800,3000}。
-    // 上一版 anti-TSPU 前默认 6；本次同步对齐 3（commit 18e28390）。
+    // 用户未提供 xmux（或提供空对象）时套**我们自己的**缺省预设
+    // （[`crate::config::default_xmux_config`]）——Go 配置面（键名/取值区间/互斥硬错/
+    // RangeConfig）逐项不变，只有「什么都没写」时的缺省不同（bd m2mmm）。
     let xmux = match obj.get("xmux").and_then(|x| x.as_object()) {
         Some(m) if !m.is_empty() => crate::config::XmuxConfig {
             max_concurrency: m.get("maxConcurrency").and_then(parse_range),
@@ -629,12 +628,7 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
             h_max_reusable_secs: m.get("hMaxReusableSecs").and_then(parse_range),
             h_keep_alive_period: m.get("hKeepAlivePeriod").and_then(|x| x.as_i64()).unwrap_or(0),
         },
-        _ => crate::config::XmuxConfig {
-            max_connections: Some(crate::config::RangeConfig::new(3, 3)),
-            h_max_request_times: Some(crate::config::RangeConfig::new(600, 900)),
-            h_max_reusable_secs: Some(crate::config::RangeConfig::new(1800, 3000)),
-            ..Default::default()
-        },
+        _ => crate::config::default_xmux_config(),
     };
 
     // Go `infra/conf/transport_method.go:458-460`：`maxConnections` 与
@@ -785,16 +779,11 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
 
 /// xHTTP 默认配置（无 splithttpSettings JSON 时套用）。
 /// 与 `parse_splithttp_config(Some({"xmux":{}}))` 等价：除 xmux 默认预设外全空。
+///
+/// 缺省 xmux 预设由 [`Config::default`] 物化（bd m2mmm 收口）⇒ 本函数不再单独
+/// 拼装 xmux（避免第三处漂移点）。
 fn default_xhttp_config() -> Config {
-    Config {
-        xmux: Some(crate::config::XmuxConfig {
-            max_connections: Some(crate::config::RangeConfig::new(3, 3)),
-            h_max_request_times: Some(crate::config::RangeConfig::new(600, 900)),
-            h_max_reusable_secs: Some(crate::config::RangeConfig::new(1800, 3000)),
-            ..Default::default()
-        }),
-        ..Config::default()
-    }
+    Config::default()
 }
 
 /// Parse a RangeConfig from JSON.
@@ -862,30 +851,43 @@ mod tests {
         assert!(cfg.mode.is_empty());
     }
 
-    /// 对齐 Go v26.7.28 infra/conf/transport_method.go:452：
-    /// 用户未提供 `xmux` 子对象时套默认预设（anti-TSPU: maxConnections=3）。
+    /// 我们自己的 xmux 缺省预设（bd m2mmm）：用户未提供 `xmux` 子对象时套用。
+    ///
+    /// 与 Go 缺省的差异**只在连接拓扑那一维**：`maxConcurrency {1,1}`（每并发
+    /// 请求独占一条连接）取代 Go 的 `maxConnections {3,3}`（固定 3 条复用）；
+    /// `hMaxRequestTimes` / `hMaxReusableSecs` 与 Go 一致。
     #[test]
     fn parse_xmux_default_preset_when_missing() {
         let cfg = parse_splithttp_config(None).unwrap();
         let xm = cfg.xmux.as_ref().expect("xmux preset applied");
-        assert_eq!(xm.max_connections.unwrap().from, 3);
-        assert_eq!(xm.max_connections.unwrap().to, 3);
+        assert_eq!(xm.max_concurrency.unwrap().from, 1);
+        assert_eq!(xm.max_concurrency.unwrap().to, 1);
         assert_eq!(xm.h_max_request_times.unwrap().from, 600);
         assert_eq!(xm.h_max_request_times.unwrap().to, 900);
         assert_eq!(xm.h_max_reusable_secs.unwrap().from, 1800);
         assert_eq!(xm.h_max_reusable_secs.unwrap().to, 3000);
-        // 其余字段保持零默认
-        assert!(xm.max_concurrency.is_none());
+        // 其余字段保持零默认（**不**给 maxConnections ⇒ 不触发互斥硬错）
+        assert!(xm.max_connections.is_none());
         assert!(xm.c_max_reuse_times.is_none());
     }
 
-    /// 对齐 Go v26.7.28：用户提供空 `xmux: {}` 也套默认预设。
+    /// 用户提供空 `xmux: {}` 也套同一缺省预设。
     #[test]
     fn parse_xmux_empty_object_applies_preset() {
         let v: serde_json::Value = serde_json::from_str(r#"{"xmux":{}}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).unwrap();
         let xm = cfg.xmux.as_ref().expect("preset");
-        assert_eq!(xm.max_connections.unwrap().to, 3);
+        assert_eq!(xm.max_concurrency.unwrap().to, 1);
+    }
+
+    /// 我们的缺省预设**不得**触发 Go 的「maxConnections 与 maxConcurrency 互斥」
+    /// 硬错（用户什么都没写 ⇒ 不报错）。
+    #[test]
+    fn default_preset_does_not_trigger_mutual_exclusion() {
+        let cfg = parse_splithttp_config(None).expect("缺省预设不得触发互斥硬错");
+        let xm = cfg.xmux.as_ref().expect("preset");
+        assert!(xm.max_connections.is_none());
+        assert!(xm.max_concurrency.as_ref().is_some_and(|r| r.to > 0));
     }
 
     /// 用户显式提供 xmux 子字段时不被默认预设覆盖（透传）。

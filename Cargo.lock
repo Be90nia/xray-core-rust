@@ -6003,6 +6003,7 @@ dependencies = [
  "xray-frame",
  "xray-geodata",
  "xray-proxy-vless",
+ "xray-transport-xdrive",
 ]
 
 [[package]]

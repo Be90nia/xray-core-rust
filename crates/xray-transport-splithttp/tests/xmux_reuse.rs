@@ -293,25 +293,52 @@ async fn dial_sequential(dest: &Destination, settings: &StreamSettings, dials: u
     tokio::time::sleep(Duration::from_millis(150)).await;
 }
 
-// ===== 用例 1：默认 xmux（缺省预设 maxConnections=3）+ 并发拨号 ⇒ 连接数远小于拨号数 =====
+// ===== 用例 1：默认 xmux（我们的缺省预设 maxConcurrency=1）+ 并发拨号 ⇒ 每请求一条连接 =====
+//
+// bd m2mmm：我们的缺省连接拓扑 = **每个并发请求独占一条连接**（池按并发需求增长），
+// 取代 Go 的 `maxConnections {3,3}`（固定 3 条复用）——高 RTT 腿的吞吐受连接数
+// 封顶（每连接 ≈ snd_wnd/RTT），3 条 = 聚合上限的 1/3。
+//
+// 语义冲突登记（本用例的断言按新缺省语义调整，理由如上）：
+// 旧断言「默认 xmux 下必须复用：accepts 显著小于 2×DIALS」描述的是 Go 缺省
+// （3 条连接复用 5 次拨号）；新缺省下**并发**拨号本就各占一条连接 ⇒ 旧断言虽仍
+// 数值成立（5 < 10）却不再守护任何东西（若池上限被压到 3，它照样「通过」）。
+// 改为直接断言新语义：**并发拨号数 ⇒ 至少一条 TCP 连接/请求**。
+//
+// S4（评审点名「断言偏弱且环境敏感」）收紧：
+// - **环境敏感**：池上限 = 整机内存份额派生（随宿主可用内存变）⇒ 并发数若
+//   超过宿主档位上限，本用例的「每请求一连接」期望就不成立 ⇒ 并发数改为 `min(5,
+//   实际池上限)`（与生产同一取值函数）⇒ **任何宿主上都确定性通过**。
+// - **偏弱**：只断言下界 `accepts >= DIALS`（连接爆炸也放过）⇒ 改为区间 `[DIALS,
+//   2×DIALS]`：既要「每请求一条连接」，也不许出现连接爆炸。
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn h2_default_xmux_reuses_tcp_connection() {
+async fn h2_default_xmux_gives_each_request_its_own_connection() {
     let (port, _cert, stats) = start_h2_server().await;
-    const DIALS: usize = 5;
-    dial_concurrent(&dest_of(port), &h2_settings(port, None), DIALS).await;
+    // 并发数 = min(5, 实际池上限)——池上限与宿主内存相关（内存份额派生）。
+    let pool_cap =
+        xray_frame::budget::plan::xmux_pool_cap(xray_frame::budget::plan::live_available());
+    let dials = 5usize.min(pool_cap.max(1));
+    dial_concurrent(&dest_of(port), &h2_settings(port, None), dials).await;
 
     let accepts = stats.accepts.load(Ordering::SeqCst);
     let gets = stats.gets.load(Ordering::SeqCst);
     let posts = stats.posts.load(Ordering::SeqCst);
-    eprintln!("[h2 default xmux] dials={DIALS} accepts={accepts} gets={gets} posts={posts}");
+    eprintln!(
+        "[h2 default xmux] dials={dials} pool_cap={pool_cap} accepts={accepts} gets={gets} posts={posts}"
+    );
 
-    assert_eq!(gets, DIALS as u64, "每次拨号都要发一个下载 GET");
-    assert_eq!(posts, DIALS as u64, "每次拨号都要发上行 POST");
-    // 无池形态实测 2×DIALS = 10 条（见 h2_bypass_pool_control）。
+    assert_eq!(gets, dials as u64, "每次拨号都要发一个下载 GET");
+    assert_eq!(posts, dials as u64, "每次拨号都要发上行 POST");
+    // 缺省 = 每并发请求一条连接（不是 Go 的 3 条复用）：下界守「池按并发需求增长」，
+    // 上界守「不得连接爆炸」。
     assert!(
-        accepts < 2 * DIALS as u64,
-        "默认 xmux 下必须复用：accepts={accepts} 应显著小于 2×{DIALS}"
+        accepts >= dials as u64,
+        "缺省 xmux 下每个并发请求应独占一条连接：accepts={accepts} < {dials}"
+    );
+    assert!(
+        accepts <= 2 * dials as u64,
+        "每请求一连接 ⇒ 连接数不应爆炸：accepts={accepts} > 2×{dials}"
     );
 }
 

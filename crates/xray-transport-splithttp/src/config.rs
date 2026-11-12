@@ -179,6 +179,34 @@ impl XmuxConfig {
     }
 }
 
+/// **我们自己的** xmux 缺省预设（用户未提供 `xmux` 子对象时套用）。
+///
+/// 与 Go v26.7.28 `infra/conf/transport_method.go:452` 的缺省预设相比：
+/// - `hMaxRequestTimes {600,900}` / `hMaxReusableSecs {1800,3000}`：**与 Go 一致**
+/// - 连接拓扑那一维**换成我们自己的**：`maxConcurrency {1,1}`（= 每个并发请求
+///   独占一条连接，池按并发需求增长）取代 Go 的 `maxConnections {3,3}` （= 固定 3 条连接复用）。
+///
+/// 理由（bd m2mmm）：高 RTT 腿的吞吐受**连接数**封顶（每连接 ≈ snd_wnd/RTT，
+/// RFC 7323 §1.1 / RFC 9293 §3.8.6），3 条连接 = 聚合上限的 1/3；缺省跟随并发
+/// 需求后，10 并发 ⇒ 10 条连接 ⇒ 聚合吞吐回到 ws 量级。
+///
+/// 互通口径：**Go 配置面逐项不变**（键名 / 取值区间 / `maxConnections` 与
+/// `maxConcurrency` 互斥硬错 / `RangeConfig` 语义）——只有「用户什么都没写」
+/// 时的缺省不同；显式写 `maxConnections` 的用户拿到的仍是 Go 的连接数语义。
+/// 池上限取整机内存份额派生（见 `xray_frame::budget::plan::conn_budget`），
+/// 不得无界。
+///
+/// **两条配置入口共用本函数**（JSON 入口 [`crate::register::parse_splithttp_config`]、
+/// proto 入口 [`Config::from_proto`]）——禁两处漂移（bd m2mmm 收口）。
+pub(crate) fn default_xmux_config() -> XmuxConfig {
+    XmuxConfig {
+        max_concurrency: Some(RangeConfig::new(1, 1)),
+        h_max_request_times: Some(RangeConfig::new(600, 900)),
+        h_max_reusable_secs: Some(RangeConfig::new(1800, 3000)),
+        ..Default::default()
+    }
+}
+
 // ===== Config =====
 
 /// 下载侧通道配置（对应 Go `splithttp.Config.DownloadSettings` = 完整 StreamConfig）。
@@ -207,7 +235,16 @@ pub struct DownloadSettings {
 }
 
 /// SplitHTTP 主配置。对应 proto `xray.transport.internet.splithttp.Config`。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// **xmux 缺省在 Config 层物化**（bd m2mmm 收口）：`Default::default()` 与两条
+/// 配置入口（JSON / proto）在「用户没填任何 xmux 字段」时都拿到**同一份**缺省
+/// 预设 `default_xmux_config()` ⇒ 入口之间零漂移，且 `to_proto` → `from_proto`
+/// 往返等值天然成立（缺省已是物化值，不是"往返才补"）。
+///
+/// 注意：`XmuxConfig::default()` **不带**缺省（它被 `XmuxManager::new` 的
+/// `unwrap_or_default()` 消费 ⇒ 带缺省会改池的「None=不限」语义）；物化只做在
+/// Config 层。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// HTTP `Host` header。
     pub host: String,
@@ -283,6 +320,53 @@ pub struct Config {
     /// [`Config::generate_session_id`] 退化为 UUID。
     /// 对应 proto `sessionIDLength=29`（Go `Config.SessionIDLength`）。
     pub session_id_length: Option<RangeConfig>,
+}
+
+impl Default for Config {
+    /// **xmux 缺省在 Config 层物化**（bd m2mmm 收口）：`Config::default()` 与两条
+    /// 配置入口（JSON / proto）在「用户没填任何 xmux 字段」时都拿到**同一份**缺省
+    /// 预设 `default_xmux_config()` ⇒ 三条入口零漂移。
+    ///
+    /// 与 Go 的对应关系：Go 在 **conf 层**（`infra/conf/transport_method.go:462-467`）
+    /// 物化缺省，本仓放在 **Config 层**——同一层语义（配置对象即已解析值）。
+    ///
+    /// 注意：`XmuxConfig::default()` **不带**缺省（它被 `XmuxManager::new` 的
+    /// `unwrap_or_default()` 消费 ⇒ 带缺省会改池的「None=不限」语义）；物化只做在
+    /// Config 层。
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            path: String::new(),
+            mode: String::new(),
+            headers: HashMap::new(),
+            x_padding_bytes: None,
+            no_grpc_header: false,
+            no_sse_header: false,
+            sc_max_each_post_bytes: None,
+            sc_min_posts_interval_ms: None,
+            sc_max_buffered_posts: 0,
+            sc_stream_up_server_secs: None,
+            xmux: Some(default_xmux_config()),
+            download_settings: None,
+            x_padding_obfs_mode: false,
+            x_padding_key: String::new(),
+            x_padding_header: String::new(),
+            x_padding_placement: String::new(),
+            x_padding_method: String::new(),
+            uplink_http_method: String::new(),
+            session_placement: String::new(),
+            session_key: String::new(),
+            h2_params: Vec::new(),
+            seq_placement: String::new(),
+            seq_key: String::new(),
+            uplink_data_placement: String::new(),
+            uplink_data_key: String::new(),
+            uplink_chunk_size: None,
+            server_max_header_bytes: 0,
+            session_id_table: String::new(),
+            session_id_length: None,
+        }
+    }
 }
 
 impl Config {
@@ -521,6 +605,7 @@ impl Config {
                     .into(),
             ));
         }
+        let xmux = xmux_from_proto_or_default(p.xmux);
         let cfg = Self {
             host: p.host,
             path: p.path,
@@ -533,7 +618,7 @@ impl Config {
             sc_min_posts_interval_ms: p.sc_min_posts_interval_ms.map(range_from_proto),
             sc_max_buffered_posts: p.sc_max_buffered_posts,
             sc_stream_up_server_secs: p.sc_stream_up_server_secs.map(range_from_proto),
-            xmux: p.xmux.map(xmux_from_proto),
+            xmux: Some(xmux),
             download_settings: None,
             x_padding_obfs_mode: p.x_padding_obfs_mode,
             x_padding_key: p.x_padding_key,
@@ -927,6 +1012,24 @@ fn range_from_proto(
 
 fn range_to_proto(r: RangeConfig) -> xray_proto::xray::transport::internet::splithttp::RangeConfig {
     xray_proto::xray::transport::internet::splithttp::RangeConfig { from: r.from, to: r.to }
+}
+
+/// proto 入口的 xmux 解析：proto 未给 xmux ⇒ 套用**与 JSON 入口同一份**缺省预设。
+///
+/// 与 JSON 入口（[`crate::register::parse_splithttp_config`]）同源同值：两条入口在
+/// 「用户没填任何 xmux 字段」时拿到**同一份**缺省（`default_xmux_config()`），
+/// 禁两处漂移（bd m2mmm 收口）。
+///
+/// proto 给了 xmux ⇒ **按用户值原样透传**（不与缺省合并）：Go 的
+/// `maxConnections` × `maxConcurrency` 互斥硬错语义因此不变（两侧都只在
+/// 「用户显式填了 xmux」时才可能有互斥冲突，且该判定仍留在 JSON 入口）。
+fn xmux_from_proto_or_default(
+    p: Option<xray_proto::xray::transport::internet::splithttp::XmuxConfig>,
+) -> XmuxConfig {
+    match p {
+        Some(m) => xmux_from_proto(m),
+        None => default_xmux_config(),
+    }
 }
 
 fn xmux_from_proto(m: xray_proto::xray::transport::internet::splithttp::XmuxConfig) -> XmuxConfig {
@@ -1637,6 +1740,73 @@ mod tests {
         };
         let err = Config::from_proto(present).expect_err("downloadSettings must not be dropped");
         assert!(err.to_string().contains("downloadSettings"), "{err}");
+    }
+
+    /// bd m2mmm 收口（缺口 A）：**三条入口在「用户没填任何 xmux 字段」时产出同一份
+    /// 物化 xmux**——JSON 入口（[`crate::register::parse_splithttp_config`]）、
+    /// proto 入口（[`Config::from_proto`]）、[`Config::default`]。
+    ///
+    /// 禁两处漂移：proto 入口原先对 `p.xmux == None` 直接透传 `None` ⇒ 同一份配置
+    /// 从两条入口进来拿到**不同**的缺省。
+    #[test]
+    fn three_entry_points_materialize_same_default_xmux() {
+        let preset = crate::config::default_xmux_config();
+
+        // ① JSON 入口（无 splithttpSettings）。
+        let json = crate::register::parse_splithttp_config(None).expect("json entry");
+        // ② proto 入口（proto 未带 xmux）。
+        let proto =
+            Config::from_proto(xray_proto::xray::transport::internet::splithttp::Config::default())
+                .expect("proto entry");
+        // ③ `Config::default()`。
+        let default = Config::default();
+
+        assert_eq!(json.xmux.as_ref(), Some(&preset));
+        assert_eq!(proto.xmux.as_ref(), Some(&preset));
+        assert_eq!(default.xmux.as_ref(), Some(&preset));
+        assert_eq!(json.xmux, proto.xmux);
+        assert_eq!(json.xmux, default.xmux);
+    }
+
+    /// 缺省预设内容：**每并发请求独占一条连接**（`maxConcurrency {1,1}`）+
+    /// Go 一致的 `hMaxRequestTimes` / `hMaxReusableSecs`（bd m2mmm）。
+    ///
+    /// `maxConnections` 保持 `None` ⇒ 不触发 Go 的「maxConnections × maxConcurrency
+    /// 互斥」硬错（Go 缺省预设只给 maxConnections）。
+    #[test]
+    fn default_xmux_preset_is_one_connection_per_request() {
+        let xm = Config::default().xmux.expect("preset materialized");
+        assert_eq!(xm.max_concurrency, Some(RangeConfig::new(1, 1)));
+        assert!(xm.max_connections.is_none());
+        assert_eq!(xm.h_max_request_times, Some(RangeConfig::new(600, 900)));
+        assert_eq!(xm.h_max_reusable_secs, Some(RangeConfig::new(1800, 3000)));
+    }
+
+    /// proto 入口**给了** xmux ⇒ 原样透传，**不与缺省预设合并**。
+    ///
+    /// proto 是 Go conf 层已解析的**终值**（`infra/conf/transport_method.go:500-507`
+    /// 逐字段填好）⇒ 合并会把用户的显式值与我们的缺省搅在一起（且可能凭空造出
+    /// 「maxConnections × maxConcurrency」互斥）。
+    #[test]
+    fn proto_entry_with_explicit_xmux_is_verbatim_not_merged() {
+        let p = xray_proto::xray::transport::internet::splithttp::Config {
+            xmux: Some(xray_proto::xray::transport::internet::splithttp::XmuxConfig {
+                max_connections: Some(
+                    xray_proto::xray::transport::internet::splithttp::RangeConfig {
+                        from: 7,
+                        to: 9,
+                    },
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let cfg = Config::from_proto(p).expect("proto entry");
+        let xm = cfg.xmux.expect("xmux present");
+        assert_eq!(xm.max_connections, Some(RangeConfig::new(7, 9)));
+        // 缺省预设**不**补进来（proto 侧是终值语义）。
+        assert!(xm.max_concurrency.is_none());
+        assert!(xm.h_max_request_times.is_none());
     }
 
     /// yvf8：uplinkDataPlacement 客户端编码。header → `{key}-N` 分块 base64 头 +

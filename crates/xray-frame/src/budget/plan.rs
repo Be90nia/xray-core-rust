@@ -167,6 +167,157 @@ impl MemoryTier {
                 .unwrap_or(BRIDGE_GATE_MAX_BYTES * 16),
         }
     }
+
+    /// 档位「设计整机」尺寸（字节）——档位预算按此尺寸标定。
+    ///
+    /// 与 [`Self::from_available`] 的档位边界同源：tiny ≤256MiB、small ≤512MiB、
+    /// medium ≤1GiB；large 档的预算（`available/4` 上限 512MiB）在 2GiB 处饱和。
+    /// 用途：算「我们那一份整机份额」（[`conn_budget`]）的分母。
+    #[must_use]
+    pub fn design_available(self) -> u64 {
+        match self {
+            Self::Tiny => 256 * MIB,
+            Self::Small => 512 * MIB,
+            Self::Medium => 1024 * MIB,
+            Self::Large => 2048 * MIB,
+        }
+    }
+
+    /// 档位「设计」预算（字节）：40 / 96 / 192 / 512 MiB——**不随实况可用内存变**。
+    ///
+    /// 与 [`Self::total_budget`] 的分工：后者是**活预算**（large 档 = `min(available/4,
+    /// 512MiB)`），只喂桥侧闸；整机份额派生必须用**设计值**，否则跨档边界会算出
+    /// 「内存变多、连接数反而变少」（bd m2mmm 评审 B1）。
+    #[must_use]
+    pub fn design_budget(self) -> u64 {
+        match self {
+            Self::Tiny => 40 * MIB,
+            Self::Small => 96 * MIB,
+            Self::Medium => 192 * MIB,
+            Self::Large => 512 * MIB,
+        }
+    }
+
+    /// 档位「设计」连接上限（条）：**13 / 32 / 64 / 170**（设计表，不随实况变）。
+    ///
+    /// = `design_budget / PER_CONN_UPPER_BYTES`（3MiB/连接）取整条。
+    #[must_use]
+    pub fn design_conn_cap(self) -> usize {
+        match self {
+            Self::Tiny => 13,
+            Self::Small => 32,
+            Self::Medium => 64,
+            Self::Large => 170,
+        }
+    }
+}
+
+/// 连接数预算派生结果（整机份额口径）——bd m2mmm xmux 缺省池上限的**唯一事实源**。
+///
+/// 派生链（每一步都可复算）：
+/// 1. 档位 = [`MemoryTier::from_available`]（按**实况**可用内存）
+/// 2. 档位连接上限 `K` = [`MemoryTier::design_conn_cap`]（**设计表** 13/32/64/170）
+/// 3. 档位预算 `B` = [`MemoryTier::design_budget`]（**设计值** 40/96/192/512MiB）
+/// 4. 整机份额 `share` = `B / 档位设计整机尺寸`（tiny 15.6% / small 18.75% / medium 18.75% / large
+///    25%）
+/// 5. 每连接规划占用 `per_conn` = `B / K`（≈3MiB）
+/// 6. 派生连接数 `derived` = 实况可用 × `share` / `per_conn` = 实况可用 × `K` / 设计尺寸
+/// 7. 生效上限 `cap` = `min(K, derived)`
+///
+/// **为什么 K 与份额都用设计值**（bd m2mmm 评审 B1）：`K` 若从**活预算**反推
+/// （large 档 = `min(available/4, 512MiB)` / 3MiB），则 `K` 本身随实况变，而分母是
+/// 常量 2048MiB ⇒ 跨档边界**非单调**（1024MiB ⇒ 64，1025MiB ⇒ 42：内存变多反而连接
+/// 数变少），且 1–2GB 的机器拿不满档位。设计值 ⇒ `derived` 对 `available` 线性 ⇒ 单调。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnBudget {
+    /// 档位。
+    pub tier: MemoryTier,
+    /// 档位连接上限（条）。
+    pub tier_cap: usize,
+    /// 按实况可用内存派生的连接数（条）。
+    pub derived: usize,
+    /// 生效连接数上限（条）= `min(tier_cap, derived)`。
+    pub cap: usize,
+    /// 每连接规划占用（字节，≈3MiB）。
+    pub per_conn: usize,
+    /// 整机份额的分子（档位预算，字节）。
+    pub share_num: u64,
+    /// 整机份额的分母（档位设计整机尺寸，字节）。
+    pub share_den: u64,
+}
+
+/// 按「整机份额」派生连接数上限（bd m2mmm：xhttp/xmux 缺省连接池上限）。
+///
+/// 用户硬约束（2026-11-12）：大机器不受牵连、小机器不被压爆 ⇒ 上限随**实况**
+/// 可用内存缩放：别人吃掉内存时我们的上限同比例下降（`derived` 项），但绝不
+/// 超过档位上限 `tier_cap`。
+#[must_use]
+pub fn conn_budget(live_available: u64) -> ConnBudget {
+    let available = if live_available == 0 { FALLBACK_AVAILABLE_BYTES } else { live_available };
+    let tier = MemoryTier::from_available(available);
+    // 档位上限与份额分子都用**设计值**（活预算反推 K ⇒ 跨档非单调，见上）。
+    let tier_cap = tier.design_conn_cap();
+    let share_num = tier.design_budget();
+    let per_conn = (share_num / tier_cap as u64) as usize;
+    let share_den = tier.design_available();
+    // derived = 实况可用 × share / per_conn = 实况可用 × K / 设计尺寸（u128 防溢出）。
+    let derived = ((available as u128 * tier_cap as u128) / share_den as u128) as usize;
+    let cap = tier_cap.min(derived).max(1);
+    ConnBudget { tier, tier_cap, derived, cap, per_conn, share_num, share_den }
+}
+
+/// 显式连接数上限（`XRAY_MAX_CONNS`）——**唯一解析点**（S3 真相源）。
+///
+/// 语义：**进程连接数的显式上限**。两侧消费方口径统一为「最终生效值恒受内存约束」：
+/// - 桥侧槽位（[`MemoryPlan::max_conns`]）：显式值**覆盖**档位派生值（既有语义），
+///   随后由装配期内存适配（[`set_effective_max_conns`]）压到内存装得下的量。
+/// - xmux/xhttp 缺省池（[`xmux_pool_cap`]）：显式值只作**上界**（取 `min`）——
+///   显式值不得让池开到超出「我们最多占整机一份」的量（契约 3）。
+///
+/// `None` = 未设（视同不额外收紧）；`0` 视同未设（否则等于全拒，运维误设即服务不可用）。
+#[must_use]
+pub fn explicit_max_conns() -> Option<usize> {
+    std::env::var(ENV_MAX_CONNS)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// xhttp/xmux 缺省连接池上限（条）——**生效值** = 内存份额派生值 ∩ 显式上限。
+///
+/// 与 [`conn_budget`] 的关系：本函数只做「显式上限收紧」这一步；份额派生仍在
+/// [`conn_budget`]（唯一派生面）里。
+#[must_use]
+pub fn xmux_pool_cap(live_available: u64) -> usize {
+    xmux_pool_cap_with(live_available, explicit_max_conns())
+}
+
+/// [`xmux_pool_cap`] 的纯函数面：显式上限由调用方传入 ⇒ 单测不碰环境变量。
+#[must_use]
+pub fn xmux_pool_cap_with(live_available: u64, explicit_max: Option<usize>) -> usize {
+    let derived = conn_budget(live_available).cap;
+    match explicit_max {
+        Some(n) => derived.min(n),
+        None => derived,
+    }
+}
+
+/// 实况可用内存（字节）：`XRAY_MEM_LIMIT_MB` 覆盖优先，其次平台探测，
+/// 最后回落 [`MemoryPlan::cached`] 的探测值（探测全失效 ⇒ 512MiB 兜底）。
+#[must_use]
+pub fn live_available() -> u64 {
+    let override_mb = std::env::var(ENV_MEM_LIMIT_MB).ok().and_then(|v| parse_mb(&v));
+    let probed =
+        probe_available().map(|(bytes, _)| bytes).or_else(|| Some(MemoryPlan::cached().available));
+    resolve_live_available(override_mb, probed)
+}
+
+/// [`live_available`] 的纯函数面（env 覆盖 → 探测值 → 兜底），单测不碰环境变量。
+fn resolve_live_available(override_mb: Option<u64>, probed: Option<u64>) -> u64 {
+    match override_mb {
+        Some(mb) => mb.saturating_mul(MIB),
+        None => probed.unwrap_or(FALLBACK_AVAILABLE_BYTES),
+    }
 }
 
 /// 一次探测 + 一次派生的全部结果（进程级缓存一份，见 [`MemoryPlan::cached`]）。
@@ -197,7 +348,7 @@ impl MemoryPlan {
     #[must_use]
     pub fn detect() -> Self {
         let override_mb = std::env::var(ENV_MEM_LIMIT_MB).ok().and_then(|v| parse_mb(&v));
-        let max_conns = std::env::var(ENV_MAX_CONNS).ok().and_then(|v| v.trim().parse().ok());
+        let max_conns = explicit_max_conns();
         match override_mb {
             Some(mb) => Self::build(mb.saturating_mul(MIB), ENV_MEM_LIMIT_MB, max_conns),
             None => {
@@ -238,11 +389,15 @@ impl MemoryPlan {
     }
 
     /// 单行摘要（启动日志 + 报告用）。
+    ///
+    /// 附「连接数预算」派生面（bd m2mmm）：档位 / 整机份额 / 每连接占用 / 派生值 /
+    /// 档位上限 / 生效值，供运维一眼核对 xmux 缺省连接池上限的来源。
     #[must_use]
     pub fn summary(&self) -> String {
+        let cb = conn_budget(self.available);
         format!(
             "memory plan: tier {} ({}) available {}B via {} -> budget {}B, bridge gate {}B/dir, \
-             max {} conns",
+             max {} conns; conn budget cap {} (tier cap {}, derived {}, share {}/{}, per-conn {}B)",
             self.tier.as_str(),
             self.tier.label(),
             self.available,
@@ -250,6 +405,12 @@ impl MemoryPlan {
             self.total_budget,
             self.bridge_gate,
             self.max_conns,
+            cb.cap,
+            cb.tier_cap,
+            cb.derived,
+            cb.share_num,
+            cb.share_den,
+            cb.per_conn,
         )
     }
 
@@ -610,5 +771,102 @@ mod tests {
         let plan = MemoryPlan::detect();
         assert!(plan.total_budget > 0 && plan.max_conns >= 1);
         assert!(plan.summary().contains("max"));
+    }
+
+    // ===== 连接数预算派生（bd m2mmm：xhttp/xmux 缺省连接池上限）=====
+
+    /// 档位边界上「派生值 = 档位上限」：256MiB⇒13、512MiB⇒32、1GiB⇒64、
+    /// 2GiB⇒170、45GiB⇒170（大盘不再增长——上限就是档位上限）。
+    #[test]
+    fn conn_budget_tier_boundaries_map_to_tier_caps() {
+        for (available, cap) in [
+            (256 * MIB, 13usize),
+            (512 * MIB, 32),
+            (1024 * MIB, 64),
+            (2048 * MIB, 170),
+            (45 * 1024 * MIB, 170),
+        ] {
+            let cb = conn_budget(available);
+            assert_eq!(cb.cap, cap, "{available}B 档 ⇒ 连接上限 {cap}");
+            assert_eq!(cb.cap, cb.tier_cap, "档位边界上派生值应等于档位上限");
+            assert!(cb.derived >= cb.cap);
+        }
+    }
+
+    /// 档位之间（700MiB ⇒ medium 档）：上限必须**落在档位上限之下**——
+    /// 证明「实况可用内存」真的参与了派生，不是恒等于档位上限。
+    #[test]
+    fn conn_budget_between_tiers_is_below_tier_cap() {
+        let cb = conn_budget(700 * MIB);
+        assert!(cb.cap > 32 && cb.cap <= 64, "700MiB ⇒ cap ∈ (32,64]，实得 {}", cb.cap);
+        assert!(cb.cap < cb.tier_cap, "派生项必须真的在起作用");
+    }
+
+    /// 别人吃掉内存 ⇒ 我们的上限同比例下降（绝不按整机富余度乐观跑）。
+    #[test]
+    fn conn_budget_shrinks_when_memory_is_taken() {
+        let rich = conn_budget(2048 * MIB).cap;
+        let poor = conn_budget(500 * MIB).cap;
+        assert!(poor < rich, "500MiB 可用 ⇒ {poor} 必须远小于 2GiB 时的 {rich}");
+        assert!(poor <= 32, "500MiB 落 small 档 ⇒ 上限 ≤ 32，实得 {poor}");
+    }
+
+    /// `XRAY_MEM_LIMIT_MB=256` ⇒ 实况可用 256MiB ⇒ tiny 档口径（上限 ≤ 13）。
+    #[test]
+    fn mem_limit_override_drives_tiny_tier_cap() {
+        let avail = resolve_live_available(Some(256), Some(45 * 1024 * MIB));
+        assert_eq!(avail, 256 * MIB, "env 覆盖优先于探测值");
+        assert!(conn_budget(avail).cap <= 13, "tiny 档口径 ⇒ ≤ 13");
+    }
+
+    /// 探测失效 ⇒ 兜底 512MiB（不得返 0 ⇒ 不得把预算归零）。
+    #[test]
+    fn live_available_never_zero() {
+        assert_eq!(resolve_live_available(None, None), FALLBACK_AVAILABLE_BYTES);
+        assert!(live_available() > 0);
+    }
+
+    /// **单调性**（bd m2mmm 评审 B1 blocker）：可用内存变多 ⇒ 连接上限**不得**变少。
+    ///
+    /// 旧实现用「活预算」反推档位上限 `K`（large 档 = `min(available/4, 512MiB)/3MiB`），
+    /// 分母却是常量 2048MiB ⇒ 1024MiB ⇒ 64、1025MiB ⇒ 42（内存变多反而连接数变少）。
+    #[test]
+    fn conn_budget_is_monotonic_in_available() {
+        let mut prev = conn_budget(64 * MIB).cap;
+        let mut available = 64 * MIB;
+        while available <= 4096 * MIB {
+            available += MIB;
+            let cap = conn_budget(available).cap;
+            assert!(cap >= prev, "可用 {available}B ⇒ cap {cap} < 上一档 {prev} ⇒ 预算非单调");
+            prev = cap;
+        }
+        // 跨档边界（1GiB）两侧的具体值：内存变多 ⇒ 连接数变多。
+        assert_eq!(conn_budget(1024 * MIB).cap, 64);
+        assert_eq!(conn_budget(1025 * MIB).cap, 85);
+        assert!(conn_budget(1025 * MIB).cap > conn_budget(1024 * MIB).cap);
+    }
+
+    /// 档位映射锚点（评审 B1 验收）：1GiB ⇒ 64、2GiB ⇒ 170、45GiB ⇒ 170。
+    #[test]
+    fn conn_budget_maps_large_tier_to_design_cap() {
+        assert_eq!(conn_budget(1024 * MIB).cap, 64, "1GiB ⇒ 64");
+        assert_eq!(conn_budget(2048 * MIB).cap, 170, "2GiB ⇒ 170");
+        assert_eq!(conn_budget(45 * 1024 * MIB).cap, 170, "45GiB ⇒ 170（大盘封顶）");
+        assert_eq!(conn_budget(2048 * MIB).tier_cap, 170);
+    }
+
+    /// S3：`XRAY_MAX_CONNS` 单一真相源——池上限 = 内存份额派生值 ∩ 显式上限。
+    ///
+    /// 显式值**只能收紧**、不得突破「我们最多占整机一份」（契约 3）。
+    #[test]
+    fn xmux_pool_cap_respects_explicit_limit_without_breaching_share() {
+        // 未设显式上限 ⇒ = 内存份额派生值（512MiB ⇒ small 档 ⇒ 32）。
+        assert_eq!(xmux_pool_cap_with(512 * MIB, None), 32);
+        // 显式上限更小 ⇒ 收紧。
+        assert_eq!(xmux_pool_cap_with(512 * MIB, Some(10)), 10);
+        // 显式上限更大 ⇒ 仍受内存份额约束（不得突破份额上限）。
+        assert_eq!(xmux_pool_cap_with(512 * MIB, Some(1000)), 32);
+        // 显式上限与派生值同源 ⇒ 一致。
+        assert_eq!(xmux_pool_cap_with(1024 * MIB, Some(64)), 64);
     }
 }
