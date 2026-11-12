@@ -335,8 +335,10 @@ fn seg(name: &str) -> String {
 /// Go TestDriveSecrets：3 元 secrets、remoteFolder 非空、secret 非空。
 #[tokio::test]
 async fn drive_secrets_validation() {
-    let make = |settings: StreamSettings| {
-        let config = Config::from_settings(&settings).unwrap();
+    // G4：secrets 计数已上移配置期（Go XDriveConfig.Build 同款）；folder/空 secret
+    // 仍由 storage 构造期拒（Go newDriveStorage 同款）。
+    let make = |settings: StreamSettings| -> std::io::Result<()> {
+        let config = Config::from_settings(&settings)?;
         DriveStorage::new(&settings, &config).map(|_| ())
     };
     let bad_two = StreamSettings::from_json(Some(&json!({
@@ -351,6 +353,7 @@ async fn drive_secrets_validation() {
         "network": "xdrive",
         "xdriveSettings": {"service": "google-drive", "remoteFolder": "f", "secrets": ["a", "", "c"]},
     })));
+    assert!(Config::from_settings(&bad_two).is_err(), "two secrets must fail at config time");
     assert!(make(bad_two).is_err(), "accepted two secrets");
     assert!(make(bad_folder).is_err(), "accepted an empty remoteFolder");
     assert!(make(bad_empty).is_err(), "accepted an empty secret");

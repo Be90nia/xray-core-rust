@@ -147,6 +147,31 @@ impl BudgetReport {
     }
 }
 
+/// 缺省 xmux/xhttp 连接池上限的**派生链**（bd m2mmm 观测缺口的接线面）。
+///
+/// 数据源 = `xray_frame::budget::plan` 的**唯一事实源**（[`conn_budget`] / [`ConnBudget`] /
+/// [`xmux_pool_cap`]）——本仓不另造派生口径（§3.5.2 禁两份真相源）。
+///
+/// 数值取**启动快照**（装配期 [`MemoryPlan::cached`] 的探测值）；运行期池上限按实况
+/// 内存重算（`xmux_pool_cap(live_available())`，5s TTL，见 splithttp `mux::pool_cap`）
+/// ⇒ 启动行是**快照**，运行期数值可微漂（漂移方向恒为「内存变少 ⇒ 上限变低」）。
+fn conn_budget_log_line(plan: &xray_frame::budget::plan::MemoryPlan) -> String {
+    let cb = xray_frame::budget::plan::conn_budget(plan.available);
+    format!(
+        "conn budget: xmux/xhttp pool cap {} conns (tier {}, tier cap {}, derived {}, \
+         share {}/{}, per-conn {}B, available {}B via {})",
+        xray_frame::budget::plan::xmux_pool_cap(plan.available),
+        cb.tier.as_str(),
+        cb.tier_cap,
+        cb.derived,
+        cb.share_num,
+        cb.share_den,
+        cb.per_conn,
+        plan.available,
+        plan.source,
+    )
+}
+
 /// 装配期预算门：产出两栏报告（违例见 [`BudgetReport::violations`]）。
 ///
 /// 校验面（bd sgdwm 扩面 + bd 258qt 口径修正 + bd sfqlu 档位自适应）：
@@ -509,6 +534,9 @@ fn check_startup_budget_with(
     }
     let log = xray_frame::logging::LogFacade::new("memory_budget", Vec::new());
     log.info(report.summary());
+    // 缺省 xmux 连接池上限的**派生链**（bd m2mmm §6 验收 4：字段写对了但没接线
+    // ⇒ 运维在真机日志里看不到「池按几条连接封顶」的来源）。
+    log.info(conn_budget_log_line(&plan));
     // 96MB = 原设计点（整机 256MB 上的保守分账）；低于它说明本机更小，必须显式告知。
     if report.budget < XRAY_BUDGET_BYTES {
         log.warn(format!(
@@ -528,6 +556,8 @@ fn check_startup_budget_with(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use xray_conf::{BuiltEntry, BuiltInbound, BuiltOutbound};
 
     use super::*;
@@ -601,6 +631,119 @@ mod tests {
             "必须出降档 warn 文案：{:?}",
             report.degraded
         );
+    }
+
+    /// bd m2mmm §6 验收 4：生产启动日志里必须能 grep 到**连接数预算派生链**
+    /// （档位 / 整机份额 / 每连接占用 / 派生值 / 生效上限 / 来源）——否则运维看到
+    /// 「max N conns」却无法反推 xmux 缺省连接池按几条封顶。
+    ///
+    /// 派生值全部取自 `xray_frame::budget::plan` 的**唯一事实源**
+    /// （`conn_budget` / `ConnBudget`）⇒ 与池侧（`xmux_pool_cap`）同源同值。
+    #[test]
+    fn conn_budget_log_line_exposes_derivation_chain() {
+        let plan = plan_96mb();
+        let line = conn_budget_log_line(&plan);
+        let cb = xray_frame::budget::plan::conn_budget(plan.available);
+        assert!(line.contains("conn budget"), "必须点名派生链：{line}");
+        assert!(line.contains(&format!("pool cap {} conns", cb.cap)), "必须带生效上限：{line}");
+        assert!(line.contains(&format!("tier cap {}", cb.tier_cap)), "必须带档位上限：{line}");
+        assert!(line.contains(&format!("derived {}", cb.derived)), "必须带派生值：{line}");
+        assert!(
+            line.contains(&format!("share {}/{}", cb.share_num, cb.share_den)),
+            "必须带整机份额：{line}"
+        );
+        assert!(line.contains(&format!("per-conn {}B", cb.per_conn)), "必须带每连接占用：{line}");
+        assert!(line.contains("available"), "必须带可用内存来源：{line}");
+    }
+
+    /// 生效上限必须**等于**池侧同一公式（`xmux_pool_cap`）——两处数值一致 ⇒
+    /// 运维在日志里看到的 cap 就是池真正封顶的条数（bd m2mmm 验收 4）。
+    #[test]
+    fn conn_budget_log_line_cap_matches_pool_cap_formula() {
+        for available in [256 * MIB, 512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
+            let line = conn_budget_log_line(&plan);
+            let expect = xray_frame::budget::plan::xmux_pool_cap(plan.available);
+            assert!(
+                line.contains(&format!("pool cap {expect} conns")),
+                "{available}B 档：日志 cap 必须与池侧公式一致：{line}"
+            );
+        }
+    }
+
+    /// **端到端验收（bd m2mmm §6 验收 4）**：生产启动路径
+    /// [`check_startup_budget_with`]（= `start_full` 的预算门入口）**真的把派生链打进
+    /// 了日志**——不只是「有个函数能拼出这条串」。
+    ///
+    /// 抓的是 `xray_frame::logging::LogFacade`（生产日志唯一出口）的真实发射 ⇒ 与运维
+    /// 在真机 `grep` 到的内容同源（同一 target / 同一 level / 同一串）。
+    #[test]
+    fn production_startup_log_contains_conn_budget_chain() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<parking_lot::Mutex<Vec<String>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &tracing::span::Id, _id: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Msg(String);
+                impl tracing::field::Visit for Msg {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0.push_str(value);
+                        }
+                    }
+
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0.push_str(&format!("{value:?}"));
+                        }
+                    }
+                }
+                let mut msg = Msg(String::new());
+                event.record(&mut msg);
+                if !msg.0.is_empty() {
+                    self.0.lock().push(msg.0);
+                }
+            }
+
+            fn enter(&self, _span: &tracing::span::Id) {}
+
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            // 缺省配置必须过门（否则走不到打日志那一步）。
+            check_startup_budget_with(&xray_conf::BuiltConfig::default(), plan_96mb())
+                .expect("缺省配置必须过预算门");
+        });
+        let logs = capture.0.lock().clone();
+        let chain = logs
+            .iter()
+            .find(|m| m.contains("conn budget"))
+            .expect("生产启动日志必须含 conn budget 派生链：{logs:?}");
+        // 六要素：档位 / 档位上限 / 派生值 / 整机份额 / 每连接占用 / 来源。
+        assert!(chain.contains("tier small"), "必须带档位：{chain}");
+        assert!(chain.contains("tier cap 32"), "必须带档位上限：{chain}");
+        assert!(chain.contains("derived 32"), "必须带派生值：{chain}");
+        assert!(chain.contains("share 100663296/536870912"), "必须带整机份额：{chain}");
+        assert!(chain.contains("per-conn 3145728B"), "必须带每连接占用：{chain}");
+        assert!(chain.contains("via injected"), "必须带来源：{chain}");
+        assert!(chain.contains("pool cap 32 conns"), "必须带生效上限：{chain}");
     }
 
     /// 反例：连 1 条满额 pipe 都装不下 ⇒ 这才是拒启（降档到底线）。
