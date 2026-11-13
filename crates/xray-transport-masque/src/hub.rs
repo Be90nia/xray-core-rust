@@ -105,6 +105,33 @@ pub struct GateGrant {
 pub type TunnelGate =
     Arc<dyn Fn(&RequestMeta) -> std::result::Result<GateGrant, GateDeny> + Send + Sync>;
 
+// ===== 共享认证闸（bd anygg G2：transport 注册表形态的 users 校验委托面） =====
+
+/// 进程级共享 masque users 闸：proxy 层（`xray_proxy_masque::server::serve`）装配时
+/// 注册首个 users gate；transport 注册表形态（`register::register_listener`）查此槽
+/// 委托认证。单槽 + 首个成功：同实例多 masque 入站时委托面取首张 users 表（各
+/// listener 自身的直连 gate 不经此槽，不受影响）。槽随进程存活不注销——与
+/// transport listener/dialer 注册表同生命周期语义。
+static SHARED_AUTH_GATE: std::sync::LazyLock<std::sync::RwLock<Option<TunnelGate>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// proxy 层注册共享 users 闸。首个注册返回 `true`；已有注册时忽略（返回 `false`
+/// ——注册方自身 listener 仍用自己的直连 gate，行为不变）。
+pub fn register_shared_auth_gate(gate: TunnelGate) -> bool {
+    let mut slot = SHARED_AUTH_GATE.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some(gate);
+    true
+}
+
+/// 查共享 users 闸（transport listener 形态消费；`None` = 本进程无 masque users
+/// 源，调用方按 Go `hub.go:53` 语义放行——transport 层无认证，协议层自认证）。
+pub(crate) fn shared_auth_gate() -> Option<TunnelGate> {
+    SHARED_AUTH_GATE.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 /// 隧道接受器（Go `internet.ConnHandler` 的强类型对应）：hub 校验/gate 通过后
 /// 把 [`ServerConn`] 交给 proxy 层。
 pub trait TunnelAcceptor: Send + Sync {

@@ -925,6 +925,15 @@ pub async fn serve(
 ) -> io::Result<(Box<dyn TransportListener>, Arc<MasqueServer>)> {
     let server = MasqueServer::new(tag, settings, dispatch, scope)?;
     let gate = server.gate();
+    // bd anygg G2：装配即注册进程级共享 users 闸（transport 注册表形态的认证委托
+    // 源，见 `xray_transport_masque::hub::register_shared_auth_gate`）。首个 masque
+    // 入站注册生效；后续入站忽略并保留自有直连 gate，行为不变。
+    if !hub::register_shared_auth_gate(Arc::clone(&gate)) {
+        LOG.info(
+            "masque: shared auth gate already registered by another masque inbound; \
+             transport-form listeners keep the first users table",
+        );
+    }
     let acceptor = server.acceptor();
     let listener = hub::listen_masque(addr, &stream_settings, &sockopt, gate, acceptor).await?;
     Ok((listener, server))

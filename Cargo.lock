@@ -6964,9 +6964,13 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "xray-app-dispatcher",
  "xray-common",
  "xray-frame",
  "xray-proto",
+ "xray-proxy-freedom",
+ "xray-proxy-masque",
+ "xray-proxy-vless",
  "xray-tls",
  "xray-transport",
 ]

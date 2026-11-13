@@ -39,6 +39,13 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# bd anygg G2 L2（network:"masque" 承载 VLESS 真实字节往返；workspace path 依赖，
+# 零新三方）：真实 proxy 层 users 源（serve() → 共享 gate 注册）+ 真 vless 双端
+# + freedom 桥。dev 环允许（xray-core dev-dep xray-cli 同款先例）。
+xray-app-dispatcher = { path = "../xray-app-dispatcher" }
+xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+xray-proxy-masque = { path = "../xray-proxy-masque" }
+xray-proxy-vless = { path = "../xray-proxy-vless" }
 
 # bd g3cr：生产代码零 unwrap（测试代码由 root clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]

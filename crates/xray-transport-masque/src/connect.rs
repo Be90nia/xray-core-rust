@@ -76,6 +76,11 @@ struct SessionState {
     peer: Option<Vec<IpPrefix>>,
     /// 对端通告路由（latest-wins；Go `c.localRoutes`）。
     routes: Vec<IpRoute>,
+    /// 透传模式（bd anygg G2 transport 形态专用）：入站 DATAGRAM 免 IP 验证。
+    /// 仅通用 transport 管线（`register` 注册表 dialer/listener）使用——载荷是
+    /// 协议裸字节（如 VLESS 流）而非 IP 包；proxy 形态（IP 栈路由）恒 false
+    /// 保持地址归属验证（Go `handleIncomingProxiedPacket` 同语义）。
+    passthrough: bool,
 }
 
 type SharedState = Arc<Mutex<SessionState>>;
@@ -189,6 +194,15 @@ impl ConnectIpSession {
         self.local_addrs = prefixes.iter().map(|p| p.addr).collect();
         if let Ok(mut st) = self.state.lock() {
             st.assigned = prefixes.to_vec();
+        }
+    }
+
+    /// 开启透传模式（bd anygg G2 transport 形态专用）：入站 DATAGRAM 免 IP 验证
+    /// （载荷 = 协议裸字节，见 [`SessionState::passthrough`]）。仅供 `register`
+    /// 注册表的 dialer/listener（通用 transport 管线）调用；proxy 形态会话禁用。
+    pub(crate) fn set_passthrough(&mut self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.passthrough = true;
         }
     }
 
@@ -331,20 +345,28 @@ impl SessionWriter {
         if packet.len() > self.max_packet_size {
             return compose_icmp_packet_too_big(packet, self.max_packet_size).map(Some);
         }
-        let data = match compose_datagram(packet) {
-            Ok(d) => d,
-            Err(e) => {
-                crate::LOG.debug(format!(
-                    "masque: dropping proxied packet ({} bytes) that can't be proxied: {e}",
-                    packet.len()
-                ));
-                return Ok(None);
-            },
-        };
-        let frame = match self.framing {
-            Framing::Capsule => encode_capsule(&Capsule::Datagram(data))?,
-            // WARP：载荷即裸 IP 包，无 contextID 前缀（Go `conn.go:667-671`）。
-            Framing::Bare => crate::capsule::encode_bare_datagram(&data)?,
+        // 透传模式（bd anygg G2 transport 形态）：载荷 = 协议裸字节而非 IP 包——
+        // 免 `compose_datagram` 的 IP 解析/TTL 递减（其对非 IP 载荷恒 Err 静默
+        // 丢弃），原样进 DATAGRAM 胶囊；对端透传会话读面同语义。
+        let passthrough = self.state.lock().map(|st| st.passthrough).unwrap_or(false);
+        let frame = if passthrough {
+            encode_capsule(&Capsule::Datagram(packet.to_vec()))?
+        } else {
+            let data = match compose_datagram(packet) {
+                Ok(d) => d,
+                Err(e) => {
+                    crate::LOG.debug(format!(
+                        "masque: dropping proxied packet ({} bytes) that can't be proxied: {e}",
+                        packet.len()
+                    ));
+                    return Ok(None);
+                },
+            };
+            match self.framing {
+                Framing::Capsule => encode_capsule(&Capsule::Datagram(data))?,
+                // WARP：载荷即裸 IP 包，无 contextID 前缀（Go `conn.go:667-671`）。
+                Framing::Bare => crate::capsule::encode_bare_datagram(&data)?,
+            }
         };
         // Go WritePacket → c.write：直写流（同步阻塞语义）；本仓经写泵队列，
         // 满即背压（与 Go 流窗满阻塞等价）。
@@ -732,6 +754,14 @@ fn compose_datagram(packet: &[u8]) -> Result<Vec<u8>> {
 // ===== 入站包验证（Go conn.go handleIncomingProxiedPacket） =====
 
 fn validate_incoming(packet: &[u8], state: &SharedState) -> bool {
+    let st = match state.lock() {
+        Ok(st) => st,
+        Err(_) => return false,
+    };
+    if st.passthrough {
+        return true;
+    }
+    drop(st);
     if packet.is_empty() {
         return false;
     }
