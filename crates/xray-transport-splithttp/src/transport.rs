@@ -71,7 +71,7 @@ pub(crate) const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 pub use xray_transport::h2_window::{
     H2_INITIAL_CONNECTION_WINDOW, H2_INITIAL_STREAM_WINDOW, H2_MAX_SEND_BUF_SIZE,
     H2_SERVER_INITIAL_CONNECTION_WINDOW, H2_SERVER_INITIAL_STREAM_WINDOW,
-    H2_SERVER_MAX_SEND_BUF_SIZE,
+    H2_SERVER_MAX_SEND_BUF_SIZE, H2_SERVER_SEND_BUF_TINY_TIER, h2_server_max_send_buf_for,
 };
 
 /// 服务端 h2 允许的对端并发流数（票 2xgln）。
@@ -619,8 +619,10 @@ where
                 // hyper h2 每流发送缓冲默认 400KB（DEFAULT_MAX_SEND_BUF_SIZE）——发送速率
                 // 被钉在 min(send_buf, 客户端窗口)/RTT：400KB 时代高 BDP 路径钉 2.7MB/s；
                 // 4MB 时代 min(4MB, Go 客户端 4MB)/0.45s≈8.8MB/s（bd enc8x 窗钉模型三组
-                // 历史数字闭环）。16MB 配合客户端 16MB 流窗（dialer.rs 同批）→ 40-60MB/s。
+                // 历史数字闭环）。16MB 时代 min(16MB, 客户端收窗 32MB) ⇒ 16MB/RTT。
                 // Go 服务端无此上限（仅受客户端窗口约束）。
+                // 现值 = 服务端静态保底 32MiB（对齐客户端收窗 32MB，下载在飞上限翻倍；
+                // 0.45s 端到端 RTT ≈ 71 MiB/s，见 `h2_window` 模块头 RTT 定量）。
                 .max_send_buf_size(win.max_send_buf)
                 // bd wz2b W2：hyper server h2 缺省收窗 1MB/1MB（proto/h2/server.rs:36-37），
                 // 上行钉 1MB/RTT@169ms≈5.9MB/s（RTT50ms 实测 17.3MB/s，verify/audit-r2-w2-ab

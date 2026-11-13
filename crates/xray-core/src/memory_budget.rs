@@ -51,10 +51,10 @@ pub use xray_frame::budget::{
     NEW_POOLS_TOTAL_MAX_BYTES, QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
     QUIC_STREAM_RECEIVE_WINDOW_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
     QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES, RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR,
-    SPLITHTTP_ENDPOINT_BOOKED_BYTES, SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
-    SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES, SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES,
-    TLS_SESSION_CACHE_ESTIMATE_BYTES, TLS_SESSION_CACHE_MAX_ENTRIES,
-    WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES, XRAY_BUDGET_BYTES,
+    SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES, SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES,
+    SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES, TLS_SESSION_CACHE_ESTIMATE_BYTES,
+    TLS_SESSION_CACHE_MAX_ENTRIES, WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES,
+    XDRIVE_H2_SEND_BUF_PER_CONN_BYTES, XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES, XRAY_BUDGET_BYTES,
     XRAY_BUF_POOL_TOTAL_MAX_BYTES, set_effective_handshake_inflight, startup_fixed_floor_bytes,
     startup_fixed_floor_bytes_for, startup_fixed_floor_bytes_for_with_inflight,
 };
@@ -172,6 +172,17 @@ fn conn_budget_log_line(plan: &xray_frame::budget::plan::MemoryPlan) -> String {
     )
 }
 
+/// xhttp（splithttp）**每连接**账面（字节）= 档位对应服务端 h2 send_buf + hyper 空闲
+/// 连接池余量（`MAX_IDLE_PER_HOST` 条 × 每连接估算）。
+///
+/// 只进 caps 栏（per-conn 上限，**不求和**）。send_buf 的唯一映射源 =
+/// [`xray_transport::h2_window::h2_server_max_send_buf_for`]（tiny 16MiB、
+/// small/medium/large 32MiB）——打印值必须与 transport 实际定窗同源，禁在此另立数字。
+fn xhttp_conn_booked_bytes(tier: xray_frame::budget::plan::MemoryTier) -> usize {
+    xray_transport::h2_window::h2_server_max_send_buf_for(tier)
+        + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES
+}
+
 /// 装配期预算门：产出两栏报告（违例见 [`BudgetReport::violations`]）。
 ///
 /// 校验面（bd sgdwm 扩面 + bd 258qt 口径修正 + bd sfqlu 档位自适应）：
@@ -228,6 +239,14 @@ pub fn budget_report_with(
     // QUIC 端点总数（显式 + 缺省）：每端点可建 N 条连接，连接窗按连接计（D-03）。
     let mut quic_endpoints = 0usize;
     let mut splithttp = 0usize;
+    // xdrive 端点数与其中 h3 分支数（bd yc54c G5）：h3 连接窗入硬账（同 D-03 口径），
+    // WAL 会话缓冲面上限面。
+    let mut xdrive_endpoints = 0usize;
+    let mut xdrive_h3_endpoints = 0usize;
+    // masque 端点数（bd anygg G3 / 规划 R14 B4.6）：masque 一体 inbound/outbound 与
+    // 纯 transport 形态都带 `network:"masque"` ⇒ 统一按 streamSettings 计数；每条
+    // 连接一条 CONNECT-IP 隧道（R15 shortcut），隧道 h2 send_buf 上界入硬账。
+    let mut masque_endpoints = 0usize;
     let stream_settings = built
         .inbounds
         .iter()
@@ -247,6 +266,15 @@ pub fn budget_report_with(
                 }
             },
             Some(xray_common::net::transport::TransportProtocol::SplitHttp) => splithttp += 1,
+            Some(xray_common::net::transport::TransportProtocol::XDrive) => {
+                xdrive_endpoints += 1;
+                if xdrive_h3(ss) {
+                    xdrive_h3_endpoints += 1;
+                }
+            },
+            Some(xray_common::net::transport::TransportProtocol::Masque) => {
+                masque_endpoints += 1;
+            },
             _ => {},
         }
     }
@@ -318,7 +346,44 @@ pub fn budget_report_with(
     let tuic_inbox_conns =
         if tuic_outbounds > 0 { tuic_inbox_fit.max(1).min(tuic_outbounds) } else { 0 };
     let tuic_inbox_booked = tuic_inbox_conns * xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP;
-    let transient_booked = frag_booked + quic_windows_booked + tuic_inbox_booked;
+    // xdrive h3 连接窗（bd yc54c G5）：xdrive h3 分支的 quinn `TransportConfig`
+    // 与 QUIC transport 同源同缺省（`xray_transport_xdrive::h3` transport_config
+    // 缺省 = `xray_transport_quic::config::DEFAULT_CONNECTION_RECEIVE_WINDOW`
+    // 32MiB）⇒ 复用同一账面常量。乘数同 D-03 余量口径，且从**扣除前序瞬时面**
+    // 之后的余量反解（QUIC/xdrive 两种 h3 族并存时不重复记账同一份余量）。
+    let xdrive_h3_fit = budget.saturating_sub(
+        fixed
+            + quic_explicit_booked
+            + conns * per_conn_pipe
+            + frag_booked
+            + quic_windows_booked
+            + tuic_inbox_booked,
+    ) / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+    let xdrive_h3_conns =
+        if xdrive_h3_endpoints > 0 { max_conns.min(xdrive_h3_fit.max(1)) } else { 0 };
+    let xdrive_windows_booked = xdrive_h3_conns * QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+    // masque 隧道 h2 send_buf（bd anygg G3 / 规划 R14 B4.6）：每条 CONNECT-IP 隧道
+    // 一条 h2 连接，发送缓冲上界 16MiB——单一事实源 = `xray_transport::h2_window::
+    // H2_MAX_SEND_BUF_SIZE`（masque `h2.rs` 与 splithttp transport 同一 re-export
+    // 符号）⇒ 复用登记簿 [`H2_MAX_SEND_BUF_PER_CONN_BYTES`] 同一账面，零新造数字。
+    // 乘数同 D-03 余量口径：从扣除前序瞬时面之后的余量反解「装得下几条满载隧道」，
+    // 上界 = 运行期连接数上限（R15：每连接一条隧道）；端点数只作开关（= 0 不记账）。
+    let masque_fit = budget.saturating_sub(
+        fixed
+            + quic_explicit_booked
+            + conns * per_conn_pipe
+            + frag_booked
+            + quic_windows_booked
+            + tuic_inbox_booked
+            + xdrive_windows_booked,
+    ) / H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    let masque_tunnels = if masque_endpoints > 0 { max_conns.min(masque_fit.max(1)) } else { 0 };
+    let masque_send_buf_booked = masque_tunnels * H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    let transient_booked = frag_booked
+        + quic_windows_booked
+        + tuic_inbox_booked
+        + xdrive_windows_booked
+        + masque_send_buf_booked;
     let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe;
     let projected = steady_booked + transient_booked;
     if conns_fit == 0 {
@@ -377,6 +442,22 @@ pub fn budget_report_with(
                 quic_conns + 1
             ));
         }
+        if xdrive_h3_conns > 0 {
+            parts.push(format!(
+                "xdrive h3 接收窗：预算只装得下 {xdrive_h3_conns} 条满窗连接（\
+                 {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B/连接，与 QUIC transport \
+                 同源同缺省）⇒ 第 {} 条起的窗口内存不受预算约束",
+                xdrive_h3_conns + 1
+            ));
+        }
+        if masque_tunnels > 0 {
+            parts.push(format!(
+                "masque 隧道 h2 send_buf：预算只装得下 {masque_tunnels} 条满载隧道（\
+                 {H2_MAX_SEND_BUF_PER_CONN_BYTES}B/隧道）⇒ 第 {} 条起的发送缓冲\
+                 不受预算约束",
+                masque_tunnels + 1
+            ));
+        }
         notes.push(format!(
             "瞬时面上界超预算（只 WARN 不拒启，bd 2026-11-08 D-03/security P2-2）：{}；\
              最坏瞬时账面 {projected}B > 预算 {budget}B，常态账面 {steady_booked}B 在预算内",
@@ -400,6 +481,9 @@ pub fn budget_report_with(
     let degraded = (!notes.is_empty()).then(|| notes.join("；"));
 
     // ── 4) 上限面（打印用；不进 projected）──
+    // xhttp 每连接账面按**档位实际生效值**打（send_buf 16MiB@tiny / 32MiB@small 起
+    // + 空闲连接池余量）：打印值必须与 transport 侧实际定窗一致。
+    let xhttp_conn_booked = xhttp_conn_booked_bytes(plan.tier);
     let caps = vec![
         (
             format!(
@@ -408,13 +492,27 @@ pub fn budget_report_with(
             quic_default * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
         ),
         (
-            format!(
-                "{splithttp} xhttp x {SPLITHTTP_ENDPOINT_BOOKED_BYTES}B per-conn h2 send_buf cap"
-            ),
-            splithttp * SPLITHTTP_ENDPOINT_BOOKED_BYTES,
+            format!("{splithttp} xhttp x {xhttp_conn_booked}B per-conn h2 send_buf cap"),
+            splithttp * xhttp_conn_booked,
         ),
-        // bd 55yh7 B4（R14）：masque 单隧道 16MiB send_buf（惰性分配，装配期
-        // 不可数）——上限面登记防回档，与同值常量的账本锚（bd sgdwm/PM-05）同源。
+        // bd yc54c G5：xdrive 会话缓冲面上限面（WAL 段缓冲 + h2 send buf，均
+        // 惰性/会话级，装配期零会话 ⇒ 不进硬账）。
+        (
+            format!(
+                "{xdrive_endpoints} xdrive x {XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES}B \
+                 WAL session buffers"
+            ),
+            xdrive_endpoints * XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES,
+        ),
+        (
+            format!(
+                "per xdrive h2 conn {XDRIVE_H2_SEND_BUF_PER_CONN_BYTES}B send buf (hyper default)"
+            ),
+            XDRIVE_H2_SEND_BUF_PER_CONN_BYTES,
+        ),
+        // bd 55yh7 B4（R14）：masque 单隧道 16MiB send_buf——per-单位上限面保留；
+        // 总额账面自 bd anygg G3 起按端点开关 × 余量口径**入硬账**（hard 栏
+        // "N masque tunnel h2 send_buf" 项），此处只留防回档登记。
         (
             format!("per masque tunnel {H2_MAX_SEND_BUF_PER_CONN_BYTES}B h2 send_buf cap"),
             H2_MAX_SEND_BUF_PER_CONN_BYTES,
@@ -484,11 +582,40 @@ pub fn budget_report_with(
                 ),
                 tuic_inbox_booked,
             ),
+            (
+                format!(
+                    "{xdrive_h3_conns} xdrive h3 conn receive window x \
+                     {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
+                ),
+                xdrive_windows_booked,
+            ),
+            (
+                format!(
+                    "{masque_tunnels} masque tunnel h2 send_buf x {H2_MAX_SEND_BUF_PER_CONN_BYTES}B"
+                ),
+                masque_send_buf_booked,
+            ),
         ],
         caps,
         degraded,
         violations,
     })
+}
+
+/// streamSettings 的 xdrive h3 派生位（Go `transport_internet.go:93-120` 的
+/// `xdriveH3`：`security` = tls（大小写不敏感）且 `tlsSettings.alpn` **恰为**
+/// `["h3"]`；bd yc54c G5 用它判 h3 分支的 quinn 连接窗账面）。与
+/// `xray_transport_xdrive::config` 的 `is_h3_alpn` 同一 Go 触发键——此处输入是
+/// `BuiltConfig` 的原始 stream_settings JSON（xray-conf lint 同款形态），不是
+/// dialer 的 security_json，故各持一份薄判定而非共享函数（输入形状不同）。
+fn xdrive_h3(ss: Option<&serde_json::Value>) -> bool {
+    let security = ss.and_then(|v| v.get("security")).and_then(|s| s.as_str());
+    security.is_some_and(|s| s.eq_ignore_ascii_case("tls"))
+        && ss
+            .and_then(|v| v.get("tlsSettings"))
+            .and_then(|t| t.get("alpn"))
+            .and_then(|a| a.as_array())
+            .is_some_and(|alpn| alpn.len() == 1 && alpn[0].as_str() == Some("h3"))
 }
 
 /// streamSettings 里 xdns 服务端 mask 的实例数（`finalmask.udp[{"type":"xdns"}]`）。
@@ -901,6 +1028,152 @@ mod tests {
         }
     }
 
+    // ── xdrive 入账（bd yc54c G5）─────────────────────────────────────────
+
+    /// xdrive 入站；`h3 = true` 带 `security=tls + alpn ["h3"]`（Go `xdriveH3`
+    /// 触发键 ⇒ quinn 连接窗账面），否则 h2/h1 分支（无窗口账面）。
+    fn xdrive_inbound(tag: &str, h3: bool) -> BuiltInbound {
+        let mut ss = serde_json::json!({
+            "network": "xdrive",
+            "xdriveSettings": { "service": "local", "remoteFolder": "/tmp/x" },
+        });
+        if h3 {
+            ss["security"] = serde_json::json!("tls");
+            ss["tlsSettings"] = serde_json::json!({"alpn": ["h3"]});
+        }
+        BuiltInbound {
+            entry: BuiltEntry { kind: "dokodemo-door".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            port: Some(443),
+            listen: Some("127.0.0.1".into()),
+            stream_settings_json: Some(ss),
+            sniffing_json: None,
+        }
+    }
+
+    fn xdrive_outbound(tag: &str, h3: bool) -> BuiltOutbound {
+        let mut ss = serde_json::json!({
+            "network": "xdrive",
+            "xdriveSettings": { "service": "local", "remoteFolder": "/tmp/x" },
+        });
+        if h3 {
+            ss["security"] = serde_json::json!("tls");
+            ss["tlsSettings"] = serde_json::json!({"alpn": ["h3"]});
+        }
+        BuiltOutbound {
+            entry: BuiltEntry { kind: "freedom".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            send_through: None,
+            stream_settings_json: Some(ss),
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }
+    }
+
+    /// 账本公式锚（bd yc54c G5）：WAL 会话缓冲 = (1 + 3×8) × 512KiB（实现侧
+    /// `params.rs` 缺省常量私有 ⇒ 钉公式与字面值，改实现缺省须两处同步）。
+    #[test]
+    fn xdrive_wal_buffer_formula_anchor() {
+        assert_eq!(XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES, (1 + 3 * 8) * 512 * 1024);
+        assert_eq!(XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES, 13_107_200, "25 × 512KiB 口径锚");
+        assert_eq!(XDRIVE_H2_SEND_BUF_PER_CONN_BYTES, 400 * 1024, "hyper 缺省 send buf 估档");
+    }
+
+    /// G5 验收：xdrive h3 连接窗**入硬账**（同 D-03 乘数口径）+ WAL/h2 面
+    /// 进 caps 栏；`--nocapture` 打印各档位 xdrive 入账值（账面对照）。
+    #[test]
+    fn xdrive_ledger_enters_hard_account_and_tiers() {
+        for (available, tier_conns) in
+            [(256 * MIB, 13usize), (512 * MIB, 32), (1024 * MIB, 64), (16 * 1024 * MIB, 170)]
+        {
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
+            let mut built = xray_conf::BuiltConfig::default();
+            built.inbounds.push(xdrive_inbound("xd-in", true));
+            built.outbounds.push(xdrive_outbound("xd-out", true));
+            let report = budget_report_with(&built, plan).expect("report");
+            // 并发能力不回退（本次改动不得动 max_conns）。
+            assert_eq!(report.max_conns, tier_conns, "{available}B 档并发能力被改动了");
+
+            let read = |pred: &dyn Fn(&str) -> bool| {
+                report.hard.iter().find(|(n, _)| pred(n)).map(|(_, b)| *b).unwrap_or(0)
+            };
+            let booked = read(&|n| n.contains("xdrive h3 conn receive window x"));
+            // 乘数口径与 QUIC 同构：min(并发上限, 扣除前序账面后的余量装得下条数)。
+            // 从报告自身反算（不写字面量）：本配置无 quic/xdns/tuic 端点 ⇒
+            // 余量 = 预算 − 固定面 − 常态连接面。
+            let fixed = read(&|n| n.starts_with("fixed floor"));
+            let conns_pipe = read(&|n| n.contains("conns x") && n.contains("pipe"));
+            let explicit = read(&|n| n == "explicit udp sockets");
+            let fit = report.budget.saturating_sub(fixed + explicit + conns_pipe)
+                / QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES;
+            let windows = report.max_conns.min(fit.max(1));
+            println!(
+                "tier {} budget {}B max_conns {} xdrive h3 window booked {} conns = {}B; \
+                 caps WAL face 2 x {}B = {}B",
+                report.tier,
+                report.budget,
+                report.max_conns,
+                windows,
+                booked,
+                XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES,
+                2 * XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES,
+            );
+            assert_eq!(
+                booked,
+                windows * QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES,
+                "{} 档 xdrive h3 窗账面必须是 min(并发上限, 余量装得下条数) × 32MiB",
+                report.tier
+            );
+            assert_eq!(
+                report.hard.iter().map(|(_, b)| b).sum::<usize>(),
+                report.projected,
+                "硬账逐项之和必须等于合计（xdrive 窗在账内）"
+            );
+            assert!(report.is_ok(), "瞬时面超预算不得拒启：{:?}", report.violations);
+            // WAL 会话面 + h2 send buf 面必须进 caps 栏（上限面可见）。
+            assert!(
+                report.caps.iter().any(|(n, _)| n.contains("xdrive x") && n.contains("WAL")),
+                "WAL 会话面必须进 caps：{:?}",
+                report.caps
+            );
+            assert!(
+                report
+                    .caps
+                    .iter()
+                    .any(|(n, _)| n.contains("xdrive h2 conn") && n.contains("send buf")),
+                "h2 send buf 面必须进 caps：{:?}",
+                report.caps
+            );
+            let over = report.projected > report.budget;
+            let warned = report.degraded.as_deref().is_some_and(|d| d.contains("xdrive h3 接收窗"));
+            assert_eq!(
+                warned, over,
+                "{} 档：xdrive 窗超预算（{over}）与告警存在（{warned}）必须一一对应：{:?}",
+                report.tier, report.degraded
+            );
+        }
+    }
+
+    /// 非 h3 分支（h2/h1）：无连接窗账面（窗口账面只挂 h3 分支），WAL/h2 caps 面照常。
+    #[test]
+    fn xdrive_non_h3_has_no_window_ledger() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(xdrive_inbound("xd-in", false));
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        assert!(
+            !report.hard.iter().any(|(n, b)| n.contains("xdrive h3 conn receive window") && *b > 0),
+            "非 h3 分支不得记非零窗口账：{:?}",
+            report.hard
+        );
+        assert!(
+            report.caps.iter().any(|(n, _)| n.contains("WAL")),
+            "WAL 面照常进 caps：{:?}",
+            report.caps
+        );
+        assert!(report.is_ok(), "{:?}", report.violations);
+    }
+
     /// E4（security P2-2）：Tiny 档（40MiB）下 xdns frag 满表 41.2MiB 必须**进硬账
     /// 并 emit WARN**，且**不拒启**（用户裁决：预算不足不得拒启）。
     #[test]
@@ -1024,6 +1297,20 @@ mod tests {
         }
     }
 
+    /// masque 端点（bd anygg G3）：`network:"masque"` 即一条 CONNECT-IP 隧道面
+    /// （一体 inbound/outbound 与纯 transport 形态同形，预算只看 streamSettings）。
+    fn masque_outbound(tag: &str) -> BuiltOutbound {
+        BuiltOutbound {
+            entry: BuiltEntry { kind: "masque".into(), data: b"{}".to_vec() },
+            tag: tag.into(),
+            send_through: None,
+            stream_settings_json: Some(serde_json::json!({"network": "masque"})),
+            proxy_settings_json: None,
+            mux_json: None,
+            target_strategy: None,
+        }
+    }
+
     /// bd k5pqt：TUIC dgram 信箱字节上界入账——瞬态面、余量口径（乘数 =
     /// 预算余量装得下的条数，不是档位/出站上限），装不下只 WARN 不拒启。
     #[test]
@@ -1071,6 +1358,102 @@ mod tests {
             report.degraded.as_ref().is_some_and(|d| d.contains("TUIC")),
             "装不下必须 WARN 点名 TUIC 面：{:?}",
             report.degraded
+        );
+    }
+
+    /// masque 隧道 h2 send_buf 入账（bd anygg G3 / 规划 R14 B4.6）：瞬态面、
+    /// 余量口径（乘数 = 预算余量装得下的满载隧道数，上界 = 运行期连接数上限；
+    /// 端点数只作开关），装不下只 WARN 不拒启。
+    #[test]
+    fn masque_send_buf_ledger_books_margin_count() {
+        const SEND_BUF: usize = H2_MAX_SEND_BUF_PER_CONN_BYTES;
+        // 单一事实源：masque `h2.rs` 消费 `xray_transport::h2_window::
+        // H2_MAX_SEND_BUF_SIZE`（与 splithttp 同一 re-export 符号）——登记簿
+        // 换值必须同步重审 masque 行为与 splithttp 两侧（改值即红）。
+        assert_eq!(
+            SEND_BUF,
+            xray_transport::h2_window::H2_MAX_SEND_BUF_SIZE,
+            "masque 隧道 h2 send_buf 账面与本登记簿不一致（bd anygg G3）"
+        );
+        assert_eq!(SEND_BUF, 16 * 1024 * 1024, "16MiB/隧道口径锚（规划 R14）");
+
+        // 单端点（1 个 masque outbound）：开关打开 ⇒ 记账 ≥ 1 条满载隧道；
+        // 乘数同 QUIC/xdrive 口径 = 运行期连接数上限 ∩ 余量装得下的条数
+        // （D-03：端点是开关不是乘数——一条连接一条隧道账面）；装得下 ⇒ 无 masque WARN。
+        let mut built = xray_conf::BuiltConfig::default();
+        built.outbounds.push(masque_outbound("masque-out"));
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        let booked = report
+            .hard
+            .iter()
+            .find(|(name, _)| name.contains("masque tunnel h2 send_buf"))
+            .map_or(0, |(_, bytes)| *bytes);
+        let tunnels = booked / SEND_BUF;
+        assert_eq!(booked % SEND_BUF, 0, "账面必须是 16MiB 整数倍");
+        assert!(
+            (1..=report.max_conns).contains(&tunnels),
+            "乘数 ∈ [1, 运行期连接数上限]（记账口径 max(1)，上界 max_conns）：tunnels={tunnels}"
+        );
+        assert_eq!(
+            report.hard.iter().map(|(_, b)| b).sum::<usize>(),
+            report.projected,
+            "hard 栏合计必须等于 projected"
+        );
+        assert!(
+            report.summary().contains("masque tunnel h2 send_buf"),
+            "启动 summary 必须可见 masque 项（运维可核）：{}",
+            report.summary()
+        );
+        assert!(
+            !report.degraded.as_ref().is_some_and(|d| d.contains("masque")),
+            "装得下不得产生 masque WARN：{:?}",
+            report.degraded
+        );
+
+        // 0 端点 ⇒ 记账 0（开关关闭；hard 栏按既有形态全项列出，0 值即未记账，
+        // 同 `"0 QUIC conn receive window"` 先例）。
+        let built = xray_conf::BuiltConfig::default();
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        let booked = report
+            .hard
+            .iter()
+            .find(|(name, _)| name.contains("masque tunnel h2 send_buf"))
+            .map_or(0, |(_, bytes)| *bytes);
+        assert_eq!(booked, 0, "无 masque 端点不得记账：{booked}");
+
+        // 12 端点 + 4MiB pipe（fixture 先例：8 conns × 8MB 双向 = 64MB steady 面）
+        // ⇒ masque 余量只剩 ~1 条 ⇒ projected 超预算 ⇒ WARN 点名 masque 面；
+        // 乘数封顶在余量装得下的条数（≤ 档位连接上限）。
+        let mut built = built_with_policy(r#"{"levels": {"0": {"bufferSize": 4096}}}"#);
+        for i in 0..12 {
+            built.outbounds.push(masque_outbound(&format!("masque-out-{i}")));
+        }
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        let booked = report
+            .hard
+            .iter()
+            .find(|(name, _)| name.contains("masque tunnel h2 send_buf"))
+            .map_or(0, |(_, bytes)| *bytes);
+        assert_eq!(booked % SEND_BUF, 0, "账面必须是 16MiB 整数倍");
+        assert!(
+            booked / SEND_BUF <= report.max_conns,
+            "乘数上界 = 运行期连接数上限（每连接一条隧道，R15）"
+        );
+        assert!(
+            report.projected > report.budget,
+            "测试前提：12 端点撑爆瞬时面（projected {} > budget {}）",
+            report.projected,
+            report.budget
+        );
+        assert!(
+            report.degraded.as_ref().is_some_and(|d| d.contains("masque")),
+            "装不下必须 WARN 点名 masque 面（只 WARN 不拒启）：{:?}",
+            report.degraded
+        );
+        assert!(
+            report.is_ok(),
+            "瞬时面超预算只 WARN，不得拒启（violations 必须为空）：{:?}",
+            report.violations
         );
     }
 
@@ -1410,9 +1793,10 @@ mod tests {
         );
     }
 
-    /// h2 发送缓冲（真缓冲）与 splithttp 客户端/服务端实现**同一常量**
-    /// （bd sgdwm/PM-05 入簿）；SETTINGS 流窗/连窗（信用计数器）一并钉住防回档
-    /// ——非内存账面，不计入预算门算式。
+    /// h2 发送缓冲（真缓冲）与 splithttp 客户端/服务端实现**逐端同一常量**
+    /// （客户端 16MiB；服务端按内存档位 16/32MiB——映射唯一源见
+    /// [`xray_transport::h2_window::h2_server_max_send_buf_for`]；bd sgdwm/PM-05 入簿）；
+    /// SETTINGS 流窗/连窗（信用计数器）一并钉住防回档——非内存账面，不计入预算门算式。
     #[test]
     fn h2_send_buf_and_flow_window_ledger_matches_impl() {
         use xray_transport_splithttp::transport as st;
@@ -1420,11 +1804,6 @@ mod tests {
             H2_MAX_SEND_BUF_PER_CONN_BYTES,
             st::H2_MAX_SEND_BUF_SIZE,
             "h2 客户端每连接发送缓冲与本登记簿不一致（bd sgdwm/PM-05）"
-        );
-        assert_eq!(
-            st::H2_SERVER_MAX_SEND_BUF_SIZE,
-            st::H2_MAX_SEND_BUF_SIZE,
-            "服务端 h2 发送缓冲必须与客户端同值（16MiB）"
         );
         assert_eq!(
             SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES,
@@ -1447,6 +1826,60 @@ mod tests {
             "服务端连窗 32MiB"
         );
         assert_eq!(H2_MAX_SEND_BUF_PER_CONN_BYTES, 16 * 1024 * 1024);
+    }
+
+    /// 服务端 h2 send_buf 按**内存档位**取值：tiny 16MiB（维持改动前现状）、
+    /// small/medium/large 32MiB（对齐客户端收窗 ⇒ 下载在飞上限翻倍；32MiB 是上限非预约，
+    /// 真实在途 = BDP）。四档全断言，禁写字面量散落（期望值由常量派生）。
+    #[test]
+    fn h2_server_send_buf_follows_memory_tier() {
+        use xray_frame::budget::plan::MemoryTier;
+        let (tiny, rest) = (
+            xray_transport::h2_window::H2_SERVER_SEND_BUF_TINY_TIER,
+            xray_transport::h2_window::H2_SERVER_MAX_SEND_BUF_SIZE,
+        );
+        // 两档值单调（放开档 > tiny 档）。
+        assert!(
+            xray_transport::h2_window::h2_server_max_send_buf_for(MemoryTier::Small)
+                > xray_transport::h2_window::h2_server_max_send_buf_for(MemoryTier::Tiny),
+            "放开档 send_buf 必须大于 tiny 档"
+        );
+        for (tier, expect) in [
+            (MemoryTier::Tiny, tiny),
+            (MemoryTier::Small, rest),
+            (MemoryTier::Medium, rest),
+            (MemoryTier::Large, rest),
+        ] {
+            assert_eq!(
+                xray_transport::h2_window::h2_server_max_send_buf_for(tier),
+                expect,
+                "{} 档 send_buf",
+                tier.as_str()
+            );
+            // splithttp 侧（xray-transport-splithttp re-export）同一函数同一值。
+            assert_eq!(
+                xray_transport_splithttp::transport::h2_server_max_send_buf_for(tier),
+                expect,
+                "{} 档 send_buf：transport re-export 与唯一映射源不一致",
+                tier.as_str()
+            );
+            // caps 账面 = 档位 send_buf + 空闲连接池余量（打印值随档位变）。
+            assert_eq!(
+                xhttp_conn_booked_bytes(tier),
+                expect + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES,
+                "{} 档 xhttp 每连接账面",
+                tier.as_str()
+            );
+        }
+        // 服务端不得低于客户端：下载在飞上限 = min(两端)，低于客户端即自钉。
+        for tier in [MemoryTier::Tiny, MemoryTier::Small, MemoryTier::Medium, MemoryTier::Large] {
+            assert!(
+                xray_transport::h2_window::h2_server_max_send_buf_for(tier)
+                    >= H2_MAX_SEND_BUF_PER_CONN_BYTES,
+                "{} 档服务端 send_buf 低于客户端 16MiB",
+                tier.as_str()
+            );
+        }
     }
 
     /// ws（tungstenite）每连接缓冲与实现**同一构造**（bd sgdwm：读+写 = 64KiB，

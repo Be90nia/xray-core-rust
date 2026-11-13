@@ -245,7 +245,7 @@ impl HubListener {
                     // 零设置时收窗 1MB/1MB + 每流 send 400KB 全量默认钉（R3 复核
                     // caller 全表：明面 listener 与 TLS 路径同构，只差 ALPN）。
                     // bd xzg3x：明文/unix 无握手 → 无 RTT 信号，取静态保底
-                    // （`SERVER_FALLBACK` = 下方原硬编码 16MB/16MB/32MB，逐值不变）；
+                    // （`server_fallback` = 16MB 流窗 / 32MB 连窗 / 档位 send_buf 16-32MiB）；
                     // bench env 覆盖（`XRAY_H2_*_OVERRIDE_BYTES`）与 serve_http_conn 同源生效。
                     let win = crate::flow_window::server_windows();
                     builder.http1().max_buf_size(max_head_bytes);
@@ -277,13 +277,18 @@ impl HubListener {
 #[cfg(test)]
 mod tests {
     /// bd xzg3x：明文/unix `serve` 取窗 = 服务端静态保底（无握手 → 无 RTT 信号，
-    /// 不探针）；未设 bench env 时逐值等于修前硬编码。削弱任一值必红。
+    /// 不探针）；send_buf 按内存档位（tiny/small 16MiB、medium/large 32MiB，逐档值
+    /// 由 `flow_window` 单测四档断言钉住）。削弱窗值必红。
     #[test]
     fn plaintext_serve_windows_equal_pre_fix_static() {
         let win = crate::flow_window::server_windows();
         assert_eq!(win.stream_window, 16 * 1024 * 1024, "修前 initial_stream_window_size");
         assert_eq!(win.connection_window, 32 * 1024 * 1024, "修前 initial_connection_window_size");
-        assert_eq!(win.max_send_buf, 16 * 1024 * 1024, "修前 max_send_buf_size");
-        assert_eq!(win, crate::flow_window::SERVER_FALLBACK);
+        assert_eq!(
+            win,
+            crate::flow_window::server_fallback(
+                xray_frame::budget::plan::MemoryPlan::cached().tier
+            )
+        );
     }
 }

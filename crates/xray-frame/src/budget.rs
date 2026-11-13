@@ -254,11 +254,14 @@ pub const SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// ≤ 本上界驻留至下次连接复用——仍是进程级常量。
 pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 128 * 1500;
 
-/// h2 每连接发送缓冲（**真缓冲**，连接级；**已落地**：splithttp
-/// `H2_MAX_SEND_BUF_SIZE` / `H2_SERVER_MAX_SEND_BUF_SIZE` = 16MiB，交叉断言钉住）。
+/// h2 每连接发送缓冲（**真缓冲**，连接级；**已落地**：splithttp 客户端
+/// `H2_MAX_SEND_BUF_SIZE` = 16MiB；服务端 `H2_SERVER_MAX_SEND_BUF_SIZE` = 32MiB 为
+/// **上限**，实际按内存档位取 16MiB（tiny）/ 32MiB（small/medium/large）——
+/// 映射唯一源 `xray_transport::h2_window::h2_server_max_send_buf_for`，交叉断言钉住）。
 ///
 /// 与 SETTINGS 流窗/连窗（信用计数器，零预分配）不同——本值是 hyper 真会堆积的
-/// 发送缓冲 ⇒ 每条满载 splithttp 连接最多 16MiB。bd sgdwm 入簿（PM-05）。
+/// 发送缓冲 ⇒ 每条满载 splithttp 连接最多 16MiB（客户端）/ 16 或 32MiB（服务端）。
+/// bd sgdwm 入簿（PM-05）。
 ///
 /// **记账归属（bd pyka7 / NEW-S2，两栏口径）**：hyper 只在背压时惰性分配，
 /// 装配期零连接 ⇒ 不进硬账；按「上限 ≠ 预约」进门的**上限面**（caps 栏 +
@@ -276,6 +279,25 @@ pub const SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
 /// splithttp **服务端** h2 SETTINGS 流窗（字节；服务端不得复用客户端 32MiB，
 /// bd rjzw2）。同上，非内存账面，只防回档。
 pub const SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
+
+/// xdrive **每会话** WAL 段缓冲账面（字节）= (1 + 3×并发缺省 8) × 段缺省 512KiB
+/// = **12.5MiB**（bd yc54c G5）。派生式（实现侧 `xray-transport-xdrive`
+/// `params.rs`/`wal.rs` 的缺省常量为私有 ⇒ 按实现代码口径登记，「仅登记不保证」，
+/// 改实现侧缺省须同步本式；交叉断言住账本公式锚 `memory_budget` tests）：
+/// - 写侧（每方向一个 writer）：累计 buf ≤ 1 段 + 在飞上传 ≤ `concurrency` × 1 段；
+/// - 读侧（对端方向一个 reader）：段投递 mpsc（容量 = `concurrency`）× 1 段
+///   + 批量取段暂存 ≤ `concurrency` × 1 段。
+///
+/// `segmentBytes`（上限 16MiB）/ `concurrency`（上限 256）可被配置放大 ⇒ 理论上界
+/// 远高于本档；与 xhttp 端点账面（`xray-core::memory_budget` 的
+/// `xhttp_conn_booked_bytes`）同口径：按**缺省档**登记，
+/// 上限面（caps 栏）按端点数可见，不进硬账（装配期零会话 ⇒ 真实占用 0）。
+pub const XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES: usize = (1 + 3 * 8) * 512 * 1024;
+
+/// xdrive **h2/h1** 每连接发送缓冲（字节）= hyper 缺省 400KiB（xdrive 的 hyper
+/// builder 未覆写 send buf——对照 splithttp 显式 16MiB，enc8x 战役口径）。
+/// 上限面（惰性分配，同 [`H2_MAX_SEND_BUF_PER_CONN_BYTES`] 口径），不进硬账。
+pub const XDRIVE_H2_SEND_BUF_PER_CONN_BYTES: usize = 400 * 1024;
 
 /// ws（tungstenite）每连接帧编解码缓冲账面 = 读 32KiB + 写 32KiB（**已落地**：
 /// `xray_transport_websocket::config::ws_config()`，交叉断言钉住）。
@@ -337,11 +359,6 @@ pub const MIN_VIABLE_CONCURRENCY: usize = 8;
 /// 总盘预留余量下限（整机 256MB 口径运维判据：256 − 系统 ~60 − 陪跑 ~40 −
 /// xray ~96 ≈ 60MB，票面判据取 ≥50MB）。上线由 PM 亲核实测 RSS，非代码强校验。
 pub const RESERVE_MARGIN_MIN_BYTES: usize = 50 * 1024 * 1024;
-
-/// xhttp（splithttp）单端点装配期账面 = 每连接 h2 发送缓冲 + 空闲连接池余量
-/// （预算门按配置的 xhttp listener/dialer 数 × 本值入算）。
-pub const SPLITHTTP_ENDPOINT_BOOKED_BYTES: usize = H2_MAX_SEND_BUF_PER_CONN_BYTES
-    + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES;
 
 /// 装配期**固定占用**下限（字节）：进程级池/缓存合计 + 每监听握手在途。
 ///

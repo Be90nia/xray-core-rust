@@ -18,9 +18,21 @@
 //!   也可能是高延迟链路的薄边缘。= 该优化没有可判定的适用范围，故整体删除（Go 侧 本无此机制：Go
 //!   xray 的 h2 发送缓冲恒为静态值，本轮对齐 Go）。
 //!
-//! 现状：`max_send_buf` 恒等于各端静态保底（16MiB）；流窗/连窗亦保持各端原静态值
-//! （32/32MB 客户端、16/32MB 服务端）——rjzw2 bench 实测缩流窗 ≤26MB 吞吐掉 14-31%
-//! （SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
+//! 现状：`max_send_buf` 恒等于各端静态保底（客户端 16MiB、服务端**按内存档位** 16/32MiB
+//! ——tiny 16MiB，small 起 32MiB，档位表见 `xray_transport::h2_window` 模块头）；流窗/连窗
+//! 亦保持各端原静态值（32/32MB 客户端、16/32MB 服务端）——rjzw2 bench 实测缩流窗 ≤26MB
+//! 吞吐掉 14-31%（SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
+//!
+//! ## 吞吐上限的 RTT 依赖（定量）
+//!
+//! 下载在飞上限 = min(服务端 send_buf, 客户端收窗 32 MiB) ⇒ tiny 16 MiB / 其余 32 MiB，
+//! 吞吐 = 在飞上限 ÷ 端到端 RTT（单位 MiB/s = 在飞上限 MiB ÷ RTT 秒；×1.049 ≈ MB/s）：
+//! - 16 MiB ÷ 0.45 s ≈ 35 MiB/s（≈37 MB/s；用户真机 xhttp+CDN 实测 31-37 MB/s 同档）
+//! - 16 MiB ÷ 0.29 s ≈ 55 MiB/s（历史 50-60 MB/s 档）
+//! - 32 MiB ÷ 0.45 s ≈ 71 MiB/s（small 起取值；**勿改按 RTT 自适应**，rjzw2 前科）
+//!
+//! 32MiB 是上限不是预约（hyper 惰性分配，真实在途 = BDP ≈ 吞吐 × RTT ≈ 30MB 全机），
+//! 故 512MB 档 96MiB 预算也成立。
 //!
 //! ## RTT 探针已删除（lf51l）
 //!
@@ -31,6 +43,8 @@
 //! 诊断 env 只保留 `XRAY_H2_FLOW_WINDOW_OVERRIDE_BYTES` /
 //! `XRAY_H2_SEND_BUF_OVERRIDE_BYTES`（强制流窗/send_buf，bench 扫曲线用）。
 
+use xray_frame::budget::plan::{MemoryPlan, MemoryTier};
+
 /// 客户端静态保底 = bd wz2b C2 + c9oc F-A 修前原静态值（32MB 流窗 / 32MB 连窗 /
 /// 16MiB send buf）——现在**恒为**客户端定窗结果，不再随 RTT 变。
 pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
@@ -39,14 +53,18 @@ pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
     max_send_buf: crate::transport::H2_MAX_SEND_BUF_SIZE,
 };
 
-/// 服务端静态保底 = 修前 `serve_http_conn` 原静态值（16MB 流窗 / 32MB 连窗 /
-/// 16MiB send buf）——**不得用客户端常量**：客户端流窗 32MB 会把服务端原静态 16MB
+/// 服务端静态保底 = 修前 `serve_http_conn` 原静态窗值（16MB 流窗 / 32MB 连窗）+ **按内存
+/// 档位**的服务端 send_buf（tiny 16MiB、small/medium/large 32MiB；映射唯一源 =
+/// [`crate::transport::h2_server_max_send_buf_for`]，档位表见 `h2_window` 模块头）。
+/// ——**不得用客户端流窗常量**：客户端流窗 32MB 会把服务端原静态 16MB
 /// 抬到 32MB（保底被偷改 → 「静态 vs 自适应」对比基线失效）。
-pub(crate) const SERVER_FALLBACK: H2Windows = H2Windows {
-    stream_window: crate::transport::H2_SERVER_INITIAL_STREAM_WINDOW,
-    connection_window: crate::transport::H2_SERVER_INITIAL_CONNECTION_WINDOW,
-    max_send_buf: crate::transport::H2_SERVER_MAX_SEND_BUF_SIZE,
-};
+pub(crate) fn server_fallback(tier: MemoryTier) -> H2Windows {
+    H2Windows {
+        stream_window: crate::transport::H2_SERVER_INITIAL_STREAM_WINDOW,
+        connection_window: crate::transport::H2_SERVER_INITIAL_CONNECTION_WINDOW,
+        max_send_buf: crate::transport::h2_server_max_send_buf_for(tier),
+    }
+}
 
 /// bench/诊断专用：强制流窗字节数（conn=2×、send=同值），进程级显式值驱动，
 /// 未设置零影响。bench 用它扫「窗-吞吐」曲线。
@@ -69,9 +87,9 @@ pub(crate) fn client_windows() -> H2Windows {
     windows_for("client", CLIENT_FALLBACK)
 }
 
-/// 服务端 h2 窗组（恒 = [`SERVER_FALLBACK`]，诊断 env 可覆盖）。
+/// 服务端 h2 窗组（send_buf 按**进程档位**取值，诊断 env 可覆盖）。
 pub(crate) fn server_windows() -> H2Windows {
-    windows_for("server", SERVER_FALLBACK)
+    windows_for("server", server_fallback(MemoryPlan::cached().tier))
 }
 
 /// 定窗 + 定窗日志（唯一实现点；客户端/服务端共用，仅保底基不同）。
@@ -135,43 +153,57 @@ mod tests {
     }
 
     #[test]
-    fn server_fallback_equals_pre_rjzw2_static() {
-        // 服务端保底 = 修前 serve_http_conn 原静态（16MB 流窗，非客户端 32MB）。
-        assert_eq!(SERVER_FALLBACK.stream_window, 16 * 1024 * 1024);
-        assert_eq!(SERVER_FALLBACK.connection_window, 32 * 1024 * 1024);
-        assert_eq!(SERVER_FALLBACK.max_send_buf, 16 * 1024 * 1024);
-        assert_eq!(server_windows(), SERVER_FALLBACK);
-        assert_ne!(
-            SERVER_FALLBACK.stream_window, CLIENT_FALLBACK.stream_window,
-            "服务端保底不得用客户端流窗常量（保底被偷改 → 对比基线失效）"
+    fn server_fallback_is_static_per_tier() {
+        // 窗值固定；send_buf 按档位（tiny 16MiB；small/medium/large 32MiB）。
+        let (tiny, rest) = (
+            crate::transport::H2_SERVER_SEND_BUF_TINY_TIER,
+            crate::transport::H2_SERVER_MAX_SEND_BUF_SIZE,
         );
+        for (tier, send_buf) in [
+            (MemoryTier::Tiny, tiny),
+            (MemoryTier::Small, rest),
+            (MemoryTier::Medium, rest),
+            (MemoryTier::Large, rest),
+        ] {
+            let w = server_fallback(tier);
+            assert_eq!(w.stream_window, 16 * 1024 * 1024, "{} 流窗（修前原静态）", tier.as_str());
+            assert_eq!(w.connection_window, 32 * 1024 * 1024, "{} 连窗", tier.as_str());
+            assert_eq!(w.max_send_buf, send_buf, "{} send buf", tier.as_str());
+            assert_ne!(
+                w.stream_window, CLIENT_FALLBACK.stream_window,
+                "服务端保底不得用客户端流窗常量（保底被偷改 → 对比基线失效）"
+            );
+        }
+        // 生产入口 = 进程档位对应保底（env 未设时逐值相等）。
+        assert_eq!(server_windows(), server_fallback(MemoryPlan::cached().tier));
     }
 
     #[test]
     fn overrides_apply_flow_then_send() {
         // 覆盖应用纯函数（服务端保底基；hub 明文路径 = server_windows() 同源）。
-        let mut w = SERVER_FALLBACK;
+        let base = server_fallback(MemoryTier::Large);
+        let mut w = base;
         apply_overrides(&mut w, Some(4 * 1024 * 1024), None);
         assert_eq!(w.stream_window, 4 * 1024 * 1024);
         assert_eq!(w.connection_window, 8 * 1024 * 1024, "连窗 = 2× 流窗");
         assert_eq!(w.max_send_buf, 4 * 1024 * 1024);
 
         // send_buf 单覆盖不动流窗。
-        let mut w = SERVER_FALLBACK;
+        let mut w = base;
         apply_overrides(&mut w, None, Some(6 * 1024 * 1024));
-        assert_eq!(w.stream_window, SERVER_FALLBACK.stream_window);
-        assert_eq!(w.connection_window, SERVER_FALLBACK.connection_window);
+        assert_eq!(w.stream_window, base.stream_window);
+        assert_eq!(w.connection_window, base.connection_window);
         assert_eq!(w.max_send_buf, 6 * 1024 * 1024);
 
         // 流窗整体覆盖优先于 send_buf 单覆盖。
-        let mut w = SERVER_FALLBACK;
+        let mut w = base;
         apply_overrides(&mut w, Some(2 * 1024 * 1024), Some(6 * 1024 * 1024));
         assert_eq!(w.max_send_buf, 2 * 1024 * 1024);
 
         // 两者皆未设置 = 原样（逐值等于保底）。
-        let mut w = SERVER_FALLBACK;
+        let mut w = base;
         apply_overrides(&mut w, None, None);
-        assert_eq!(w, SERVER_FALLBACK);
+        assert_eq!(w, base);
     }
 
     #[test]
