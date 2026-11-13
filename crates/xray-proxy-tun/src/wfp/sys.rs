@@ -119,14 +119,7 @@ fn install_specs(specs: &[super::spec::FilterSpec]) -> Result<LeakFilterGuard, S
     // SAFETY：engine 有效。
     check(unsafe { wfp::FwpmTransactionBegin0(engine, 0) }, "FwpmTransactionBegin0")?;
 
-    let result = (|| {
-        let sublayer = new_guid();
-        add_sublayer(engine, sublayer)?;
-        for spec in specs {
-            add_filter(engine, sublayer, spec)?;
-        }
-        Ok(())
-    })();
+    let result = add_specs(engine, specs);
 
     match result {
         Ok(()) => {
@@ -141,6 +134,17 @@ fn install_specs(specs: &[super::spec::FilterSpec]) -> Result<LeakFilterGuard, S
             Err(e)
         },
     }
+}
+
+/// 往事务里加一个子层 + 全部过滤器（`install_specs` 与真机校验测试共用同一序列，
+/// 免得测试校验的不是生产实际发的调用）。
+fn add_specs(engine: HANDLE, specs: &[super::spec::FilterSpec]) -> Result<(), String> {
+    let sublayer = new_guid();
+    add_sublayer(engine, sublayer)?;
+    for spec in specs {
+        add_filter(engine, sublayer, spec)?;
+    }
+    Ok(())
 }
 
 /// 新建子层（Go :260-268）。
@@ -520,5 +524,106 @@ mod tests {
             (40, 24),
             "FWPM_FILTER_CONDITION0"
         );
+    }
+}
+
+/// 让 **WFP 内核自己**校验过滤器（对应 Go `TestLeakFiltersAccepted`，
+/// `tun_windows_wfp_test.go:105-150`）。
+///
+/// [`super::spec`] 的 `constants_match_go` 只能证明「数字对数字」；层 GUID、条件与层的
+/// 组合、权重类型是否被内核接受，只有 `FwpmFilterAdd0` 说了算。做法同 Go：开引擎 → 开
+/// 事务 → 逐条加进去（内核在此真校验）→ **abort 事务**（系统零改动）→ 关引擎。
+///
+/// 添加过滤器需要提权，引擎打不开时（未提权 / BFE 未运行）打印原因并 skip，
+/// **不 fail**；`cargo test -p xray-proxy-tun -- --nocapture` 可看到原因。
+#[cfg(all(test, target_os = "windows", target_pointer_width = "64"))]
+mod live_tests {
+    use super::{
+        LeakFilterGuard, add_specs, check, current_exe_app_id, dns_client_security_descriptor,
+        interface_luid, open_engine, wfp,
+    };
+    use crate::wfp::{
+        leak,
+        spec::{FilterSpec, LeakFilterInput, leak_filter_specs},
+    };
+
+    /// 写一行到 stdout。不用 `println!`：crate 级 `#![deny(warnings)]` 让
+    /// `clippy::print_stdout` 生效；写失败在测试进程里无处上报，忽略即可。
+    fn say(msg: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), "{msg}");
+    }
+
+    /// Go `skipUnlessElevated` 的 Rust 形态：环境不具备（未提权 / BFE 未运行）时打印
+    /// 原因并放弃，不 fail。`cargo test -- --nocapture` 可看到原因。
+    fn skip(reason: &str) {
+        say(&format!(
+            "SKIP leak_filters_are_accepted_by_wfp: {reason} —— WFP 写事务需要管理员权限，\
+             且 Base Filtering Engine 服务在运行"
+        ));
+    }
+
+    #[test]
+    fn leak_filters_are_accepted_by_wfp() {
+        let engine = match open_engine() {
+            Ok(engine) => engine,
+            Err(e) => return skip(&e),
+        };
+        // guard 先建：后面任何 panic/skip 仍会关引擎（动态会话，内核随之清空）。
+        let guard = LeakFilterGuard { engine };
+
+        // 环境无关的准备先做完：即使非提权 skip，LUID / AppID / 安全描述符这三处 FFI
+        // 与规格组装也一并被验证到（否则它们在这类机器上永远跑不到）。
+        // 回环接口恒存在，同 Go 用它当 TUN 的 LUID 占位。
+        let tun_luid = interface_luid(1).expect("loopback interface index 1 → LUID");
+        let app_id = current_exe_app_id().expect("本进程 AppID");
+        let dns_sd = dns_client_security_descriptor().expect("DNS Client 安全描述符");
+
+        let specs_for = |values: &[&str], route4, route6| {
+            let values: Vec<String> = values.iter().map(|v| (*v).to_string()).collect();
+            let block =
+                leak::new_leak_filters(&leak::expand(&values).expect("合法值"), route4, route6);
+            let dns_client_sd = if block.iter().any(|leak| leak.name == "windnsclient") {
+                Some(dns_sd.clone())
+            } else {
+                None
+            };
+            leak_filter_specs(&LeakFilterInput {
+                tun_luid,
+                app_id: app_id.clone(),
+                block,
+                dns_client_sd,
+            })
+        };
+
+        // 空 block（只剩 Permit 过滤器）/ `dns` 展开（含 windnsclient 服务族）/
+        // 全量 + 指定端口；每族一个独立子层（Go 同）。
+        let cases: [(&[&str], bool, bool); 3] = [
+            (&[], false, false),
+            (&["dns", "misconfigtun"], true, false),
+            (&["tcp/853", "all", "udp/1000-2000"], true, true),
+        ];
+        let cases: Vec<(&[&str], Vec<FilterSpec>)> = cases
+            .iter()
+            .map(|(values, route4, route6)| (*values, specs_for(values, *route4, *route6)))
+            .collect();
+
+        // 写事务要提权才开得起来——实测非管理员的 FwpmEngineOpen0 成功而这里返回
+        // ERROR_ACCESS_DENIED，故两步都要按 Go `skipUnlessElevated` 处理。
+        if let Err(e) =
+            check(unsafe { wfp::FwpmTransactionBegin0(engine, 0) }, "FwpmTransactionBegin0")
+        {
+            return skip(&e);
+        }
+
+        for (values, specs) in &cases {
+            add_specs(engine, specs).unwrap_or_else(|e| panic!("{values:?}: {e}"));
+            say(&format!("WFP 接受了 {values:?} 的 {} 条过滤器", specs.len()));
+        }
+
+        // 系统零改动：abort 而非 commit。
+        check(unsafe { wfp::FwpmTransactionAbort0(engine) }, "FwpmTransactionAbort0")
+            .expect("FwpmTransactionAbort0");
+        drop(guard);
     }
 }
