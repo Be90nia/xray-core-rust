@@ -40,6 +40,14 @@ use xray_transport::connection::Connection;
 
 use crate::fingerprint::Fingerprint;
 
+/// btls 读批窗口 = 单条 TLS record 的明文上限（16KiB）。
+///
+/// BoringSSL `SSL_read` 一次只交付**一条 record**：`SSL_read` → `SSL_peek` 取
+/// `min(pending_app_data, num)`，`ssl_read_impl` 仅在 pending 空时才取下一 record
+/// （`ssl_lib.cc:923/957`）⇒ 窗口 ≥16KiB 即「一 record 一 poll_read」，再大零增益。
+/// 缺省 0 = 桥层池化 8KiB，会把每个满窗 record 劈成两次 poll（bd lj5z6）。
+pub(crate) const TLS_RECORD_READBUF: usize = 16 * 1024;
+
 // ============================================================
 // 指纹配置输出：connector + per-connection 参数
 // ============================================================
@@ -1650,6 +1658,14 @@ impl<S: Connection + Unpin> Connection for BtlsConn<S> {
         // 内层继续沿 Connection 链穿透（TcpConnection / HelloRewriteStream / Box）。
         let stream: &TokioSslStream<S> = self.stream.as_ref().get_ref();
         stream.get_ref().raw_tcp_clone()
+    }
+
+    fn tls_readbuf_size(&self) -> usize {
+        // bd lj5z6：给出「一 record 一 poll_read」所需的读窗口，由桥层
+        // （`bridge_link_with_stream_full`）据此建读缓冲。缺省 0 = 池化 8KiB ⇒
+        // 16KiB record 被劈成两次 poll，吞吐钉在 ≈8KiB/事件成本。见
+        // [`TLS_RECORD_READBUF`] 的 BoringSSL 语义依据。
+        TLS_RECORD_READBUF
     }
 }
 

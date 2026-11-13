@@ -177,3 +177,45 @@ async fn duplex_btls_512k_bulk_stress() {
     let payload: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
     run_duplex_bulk(sa.unwrap(), sb.unwrap(), &payload).await;
 }
+
+/// bd lj5z6：btls 读窗口必须覆盖一整条 TLS record（明文上限 16KiB）。
+///
+/// 窗口由 `Connection::tls_readbuf_size` 报给桥层建读器；缺省 0 = 池化 8KiB ⇒
+/// 每个满窗 record 被劈成两次 `poll_read`，吞吐钉在「8KiB / 单次事件成本」。
+/// BoringSSL `SSL_read` 不跨 record（`ssl_lib.cc` `SSL_peek` 只取
+/// `pending_app_data`）⇒ 16KiB 是恰好值，再大零增益。
+#[tokio::test]
+async fn btls_read_window_covers_one_full_record() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let (cert_der, key_der) = self_signed_der();
+    let sc = rustls_server_config(&cert_der, &key_der);
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let (server, client) = tokio::join!(
+        crate::utls::server(TestConn(a), Arc::new(sc)),
+        crate::btls_client::BtlsConn::connect(
+            TestConn(b),
+            "localhost",
+            Fingerprint::HelloChrome133,
+            None,
+            None, // 内存 duplex + 自签 server：跳过验证（本测试只看读批窗）
+        ),
+    );
+    let mut server = server.unwrap();
+    let mut client = client.unwrap();
+
+    let cap = client.tls_readbuf_size();
+    assert!(
+        cap >= 16 * 1024,
+        "btls 读窗口 {cap}B 不足单 record 明文上限 16KiB ⇒ 桥层会把每个 record 劈成两次 poll"
+    );
+
+    // 服务端单次 write_all(16KiB) 恰好一条满窗 record；客户端按报告窗口一次交付。
+    let payload: Vec<u8> = (0u8..=255).cycle().take(16 * 1024).collect();
+    let mut got = vec![0u8; cap];
+    let (wrote, read) = tokio::join!(server.write_all(&payload), client.read(&mut got));
+    wrote.unwrap();
+    let n = read.unwrap();
+    assert_eq!(n, 16 * 1024, "一条 16KiB record 必须一次交付（实收 {n}B）");
+    assert_eq!(&got[..n], &payload[..], "明文逐字节不变（读缓冲只改批形）");
+}

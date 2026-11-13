@@ -703,9 +703,10 @@ where
     // 省掉 AsyncRead → 池化 8KB 缓冲的一次全量 memcpy（Buffer::from_bytes_frozen）。
     // 必须在 split 前取；包装层（TLS/AEAD/vision）不转发即自动回退下方拷贝路径。
     let frozen = stream.frozen_reader();
-    // F3：rustls 客户端 TLS 流读缓冲放大（Connection::tls_readbuf_size，
-    // 缺省 0 = 池化 8KB 不变；btls SSL_read 单 record 零收益，vision/reality
-    // 包装层不转发即保持批边界语义）。
+    // F3：TLS 流读缓冲放大（`Connection::tls_readbuf_size`，缺省 0 = 池化 8KB 不变）。
+    // rustls 每次 recv 吃满内部缓冲、多 record 批量解密 ⇒ 64KB；btls `SSL_read`
+    // 不跨 record ⇒ 16KB 恰是「一 record 一 poll_read」（bd lj5z6）；vision 包装层
+    // 不转发即保持批边界语义。
     let tls_readbuf = stream.tls_readbuf_size();
     let (s_read_half, mut s_write) = tokio::io::split(stream);
     let mut s_read: Box<dyn Reader> = match (frozen, s_read_dup, tls_readbuf) {
