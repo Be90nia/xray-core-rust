@@ -847,6 +847,49 @@ fn self_signed_tls() -> (String, String, rustls::pki_types::CertificateDer<'stat
 /// 断言：上行 POST → dispatcher echo → 下行 GET body 双向可达。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
+    let (mut conn, listener) = hub_h2_echo_session(1024).await;
+
+    // 双向可达：上行 POST(seq) → upload_queue → ServerConn.reader → echo →
+    // ServerConn.writer → dl_tx → GET body。
+    conn.write_all(b"r2lq-echo-h2").await.expect("upload write");
+    let mut got = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut got))
+        .await
+        .expect("echo round-trip timeout (h2 server data path broken)")
+        .expect("download read");
+    assert_eq!(&got, b"r2lq-echo-h2");
+
+    let _ = listener.close();
+}
+
+/// bd n8b4e：服务端 `add_conn` 零跳（无 duplex + copy_large 桥）后的字节级契约——
+/// 1 MiB 全量经「POST → upload_queue → ServerConn.reader → echo →
+/// ServerConn.writer → GET body」逐字节往返。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packet_up_end_to_end_echoes_1mib_byte_exact() {
+    const MIB: usize = 1024 * 1024;
+    let (mut conn, listener) = hub_h2_echo_session(64 * 1024).await;
+
+    let payload: Vec<u8> = (0..MIB as u32).map(|i| (i % 251) as u8).collect();
+    conn.write_all(&payload).await.expect("upload write");
+    let mut got = vec![0u8; MIB];
+    tokio::time::timeout(Duration::from_secs(60), conn.read_exact(&mut got))
+        .await
+        .expect("1 MiB echo timeout (h2 server data path stalled)")
+        .expect("download read");
+    assert_eq!(got, payload, "1 MiB 往返必须逐字节一致");
+
+    let _ = listener.close();
+}
+
+/// hub h2 echo 端到端骨架（TLS + packet-up 生产入口）：echo handler → 服务端 →
+/// 客户端拨号，返回已建立的连接与 listener（调用方负责 `close()`）。
+async fn hub_h2_echo_session(
+    max_each_post_bytes: usize,
+) -> (
+    xray_transport_splithttp::dialer::PacketUpConn,
+    Box<dyn xray_transport::listener_registry::TransportListener>,
+) {
     use xray_transport::{
         dialer::StreamSettings, listener_registry::ConnHandler, sockopt::SocketOptions,
     };
@@ -929,31 +972,21 @@ async fn packet_up_end_to_end_tls_h2_via_serve_http_conn() {
         None,
     ));
 
-    let mut conn = tokio::time::timeout(
+    let conn = tokio::time::timeout(
         Duration::from_secs(15),
         dial_packet_up(
             xray_transport_splithttp::mux::wrap_xmux_client(client),
             None,
             format!("https://127.0.0.1:{}/", server_addr.port()),
             "r2lq-h2-echo-sess".into(),
-            1024,
+            max_each_post_bytes,
             RangeConfig::new(0, 0),
         ),
     )
     .await
     .expect("dial timeout (GET stream-down never established)")
     .expect("dial_packet_up");
-
-    // 双向可达：上行 POST(seq) → upload_queue → 桥 → echo → dl_tx → GET body。
-    conn.write_all(b"r2lq-echo-h2").await.expect("upload write");
-    let mut got = [0u8; 12];
-    tokio::time::timeout(Duration::from_secs(15), conn.read_exact(&mut got))
-        .await
-        .expect("echo round-trip timeout (h2 server data path broken)")
-        .expect("download read");
-    assert_eq!(&got, b"r2lq-echo-h2");
-
-    let _ = listener.close();
+    (conn, listener)
 }
 
 // ===== bd 43lut / biuu5：stream-up 明文 h1 流式上传拨号契约 =====

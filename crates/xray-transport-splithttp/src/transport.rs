@@ -25,7 +25,6 @@ use bytes::{Buf as _, Bytes};
 use http_body_util::BodyExt as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use xray_transport::{
-    connection::Connection,
     dialer::StreamSettings,
     fallback::fallback_to_dest,
     listener_registry::{ConnHandler, TransportListener},
@@ -42,9 +41,6 @@ use crate::{
 
 /// h1 请求头读取超时。对应 Go hub.go:570 `ReadHeaderTimeout: time.Second * 4`。
 const READ_HEADER_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// duplex bridge 缓冲。与 `hub::handler::DUPLEX_BUF` 对齐（64 KiB）。
-const DUPLEX_BUF: usize = 64 * 1024;
 
 /// serve 空闲兜底窗（bd lfeu：hyper h2 serve 对客户端 hard-close/静默对端
 /// 不退出——724cc20 ws serve_h2_reject 同族 N-1）。与 ws 的差异：serve_http_conn
@@ -1250,98 +1246,13 @@ fn build_context(
 
 /// `ConnHandler`（registry 的 `Arc<dyn Fn(Box<dyn Connection>)>`）→ `HubConnHandler`。
 ///
-/// `ServerConn` 的 box 字段非 `Sync`，不满足 `Connection: Sync` 约束，故沿用
-/// duplex bridge 模式：`tokio::io::duplex` 一端交 registry handler（`DuplexConn`），
-/// 另一端与 `ServerConn` 的 reader/writer 双向 copy。
+/// `ServerConn` 自身即 `Connection`（`Send + Sync + Unpin`，bd n8b4e）⇒ 直接交出去，
+/// 无 duplex 中转、无泵任务。
 struct ConnHandlerAdapter(ConnHandler);
 
 impl HubConnHandler for ConnHandlerAdapter {
     fn add_conn(&self, conn: ServerConn) {
-        let (client, server) = tokio::io::duplex(DUPLEX_BUF);
-        let remote = conn.remote_addr;
-        let local = conn.local_addr;
-        (self.0)(Box::new(DuplexConn { inner: client, remote: Some(remote), local: Some(local) }));
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "②豁免（bd kwevg · §3.5.6）：数据面逐包泵（坑约束⑫零改动红线）——duplex 双向 copy 桥任务（ServerConn ↔ registry handler）；随两端 EOF 自终，停机不拆在途泵，不迁托管口"
-        )]
-        tokio::spawn(async move {
-            let ServerConn { reader: mut up, writer: mut down, .. } = conn;
-            let (mut rd, mut wr) = tokio::io::split(server);
-            // 上行（客户端上传 → dispatcher 读）/ 下行（dispatcher 写 → HTTP 响应）。
-            // 显式 64KB 缓冲：tokio::io::copy 内部 DEFAULT_BUF_SIZE=8KB 会把 DATA
-            // 帧粒度钉死在 8KB，高 RTT 路径帧数放大 ~8x（对照 Go dispatcher
-            // MultiBuffer 合并写）。
-            let a = copy_large(&mut up, &mut wr);
-            let b = copy_large(&mut rd, &mut down);
-            let _ = tokio::join!(a, b);
-        });
-    }
-}
-
-/// 64KB 缓冲单向拷贝（替代 [`tokio::io::copy`] 的 8KB 内部缓冲）。
-/// 错误传播语义一致：Err 即终止该方向；调用方 `join!` 吞返回值（原语义）。
-async fn copy_large<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
-    r: &mut R,
-    w: &mut W,
-) -> std::io::Result<u64> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut buf = vec![0u8; DUPLEX_BUF];
-    let mut total = 0u64;
-    loop {
-        let n = r.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        w.write_all(&buf[..n]).await?;
-        total += n as u64;
-    }
-    w.flush().await?;
-    Ok(total)
-}
-
-/// duplex 半部，满足 `Connection: AsyncRead + AsyncWrite + Send + Sync + Unpin`。
-struct DuplexConn {
-    inner: tokio::io::DuplexStream,
-    remote: Option<SocketAddr>,
-    local: Option<SocketAddr>,
-}
-
-impl AsyncRead for DuplexConn {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for DuplexConn {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl Connection for DuplexConn {
-    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
-        Ok(self.remote)
-    }
-
-    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
-        Ok(self.local)
+        (self.0)(Box::new(conn));
     }
 }
 
@@ -1399,6 +1310,7 @@ mod tests {
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
     };
+    use xray_transport::connection::Connection;
 
     use super::*;
 

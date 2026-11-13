@@ -41,6 +41,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener as TokioTcpListener,
 };
+use xray_transport::connection::Connection;
 
 use crate::{
     config::Config,
@@ -51,6 +52,10 @@ use crate::{
 ///
 /// 对应 Go `splitConn`。dispatcher 通过 reader 读客户端上传数据（来自 UploadQueue），
 /// 通过 writer 写下行数据（转发到 HTTP GET response body）。
+///
+/// 直接实现 [`Connection`]（bd n8b4e）：两条管道即 dispatcher 的读写端，不再经
+/// `tokio::io::duplex` + 泵任务中转（原形态每 64 KiB 白付一次 read+write + 一次
+/// 任务唤醒）。
 ///
 /// `close_signal`：服务端 GET 断开（会话终结）时置位，ServerConn 的 poll_read
 /// 随即注入 EOF——对齐 Go hub.go:399 GET handler 退出时的 `conn.Close()`：
@@ -93,9 +98,9 @@ impl ServerConnCloseSignal {
 
 pub struct ServerConn {
     /// 上行数据 reader（UploadQueue → dispatcher）。
-    pub reader: Box<dyn AsyncRead + Unpin + Send>,
+    pub reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
     /// 下行数据 writer（dispatcher → HTTP response body）。
-    pub writer: Box<dyn AsyncWrite + Unpin + Send>,
+    pub writer: Box<dyn AsyncWrite + Unpin + Send + Sync>,
     /// 远端地址。
     pub remote_addr: SocketAddr,
     /// 本地地址。
@@ -132,6 +137,16 @@ impl AsyncWrite for ServerConn {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.writer).poll_shutdown(cx)
+    }
+}
+
+impl Connection for ServerConn {
+    fn remote_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(Some(self.remote_addr))
+    }
+
+    fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
+        Ok(Some(self.local_addr))
     }
 }
 

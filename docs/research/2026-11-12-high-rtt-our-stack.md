@@ -363,8 +363,8 @@ changes at runtime.」（`h2-0.4.20/CHANGELOG.md` 第 4 行）。
 | `crates/xray-transport-splithttp/src/hub/handler.rs:411-413` | 上行 `duplex(DUPLEX_BUF)`、下行 `duplex(DUPLEX_BUF)` |
 | `crates/xray-transport-splithttp/src/hub/dl_stream.rs:34` | `PoolStream::new(inner, super::handler::DUPLEX_BUF)` ⇒ **下行 body 的读块 = 64KiB** |
 | `crates/xray-transport-splithttp/src/pool_stream.rs:36` | `pub(crate) const UPLINK_CHUNK: usize = 64 * 1024;` |
-| `crates/xray-transport-splithttp/src/transport.rs:46-47` | `const DUPLEX_BUF: usize = 64 * 1024;`（`copy_large` 用的 64KiB 缓冲） |
-| `crates/xray-transport-splithttp/src/transport.rs:1268-1272` | 注释明写：「显式 64KB 缓冲：tokio::io::copy 内部 DEFAULT_BUF_SIZE=8KB 会把 DATA 帧粒度钉死在 8KB，高 RTT 路径帧数放大 ~8x」——**这条病已经治过了** |
+| `crates/xray-transport-splithttp/src/transport.rs:46-47` | `const DUPLEX_BUF: usize = 64 * 1024;`（`copy_large` 用的 64KiB 缓冲）——**bd n8b4e 后该常量与 `copy_large` 桥已删**（本行指针仅存历史） |
+| `crates/xray-transport-splithttp/src/transport.rs:1268-1272` | 注释明写：「显式 64KB 缓冲：tokio::io::copy 内部 DEFAULT_BUF_SIZE=8KB 会把 DATA 帧粒度钉死在 8KB，高 RTT 路径帧数放大 ~8x」——**这条病已经治过了**（bd n8b4e 后该 duplex 桥整段删除，帧粒度由 `hub/handler.rs` 的两条 64KiB 管道承接） |
 | `crates/xray-transport-splithttp/src/hub/handler.rs:464-467` | 注释明写：「读块 64 KiB：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在 4KB——高 RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，**是 xhttp 吞吐缺陷主因**」——**主因已按 64KiB 治过** |
 
 **对照 ss 路径的差异（为什么 ss 需要 `c9f51064` 而 xhttp 不需要）**：
@@ -759,7 +759,7 @@ at the Network Bottleneck」, *AICT 2019*（IEEE）— <https://web.cs.wpi.edu/~
 - `crates/xray-transport-splithttp/src/hub/handler.rs:56`（`DUPLEX_BUF = 64KiB`）/ `:464-467`（64KiB 读块治「帧粒度钉死 4KB」）
 - `crates/xray-transport-splithttp/src/hub/dl_stream.rs:34`（`PoolStream(64KiB)`）
 - `crates/xray-transport-splithttp/src/pool_stream.rs:36`（`UPLINK_CHUNK = 64KiB`）
-- `crates/xray-transport-splithttp/src/transport.rs:46-47` / `:1268-1272`（`copy_large` 64KiB + 8KB 病已治注释）
+- `crates/xray-transport-splithttp/src/transport.rs:46-47` / `:1268-1272`（`copy_large` 64KiB + 8KB 病已治注释；**bd n8b4e 已删该桥，指针仅存历史**）
 - `crates/xray-transport/src/bridge.rs:638-641`（字节闸口径）/ `:705-715`（读腿三选一）/ `:738-744`（闸实例化=每连接）
 - `crates/xray-frame/src/budget/plan.rs:58-61`（过订 3.3-21×）/ `:102-105`（4/32MiB 上下限）/ `:226`（闸值派生）/ `:457-460`（small 档 12MiB）
 - `crates/xray-transport-quic/src/congestion_swappable/quinn_bridge.rs:517-520`（**本仓 BbrSender 是桩**）
