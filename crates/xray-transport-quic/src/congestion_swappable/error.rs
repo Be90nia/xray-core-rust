@@ -15,6 +15,12 @@ pub enum CongestionError {
     /// 不支持的 BBR profile。
     #[error("unsupported BBR profile: {0}")]
     UnsupportedBbrProfile(String),
+
+    /// quicParams 翻译层参数非法——文本直通（Display = 原文），调用方
+    /// [`crate::congestion_swappable::apply_quic_params_cc`] 依赖它保证两侧
+    /// （splithttp/xdrive）错误消息逐字节不变。
+    #[error("{0}")]
+    InvalidParams(String),
 }
 
 /// 模块内统一 Result 别名。

@@ -1,5 +1,12 @@
 # Xray-core-rust CI 流水线
 
+# xdrive 覆盖登记（bd yc54c G1/G6）：传输互通冒烟走 interop.yml 的 extra 套件
+# （dist/interop_ci.py 的 EXTRA_PROTOS 含 xdrive——service=local 共享文件夹
+# rendezvous，mock 级零外网依赖；Go 基线不支持的方向由 runtime 探测自动跳过）。
+# 本文件不重复挂 xdrive 冒烟：全量二进制互通属 interop.yml 职责，在此重复挂 =
+# 双份 btls 全量构建成本。Windows 腿缺口见 crates/xray-transport-xdrive/src/
+# local.rs 的 fail-visible 登记（共享冲突重试路径零 CI 覆盖，仅真机可证）。
+
 name: CI
 
 on:

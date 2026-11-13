@@ -65,6 +65,38 @@ pub fn validate_xdrive(
         xray_transport_xdrive::Config::from_config_json(Some(xdrive_json))
             .map_err(|e| lint_err(kind, tag, &e.to_string()))?;
     }
+    // h3 硬错面（Go `transport_internet.go:266-275` StreamConfig.Build；bd yc54c G3）：
+    // h3 + google-drive 时 finalmask.udp 只允许 noise——其余 mask 会改写 QUIC 数据报
+    // 或需要能 undo 的对端（Go 注释原文语义）。Go 顺序：service 形状（XDRIVESettings
+    // Build，:223-227）→ h3 门（:266-275）→ validateXDrive 规则，此处同序。
+    if xdrive_h3_alpn(stream_settings) {
+        let drive = stream_settings
+            .and_then(|ss| ss.get("xdriveSettings"))
+            .and_then(|x| x.get("service"))
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s == "google-drive");
+        if drive {
+            if let Some(udp) = stream_settings
+                .and_then(|ss| ss.get("finalmask"))
+                .and_then(|fm| fm.get("udp"))
+                .and_then(|u| u.as_array())
+            {
+                for mask in udp {
+                    let ty = mask.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if !ty.eq_ignore_ascii_case("noise") {
+                        return Err(lint_err(
+                            kind,
+                            tag,
+                            &format!(
+                                "XDRIVE: over h3 to Google Drive the only \"udp\" mask that \
+                                 works is \"noise\", not \"{ty}\""
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     match kind {
         "outbound" => validate_outbound(kind, tag, settings, mux),
         "inbound" => validate_inbound(kind, tag, settings, ports),
@@ -184,6 +216,22 @@ fn vless_outbound_user(settings: Option<&serde_json::Value>) -> Option<&serde_js
     settings.get("address").and_then(|a| a.as_str()).is_some().then_some(settings)
 }
 
+/// streamSettings 的 xdrive h3 派生位（Go `transport_internet.go:93-120` 的
+/// `xdriveH3`：`security` = tls（大小写不敏感，switch 分支守卫）且
+/// `tlsSettings.alpn` **恰为** `["h3"]`——Go slices.Equal 单元素语义）。与
+/// `xray_transport_xdrive::config` 的 `is_h3_alpn` 同一 Go 触发键；此处输入是
+/// lint 层的原始 streamSettings JSON（dialer 侧吃的是 StreamSettings.security_json，
+/// 形状不同），故在本层薄判定一份。
+fn xdrive_h3_alpn(ss: Option<&serde_json::Value>) -> bool {
+    let security = ss.and_then(|v| v.get("security")).and_then(|s| s.as_str());
+    security.is_some_and(|s| s.eq_ignore_ascii_case("tls"))
+        && ss
+            .and_then(|v| v.get("tlsSettings"))
+            .and_then(|t| t.get("alpn"))
+            .and_then(|a| a.as_array())
+            .is_some_and(|alpn| alpn.len() == 1 && alpn[0].as_str() == Some("h3"))
+}
+
 fn lint_err(kind: &str, tag: &str, msg: &str) -> LintError {
     LintError::new(format!("{kind} '{tag}': {msg}"))
 }
@@ -243,6 +291,131 @@ mod tests {
             validate_xdrive("outbound", "ob", "vless", Some(&user), Some(&ss), Some(&mux), None)
                 .expect_err("s3 缺 s3 对象必须在配置装载期拒");
         assert!(err.to_string().contains(r#"needs an "s3" object"#), "{err}");
+    }
+
+    // ===== G3：h3+google-drive 的 finalmask.udp 硬错面（Go transport_internet.go:266-275）=====
+
+    #[test]
+    fn h3_drive_rejects_non_noise_udp_mask() {
+        let user = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC}));
+        let mux = mux_ok();
+        let ss = |alpn: serde_json::Value, service: &str, mask: serde_json::Value| {
+            json!({
+                "network": "xdrive",
+                "security": "tls",
+                "tlsSettings": {"alpn": alpn},
+                "xdriveSettings":
+                    {"service": service, "remoteFolder": "f", "secrets": ["a", "b", "c"]},
+                "finalmask": {"udp": [mask]},
+            })
+        };
+        // 反例：h3 + google-drive + xtcp → 拒，文案逐字对齐 Go :272。
+        let err = validate_xdrive(
+            "outbound",
+            "ob",
+            "vless",
+            Some(&user),
+            Some(&ss(json!(["h3"]), "google-drive", json!({"type": "xtcp"}))),
+            Some(&mux),
+            None,
+        )
+        .expect_err("h3+drive 非 noise mask 必须拒");
+        assert!(
+            err.to_string().contains(
+                "XDRIVE: over h3 to Google Drive the only \"udp\" mask that works is \
+                 \"noise\", not \"xtcp\""
+            ),
+            "{err}"
+        );
+        // 大小写：Go ToLower 归一后 != noise ⇒ "XTCP" 同拒，错误文案带原始拼写。
+        let err = validate_xdrive(
+            "outbound",
+            "ob",
+            "vless",
+            Some(&user),
+            Some(&ss(json!(["h3"]), "google-drive", json!({"type": "XTCP"}))),
+            Some(&mux),
+            None,
+        )
+        .expect_err("XTCP（大写）同拒");
+        assert!(err.to_string().contains("not \"XTCP\""), "{err}");
+        // mask 缺 type（Go 解码为 ""）同拒。
+        let err = validate_xdrive(
+            "outbound",
+            "ob",
+            "vless",
+            Some(&user),
+            Some(&ss(json!(["h3"]), "google-drive", json!({}))),
+            Some(&mux),
+            None,
+        )
+        .expect_err("缺 type 等于空串，同拒");
+        assert!(err.to_string().contains("not \""), "{err}");
+        // 正例：noise（含大小写变体）放行（Go ToLower == "noise"）。
+        for ok_mask in [json!({"type": "noise"}), json!({"type": "Noise"})] {
+            assert!(
+                validate_xdrive(
+                    "outbound",
+                    "ob",
+                    "vless",
+                    Some(&user),
+                    Some(&ss(json!(["h3"]), "google-drive", ok_mask)),
+                    Some(&mux),
+                    None,
+                )
+                .is_ok(),
+                "noise 变体必须放行"
+            );
+        }
+        // 非 h3 ALPN（Go slices.Equal 恰为 ["h3"]；["h2","h3"] 不触发）。
+        assert!(
+            validate_xdrive(
+                "outbound",
+                "ob",
+                "vless",
+                Some(&user),
+                Some(&ss(json!(["h2", "h3"]), "google-drive", json!({"type": "xtcp"}))),
+                Some(&mux),
+                None,
+            )
+            .is_ok(),
+            "非 h3 ALPN 门不触发"
+        );
+        // 非 google-drive service（Go == "google-drive" 精确比较）→ 门不触发。
+        assert!(
+            validate_xdrive(
+                "outbound",
+                "ob",
+                "vless",
+                Some(&user),
+                Some(&ss(json!(["h3"]), "local", json!({"type": "xtcp"}))),
+                Some(&mux),
+                None,
+            )
+            .is_ok(),
+            "非 google-drive service 门不触发"
+        );
+        // 缺 finalmask（Go c.FinalMask == nil）→ 门不触发。
+        let no_mask = json!({
+            "network": "xdrive",
+            "security": "tls",
+            "tlsSettings": {"alpn": ["h3"]},
+            "xdriveSettings":
+                {"service": "google-drive", "remoteFolder": "f", "secrets": ["a", "b", "c"]},
+        });
+        assert!(
+            validate_xdrive(
+                "outbound",
+                "ob",
+                "vless",
+                Some(&user),
+                Some(&no_mask),
+                Some(&mux),
+                None
+            )
+            .is_ok(),
+            "缺 finalmask 门不触发"
+        );
     }
 
     // ===== 出站六规则矩阵（正/反） =====

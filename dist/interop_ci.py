@@ -4,11 +4,11 @@
 - suite rust:        Rust client<->Rust server, 6 协议 x 2 轮 = 12 测
 - suite go:          Go client -> Rust server (官方 xray-core release 二进制), 默认 12 协议
 - suite rust_to_go:  Rust client -> Go server 反向 (26zn 战役暴露盲区补缺), 默认 12 协议
-- suite extra:       新协议 (splithttp/grpc/reality + hysteria2/anytls/tuic/naive),
+- suite extra:       新协议 (splithttp/grpc/reality + hysteria2/anytls/tuic/naive + xdrive),
                      每协议 3 方向 (Rust<->Rust + Go->Rust + Rust->Go) = 3N 测;
                      Go 基线不支持的 proto 自动跳过 cross 方向, 仅 Rust<->Rust 保留.
 
-默认套件 = rust + go + rust_to_go + extra = 12+12+12+21 = 57 测 (Go 26.9.9 全支持口径;
+默认套件 = rust + go + rust_to_go + extra = 12+12+12+24 = 60 测 (Go 全支持口径;
 干跑按满矩阵列清单, 实跑由 runtime 探测门控自动跳过 Go 不支持的方向)
 (local 26.7.28 Go: hysteria2/anytls/tuic/naive 不支持, 实跑自动跳过相应 cross 方向)
 TLS 双向统一 pinnedPeerCertSha256 (bd 5x41: allowInsecure 配置期硬错), 证书由 openssl 现场生成.
@@ -35,6 +35,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 UUID = 'b831381d-6324-4d53-ad4f-8cda48b30811'
@@ -54,9 +55,15 @@ RUST_TO_GO_PROTOS = PROTOS + CROSS_X_PROTOS
 # 新协议套件：splithttp/grpc/reality 三件必交付，hysteria2/anytls/tuic/naive。
 # naive 已加回（bd 88vp 收口：xray-transport-naive inbound 已实现——rustls TLS +
 # h2 CONNECT + Basic auth + padding，naiveproxy 服务端语义；Go 基线无 naive，
-# 实跑 runtime 探测自动跳过 cross 方向，仅 Rust<->Rust）。
+# 实跑 runtime 探测自动跳过 cross 方向，仅 Rust<->Rust）。xdrive 已加回
+# （bd yc54c G1：service=local 共享文件夹 rendezvous，mock 级零外网依赖）。
 # 每个 proto 各跑 Rust↔Rust + Go→Rust + Rust→Go 三方向 = 3 测。
-EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic', 'naive']
+EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic', 'naive', 'xdrive']
+# xdrive 的 VLESS ENC 对（Go infra/conf/transport_test.go:513-519 的
+# xdriveEnc/xdriveDec；xdrive_go_interop.rs B6 三方向实测通过）。xdrive 硬要求
+# VLESS ENC + mux 开启（Go validateXDrive / 本仓 xray-conf lint 同款）。
+XDRIVE_ENC = 'mlkem768x25519plus.native.0rtt.XKbaq1BuzJKKKPxZbwgRpn-gYQbnhrYketgezASCL1I'
+XDRIVE_DEC = 'mlkem768x25519plus.native.600s.UKfUEMDdjlEnycTMBP0a08acky8vRRKSrM1MRnaYk3s'
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
@@ -201,6 +208,14 @@ def _ensure_reality_keys():
     return _REALITY_KEYS
 
 
+def _xdrive_folder(port):
+    """xdrive local 后端的共享文件夹（双端 rendezvous，服务端/客户端配置同目录）。
+    按端口隔离各用例；留在系统临时目录不清理（与 target/interop_ci 工作目录同口径）。"""
+    folder = os.path.join(tempfile.gettempdir(), 'xdrive-interop-%d' % port)
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
 def build_x(proto, P):
     """新协议 build: 返回 (server_inbound, client_outbound). 与 build() 解耦.
     每协议一份独立配置, 复用 tls_cli/tls_srv 走证书 pin 双向统一.
@@ -285,6 +300,27 @@ def build_x(proto, P):
                                  "hysteriaSettings": {"version": 2},
                                  "tlsSettings": {"serverName": "localhost",
                                                  "pinnedPeerCertSha256": PIN}}}
+    elif proto == 'xdrive':
+        # xdrive 传输承载 VLESS（bd yc54c G1）：service=local 共享文件夹 = 双端
+        # rendezvous（mock 级零外网依赖；隧道验收流量仍走默认 upstream）。配置
+        # 形态 = xdrive_go_interop.rs B6 三方向实测通过的同一份（ENC 对取自 Go
+        # transport_test.go:513-519；mux 是 validateXDrive 硬要求；小段+快轮询）。
+        # xdrive 入站不真 bind TCP（rendezvous 走文件夹，B6 实测）——run_x_one
+        # 对本 proto 跳过端口探测。
+        folder = _xdrive_folder(P)
+        xd = {"service": "local", "remoteFolder": folder,
+              "segmentBytes": 16 * 1024, "flushIntervalMs": 5,
+              "pollIntervalMs": 20, "maxPollIntervalMs": 50,
+              "sessionTtlSeconds": 60, "eagerWindowMs": 200, "holeTimeoutMs": 30000}
+        ss_xd = {"network": "xdrive", "xdriveSettings": xd}
+        si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
+              "settings": {"clients": [{"id": UUID}], "decryption": XDRIVE_DEC},
+              "streamSettings": ss_xd}
+        co = {"protocol": "vless", "settings": {"vnext": [
+            {"address": "127.0.0.1", "port": P,
+             "users": [{"id": UUID, "encryption": XDRIVE_ENC}]}]},
+              "streamSettings": {"network": "xdrive", "xdriveSettings": xd},
+              "mux": {"enabled": True}}
     elif proto == 'anytls':
         # anytls 协议对 dest 行为: 透明代理 (类似 vision); 用本地 echo 当 dest.
         auth_pw = 'anytls-secret'
@@ -676,8 +712,15 @@ def run_x_one(idx, proto, server_bin, client_bin, tag, work, dry=False):
                               stderr=subprocess.STDOUT, env=env)
         slog.close()
         procs.append(ps)
-        # hysteria/tuic 是 QUIC/UDP-only 监听, TCP connect 探测恒假失败
-        if not wait_port(P, 15, udp=proto in ('hysteria2', 'tuic')):
+        # hysteria/tuic 是 QUIC/UDP-only 监听, TCP connect 探测恒假失败.
+        # xdrive (local 后端) 入站不真 bind TCP: rendezvous = 共享文件夹
+        # (xdrive_go_interop.rs B6 同款实测), 端口探测恒假失败 => 短等配置装载.
+        if proto == 'xdrive':
+            time.sleep(1.0)
+            listening = True
+        else:
+            listening = wait_port(P, 15, udp=proto in ('hysteria2', 'tuic'))
+        if not listening:
             err = 'server 未监听 %d (15s)' % P
         else:
             clog = open(os.path.join(work, 'c%d.log' % idx), 'wb')

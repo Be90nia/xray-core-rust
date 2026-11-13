@@ -328,22 +328,17 @@ impl H3Client {
 /// 与 `force-brutal`）硬错——brutal 是给 Hysteria 服务端的，不是给普通服务用的。
 ///
 /// `""`/`reno` 不装算法（Go 两个空 case 体 ⇒ quic-go 缺省 CUBIC）；`bbr` 装 BBR。
+/// 转调上浮实现
+/// [`apply_quic_params_cc`](xray_transport_quic::congestion_swappable::apply_quic_params_cc)
+/// （G7：全仓唯一 CC 翻译件，本侧语义 = `CcSemantics::XdriveH3`）。
 fn apply_h3_cc(
     slot: &xray_transport_quic::congestion_swappable::HysteriaCCSlot,
     quic_params: Option<&QuicParamsConfig>,
 ) -> io::Result<()> {
-    let Some(qp) = quic_params else { return Ok(()) };
-    match qp.congestion.to_ascii_lowercase().as_str() {
-        "" | "reno" => Ok(()),
-        "bbr" => {
-            let profile =
-                xray_transport_quic::congestion_swappable::bbr::Profile::parse(&qp.bbr_profile)
-                    .map_err(|e| invalid(&format!("quicParams: {e}")))?;
-            xray_transport_quic::congestion_swappable::apply_bbr(slot, profile);
-            Ok(())
-        },
-        other => Err(invalid(&format!("unsupported congestion control over h3: {other}"))),
-    }
+    use xray_transport_quic::congestion_swappable::{CcSemantics, apply_quic_params_cc};
+
+    apply_quic_params_cc(slot, quic_params, CcSemantics::XdriveH3)
+        .map_err(|e| invalid(&e.to_string()))
 }
 
 fn h3_err(stage: &'static str) -> impl Fn(h3::error::StreamError) -> io::Error + Copy + Send {

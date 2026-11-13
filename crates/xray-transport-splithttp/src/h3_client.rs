@@ -407,71 +407,17 @@ fn build_h3_transport_config(
     Ok(transport_config)
 }
 
-/// 按 splithttp H3 语义应用拥塞控制（对应 Go `splithttp/dialer.go:161-164` nil 兜底 +
-/// `:239-246` congestion switch；conf 层校验语义来自 `infra/conf/transport_internet.go:217-254`，
-/// Rust 侧 memory_settings 宽容解析故在此一并硬错）。
-///
-/// 与 Go 逐条对齐：
-/// - `quicParams == None` → 兜底 `BbrProfile=standard`、congestion 空 → BBR （PR #5711：H3 默认
-///   BBR）
-/// - congestion 大小写不敏感（Go conf :245 ToLower）
-/// - `"reno"` → 不应用（Go 空 case 体，保留 quinn 默认 CUBIC）
-/// - `""`/`"bbr"` → BBR；未知 profile → Err（Go conf `"unknown bbr profile"` 硬错）
-/// - `"force-brutal"` → Brutal(brutalUp, brutalDisableLossCompensation)；up==0 → Err （Go conf
-///   `"force-brutal requires up"`）
-/// - 带宽字符串无条件解析（Go conf :229-236 不论 congestion 取值），失败 → Err
-/// - `"brutal"` 通过 conf 白名单（:247）但 splithttp dialer switch 无此臂 → Go `panic`； 未知值同
-///   panic。Rust 生产路径安全化为 Err。
+/// 按 splithttp H3 语义应用拥塞控制——转调上浮实现
+/// [`apply_quic_params_cc`](xray_transport_quic::congestion_swappable::apply_quic_params_cc)
+/// （G7：全仓唯一 CC 翻译件，Go 对齐语义见其文档）。
 fn apply_splithttp_cc(
     slot: &xray_transport_quic::congestion_swappable::HysteriaCCSlot,
     quic_params: Option<&xray_transport::memory_settings::QuicParamsConfig>,
 ) -> Result<()> {
-    use xray_transport_quic::congestion_swappable::{
-        apply_bbr, apply_brutal, bbr::Profile, parse_bandwidth_bps,
-    };
+    use xray_transport_quic::congestion_swappable::{CcSemantics, apply_quic_params_cc};
 
-    let Some(qp) = quic_params else {
-        // Go dialer.go:161-164：quicParams 为 nil 时兜底 BbrProfile=standard，
-        // congestion 空串走 UseBBR 分支——H3 无配置也默认 BBR。
-        apply_bbr(slot, Profile::Standard);
-        return Ok(());
-    };
-    // Go conf :229-243：Brutal 带宽无条件解析（Up 与 Down 都验），失败硬错；
-    // >0 且 <65536 → 硬错（"BrutalUp/Down must be at least 65536 bytes per second"）。
-    let brutal_up_bps = parse_bandwidth_bps(&qp.brutal_up)
-        .map_err(|e| SplitHttpError::Hyper(format!("quicParams brutalUp: {e}")))?;
-    let brutal_down_bps = parse_bandwidth_bps(&qp.brutal_down)
-        .map_err(|e| SplitHttpError::Hyper(format!("quicParams brutalDown: {e}")))?;
-    if brutal_up_bps > 0 && brutal_up_bps < 65_536 {
-        return Err(SplitHttpError::Hyper(
-            "BrutalUp must be at least 65536 bytes per second".to_string(),
-        ));
-    }
-    if brutal_down_bps > 0 && brutal_down_bps < 65_536 {
-        return Err(SplitHttpError::Hyper(
-            "BrutalDown must be at least 65536 bytes per second".to_string(),
-        ));
-    }
-    match qp.congestion.to_ascii_lowercase().as_str() {
-        "reno" => {},
-        "" | "bbr" => {
-            let profile = Profile::parse(&qp.bbr_profile)
-                .map_err(|e| SplitHttpError::Hyper(format!("quicParams: {e}")))?;
-            apply_bbr(slot, profile);
-        },
-        "force-brutal" => {
-            if brutal_up_bps == 0 {
-                return Err(SplitHttpError::Hyper("force-brutal requires up".to_string()));
-            }
-            apply_brutal(slot, brutal_up_bps, qp.brutal_disable_loss_compensation);
-        },
-        other => {
-            return Err(SplitHttpError::Hyper(format!(
-                "unknown congestion control: {other}, valid values: reno, bbr, brutal, force-brutal"
-            )));
-        },
-    }
-    Ok(())
+    apply_quic_params_cc(slot, quic_params, CcSemantics::SplitHttpH3)
+        .map_err(|e| SplitHttpError::Hyper(e.to_string()))
 }
 
 /// H3 客户端：封装 quinn + h3 SendRequest。

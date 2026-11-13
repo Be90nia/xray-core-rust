@@ -99,6 +99,14 @@ fn clean_rooted(name: &str) -> String {
 /// Go 注释原文语义：Put 的 rename（MoveFileEx）对目标持 DELETE 访问权直至
 /// rename 后一刻；不含 FILE_SHARE_DELETE 的读方（含跨进程）会撞
 /// ERROR_SHARING_VIOLATION。读侧最多等 2s（delay 1ms 倍增封顶 100ms）。
+///
+/// **fail-visible 登记（bd yc54c G6）**：本路径 `#[cfg(windows)]` 专属，且要真实
+/// 文件共享竞争（Put 的 rename 与跨进程读并发）才触发——本仓 CI **没有任何
+/// Windows 腿编译/运行本 crate**（`ci.yml` 的 Windows 门只挂 `xray-proxy-tun`，
+/// 其依赖闭包无 btls-sys 而本 crate 有；`interop.yml` 双腿是 macos/ubuntu），
+/// `tests/local_roundtrip.rs::windows_sharing_violation_read_retries` 在 CI 永不
+/// 执行 ⇒ **本重试行为零 CI 覆盖，仅真机 Windows 可证**。触碰本路径必须真机
+/// 验证后再合入（或先给 CI 补 Windows xdrive 腿）。
 #[cfg(windows)]
 async fn read_file_with_retry(
     clock: std::sync::Arc<dyn skeleton::clock::Clock>,

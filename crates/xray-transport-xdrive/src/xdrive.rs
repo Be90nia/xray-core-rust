@@ -91,6 +91,24 @@ fn unix_nanos_now(clock: &std::sync::Arc<dyn skeleton::clock::Clock>) -> i64 {
 
 // ── 预热点池（Go spareBox）───────────────────────────────────────────────────
 
+/// **udf `ObjectPool` 不适用判定（§3.5.2 例外条款，G8 举证）**：spareBox 与
+/// `skeleton_infra::objpool::ObjectPool` 的池模型在三个轴上语义错位——
+/// ① **消费方向相反**：ObjectPool = 借出→用→RAII 归还→同对象再借（复用记账
+///   reused/borrowed/degraded）；spareBox = 后台**预建**一次性会话，[`take_spare`]
+///   取出即消费所有权、**永无归还路径**（消费完由 [`drop_spare_of`] 异步泄放）。
+///   硬套 ObjectPool 需对每次取出走 `detach` 逃生口，复用账本全成噪音账本
+///   （「禁双份账本」红线）。
+/// ② **水位维持方不同**：ObjectPool 明确不起后台线程（prune_idle 由宿主按节奏
+///   调）；spareBox 水位由后台泵维持（[`fill_spares_task`]：busy 单飞 + 2s 节流 +
+///   TTL/3 清理 + `SPARE_IDLE_STOP` 拨号窗）——ObjectPool 的同步 `Fn` 工厂表达不了
+///   异步拨号 + 失败退避。
+/// ③ **过期泄放是异步副作用**：过期 spare 处置 = `storage.delete(prefix).await` +
+///   `storage.close().await`；ObjectPool 丢弃路径（prune_idle/dropped_overflow）是
+///   同步销毁，无 async 泄放钩子；`ResetPhase::OnAcquire` 钩子对新建对象又不调
+///   （预建件全是工厂新建），语义拧不上。
+/// 结论：强扭 = 行为变化 + 账本污染，**留自造件**（协议方向件、Go 亦内联于
+/// `xdrive.go`，无独立文件）⇒ `udf-promotion-candidate`（第二消费方出现时上浮）。
+///
 /// 预热环：一只已建好槽位的会话（Go `spareRing`）。
 struct SpareRing {
     storage: Arc<dyn Storage>,
