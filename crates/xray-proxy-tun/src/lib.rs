@@ -46,7 +46,8 @@ pub mod sysroute;
 pub mod tun_fd;
 pub mod wfp;
 // TUN 设备实现按平台门控：windows/macos/linux/bsd 走 tun_rs 真实现，
-// android/ios 走 stub（移动端由宿主 App 注入流量，见 device_stub.rs）。
+// android/ios 走 device_stub（移动端由宿主 App 注入 TUN fd，iOS 侧还带 utun 的
+// 4 字节地址族头剥离/垫放，见 device_stub.rs）。
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod device;
 // stub 必须占用同一 `crate::device` 路径：inbound.rs 等下游

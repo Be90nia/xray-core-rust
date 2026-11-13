@@ -27,8 +27,8 @@ xray-frame = { path = "../xray-frame" }
 
 # tun-rs 无 android/ios target（DeviceBuilder/Layer/if_index 未导出；移动端
 # 生态 = Android VpnService / iOS NEPacketTunnelProvider 宿主注入流量）。
-# 依赖按平台门控，android/ios 走 src/device_stub.rs（保持 TunDevice 类型
-# 签名可编译，create/recv/send 返回 Unsupported）。
+# 依赖按平台门控，android/ios 走 src/device_stub.rs（接管宿主注入的 TUN fd：
+# Android 裸 IP 包；iOS utun 剥/垫 4 字节地址族头。env 未注入即显式报错）。
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tun-rs = { workspace = true }
 
