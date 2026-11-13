@@ -256,11 +256,11 @@ pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 128 * 1500;
 
 /// h2 每连接发送缓冲（**真缓冲**，连接级；**已落地**：splithttp 客户端
 /// `H2_MAX_SEND_BUF_SIZE` = 16MiB；服务端 `H2_SERVER_MAX_SEND_BUF_SIZE` = 32MiB 为
-/// **上限**，实际按内存档位取 16MiB（tiny）/ 32MiB（small/medium/large）——
+/// **上限**，实际按内存档位取 8MiB（tiny）/ 16MiB（small）/ 32MiB（medium/large）——
 /// 映射唯一源 `xray_transport::h2_window::h2_server_max_send_buf_for`，交叉断言钉住）。
 ///
 /// 与 SETTINGS 流窗/连窗（信用计数器，零预分配）不同——本值是 hyper 真会堆积的
-/// 发送缓冲 ⇒ 每条满载 splithttp 连接最多 16MiB（客户端）/ 16 或 32MiB（服务端）。
+/// 发送缓冲 ⇒ 每条满载 splithttp 连接最多 16MiB（客户端）/ 8-32MiB（服务端）。
 /// bd sgdwm 入簿（PM-05）。
 ///
 /// **记账归属（bd pyka7 / NEW-S2，两栏口径）**：hyper 只在背压时惰性分配，

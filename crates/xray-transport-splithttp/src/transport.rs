@@ -71,7 +71,8 @@ pub(crate) const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 pub use xray_transport::h2_window::{
     H2_INITIAL_CONNECTION_WINDOW, H2_INITIAL_STREAM_WINDOW, H2_MAX_SEND_BUF_SIZE,
     H2_SERVER_INITIAL_CONNECTION_WINDOW, H2_SERVER_INITIAL_STREAM_WINDOW,
-    H2_SERVER_MAX_SEND_BUF_SIZE, H2_SERVER_SEND_BUF_TINY_TIER, h2_server_max_send_buf_for,
+    H2_SERVER_MAX_SEND_BUF_SIZE, H2_SERVER_SEND_BUF_SMALL_TIER, H2_SERVER_SEND_BUF_TINY_TIER,
+    h2_server_max_send_buf_for,
 };
 
 /// 服务端 h2 允许的对端并发流数（票 2xgln）。

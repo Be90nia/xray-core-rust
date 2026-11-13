@@ -176,8 +176,8 @@ fn conn_budget_log_line(plan: &xray_frame::budget::plan::MemoryPlan) -> String {
 /// 连接池余量（`MAX_IDLE_PER_HOST` 条 × 每连接估算）。
 ///
 /// 只进 caps 栏（per-conn 上限，**不求和**）。send_buf 的唯一映射源 =
-/// [`xray_transport::h2_window::h2_server_max_send_buf_for`]（tiny 16MiB、
-/// small/medium/large 32MiB）——打印值必须与 transport 实际定窗同源，禁在此另立数字。
+/// [`xray_transport::h2_window::h2_server_max_send_buf_for`]（tiny 8MiB、small 16MiB、
+/// medium/large 32MiB）——打印值必须与 transport 实际定窗同源，禁在此另立数字。
 fn xhttp_conn_booked_bytes(tier: xray_frame::budget::plan::MemoryTier) -> usize {
     xray_transport::h2_window::h2_server_max_send_buf_for(tier)
         + HYPER_MAX_IDLE_PER_HOST_CONNECTIONS * HYPER_IDLE_CONN_EST_BYTES
@@ -481,8 +481,8 @@ pub fn budget_report_with(
     let degraded = (!notes.is_empty()).then(|| notes.join("；"));
 
     // ── 4) 上限面（打印用；不进 projected）──
-    // xhttp 每连接账面按**档位实际生效值**打（send_buf 16MiB@tiny / 32MiB@small 起
-    // + 空闲连接池余量）：打印值必须与 transport 侧实际定窗一致。
+    // xhttp 每连接账面按**档位实际生效值**打（send_buf 8MiB@tiny / 16MiB@small /
+    // 32MiB@medium|large + 空闲连接池余量）：打印值必须与 transport 侧实际定窗一致。
     let xhttp_conn_booked = xhttp_conn_booked_bytes(plan.tier);
     let caps = vec![
         (
@@ -1794,7 +1794,7 @@ mod tests {
     }
 
     /// h2 发送缓冲（真缓冲）与 splithttp 客户端/服务端实现**逐端同一常量**
-    /// （客户端 16MiB；服务端按内存档位 16/32MiB——映射唯一源见
+    /// （客户端 16MiB；服务端按内存档位 8/16/32MiB——映射唯一源见
     /// [`xray_transport::h2_window::h2_server_max_send_buf_for`]；bd sgdwm/PM-05 入簿）；
     /// SETTINGS 流窗/连窗（信用计数器）一并钉住防回档——非内存账面，不计入预算门算式。
     #[test]
@@ -1828,27 +1828,26 @@ mod tests {
         assert_eq!(H2_MAX_SEND_BUF_PER_CONN_BYTES, 16 * 1024 * 1024);
     }
 
-    /// 服务端 h2 send_buf 按**内存档位**取值：tiny 16MiB（维持改动前现状）、
-    /// small/medium/large 32MiB（对齐客户端收窗 ⇒ 下载在飞上限翻倍；32MiB 是上限非预约，
-    /// 真实在途 = BDP）。四档全断言，禁写字面量散落（期望值由常量派生）。
+    /// 服务端 h2 send_buf 按**内存档位**三档取值：tiny 8MiB / small 16MiB /
+    /// medium/large 32MiB（32MiB 对齐客户端收窗；32MiB 是上限非预约，真实在途 = BDP）。
+    /// 四档全断言，禁写字面量散落（期望值由常量派生）。
     #[test]
     fn h2_server_send_buf_follows_memory_tier() {
         use xray_frame::budget::plan::MemoryTier;
-        let (tiny, rest) = (
+        let (tiny, small, large) = (
             xray_transport::h2_window::H2_SERVER_SEND_BUF_TINY_TIER,
+            xray_transport::h2_window::H2_SERVER_SEND_BUF_SMALL_TIER,
             xray_transport::h2_window::H2_SERVER_MAX_SEND_BUF_SIZE,
         );
-        // 两档值单调（放开档 > tiny 档）。
-        assert!(
-            xray_transport::h2_window::h2_server_max_send_buf_for(MemoryTier::Small)
-                > xray_transport::h2_window::h2_server_max_send_buf_for(MemoryTier::Tiny),
-            "放开档 send_buf 必须大于 tiny 档"
-        );
+        assert_eq!(tiny, 8 * 1024 * 1024, "tiny 档 8MiB（≤256MB 机器不赌大缓冲）");
+        assert_eq!(small, H2_MAX_SEND_BUF_PER_CONN_BYTES, "small 档 = 客户端收窗档 16MiB");
+        // 档位单调递增（tiny < small < medium|large）。
+        assert!(tiny < small && small < large, "档位 send_buf 必须随档位单调递增");
         for (tier, expect) in [
             (MemoryTier::Tiny, tiny),
-            (MemoryTier::Small, rest),
-            (MemoryTier::Medium, rest),
-            (MemoryTier::Large, rest),
+            (MemoryTier::Small, small),
+            (MemoryTier::Medium, large),
+            (MemoryTier::Large, large),
         ] {
             assert_eq!(
                 xray_transport::h2_window::h2_server_max_send_buf_for(tier),
@@ -1871,8 +1870,9 @@ mod tests {
                 tier.as_str()
             );
         }
-        // 服务端不得低于客户端：下载在飞上限 = min(两端)，低于客户端即自钉。
-        for tier in [MemoryTier::Tiny, MemoryTier::Small, MemoryTier::Medium, MemoryTier::Large] {
+        // 服务端不得低于客户端（下载在飞上限 = min(两端)，低于客户端即自钉）——唯 tiny 档
+        // 例外：该档按 8MiB 保守取值（2026-11-13 用户拍板）。
+        for tier in [MemoryTier::Medium, MemoryTier::Large] {
             assert!(
                 xray_transport::h2_window::h2_server_max_send_buf_for(tier)
                     >= H2_MAX_SEND_BUF_PER_CONN_BYTES,

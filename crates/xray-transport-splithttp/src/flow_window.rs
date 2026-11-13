@@ -2,46 +2,19 @@
 //!
 //! 物理约束：单流吞吐 ≤ min(对端收窗, 本端 send_buf)/RTT，其中 RTT 是**数据路径
 //! 的端到端 RTT**。h2 的接收窗只在握手 SETTINGS 定初值、运行时 auto-refill 不超初窗
-//! （hyper/h2 无运行时调接收窗 API——已知局限），故任何自适应都只能落在握手前的初值上。
+//! （hyper/h2 无运行时调接收窗 API——已知局限），故窗值只能在握手前定死。
 //!
-//! ## 为什么**不再**按 RTT 缩 send_buf（撤掉 bd rjzw2 的阶梯）
+//! 现状：`max_send_buf` 恒为各端静态保底（客户端 16MiB、服务端**按内存档位** 8/16/32MiB
+//! ——tiny 8MiB、small 16MiB、medium/large 32MiB，档位表见 `xray_transport::h2_window`
+//! 模块头）；流窗/连窗亦保持各端原静态值（32/32MB 客户端、16/32MB 服务端）——rjzw2 bench
+//! 实测缩流窗 ≤26MB 吞吐掉 14-31%（SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
 //!
-//! 33bacd22 曾按探测 RTT 缩 send_buf：<40ms→8MB、40-99ms→12MB、≥100ms→16MB。
-//! 该优化的隐含前提是「探测 RTT = 端到端 RTT」，**在代理场景结构性不成立**：
+//! ## RTT 不参与任何决策（bd rjzw2 / lf51l，**勿恢复**）
 //!
-//! - 客户端探针只测到「本机 → host」这一段（`probe_rtt` 建一条一次性 TCP 连接计时）。
-//! - host 是 CDN 域名时（生产 xhttp 入站走 CDN，mode=packet-up），这一段 ≈ **CDN 边缘 RTT**（实测
-//!   ~30ms），真实数据路径（客户端→CDN→源站）端到端 RTT ≈ 200ms。
-//! - 于是 send_buf 落 8MB 档，而吞吐上限 = send_buf / 端到端 RTT = 8MB / 0.2s ≈ 40MB/s ——实测被钉在
-//!   35MB/s（历史 50-60MB/s）。**这是把 probe 的 RTT 当成了 BDP 的 RTT**。
-//! - 探针无法区分「直连」与「CDN/中转/隧道」：同一个低 RTT 观测既可能是低延迟直连，
-//!   也可能是高延迟链路的薄边缘。= 该优化没有可判定的适用范围，故整体删除（Go 侧 本无此机制：Go
-//!   xray 的 h2 发送缓冲恒为静态值，本轮对齐 Go）。
-//!
-//! 现状：`max_send_buf` 恒等于各端静态保底（客户端 16MiB、服务端**按内存档位** 16/32MiB
-//! ——tiny 16MiB，small 起 32MiB，档位表见 `xray_transport::h2_window` 模块头）；流窗/连窗
-//! 亦保持各端原静态值（32/32MB 客户端、16/32MB 服务端）——rjzw2 bench 实测缩流窗 ≤26MB
-//! 吞吐掉 14-31%（SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
-//!
-//! ## 吞吐上限的 RTT 依赖（定量）
-//!
-//! 下载在飞上限 = min(服务端 send_buf, 客户端收窗 32 MiB) ⇒ tiny 16 MiB / 其余 32 MiB，
-//! 吞吐 = 在飞上限 ÷ 端到端 RTT（单位 MiB/s = 在飞上限 MiB ÷ RTT 秒；×1.049 ≈ MB/s）：
-//! - 16 MiB ÷ 0.45 s ≈ 35 MiB/s（≈37 MB/s；用户真机 xhttp+CDN 实测 31-37 MB/s 同档）
-//! - 16 MiB ÷ 0.29 s ≈ 55 MiB/s（历史 50-60 MB/s 档）
-//! - 32 MiB ÷ 0.45 s ≈ 71 MiB/s（small 起取值；**勿改按 RTT 自适应**，rjzw2 前科）
-//!
-//! 32MiB 是上限不是预约（hyper 惰性分配，真实在途 = BDP ≈ 吞吐 × RTT ≈ 30MB 全机），
-//! 故 512MB 档 96MiB 预算也成立。
-//!
-//! ## RTT 探针已删除（lf51l）
-//!
-//! 阶梯撤掉后探针**零消费者**（窗组恒为静态保底，结果只进一行 DEBUG 日志），却让每条
-//! h2 代理连接多拨一条一次性 TCP（`register.rs` 在 xmux 池查找前 `resolve_rtt`）——bd
-//! vkirx① 抓包实证的「stream-one 每会话多 1 条零字节 TCP（Rust 2 条 vs Go 1 条）」即它。
-//! Go 侧本无此机制。`probe_rtt` / `resolve_rtt` / `XRAY_H2_RTT_HINT_MS` 一并删除；
-//! 诊断 env 只保留 `XRAY_H2_FLOW_WINDOW_OVERRIDE_BYTES` /
-//! `XRAY_H2_SEND_BUF_OVERRIDE_BYTES`（强制流窗/send_buf，bench 扫曲线用）。
+//! 33bacd22 的 RTT 阶梯与探针（`probe_rtt`/`resolve_rtt`/`XRAY_H2_RTT_HINT_MS`）已整体删除：
+//! 探针只测到 CDN 边缘 RTT ≠ 数据路径端到端 RTT，据此缩 send_buf 把吞吐钉死。防回档测试
+//! `client.rs::h2_windows_are_static_fallback` / `h2_window_pins_match_wz2b_c9oc`；诊断 env
+//! 仅剩下面两个 override（bench 扫曲线用）。
 
 use xray_frame::budget::plan::{MemoryPlan, MemoryTier};
 
@@ -54,7 +27,7 @@ pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
 };
 
 /// 服务端静态保底 = 修前 `serve_http_conn` 原静态窗值（16MB 流窗 / 32MB 连窗）+ **按内存
-/// 档位**的服务端 send_buf（tiny 16MiB、small/medium/large 32MiB；映射唯一源 =
+/// 档位**的服务端 send_buf（tiny 8MiB、small 16MiB、medium/large 32MiB；映射唯一源 =
 /// [`crate::transport::h2_server_max_send_buf_for`]，档位表见 `h2_window` 模块头）。
 /// ——**不得用客户端流窗常量**：客户端流窗 32MB 会把服务端原静态 16MB
 /// 抬到 32MB（保底被偷改 → 「静态 vs 自适应」对比基线失效）。
@@ -154,16 +127,17 @@ mod tests {
 
     #[test]
     fn server_fallback_is_static_per_tier() {
-        // 窗值固定；send_buf 按档位（tiny 16MiB；small/medium/large 32MiB）。
-        let (tiny, rest) = (
+        // 窗值固定；send_buf 按档位（tiny 8MiB；small 16MiB；medium/large 32MiB）。
+        let (tiny, small, large) = (
             crate::transport::H2_SERVER_SEND_BUF_TINY_TIER,
+            crate::transport::H2_SERVER_SEND_BUF_SMALL_TIER,
             crate::transport::H2_SERVER_MAX_SEND_BUF_SIZE,
         );
         for (tier, send_buf) in [
             (MemoryTier::Tiny, tiny),
-            (MemoryTier::Small, rest),
-            (MemoryTier::Medium, rest),
-            (MemoryTier::Large, rest),
+            (MemoryTier::Small, small),
+            (MemoryTier::Medium, large),
+            (MemoryTier::Large, large),
         ] {
             let w = server_fallback(tier);
             assert_eq!(w.stream_window, 16 * 1024 * 1024, "{} 流窗（修前原静态）", tier.as_str());
