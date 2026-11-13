@@ -1788,6 +1788,35 @@ mod tests {
         }
     }
 
+    /// vendor/quinn-proto 的 assume-peer patch 守卫（bd nza5s）：对端不广告
+    /// max_datagram_frame_size TP（quic-go hysteria2 client 自 2026-09-01 起
+    /// `OmitMaxDatagramFrameSize=true`）时，本侧**发送**上限必须按本地 path MTU 推出，
+    /// 而不是像上游那样返回 None —— 否则服务端回包全被 `UnsupportedByPeer` 拒掉
+    /// （hysteria2 UDP 下行断流）。0.11.19 上游仍无等价 API。
+    ///
+    /// 只断言发送侧：quinn 的 `datagram_receive_buffer_size(None)` 同时关掉本地接收
+    /// （Go 只省略广告、仍收包），故这里不投递到对端。
+    #[tokio::test]
+    async fn send_side_max_datagram_when_peer_omits_tp() {
+        let (server_tc, _slot) =
+            build_hysteria_transport_config(&QuicConfig::default_for_hysteria());
+        let mut client_tc = quinn::TransportConfig::default();
+        client_tc.datagram_receive_buffer_size(None); // = 对端 OmitMaxDatagramFrameSize
+
+        let (_client, server, _ep) =
+            make_loopback_conn_pair_cfg(Some(Arc::new(server_tc)), Some(Arc::new(client_tc))).await;
+
+        let max = server
+            .inner()
+            .max_datagram_size()
+            .expect("assume-peer patch：对端未广告也须给出上限（上游此处返 None）");
+        assert!(max > 1000, "上限须由本地 MTU 推导（1KiB 以上），实际 {max}");
+        server
+            .send_datagram(Bytes::from_static(b"downlink"))
+            .await
+            .expect("对端未广告 TP 时服务端仍须能发 datagram");
+    }
+
     #[tokio::test]
     async fn remote_addr_populated_after_handshake() {
         // ponytail: quinn::Connection::local_ip 返 None/unspecified（端口不维护），

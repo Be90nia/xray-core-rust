@@ -252,9 +252,12 @@ rustls = { path = "vendor/rustls" }
 tokio-rustls = { path = "vendor/tokio-rustls" }
 # hysteria2 UDP relay：对端不宣告 max_datagram_frame_size TP（quic-go
 # OmitMaxDatagramFrameSize=true）时按本地 MTU 假定对端支持——对齐 apernet/quic-go
-# fork 的 AssumePeerMaxDatagramFrameSize。基线 = 上游 quinn-proto 0.11.18 原版
-# （字节级对齐），唯一本地 patch 见 REBASE 注释：
-# vendor/quinn-proto/src/connection/datagrams.rs max_size()。
+# fork 的 AssumePeerMaxDatagramFrameSize。基线 = 上游 quinn-proto 0.11.19 原版
+# （字节级对齐）。0.11.18→0.11.19 为安全版：消解 RUSTSEC-2026-0523（MAX_STREAM_DATA
+# 越过流上限开流 ⇒ OOM）/ RUSTSEC-2026-0524（长 Retry token ⇒ panic / 10GiB 分配）。
+# 唯一本地 patch 见 REBASE 注释：vendor/quinn-proto/src/connection/datagrams.rs
+# max_size()（0.11.19 仍无等价 assume-peer API）；升级 SOP 见
+# vendor/quinn-proto/REBASE.md。
 quinn-proto = { path = "vendor/quinn-proto" }
 # h2 WINDOW_UPDATE 回填粒度：h2 缺省按「窗口的一半」回填（threshold = window/2）
 # ⇒ 稳态在飞只有半窗 ⇒ 高 RTT 路径带宽被砍半（实测 RTT170ms 69.8-70.1 MB/s、

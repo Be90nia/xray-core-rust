@@ -90,10 +90,14 @@ impl Datagrams<'_> {
         // 对端（quic-go hysteria2 client，OmitMaxDatagramFrameSize=true）不宣告
         // max_datagram_frame_size TP 时，按本地 path MTU 推导上限假定对端支持
         // ——对齐 apernet/quic-go fork 的 AssumePeerMaxDatagramFrameSize 语义。
-        // REBASE(quinn>=0.11.18): 上游若提供等价 assume-peer API 可删除本 patch。
-        // 上游 0.11.17/0.11.18 的 GHSA-ppcp-v39w 修复（DatagramBuffer 封装）不触碰
-        // max_size()，两者正交；0.11.18 新增的 Datagrams::drop_oversized() 走
-        // max_size()，自动继承本假定语义。
+        // REBASE(quinn>=0.11.19): 上游仍无等价 assume-peer API —— 0.11.19 的
+        // max_size() 依旧是 `peer_params.max_datagram_frame_size?`（`?` 展开即
+        // 「对端未广告 ⇒ None」），故本 patch 必须保留。0.11.18 起的
+        // drop_oversized() 走 max_size()，自动继承本假定语义；0.11.17/0.11.18 的
+        // GHSA-ppcp-v39w 修复（DatagramBuffer 封装）与本处正交。
+        // 已知冲突：上游单测 tests/mod.rs::datagram_unsupported 断言「对端未广告
+        // ⇒ max_size()==None」，与本 patch 语义相反（0.11.18 起即如此；vendor 单测
+        // 不进本仓 workspace，故不影响 CI）。
         let peer_limit = match self.conn.peer_params.max_datagram_frame_size {
             Some(v) => v.into_inner().saturating_sub(Datagram::SIZE_BOUND as u64),
             None => u64::from(self.conn.path.current_mtu()),
