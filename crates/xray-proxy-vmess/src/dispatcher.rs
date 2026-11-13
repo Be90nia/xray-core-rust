@@ -1739,7 +1739,7 @@ mod tests {
         let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
         let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
         let mut sp = PlainSizeParser;
-        let mut frame = ChunkFrame::new();
+        let mut frame = ChunkFrame::new(2);
         frame.write_plaintext(b"hello wire");
         let mut out = Vec::new();
         write_chunk_frame(&mut out, &mut frame, 10, &cipher, nonce_gen.next_ref(), &mut sp, false)
@@ -1805,7 +1805,7 @@ mod tests {
         let cipher = Aes128Gcm::new(&[0x42u8; 16]).expect("cipher");
         let mut nonce_gen = ChunkNonceGenerator::new(&[0xAAu8; 16], 12);
         let mut sp = ShakeSizeParserAdapter::new(&[0x11u8; 16]);
-        let mut frame = ChunkFrame::new();
+        let mut frame = ChunkFrame::new(2);
         let cap = frame.plaintext_max(cipher.tag_size());
         let mut w = CountingWriter { buf: Vec::new(), writes: 0 };
         let pt = b"payload bytes for one chunk";
@@ -1869,8 +1869,10 @@ mod tests {
         let aes = Aes128Gcm::new(&[0x42u8; 16]).expect("aes");
         let chacha = ChaCha20Poly1305Aead::new(&[0x11u8; 32]).expect("chacha");
         let ciphers: [(&str, &dyn AeadCipher); 2] = [("aes128gcm", &aes), ("chacha20", &chacha)];
-        // 空（终止 chunk 形态）/ 小载荷 / 读区上界（块容量 − tag）
-        let payloads: [&[u8]; 3] = [b"", b"hello wire", &[0x5Au8; PUMP_BUF - 16]];
+        // 空（终止 chunk 形态）/ 小载荷 / 读区上界（块容量 − 帧头预留 − tag）
+        // 帧头预留宽度随 size parser 变（Plain/Shake 2B、AuthenticatedLength 18B），
+        // 取最宽的 18 ⇒ 三档都能装到下界（AEAD 档正好卡在上界）。
+        let payloads: [&[u8]; 3] = [b"", b"hello wire", &[0x5Au8; PUMP_BUF - 18 - 16]];
         for (name, cipher) in ciphers {
             for kind in [SpKind::Plain, SpKind::Shake, SpKind::AeadLen] {
                 for pt in payloads {
@@ -1895,8 +1897,8 @@ mod tests {
         encode_frame_into(&mut vec_frame, pt, cipher, &nonce, kind.make().as_mut(), global_padding)
             .expect("vec 构帧");
 
-        // ② TCP 路径：原地 seal + 分段写（未实现 vectored ⇒ 逐段顺序写，字节序不变）
-        let mut frame = ChunkFrame::new();
+        // ② TCP 路径：原地 seal + 单缓冲写（无 padding）/ 2 段写（padding 档）
+        let mut frame = ChunkFrame::new(kind.make().size_bytes());
         frame.write_plaintext(pt);
         let mut sink = CountingWriter { buf: Vec::new(), writes: 0 };
         write_chunk_frame(

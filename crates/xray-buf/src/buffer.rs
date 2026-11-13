@@ -203,6 +203,21 @@ impl Buffer {
         self.start += n;
     }
 
+    /// 把读游标**回退** n 字节（提交写侧预留的头部区）。
+    ///
+    /// 装帧场景：写侧先用 `advance(n)` 跳过块首 n 字节做帧头预留区，正文（含原地
+    /// seal 的 tag）写在预留区之后；帧头就位后调用本函数把读游标退回预留区起点，
+    /// 整帧（帧头‖正文）即 `[start, end)` 一段连续字节 ⇒ **一次单缓冲写**发出，
+    /// 不需要 `write_vectored` 拼 2~3 段（Windows 上多 iovec send 的每条 iovec 都是
+    /// 一次额外的内核 MDL 处理，实测每帧 3 段 send ≈ 3 倍内核态开销，bd 7choj）。
+    ///
+    /// # Panics
+    /// 如果 n 超过已读游标（`start < n`）会 panic——预留不足即调用方算错。
+    pub fn prepend_head(&mut self, n: usize) {
+        assert!(n <= self.start, "prepend_head {n} 超过已读游标 start={}", self.start);
+        self.start -= n;
+    }
+
     /// 从缓冲区读取数据到 `dst`，返回实际读取的字节数。
     ///
     /// 对应 Go 的 `Buffer.Read()`。

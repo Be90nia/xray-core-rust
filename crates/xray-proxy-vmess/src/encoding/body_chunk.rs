@@ -24,6 +24,7 @@ use std::io::{Read, Write};
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(test)]
 use xray_buf::{buffer::Buffer, writer::write_segments};
 use xray_common::protocol::SecurityType;
 use xray_crypto::{
@@ -463,36 +464,62 @@ pub fn single_chunk_capacity(cipher: &dyn AeadCipher, size_parser: &dyn SizePars
 // ============================================================================
 
 /// chunk size 字段最大长度（Plain/Shake = 2；AuthenticatedLength = 2 + AEAD tag 16）。
+#[cfg(test)]
 const MAX_SIZE_FIELD: usize = 18;
 
 /// padding 段最大长度（`ShakeSizeParser::next_padding_len` = mask % 64）。
-const MAX_PADDING: usize = 64;
+pub(crate) const MAX_PADDING: usize = 64;
 
 /// 一帧的装帧状态，跨 chunk 复用 ⇒ 稳态零分配。
 ///
-/// wire 顺序即段序（[`write_chunk_frame`] 一次向量写发出）：
-/// 1. `size_field`：`SizeParser` 编码的 2B/18B 头（独立段）
-/// 2. `payload`：明文区被 [`Buffer::seal_window`] **原地**覆写为密文，AEAD tag 落在
-///    同一分配紧随其后的尾部区 ⇒ `[ciphertext‖tag]` 一段连续字节，无第二块缓冲
-/// 3. `padding`：随机填充（独立段，不与载荷合并——合并 = 用户态再多搬一遍全量）
+/// 块内布局（`head_len` = size 字段宽度，Plain/Shake 2B，AuthenticatedLength 18B）：
+/// 1. `[0, head_len)`：size 字段预留区，帧末由 [`write_chunk_frame`] 回填
+/// 2. `[head_len, head_len + n)`：明文区，被 [`Buffer::seal_window`] **原地**覆写为密文， AEAD tag
+///    落在同一分配紧随其后的尾部 ⇒ `[size‖ciphertext‖tag]` 一段连续字节
+/// 3. `padding`：随机填充（`global_padding` 时才有；独立段，合并会多搬一遍全量）
+///
+/// **整帧一段连续字节**是有意的：`write_chunk_frame` 因此可以用一次单缓冲写发出整帧
+/// （`write_all`），而不是 `write_vectored` 拼 2~3 段——后者在 Windows 上每段 iovec
+/// 都是一份内核 MDL，实测每帧 3 段 = 内核态 +4ms/MiB（bd 7choj，141 vs 262 MB/s）。
+///
+/// 生产写侧不走本条路径（它要攒批，见 `inbound::chunk_stream::ChunkWriter`）；本件与
+/// `write_chunk_frame` 是**单帧参考构帧器**，作为测试的 wire 对拍基准保留。
+#[cfg(test)]
 pub(crate) struct ChunkFrame {
     payload: Buffer,
-    size_field: [u8; MAX_SIZE_FIELD],
+    /// size 字段预留区宽度（构造期定，随 size parser 而变）。
+    head_len: usize,
     padding: [u8; MAX_PADDING],
+    /// 本帧实际 padding 长度（装帧时定；`clear` 归零）。
+    padding_len: usize,
 }
 
+#[cfg(test)]
 impl ChunkFrame {
-    pub(crate) fn new() -> Self {
-        Self {
+    /// `head_len` = size 字段宽度（`SizeParser::size_bytes()`）——预留不足时
+    /// [`write_chunk_frame`] 显式报错，不会静默把帧头挤进正文。
+    pub(crate) fn new(head_len: usize) -> Self {
+        let mut frame = Self {
             payload: Buffer::new_pooled(DEFAULT_PAYLOAD_SIZE),
-            size_field: [0; MAX_SIZE_FIELD],
+            head_len,
             padding: [0; MAX_PADDING],
-        }
+            padding_len: 0,
+        };
+        frame.clear();
+        frame
     }
 
-    /// 丢弃上一帧（游标归零，池化块保留复用）。
+    /// 丢弃上一帧（游标归零到帧头预留区之后，池化块保留复用）。
     pub(crate) fn clear(&mut self) {
+        self.padding_len = 0;
         self.payload.clear();
+        if self.head_len > 0 {
+            // 预留区先占位（内容由 write_chunk_frame 回填）：不占位则正文从块首开始，
+            // 帧头无处安放。
+            let zeros = [0u8; MAX_SIZE_FIELD];
+            self.payload.write_from(&zeros[..self.head_len]);
+            self.payload.advance(self.head_len);
+        }
     }
 
     /// 明文读入区长度上限 = 块剩余空间 − tag 区（tag 与载荷同块相邻，必须留位）。
@@ -511,20 +538,92 @@ impl ChunkFrame {
         assert_eq!(written, data.len(), "明文区剩余空间装不下 {} 字节", data.len());
         written
     }
+
+    /// 装帧后的整帧字节 `[size‖ciphertext‖tag]`（[`seal_chunk_frame`] 之后有效）。
+    pub(crate) fn frame_bytes(&self) -> &[u8] {
+        self.payload.bytes()
+    }
+
+    /// 本帧 padding 字节（`global_padding` 关闭时为空）。
+    pub(crate) fn padding_bytes(&self) -> &[u8] {
+        &self.padding[..self.padding_len]
+    }
 }
 
-/// 把一帧 `[size_field][ciphertext‖tag][padding]` 以 2~3 段向量写发出（用户态零拷贝）。
+/// 装帧：原地 seal 正文 + 回填 size 字段，**不发 IO**。
+///
+/// 返回后 [`ChunkFrame::frame_bytes`] 即整帧 `[size‖ciphertext‖tag]` 连续字节，
+/// padding（`global_padding` 时才有）由 [`ChunkFrame::padding_bytes`] 单独给。
+///
+/// 与写分离是为了让写侧把多帧攒成**一次**向量写：每帧一次 send 在 Windows 上实测
+/// 128 次/MiB ≈ 内核态 4ms/MiB（bd 7choj）。
+///
+/// SHAKE128 流消费顺序：`next_padding_len` → `encode`（与 decode 侧对称）。
+#[cfg(test)]
+pub(crate) fn seal_chunk_frame<C>(
+    frame: &mut ChunkFrame,
+    plaintext_len: usize,
+    cipher: &C,
+    nonce: &[u8],
+    size_parser: &mut (dyn SizeParser + Send),
+    global_padding: bool,
+) -> std::io::Result<()>
+where
+    C: AeadCipher + ?Sized,
+{
+    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
+    let sb = size_parser.size_bytes();
+    let tag_len = cipher.tag_size();
+    // size 字段预留不足 = 构造期给的宽度与 parser 不一致（调用方算错，显式失败）
+    if frame.head_len != sb {
+        return Err(std::io::Error::other(format!(
+            "vmess chunk frame: head reservation {} != size field {sb}",
+            frame.head_len
+        )));
+    }
+    {
+        // 尾部不足 ⇒ None（读入区已按 tag_len 预留，走到这里即读入界失效）
+        let window = frame.payload.seal_window(tag_len).ok_or_else(|| {
+            std::io::Error::other("vmess chunk frame: rear headroom < tag (read bound violated)")
+        })?;
+        debug_assert_eq!(window.payload.len(), plaintext_len);
+        cipher
+            .seal_in_place_with_tag(nonce, &[], window.payload, window.tag)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    }
+    frame.payload.advance_write(tag_len);
+    // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
+    let size_value = u16::try_from(plaintext_len + tag_len + padding_size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
+    })?;
+    // 回填帧头 → 整帧连续
+    frame.payload.prepend_head(sb);
+    size_parser.encode(size_value, &mut frame.payload.as_mut()[..sb]);
+    if padding_size > 0 {
+        use rand::RngCore;
+        rand::rng().fill_bytes(&mut frame.padding[..padding_size]);
+    }
+    frame.padding_len = padding_size;
+    Ok(())
+}
+
+/// 把一帧 `[size_field][ciphertext‖tag][padding]` 装帧后发出。
 ///
 /// 前置：`plaintext_len` 字节明文已落在 `frame` 的读入区并经
-/// [`ChunkFrame::write_plaintext`] 提交。
+/// [`ChunkFrame::write_plaintext`] 提交；`frame` 的块首已按 size 字段宽度预留
+/// （[`ChunkFrame::new`] / [`ChunkFrame::clear`] 完成）。
 /// `plaintext_len == 0` 即终止 chunk
 /// （Go `seal([])` 语义）：wire 上只余 size + tag。
 ///
-/// 段数 ≤ 3（< `MAX_SEGMENTS_PER_WRITE`）⇒ 一次 `poll_write_vectored`；底层不支持
-/// vectored（TLS 包装层）时 [`write_segments`] 退化为逐段顺序写——字节序不变、
-/// 仍零载荷拷贝，只是 syscall 变多。
+/// **单缓冲写**：size 字段回填进块首预留区后，整帧是 `[start, end)` 一段连续字节
+/// ⇒ 无 `global_padding` 时一次 `write_all`（每帧 1 个 iovec，与旧泵形态一致）。
+/// padding 开启时 padding 仍是独立段（合进载荷 = 用户态多搬一遍全量）⇒ 2 段一次
+/// `write_segments`（1 次 `poll_write_vectored`）；TLS 包装层不支持 vectored 时退化为
+/// 逐段顺序写，字节序不变。
 ///
-/// SHAKE128 流消费顺序：`next_padding_len` → `encode`（与 decode 侧对称）。
+/// 注意：写侧热路径（[`crate::inbound::chunk_stream::ChunkWriter`]）**不走本函数**
+/// ——它用 [`seal_chunk_frame`] + 多帧一次向量写（每帧一次 send 太贵，bd 7choj）。
+#[cfg(test)]
 pub(crate) async fn write_chunk_frame<W, C>(
     writer: &mut W,
     frame: &mut ChunkFrame,
@@ -538,37 +637,13 @@ where
     W: AsyncWrite + Unpin,
     C: AeadCipher + ?Sized,
 {
-    let padding_size = if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
-    let sb = size_parser.size_bytes();
-    let tag_len = cipher.tag_size();
-    {
-        // 尾部不足 ⇒ None（读入区已按 tag_len 预留，走到这里即读入界失效）
-        let window = frame.payload.seal_window(tag_len).ok_or_else(|| {
-            std::io::Error::other("vmess chunk frame: rear headroom < tag (read bound violated)")
-        })?;
-        debug_assert_eq!(window.payload.len(), plaintext_len);
-        cipher
-            .seal_in_place_with_tag(nonce, &[], window.payload, window.tag)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    seal_chunk_frame(frame, plaintext_len, cipher, nonce, size_parser, global_padding)?;
+    if frame.padding_len > 0 {
+        return write_segments(writer, &[frame.frame_bytes(), frame.padding_bytes()])
+            .await
+            .map_err(std::io::Error::other);
     }
-    frame.payload.advance_write(tag_len);
-    if padding_size > 0 {
-        use rand::RngCore;
-        rand::rng().fill_bytes(&mut frame.padding[..padding_size]);
-    }
-    // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
-    let size_value = u16::try_from(plaintext_len + tag_len + padding_size).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "vmess chunk size exceeds u16")
-    })?;
-    size_parser.encode(size_value, &mut frame.size_field[..sb]);
-    let mut segments: [&[u8]; 3] = [&frame.size_field[..sb], frame.payload.bytes(), &[]];
-    let seg_count = if padding_size > 0 {
-        segments[2] = &frame.padding[..padding_size];
-        3
-    } else {
-        2
-    };
-    write_segments(writer, &segments[..seg_count]).await.map_err(std::io::Error::other)
+    writer.write_all(frame.frame_bytes()).await
 }
 
 // ============================================================================
@@ -845,7 +920,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "明文区剩余空间装不下")]
     fn write_plaintext_panics_instead_of_silent_short_write() {
-        let mut frame = ChunkFrame::new();
+        let mut frame = ChunkFrame::new(2);
         let cap = frame.payload.free();
         assert_eq!(frame.write_plaintext(&vec![0u8; cap]), cap, "写满容量内应成功");
         assert_eq!(frame.payload.free(), 0, "前置：明文区已无剩余空间");

@@ -79,9 +79,13 @@ pub const XHTTP_SRV_H2CONN: u8 = 9;
 /// `SiteTaskExecutor`，execute 处 `scope` 后委托 `TokioExecutor`）。cli 侧 h2
 /// DATA/流控/HPACK/上传泵全在这两处任务内。
 pub const XHTTP_CLI_H2CONN: u8 = 10;
+/// VMess 服务端下行帧编码（`ChunkWriter::write_multi_buffer` 一轮 = 装帧
+/// `split_bytes` + `write_chunk_frame`）。bd 7choj：下行比 10-13 基线慢 1.85× 的
+/// 增量全在内核态（页错误 88 vs 6/MiB），本条站点用于判定每帧分配事件数。
+pub const VMESS_FRAME: u8 = 11;
 
 /// 站点目录（索引 = 站点 id；新站点只能追加，禁重编号——dump 行与归集脚本按名对齐）。
-pub const SITE_NAMES: [&str; 11] = [
+pub const SITE_NAMES: [&str; 12] = [
     "(none)",
     "tls_write",
     "xhttp_srv_send",
@@ -93,6 +97,7 @@ pub const SITE_NAMES: [&str; 11] = [
     "bridge_down_write",
     "xhttp_srv_h2conn",
     "xhttp_cli_h2conn",
+    "vmess_frame",
 ];
 
 // 内容留仓，机制已上浮 udf（bd 24a5k / udf-frame#6）：以下只是站点清单的
@@ -108,6 +113,7 @@ static SITE_BRIDGE_UP_WRITE: AllocSite = AllocSite::new("bridge_up_write");
 static SITE_BRIDGE_DOWN_WRITE: AllocSite = AllocSite::new("bridge_down_write");
 static SITE_XHTTP_SRV_H2CONN: AllocSite = AllocSite::new("xhttp_srv_h2conn");
 static SITE_XHTTP_CLI_H2CONN: AllocSite = AllocSite::new("xhttp_cli_h2conn");
+static SITE_VMESS_FRAME: AllocSite = AllocSite::new("vmess_frame");
 
 /// 站点目录表（枚举序 = 站点 id 序）：名 → 站点查表口 = udf
 /// `skeleton_infra::alloc_site::find(SITE_TABLE, name)`（零堆分配）。
@@ -123,6 +129,7 @@ pub static SITE_TABLE: &[&AllocSite] = &[
     &SITE_BRIDGE_DOWN_WRITE,
     &SITE_XHTTP_SRV_H2CONN,
     &SITE_XHTTP_CLI_H2CONN,
+    &SITE_VMESS_FRAME,
 ];
 
 /// 各站点累计字节（Relaxed 同 alloc_stats 无同步语义需求）。
@@ -424,6 +431,8 @@ mod tests {
                 "site=bridge_down_write alloc_n=0 alloc_bytes=0",
                 "site=xhttp_srv_h2conn alloc_n=0 alloc_bytes=0",
                 "site=xhttp_cli_h2conn alloc_n=0 alloc_bytes=0",
+                // bd 7choj：VMess 帧分配站点（追加式，本测试不记录它 ⇒ 增量恒 0）。
+                "site=vmess_frame alloc_n=0 alloc_bytes=0",
             ]
         );
     }

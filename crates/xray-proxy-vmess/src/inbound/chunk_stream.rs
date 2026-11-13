@@ -5,8 +5,8 @@
 //! 因此**没有**中转缓冲。本文件是等价物：
 //!
 //! - [`ChunkReader`]：wire → chunk 帧 → **原地**解密 → 明文 MultiBuffer（0 遍用户态 memcpy）
-//! - [`ChunkWriter`]：明文 MultiBuffer → 装帧（复用 [`write_chunk_frame`]，字节序与旧泵逐字节同源）
-//!   → wire
+//! - [`ChunkWriter`]：明文 MultiBuffer → 装帧（原地 seal + 帧头回填）→ 一批帧拼成一段
+//!   连续字节，一次单缓冲写落 wire
 //!
 //! 旧实现是「wire ↔ chunk 泵 ↔ `tokio::io::duplex` ↔ dispatch link」，每方向固定多 2 遍
 //! 用户态 memcpy（写进环 + 读出环）。直挂后：下行 0 遍、上行 1 遍（明文入装帧块）。
@@ -22,10 +22,7 @@ use xray_buf::{
 use xray_crypto::aead::AeadCipher;
 
 use crate::{
-    encoding::{
-        ChunkNonceGenerator,
-        body_chunk::{ChunkFrame, SizeParser, write_chunk_frame},
-    },
+    encoding::{ChunkNonceGenerator, body_chunk::SizeParser},
     inbound::server::BodyCipher,
 };
 
@@ -124,9 +121,21 @@ pub(crate) struct ChunkWriter<W> {
     size_parser: Box<dyn SizeParser + Send>,
     global_padding: bool,
     no_termination: bool,
-    frame: ChunkFrame,
+    /// 批缓冲：整批帧在**同一段连续字节**里（`[size][ct‖tag][padding]` 帧序列紧挨），
+    /// `flush` 后 `clear` 复用容量（零 realloc）。
+    batch: Vec<u8>,
     terminated: std::cell::Cell<bool>,
 }
+
+/// 一批帧数（批缓冲目标 ≈ 64 KiB）。
+///
+/// 本机 loopback 实测内核态成本：每 8 KiB send ≈ 53µs、每 64 KiB send ≈ 72µs
+/// ⇒ **成本随 send 次数走、不随字节走**（8 KiB×8 次 = 424µs vs 64 KiB×1 次 = 72µs）。
+/// 攒 8 帧一次写 ⇒ 每 MiB 16 次 send（bd 7choj）。
+///
+/// 注意：`write_vectored` 传 8 段**不等于**一次大 send（每段仍各自处理，实测无收益），
+/// 必须把帧字节拼进同一段连续内存。
+const FRAME_BATCH: usize = 8;
 
 impl<W> ChunkWriter<W> {
     pub(crate) fn new(
@@ -137,6 +146,11 @@ impl<W> ChunkWriter<W> {
         global_padding: bool,
         no_termination: bool,
     ) -> Self {
+        // 一批的字节上界：每帧 [size + 明文上限 + tag + padding 上限]
+        let frame_wire = size_parser.size_bytes()
+            + PAYLOAD_MAX
+            + cipher.tag_size()
+            + crate::encoding::body_chunk::MAX_PADDING;
         Self {
             stream,
             cipher,
@@ -144,9 +158,69 @@ impl<W> ChunkWriter<W> {
             size_parser,
             global_padding,
             no_termination,
-            frame: ChunkFrame::new(),
+            batch: Vec::with_capacity(FRAME_BATCH * frame_wire),
             terminated: std::cell::Cell::new(false),
         }
+    }
+
+    /// 收尾当前帧：原地 AEAD seal 明文区 → 追加 padding → 回填 size 字段。
+    ///
+    /// 明文已由调用方写进 `batch[off + sb .. off + sb + n]`（size 字段的 `sb` 字节
+    /// 占位也在 `off` 处）。SHAKE128 流顺序：`next_padding_len` → `encode`（与 decode 侧对称）。
+    #[allow(clippy::too_many_arguments, reason = "批缓冲原位装帧：每项都是本帧构帧参数")]
+    fn finish_frame(
+        batch: &mut Vec<u8>,
+        off: usize,
+        n: usize,
+        sb: usize,
+        tag_len: usize,
+        cipher: &BodyCipher,
+        nonce: &[u8],
+        size_parser: &mut (dyn SizeParser + Send),
+        global_padding: bool,
+    ) -> Result<()> {
+        let padding_size =
+            if global_padding { usize::from(size_parser.next_padding_len()) } else { 0 };
+        // 先把 tag/padding 区纳入 len（本帧的线上长度：size ‖ 密文 ‖ tag ‖ padding）
+        batch.resize(off + sb + n + tag_len + padding_size, 0);
+        {
+            // 原地 AEAD：载荷 [off+sb, off+sb+n) 覆写为密文，tag 紧随其后（同一段字节）
+            let (head, tail) = batch.split_at_mut(off + sb + n);
+            let tag: &mut [std::mem::MaybeUninit<u8>] = {
+                // SAFETY: `tail[..tag_len]` 是本次 `resize` 已纳入 len 的连续字节区；
+                // `MaybeUninit<u8>` 与 `u8` 同布局，seal 会把它整段写满（只写不读）。
+                unsafe {
+                    std::slice::from_raw_parts_mut(
+                        tail.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                        tag_len,
+                    )
+                }
+            };
+            cipher
+                .seal_in_place_with_tag(nonce, &[], &mut head[off + sb..], tag)
+                .map_err(|e| Error::WriteError(e.to_string()))?;
+        }
+        if padding_size > 0 {
+            use rand::RngCore;
+            rand::rng().fill_bytes(&mut batch[off + sb + n + tag_len..]);
+        }
+        // size 字段 u16：超出即显式报错（静默回退 u16::MAX 会致收端按 65535 读、错位）
+        let size_value = u16::try_from(n + tag_len + padding_size)
+            .map_err(|_| Error::WriteError("vmess chunk size exceeds u16".into()))?;
+        size_parser.encode(size_value, &mut batch[off..off + sb]);
+        Ok(())
+    }
+}
+
+impl<W: AsyncWrite + Unpin> ChunkWriter<W> {
+    /// 发出批缓冲（1 次单缓冲写），随后清空复用容量。
+    async fn flush_batch(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(&self.batch).await.map_err(|e| Error::WriteError(e.to_string()))?;
+        self.batch.clear();
+        Ok(())
     }
 }
 
@@ -155,35 +229,60 @@ impl<W: AsyncWrite + Unpin + Send> Writer for ChunkWriter<W> {
         &mut self,
         mb: MultiBuffer,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async move {
+        // 站点归集（bd 7choj）：本函数的分配 = 每帧装帧开销的唯一候选面。
+        Box::pin(xray_common::alloc_site::scope(xray_common::alloc_site::VMESS_FRAME, async move {
             let tag_len = self.cipher.tag_size();
-            let mut mb = mb;
-            while !mb.is_empty() {
-                let cap = self.frame.plaintext_max(tag_len).min(PAYLOAD_MAX);
-                let piece = mb.split_bytes(cap);
-                let n = piece.len();
+            let sb = self.size_parser.size_bytes();
+            let frame_wire = sb
+                + PAYLOAD_MAX
+                + tag_len
+                + if self.global_padding { crate::encoding::body_chunk::MAX_PADDING } else { 0 };
+            let batch_limit = FRAME_BATCH * frame_wire;
+            // 逐帧装填：游标走过源 Buffer，**不切 MultiBuffer**。
+            // `split_bytes` 每帧新建 `Vec<Buffer>`（跨块时另有 `drain().collect()`），
+            // 即每帧 2 次堆 churn；bd 7choj 实测这笔 churn 在 Windows 上换来每 MiB
+            // 上百次缺页、内核态 +4ms/MiB（吞吐 141 vs 基线 262 MB/s）。
+            let mut bufs = mb.into_buffers().into_iter();
+            let mut cur = bufs.next();
+            loop {
+                if self.batch.len() + frame_wire > batch_limit {
+                    self.flush_batch().await?;
+                }
+                let off = self.batch.len();
+                // size 字段占位（帧末回填），随后是明文区
+                self.batch.resize(off + sb, 0);
+                let mut n = 0usize;
+                while n < PAYLOAD_MAX {
+                    let Some(buf) = cur.as_mut() else { break };
+                    if buf.is_empty() {
+                        cur = bufs.next();
+                        continue;
+                    }
+                    let take = buf.len().min(PAYLOAD_MAX - n);
+                    self.batch.extend_from_slice(&buf.bytes()[..take]);
+                    buf.advance(take);
+                    n += take;
+                }
                 if n == 0 {
+                    // 源已空：撤掉本帧占位（不留半帧）
+                    self.batch.truncate(off);
                     break;
                 }
-                for buf in piece.iter() {
-                    self.frame.write_plaintext(buf.bytes());
-                }
                 let nonce = self.nonce_gen.next_ref();
-                write_chunk_frame(
-                    &mut self.stream,
-                    &mut self.frame,
+                Self::finish_frame(
+                    &mut self.batch,
+                    off,
                     n,
+                    sb,
+                    tag_len,
                     &self.cipher,
                     nonce,
                     self.size_parser.as_mut(),
                     self.global_padding,
-                )
-                .await
-                .map_err(|e| Error::WriteError(e.to_string()))?;
-                self.frame.clear();
+                )?;
             }
-            Ok(())
-        })
+            self.flush_batch().await
+        }))
     }
 
     /// 终止 chunk（`seal([])`）由 [`Writer::shutdown_flush`] 写（旧泵在明文源 EOF 时写）。
@@ -195,20 +294,26 @@ impl<W: AsyncWrite + Unpin + Send> Writer for ChunkWriter<W> {
             if !self.terminated.get() {
                 self.terminated.set(true);
                 if !self.no_termination {
-                    self.frame.clear();
+                    // 终止 chunk：明文 0 字节，wire 上只余 size + tag（+ padding）
+                    let sb = self.size_parser.size_bytes();
+                    let tag_len = self.cipher.tag_size();
+                    let off = self.batch.len();
+                    self.batch.resize(off + sb, 0);
                     let nonce = self.nonce_gen.next_ref();
-                    write_chunk_frame(
-                        &mut self.stream,
-                        &mut self.frame,
+                    Self::finish_frame(
+                        &mut self.batch,
+                        off,
                         0,
+                        sb,
+                        tag_len,
                         &self.cipher,
                         nonce,
                         self.size_parser.as_mut(),
                         self.global_padding,
                     )
-                    .await?;
-                    self.frame.clear();
+                    .map_err(std::io::Error::other)?;
                 }
+                self.flush_batch().await.map_err(std::io::Error::other)?;
             }
             self.stream.flush().await?;
             self.stream.shutdown().await?;
@@ -257,16 +362,15 @@ mod tests {
     use xray_crypto::aead::Aes128Gcm;
 
     use super::*;
-    use crate::encoding::body_chunk::{ChunkFrame, PlainSizeParser};
+    use crate::encoding::body_chunk::{ChunkFrame, PlainSizeParser, write_chunk_frame};
 
     fn aes_cipher(key: &[u8; 16]) -> BodyCipher {
         BodyCipher::Aes(Aes128Gcm::new(key).expect("aes key"))
     }
 
-    /// wire 不变量 W1：写半产出的字节与旧泵路径（`write_chunk_frame`）**逐字节相同**。
-    ///
-    /// 写半内部复用同一份 `write_chunk_frame` ⇒ 结构上不可能漂移；本测试把
-    /// 「同一明文 + 同一 nonce 序列 + 同一 size parser」的旧路径字节钉死。
+    /// wire 不变量 W1：写半产出的字节与 [`write_chunk_frame`]（单帧参考构帧路径）
+    /// **逐字节相同**。写半现在走「攒批连续字节 + 一次 write_all」，本测试把
+    /// 「同一明文 + 同一 nonce 序列 + 同一 size parser」的参考字节钉死 ⇒ 攒批不得改 wire。
     #[tokio::test]
     async fn chunk_writer_bytes_match_write_chunk_frame() {
         let key = [7u8; 16];
@@ -285,7 +389,7 @@ mod tests {
 
         // 旧路径：同一份 write_chunk_frame + 同一 nonce 序号
         let mut want = Vec::new();
-        let mut frame = ChunkFrame::new();
+        let mut frame = ChunkFrame::new(2);
         let mut nonce_gen = ChunkNonceGenerator::new(&iv, 12);
         let mut sp = PlainSizeParser;
         frame.write_plaintext(plaintext);
@@ -302,6 +406,42 @@ mod tests {
         .expect("write_chunk_frame");
 
         assert_eq!(&got[..n], &want[..], "写半字节必须与旧泵逐字节相同");
+    }
+
+    /// 帧边界不变式：同一明文按**任意 Buffer 切分**喂入，产出必须与「单块喂入」
+    /// 逐字节相同——逐帧装填走游标而非 `split_bytes`，不得改变分帧边界或 nonce 序号。
+    #[tokio::test]
+    async fn chunk_writer_multibuffer_framing_matches_contiguous() {
+        async fn wire_of(parts: &[&[u8]], key: &[u8; 16], iv: [u8; 16]) -> Vec<u8> {
+            let (mut wire_r, wire_w) = tokio::io::duplex(64 * 1024);
+            let mut writer = ChunkWriter::new(
+                wire_w,
+                aes_cipher(key),
+                iv,
+                Box::new(PlainSizeParser),
+                false,
+                false,
+            );
+            let mut mb = MultiBuffer::new();
+            for p in parts {
+                mb.merge_bytes(p);
+            }
+            writer.write_multi_buffer(mb).await.expect("write chunk");
+            writer.shutdown_flush().await.expect("flush");
+            let mut out = Vec::new();
+            wire_r.read_to_end(&mut out).await.expect("read wire");
+            out
+        }
+
+        let key = [0x11u8; 16];
+        let iv = [0x22u8; 16];
+        let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+        let one = wire_of(&[&payload[..]], &key, iv).await;
+        let parts: [&[u8]; 4] =
+            [&payload[..7], &payload[7..9000], &payload[9000..30001], &payload[30001..]];
+        let many = wire_of(&parts, &key, iv).await;
+        assert_eq!(one.len(), many.len(), "分块喂入不得改变帧长序列");
+        assert_eq!(one, many, "分块喂入不得改变帧边界/nonce 序号");
     }
 
     /// wire 不变量 W2：写半 → 读半往返，明文逐字节相同（多批 + 跨 chunk 边界）。
