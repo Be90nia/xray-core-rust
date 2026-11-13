@@ -126,12 +126,20 @@ impl Config {
         // version 等硬错都在该链触发）。Rust 的 lint 注册表此前仅测试调用
         // （生产死代码），而 build() 是所有配置的唯一生产 funnel（xray-cli
         // run.rs `load_first_config` → `Config::build`），故在此自举内置阶段
-        // （register_builtin_stages 按名跳过已注册项，幂等）并执行。阶段回调需要 `&mut Config`
-        // （FakeDNS 默认池填充），而 build(&self) 不可变：在克隆体上校验，
-        // 填充不回写——除新增硬错外，生产行为与既有完全一致。
+        // （register_builtin_stages 按名跳过已注册项，幂等）并执行。
+        //
+        // 阶段回调是**写回型**（FakeDNS 默认池填充），故在克隆体上跑后必须由产物侧
+        // 读**该克隆体**（bd j9rn3）：此前把克隆体丢掉、继续读原始 `self`，注入结果
+        // 全丢——`dns.servers:["fakedns"]` 而无 `fakeDns` 块时产物缺 fakeDns app，
+        // DNS 照常返回 240/4 假 IP 但无反向映射，连接全失败且零日志。
         crate::init::register_builtin_stages();
-        crate::lint::post_process(&mut self.clone())?;
+        let mut staged = self.clone();
+        crate::lint::post_process(&mut staged)?;
+        staged.build_staged()
+    }
 
+    /// [`Config::build`] 的后半程：读已完成 lint 阶段的配置（注入已回写）。
+    fn build_staged(&self) -> Result<BuiltConfig> {
         // Go xray.go:532-536：Build 第一步注入 env，先于后续 env:VAR 值展开。
         // SAFETY: build_config 在进程启动早期、工作线程/异步 runtime 创建之前
         // 单次调用，与 Go os.Setenv（xray.go:534）语义对齐；无并发 env 访问窗口。
@@ -592,6 +600,34 @@ mod tests {
         let kinds: Vec<&str> = built.apps.iter().map(|a| a.kind.as_str()).collect();
         assert!(kinds.contains(&"fakeDns"));
         assert!(kinds.contains(&"burstObservatory"));
+    }
+
+    /// bd j9rn3（bd w5krw T-3）：走 `build()` 全链，钉住**注入回写生效**。
+    ///
+    /// `dns.servers: ["fakedns"]` 且未写 `fakeDns` 块 ⇒ `FakeDNS` 阶段在 build 内
+    /// 填默认池（Go `infra/conf/fakedns.go:74-118`），该填充必须出现在 `BuiltConfig.apps`
+    /// 里——否则 fakeDns app 缺失，DNS 照常返回 240/4 假 IP 但无反向映射，连接全失败
+    /// 且零日志。修前此断言必红（post_process 跑在克隆体上且不回写）。
+    #[test]
+    fn build_applies_fakedns_default_pool_injection() {
+        let _g = registry_lock();
+        let json = r#"{
+            "dns": { "servers": ["fakedns"] },
+            "outbounds": [{ "protocol": "freedom", "tag": "direct" }]
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let built = cfg.build().expect("build");
+        let entry = built
+            .apps
+            .iter()
+            .find(|a| a.kind == "fakeDns")
+            .expect("FakeDNS stage must inject default pools into built apps");
+        let v: Value = serde_json::from_slice(&entry.data).unwrap();
+        let pools = v.as_array().expect("dual-stack default = pool array");
+        assert_eq!(pools.len(), 2, "双栈默认双池, got {v}");
+        assert_eq!(pools[0]["ipPool"], "198.18.0.0/15");
+        assert_eq!(pools[0]["poolSize"], 32768);
+        assert_eq!(pools[1]["ipPool"], "2001:2::/48");
     }
 
     // ===== transportLayer 代理门控（bd enk）=====
