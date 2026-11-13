@@ -12,11 +12,11 @@
 //! - **listener**：hub 装配（`crate::hub::listen_masque`）+ 认证委托 + 协议桥 （bd anygg G2）。gate
 //!   = 进程级共享 users 闸（`hub::shared_auth_gate`，由 proxy 层 `xray_proxy_masque::server::serve`
 //!   注册）；本进程无 masque users 源 时按 Go `hub.go:53` ServeHTTP 语义放行（transport
-//!   层无认证，协议层自认证 ——VLESS UUID 与 ws/grpc 同列）。acceptor =
-//!   `HandlerAcceptor`：隧道升级 （CONNECT-IP 会话）→ ADDRESS_REQUEST 回应（本仓 dialer
-//!   `establish` 协商 契约；缺省段地址 inert）→ `PacketStreamConn` 裸流适配 → `ConnHandler`
-//!   （协议 listener，如 VLESS inbound worker）。生产装配入口 = arm_builders
-//!   `inbound:masque`（gate/acceptor 由 proxy users 表一体提供，不经本注册表）。
+//!   层无认证，协议层自认证 ——VLESS UUID 与 ws/grpc 同列）。acceptor = `HandlerAcceptor`：隧道升级
+//!   （CONNECT-IP 会话）→ ADDRESS_REQUEST 回应（本仓 dialer `establish` 协商 契约；缺省段地址
+//!   inert）→ `PacketStreamConn` 裸流适配 → `ConnHandler` （协议 listener，如 VLESS inbound
+//!   worker）。生产装配入口 = arm_builders `inbound:masque`（gate/acceptor 由 proxy users
+//!   表一体提供，不经本注册表）。
 
 use std::{io, sync::Arc};
 
