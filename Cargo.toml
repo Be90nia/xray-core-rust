@@ -91,7 +91,7 @@ members = [
 
 # udf-frame 仓内工作副本（独立 git 仓；本地开发 path 依赖源，CI 由拉料步骤生成）——
 # 必须排除：path 依赖落在 workspace 目录内会被 cargo 自动纳入 member。
-exclude = ["crates/udf-frame"]
+exclude = ["crates/udf-frame", "vendor/h2"]
 
 [workspace.package]
 version = "0.1.0"
@@ -256,6 +256,14 @@ tokio-rustls = { path = "vendor/tokio-rustls" }
 # （字节级对齐），唯一本地 patch 见 REBASE 注释：
 # vendor/quinn-proto/src/connection/datagrams.rs max_size()。
 quinn-proto = { path = "vendor/quinn-proto" }
+# h2 WINDOW_UPDATE 回填粒度：h2 缺省按「窗口的一半」回填（threshold = window/2）
+# ⇒ 稳态在飞只有半窗 ⇒ 高 RTT 路径带宽被砍半（实测 RTT170ms 69.8-70.1 MB/s、
+# RTT400ms 35.6-35.8 MB/s，恰好一半；见 reports/2026-11-13-readonly-threeaxis-audit.md
+# §11-§13）。本仓 patch 面：src/proto/streams/flow_control.rs 一处阈值改为 Go
+# x/net/http2 粒度（inflowMinRefresh = 4KiB，http2/flow.go:12-14）。
+# 基线 = 上游 crates.io h2 0.4.20 原版；vendor 升级路径：新上游 release 解 .crate
+# 后叠本 patch（手法同 quinn-proto / rustls，SOP 见 vendor/h2/REBASE.md）。
+h2 = { path = "vendor/h2" }
 
 [profile.release]
 lto = "fat"
