@@ -213,6 +213,8 @@ impl ResolvesServerCert for SniCertResolver {
 /// - **单证书**：btls 侧无 SNI 多证书选择接线 ⇒ 多张 `encipherment` 条目**配置期硬错**
 ///   （否则会静默用首张，SNI 命中错证书）。
 /// - **无 mTLS**：`certificates[].usage:"verify"`（客户端 CA）有配置即**硬错**。
+/// - **无动态签发**：`certificates[].usage:"issue"`（Go 按 SNI 现签）同样**硬错**——btls
+///   单证书后端签不出证书，静默跳过会让每条握手失败。
 /// - **无热重载**：ctx 静态；`certificateFile`/`keyFile` 装配期读一次。
 /// - `masterKeyLog` / `enableSessionResumption=false` / `cipherSuites` / `curvePreferences`
 ///   后端未接线 ⇒ 聚合成一条 warn 列出被忽略的键（与 rustls 侧 「不支持的密钥套件 warn
@@ -222,7 +224,7 @@ impl ResolvesServerCert for SniCertResolver {
 ///
 /// # Errors
 /// - 证书/私钥读取或解析失败、证书与私钥不匹配
-/// - 多证书条目 / `usage:"verify"` 条目（`Unsupported`）
+/// - 多证书条目 / `usage:"verify"` / `usage:"issue"` 条目（`Unsupported`）
 /// - ECH keys 非法（BoringSSL 拒绝，含非 HKDF-SHA256 suite / 无 retry config）
 #[cfg(not(target_os = "ios"))]
 pub fn build_btls_server_context(
@@ -245,8 +247,18 @@ pub fn build_btls_server_context(
                     ));
                 },
                 EntryUsage::Encipherment => {},
-                // 与 build_named_cert_keys 同口径：`issue`（动态签发）不是服务端证书。
-                EntryUsage::Issue => continue,
+                // Go `tls/config.go:145-171` + `:205-235` 按 SNI 用 issue 证书现签
+                // （getGetCertificateFunc）；btls 单证书后端无法等价 ⇒ 硬错。
+                // 静默跳过 = 无可用证书 ⇒ 启动成功但每次握手失败（bd wr9e6）。
+                EntryUsage::Issue => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "certificates[].usage:\"issue\" (per-SNI dynamic issuance) is not \
+                         supported by the btls backend: it serves a single static certificate, \
+                         so every handshake would fail; replace the issue authority with a \
+                         static certificate + key (usage:\"encipherment\")",
+                    ));
+                },
             }
             let (certs, key) = entry_certs_and_key(entry)?;
             let Some(key) = key else {

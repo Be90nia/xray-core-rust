@@ -367,6 +367,23 @@ mod tests {
         assert!(err.to_string().contains("verify"), "got: {err}");
     }
 
+    /// `usage:"issue"`（动态签发）+ ECH ⇒ 硬错（bd wr9e6：btls 单证书后端签不出
+    /// 证书，静默跳过 = 启动成功但每条握手失败；Go `tls/config.go:145-171` 是现签）。
+    #[test]
+    fn issue_entry_with_ech_is_config_error() {
+        let (leaf, ca) = (leaf_cert(&[INNER_NAME]), leaf_cert(&["ca.example"]));
+        let json = serde_json::json!({
+            "certificates": [
+                certs_entry(&leaf),
+                { "certificate": ca.cert_pem, "key": ca.key_pem, "usage": "issue" },
+            ],
+            "echServerKeys": ech_keys_b64(),
+        });
+        let err = build_inbound_acceptor("tls", Some(&json)).err().expect("must fail");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("issue"), "got: {err}");
+    }
+
     /// 非 TLS security 不建 acceptor；未知值沿用 rustls 侧既有硬错文案。
     #[test]
     fn security_routing_matches_existing_semantics() {

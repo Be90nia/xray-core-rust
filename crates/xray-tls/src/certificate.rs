@@ -164,7 +164,7 @@ pub enum EntryUsage {
     Encipherment,
     /// 用作验证客户端证书的 CA（mTLS）。
     Verify,
-    /// 动态签发 CA（未实现动态签发，仅参与过滤）。
+    /// 动态签发 CA（未实现动态签发：rustls 路径过滤掉，btls 路径配置期硬错）。
     Issue,
 }
 

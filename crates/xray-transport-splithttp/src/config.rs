@@ -777,9 +777,10 @@ impl Config {
 
     /// 构造 XPaddingConfig。采样 padding 长度 + 根据 `x_padding_obfs_mode` 选择 placement。
     ///
-    /// `obfs_mode = false`（默认）：placement=queryInHeader, header=Referer, key=x_padding（与切片
-    /// A 行为对齐，但 length 由硬编码 0 改为随机）。 `obfs_mode = true`：placement/key/header
-    /// 来自 config 字段，空时用默认。
+    /// `obfs_mode = false`（默认）：placement=queryInHeader, header=Referer, key=x_padding
+    /// （Go `config.go:315-320` 客户端非 obfs 形态）。`obfs_mode = true`：placement/key/header
+    /// 来自 config 字段，空时用 Go 缺省 queryInHeader / x_padding / **X-Padding**
+    /// （Go `infra/conf/transport_method.go:348-358`，bd h49yy）。
     #[must_use]
     pub(crate) fn build_xpadding_config(&self, base_uri: &str) -> XPaddingConfig {
         let range = self.get_normalized_x_padding_bytes();
@@ -803,7 +804,7 @@ impl Config {
                         self.x_padding_key.clone()
                     },
                     header: if self.x_padding_header.is_empty() {
-                        "Referer".to_string()
+                        "X-Padding".to_string()
                     } else {
                         self.x_padding_header.clone()
                     },
@@ -1514,6 +1515,18 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .expect("User-Agent must be set");
         assert!(ua.contains("Chrome/"), "UA must masquerade as Chrome, got: {ua}");
+    }
+
+    #[test]
+    fn build_xpadding_config_obfs_defaults_match_go() {
+        // bd h49yy：Go `infra/conf/transport_method.go:348-358` 的缺省是
+        // key=x_padding / header=X-Padding / placement=queryInHeader；本仓此前 header
+        // 缺省写 Referer ⇒ obfs 模式下服务端按 X-Padding 取不到 padding ⇒ 双向 400。
+        let cfg = Config { x_padding_obfs_mode: true, ..Default::default() };
+        let placement = cfg.build_xpadding_config("https://h/ws").placement;
+        assert_eq!(placement.key, "x_padding");
+        assert_eq!(placement.header, "X-Padding");
+        assert_eq!(placement.placement, PLACEMENT_QUERY_IN_HEADER);
     }
 
     #[test]

@@ -88,7 +88,7 @@ use xray_proxy_vless::{
 };
 use xray_proxy_vmess::{
     MemoryAccount as VmessMemoryAccount, MemoryUser as VmessMemoryUser,
-    TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator, VmessError,
+    TimedUserValidator as VmessTimedUserValidator, Validator as VmessValidator,
 };
 use xray_proxy_wireguard::DeviceConfig;
 use xray_transport::{
@@ -5572,9 +5572,10 @@ pub(crate) fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoIn
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
 ///
 /// JSON 格式：`{"clients":[{"id":"uuid","level":0,"alterId":0,"email":""}]}`。
-/// 现代 VMess (AEAD) 不用 alterId：Go v26 已删除该字段，legacy 请求在服务端死于
-/// "invalid user"。本实现保留兼容字段但 alterId≠0 直接拒绝（fail-fast），
-/// 不静默忽略。`id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
+/// 现代 VMess (AEAD) 不用 alterId：Go v26 已删除该字段（`infra/conf/vmess.go:20-24`
+/// 的 Account 无 alterId），JSON 未知键被忽略、配置照常启动；本实现同口径——alterId≠0
+/// 只 warn 不拒启，legacy 请求在服务端仍死于 "invalid user"（bd fpmj8）。
+/// `id` 解析为 `UUID` → `MemoryAccount::new(uuid)`。
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
 pub(crate) fn build_vmess_validator(
     data: &[u8],
@@ -5599,17 +5600,17 @@ pub(crate) fn build_vmess_validator(
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let level =
                 c.get("level").and_then(|x| x.as_u64()).unwrap_or(u64::from(default_level)) as u32;
-            // alterId≠0 = legacy VMess 意图，AEAD-only 实现直接拒绝（数字/字符串都认）。
+            // alterId≠0 = legacy VMess 配置残留。Go `infra/conf/vmess.go:20-24` 的
+            // VMessAccount 没有 alterId 字段 ⇒ encoding/json 忽略未知键、照常启动
+            // （AEAD 本就不用 alterId）。这里同口径：只 warn 不拒启——旧 v2rayN 配置
+            // 普遍带 `"alterId": 64`，拒启等于整入站消失（bd fpmj8）。
             let alter_id = c
                 .get("alterId")
                 .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
                 .unwrap_or(0);
             if alter_id != 0 {
                 // id 是客户端凭据（S-11）：只报 alterId，不落 UUID 原文。
-                tracing::warn!(alter_id, "vmess inbound: legacy VMess is not supported");
-                return Err(std::io::Error::other(
-                    VmessError::UnsupportedLegacyAlterId(alter_id).to_string(),
-                ));
+                tracing::warn!(alter_id, "vmess inbound: ignoring legacy alterId (AEAD-only)");
             }
             let uuid = UUID::parse(id).ok_or_else(|| {
                 // 同上：错误链经 `error = %e` 直落日志，只留长度不留原文。
@@ -12306,28 +12307,30 @@ mod tests {
         assert!(super::build_vmess_validator(&data).is_err());
     }
 
-    /// alterId>0 的 legacy VMess 不支持（AEAD-only）：启动即报错，不静默忽略。
+    /// bd fpmj8：`alterId` 是 Go 侧根本不存在的键（`infra/conf/vmess.go:20-24` 的
+    /// VMessAccount 无该字段 ⇒ json 忽略未知键），配置照常启动、用户照常入表。
+    /// 旧断言钉住的是「整入站拒启」，与 Go 相反。
     #[test]
-    fn build_vmess_validator_alter_id_nonzero_fails() {
+    fn build_vmess_validator_alter_id_nonzero_ignored() {
         let settings = serde_json::json!({
             "clients": [{ "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57", "alterId": 64 }]
         });
         let data = serde_json::to_vec(&settings).unwrap();
-        let err = match super::build_vmess_validator(&data) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("alterId=64 should be rejected"),
-        };
-        assert!(err.contains("alterId"), "unexpected error: {err}");
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
     }
 
-    /// 字符串形式 alterId（老配置生成器输出）同样拒绝。
+    /// 字符串形式 alterId（老配置生成器输出）同样只 warn 不拒启。
     #[test]
-    fn build_vmess_validator_alter_id_string_fails() {
+    fn build_vmess_validator_alter_id_string_ignored() {
         let settings = serde_json::json!({
             "clients": [{ "id": "66ad4540-b58c-4ad2-9926-ea63445a9b57", "alterId": "64" }]
         });
         let data = serde_json::to_vec(&settings).unwrap();
-        assert!(super::build_vmess_validator(&data).is_err());
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
     }
 
     /// alterId==0 走现有 AEAD 路径，validator 正常构建。

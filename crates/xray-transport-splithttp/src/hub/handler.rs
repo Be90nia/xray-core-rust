@@ -257,7 +257,7 @@ fn apply_xpadding_to_response(
             ctx.config.x_padding_key.as_str()
         };
         let header = if ctx.config.x_padding_header.is_empty() {
-            "Referer"
+            "X-Padding"
         } else {
             ctx.config.x_padding_header.as_str()
         };
@@ -707,7 +707,7 @@ fn extract_cookie_payload(headers: &HeaderMap, key: &str) -> Vec<u8> {
 fn extract_obfs_padding(headers: &HeaderMap, uri: &http::Uri, cfg: &Config) -> String {
     let key = if cfg.x_padding_key.is_empty() { "x_padding" } else { cfg.x_padding_key.as_str() };
     let header =
-        if cfg.x_padding_header.is_empty() { "Referer" } else { cfg.x_padding_header.as_str() };
+        if cfg.x_padding_header.is_empty() { "X-Padding" } else { cfg.x_padding_header.as_str() };
 
     // 1. cookie(key)
     let cookie_val = cookie_get(headers, key);
@@ -903,13 +903,26 @@ mod tests {
 
     #[test]
     fn extract_obfs_padding_query_in_header() {
-        // 默认 placement（空 = 非 header 分支）+ 默认 Referer：header 值是
-        // URL，padding 在其 query 参数（queryInHeader 语义）。
+        // 默认 placement（空 = 非 header 分支）+ 默认 header：Go 缺省 X-Padding
+        // （infra/conf/transport_method.go:352-354；bd h49yy 前此处错钉 Referer）。
+        // header 值是 URL，padding 在其 query 参数（queryInHeader 语义）。
+        let cfg = obfs_cfg("", "", "");
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Padding", "https://ref.example/page?x_padding=QQ".parse().unwrap());
+        let uri = "http://h/path".parse().unwrap();
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "QQ");
+    }
+
+    #[test]
+    fn extract_obfs_padding_default_ignores_referer_header() {
+        // bd h49yy 回归：obfs 模式缺省 header 是 X-Padding，不是 Referer——
+        // 从 Referer 取会在 Rust↔Go 间取到不同 header（Go 的
+        // ExtractXPaddingFromRequest obfs 路径读 c.XPaddingHeader → X-Padding）。
         let cfg = obfs_cfg("", "", "");
         let mut headers = HeaderMap::new();
         headers.insert("Referer", "https://ref.example/page?x_padding=QQ".parse().unwrap());
         let uri = "http://h/path".parse().unwrap();
-        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "QQ");
+        assert_eq!(extract_obfs_padding(&headers, &uri, &cfg), "");
     }
 
     #[test]
@@ -1166,6 +1179,26 @@ mod tests {
             range.from,
             range.to
         );
+    }
+
+    /// bd h49yy：obfs 模式缺省 header 同样是 X-Padding（Go
+    /// `infra/conf/transport_method.go:352-354`）——此前响应侧缺省写 Referer，
+    /// 与 Go 服务端出的 padding 互不通。
+    #[tokio::test]
+    async fn h3a_obfs_response_uses_default_x_padding_header() {
+        let ctx = make_ctx_with_config(Config { x_padding_obfs_mode: true, ..Config::default() });
+        let req = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/x")
+            .header("Host", "h")
+            .header("Access-Control-Request-Method", "POST")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = dispatch_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let pad = resp.headers().get("X-Padding").expect("obfs default header must be X-Padding");
+        assert!(pad.to_str().unwrap().starts_with("?x_padding="), "got {pad:?}");
+        assert!(resp.headers().get("Referer").is_none(), "default must not be Referer");
     }
 
     /// A-4（Go hub.go:129-135）：不带 `Access-Control-Request-Method` 的 OPTIONS 是
