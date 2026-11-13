@@ -22,7 +22,10 @@
 use std::{
     io,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     task::{Context, Poll},
 };
 
@@ -42,7 +45,8 @@ pub(crate) const UPLINK_CHUNK: usize = 64 * 1024;
 ///
 /// 旧口径按 hyper 16 MB send_buf 推导块数（64 KiB chunk ⇒ 258 块 ≈ 16.5 MB/流），
 /// 且 `idle_cap` 随在飞峰值涨到该上限 ⇒ 高负载后空闲常驻可逼近 16.5 MB。
-/// hyper 的 send_buf 属另一份账（连接缓冲面），**不是**本池可以跟着涨的理由。
+/// hyper 的 send_buf 属另一份账（连接缓冲面），**不是常驻预算可以跟着涨的理由**
+/// （宇宙记账上界另按 send_buf 深度推导，见 `pool_universe_blocks`）。
 ///
 /// 生产只存在 64 KiB 一种 chunk（上行 `UPLINK_CHUNK` = 下行
 /// `DUPLEX_BUF`，hub handler）⇒ 进程级合计 ≤ [`POOL_BYTE_BUDGET`]；
@@ -55,11 +59,34 @@ pub const POOL_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 /// 下限换的是「窗口小包不逐帧走直构」。
 const POOL_MIN_BLOCKS: usize = 4;
 
-/// 池容量硬上限 = 共享池**空闲块数**上界（按 [`POOL_BYTE_BUDGET`] 推导）：64 KiB
-/// chunk ⇒ 32 块 = 2 MB（进程级）。在飞块数不受此限——超上限时 `acquire_owned`
-/// 降级直构，只是不进 idle 常驻（`ObjectPool` 语义）。
+/// 池**空闲**块数上界（按 [`POOL_BYTE_BUDGET`] 推导）：64 KiB chunk ⇒ 32 块 =
+/// 2 MB（进程级常驻）。这只是常驻预算，**不是**在飞上界（见
+/// [`pool_universe_blocks`]）。
 fn pool_max_blocks(chunk: usize) -> usize {
     (POOL_BYTE_BUDGET / chunk.max(1)).max(POOL_MIN_BLOCKS)
+}
+
+/// 宇宙块数（在飞记账上界，bd vktyw）= **h2 send_buf 最大档 / chunk**。
+///
+/// `max`（宇宙）与 `idle_cap`（常驻）是两码事：块交给 h2 `SendBuffer` 后按引用
+/// 扣住不还（`vendor/h2/src/proto/streams/streams.rs`），在飞块数的物理上界由队列
+/// 深度决定（服务端 send_buf 32 MiB 档 / 64 KiB = 512 块）。宇宙若只等于空闲预算
+/// （32 块），超出的一律走「降级直构 + 归还即释放」⇒ **每帧一次 64 KiB 新分配**
+/// （实测 2.44 MB 分配 / MB 下发；1 MiB send_buf 档因果反证见
+/// `reports/audit-2026-11-14/vktyw.md`）。宇宙只记账、
+/// 不预分配（常驻仍由 [`pool_max_blocks`] 裁决）⇒ 放大它不涨内存。
+fn pool_universe_blocks(chunk: usize) -> usize {
+    let send_buf_blocks = xray_transport::h2_window::H2_SERVER_MAX_SEND_BUF_SIZE / chunk.max(1);
+    pool_max_blocks(chunk).max(send_buf_blocks)
+}
+
+/// bench/诊断专用：覆盖宇宙 / 空闲块数（bd vktyw 档位对照，未设置零影响）。
+const ENV_UNIVERSE_BLOCKS: &str = "XRAY_SPLITHTTP_POOL_UNIVERSE_BLOCKS";
+const ENV_IDLE_BLOCKS: &str = "XRAY_SPLITHTTP_POOL_IDLE_BLOCKS";
+
+/// 块数覆盖解析：非数字/零 = 未设置。
+fn env_blocks(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok().filter(|b| *b > 0)
 }
 
 /// `Bytes` 的缓冲所有者：`Bytes` 最后一个引用释放 ⇒ 本结构 Drop ⇒ 池句柄 Drop ⇒
@@ -99,8 +126,9 @@ impl AsRef<[u8]> for PooledBuf {
 /// - 在飞块数 = `metrics().core.borrowed`：块以 `'static` 句柄（`acquire_owned`） 随 [`PooledBuf`]
 ///   存续到 `Bytes` 最后一个引用释放，句柄 Drop 即归还——
 ///   「最后一个引用释放才归还」由引用计数天然保证，不需要第二套借还账本；
-/// - `idle_cap` 恒等于池上界（[`pool_max_blocks`]）：共享池的 2 MiB 是进程级预算
-///   承诺，恒定上界可审计；`idle_cap` 不预分配内存（块只有借过才占 idle 槽）， 低负载下常驻 =
+/// - `idle_cap` = 常驻预算（[`pool_max_blocks`]，2 MiB），`max` = 宇宙记账上界
+///   （[`pool_universe_blocks`]，bd vktyw——在飞块被 h2 扣住时仍留在宇宙内可回收，
+///   不再逐帧降级直构）；`idle_cap` 不预分配内存（块只有借过才占 idle 槽），低负载下 常驻 =
 ///   历史峰值在飞数 × chunk，与旧自适应抬升的稳态一致；
 /// - reset 钩子只做容量归一（红线：池化对象等重，防池毒化）；明文清零**不在钩子里**，
 ///   在**写入现场**按实际写入量做（bd vjii0 收口）：数据帧 [`PooledBuf::drop`] 的
@@ -123,11 +151,38 @@ pub(crate) struct PoolStream<R> {
 /// 按尺寸 class 分桶 / first-wins / 中毒恢复等语义文档见该件；本 crate 只留
 /// 池构造形状（预算公式 + reset 钩子，方向件留主仓口径不变）。
 fn build_chunk_pool(chunk: usize) -> Arc<ObjectPool<Vec<u8>>> {
+    // idle_cap = 常驻预算（归还即留池，不预分配）；max = 宇宙记账上界（须 ≥ idle_cap，
+    // 否则 panic）。分片数 = 构造期 `idle_cap.clamp(1, 8)` ⇒ 8 分片摊薄借还争用。
+    let ledger_idle = pool_max_blocks(chunk);
+    let idle = env_blocks(ENV_IDLE_BLOCKS).unwrap_or(ledger_idle);
+    let default_max = pool_universe_blocks(chunk);
+    let max = env_blocks(ENV_UNIVERSE_BLOCKS).unwrap_or(default_max).max(idle);
+    // 调参面必须可见（fail-visible，bd vktyw）：诊断覆盖偏离账本、或宇宙被抬平都要说，
+    // 禁静默把「覆盖生效 / 宇宙被常驻抬平」当成正常行为。
+    if idle != ledger_idle {
+        crate::LOG.warn(format!(
+            "{} splithttp block pool 常驻覆盖生效：idle={idle} 块 = {}B，偏离账本 \
+             SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES={}B（诊断 env，勿用于生产）",
+            ENV_IDLE_BLOCKS,
+            idle * chunk,
+            ledger_idle * chunk
+        ));
+    }
+    if max < default_max {
+        crate::LOG.warn(format!(
+            "{}={max} 小于 send_buf 推导的宇宙 {default_max} 块：在飞块超 {max} 即退回逐帧直构 \
+             （诊断 env，勿用于生产）",
+            ENV_UNIVERSE_BLOCKS
+        ));
+    }
+    crate::LOG.info(format!(
+        "splithttp block pool chunk={chunk}B idle={idle} 块（{}B 常驻）/ universe={max} 块（{}B 记账上界）",
+        idle * chunk,
+        max * chunk
+    ));
     Arc::new(ObjectPool::with_reset(
-        // idle_cap = max = 池上界：归还即留池（不预分配）；分片数 =
-        // 构造期 `idle_cap.clamp(1, 8)` ⇒ 8 分片摊薄并发借还争用。
-        pool_max_blocks(chunk),
-        pool_max_blocks(chunk),
+        max,
+        idle,
         move || vec![0u8; chunk],
         move |buf: &mut Vec<u8>| {
             // 容量归一：合规块只付一次 len 比较（`ReadBuf` 不改 Vec 的 len）。
@@ -163,7 +218,32 @@ impl<R> PoolStream<R> {
 
     /// 借一块（`'static` 句柄：归还点是任意 worker 线程的引用计数归零）。
     fn take_block(&self) -> Owned<Vec<u8>> {
+        self.warn_if_universe_saturated();
         self.pool.acquire_owned()
+    }
+
+    /// 宇宙饱和可见性（fail-visible，bd vktyw）：udf 池在宇宙满时静默走「降级直构」，
+    /// 只记 `degraded` 计数、生产侧无人读 ⇒ 退化成旧行为而无人知。这里每
+    /// `SAMPLE_EVERY_TAKES` 次借出抽样读一次 metrics（8 片锁，非热路径量级），
+    /// 首次发现降级即 WARN 一次（进程级一次，不刷屏）。
+    fn warn_if_universe_saturated(&self) {
+        static TAKES: AtomicU64 = AtomicU64::new(0);
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        const SAMPLE_EVERY_TAKES: u64 = 4096;
+        if TAKES.fetch_add(1, Ordering::Relaxed) % SAMPLE_EVERY_TAKES != 0
+            || WARNED.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let m = self.pool.metrics();
+        if m.degraded > 0 {
+            WARNED.store(true, Ordering::Relaxed);
+            crate::LOG.warn(format!(
+                "splithttp block pool universe={} 满：degraded={} constructed={} idle={} \
+                 —— 在飞块数超记账上界，退回逐帧直构（bd vktyw）",
+                m.core.max, m.degraded, m.constructed, m.core.idle
+            ));
+        }
     }
 
     /// 池内空闲块数（测试观测用）。
@@ -493,6 +573,23 @@ mod tests {
         assert_eq!(pool_max_blocks(POOL_BYTE_BUDGET), POOL_MIN_BLOCKS);
     }
 
+    /// 宇宙（在飞记账上界）必须覆盖服务端 send_buf 最大档（bd vktyw）。
+    /// **反向自检锚点**：把 `pool_universe_blocks` 改回 `pool_max_blocks`（宇宙 =
+    /// 常驻预算），本断言必红。
+    #[test]
+    fn pool_universe_covers_h2_send_buf_max_tier() {
+        use xray_transport::h2_window::H2_SERVER_MAX_SEND_BUF_SIZE;
+
+        let universe = pool_universe_blocks(UPLINK_CHUNK);
+        assert_eq!(universe, 512, "64 KiB chunk ⇒ 32 MiB send_buf / 64 KiB = 512 块宇宙");
+        assert!(
+            universe * UPLINK_CHUNK >= H2_SERVER_MAX_SEND_BUF_SIZE,
+            "宇宙 {} 字节须覆盖 send_buf 最大档 {H2_SERVER_MAX_SEND_BUF_SIZE}",
+            universe * UPLINK_CHUNK
+        );
+        assert!(pool_universe_blocks(4 * 1024) >= pool_max_blocks(4 * 1024), "宇宙恒 ≥ 常驻");
+    }
+
     /// **内存审计锚点（2026-11-04 audit4-memory）**：`POOL_BYTE_BUDGET` 是
     /// 池级预算。锚点登记时预算是**单实例**口径（每个 `PoolStream` 一份
     /// `Arc::new(ObjectPool::…)`，N 流 = N × 2 MiB 乘积面，见
@@ -557,7 +654,12 @@ mod tests {
         assert!(frames >= FRAMES, "帧数 = 数据量 / 块大小，实测 {frames}");
 
         let m = stream.pool.metrics();
-        assert_eq!(m.core.max, 32, "64 KiB ⇒ idle 上限 32 块（2 MB 预算）");
+        assert_eq!(
+            pool_max_blocks(UPLINK_CHUNK) * UPLINK_CHUNK,
+            2 * 1024 * 1024,
+            "64 KiB ⇒ idle 上限 32 块（2 MB 常驻预算）"
+        );
+        assert!(m.core.idle <= pool_max_blocks(UPLINK_CHUNK), "空闲块 ≤ 常驻预算");
         assert!(
             m.constructed <= 4,
             "{frames} 帧只允许 ≤4 次新分配（首块 + 读腿/在飞余量），constructed={}",
@@ -573,7 +675,7 @@ mod tests {
         let chunk = 4 * 1024;
         let stream = PoolStream::with_pool(tokio::io::empty(), isolated_pool(chunk));
 
-        // idle_cap 恒 = 池上界，足够收下这一块。
+        // idle_cap = 常驻预算（32 块），足够收下这一块。
         drop(stream.pool.insert(vec![0xCD; chunk * 3]));
         assert_eq!(stream.pool.metrics().core.idle, 1, "归一到定长的块才入池");
 

@@ -6,8 +6,8 @@
 //!
 //! ```text
 //! ObjectPool::with_reset(
-//!     max      = pool_max_blocks(64 KiB) = POOL_BYTE_BUDGET(2 MiB) / 64 KiB = 32 块
-//!     idle_cap = 同上 = 32 块
+//!     max      = pool_universe_blocks(64 KiB) = 32 MiB send_buf / 64 KiB = 512 块（在飞记账上界）
+//!     idle_cap = pool_max_blocks(64 KiB)      = POOL_BYTE_BUDGET(2 MiB) / 64 KiB = 32 块
 //!     factory  = || vec![0u8; 64 KiB]        （每次新构造 = 一次 64 KiB 分配）
 //!     reset    = 容量归一到 64 KiB
 //!     phase    = OnReturn
@@ -22,24 +22,28 @@
 //!
 //! 关键语义（udf `ObjectPool`）：
 //!
-//! - `max` = **池宇宙**（idle + 正常借出）硬上界，且**按分片均分**：`share(max, 8, idx) = 4` ⇒
-//!   全进程最多 **32 块**存活于池内（= 2 MiB，与 `POOL_BYTE_BUDGET` 口径一致）。
-//! - `idle_cap` 同为 32 ⇒ 全进程最多缓存 32 块（每片 4）。
+//! - `max` = **池宇宙**（idle + 正常借出）硬上界，且**按分片均分**：`share(512, 8, idx) = 64` ⇒
+//!   全进程最多 512 块存活于宇宙内（= 32 MiB，与 send_buf 最大档同量级，bd vktyw）。
+//! - `idle_cap` = **常驻预算** 32 块 ⇒ 全进程最多缓存 32 块（每片 4）；归还超出常驻预算
+//!   的部分直接释放（`dropped_overflow`），故常驻字节恒 ≤ `POOL_BYTE_BUDGET`。
 //! - 借出四路径（`objpool.rs::pop_or_build`）：① 命中 idle（`reused++`）→ ② 宇宙扩容
 //!   （`constructed++`，进入宇宙）→ ③ **宇宙已满 ⇒ 降级直构**（`constructed++` 且
 //!   `degraded++`，该块**不入宇宙**，归还即释放）→ ④ 同 ③。
-//! - `dropped_overflow` 只在**宇宙内**块归还时无处安放（每片 idle 已满且无片可迁）才 +1； 由于
-//!   `idle_cap == max`（每片 idle 上限 = 宇宙上限），归还必落在原属片 ⇒ 该计数恒 0。
+//! - `dropped_overflow` 记「宇宙内块归还但常驻预算已满」⇒ 释放（**不是**分配）。
 //!
 //! # 判据
 //!
 //! 设进程内**同时在飞的块数** = I（= 并发流数 × 每流在飞块数）：
 //!
 //! - I ≤ 32 ⇒ 每轮 `reused += I`，`constructed` 不再增长 ⇒ 池完全吸收，无 churn。
-//! - I > 32 ⇒ 每轮 `reused += 32`、`degraded += I-32`、`constructed += I-32` ⇒ **超出 32
-//!   的在飞块每次借出都是一次全新 64 KiB 分配**（churn）。
+//! - 32 < I ≤ 512 ⇒ 每轮 `reused += 32`、`constructed += I-32`、`dropped_overflow += I-32` ⇒
+//!   超出**常驻预算**的在飞块每次借出仍是一次全新 64 KiB 分配（churn 由常驻预算
+//!   决定，不是宇宙）；但**不再降级**（块仍在宇宙内，可在宇宙内回收）。
+//! - I > 512 ⇒ 再叠加 `degraded += I-512`（本表不覆盖该档）。
 //!
-//! 即：churn 的触发条件是**进程内在飞块总数 > 32**，不是"流数 > 32"。
+//! 即：churn 的触发条件是**进程内在飞块总数 > 常驻预算 32 块**，不是"流数 > 32"。
+//! 真实数据面里归还与借出交错发生（非本表的两相位），32 块深度的空闲栈足以吸收
+//! 抖动 ⇒ 实测分配量见 `reports/audit-2026-11-14/vktyw.md`（bd vktyw）。
 //!
 //! # 跑法
 //!
@@ -68,8 +72,13 @@ use skeleton_infra::{ObjectPool, ObjectPoolTuning, Owned, ResetPhase};
 /// 生产 chunk 大小（`pool_stream.rs::UPLINK_CHUNK` = `hub::handler::DUPLEX_BUF` = 64 KiB）。
 const CHUNK: usize = 64 * 1024;
 
-/// 生产池宇宙块数：`POOL_BYTE_BUDGET`(2 MiB) / 64 KiB = 32（`pool_stream.rs::pool_max_blocks`）。
-const UNIVERSE_BLOCKS: usize = 32;
+/// 生产池**空闲**块数（常驻预算）：`POOL_BYTE_BUDGET`(2 MiB) / 64 KiB = 32
+/// （`pool_stream.rs::pool_max_blocks`）。
+const IDLE_BLOCKS: usize = 32;
+
+/// 生产池**宇宙**块数（在飞记账上界）= 32 MiB send_buf / 64 KiB = 512 块
+/// （`pool_stream.rs::pool_universe_blocks`，bd vktyw）。
+const UNIVERSE_BLOCKS: usize = 512;
 
 /// 测量轮数（每轮 = 一次"全部流同时借出再全部归还"）。
 const ROUNDS: usize = 8;
@@ -78,7 +87,7 @@ const ROUNDS: usize = 8;
 fn shared_pool_replica() -> Arc<ObjectPool<Vec<u8>>> {
     Arc::new(ObjectPool::with_reset(
         UNIVERSE_BLOCKS,
-        UNIVERSE_BLOCKS,
+        IDLE_BLOCKS,
         move || vec![0u8; CHUNK],
         move |buf: &mut Vec<u8>| {
             // 容量归一（生产 reset 钩子同款：只比较 len，命中即零成本）。
@@ -158,19 +167,26 @@ fn sweep(threads: usize, depth: usize) -> Reading {
     Reading::of(&pool)
 }
 
-/// 期望读数（由 udf 池语义推导，见文件头「判据」）。
+/// 期望读数（由 udf 池语义推导，见文件头「判据」；覆盖 I ≤ 宇宙 512 块）。
 fn expected(in_flight: usize) -> Reading {
-    let universe = in_flight.min(UNIVERSE_BLOCKS);
-    let overflow = in_flight.saturating_sub(UNIVERSE_BLOCKS);
-    // 第 1 轮：idle 空 ⇒ 全部走构造路径（扩容 + 降级）。
-    let constructed = in_flight as u64 + (ROUNDS as u64 - 1) * overflow as u64;
-    let reused = (ROUNDS as u64 - 1) * universe as u64;
+    assert!(
+        in_flight <= UNIVERSE_BLOCKS,
+        "本表只覆盖 I ≤ 宇宙 {UNIVERSE_BLOCKS} 块（更深的积压会叠加降级，未建模）"
+    );
+    let resident = in_flight.min(IDLE_BLOCKS);
+    let over_resident = in_flight - resident;
+    // 第 1 轮：idle 空 ⇒ 全部走构造路径。此后每轮先命中常驻预算（≤32 块），再构造余量
+    // （宇宙 512 块足够 ⇒ 余量走路径②，不降级）。
+    let constructed = in_flight as u64 + (ROUNDS as u64 - 1) * over_resident as u64;
+    let reused = (ROUNDS as u64 - 1) * resident as u64;
     Reading {
         constructed,
         reused,
-        degraded: (ROUNDS as u64) * overflow as u64,
-        dropped_overflow: 0,
-        idle_blocks: universe,
+        // 宇宙放大后（bd vktyw）：在飞 ≤ 512 块全部正常借出，零降级。
+        degraded: 0,
+        // 超出常驻预算的归还直接释放（常驻预算的兑现方式，不是分配）。
+        dropped_overflow: (ROUNDS * over_resident) as u64,
+        idle_blocks: resident,
         borrowed_blocks: 0,
     }
 }
@@ -253,9 +269,9 @@ fn sweep_legacy(threads: usize, depth: usize) -> (Reading, usize) {
 fn replica_tuning_matches_production_shared_pool() {
     let pool = shared_pool_replica();
     let m = pool.metrics();
-    // `max` = 32 块（2 MiB / 64 KiB），`idle_cap` 同值 ⇒ 每片（8 片）4 块。
+    // `max` = 512 块宇宙（在飞记账上界），`idle_cap` = 32 块常驻预算 ⇒ 每片（8 片）64 / 4 块。
     assert_eq!(m.core.max, UNIVERSE_BLOCKS);
-    assert_eq!(m.core.max * CHUNK, 2 * 1024 * 1024, "池宇宙字节 = POOL_BYTE_BUDGET 口径");
+    assert_eq!(m.core.max * CHUNK, 32 * 1024 * 1024, "宇宙字节 = 服务端 send_buf 最大档");
     assert_eq!(m.core.idle, 0);
     assert_eq!(m.degraded, 0);
 }
@@ -296,10 +312,11 @@ fn in_flight_depth_drives_churn_not_stream_count() {
 /// A/B：**改前（每流一份池 + 自适应 idle_cap）vs 改后（进程级共享池）** 的 churn 对比。
 ///
 /// 回答票面核心问题「kw2si 是不是拿内存换了 CPU」：
-/// - 改前：N 流各一份 32 块宇宙 ⇒ 每流可独占 32 块 ⇒ **单流在飞 ≤ 32 时零 churn**；
-/// - 改后：全进程一份 32 块宇宙 ⇒ **进程内在飞 > 32 时开始降级直构**。
+/// - 改前：N 流各一份 32 块宇宙 ⇒ 每流可独占 32 块 ⇒ 单流在飞 ≤ 32 时零 churn；
+/// - 改后：全进程一份 512 块宇宙 + 32 块常驻预算 ⇒ 进程内在飞 > 32 块的部分每次借出
+///   仍要新分配（常驻预算决定 churn），但不再降级（bd vktyw 放大宇宙）。
 ///
-/// ⇒ churn 是 kw2si **引入的**（改前同形负载下不产生），代价换的是常驻内存 N×2 MiB → 2 MiB。
+/// ⇒ 共享池的分配代价仍在（常驻预算 2 MiB 的兑现方式），换来的是常驻 N×2 MiB → 2 MiB。
 #[test]
 fn shared_pool_introduces_churn_above_process_wide_32_in_flight_blocks() {
     // 每流各 1 块（最常见的稳态形态：一条流同一时刻在飞的块数很小）。
@@ -309,13 +326,14 @@ fn shared_pool_introduces_churn_above_process_wide_32_in_flight_blocks() {
         println!(
             "streams={streams:>4} | 改前(每流一份): universe={legacy_universe:>4} 块 \
              constructed={:<5} degraded={:<5} idle={} B | 改后(共享): universe={} 块 \
-             constructed={:<5} degraded={:<5} idle={} B",
+             constructed={:<5} degraded={:<5} dropped_ovf={:<5} idle={} B",
             legacy.constructed,
             legacy.degraded,
             legacy.idle_bytes(),
             UNIVERSE_BLOCKS,
             shared.constructed,
             shared.degraded,
+            shared.dropped_overflow,
             shared.idle_bytes(),
         );
         // 改前：每流峰值仅 1 块 ⇒ 每流宇宙 32 块远够 ⇒ 零降级、零丢弃。
@@ -323,18 +341,19 @@ fn shared_pool_introduces_churn_above_process_wide_32_in_flight_blocks() {
         assert_eq!(legacy.dropped_overflow, 0, "改前设计在每流 1 块时不得丢弃");
         // 改前常驻 = N × 1 块（idle_cap 自适应到该流峰值 1）⇒ N × 64 KiB。
         assert_eq!(legacy.idle_blocks, streams, "改前每流 idle 应为该流峰值 1 块");
-        // 改后：streams ≤ 32 ⇒ 零降级；streams > 32 ⇒ 降级 = (streams-32) × ROUNDS。
-        let want_degraded = streams.saturating_sub(UNIVERSE_BLOCKS) as u64 * ROUNDS as u64;
+        // 改后：在飞 ≤ 512 块宇宙 ⇒ 零降级；churn 只体现为「借用后超额归还即释放」。
+        assert_eq!(shared.degraded, 0, "streams={streams}: 宇宙内借出不得降级");
+        let want_dropped = streams.saturating_sub(IDLE_BLOCKS) as u64 * ROUNDS as u64;
         assert_eq!(
-            shared.degraded, want_degraded,
-            "streams={streams}: 改后降级次数应为 (N-32)×ROUNDS"
+            shared.dropped_overflow, want_dropped,
+            "streams={streams}: 改后丢弃次数应为 (N-32)×ROUNDS"
         );
     }
-    // 关键断言：N=64 时改前零 churn、改后有 churn ⇒ churn 是 kw2si 引入的。
+    // 关键断言：N=64 时改前零 churn（零丢弃）、改后受常驻预算约束必丢弃 ⇒ 省内存的代价可见。
     let (legacy64, _) = sweep_legacy(64, 1);
     let shared64 = sweep(64, 1);
-    assert_eq!(legacy64.degraded, 0, "改前 64 流零降级");
-    assert!(shared64.degraded > 0, "改后 64 流必降级 ⇒ churn 由 kw2si 引入");
+    assert_eq!(legacy64.dropped_overflow, 0, "改前 64 流零丢弃");
+    assert!(shared64.dropped_overflow > 0, "改后 64 流必超常驻预算 ⇒ 超额归还即释放");
     assert!(
         shared64.idle_bytes() < legacy64.idle_bytes(),
         "改后常驻必须小于改前（省内存的收益确已兑现）"

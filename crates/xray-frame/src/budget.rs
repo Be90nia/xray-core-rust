@@ -238,6 +238,10 @@ pub const XRAY_BUF_POOL_TOTAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// splithttp 进程级共享块池字节预算（**已落地**：
 /// `xray_transport_splithttp::pool_stream::POOL_BYTE_BUDGET` = 2MiB，交叉断言钉住；
 /// bd kw2si 起全进程唯一一份，同 chunk 不随连接数翻倍）。
+///
+/// 口径 = **常驻**（空闲块）预算；块借出后随 `Bytes` 进 h2 发送队列的那份内存记在
+/// caps 的「per-conn h2 send_buf cap」面（`xhttp_conn_booked_bytes`），本项不重复计账
+/// ——池的宇宙（`max`）只是记账上界，不预分配（bd vktyw）。
 pub const SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// hysteria udphop 进程级共享块池字节预算（**已落地**（bd ccy5d）：
