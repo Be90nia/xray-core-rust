@@ -4224,10 +4224,13 @@ mod tests {
     }
 
     /// 反向代理 Bridge 装配（Go infra/conf/vless.go:302-308 → outbound.go:104-125）：
-    /// user `reverse.tag` 注入出站注册表（domain 缺省 `v1.rvs.cool`），无则 None。
+    /// **仅 simplified（扁平）形式**允许 `reverse.tag`（注入出站注册表，domain 缺省
+    /// `v1.rvs.cool`）；**vnext 形式 + user reverse ⇒ 配置期硬错**（bd k873k 对齐
+    /// Go `infra/conf/vless.go:318-320`「please use simplified outbound's config
+    /// style to use "reverse"」—— 此前正负两用例在同一 commit 里自相矛盾，已改判）。
     #[test]
     fn parse_vless_config_reverse_tag_wires_registry() {
-        // 标准 vnext 形式：reverse 挂在 user 上。
+        // vnext 形式挂 user reverse ⇒ 必须拒启（Go 同判）。
         let vnext = r#"{
             "vnext": [{
                 "address": "s.example.com",
@@ -4236,13 +4239,14 @@ mod tests {
                             "reverse": { "tag": "portal-tag" } }]
             }]
         }"#;
-        let config = parse_vless_config(vnext.as_bytes()).unwrap();
-        let registry = config.reverse.as_ref().expect("reverse tag must wire a portal registry");
-        assert_eq!(registry.len(), 1);
-        assert!(registry.contains("portal-tag"));
-        assert!(registry.contains_domain(xray_proxy_vless::RVS_DOMAIN));
+        let err = parse_vless_config(vnext.as_bytes())
+            .expect_err("vnext 形式的 reverse 必须拒启（Go vless.go:318-320）");
+        assert!(
+            err.to_string().contains("simplified outbound"),
+            "文案须指向 simplified 形式: {err}"
+        );
 
-        // 扁平形式：顶层 reverse 同样生效（Go simplified settings）。
+        // 扁平形式（Go simplified settings）：reverse 同样注入出站注册表。
         let flat = r#"{
             "address": "flat.example.com",
             "port": 443,
@@ -4250,7 +4254,10 @@ mod tests {
             "reverse": { "tag": "portal-flat" }
         }"#;
         let config = parse_vless_config(flat.as_bytes()).unwrap();
-        assert!(config.reverse.as_ref().is_some_and(|r| r.contains("portal-flat")));
+        let registry = config.reverse.as_ref().expect("reverse tag must wire a portal registry");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains("portal-flat"));
+        assert!(registry.contains_domain(xray_proxy_vless::RVS_DOMAIN));
 
         // 未配置 reverse（或空 tag）→ 普通出站：反向域名拨号由 dispatcher 报错。
         let bare = r#"{
