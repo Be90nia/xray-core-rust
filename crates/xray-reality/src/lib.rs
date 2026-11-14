@@ -37,9 +37,11 @@
 //! ## 已知缺口
 //! - mldsa65 后量子证书签名的**服务端生产接线**：签名原语已实现
 //!   （[`mitm::generate_reality_ed25519_cert_mldsa65`]，契约测试覆盖），客户端 btls ServerHello
-//!   捕获 + 验签链路已落地（cm97）；但 rustls `ResolvesServerCert::resolve()` 拿不到 ServerHello
-//!   字节（btls 无 server acceptor），`server_tls` 生产路径仍下发标准 cert。tvky 已落地：
-//!   X25519MLKEM768 hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生。
+//!   捕获 + 验签链路已落地（cm97）；但签名输入含 **ServerHello 原文**，而 rustls
+//!   `ResolvesServerCert::resolve()` 与 btls（`SSL_CTX` 装配期给 cert）都在 ServerHello
+//!   生成**之前**定证书 ⇒ 等价实现须改 TLS 库本体（vendor 红线）。故 `mldsa65Seed` 配置
+//!   显式拒启并给出出路（[`config::MLDSA65_SEED_UNSUPPORTED`]）。tvky 已落地： X25519MLKEM768
+//!   hybrid KX（服务端 key_share 解析）+ mldsa65 公钥派生。
 //! - http2 spider 爬行（fallback 探测路径；`spider_x` 已解析保留，爬行未实现）
 //! - btls 全指纹 e2e 矩阵 `#[ignore]`（566y 分类：MLKEM-capable 子集已摘 active； transcript
 //!   mismatch 已不复现；非 MLKEM 模板语义：2ktp ① 已回贴 Go tls.go:233-235 门禁—— X25519-only 模板

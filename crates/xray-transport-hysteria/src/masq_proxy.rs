@@ -8,13 +8,13 @@
 //! | `if !MasqUrlRewriteHost { r.Out.Host = r.In.Host }` | `rewrite_host=false`（**Go 默认**）→ Host 头保留**客户端原始 Host**；`true` → Host 头 = 上游 authority |
 //! | `MasqUrlInsecure`（仅 http/https）→ 上游 TLS `InsecureSkipVerify` | `tls_connector` 的 `insecure` 分支（跳过证书校验） |
 //! | Rewrite 前剥除客户端自带 `X-Forwarded-*` | `strip_forwarded_headers` |
+//! | `if MasqUrlXForwarded { r.SetXForwarded() }` | [`ProxyMasqHandler::with_x_forwarded`]：注入 XFF（客户端 IP）/ XFH（入站 Host）/ XFP（`https`，hysteria 恒 QUIC+TLS） |
 //! | hop-by-hop 头不转发（Go `ReverseProxy`） | `HOP_BY_HOP` |
 //! | `ErrorHandler` → `502 Bad Gateway` | `proxy_bad_gateway` |
 //! | scheme `""`/`unix` → unix socket 上游 | 未实现：构造期报错（Rust 侧无 unix socket 上游面） |
 //!
-//! 未对齐（已知偏差，报告登记）：Go 的 `MasqUrlXForwarded`（本仓配置面无该字段）、
-//! Go 的 `cleanQueryParams`（丢弃不可解析的 query 参数）、Go 的连接池
-//! （`MaxIdleConns=100`；本实现每请求一次连接，伪装面低频可接受）。
+//! 未对齐（已知偏差，报告登记）：Go 的 `cleanQueryParams`（丢弃不可解析的 query
+//! 参数）、Go 的连接池（`MaxIdleConns=100`；本实现每请求一次连接，伪装面低频可接受）。
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -232,13 +232,22 @@ pub struct ProxyMasqHandler {
     rewrite_host: bool,
     /// `MasqUrlInsecure`：跳过上游 TLS 证书校验。
     insecure: bool,
+    /// `MasqUrlXForwarded`：注入 `X-Forwarded-For/Host/Proto`（Go `r.SetXForwarded()`）。
+    x_forwarded: bool,
 }
 
 impl ProxyMasqHandler {
     /// 构造反代 handler（对应 Go `Listen` 的 `"proxy"` 分支）。
     #[must_use]
     pub fn new(url: &str, rewrite_host: bool, insecure: bool) -> Self {
-        Self { target: parse_masq_target(url), rewrite_host, insecure }
+        Self { target: parse_masq_target(url), rewrite_host, insecure, x_forwarded: false }
+    }
+
+    /// `MasqUrlXForwarded`（Go `hub.go:254`）：反代请求注入 `X-Forwarded-*`。
+    #[must_use]
+    pub fn with_x_forwarded(mut self, on: bool) -> Self {
+        self.x_forwarded = on;
+        self
     }
 
     /// 反代一次请求（Go `ReverseProxy.ServeHTTP`）。
@@ -246,6 +255,7 @@ impl ProxyMasqHandler {
         target: &MasqTarget,
         rewrite_host: bool,
         insecure: bool,
+        x_forwarded: bool,
         req: MasqRequest,
     ) -> Result<MasqResponse, String> {
         let (in_path, in_query) = match req.path.split_once('?') {
@@ -293,6 +303,18 @@ impl ProxyMasqHandler {
         } else {
             target.authority().to_string()
         };
+        // Go `ProxyRequest.SetXForwarded()`（httputil，reverseproxy.go:81-98）：客户端
+        // 转发头已在上一步剥除，故三条都是「首次写入」语义——XFF = 客户端 IP（无端口，
+        // `SplitHostPort` 失败则不写），XFH = 入站 Host（Go 无条件 Set），XFP = https
+        // （hysteria 恒 QUIC+TLS；quic-go `http3/server_conn.go:165-167` 给 h3 请求填了
+        // 非 nil `req.TLS` ⇒ Go 侧取值同为 "https"）。
+        if x_forwarded {
+            if let Some(ip) = req.remote_ip {
+                headers.insert("x-forwarded-for".to_string(), ip.to_string());
+            }
+            headers.insert("x-forwarded-host".to_string(), req.host.clone());
+            headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+        }
         let mut builder = Request::builder().method(req.method.as_str()).uri(uri);
         for (k, v) in &headers {
             if let (Ok(name), Ok(value)) =
@@ -344,6 +366,9 @@ impl MasqueradeHandler for ProxyMasqHandler {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default(),
             body: Vec::new(),
+            // `serve()` 是老签名，没有对端地址（Go 侧 RemoteAddr 恒有值）——
+            // 走这条的调用方拿不到 X-Forwarded-For。
+            remote_ip: None,
         };
         self.serve_request(req)
     }
@@ -355,6 +380,7 @@ impl MasqueradeHandler for ProxyMasqHandler {
         let target = self.target.clone();
         let rewrite_host = self.rewrite_host;
         let insecure = self.insecure;
+        let x_forwarded = self.x_forwarded;
         Box::pin(async move {
             let target = match &target {
                 Ok(t) => t.clone(),
@@ -363,7 +389,7 @@ impl MasqueradeHandler for ProxyMasqHandler {
                     return proxy_bad_gateway(e);
                 },
             };
-            match Self::forward(&target, rewrite_host, insecure, req).await {
+            match Self::forward(&target, rewrite_host, insecure, x_forwarded, req).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     crate::LOG.debug(format!("masq proxy error: {e}"));
@@ -385,7 +411,7 @@ pub(crate) mod test_support {
         net::TcpListener,
     };
 
-    /// 上游观测到的请求（method / path / query / Host / body）。
+    /// 上游观测到的请求（method / path / query / Host / body / 全部头）。
     #[derive(Debug, Clone, Default)]
     pub(crate) struct UpstreamSeen {
         pub(crate) method: String,
@@ -393,6 +419,8 @@ pub(crate) mod test_support {
         pub(crate) query: String,
         pub(crate) host: String,
         pub(crate) body: String,
+        /// 全部请求头（小写名 → 值），用于断言转发头注入。
+        pub(crate) headers: Vec<(String, String)>,
     }
 
     /// 起一个记录请求的本地 HTTP 上游（响应固定 200 + "upstream-ok"）。
@@ -432,15 +460,17 @@ pub(crate) mod test_support {
                     };
                     let mut host = String::new();
                     let mut content_length = 0usize;
+                    let mut headers: Vec<(String, String)> = Vec::new();
                     for line in lines {
                         let Some((k, v)) = line.split_once(':') else { continue };
                         let key = k.trim().to_ascii_lowercase();
                         let val = v.trim().to_string();
                         if key == "host" {
-                            host = val;
+                            host = val.clone();
                         } else if key == "content-length" {
                             content_length = val.parse().unwrap_or(0);
                         }
+                        headers.push((key, val));
                     }
                     // 读 body
                     let mut body = buf[head_end..].to_vec();
@@ -457,6 +487,7 @@ pub(crate) mod test_support {
                         query,
                         host,
                         body: String::from_utf8_lossy(&body).to_string(),
+                        headers,
                     });
                     let payload = b"upstream-ok";
                     let resp = format!(
@@ -494,7 +525,42 @@ mod tests {
             headers: HashMap::from([("x-test".to_string(), "1".to_string())]),
             host: host.to_string(),
             body: body.as_bytes().to_vec(),
+            remote_ip: None,
         }
+    }
+
+    /// bd mxxzi：`MasqUrlXForwarded=true` → 上游收到 Go `SetXForwarded()` 的三头
+    /// （XFF = 客户端 IP、XFH = 入站 Host、XFP = https）；关闭时连客户端自带的
+    /// 转发头也不转发（Go `Rewrite` 前剥除）。
+    #[tokio::test]
+    async fn proxy_injects_x_forwarded_headers_only_when_enabled() {
+        let (port, seen) = start_recording_upstream().await;
+        let handler = ProxyMasqHandler::new(&format!("http://127.0.0.1:{port}/base"), false, false)
+            .with_x_forwarded(true);
+        let mut req = masq_request("GET", "/probe", "masq.example.com", "");
+        req.remote_ip = Some("203.0.113.7".parse().expect("client ip"));
+        let _ = handler.serve_request(req).await;
+
+        let seen = seen.lock().await;
+        let header =
+            |name: &str| seen[0].headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        assert_eq!(header("x-forwarded-for").as_deref(), Some("203.0.113.7"));
+        assert_eq!(header("x-forwarded-host").as_deref(), Some("masq.example.com"));
+        assert_eq!(header("x-forwarded-proto").as_deref(), Some("https"));
+        drop(seen);
+
+        let (port, seen) = start_recording_upstream().await;
+        let handler = ProxyMasqHandler::new(&format!("http://127.0.0.1:{port}/base"), false, false);
+        let mut req = masq_request("GET", "/probe", "masq.example.com", "");
+        req.headers.insert("x-forwarded-for".to_string(), "1.2.3.4".to_string());
+        req.remote_ip = Some("203.0.113.7".parse().expect("client ip"));
+        let _ = handler.serve_request(req).await;
+        let seen = seen.lock().await;
+        assert!(
+            seen[0].headers.iter().all(|(k, _)| !k.starts_with("x-forwarded")),
+            "xForwarded=false 时既不自造也不转发客户端自带转发头，got {:?}",
+            seen[0].headers
+        );
     }
 
     /// bd 4zcki：`MasqUrlRewriteHost=false`（Go 默认）→ 上游 Host 头 = 客户端原始

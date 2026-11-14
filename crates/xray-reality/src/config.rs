@@ -21,6 +21,21 @@ pub const X25519_KEY_LEN: usize = 32;
 /// ML-DSA-65 种子长度（Go `mldsa65.NewKeyFromSeed(*[32]byte)`）。
 pub const MLDSA65_SEED_LEN: usize = 32;
 
+/// 服务端 `mldsa65Seed` 的拒启文案（两处解析点共用：xray-core reality 入站 +
+/// splithttp reality 入站）。
+///
+/// 为何不能实现（bd mxxzi 复核，Go `crypto/tls` fork 专属 hack）：Go 在握手状态机内用
+/// mldsa65 变体证书并写 `ML-DSA-65(HMAC(auth, pub‖ClientHello.Raw‖ServerHello.Raw))` 到
+/// 证书保留扩展；签名输入含 ServerHello，而 rustls（`ResolvesServerCert::resolve`）与
+/// btls（`SSL_CTX` 装配期给 cert）都在 ServerHello 生成**之前**定证书 ⇒ 等价实现需改
+/// TLS 库本体（vendor 红线）。签名原语与本仓客户端验签链路均已落地，缺的只是这个时机。
+pub const MLDSA65_SEED_UNSUPPORTED: &str = "reality: mldsa65Seed is not supported by this build \
+     (ML-DSA-65 signing must cover the ServerHello bytes and land in the certificate, which \
+     neither the rustls nor the btls acceptor can do — both fix the certificate before \
+     ServerHello exists); remove mldsa65Seed to start — if your clients also set \
+     mldsa65Verify, drop it there too or they will reject this server; alternatively run the \
+     REALITY server on Go Xray";
+
 /// REALITY ShortId（固定 8 字节）。
 ///
 /// 对应 Go 端 `*[8]byte`，Rust 端用 newtype 包装以便类型安全区分 `Vec<u8>`。
@@ -48,6 +63,10 @@ impl AsRef<[u8; SHORT_ID_LEN]> for ShortId {
 /// fallback 限速配置。
 ///
 /// 对应 Go `reality.LimitFallback`，与 proto `LimitFallback` 同构。
+///
+/// ⚠️ Go 自己也**不消费**这两个字段：`reality/config.go:45-54` 只是把值拷进
+/// `reality.Config`，全仓无运行时读者（无 `.LimitFallbackUpload`/`Download` 消费点）。
+/// 故本仓接受配置但不生效（对齐 Go），解析点显式告警。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LimitFallback {
     /// 启用限速前的字节数。

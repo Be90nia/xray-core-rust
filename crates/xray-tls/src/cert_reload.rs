@@ -2,7 +2,8 @@
 //!
 //! # Go 事实（`D:/Project/Xray-core/transport/internet/tls/config.go:104-136`）
 //! - 周期 = **3600 s 常量**（`:110` `hotReloadCertInterval := uint64(3600)`）；条目 `ocspStapling >
-//!   0` 时改用该秒数——本仓该字段直接拒启（bd mvmwu），故恒 3600 s。
+//!   0` 时改用该秒数（本仓同样接线：`server_config::cert_reload_interval` 取各可重载条目
+//!   周期的**最短**值，因为重载是单任务而 Go 是每证书一个 ticker）。
 //! - 变更判定 = **读回来的内容字符串比对**（`:126`），**不看 mtime**。
 //! - 读失败 ⇒ `LogErrorInner` 后 `return`（`:117-124`）：旧证书原位保留，但该条目的重读
 //!   **永久停止**。本仓改为「失败保留旧证书 + 下个周期继续重试」——运维换文件换到一半、
@@ -118,9 +119,14 @@ pub(crate) fn spawn_reload_task(
 
 /// 装配期入口：存在 file 形态条目时启动进程级重读任务。
 ///
-/// 无 tokio runtime（同步上下文/单元测试）时跳过：不能裸造 runtime，也不该让配置
-/// 构建失败——证书就是装配期读到的那份，与无热重载时行为一致。
-pub(crate) fn start(slot: Arc<HotSlot<CertSnapshot>>, specs: Vec<CertEntrySpec>) {
+/// `interval` 取自 `certificates[].ocspStapling`（Go `config.go:104-107`），缺省
+/// [`DEFAULT_RELOAD_INTERVAL`]。无 tokio runtime（同步上下文/单元测试）时跳过：不能裸造
+/// runtime，也不该让配置构建失败——证书就是装配期读到的那份，与无热重载时行为一致。
+pub(crate) fn start(
+    slot: Arc<HotSlot<CertSnapshot>>,
+    specs: Vec<CertEntrySpec>,
+    interval: Duration,
+) {
     if !specs.iter().any(|s| matches!(s, CertEntrySpec::File { .. })) {
         return;
     }
@@ -131,7 +137,7 @@ pub(crate) fn start(slot: Arc<HotSlot<CertSnapshot>>, specs: Vec<CertEntrySpec>)
         );
         return;
     }
-    if let Err(e) = spawn_reload_task(&PROCESS_SCOPE, slot, specs, DEFAULT_RELOAD_INTERVAL) {
+    if let Err(e) = spawn_reload_task(&PROCESS_SCOPE, slot, specs, interval) {
         tracing::warn!(
             target: "xray_tls::cert_reload",
             error = %e,

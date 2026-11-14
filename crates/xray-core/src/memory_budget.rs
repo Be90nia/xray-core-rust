@@ -2247,7 +2247,7 @@ mod tests {
                 budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
             let (resident, worst) = udp_session_columns(&report);
             let cap = resident / UDP_SESSION_RESIDENT_BYTES;
-            assert!(cap >= 1 && cap <= MAX_UDP_SESSIONS, "{available}B 档条数越界：{cap}");
+            assert!((1..=MAX_UDP_SESSIONS).contains(&cap), "{available}B 档条数越界：{cap}");
             assert_eq!(
                 worst / UDP_SESSION_WORST_CASE_BYTES,
                 cap,

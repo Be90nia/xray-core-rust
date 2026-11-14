@@ -520,7 +520,7 @@ mod tests {
         assert!(cfg.masq_url_insecure);
         assert!(matches!(
             MasqType::from_config(&cfg).unwrap(),
-            MasqType::Proxy { url, rewrite_host: true, insecure: true } if url == "https://e.com"
+            MasqType::Proxy { url, rewrite_host: true, insecure: true, .. } if url == "https://e.com"
         ));
 
         let v: serde_json::Value = serde_json::from_str(

@@ -1141,6 +1141,9 @@ async fn h3_auth(
                     headers: req_headers.clone(),
                     host: host.clone(),
                     body,
+                    // Go h3 请求的 `r.RemoteAddr` 来自 QUIC 连接对端（quic-go
+                    // server_conn.go:167）；xForwarded 的 XFF 取这里的 IP。
+                    remote_ip: Some(conn.remote_address().ip()),
                 };
                 let (status, headers, body) = masq.serve_request(masq_req).await;
                 let mut builder = http::Response::builder().status(status);
@@ -1202,6 +1205,9 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                 Some(c) => c.clone(),
                 None => return,
             };
+            // masquerade 的 `X-Forwarded-For` 取连接对端（Go h3 `r.RemoteAddr` 同源）；
+            // 连接级常量，clone 进各请求任务。
+            let remote_ip = quinn_conn.remote_address().ip();
             let mut h3_conn =
                 match h3::server::Connection::new(h3_quinn::Connection::new(quinn_conn)).await {
                     Ok(c) => c,
@@ -1294,6 +1300,7 @@ impl HysteriaHttp3Server for QuinnHttp3Server {
                                     headers: hdrs.clone(),
                                     host: host.clone(),
                                     body,
+                                    remote_ip: Some(remote_ip),
                                 };
                                 let (status, headers, body) = masq.serve_request(masq_req).await;
                                 let mut builder = http::Response::builder().status(status);
@@ -2576,6 +2583,7 @@ mod tests {
             url: format!("http://127.0.0.1:{upstream_port}/base"),
             rewrite_host: false,
             insecure: false,
+            x_forwarded: false,
         };
         struct MasqValidator;
         impl crate::hub::AuthValidator for MasqValidator {

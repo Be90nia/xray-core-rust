@@ -391,8 +391,9 @@ pub fn build_btls_server_context(
 /// 只在装配期读一次（Go `:105-107`）。构建时无 tokio runtime ⇒ 不启动任务（证书即
 /// 装配期那份）。
 ///
-/// OCSP 装订走 `ocsp-stapler`（`ocsp-stapling` feature）的握手层实现，
-/// 参见 `crate::ocsp_stapling`；证书级 `ocspStapling` 配置键仍按 bd mvmwu 拒启。
+/// OCSP 装订走 `ocsp-stapler`（`ocsp-stapling` feature）的握手层实现——该 feature 全仓
+/// **无启用点**，故本仓不装订 OCSP 响应；证书级 `ocspStapling` 只接线它的
+/// 「热重载周期」语义（bd mxxzi，见下）。
 ///
 /// # pwh6: Go v26 TLS 字段族增量（服务端）
 /// - `masterKeyLog`：Go `tls.Config.KeyLogWriter`（transport_security.go→config.go:467-474） string
@@ -440,21 +441,22 @@ pub fn build_server_config(
     // 证书级键（ocspStapling/oneTimeLoading/buildChain）在 certificates[] 条目内
     // 解析（Go TLSCertConfig），见 cert_entry_flags / any_cert_ocsp_stapling。
 
-    // bd mvmwu（blocker）：证书级 `ocspStapling` 在本仓**未实现**——Go 侧靠
-    // `setupOcspTicker` 后台 goroutine 周期向 issuer 的 OCSP responder 发请求取
-    // 响应并塞进 `cert.OCSPStaple`；Rust 侧既无 OCSP responder 客户端，
-    // `ocsp-stapling` feature 也从未被任何 crate 打开（其接线函数
-    // `ServerConfigAndStapler::wrap_server_config` 根本不存在——该分支从未编译
-    // 通过）。⇒ 配置写了该键 = 运行零效果（用户以为开了 OCSP 校验，实际没
-    // 开）= 安全面静默失效 ⇒ **硬错拒启**（CLAUDE.md L5 装配门 fail-visible），
-    // 不做无声降级。Go 语义对齐：uint64 秒（>0 启用；0 = 关闭）。
+    // bd mxxzi：证书级 `ocspStapling` 双作用（Go `setupOcspTicker`，config.go:104-136）——
+    // ①该条目热重载周期 = 该秒数（>0 时覆盖 3600 s 缺省）⇒ **已实现**（见下方
+    // `cert_reload_interval`）；②每 tick 向 issuer 的 OCSP responder 取响应并装订进
+    // 握手证书 ⇒ 本仓**未实现**（无 OCSP responder 客户端，`ocsp-stapling` feature
+    // 全仓无启用点）。原先整个键拒启挡掉了①；现接受配置并显式 WARN ②，不静默。
+    // Go 侧在证书无 issuer 链时同样只 warn 后跳过装订（`ocsp.GetOCSPForCert` 失败
+    // → "ignoring invalid OCSP"），故本仓这条降级路径并非独有语义。
+    let reload_interval = cert_reload_interval(&json);
     if any_cert_ocsp_stapling(&json) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "certificates[].ocspStapling is not supported by this build: OCSP stapling \
-             needs an issuer certificate chain plus an OCSP responder client, neither \
-             of which this build provides; remove the field to start",
-        ));
+        tracing::warn!(
+            target: "xray_tls::server_config",
+            reload_interval_secs = reload_interval.as_secs(),
+            "certificates[].ocspStapling accepted: hot-reload interval follows Go, but OCSP \
+             responses are NOT stapled by this build (no OCSP responder client); clients that \
+             require must-staple will reject the handshake"
+        );
     }
 
     // bd 5t1zj：本函数产出的恒是 **rustls** `ServerConfig`，而 rustls 0.23 的 ECH
@@ -586,7 +588,8 @@ pub fn build_server_config(
     }
 
     // 证书热重载（bd 5ctu1）：file 形态条目由托管周期任务重读，内容变化才换快照。
-    crate::cert_reload::start(cert_slot, cert_specs);
+    // 周期取自 `certificates[].ocspStapling`（Go config.go:104-107），缺省 3600 s。
+    crate::cert_reload::start(cert_slot, cert_specs, reload_interval);
 
     Ok(Some(Arc::new(config)))
 }
@@ -787,6 +790,29 @@ fn any_cert_ocsp_stapling(json: &serde_json::Value) -> bool {
             .filter(|e| entry_usage(e) == EntryUsage::Encipherment)
             .any(|e| cert_entry_flags(e).ocsp_stapling_secs > 0)
     })
+}
+
+/// 证书热重载周期（Go `config.go:104-107`：条目 `ocspStapling > 0` 时 = 该秒数，
+/// 否则 3600 s）。
+///
+/// Go 是**每条目一个 ticker**；本仓重载是单任务（resolver 级一个周期）⇒ 取所有可
+/// 重载 `encipherment` 条目周期的**最短**值，任何条目都不会比 Go 慢。
+#[must_use]
+fn cert_reload_interval(json: &serde_json::Value) -> std::time::Duration {
+    let default_secs = crate::cert_reload::DEFAULT_RELOAD_INTERVAL.as_secs();
+    let secs = json
+        .get("certificates")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|e| entry_usage(e) == EntryUsage::Encipherment)
+        .map(cert_entry_flags)
+        // `oneTimeLoading=true` 的条目在 Go 不 spawn ticker，不参与周期。
+        .filter(|f| !f.one_time_loading)
+        .map(|f| if f.ocsp_stapling_secs == 0 { default_secs } else { f.ocsp_stapling_secs })
+        .min()
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
 }
 
 /// 从 `tlsSettings` JSON 解析全部命名证书。
@@ -1050,17 +1076,34 @@ mod tests {
         assert!(config.is_some());
     }
 
-    /// bd mvmwu：证书级 `ocspStapling` 未实现 ⇒ 配置期硬错拒启（fail-visible），
-    /// 不得静默接受后运行无效果。
+    /// bd mxxzi：证书级 `ocspStapling` 从「拒启」改为「接受」——Go 的双作用里①热重载
+    /// 周期已实现（本测试断言取该秒数）；②响应装订未实现，解析点发一次 WARN。
     #[test]
-    fn ocsp_stapling_certificate_entry_rejected() {
+    fn ocsp_stapling_certificate_entry_accepted_and_sets_reload_interval() {
         let (cert_pem, key_pem) = leaf_cert(&["localhost"]);
         let json = serde_json::json!({
             "certificates": [{ "certificate": cert_pem, "key": key_pem, "ocspStapling": 60 }]
         });
-        let err = build_server_config("tls", Some(&json)).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("not supported"), "got: {err}");
+        let config =
+            build_server_config("tls", Some(&json)).expect("ocspStapling must be accepted");
+        assert!(config.is_some());
+        // 周期取该条目的秒数（Go config.go:104-107）；缺省 = 3600 s。
+        assert_eq!(cert_reload_interval(&json).as_secs(), 60);
+        assert_eq!(cert_reload_interval(&serde_json::json!({})).as_secs(), 3600);
+        // 多条：取最短（单任务重载，任何条目都不比 Go 慢）。
+        let many = serde_json::json!({
+            "certificates": [
+                { "certificate": "C1", "key": "K1", "ocspStapling": 7200 },
+                { "certificate": "C2", "key": "K2", "ocspStapling": 300 },
+                { "certificate": "C3", "key": "K3" },
+            ]
+        });
+        assert_eq!(cert_reload_interval(&many).as_secs(), 300);
+        // `oneTimeLoading` 条目不 spawn ticker（Go :105-107），不参与周期。
+        let one_time = serde_json::json!({
+            "certificates": [{ "certificate": "C1", "key": "K1", "ocspStapling": 5, "oneTimeLoading": true }]
+        });
+        assert_eq!(cert_reload_interval(&one_time).as_secs(), 3600);
     }
 
     /// 同一条目去掉 `ocspStapling` ⇒ 正常构建（对照：Err 由该键触发）。

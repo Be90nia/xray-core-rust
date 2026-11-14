@@ -3869,6 +3869,40 @@ impl std::fmt::Debug for RealityInboundConfig {
     }
 }
 
+/// 「Go 也只存不读」的 realitySettings 键（有意图值时返回，供解析点发一次 WARN）。
+///
+/// `limitFallbackUpload/Download`：Go `infra/conf/transport_security.go:42-43` 解析后，
+/// `transport/internet/reality/config.go:45-54` 只把值拷进 `reality.Config`，全仓
+/// **无任何读者**（无 `.LimitFallbackUpload`/`.LimitFallbackDownload` 运行时消费点）
+/// ⇒ 限速在 Go 侧同样不生效。故本仓接受配置（不拒启），由调用方显式 WARN。
+///
+/// # Errors
+/// 键值不是对象（Go proto 解码即错）⇒ `InvalidInput`。
+fn inert_reality_keys(json: &serde_json::Value) -> std::io::Result<Vec<&'static str>> {
+    let mut out = Vec::new();
+    for lf_key in ["limitFallbackUpload", "limitFallbackDownload"] {
+        let Some(v) = json.get(lf_key) else { continue };
+        if !v.is_null() && !v.is_object() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "reality: \"{lf_key}\" must be an object \
+                     (afterBytes/bytesPerSec/burstBytesPerSec)"
+                ),
+            ));
+        }
+        let active = v.as_object().is_some_and(|o| {
+            ["afterBytes", "bytesPerSec", "burstBytesPerSec"]
+                .iter()
+                .any(|k| o.get(*k).and_then(|x| x.as_u64()).unwrap_or(0) > 0)
+        });
+        if active {
+            out.push(lf_key);
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn parse_reality_config(
     settings: &xray_transport::dialer::StreamSettings,
 ) -> std::io::Result<RealityInboundConfig> {
@@ -3972,14 +4006,11 @@ pub(crate) fn parse_reality_config(
             },
         },
     };
-    // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
-    // 不静默忽略——避免运营者误以为 PQC 已生效。
+    // mldsa65Seed：服务端生产接线不可行（签名输入含 ServerHello，证书在 SH 之前定）
+    // ⇒ 配置在场显式报错并给出出路，不静默忽略（运营者会误以为 PQC 已生效）。
     if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
         if !seed.is_empty() {
-            return Err(std::io::Error::other(
-                "reality: mldsa65Seed configured but ML-DSA-65 signing is not implemented \
-                 in Rust (remove mldsa65Seed or use a Go server)",
-            ));
+            return Err(std::io::Error::other(xray_reality::config::MLDSA65_SEED_UNSUPPORTED));
         }
     }
     // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
@@ -4031,22 +4062,15 @@ pub(crate) fn parse_reality_config(
             ));
         }
     }
-    // - limitFallbackUpload/Download（:42-43）：fallback 限速器未实现； 全零对象/缺省 = Go
-    //   无限制语义，放行。
-    for lf_key in ["limitFallbackUpload", "limitFallbackDownload"] {
-        if let Some(v) = json.get(lf_key) {
-            let active = v.as_object().is_some_and(|o| {
-                ["afterBytes", "bytesPerSec", "burstBytesPerSec"]
-                    .iter()
-                    .any(|k| o.get(*k).and_then(|x| x.as_u64()).unwrap_or(0) > 0)
-            });
-            if active || (!v.is_null() && !v.is_object()) {
-                return Err(std::io::Error::other(format!(
-                    "reality: \"{lf_key}\" is not supported by this build (fallback rate \
-                     limiting is not implemented); remove the key"
-                )));
-            }
-        }
+    // - limitFallbackUpload/Download（:42-43）：Go 只把值拷进 `reality.Config`
+    //   （reality/config.go:45-54），**全仓无读者** ⇒ 纯 inert 配置。按 Go 语义接受
+    //   （不拒启、不实现限速），但显式告警一次，禁止运营者误以为限速生效。
+    for lf_key in inert_reality_keys(json)? {
+        tracing::warn!(
+            key = lf_key,
+            "reality: \"{lf_key}\" has no effect — Go stores it in reality.Config but nothing \
+             reads it (reality/config.go:45-54); accepted for config compatibility"
+        );
     }
     // - type（:32）与 unix 形态 target/dest（:68-84 '@'/'/' 前缀推导 unix， 含 Linux @@
     //   抽象套接字）：Rust reality fallback 拨号仅支持 host:port。
@@ -8365,7 +8389,8 @@ mod tests {
         assert!(parse_reality_config(&settings).is_err());
     }
 
-    /// mldsa65 后未实现：JSON 端必须显式报错不静默忽略（cz5x）。
+    /// mldsa65Seed：仍拒启（签名输入含 ServerHello，本仓 TLS acceptor 拿不到），
+    /// 但文案必须给出出路（bd mxxzi：清掉该键即可启动 + 客户端 mldsa65Verify 连带）。
     #[test]
     fn parse_reality_config_rejects_mldsa65_seed() {
         use base64::Engine as _;
@@ -8383,9 +8408,45 @@ mod tests {
         };
         let err = parse_reality_config(&settings).unwrap_err();
         let msg = err.to_string();
+        assert!(msg.contains("mldsa65Seed"), "must name the key, got: {msg}");
         assert!(
-            msg.contains("mldsa65") && msg.contains("not implemented"),
-            "expected mldsa65 not implemented error, got: {msg}"
+            msg.contains("remove mldsa65Seed") && msg.contains("mldsa65Verify"),
+            "must give a way out (drop the key / drop client-side mldsa65Verify), got: {msg}"
+        );
+    }
+
+    /// bd mxxzi：limitFallback* 由「拒启」改为「接受 + WARN 一次」——Go 只把值拷进
+    /// `reality.Config`（reality/config.go:45-54），全仓无读者 ⇒ 限速在 Go 同样不生效。
+    /// 断言：①解析成功（不再拦 Go 配置）；②该键进 WARN 名单（解析点据此发一次 warn）；
+    /// ③类型错仍硬错。
+    #[test]
+    fn parse_reality_config_accepts_inert_limit_fallback() {
+        use base64::Engine as _;
+        let key_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        for (key, val) in [
+            ("limitFallbackUpload", serde_json::json!({ "afterBytes": 1024 })),
+            ("limitFallbackDownload", serde_json::json!({ "bytesPerSec": 8 })),
+        ] {
+            let mut json = serde_json::json!({
+                "privateKey": key_b64,
+                "serverNames": ["a.com"],
+                "shortIds": ["01"],
+                "target": "example.com:443",
+            });
+            json[key] = val;
+            let settings = xray_transport::dialer::StreamSettings {
+                security: "reality".to_string(),
+                security_json: Some(json.clone()),
+                ..xray_transport::dialer::StreamSettings::tcp()
+            };
+            parse_reality_config(&settings)
+                .unwrap_or_else(|e| panic!("{key} must now be accepted, got: {e}"));
+            assert_eq!(inert_reality_keys(&json).expect("keys"), vec![key]);
+        }
+        // 类型错（非对象）仍硬错。
+        assert!(
+            inert_reality_keys(&serde_json::json!({"limitFallbackUpload": true})).is_err(),
+            "non-object limitFallback must stay rejected"
         );
     }
 
@@ -8477,16 +8538,6 @@ mod tests {
         let cases: Vec<(serde_json::Value, &str, bool)> = vec![
             (serde_json::json!({ "show": true }), "show", false),
             (serde_json::json!({ "masterKeyLog": "keys.log" }), "masterKeyLog", false),
-            (
-                serde_json::json!({ "limitFallbackUpload": { "afterBytes": 1024 } }),
-                "limitFallbackUpload",
-                false,
-            ),
-            (
-                serde_json::json!({ "limitFallbackDownload": { "bytesPerSec": 8 } }),
-                "limitFallbackDownload",
-                false,
-            ),
             (serde_json::json!({ "type": "unix" }), "type", false),
             (serde_json::json!({ "target": "@@reality-fallback" }), "unix socket", false),
             (serde_json::json!({ "dest": "/run/reality.sock" }), "unix socket", true),
@@ -8498,11 +8549,12 @@ mod tests {
             assert!(err.to_string().contains(needle), "expected error naming {needle}, got: {err}");
         }
 
-        // 关闭值/缺省 → 放行（Go 兼容配置零回归）。
+        // 关闭值/缺省/「Go 亦 inert」→ 放行（Go 兼容配置零回归）。
         for extra in [
             serde_json::json!({ "show": false }),
             serde_json::json!({ "masterKeyLog": "none" }),
-            serde_json::json!({ "limitFallbackUpload": {} }),
+            serde_json::json!({ "limitFallbackUpload": { "afterBytes": 1024 } }),
+            serde_json::json!({ "limitFallbackDownload": {} }),
             serde_json::json!({ "type": "tcp" }),
             serde_json::json!({}),
         ] {

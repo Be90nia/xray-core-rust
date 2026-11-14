@@ -740,14 +740,11 @@ fn reality_server_config(
     let server_acceptor =
         xray_reality::ServerAcceptorSetting::from_json(json.get("serverAcceptor"))
             .map_err(io::Error::other)?;
-    // mldsa65Seed：后量子签名未实现（cz5x）。配置在场即显式报错，
-    // 不静默忽略——避免运营者误以为 PQC 已生效。
+    // mldsa65Seed：服务端生产接线不可行（签名输入含 ServerHello，证书在 SH 之前定）
+    // ⇒ 配置在场显式报错并给出出路，不静默忽略。
     if let Some(seed) = json.get("mldsa65Seed").and_then(|x| x.as_str()) {
         if !seed.is_empty() {
-            return Err(io::Error::other(
-                "reality: mldsa65Seed configured but ML-DSA-65 signing is not implemented \
-                 in Rust (remove mldsa65Seed or use a Go server)",
-            ));
+            return Err(io::Error::other(xray_reality::config::MLDSA65_SEED_UNSUPPORTED));
         }
     }
     // maxTimeDiff：Go 默认 0（禁用），单位毫秒 → 转换为秒传给 verify。
@@ -2167,6 +2164,28 @@ mod tests {
         assert!(got.starts_with(garbage), "fallback should receive original record, got {got:?}");
         assert_eq!(count.load(Ordering::SeqCst), 0, "fallback conn must not reach dispatcher");
     }
+    /// bd mxxzi：`mldsa65Seed` 仍拒启，但文案必须给出出路（与 xray-core reality 入站
+    /// 共用 `xray_reality::config::MLDSA65_SEED_UNSUPPORTED`）；去掉该键即可启动。
+    #[test]
+    fn reality_server_config_rejects_mldsa65_seed_with_route() {
+        let mut json = serde_json::json!({
+            "privateKey": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "serverNames": ["a.com"],
+            "shortIds": [""],
+            "mldsa65Seed": "deadbeef00000000000000000000000000000000000000000000000000000000",
+        });
+        let msg = match reality_server_config("reality", Some(&json)) {
+            Ok(_) => panic!("mldsa65Seed must still be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("remove mldsa65Seed"), "must give a way out, got: {msg}");
+        json.as_object_mut().expect("object literal").remove("mldsa65Seed");
+        assert!(
+            reality_server_config("reality", Some(&json)).is_ok(),
+            "same config without mldsa65Seed must start"
+        );
+    }
+
     /// TCP 分支：close() abort accept task → TcpListener drop → 端口释放
     /// （票 4kjs 回归锚：修复前 close 仅日志，连接一直成功）。
     #[tokio::test]

@@ -29,8 +29,9 @@ pub enum MasqType {
     NotFound,
     /// 静态文件服务（对应 Go `"file"`，配置 `MasqFile` 路径）。
     File(String),
-    /// 反向代理（对应 Go `"proxy"`，配置 `MasqUrl` + `MasqUrlRewriteHost` + `MasqUrlInsecure`）。
-    Proxy { url: String, rewrite_host: bool, insecure: bool },
+    /// 反向代理（对应 Go `"proxy"`，配置 `MasqUrl` + `MasqUrlRewriteHost` + `MasqUrlInsecure`
+    /// + `MasqUrlXForwarded`）。
+    Proxy { url: String, rewrite_host: bool, insecure: bool, x_forwarded: bool },
     /// 静态字符串响应（对应 Go `"string"`，配置 `MasqString` + Headers + StatusCode）。
     String { body: String, headers: HashMap<String, String>, status_code: u16 },
 }
@@ -45,6 +46,7 @@ impl MasqType {
                 url: config.masq_url.clone(),
                 rewrite_host: config.masq_url_rewrite_host,
                 insecure: config.masq_url_insecure,
+                x_forwarded: config.masq_url_x_forwarded,
             }),
             "string" => Ok(Self::String {
                 body: config.masq_string.clone(),
@@ -77,11 +79,12 @@ impl MasqType {
                 config.masq_type = "file".into();
                 config.masq_file = dir.clone();
             },
-            Self::Proxy { url, rewrite_host, insecure } => {
+            Self::Proxy { url, rewrite_host, insecure, x_forwarded } => {
                 config.masq_type = "proxy".into();
                 config.masq_url = url.clone();
                 config.masq_url_rewrite_host = *rewrite_host;
                 config.masq_url_insecure = *insecure;
+                config.masq_url_x_forwarded = *x_forwarded;
             },
             Self::String { body, headers, status_code } => {
                 config.masq_type = "string".into();
@@ -101,9 +104,9 @@ impl MasqType {
             // Go "proxy" 分支：httputil.ReverseProxy 真反代（hub.go:219-265）——
             // 上游 URL 解析失败 → handler 固定回 502（fail-visible；Go 侧是
             // Listen 期报错，本仓构造面无错误出口）。
-            Self::Proxy { url, rewrite_host, insecure } => {
-                std::sync::Arc::new(ProxyMasqHandler::new(url, *rewrite_host, *insecure))
-            },
+            Self::Proxy { url, rewrite_host, insecure, x_forwarded } => std::sync::Arc::new(
+                ProxyMasqHandler::new(url, *rewrite_host, *insecure).with_x_forwarded(*x_forwarded),
+            ),
             Self::String { body, headers, status_code } => std::sync::Arc::new(StringMasqHandler {
                 body: body.clone(),
                 headers: headers.clone(),
@@ -162,6 +165,10 @@ pub struct MasqRequest {
     pub host: String,
     /// 请求体（Go `r.Body`；h3 数据帧汇总）。
     pub body: Vec<u8>,
+    /// 客户端 IP（Go `r.RemoteAddr` 的 host 部分，quic-go 由连接对端地址填）。
+    /// `xForwarded` 时写入 `X-Forwarded-For`；未知 = `None`（该头不写，同 Go
+    /// `SplitHostPort` 失败分支）。
+    pub remote_ip: Option<std::net::IpAddr>,
 }
 
 /// 默认 NotFound 实现（对应 Go `http.NotFoundHandler()`）。
@@ -597,10 +604,11 @@ mod tests {
         let c = make_config("proxy");
         let m = MasqType::from_config(&c).unwrap();
         match m {
-            MasqType::Proxy { url, rewrite_host, insecure } => {
+            MasqType::Proxy { url, rewrite_host, insecure, x_forwarded } => {
                 assert_eq!(url, "https://example.com");
                 assert!(rewrite_host);
                 assert!(!insecure);
+                assert!(!x_forwarded, "默认关闭（Go proto 零值）");
             },
             _ => panic!("expected Proxy"),
         }
@@ -734,9 +742,13 @@ mod tests {
         let n = MasqType::NotFound.build_handler();
         let (status, _, body) = n.serve("GET", "/", &HashMap::new()).await;
         assert_eq!((status, body.as_slice()), (404, &b"404 page not found\n"[..]));
-        let p =
-            MasqType::Proxy { url: "https://e.com".into(), rewrite_host: false, insecure: false }
-                .build_handler();
+        let p = MasqType::Proxy {
+            url: "https://e.com".into(),
+            rewrite_host: false,
+            insecure: false,
+            x_forwarded: false,
+        }
+        .build_handler();
         // proxy = 真反代（bd 4zcki）：上游不可达 → 502（Go ErrorHandler）
         assert_eq!(p.serve("GET", "/", &HashMap::new()).await.0, 502);
         let s = MasqType::String { body: "ok".into(), headers: HashMap::new(), status_code: 200 }
