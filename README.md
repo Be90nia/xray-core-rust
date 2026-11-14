@@ -56,9 +56,11 @@ CLI 子命令（对应 Go `main/`）：`run`（默认，v4 兼容）、`version`
 cargo test --workspace --lib     # 本机快速口径；Windows 下 tests/ 集成套件可能挂死
 cargo test --lib -p xray-proxy-vless    # 单 crate
 
-# 双向互操作矩阵（默认套件 37 测：Rust↔Rust 12 + Go→Rust 6 + Rust→Go 6 + 新协议 13）
-# 需要 Go v26.9.9 官方 release 二进制与 Python `cryptography` 包
-python dist/interop_ci.py
+# 双向互操作矩阵（默认 54 测：Rust↔Rust 12 + Go→Rust 12 + Rust→Go 12 + extra 18；
+# Go 不支持的方向运行时探测自动跳过）
+# Go 基准 = v26.11.9（commit 676eaf66）自建二进制（CI 由 .github/actions/fetch-go-baseline
+# 现场构建并断言版本号），另需 Python `cryptography` 包
+python dist/interop_ci.py --rust <rust 二进制> --go <go 基准二进制>
 
 # 长时压测（12 场景协议矩阵，RSS/FD/吞吐/延迟分位采样）
 # 载体: crates/xray-stress/docker/Dockerfile + crates/xray-stress/scripts/run_stress.{ps1,sh}
@@ -66,16 +68,17 @@ python dist/interop_ci.py
 
 ## CI
 
-`.github/workflows/` 下 6 条流水线：
+`.github/workflows/` 下 7 条流水线：
 
-| workflow | 内容 |
-|---|---|
-| `ci.yml` | fmt + clippy(`-D warnings`) + 三平台 build + `cargo test --workspace`（debug/release）+ cargo-deny + doc |
-| `interop.yml` | 互通矩阵：ubuntu-24.04 + macos-14，workspace `--lib` 全测 + release 构建 + `dist/interop_ci.py` 37 测；Go 基线 = 官方 v26.9.9 release 二进制 |
-| `stress.yml` | `xray-stress` 压测矩阵（12 场景分批，macOS + Linux + Windows 三平台，长时硬顶） |
-| `release.yml` | tag `v*` → 4 平台二进制（linux/windows amd64 + macos amd64/arm64），通用 target（`RUSTFLAGS` 覆盖 native） |
-| `build-linux-release.yml` | workflow_dispatch PGO 三段构建（instrument → loopback workload → optimize） |
-| `mobile.yml` | Android aarch64 全量 build + iOS aarch64 check 双编译门 |
+| workflow | 触发 | 内容 |
+|---|---|---|
+| `ci.yml` | push（main/dev/master/`feature/**`）+ PR | 15 个 job：`Format` / `Clippy` / `Build`（3 靶：linux-gnu、windows-msvc、macos-arm64）/ `Test`（debug+release）/ `Test (windows, xray-proxy-tun)` / `Test (linux, privileged tproxy gate)` / `Parser Parity (Go ruling baseline vs Rust)` / `Security & License`（cargo-deny + osv-scanner）/ `Docs` / `Fuzz Smoke`（仅手动）/ `Proto Drift Gate` / `Asset Gate` / `Framework Assembly (clippy + lib test)` / `Quality Gates` / `UDP Bind Gate` |
+| `interop.yml` | push + PR + 手动 + nightly 03:17 UTC | `Interop (os)`（ubuntu-24.04 + macos-14）：workspace `--lib` + release 构建 + `dist/interop_ci.py` 54 测；Go 基准 = **v26.11.9（commit `676eaf66`）按源码现场构建**（`.github/actions/fetch-go-baseline`）。`Full 32-node matrix` 只在 nightly/手动跑（需 secret 节点表） |
+| `stress.yml` | 手动 | `xray-stress` 压测矩阵（12 场景分批：macos a/b、linux a/b、windows all；6h 硬顶） |
+| `release.yml` | tag `v*` | **5 个产物**：`xray-linux-amd64`、`xray-linux-amd64-musl`、`xray-windows-amd64.exe`、`xray-macos-amd64`、`xray-macos-arm64`。指令集由 `.cargo/config.toml` 的 x86_64 分目标 `+sse4.1,+sse4.2,+popcnt` 决定（**不**用 `RUSTFLAGS` 覆盖），要求 Nehalem 2008+ / AMD Barcelona 2007+ |
+| `build-linux-release.yml` | 手动（+ 本文件变更时 push main） | PGO 三段构建（instrument → loopback workload → optimize），ubuntu:22.04 容器锚定 glibc 2.35 |
+| `mobile.yml` | 手动 + push（master/main/dev） | `Android aarch64 build gate` + `iOS aarch64 check gate` |
+| `musl-probe.yml` | 手动 | `musl x86_64 build probe`：全静态链接 + `./xray version` 冒烟 |
 
 ## 文档
 

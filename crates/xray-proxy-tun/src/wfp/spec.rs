@@ -469,23 +469,41 @@ fn multicast_dhcpv6_server() -> [u8; 16] {
     a
 }
 
-/// 返回落在所有给定前缀**之外**的 DNS 服务器（对应 Go `dnsOutsideTUN`）。
+/// 返回「查询到不了 TUN 且会被阻断」的 DNS 服务器（对应 Go `tun_windows_wfp.go` 的
+/// `dnsOutsideTUN`）。
 ///
-/// 这些服务器的查询无法走 TUN（Windows 会按各网卡的首个服务器发查询）。
+/// 三条判据缺一不可（少任何一条就是过度告警）：
+/// - 回环服务器跳过——本地解析器走回环，而回环保留在 TUN 内被放行；
+/// - 落在 `prefixes`（gateway ∪ autoSystemRoutingTable）内的跳过——查询本来就走 TUN；
+/// - 必须落在某个「阻断系统 DNS」的值（[`Leak::blocks_dns`]）或 `misconfigtun` 的 CIDR 内，
+///   否则那些查询根本不会被 WFP 挡掉。
 #[must_use]
-pub fn dns_outside_tun(servers: &[IpAddr], prefixes: &[(IpAddr, u8)]) -> Vec<IpAddr> {
+pub fn dns_outside_tun(
+    servers: &[IpAddr],
+    prefixes: &[(IpAddr, u8)],
+    block: &[Leak],
+) -> Vec<IpAddr> {
     servers
         .iter()
         .copied()
-        .filter(|server| {
+        .filter_map(|server| {
             let server = match server {
-                IpAddr::V4(v4) => IpAddr::V4(*v4),
+                IpAddr::V4(v4) => IpAddr::V4(v4),
                 IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                     Some(v4) => IpAddr::V4(v4),
-                    None => IpAddr::V6(*v6),
+                    None => IpAddr::V6(v6),
                 },
             };
-            !prefixes.iter().any(|(net, len)| contains(net, *len, server))
+            let covered = prefixes.iter().any(|(net, len)| contains(net, *len, server));
+            if server.is_loopback() || covered {
+                return None;
+            }
+            let blocked = block.iter().any(|leak| {
+                leak.over(server.is_ipv6()).is_some_and(|prefix| {
+                    prefix.contains(server) && (leak.blocks_dns() || leak.name == "misconfigtun")
+                })
+            });
+            blocked.then_some(server)
         })
         .collect()
 }
@@ -843,24 +861,45 @@ mod tests {
         assert!(!leak_filter_specs(&input).iter().any(|spec| spec.weight == WEIGHT_DNS_CLIENT));
     }
 
+    /// 阻断值的构造入口（`new_leak_filters` 就是生产用的那个）。
+    fn leak_block(values: &[&str]) -> Vec<leak::Leak> {
+        let values: Vec<String> = values.iter().map(|v| (*v).to_string()).collect();
+        leak::new_leak_filters(&leak::expand(&values).expect("合法值"), true, true)
+    }
+
+    /// F-02（bd 4af7e）：对齐 Go `dnsOutsideTUN` 的两条前置过滤。
+    ///
+    /// 旧断言把 `::1`（回环）算作「在外面」——那正是被否掉的过度告警，故此处改判：
+    /// 回环跳过，且只有落在阻断值 CIDR 内的服务器才告警。
     #[test]
-    fn dns_outside_tun_filters_by_prefix() {
+    fn dns_outside_tun_skips_loopback_and_requires_block_cidr() {
         let servers = vec![
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), // 前缀内
-            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),     // 前缀外
-            IpAddr::V6(Ipv6Addr::LOCALHOST),           // 前缀外
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), // 覆盖前缀内 → 不告警
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),     // 前缀外 + 落在阻断 CIDR 内 → 告警
+            IpAddr::V4(Ipv4Addr::LOCALHOST),           // 回环 → 跳过（旧实现误报）
+            IpAddr::V6(Ipv6Addr::LOCALHOST),           // 回环（v6）→ 跳过（旧实现误报）
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),    // 前缀外但不在阻断 CIDR 内 → 不告警
         ];
         let prefixes = vec![(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 0)), 24)];
-        let outside = dns_outside_tun(&servers, &prefixes);
-        assert_eq!(outside.len(), 2);
-        assert!(outside.contains(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(outside.contains(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        let block = leak_block(&["8.8.8.0/24:53"]);
+        assert_eq!(
+            dns_outside_tun(&servers, &prefixes, &block),
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]
+        );
+
+        // 没有阻断系统 DNS 的值（`icmp`）⇒ 那几条查询不会被挡 ⇒ 一条都不告警。
+        assert!(dns_outside_tun(&servers, &prefixes, &leak_block(&["icmp"])).is_empty());
     }
 
     #[test]
     fn dns_outside_tun_empty_inputs() {
-        assert!(dns_outside_tun(&[], &[]).is_empty());
         let one = vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))];
-        assert_eq!(dns_outside_tun(&one, &[]).len(), 1, "空前缀 = 全部在外面");
+        assert!(dns_outside_tun(&[], &[], &leak_block(&["dns"])).is_empty());
+        assert!(dns_outside_tun(&one, &[], &[]).is_empty(), "没有阻断值 ⇒ 不告警");
+        assert_eq!(
+            dns_outside_tun(&one, &[], &leak_block(&["dns"])).len(),
+            1,
+            "全地址阻断 + 空前缀 ⇒ 在外面"
+        );
     }
 }

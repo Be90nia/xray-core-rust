@@ -3,8 +3,8 @@
 //! 直接调用生产函数（不是替身）：输出就是 `TUN_LOG`（target `xray_frame::tun`）的真实
 //! 日志——`tracing_subscriber` 把 WARN 打到 stderr。
 //!
-//! - ② `sysroute::warn_dns_outside_tun`：覆盖集合（gateway ∪ autoSystemRoutingTable）之外 的 DNS
-//!   服务器逐条 WARN；
+//! - ② `sysroute::warn_dns_outside_tun`：覆盖集合（gateway ∪ autoSystemRoutingTable）之外、
+//!   且落在某个阻断系统 DNS 的值 CIDR 内的服务器逐条 WARN；回环解析器跳过（Go 同）；
 //! - ③ `sysroute::flush_dns_cache`：真调 `dnsapi!DnsFlushResolverCache`；
 //! - ④ `sysroute::guard::OutboundGuard`：真调 `iphlpapi!SetIpInterfaceEntry`——非管理员
 //!   必然被拒，WARN 后照常返回（关键判据：不 panic、不中断）。
@@ -35,18 +35,27 @@ fn main() {
         .without_time()
         .init();
 
-    // ② 覆盖集合内的 DNS 静默、集合外的 DNS 告警（gateway 只覆盖 192.168.77.0/24）。
+    // ② 覆盖集合内的 DNS 静默、集合外且会被阻断的 DNS 告警（gateway 只覆盖
+    // 192.168.77.0/24，阻断值 = `dns` 展开的全地址族）。
     let options = StackOptions {
         gateway: vec!["192.168.77.1/24".to_string()],
         dns: vec![
             "192.168.77.53".to_string(), // 集合内 → 不告警
-            "8.8.8.8".to_string(),       // 集合外 → 告警
+            "8.8.8.8".to_string(),       // 集合外 + 被阻断 → 告警
+            "127.0.0.1".to_string(),     // 回环解析器 → 不告警（回环保留在 TUN 内被放行）
             "not-an-ip".to_string(),     // 解析失败 → 告警（不静默丢弃）
         ],
         ..StackOptions::default()
     };
-    println!("== ② dnsOutsideTUN: gateway=192.168.77.1/24, dns=192.168.77.53,8.8.8.8,not-an-ip ==");
-    sysroute::warn_dns_outside_tun(&options, None);
+    let block = xray_proxy_tun::wfp::new_leak_filters(
+        &xray_proxy_tun::wfp::expand(&["dns".to_string()]).expect("dns 展开"),
+        true,
+        true,
+    );
+    println!(
+        "== ② dnsOutsideTUN: gateway=192.168.77.1/24, dns=192.168.77.53,8.8.8.8,127.0.0.1,not-an-ip =="
+    );
+    sysroute::warn_dns_outside_tun(&options, None, &block);
 
     // ③ 真调 dnsapi。
     println!("== ③ flushDNSCache ==");

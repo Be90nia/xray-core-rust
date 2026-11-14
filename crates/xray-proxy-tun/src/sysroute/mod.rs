@@ -945,13 +945,20 @@ pub(crate) fn dns_covered_prefixes(
     covered
 }
 
-/// 落在覆盖集合外的 DNS 服务器逐条告警：查询到不了 TUN，会被 WFP 阻断
-/// （Go `tun_windows.go:326-330` 的 `dnsOutsideTUN` + `LogWarning`）。
+/// 落在覆盖集合外、且会被 WFP 挡掉的 DNS 服务器逐条告警（Go `tun_windows.go:326-330`
+/// 的 `dnsOutsideTUN` + `LogWarning`；判据见 [`crate::wfp::spec::dns_outside_tun`]）。
+///
+/// `block` = 本次装上的泄漏阻断值（[`crate::wfp::new_leak_filters`] 的输出）：不在任何
+/// 阻断值 CIDR 内的服务器，其查询不会被挡，**不告警**。
 ///
 /// 生产调用点 = `TunInboundHandler::start`（WFP 装好之后）；本节公开亦供真机自检
 /// （`examples/tun_win_live.rs`）。
 #[cfg(target_os = "windows")]
-pub fn warn_dns_outside_tun(options: &StackOptions, applied: Option<&AppliedSystemChanges>) {
+pub fn warn_dns_outside_tun(
+    options: &StackOptions,
+    applied: Option<&AppliedSystemChanges>,
+    block: &[crate::wfp::Leak],
+) {
     let mut servers = Vec::with_capacity(options.dns.len());
     for entry in &options.dns {
         match entry.parse::<IpAddr>() {
@@ -962,10 +969,10 @@ pub fn warn_dns_outside_tun(options: &StackOptions, applied: Option<&AppliedSyst
         }
     }
     let covered = dns_covered_prefixes(options, applied);
-    for server in crate::wfp::spec::dns_outside_tun(&servers, &covered) {
+    for server in crate::wfp::spec::dns_outside_tun(&servers, &covered, block) {
         crate::TUN_LOG.warn(format!(
-            "[tun] DNS server {server} is in neither gateway nor autoSystemRoutingTable, so \
-             queries to it cannot go through the TUN and are blocked"
+            "[tun] DNS server {server} is outside gateway and autoSystemRoutingTable but inside a \
+             blocked CIDR, so queries to it cannot go through the TUN"
         ));
     }
 }
@@ -1879,7 +1886,13 @@ mod tests {
         let covered = dns_covered_prefixes(&options, None);
         let servers =
             [IpAddr::V4(Ipv4Addr::new(192, 168, 77, 53)), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
-        let outside = crate::wfp::spec::dns_outside_tun(&servers, &covered);
+        // F-02（bd 4af7e）：只有「阻断系统 DNS」的值才让集合外的服务器变告警对象。
+        let block = crate::wfp::new_leak_filters(
+            &crate::wfp::expand(&["dns".to_string()]).expect("合法值"),
+            true,
+            true,
+        );
+        let outside = crate::wfp::spec::dns_outside_tun(&servers, &covered, &block);
         assert_eq!(outside, vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]);
     }
 

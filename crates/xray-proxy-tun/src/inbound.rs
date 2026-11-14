@@ -226,7 +226,7 @@ impl TunInboundHandler {
         &self.netstack
     }
 
-    /// 启动失败回滚：撤销已应用的系统路由/DNS 变更 + 关闭设备。
+    /// 启动失败回滚：撤销已应用的系统路由/DNS 变更、拆掉 WFP 泄漏过滤器、关闭设备。
     ///
     /// 对齐 Go handler.go:194-203「宁可无 TUN」：启动失败即把 TUN 拆干净，
     /// 不留半装状态（系统路由残留 = 黑洞）。
@@ -243,6 +243,15 @@ impl TunInboundHandler {
         #[cfg(target_os = "windows")]
         if let Some(watch) = self.outbound_watch.lock().take() {
             watch.stop();
+        }
+        // WFP 泄漏过滤器与 `close` 同一条路：drop 即关 engine → 动态会话的过滤器随之
+        // 删除（Go `closeWFPEngine`）。漏这一步 = 设备已关而 block 规则（`all` /
+        // `misconfigtun` 无接口条件）仍在切断全部非许可出站，直到进程退出
+        // （bd 4af7e F-01）。顺序同 `close`：设备下线之前。
+        #[cfg(target_os = "windows")]
+        if self.leak_filter.lock().take().is_some() {
+            crate::TUN_LOG
+                .info(format!("[tun] WFP leak filters removed on start rollback tag={}", self.tag));
         }
         *self.device.lock() = None;
         let _ = device.close();
@@ -426,10 +435,10 @@ impl InboundHandler for TunInboundHandler {
                             "[tun] blocked outside the TUN: {blocked} tag={} blocked={blocked}",
                             self.tag
                         ));
-                        // 覆盖集合（gateway + autoSystemRoutingTable）外的 DNS 服务器
-                        // 查询会被上面装的过滤器挡掉——逐条告警（Go tun_windows.go:326-330）。
+                        // 覆盖集合（gateway + autoSystemRoutingTable）外、且落在这台过滤器
+                        // 阻断范围内的 DNS 服务器——逐条告警（Go tun_windows.go:326-330）。
                         let applied = self.applied_sysroute.lock();
-                        sysroute::warn_dns_outside_tun(cfg, applied.as_ref());
+                        sysroute::warn_dns_outside_tun(cfg, applied.as_ref(), &block);
                     },
                     Err(e) => {
                         self.rollback_start(&device);
@@ -2910,5 +2919,22 @@ mod tests {
             sessions.lock().contains_key(&src),
             "a newer session for the same src must not be removed by the old one's failure"
         );
+    }
+
+    /// F-01（bd 4af7e）：`rollback_start` 必须清 `leak_filter`，且在设备下线之前。
+    ///
+    /// 真机装过滤器要管理员 + 真实适配器（CI 两条都没有），故按源码顺序钉住契约：
+    /// 漏掉这一步 = WFP 动态会话活到进程退出，`all`/`misconfigtun` 这类无接口条件的
+    /// block 规则在设备已关的情况下继续切断非许可出站。
+    #[test]
+    fn rollback_start_clears_leak_filter_before_device_close() {
+        let src = include_str!("inbound.rs");
+        let start = src.find("fn rollback_start").expect("rollback_start 存在");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("rollback_start 函数体有终点")];
+        let clear =
+            body.find("self.leak_filter.lock().take()").expect("回滚必须清 leak_filter（F-01）");
+        let close = body.find("device.close()").expect("回滚必须关设备");
+        assert!(clear < close, "leak_filter 必须在 device.close() 之前清掉");
     }
 }
