@@ -10,7 +10,7 @@
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 //! [`Connection`]: xray_transport::connection::Connection
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::destination::Destination;
@@ -211,6 +211,10 @@ pub struct FreedomDispatchBridge {
     domain_strategy: i32,
     /// 托管句柄（坑约束 5）：UDP 响应泵经 `ctx.spawn` 落 FxScope 记账。
     ctx: Arc<xray_frame::PluginContext>,
+    /// UDP 上行结束后的下行空闲窗（Go `Timeouts.DownlinkOnly`，freedom.go:418
+    /// `requestDone` 的 `defer timer.SetTimeout`）。由装配层按 userLevel 档位注入，
+    /// 缺省 SessionDefault 1s。
+    downlink_only: Duration,
 }
 
 impl FreedomDispatchBridge {
@@ -228,6 +232,7 @@ impl FreedomDispatchBridge {
             inbound_rules: Arc::new(HashMap::new()),
             domain_strategy: 0,
             ctx,
+            downlink_only: xray_features::policy::DEFAULT_DOWNLINK_ONLY_TIMEOUT,
         }
     }
 
@@ -284,6 +289,14 @@ impl FreedomDispatchBridge {
         self.domain_strategy = strategy;
         self
     }
+
+    /// 设置 UDP 上行结束后的下行空闲窗（Go `Timeouts.DownlinkOnly`，
+    /// freedom.go:418；装配层按 settings.userLevel 档位传入）。
+    #[must_use]
+    pub fn with_downlink_only(mut self, downlink_only: Duration) -> Self {
+        self.downlink_only = downlink_only;
+        self
+    }
 }
 impl std::fmt::Debug for FreedomDispatchBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -305,6 +318,7 @@ impl FreedomDispatchBridge {
             domain_strategy: xray_transport::sockopt::DomainStrategy::from_i32(
                 self.domain_strategy,
             ),
+            downlink_only: self.downlink_only,
         }
     }
 }

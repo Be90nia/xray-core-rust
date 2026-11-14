@@ -23,6 +23,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::net::UdpSocket;
@@ -47,7 +48,7 @@ const RECV_BUF_SIZE: usize = 65535;
 const ACCUM_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// UDP relay 策略（Go `Process` 的 `UDPOverride` + `defaultRule` 形态）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UdpPolicy {
     /// destinationOverride（逐包改写请求目标；Go :269-279 + :596-601）。
     pub destination_override: Option<crate::config::DestinationOverride>,
@@ -58,6 +59,23 @@ pub struct UdpPolicy {
     /// 域名解析策略（bd 2yj2/czwu，Go PacketWriter 用 config.DomainStrategy
     /// 逐帧解析域名；会话默认目标另经 GetDynamicStrategy 调整）。
     pub domain_strategy: xray_transport::sockopt::DomainStrategy,
+    /// 上行结束后的下行空闲窗（Go `Timeouts.DownlinkOnly`：
+    /// `freedom.go:418` `requestDone` 的 `defer timer.SetTimeout`，逐包活动续期）。
+    /// 窗口耗尽即中止响应泵——静默目标不再永久占住 task/socket（bd 4zsk5）。
+    pub downlink_only: Duration,
+}
+
+impl Default for UdpPolicy {
+    fn default() -> Self {
+        Self {
+            destination_override: None,
+            final_rules: Vec::new(),
+            default_rule: None,
+            domain_strategy: xray_transport::sockopt::DomainStrategy::default(),
+            // Duration 的 Default 是 0（= 立即中止），这里必须显式取 Go 会话缺省值。
+            downlink_only: xray_features::policy::DEFAULT_DOWNLINK_ONLY_TIMEOUT,
+        }
+    }
 }
 
 /// Freedom UDP relay 主入口（无 noises、无策略）。
@@ -133,10 +151,20 @@ pub async fn relay_policy(
     let resp_sock = Arc::clone(&sock);
     let resp_global_id = global_id;
     let resp_policy = policy.clone();
+    // 上行结束信号：泵据此从「无超时等待」切到 DownlinkOnly 空闲窗
+    // （Go `requestDone` 的 `defer timer.SetTimeout(DownlinkOnly)`，freedom.go:418）。
+    let (uplink_done_tx, mut uplink_done_rx) = tokio::sync::watch::channel(false);
     // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-    let resp_task =
-        ctx.spawn(async move {
-            pump_response(&resp_sock, resp_global_id, &mut writer, &resp_policy).await
+    let resp_task = ctx
+        .spawn(async move {
+            pump_response(
+                &resp_sock,
+                resp_global_id,
+                &mut writer,
+                &resp_policy,
+                &mut uplink_done_rx,
+            )
+            .await
         })
         .expect("plugin ctx FxScope is never closed (assembly-owned)");
 
@@ -155,7 +183,16 @@ pub async fn relay_policy(
     )
     .await;
 
-    // 请求方向结束（link EOF），等待响应方向也结束
+    // 请求方向结束（link EOF）→ 响应方向只剩 DownlinkOnly 空闲窗：Go
+    // `requestDone` 的 `defer timer.SetTimeout(DownlinkOnly)`（freedom.go:418），
+    // 窗口被逐包回写活动续期（`buf.UpdateActivity(timer)`），耗尽即 cancel →
+    // 阻塞在 conn 读上的 response goroutine 随 `defer conn.Close` 退出
+    // （freedom.go:480 task.Run 返回后 conn 关闭）。
+    // 修前此处是裸 `resp_task.join()`：目标静默时永久阻塞在 recv_from，每会话泄漏
+    // 1 个 task + 1 个 UDP socket + 64KiB recv scratch 直到进程退出（bd 4zsk5）。
+    // 泵侧在窗口耗尽时自行返回（socket Arc 与 scratch 随任务 drop 释放），故本
+    // join 有界；下行空闲语义只有这一份账本，不再叠加第二重截止。
+    let _ = uplink_done_tx.send(true);
     let _ = resp_task.join().await;
 
     req_result
@@ -502,11 +539,17 @@ async fn send_noises(
 /// peer（multi-dest 会话下客户端才能区分各目标的响应来源）。
 /// 逐包来源 finalRule Block 检查（Go `PacketReader.ReadMultiBuffer` :515-517，
 /// 命中丢包 continue）。
+///
+/// `uplink_done`：上行（请求方向）结束后切到 [`UdpPolicy::downlink_only`] 空闲窗
+/// ——Go `requestDone` 的 `defer timer.SetTimeout(DownlinkOnly)`（freedom.go:418），
+/// 窗内每收到一个回包即重新计时（`buf.UpdateActivity(timer)`）；窗耗尽返回 Ok，
+/// socket 与 recv scratch 随本任务 drop 释放（bd 4zsk5）。
 async fn pump_response(
     sock: &UdpSocket,
     global_id: [u8; GLOBAL_ID_LEN],
     writer: &mut Box<dyn Writer>,
     policy: &UdpPolicy,
+    uplink_done: &mut tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut buf = vec![0u8; RECV_BUF_SIZE];
     // 响应帧缓冲（bd 1fm1l W5）：池化 Buffer 按本次载荷取层借出、随 MultiBuffer
@@ -516,8 +559,34 @@ async fn pump_response(
     // New/Keep 状态由本 pump 跨包持有；容量不足由 `write_packet_into_buffer`
     // 显式报错（不静默截断）。
     let mut new_sent = false;
+    // 上行结束后是否已进入 DownlinkOnly 空闲窗（一次性切换，此后每包重新计时）。
+    let mut in_downlink_window = false;
     loop {
-        let (n, peer) = match sock.recv_from(&mut buf).await {
+        let recv = if in_downlink_window {
+            match tokio::time::timeout(policy.downlink_only, sock.recv_from(&mut buf)).await {
+                Ok(r) => r,
+                // 窗内无回包（Go：timer 到期 cancel → conn.Close 解阻塞读）：
+                // 返回即释放 socket 与 64KiB scratch，不让会话永久挂着。
+                Err(_) => {
+                    crate::FREEDOM_LOG.debug(format!(
+                        "freedom: udp uplink ended, no response within {:?} → close response pump",
+                        policy.downlink_only
+                    ));
+                    return Ok(());
+                },
+            }
+        } else {
+            tokio::select! {
+                r = sock.recv_from(&mut buf) => r,
+                // 上行结束 = 会话转入下行收尾阶段（Go requestDone 返回时
+                // defer 触发 SetTimeout(DownlinkOnly)）。
+                _ = uplink_done.changed() => {
+                    in_downlink_window = true;
+                    continue;
+                },
+            }
+        };
+        let (n, peer) = match recv {
             Ok(v) => v,
             Err(_) => return Ok(()),
         };
@@ -873,6 +942,128 @@ mod tests {
         drop(client_writer);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
         echo_task.abort();
+    }
+
+    /// bd 4zsk5 ①：静默（黑洞）目标——上行 EOF 后必须在下行空闲窗内收口。
+    ///
+    /// 修前 `relay_policy` 是裸 `resp_task.join()`：响应泵永久阻塞在 `recv_from`，
+    /// 本测试 8 个会话的 relay 全部超时未返回（每会话泄漏 1 task + 1 socket +
+    /// 64KiB recv scratch，直到进程退出）。
+    #[tokio::test]
+    async fn udp_blackhole_session_released_after_uplink_eof() {
+        const SESSIONS: usize = 8;
+        // 绑了端口但从不读也不回包 = 黑洞目标
+        let blackhole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = udp_dest("127.0.0.1", blackhole.local_addr().unwrap().port());
+
+        let mut handles = Vec::with_capacity(SESSIONS);
+        for _ in 0..SESSIONS {
+            let pipe_opt = xray_buf::pipe::PipeOption::default();
+            let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+            let link =
+                Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
+            let sess_dest = dest.clone();
+            handles.push(xray_common::testing::spawn("udp-blackhole-grace", async move {
+                let ctx = test_ctx();
+                let policy = UdpPolicy {
+                    downlink_only: std::time::Duration::from_millis(150),
+                    ..Default::default()
+                };
+                relay_policy(&ctx, &sess_dest, link, &[], &policy).await
+            }));
+
+            let mut client_writer = up_w;
+            let mut frame = Vec::new();
+            {
+                let mut pw = PacketWriter::new(&mut frame, dest.clone(), [7u8; GLOBAL_ID_LEN]);
+                pw.write_packet(b"to-blackhole").unwrap();
+            }
+            let mut mb = MultiBuffer::new();
+            mb.merge_bytes(&frame);
+            client_writer.write_multi_buffer(mb).await.unwrap();
+            // 上行 EOF（inbound 关闭 link 写端 → 请求泵读到 Eof）
+            // → 响应方向进入 DownlinkOnly 空闲窗
+            client_writer.close().unwrap();
+        }
+
+        for (i, h) in handles.into_iter().enumerate() {
+            let relay_result = tokio::time::timeout(std::time::Duration::from_secs(5), h)
+                .await
+                .unwrap_or_else(|_| panic!("session {i}: relay 未在空闲窗内收口 = 响应泵泄漏"));
+            // JoinError（panic/取消）与 relay 自身 io 结果都要显式消化
+            relay_result.unwrap().unwrap();
+        }
+    }
+
+    /// bd 4zsk5 ②：正常回包不被空闲窗误杀——上行 EOF 后目标持续回包，每次回包
+    /// 续期窗口（Go `buf.UpdateActivity(timer)`），全部回包必须送达。窗口不续期
+    /// （= 硬截止 300ms）时第 4 包起会被 abort 切断。
+    #[tokio::test]
+    async fn udp_downlink_activity_resets_grace_window() {
+        const PACKETS: usize = 6;
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let responder = xray_common::testing::spawn("udp-downlink-activity", async move {
+            let mut buf = vec![0u8; RECV_BUF_SIZE];
+            let (_, peer) = target.recv_from(&mut buf).await.unwrap();
+            for i in 0..PACKETS {
+                // 间隔 < 空闲窗（100ms < 300ms）⇒ 每包都续期
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = target.send_to(&[i as u8], peer).await;
+            }
+        });
+
+        let dest = udp_dest("127.0.0.1", target_port);
+        let pipe_opt = xray_buf::pipe::PipeOption::default();
+        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
+        let sess_dest = dest.clone();
+        let relay_task = xray_common::testing::spawn("udp-downlink-activity", async move {
+            let ctx = test_ctx();
+            let policy = UdpPolicy {
+                downlink_only: std::time::Duration::from_millis(300),
+                ..Default::default()
+            };
+            relay_policy(&ctx, &sess_dest, link, &[], &policy).await
+        });
+
+        let mut client_writer = up_w;
+        let mut frame = Vec::new();
+        {
+            let mut pw = PacketWriter::new(&mut frame, dest.clone(), [3u8; GLOBAL_ID_LEN]);
+            pw.write_packet(b"query").unwrap();
+        }
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(&frame);
+        client_writer.write_multi_buffer(mb).await.unwrap();
+        // 上行立刻 EOF：后续回包只能靠续期窗口存活
+        client_writer.close().unwrap();
+
+        let mut client_reader = Box::new(dn_r) as Box<dyn Reader>;
+        let mut collected = Vec::new();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while payloads.len() < PACKETS {
+                match client_reader.read_multi_buffer().await {
+                    Ok(mb) if !mb.is_empty() => collected.extend_from_slice(&mb.to_vec()),
+                    Ok(_) => continue,
+                    Err(_) => break, // 会话收口：剩余回包已丢
+                }
+                let mut pr = PacketReader::new(std::io::Cursor::new(&collected[..]));
+                payloads.clear();
+                while let Ok(Some(pkt)) = pr.read_packet() {
+                    payloads.push(pkt.data().to_vec());
+                }
+            }
+        })
+        .await
+        .expect("超时：回包未在续期窗口内全部送达");
+
+        assert_eq!(payloads.len(), PACKETS, "续期窗口失效：回包被提前切断 {payloads:?}");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task).await;
+        responder.abort();
     }
 
     #[test]
@@ -1350,11 +1541,14 @@ mod tests {
             use std::sync::atomic::Ordering as O;
 
             let policy = UdpPolicy::default();
+            // 上行未结束（sender 保活）= 旧行为：recv 无超时，测量稳态分配。
+            let (_uplink_done_tx, mut uplink_done_rx) = tokio::sync::watch::channel(false);
             let pump = std::pin::pin!(pump_response(
                 &pump_sock,
                 [0x1F; GLOBAL_ID_LEN],
                 &mut writer,
                 &policy,
+                &mut uplink_done_rx,
             ));
 
             // 驱动腿：预热 64 包（消化 tokio/池惰性初始化）→ 开测量窗 → 计量

@@ -64,6 +64,12 @@ pub(crate) fn build_freedom_outbound(
     let bridge_policy = policy_manager.map(|pm| {
         xray_features::policy::PolicyManager::policy_for_level(pm, config.user_level).timeout
     });
+    // UDP 下行空闲窗（Go `Timeouts.DownlinkOnly`：freedom.go:222-225 取 userLevel
+    // 档位 → :418 requestDone defer SetTimeout）。bridge_policy 随后被
+    // tcp_bridge.with_policy 消费，故先取值。
+    let downlink_only = bridge_policy
+        .as_ref()
+        .map_or(xray_features::policy::DEFAULT_DOWNLINK_ONLY_TIMEOUT, |p| p.downlink_only);
     // #6742（Go freedom.go:193-198 Init 早退 + :263-265 defaultRule=nil）：
     // dialerProxy（sockopt.dialerProxy，含 transportLayer 注入）或 proxy_chain
     // （proxySettings.tag）时 freedom 非最终出站——finalRules 不构建（配了则
@@ -122,7 +128,8 @@ pub(crate) fn build_freedom_outbound(
             .with_noises(noises)
             .with_destination_override(destination_override)
             .with_final_rules(final_rules)
-            .with_domain_strategy(domain_strategy);
+            .with_domain_strategy(domain_strategy)
+            .with_downlink_only(downlink_only);
     if !uses_dialer_proxy {
         bridge = bridge.with_inbound_default_rules(inbound_default_rules.clone());
     }
