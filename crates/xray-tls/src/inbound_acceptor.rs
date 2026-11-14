@@ -12,7 +12,11 @@
 //! 上层（`xray-core` / 各协议 inbound）只依赖本模块的 [`InboundTlsAcceptor`] 与
 //! [`InboundTlsStream`]，不再直接摸 `tokio_rustls::TlsAcceptor`。
 
-use std::{io, sync::Arc};
+use std::io;
+// `Arc` 仅用于非 iOS 的 btls 后端变体与测试（iOS 门 `-D warnings` 下未用即硬错，
+// CI Mobile Gates 实测 crates/xray-tls/src/inbound_acceptor.rs:15）。
+#[cfg(any(not(target_os = "ios"), test))]
+use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
