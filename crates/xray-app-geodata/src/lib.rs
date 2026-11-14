@@ -28,7 +28,7 @@ pub mod instance;
 pub mod loader;
 pub mod scheduler;
 pub mod swap;
-pub use config::{ALLOWED_ASSET_EXTENSIONS, GeodataAsset, GeodataConfig};
+pub use config::{ALLOWED_ASSET_EXTENSIONS, GeodataAsset, GeodataConfig, migrate_geodata_url};
 pub use downloader::{
     AssetDownloader, DefaultAssetDownloader, GeodataReloader, MAX_DOWNLOAD_SIZE, NoopReloader,
     RealAssetDownloader, ReloadListener, clear_reload_listeners, download_assets,

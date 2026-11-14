@@ -880,10 +880,12 @@ fn parse_routing_json_to_proto_in(
             let mut domains = Vec::new();
             // Go router.go:182-188：`domains` 键存在时覆盖 `domain`；两者都是
             // `*StringList`（字符串形态按逗号切分，数组元素原样）。
-            let domain_list: Vec<String> = if r.get("domains").is_some() {
-                json_string_list(r.get("domains"))?
-            } else {
-                json_string_list(r.get("domain"))?
+            // Go `router.go:190-193`：`domains: null` == 未设置（Go 侧是 nil 指针 ⇒
+            // 不覆盖 `domain`）。只判 `is_some()` 会把 null 当空列表，把规则从
+            // 「限域名」放宽成「全域名」（fail-open，bd ix8xd D-8）。
+            let domain_list: Vec<String> = match r.get("domains").filter(|v| !v.is_null()) {
+                Some(v) => json_string_list(Some(v))?,
+                None => json_string_list(r.get("domain"))?,
             };
             for d in &domain_list {
                 let pb_rule = xray_geodata::rule_parser::parse_domain_rule(
@@ -2542,6 +2544,20 @@ mod tests {
             },
             other => panic!("unexpected domain rule: {other:?}"),
         }
+    }
+
+    /// bd ix8xd D-8：Go `infra/conf/router.go:190-193` 的 `domains: null` 是 nil
+    /// 指针 ⇒ **不覆盖** `domain`。旧实现只判 `is_some()`，null 当空列表 ⇒ 规则从
+    /// 「限域名」放宽为「全域名」（fail-open：屏蔽规则断网面扩大）。
+    #[test]
+    fn routing_domains_null_keeps_domain_filter() {
+        let dir = temp_asset_dir("domains-null");
+        let cfg = parse_routing_json_to_proto_in(
+            br#"{"rules":[{"outboundTag":"b","domain":["example.com"],"domains":null}]}"#,
+            &dir,
+        )
+        .expect("domains:null 必须按未设置处理");
+        assert_eq!(cfg.rule[0].domain.len(), 1, "domain 列表不得被 null 清空");
     }
 
     /// 票 5std M3：routing 顶层 `script`（Go Lua 路由脚本引擎）非空硬错，

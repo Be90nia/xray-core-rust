@@ -4,6 +4,27 @@ use xray_proto::xray::app::geodata::{Asset as ProtoAsset, Config as ProtoConfig}
 
 use crate::error::GeodataError;
 
+/// Go `infra/conf/geodata.go:22-31` `migrateGeodataURL`：xray-rules-dat 仓的裸
+/// `.dat` URL 改写成 `.dat.gz`（同内容，体积差一个量级），其余 URL 原样返回。
+///
+/// 只改写 `github.com/xtls/xray-rules-dat/` 与
+/// `raw.githubusercontent.com/xtls/xray-rules-dat/` 两个前缀——自建源不一定有
+/// `.gz`，改写会 404。大小写不敏感（Go 两侧都先 `ToLower`）。
+///
+/// 落盘内容不变：[`crate::downloader`] 按 gzip magic 字节透明解压，与 Go
+/// `app/geodata/download.go:208-212` 同判据。故改写对用户不可见（Go 另打弃用警告，
+/// 本仓无 WARN 面：改写是等价行为，不是降级）。
+#[must_use]
+pub fn migrate_geodata_url(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
+    let rules_dat = lower.starts_with("https://github.com/xtls/xray-rules-dat/")
+        || lower.starts_with("https://raw.githubusercontent.com/xtls/xray-rules-dat/");
+    if rules_dat && lower.ends_with(".dat") {
+        return format!("{url}.gz");
+    }
+    url.to_string()
+}
+
 /// Geodata 资产**本地文件名**扩展名白名单（含前导点，与 Go `filepath.Ext` 同形）。
 ///
 /// 对齐 Go v26.11.9 `app/geodata/geodata.go:36`：
@@ -11,8 +32,8 @@ use crate::error::GeodataError;
 /// （大小写不敏感）；`.lua` / `.txt` / 无扩展名 / `.dat.gz` 一律拒收。
 ///
 /// 注：白名单作用于**本地目标文件名**（Go 的 `asset.File`），**不**作用于 URL ——
-/// Go 的 URL 侧是 `infra/conf/geodata.go` `migrateGeodataURL`（把 rules-dat 仓的
-/// `.dat` URL 改写成 `.dat.gz`，见 B-6 票），且 `app/geodata/download.go` 按 gzip
+/// Go 的 URL 侧是 [`migrate_geodata_url`]（把 rules-dat 仓的
+/// `.dat` URL 改写成 `.dat.gz`），且 `app/geodata/download.go` 按 gzip
 /// magic 字节透明解压。URL 扩展名在 Go 侧无白名单，本仓同样不设。
 pub const ALLOWED_ASSET_EXTENSIONS: &[&str] = &[".dat"];
 
@@ -42,7 +63,18 @@ impl GeodataAsset {
     /// （`url.ParseRequestURI` + scheme 必须 https 且 host 非空）；扩展名白名单来自
     /// `app/geodata/geodata.go` `New()`（`EqualFold(filepath.Ext(file), ".dat")`）。
     /// 拒收 = 报错，**禁**静默跳过、**禁**降级为其他格式。
+    ///
+    /// 注：Go 的两段校验发生在**不同层**——`validateHTTPS` 在 conf 层恒跑，扩展名
+    /// 校验在 `app/geodata` 的 `New()` 且 `cron == ""` 时提前 return（不校验）。需要
+    /// 对齐该时序时用 [`Self::validate_url`] / [`Self::validate_extension`] 分开调。
     pub fn validate(&self) -> Result<(), GeodataError> {
+        self.validate_url()?;
+        self.validate_extension()
+    }
+
+    /// URL 校验（Go `infra/conf/geodata.go` `validateHTTPS`）：`https` + host 非空 +
+    /// 无 fragment。conf 层恒跑（与 cron 是否为空无关）。
+    pub fn validate_url(&self) -> Result<(), GeodataError> {
         let (scheme, rest) = match self.url.split_once("://") {
             Some((s, r)) => (s, r),
             None => return Err(self.invalid_url_err()),
@@ -60,7 +92,7 @@ impl GeodataAsset {
         if self.url.contains('#') {
             return Err(self.invalid_url_err());
         }
-        self.validate_extension()
+        Ok(())
     }
 
     /// 非法 URL 错误（URL 走 `redact_url` 脱敏——凭据不得进日志/错误文本）。
@@ -190,6 +222,58 @@ mod tests {
         let c1 = GeodataConfig { cron: "x".into(), outbound: "y".into(), assets: vec![] };
         let c2 = c1.clone();
         assert_eq!(c1, c2);
+    }
+
+    // ===== bd ix8xd D-4：`migrateGeodataURL` 移植（Go `infra/conf/geodata.go:22-31`）=====
+
+    /// rules-dat 仓的裸 `.dat` URL → `.dat.gz`；其余原样（自建源可能无 `.gz`）。
+    ///
+    /// 大小写不敏感（Go 两侧先 `ToLower`），改写后 `download.rs` 按 gzip magic 解压
+    /// ⇒ 落盘内容与裸 `.dat` 等价。
+    #[test]
+    fn migrate_url_rewrites_rules_dat_to_gz() {
+        for (input, want) in [
+            (
+                "https://github.com/xtls/xray-rules-dat/raw/main/geoip.dat",
+                "https://github.com/xtls/xray-rules-dat/raw/main/geoip.dat.gz",
+            ),
+            (
+                "https://raw.githubusercontent.com/xtls/xray-rules-dat/main/geosite.dat",
+                "https://raw.githubusercontent.com/xtls/xray-rules-dat/main/geosite.dat.gz",
+            ),
+            (
+                "https://github.com/XTLS/Xray-Rules-Dat/raw/main/geoip.DAT",
+                "https://github.com/XTLS/Xray-Rules-Dat/raw/main/geoip.DAT.gz",
+            ),
+            // 非 rules-dat 仓 / 已带 .gz / 非 .dat 后缀：原样。
+            ("https://example.com/geoip.dat", "https://example.com/geoip.dat"),
+            (
+                "https://github.com/xtls/xray-rules-dat/raw/main/geoip.dat.gz",
+                "https://github.com/xtls/xray-rules-dat/raw/main/geoip.dat.gz",
+            ),
+            (
+                "https://github.com/xtls/xray-rules-dat/releases/download/latest/x.json",
+                "https://github.com/xtls/xray-rules-dat/releases/download/latest/x.json",
+            ),
+            // 相似但不是该仓（后缀伪装）不改写。
+            (
+                "https://github.com/xtls/xray-rules-dat-evil/geoip.dat",
+                "https://github.com/xtls/xray-rules-dat-evil/geoip.dat",
+            ),
+        ] {
+            assert_eq!(super::migrate_geodata_url(input), want, "input={input}");
+        }
+    }
+
+    /// URL 校验与扩展名校验可分开调：Go 的 `validateHTTPS` 在 conf 层恒跑，扩展名
+    /// 校验在 `app/geodata` 且 `cron == ""` 时跳过（bd ix8xd D-9 的时序依据）。
+    #[test]
+    fn url_validation_independent_of_extension() {
+        let a = GeodataAsset { url: "https://example.com/x.dat".into(), file: "x.lua".into() };
+        assert!(a.validate_url().is_ok(), "URL 合法时与本地文件名无关");
+        assert!(a.validate().is_err(), "扩展名白名单仍须拒");
+        let b = GeodataAsset { url: "http://example.com/x.dat".into(), file: "x.dat".into() };
+        assert!(b.validate_url().is_err(), "scheme 必须 https");
     }
 
     // ===== bd dr0fu B-7：geodata 下载加固（对齐 Go v26.11.9 48f62b80）=====

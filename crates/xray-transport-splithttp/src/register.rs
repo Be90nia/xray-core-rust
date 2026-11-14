@@ -20,10 +20,14 @@ use xray_transport::{
 
 use crate::{
     client::{DefaultDialerClient, DialTarget},
-    config::Config,
+    config::{
+        Config, PLACEMENT_AUTO, PLACEMENT_BODY, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_PATH,
+        PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER,
+    },
     dialer,
     h3_client::{H3Conn, LazyH3Conn},
     transport::listen_splithttp,
+    xpadding::{PADDING_METHOD_REPEAT_X, PADDING_METHOD_TOKENISH},
 };
 
 /// 注册 SplitHTTP transport dialer。幂等。
@@ -615,6 +619,59 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         .or_else(|| parse_headers(obj.get("headers")))
         .unwrap_or_default();
 
+    // ===== Go 配置期枚举闸（bd qbpxv）=====
+    // Go `infra/conf/transport_method.go:356-407` 在 `SplitHTTPConfig.Build` 里逐枚举
+    // 硬错：非法值不被接受（`infra/conf: unsupported padding method: garble`）。本仓
+    // 此前纯 `get_str` 透传——拼错的值静默落到缺省行为（`garble` 按 repeat-x 跑），
+    // 配置意图与实际行为不一致且零告警。
+    //
+    // 空串一律放行：Go 在 `Build` 里就地补缺省，本仓保持字段原样、由消费侧归一
+    // （`xpadding.rs` / placement 分支），故「未设置」不在此判。
+    let mode = get_str("mode");
+    // Go `:330-336`：`mode` 只认 auto / packet-up / stream-up / stream-one（空 → auto）。
+    check_conf_enum("unsupported mode", &mode, &["auto", "packet-up", "stream-up", "stream-one"])?;
+    check_conf_enum(
+        "unsupported padding placement",
+        &get_str("xPaddingPlacement"),
+        &[PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_QUERY, PLACEMENT_QUERY_IN_HEADER],
+    )?;
+    check_conf_enum(
+        "unsupported padding method",
+        &get_str("xPaddingMethod"),
+        &[PADDING_METHOD_REPEAT_X, PADDING_METHOD_TOKENISH],
+    )?;
+    // Go `:372-382`：`cookie`/`header` 只在 packet-up 形态可用（其余形态 payload 走 body）。
+    let uplink_placement = get_str("uplinkDataPlacement");
+    match uplink_placement.as_str() {
+        "" | PLACEMENT_AUTO | PLACEMENT_BODY => {},
+        PLACEMENT_COOKIE | PLACEMENT_HEADER if mode != "packet-up" => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("UplinkDataPlacement can be {uplink_placement} only in packet-up mode"),
+            ));
+        },
+        PLACEMENT_COOKIE | PLACEMENT_HEADER => {},
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported uplink data placement: {other} (allowed: auto | body; \
+                     cookie | header only in packet-up mode)"
+                ),
+            ));
+        },
+    }
+    check_conf_enum(
+        "unsupported session placement",
+        &get_str2("sessionIDPlacement", "sessionPlacement"),
+        &[PLACEMENT_PATH, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_QUERY],
+    )?;
+    check_conf_enum(
+        "unsupported seq placement",
+        &get_str("seqPlacement"),
+        &[PLACEMENT_PATH, PLACEMENT_COOKIE, PLACEMENT_HEADER, PLACEMENT_QUERY],
+    )?;
+
     // xmux 子对象 → XmuxConfig
     // 用户未提供 xmux（或提供空对象）时套**我们自己的**缺省预设
     // （[`crate::config::default_xmux_config`]）——Go 配置面（键名/取值区间/互斥硬错/
@@ -744,6 +801,20 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
     // 执行，与 proto 入口共用（bd 1a2yy 收口入口漂移；roomSize 方向见 bd bnt45）。
     crate::config::validate_session_id(&config.session_id_table, config.session_id_length)?;
     Ok(config)
+}
+
+/// 配置期枚举校验：值非空且不在白名单 → 硬错（Go 文案前缀 + 合法值清单）。
+///
+/// 对应 Go `infra/conf/transport_method.go:356-407` 的 `switch ... default: return
+/// errors.New("unsupported ...: " + v)`。空串 = 未设置，由消费侧归一（见调用点注释）。
+fn check_conf_enum(tag: &str, value: &str, allowed: &[&str]) -> io::Result<()> {
+    if value.is_empty() || allowed.contains(&value) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{tag}: {value} (allowed: {})", allowed.join(" | ")),
+    ))
 }
 
 /// xHTTP 默认配置（无 splithttpSettings JSON 时套用）。
@@ -888,13 +959,77 @@ mod tests {
         );
     }
 
+    /// bd qbpxv：Go `infra/conf/transport_method.go:356-407` 的配置期枚举闸。
+    ///
+    /// 非法值必须在解析期硬错——Go probe 实测文案 `infra/conf: unsupported padding
+    /// method: garble`（reports/audit-2026-11-14/w5krw.md §3）。本仓此前静默接受并按
+    /// 缺省行为跑。
+    #[test]
+    fn parse_splithttp_config_rejects_invalid_enums() {
+        for (json, needle) in [
+            (r#"{"xPaddingMethod":"garble"}"#, "unsupported padding method: garble"),
+            (r#"{"mode":"stream"}"#, "unsupported mode: stream"),
+            (r#"{"xPaddingPlacement":"body"}"#, "unsupported padding placement: body"),
+            (
+                r#"{"mode":"stream-up","uplinkDataPlacement":"query"}"#,
+                "unsupported uplink data placement: query",
+            ),
+            (
+                r#"{"mode":"packet-up","uplinkDataPlacement":"query"}"#,
+                "unsupported uplink data placement: query",
+            ),
+            (r#"{"sessionIDPlacement":"body"}"#, "unsupported session placement: body"),
+            (r#"{"seqPlacement":"body"}"#, "unsupported seq placement: body"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            let err = parse_splithttp_config(Some(&v)).expect_err(json);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{json}");
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{json}: expected `{needle}` in `{msg}`");
+            // 文案须给出合法值清单（运维可自救）。
+            assert!(msg.contains("allowed"), "{json}: {msg}");
+        }
+
+        // cookie/header 只在 packet-up 可用（Go `:372-382` 独立文案）。
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"mode":"stream-up","uplinkDataPlacement":"header"}"#).unwrap();
+        let msg = parse_splithttp_config(Some(&v)).expect_err("stream-up + header").to_string();
+        assert!(msg.contains("UplinkDataPlacement can be header only in packet-up mode"), "{msg}");
+    }
+
+    /// 合法值（含空串 = 未设置）一律放行——与 Go 白名单逐值对齐。
+    #[test]
+    fn parse_splithttp_config_accepts_go_legal_enums() {
+        for json in [
+            r#"{"xPaddingMethod":"repeat-x"}"#,
+            r#"{"xPaddingMethod":"tokenish"}"#,
+            r#"{"xPaddingPlacement":"cookie"}"#,
+            r#"{"xPaddingPlacement":"header"}"#,
+            r#"{"xPaddingPlacement":"query"}"#,
+            r#"{"xPaddingPlacement":"queryInHeader"}"#,
+            r#"{"mode":"packet-up","uplinkDataPlacement":"cookie"}"#,
+            r#"{"mode":"packet-up","uplinkDataPlacement":"header"}"#,
+            r#"{"mode":"stream-up","uplinkDataPlacement":"body"}"#,
+            r#"{"mode":"stream-up","uplinkDataPlacement":"auto"}"#,
+            r#"{"sessionIDPlacement":"path"}"#,
+            r#"{"sessionPlacement":"query"}"#,
+            r#"{"seqPlacement":"header"}"#,
+            r#"{"xPaddingMethod":"","xPaddingPlacement":"","uplinkDataPlacement":"",
+                "seqPlacement":"","sessionIDPlacement":""}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            parse_splithttp_config(Some(&v)).unwrap_or_else(|e| panic!("`{json}` must pass: {e}"));
+        }
+    }
+
     /// bd w5krw（T-2）：本用例只覆盖**字段通管道**（Go SplitHTTPConfig 30 字段全量
     /// 对拍），fixture 一律用 **Go 合法值**——旧 fixture 用 `xPaddingMethod="garble"`
     /// 与 `uplinkDataPlacement="query"`（mode=stream-up），而 Go v26.11.9 对这两值
     /// **硬错**（`infra/conf/transport_method.go:364-370` `unsupported padding method`；
     /// `:372-382` `unsupported uplink data placement`；Go probe 实跑同错），旧断言等于
-    /// 把「非法值必须被接受」钉成契约。本仓 conf 层**尚无**该枚举校验（产品缺口 bd
-    /// qbpxv），故此处只钉合法值的解析结果。
+    /// 把「非法值必须被接受」钉成契约。枚举闸已由 bd qbpxv 补在
+    /// [`parse_splithttp_fields`]（负向见 `parse_splithttp_config_rejects_invalid_enums`），
+    /// 此处只钉合法值的解析结果。
     #[test]
     fn parse_splithttp_config_all_fields() {
         // 对齐 Go SplitHTTPConfig 30 字段全量对拍

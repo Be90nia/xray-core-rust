@@ -515,6 +515,17 @@ fn burst_observatory_factory() -> FeatureFactory {
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
 }
+
+/// Go `infra/conf/metrics.go:19-21`：`tag` 为空时补 `"Metrics"`。
+///
+/// 调用点已先用 [`xray_app_metrics::MetricsConfig::validate`] 拒掉「tag 与 listen
+/// 双空」，故 tag 空必伴 listen 非空。缺了这条缺省，路由规则 `outboundTag:"Metrics"`
+/// 的抓取面在配置层就不存在（`listen` 直抓不受影响）——按 Go 语义写的路由静默
+/// 不生效（bd ix8xd D-2）。
+fn default_metrics_tag(tag: &str) -> String {
+    if tag.is_empty() { "Metrics".to_string() } else { tag.to_string() }
+}
+
 /// Metrics app 真实 factory：解析 JSON → proto Config →
 /// [`xray_app_metrics::MetricsConfig`] → [`MetricsFeature`](xray_app_metrics::MetricsFeature)。
 ///
@@ -550,7 +561,7 @@ fn metrics_factory() -> FeatureFactory {
             listen: json_cfg.listen.clone().unwrap_or_default(),
         };
 
-        let config = xray_app_metrics::MetricsConfig::from_proto(&proto);
+        let mut config = xray_app_metrics::MetricsConfig::from_proto(&proto);
         // c1mg：tag 与 listen 至少一项非空——两者皆空 metrics 永远不可达，配置错误。
         // Go metrics.go:15 Build 硬错（bd onx4：ConfigInvalid 致命）。
         if let Err(e) = config.validate() {
@@ -560,6 +571,9 @@ fn metrics_factory() -> FeatureFactory {
                 message: format!("{e}"),
             });
         }
+        // bd ix8xd D-2（Go metrics.go:19-21）：缺省 tag = "Metrics"，供路由
+        // `outboundTag:"Metrics"` 抓取。顺序必须在 validate 之后（双空先前已拒）。
+        config.tag = default_metrics_tag(&config.tag);
         let feature = xray_app_metrics::MetricsFeature::new(config);
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
@@ -1013,12 +1027,15 @@ fn geodata_factory() -> FeatureFactory {
     })
 }
 
-/// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go
-/// `infra/conf/geodata.go:48-71` Build() 语义校验：cron 非法 / asset url
-/// 非 https / asset 扩展名非 `.dat` / asset file 本地缺失 → `ConfigInvalid` 硬错
-/// （bd onx4：启动期致命）。asset 校验口径见
-/// [`xray_app_geodata::GeodataAsset::validate`]（单一来源）。
-/// cron 为空则原样放行（start 时不调度，与 Go `if config.cron == ""` 等价）。
+/// JSON 字段映射进运行时 [`xray_app_geodata::GeodataConfig`]，并按 Go 分层语义校验：
+///
+/// - `infra/conf/geodata.go:48-57`：cron 非法 → 硬错；`validateHTTPS`（:33-40） **恒跑**（与 cron
+///   是否为空无关）。
+/// - `infra/conf/geodata.go:22-31` `migrateGeodataURL`：rules-dat 仓的裸 `.dat` → `.dat.gz`（bd
+///   ix8xd D-4；下载器按 gzip magic 解压，落盘内容不变）。
+/// - `app/geodata/geodata.go:29-31`：`cron == ""` **提前 return** ⇒ 扩展名（`.dat`）
+///   与文件存在性**不校验**、也不下载（bd ix8xd D-9）。start 侧同口径（cron 空不
+///   调度），故此处跳过是等价的，仍保留下载期 `validate_extension` 兜底。
 ///
 /// bd 3nt18 / bd 2bmns G-3：`geodata.outbound` 在 Rust 侧**无接线**
 /// （`RealAssetDownloader` 不带 dispatcher，Go `app/geodata/geodata.go:28-40` 走
@@ -1040,30 +1057,47 @@ fn map_geodata_config(
             ),
         });
     }
+    let cron = json_cfg.cron.unwrap_or_default();
     let mut assets = Vec::new();
     for a in json_cfg.assets.unwrap_or_default() {
-        let asset = xray_app_geodata::GeodataAsset {
+        let mut asset = xray_app_geodata::GeodataAsset {
             url: a.url.unwrap_or_default(),
             file: a.file.unwrap_or_default(),
         };
-        // Go v26.11.9 `infra/conf/geodata.go` `validateHTTPS`（scheme 必须 https 且
-        // host 非空）+ `app/geodata/geodata.go` `New()`（扩展名必须 `.dat`，大小写
-        // 不敏感）。校验收敛在 `xray_app_geodata::GeodataAsset::validate`（单一来源；
-        // URL 已在 `InvalidAssetUrl` 内脱敏）。
+        // Go `infra/conf/geodata.go:33-40` `validateHTTPS`（https + host 非空 + 无
+        // fragment）：conf 层恒跑，与 cron 无关。URL 已在 `InvalidAssetUrl` 内脱敏。
         asset
-            .validate()
+            .validate_url()
             .map_err(|e| FeatureError::ConfigInvalid { name: "geodata", message: e.to_string() })?;
-        let file = &asset.file;
-        if file.is_empty() || !default_asset_dir().join(file).exists() {
-            return Err(FeatureError::ConfigInvalid {
+        let migrated = xray_app_geodata::migrate_geodata_url(&asset.url);
+        if migrated != asset.url {
+            // Go `errors.PrintDeprecatedFeatureWarning(url, url+".gz")`。
+            tracing::warn!(
+                url = %asset.url,
+                "geodata asset url is deprecated: downloading the .gz form instead",
+            );
+            asset.url = migrated;
+        }
+        // Go `app/geodata/geodata.go:29-31`：cron 空 ⇒ assets 不下载、不校验（bd ix8xd
+        // D-9）。扩展名仍由下载期 `GeodataAsset::validate_extension` 兜底。
+        if !cron.is_empty() {
+            // Go `:36-41`：扩展名必须 `.dat`（大小写不敏感）+ 文件须本机存在。
+            asset.validate_extension().map_err(|e| FeatureError::ConfigInvalid {
                 name: "geodata",
-                message: format!("invalid geodata asset file: {file}"),
-            });
+                message: e.to_string(),
+            })?;
+            let file = &asset.file;
+            if file.is_empty() || !default_asset_dir().join(file).exists() {
+                return Err(FeatureError::ConfigInvalid {
+                    name: "geodata",
+                    message: format!("invalid geodata asset file: {file}"),
+                });
+            }
         }
         assets.push(asset);
     }
     let config = xray_app_geodata::GeodataConfig {
-        cron: json_cfg.cron.unwrap_or_default(),
+        cron,
         // 上面已拒非空 `outbound`；此处恒空（下载器不接 dispatcher，bd 3nt18）。
         outbound: String::new(),
         assets,
@@ -1323,8 +1357,9 @@ mod tests {
         assert!(err.to_string().contains("invalid geodata cron"), "unexpected error: {err}");
     }
 
-    /// 资产校验对齐 Go GeodataAssetConfig.Build()：url 必须 https+host，
-    /// file 必须本地存在（StatAsset 语义）。
+    /// 资产校验对齐 Go 的分层（bd ix8xd D-9）：`infra/conf/geodata.go` `validateHTTPS`
+    /// 恒跑；`app/geodata.New` 的扩展名/存在性校验只在 `cron` 非空时跑（`geodata.go:29-31`
+    /// 在 `cron == ""` 时提前 return，assets 完全惰性）。
     #[test]
     fn geodata_mapping_rejects_bad_assets() {
         let http_url: xray_conf::app_config::GeodataConfig = serde_json::from_str(
@@ -1335,11 +1370,20 @@ mod tests {
         assert!(err.to_string().contains("invalid geodata asset url"));
 
         let missing_file: xray_conf::app_config::GeodataConfig = serde_json::from_str(
-            r#"{"assets":[{"url":"https://example.com/geoip.dat","file":"no-such-xei2.dat"}]}"#,
+            r#"{"cron":"*/5 * * * *",
+                "assets":[{"url":"https://example.com/geoip.dat","file":"no-such-xei2.dat"}]}"#,
         )
         .expect("json should parse");
         let err = map_geodata_config(missing_file).expect_err("missing file must fail");
         assert!(err.to_string().contains("invalid geodata asset file"));
+
+        // cron 空 ⇒ Go `New()` 提前 return：扩展名/存在性都不校验（assets 惰性）。
+        let missing_file_no_cron: xray_conf::app_config::GeodataConfig = serde_json::from_str(
+            r#"{"assets":[{"url":"https://example.com/geoip.dat","file":"no-such-xei2.dat"}]}"#,
+        )
+        .expect("json should parse");
+        map_geodata_config(missing_file_no_cron)
+            .expect("cron 空时不校验资产存在性（Go app/geodata.New 提前 return）");
     }
 
     /// 工厂接线：合法配置建出真实 feature；非法 cron 在 create_feature 层硬错
@@ -1359,6 +1403,31 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("invalid geodata cron"));
+    }
+
+    /// bd ix8xd D-2：Go `metrics.go:19-21` 空 tag 补 `"Metrics"`（路由 `outboundTag`
+    /// 抓取面）。双空在补缺省前已由 `MetricsConfig::validate` 拒（用例见
+    /// `metrics_factory_returns_real_metrics_feature`）。
+    #[test]
+    fn metrics_default_tag_matches_go() {
+        assert_eq!(super::default_metrics_tag(""), "Metrics");
+        assert_eq!(super::default_metrics_tag("Metrics"), "Metrics", "重复应用幂等");
+        assert_eq!(super::default_metrics_tag("my-metrics"), "my-metrics");
+    }
+
+    /// bd ix8xd D-9 接线证明：`create_feature("geodata", …)`（生产入口）在 cron 空时放行
+    /// 惰性 assets —— Go `app/geodata/geodata.go:29-31` 提前 return。校验口径本身（含 cron
+    /// 非空时扩展名/存在性/URL 的负向面）见 `geodata_mapping_rejects_bad_assets`。
+    #[test]
+    fn geodata_assets_without_cron_are_inert_like_go() {
+        register_all_features();
+        // 非 .dat 扩展名 + 不存在的文件 + 合法 https URL：cron 空 ⇒ Go 接受。
+        let json =
+            br#"{"assets":[{"url":"https://github.com/xtls/xray-rules-dat/raw/main/geoip.dat",
+            "file":"missing-asset.lua"}]}"#;
+        let feat = registry::create_feature("geodata", json)
+            .unwrap_or_else(|e| panic!("cron 空时 assets 必须惰性放行（Go 提前 return）: {e}"));
+        assert_eq!(feat.feature_name(), "geodata");
     }
 
     #[test]

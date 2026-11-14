@@ -193,10 +193,8 @@ pub struct StatsConfig {}
 /// }
 /// ```
 ///
-/// Rust 端当前为死字段（仅 `Config.version: Option<VersionConfig>` 一处定义，
-/// xray-app-version 已实现但 Instance 装配未注册）——保留形状对齐 Go，等
-/// 后续 batch 接入 `xray_app_version::Version::new` 即可生效（`coreVersion`
-/// 取自 `core.Version_x/y/z`，`min/max` 为运行期约束）。
+/// 生效面：`xray-core::register::version_factory`（`min`/`max` 由
+/// `xray_app_version::Version::new` 在启动期校验，不满足即拒启）。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct VersionConfig {
