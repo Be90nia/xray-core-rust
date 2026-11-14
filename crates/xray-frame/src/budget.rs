@@ -245,18 +245,18 @@ pub const XRAY_BUF_POOL_TOTAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// hysteria udphop 进程级共享块池字节预算（**已落地**（bd ccy5d）：
-/// `xray_transport_hysteria::udphop::POOL_IDLE_CAP`（128 块）× 实现侧
-/// `UDP_BUFFER_SIZE`（1500B）= **192_000B**，交叉断言钉住
+/// `xray_transport_hysteria::udphop::POOL_IDLE_CAP`（48 块）× 实现侧
+/// `UDP_BUFFER_SIZE`（4096B，= Go `finalmask.UDPSize`）= **196_608B**，交叉断言钉住
 /// （断言面 `xray-core::memory_budget` tests——它同时可见实现 crate）。
 ///
 /// 旧口径**每连接一份**池（N 连接 = N × 192KB 乘积面，audit4-memory 未入簿）；
-/// bd ccy5d 起同尺寸块（1500B）全进程唯一一份池（`xray_frame` 的
+/// bd ccy5d 起同尺寸块（4096B）全进程唯一一份池（`xray_frame` 的
 /// `SharedPoolRegistry`，尺寸 class 分桶），上界收敛为**进程级常量**。
-/// 账面只含 idle 常驻（≤128 块）+ 池内在飞；块随 `UdpPacket` detach 进
+/// 账面只含 idle 常驻（≤48 块）+ 池内在飞；块随 `UdpPacket` detach 进
 /// mpsc 队列/桥后脱离池记账，归 [`MAX_PER_CONN_BUFFER_BYTES`] 每连接份额口径
 /// （不与本项重复计账）。连接全关后老化任务随连接 scope 停，残余 idle 块
 /// ≤ 本上界驻留至下次连接复用——仍是进程级常量。
-pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 128 * 1500;
+pub const HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES: usize = 48 * 4096;
 
 /// h2 每连接发送缓冲（**真缓冲**，连接级；**已落地**：splithttp 客户端
 /// `H2_MAX_SEND_BUF_SIZE` = 16MiB；服务端 `H2_SERVER_MAX_SEND_BUF_SIZE` = 32MiB 为
@@ -433,13 +433,13 @@ mod tests {
 
     /// 固定占用底数（8 核参考机）随簿搬家后数值不变（断言本体住
     /// `xray-core::memory_budget`——它同时可见实现 crate；此处只钉搬家无漂移）。
-    /// bd ccy5d 起含 hysteria 共享块池 192_000B：20_316_160 + 192_000 = 20_508_160。
+    /// bd ccy5d 起含 hysteria 共享块池（bd qetcn 起 48 × 4096B = 196_608B）。
     #[test]
     fn floor_moves_without_drift() {
-        // 8 核参考机 + 1 监听：20_114_944（池/缓存）+ 64 × 55KiB（握手在途）= 23_719_424。
+        // 8 核参考机 + 1 监听：20_119_552（池/缓存）+ 64 × 55KiB（握手在途）= 23_724_032。
         assert_eq!(
             startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX),
-            23_719_424
+            23_724_032
         );
         // 每监听一份（bd 258qt(a)）：多一个监听多 64 × 55KiB。
         assert_eq!(

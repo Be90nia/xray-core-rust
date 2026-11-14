@@ -851,15 +851,41 @@ impl H3Conn {
                 },
             }
             if upload_only {
-                // stream-up：drain 响应（h3 协议要求收完否则连接异常）
-                while let Ok(Some(_)) = recv_half.recv_data().await {}
+                // stream-up：drain 响应（h3 协议要求收完否则连接异常）。无读端可上报
+                // ⇒ 错误只留痕（对齐 Go `io.Copy(io.Discard, resp.Body)` 的同位忽略，
+                // 但不再与干净 EOF 无从区分，bd qetcn）。
+                loop {
+                    match recv_half.recv_data().await {
+                        Ok(Some(_)) => {},
+                        Ok(None) => break,
+                        Err(e) => {
+                            crate::hot_log!(
+                                tracing::Level::DEBUG,
+                                "stream-up drain recv_data: {e}"
+                            );
+                            break;
+                        },
+                    }
+                }
             } else {
-                // stream-one：响应数据即下行流，转发给调用方
-                while let Ok(Some(mut buf)) = recv_half.recv_data().await {
-                    let len = buf.remaining();
-                    let data = buf.copy_to_bytes(len);
-                    if data_tx.send(Ok(data)).await.is_err() {
-                        break;
+                // stream-one：响应数据即下行流，转发给调用方。**错误必须交给读端**
+                // （对齐 Go `wrc.Set(resp.Body)`：body 读失败 → Read 返错），吞成 EOF
+                // 会把截断的代理流当正常结束（bd qetcn）。
+                loop {
+                    match recv_half.recv_data().await {
+                        Ok(Some(mut buf)) => {
+                            let len = buf.remaining();
+                            if data_tx.send(Ok(buf.copy_to_bytes(len))).await.is_err() {
+                                break;
+                            }
+                        },
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = data_tx
+                                .send(Err(std::io::Error::other(format!("h3 recv_data: {e}"))))
+                                .await;
+                            break;
+                        },
                     }
                 }
             }

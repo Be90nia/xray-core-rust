@@ -1766,7 +1766,8 @@ mod tests {
     }
 
     /// hysteria udphop 进程级共享块池与实现**同一算式**（bd ccy5d）：
-    /// 簿值 = `POOL_IDLE_CAP`（128 块）× `UDP_BUFFER_SIZE`（1500B）= 192_000B。
+    /// 簿值 = `POOL_IDLE_CAP`（48 块）× `UDP_BUFFER_SIZE`（4096B，Go `finalmask.UDPSize`）
+    /// = 196_608B（bd qetcn 块尺寸 1500→4096 后同额收敛）。
     /// **改任一实现值即红**（块数或块大小变了 ⇒ 账本与 96MB 分账必须同步重审）。
     /// 同时钉「总实算」口径：固定面（含本项）+ 8 连接 × pipe 双向的既有总账
     /// 测试（`ledger_total_stays_within_budget`；u440m 字节闸回退后桥在途为
@@ -1779,7 +1780,7 @@ mod tests {
             hop::POOL_IDLE_CAP * hop::UDP_BUFFER_SIZE,
             "hysteria 共享块池预算与本登记簿不一致：两处同步改（bd ccy5d）"
         );
-        assert_eq!(HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES, 192_000, "128 块 × 1500B 口径锚");
+        assert_eq!(HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES, 196_608, "48 块 × 4096B 口径锚");
     }
 
     /// hyper 每 host 空闲**连接数**与实现**同一常量**（bd sgdwm 修正 PM-04：
@@ -1984,7 +1985,7 @@ mod tests {
             assert!(HANDSHAKE_TASK_EST_BYTES == 55 * 1024, "账面口径 = 实测取整上沿 55KiB");
     }
 
-    /// 固定占用底数 ≤ 预算的固定份额（**8 核 / 1 监听参考机** = 23,719,424B
+    /// 固定占用底数 ≤ 预算的固定份额（**8 核 / 1 监听参考机** = 23,724,032B
     /// ≈ 22.6MiB；本断言防固定面悄悄长穿预算的 1/4 —— 超过即须重审分账，不是
     /// 硬顶）。thread_local 项随核数线性、握手项随监听数线性（bd 258qt(a)），
     /// 两者都显式注入 ⇒ 换机器断言不漂移（铁律①）。
@@ -1992,9 +1993,10 @@ mod tests {
     fn fixed_floor_stays_within_quarter_of_budget() {
         let fixed = startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX);
         assert_eq!(
-            fixed, 23_719_424,
+            fixed, 23_724_032,
             "8 核/1 监听参考机固定底数变了：成员或估算须重审（bd sgdwm；bd ccy5d 起 \
-             含 hysteria 共享块池 192_000B；bd 258qt(a) 起握手按 55KiB × 监听数）"
+             含 hysteria 共享块池（bd qetcn 起 48 × 4096B = 196_608B）；bd 258qt(a) 起握手按 \
+             55KiB × 监听数）"
         );
         assert!(
             fixed <= XRAY_BUDGET_BYTES / 4,

@@ -210,6 +210,41 @@ type WaiterSlot = Arc<parking_lot::Mutex<Option<tokio::sync::oneshot::Sender<Pac
 /// assoc_id → 等待者队列共享句柄。
 type Waiters = Arc<parking_lot::Mutex<HashMap<u16, std::collections::VecDeque<WaiterSlot>>>>;
 
+/// 超时等待槽的进程级累计计数（bd qetcn）。
+///
+/// 超时请求必须显式移出队列，否则每个超时都在队列里留一个死节点——长活 UDP 会话
+/// 只发不收时队列随超时次数无界增长。可读出口供上层自取（口径同
+/// [`inbox_byte_cap_drop_counters`]：协议 crate 不反向依赖应用指标面）。
+static TIMED_OUT_WAITERS: AtomicU64 = AtomicU64::new(0);
+
+/// 累计超时的等待槽请求数（进程级；每次超时都把该请求的等待槽移出队列）。
+#[must_use]
+pub fn udp_waiter_timeouts() -> u64 {
+    TIMED_OUT_WAITERS.load(Ordering::Relaxed)
+}
+
+/// 超时收尾：把本槽移出等待队列并计数（bd qetcn）。
+///
+/// 顺序 = 先持队列锁再清 sender：与 pump（队列锁 → 槽锁）同序，反序即死锁。
+/// 清 sender 保证「pump 已 pop 到本槽」时 `take()` 得 `None` 跳过（不会错投）。
+fn evict_waiter(waiters: &Waiters, assoc_id: u16, slot: &WaiterSlot) {
+    let mut w = waiters.lock();
+    *slot.lock() = None;
+    let queue_empty = match w.get_mut(&assoc_id) {
+        Some(queue) => {
+            if let Some(pos) = queue.iter().position(|s| Arc::ptr_eq(s, slot)) {
+                queue.remove(pos);
+            }
+            queue.is_empty()
+        },
+        None => false,
+    };
+    if queue_empty {
+        w.remove(&assoc_id);
+    }
+    TIMED_OUT_WAITERS.fetch_add(1, Ordering::Relaxed);
+}
+
 impl UniRespRouter {
     /// 在连接建立后调用：spawn per-connection 响应 pump（连接关闭自动退出）。
     pub(crate) fn spawn(conn: quinn::Connection) -> Self {
@@ -296,8 +331,9 @@ impl UniRespRouter {
             Ok(Ok(resp)) => Ok(resp.data.into()),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                // 超时：清空本槽（sender drop → 后续响应跳过本槽，不会错投）
-                *slot.lock() = None;
+                // 超时：把本槽移出队列（sender drop 保证不会错投；残留槽会让每个
+                // 超时请求永久占一个队列节点 ⇒ 长活会话无界增长）
+                evict_waiter(&self.waiters, pkt.assoc_id, &slot);
                 Err(TuicError::UdpTimeout(timeout))
             },
         }
@@ -989,5 +1025,27 @@ mod tests {
 
         release_retained_bytes(&mut state, 6);
         assert_eq!(state.retained_bytes, 0, "出账额等于账面时归零（边界）");
+    }
+
+    /// bd qetcn：超时的等待槽必须移出队列并计数。
+    ///
+    /// 改前超时只清 sender（`*slot.lock() = None`）而槽本身留在 `VecDeque` 里——
+    /// 只在「后续还有响应被 pump 弹出」时才顺带清掉；对端不再回包时每个超时请求
+    /// 都在队列留一个死节点，长活 UDP 会话无界增长。
+    #[test]
+    fn timed_out_waiter_is_evicted_from_queue() {
+        let waiters: Waiters = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let slot: WaiterSlot = Arc::new(parking_lot::Mutex::new(Some(tx)));
+        waiters.lock().entry(9).or_default().push_back(Arc::clone(&slot));
+
+        let before = udp_waiter_timeouts();
+        evict_waiter(&waiters, 9, &slot);
+
+        assert!(
+            waiters.lock().get(&9).is_none(),
+            "超时槽必须移出队列（队列空了连 assoc 条目一起删）"
+        );
+        assert_eq!(udp_waiter_timeouts(), before + 1, "超时移除必须计数");
     }
 }

@@ -15,8 +15,12 @@ use xray_frame::scope::ComponentScope;
 
 use crate::error::{HysteriaError, Result};
 
-/// UDP 包缓冲大小（对应 Go `udpBufferSize = finalmask.UDPSize`）。
-pub const UDP_BUFFER_SIZE: usize = 1500;
+/// UDP 包缓冲大小（对应 Go `udpBufferSize = finalmask.UDPSize` = 4096）。
+///
+/// **必须与 Go 同值**：内核 UDP `recv_from` 对超长数据报**静默截断**并返回截断后的
+/// 长度（不报错）——缓冲小于 4096 时 1501..4096B 的包只剩前半段，调用方拿不到任何
+/// 错误（bd qetcn）。
+pub const UDP_BUFFER_SIZE: usize = 4096;
 
 /// 默认 hop 间隔（对应 Go `defaultHopInterval = 30 * time.Second`）。
 pub const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
@@ -28,8 +32,11 @@ pub const MIN_HOP_INTERVAL: Duration = Duration::from_secs(5);
 pub const PACKET_QUEUE_SIZE: usize = 1024;
 
 /// 池**空闲**块额度（bd ccy5d 起 = **进程级**常驻上界，全连接共享一份池）：
-/// 128 × [`UDP_BUFFER_SIZE`] = **192 KB/进程**（账本
+/// 48 × [`UDP_BUFFER_SIZE`] = **192 KB/进程**（账本
 /// `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`，交叉断言钉住）。
+///
+/// 块尺寸 1500 → 4096 对齐 Go `finalmask.UDPSize`（bd qetcn）后，idle 额度同比例下调
+/// 48 块以守住 192 KB 进程级常驻上界（改前 128 × 1500B 同额）。
 ///
 /// 旧值 = `PACKET_QUEUE_SIZE` ⇒ 1500 B × 1024 = 1.5 MB/连接（20 条连接 30 MB，撞
 /// 256 MB 小机场的 96 MB xray 预算，见 `reports/audit-2026-11-04/MEMORY-BUDGET-256MB.md`）。
@@ -39,7 +46,7 @@ pub const PACKET_QUEUE_SIZE: usize = 1024;
 /// `sync.Pool` 的包级语义），上界收敛为进程级常量。`max` 仍取
 /// `PACKET_QUEUE_SIZE * 2`：它只按值认领宇宙配额、**不预分配**，管的是
 /// 「在飞 + idle」总量，突发照收（超 max 走降级直构，不进 idle 常驻）。
-pub const POOL_IDLE_CAP: usize = 128;
+pub const POOL_IDLE_CAP: usize = 48;
 
 /// 池老化窗：idle 块距上次使用超此值即释放。Go 的 `sync.Pool` 靠 GC 回收，Rust 无
 /// GC ⇒ 不修剪就永久常驻（本池的 idle 额度即上界，故必须有显式老化）。
@@ -91,7 +98,7 @@ fn reset_returned_block(buf: &mut Vec<u8>) {
 /// 消费端拷出数据后归还（对齐 Go `ReadFrom` 的 `pool.Put`）。
 ///
 /// **进程级共享（bd ccy5d）**：生产池走 [`BufPool::new`] ⇒ 框架
-/// [`xray_frame::pool::SharedPoolRegistry`]（1500B class 全进程唯一一份，
+/// [`xray_frame::pool::SharedPoolRegistry`]（4096B class 全进程唯一一份，
 /// N 连接复用——Go `sync.Pool` 本就是包级共享，逐连接池是本仓旧偏差）；
 /// 池常驻上界从 N × 192 KB 乘积面收敛为进程级常量（账本
 /// `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`）。测试面用
@@ -127,13 +134,13 @@ fn build_buf_pool() -> Arc<ObjectPool<Vec<u8>>> {
     ))
 }
 
-/// 生产取口：1500B class 的进程级共享池（框架注册表，同尺寸全进程唯一一份）。
+/// 生产取口：4096B class 的进程级共享池（框架注册表，同尺寸全进程唯一一份）。
 fn shared_buf_pool() -> Arc<ObjectPool<Vec<u8>>> {
     xray_frame::pool::SharedPoolRegistry::shared().get_or_init(UDP_BUFFER_SIZE, build_buf_pool)
 }
 
 /// 进程级 idle 老化（bd m6pkl N5）：共享池的 idle 块原来只由**连接级** pruner 回收，
-/// 最后一条连接关闭后其 scope 随之停 ⇒ 残余 idle（≤ `POOL_IDLE_CAP` × 1500B）常驻到
+/// 最后一条连接关闭后其 scope 随之停 ⇒ 残余 idle（≤ `POOL_IDLE_CAP` × 4096B）常驻到
 /// 进程结束，空闲连接不再有任何回收面。这里在**首次**建共享池时装一个进程生命周期的
 /// pruner（坑约束 ⑥ **② 类豁免**：进程级后台任务必须活得比任何组件久）。
 /// 连接级 pruner 保留（`prune_idle` 幂等，多 pruner 无冲突）。
@@ -163,7 +170,7 @@ fn ensure_process_pruner(pool: &Arc<ObjectPool<Vec<u8>>>) {
 }
 
 impl BufPool {
-    /// 生产构造：进程级共享池（bd ccy5d）——同尺寸块（1500B）全进程唯一一份，
+    /// 生产构造：进程级共享池（bd ccy5d）——同尺寸块（4096B）全进程唯一一份，
     /// 全部连接复用；预算账本 `xray_frame::budget::HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES`。
     fn new() -> Self {
         let inner = shared_buf_pool();
@@ -291,7 +298,7 @@ impl UdpHopPacketConn {
     ///
     /// 异步：内部 spawn 两个 tokio 任务（hop_loop + recv_loop on current_conn）。
     ///
-    /// 池面（bd ccy5d）：进程级共享池——1500B class 全进程唯一一份
+    /// 池面（bd ccy5d）：进程级共享池——4096B class 全进程唯一一份
     /// （`SharedPoolRegistry`），全部连接复用，N 连接常驻不再随连接数翻倍；
     /// 测试注入独立池走 `Self::with_pool`（测试面）。
     ///
@@ -437,7 +444,7 @@ impl UdpHopPacketConn {
         // 底层句柄经 `fx_scope()` 喂统一托管口（bd hj3jf 先例延续）。
         // 目标池 = 进程级共享池（bd ccy5d）：每条活连接各挂一个 pruner 同扫一份池
         // （prune 幂等，多 pruner 无冲突）；连接全关后 pruner 随 scope 停，残余
-        // idle ≤ POOL_IDLE_CAP × 1500B = 192 KB 进程级常驻（账本口径），下次连接
+        // idle ≤ POOL_IDLE_CAP × 4096B = 192 KB 进程级常驻（账本口径），下次连接
         // 直接复用。
         if xray_frame::pool::spawn_idle_pruner(
             prune_scope.fx_scope(),
@@ -745,7 +752,7 @@ mod tests {
 
     #[test]
     fn constants_match_go() {
-        assert_eq!(UDP_BUFFER_SIZE, 1500);
+        assert_eq!(UDP_BUFFER_SIZE, 4096, "Go finalmask.UDPSize = 4096");
         assert_eq!(DEFAULT_HOP_INTERVAL, Duration::from_secs(30));
         assert_eq!(MIN_HOP_INTERVAL, Duration::from_secs(5));
         assert_eq!(PACKET_QUEUE_SIZE, 1024);
@@ -866,14 +873,78 @@ mod tests {
         conn.close().await.ok();
     }
 
-    /// bd ccy5d 契约：进程级共享池 = 同尺寸（1500B）全进程唯一一份——生产取口
+    /// 内核 UDP `recv_from` 语义的 mock：数据报大于用户缓冲时**截断**并返回截断后的
+    /// 长度（不报错）——`n = min(datagram_len, buf.len())`。
+    ///
+    /// 用于锁死「接收缓冲必须容得下 Go `finalmask.UDPSize`（4096）」，否则大包静默
+    /// 截断且调用方拿不到任何错误。
+    struct OversizedDatagramConn {
+        datagram_len: usize,
+        addr: SocketAddr,
+    }
+
+    impl PacketConn for OversizedDatagramConn {
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<(usize, SocketAddr)>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let n = self.datagram_len.min(buf.len());
+                buf[..n].fill(0xCD);
+                Ok((n, self.addr))
+            })
+        }
+
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            _addr: SocketAddr,
+        ) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn close(&self) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.addr)
+        }
+    }
+
+    /// bd qetcn：接收缓冲必须对齐 Go `finalmask.UDPSize`（4096）。缓冲退回 1500 时
+    /// 本断言必红——4000B 数据报被内核静默截成 1500B。
+    #[tokio::test]
+    async fn oversized_datagram_is_not_truncated() {
+        let addr: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        let conn = UdpHopPacketConn::with_pool(
+            vec![addr],
+            MIN_HOP_INTERVAL,
+            MIN_HOP_INTERVAL,
+            Arc::new(|_| Box::pin(async { unreachable!() })),
+            Arc::new(OversizedDatagramConn { datagram_len: 4000, addr }),
+            0,
+            Arc::new(BufPool::isolated()),
+        )
+        .await
+        .expect("new");
+
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let (n, _) = conn.read_from(&mut buf).await.expect("read_from");
+        assert_eq!(n, 4000, "≤4096B 的包不得被截断（Go finalmask.UDPSize = 4096）");
+        conn.close().await.ok();
+    }
+
+    /// bd ccy5d 契约：进程级共享池 = 同尺寸（4096B）全进程唯一一份——生产取口
     /// `BufPool::new` 经框架 `SharedPoolRegistry` 取池，两次取同一 `Arc`。
     /// **反向自检锚点**：`shared_buf_pool` 退回每连接直构（不走注册表），本断言必红。
     #[test]
     fn shared_buf_pool_is_process_unique() {
         assert!(
             Arc::ptr_eq(&shared_buf_pool(), &shared_buf_pool()),
-            "1500B class 的共享池必须全进程唯一一份（SharedPoolRegistry，bd ccy5d）"
+            "4096B class 的共享池必须全进程唯一一份（SharedPoolRegistry，bd ccy5d）"
         );
     }
 
@@ -948,7 +1019,7 @@ mod tests {
         assert_eq!(m.core.idle, POOL_IDLE_CAP, "idle 不得越过额度");
     }
 
-    /// 每连接池常驻上界（96 MB 预算口径）：idle 额度按 1500 B/块计 ≤ 192 KB。
+    /// 每连接池常驻上界（96 MB 预算口径）：idle 额度按 4096 B/块计 ≤ 192 KB。
     /// **反向自检锚点**：把 `idle_cap` 改回 `PACKET_QUEUE_SIZE`（1.5 MB/连接），
     /// 下面两条 `const` 断言直接编译不过。
     #[test]
