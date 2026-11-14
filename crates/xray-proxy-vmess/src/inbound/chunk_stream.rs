@@ -121,21 +121,35 @@ pub(crate) struct ChunkWriter<W> {
     size_parser: Box<dyn SizeParser + Send>,
     global_padding: bool,
     no_termination: bool,
-    /// 批缓冲：整批帧在**同一段连续字节**里（`[size][ct‖tag][padding]` 帧序列紧挨），
+    /// 写缓冲：本次要发的帧在**同一段连续字节**里（`[size][ct‖tag][padding]`），
     /// `flush` 后 `clear` 复用容量（零 realloc）。
+    ///
+    /// 一次写带几帧见 [`FRAMES_PER_WRITE`]（bd 7choj：一次一帧——写大了会让服务端
+    /// 那次 `write_all` 等对端窗口，流水线退化成锁步）。
     batch: Vec<u8>,
     terminated: std::cell::Cell<bool>,
 }
 
-/// 一批帧数（批缓冲目标 ≈ 64 KiB）。
+/// 每次 socket 写携带的帧数（bd 7choj 实测定值 = 1）。
 ///
-/// 本机 loopback 实测内核态成本：每 8 KiB send ≈ 53µs、每 64 KiB send ≈ 72µs
-/// ⇒ **成本随 send 次数走、不随字节走**（8 KiB×8 次 = 424µs vs 64 KiB×1 次 = 72µs）。
-/// 攒 8 帧一次写 ⇒ 每 MiB 16 次 send（bd 7choj）。
+/// **为什么不是「攒多帧一次写」**：写越大，服务端那一次 `write_all` 要等对端窗口
+/// 打开才完成 ⇒ 服务端装帧停摆、`pipe` 读前瞻被抽干 ⇒ 整条链退化成「服务端写一
+/// 批 ⇄ 客户端吃一批」的锁步；吞吐 = 客户端单侧速率 × 锁步放大。
 ///
-/// 注意：`write_vectored` 传 8 段**不等于**一次大 send（每段仍各自处理，实测无收益），
-/// 必须把帧字节拼进同一段连续内存。
-const FRAME_BATCH: usize = 8;
+/// 同机同拓扑交错实测（服务端每次写的字节数 → vmess 下行吞吐中位，128 MiB/轮）：
+///
+/// | 每次写 | 8 KiB | 16 KiB | 24 KiB | 32 KiB | 48 KiB | 64 KiB（本仓原值） |
+/// |---|---|---|---|---|---|---|
+/// | MB/s | **302.8** | 265.9 | 207.4 | 207.3 | 174.4 | 228.2 |
+///
+/// 判据：写 ≤ socket 发送缓冲的一小部分 ⇒ 一次 `write_all` 不等对端窗口，服务端
+/// 能继续装帧 + 继续从 `pipe` 取数（读前瞻保持深度），流水线不塌成锁步。
+///
+/// **保留的部分**（bd 7choj 前一轮交付的收益）：整帧**一段连续字节**
+/// （`[size][ct‖tag][padding]`）⇒ 一次单缓冲写（1 个 iovec，不是旧泵的 3 段
+/// `write_vectored`）⇒ 内核态每帧 1 次 MDL 处理；缓冲容量复用 ⇒ 每帧零堆分配
+/// （帧分配 190.9 → 0.3 /MiB 不回退）。
+const FRAMES_PER_WRITE: usize = 1;
 
 impl<W> ChunkWriter<W> {
     pub(crate) fn new(
@@ -146,7 +160,7 @@ impl<W> ChunkWriter<W> {
         global_padding: bool,
         no_termination: bool,
     ) -> Self {
-        // 一批的字节上界：每帧 [size + 明文上限 + tag + padding 上限]
+        // 一批的字节上界：每帧 [size + 明文上限 + tag + padding 上界]
         let frame_wire = size_parser.size_bytes()
             + PAYLOAD_MAX
             + cipher.tag_size()
@@ -158,7 +172,7 @@ impl<W> ChunkWriter<W> {
             size_parser,
             global_padding,
             no_termination,
-            batch: Vec::with_capacity(FRAME_BATCH * frame_wire),
+            batch: Vec::with_capacity(FRAMES_PER_WRITE * frame_wire),
             terminated: std::cell::Cell::new(false),
         }
     }
@@ -213,7 +227,7 @@ impl<W> ChunkWriter<W> {
 }
 
 impl<W: AsyncWrite + Unpin> ChunkWriter<W> {
-    /// 发出批缓冲（1 次单缓冲写），随后清空复用容量。
+    /// 发出写缓冲（1 次单缓冲写），随后清空复用容量。
     async fn flush_batch(&mut self) -> Result<()> {
         if self.batch.is_empty() {
             return Ok(());
@@ -237,7 +251,7 @@ impl<W: AsyncWrite + Unpin + Send> Writer for ChunkWriter<W> {
                 + PAYLOAD_MAX
                 + tag_len
                 + if self.global_padding { crate::encoding::body_chunk::MAX_PADDING } else { 0 };
-            let batch_limit = FRAME_BATCH * frame_wire;
+            let batch_limit = FRAMES_PER_WRITE * frame_wire;
             // 逐帧装填：游标走过源 Buffer，**不切 MultiBuffer**。
             // `split_bytes` 每帧新建 `Vec<Buffer>`（跨块时另有 `drain().collect()`），
             // 即每帧 2 次堆 churn；bd 7choj 实测这笔 churn 在 Windows 上换来每 MiB

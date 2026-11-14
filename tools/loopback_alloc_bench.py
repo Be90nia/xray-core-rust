@@ -71,6 +71,9 @@ TOPOLOGIES = {
     'vless-xhttp-reality': {'label': 'via-enc-chain', 'chunk_cap': None},
     'ss2022-tcp': {'label': 'via-ss2022-tcp', 'chunk_cap': 65535},
     'vmess-tls-ws': {'label': 'via-vmess-tls-ws', 'chunk_cap': 8110},
+    # bd 7choj：裸 VMess/TCP 下行（无 TLS/WS 附加层）——VMess 服务端下行帧路径的
+    # 纯净测量面；chunk_cap = 服务端下行帧明文上限（`PAYLOAD_MAX`）。
+    'vmess-tcp': {'label': 'via-vmess-tcp', 'chunk_cap': 8176},
 }
 
 # 自签 interop 证书（control-plane 测试资产，非红线）
@@ -125,6 +128,29 @@ def build_configs(topo, keys):
                 'protocol': 'shadowsocks',
                 'settings': {'servers': [{'address': '127.0.0.1', 'port': SRV_PORT,
                             'method': '2022-blake3-aes-128-gcm', 'password': SS_PSK}]}}]}
+        return srv, cli
+    if topo == 'vmess-tcp':
+        # 裸 VMess over TCP（无 TLS/WS）：隔离 VMess 服务端下行帧路径本身。
+        srv = {
+            'log': {'loglevel': 'warning'},
+            'inbounds': [{
+                'tag': 'vmess-in', 'listen': '127.0.0.1', 'port': SRV_PORT,
+                'protocol': 'vmess',
+                'settings': {'clients': [{'id': UUID, 'alterId': 0}]},
+                'streamSettings': {'network': 'tcp'},
+                'sniffing': {'enabled': True, 'destOverride': ['http', 'tls', 'quic'],
+                             'metadataOnly': False}}],
+            'outbounds': [{'protocol': 'freedom',
+                           'settings': {'finalRules': [{'action': 'allow'}]}}]}
+        cli = {
+            'log': {'loglevel': 'warning'},
+            'inbounds': [{'listen': '127.0.0.1', 'port': CLI_SOCKS, 'protocol': 'socks',
+                          'settings': {'udp': True}}],
+            'outbounds': [{
+                'protocol': 'vmess',
+                'settings': {'vnext': [{'address': '127.0.0.1', 'port': SRV_PORT,
+                    'users': [{'id': UUID, 'alterId': 0, 'security': VMESS_SECURITY}]}]},
+                'streamSettings': {'network': 'tcp'}}]}
         return srv, cli
     if topo == 'vmess-tls-ws':
         ws = {'path': '/bench', 'poolSize': 0}   # poolSize 0 = 严格对齐 Go 无预连接池
