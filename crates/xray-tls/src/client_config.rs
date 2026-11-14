@@ -206,14 +206,24 @@ pub fn build_client_config(
     // 暴露的真实服务做校验。空=保持默认 SNI 校验。
     let verify_peer_cert_by_name = parse_verify_peer_cert_by_name(&json);
 
-    // echSockopt（Go transport_security.go:318 `echSockopt`）：Go 唯一消费点是
-    // ECH DoH 查询链（ech.go QueryRecord→dnsQuery 的 DialSystem 连接 sockopt）。
-    // Rust ECH DoH 查询已接线（ech_doh），但查询连接的 sockopt 应用未实现，
-    // 此处识别 + 显式忽略提示。
+    // echSockopt（Go transport_security.go:318 `echSockopt`）：Go **接受且真正生效**的
+    // 配置（`:400-404` 解析并 Build()，挂到 ECH config 上），Go 侧唯一消费点是
+    // ECH DoH 查询链（ech.go:216,277 `internet.DialSystem(dnsCtx, dest, sockopt)`
+    // ——查询连接按 interface / dialerProxy / domainStrategy 走）。
+    // 本仓 ECH DoH 查询（ech_doh.rs::dns_query_doh）直连 `TcpStream::connect`，
+    // **不经 transport 拨号面** ⇒ sockopt 无处可透传。
+    //
+    // bd rruui G8 复核（PM 审计裁决）：Go 接受 ⇒ 我方接受，**不得拒启**（拒掉 Go 能跑的
+    // 配置违反「Go 配置兼容是铁律」；同 `mxxzi` 把 ocspStapling/limitFallback 改回
+    // 接受+WARN 的取向）。故：接受 + **WARN 点名**说明该键**未应用**（不静默），
+    // 并给出可行替代（改用字面量 `echConfigList`，避免走 DoH 查询链）。
     if crate::ech::parse_ech_sockopt(&json).is_some() && ech_doh_query {
         tracing::warn!(
             target: "xray_tls::client_config",
-            "echSockopt is set but sockopt is not applied to the ECH DoH query connection; sockopt ignored"
+            "echSockopt is set but NOT applied by this build: the ECH DoH query connection \
+             does not go through the transport dialer, so socket options (interface / \
+             dialerProxy / domainStrategy) are ignored — use a literal \"echConfigList\" \
+             instead of a DoH URL to avoid this"
         );
     }
 
@@ -714,6 +724,8 @@ impl ServerCertVerifier for NoCertificateVerification {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use rustls::version::{TLS12, TLS13};
 
     use super::*;
@@ -727,6 +739,83 @@ mod tests {
             "certificates": [{ "certificate": 42 }]
         });
         assert!(build_client_config("tls", Some(&v), "fallback.com").is_err());
+    }
+
+    /// bd rruui G8（PM 审计裁决后）：`echSockopt` 是 Go **接受且生效**的键
+    /// （`infra/conf/transport_security.go:318,400-404`）⇒ 我方**必须接受**
+    /// （拒掉 Go 能跑的配置违反「Go 配置兼容是铁律」）。
+    /// 本仓 ECH DoH 查询不经 transport 拨号面 ⇒ 该键**未应用**，但必须
+    /// **WARN 点名**（不静默）+ 给出可行替代。
+    ///
+    /// 本用例钉：① 装配**成功**（不拒启）；② WARN 真的发出且含键名 `echSockopt`。
+    #[test]
+    fn ech_sockopt_with_doh_query_is_accepted_and_warned() {
+        let log = SharedBuf::default();
+        let _guard = capture_log(log.clone());
+
+        let v = serde_json::json!({
+            "echConfigList": "https://cloudflare-dns.com/dns-query",
+            "echSockopt": { "domainStrategy": "UseIP" },
+        });
+        let cfg = build_client_config("tls", Some(&v), "example.com")
+            .expect("echSockopt 是 Go 接受的键 ⇒ 不得拒启");
+        assert!(cfg.is_some(), "必须产出 ClientConfig");
+
+        let out = log.snapshot();
+        assert!(out.contains("echSockopt"), "WARN 必须点名该键: {out}");
+        assert!(out.contains("NOT applied"), "WARN 必须说明该键未应用（不静默）: {out}");
+    }
+
+    /// 非 DoH 查询形态（字面量 echConfigList）时 sockopt 无消费点 ⇒ 不报警
+    /// （Go 侧同样不消费：`ech.go` 只在 DoH 分支用 EchSocketSettings）。
+    #[test]
+    fn ech_sockopt_without_doh_query_is_accepted_without_warn() {
+        let log = SharedBuf::default();
+        let _guard = capture_log(log.clone());
+
+        let v = serde_json::json!({
+            "echConfigList": "aGVsbG8=",
+            "echSockopt": { "domainStrategy": "UseIP" },
+        });
+        assert!(
+            build_client_config("tls", Some(&v), "example.com").is_ok(),
+            "字面量 echConfigList + echSockopt 必须照常装配"
+        );
+        let out = log.snapshot();
+        assert!(!out.contains("echSockopt"), "非 DoH 形态不该报 echSockopt WARN: {out}");
+    }
+
+    /// 日志捕获闭环 writer（同 xray-proxy-vmess plugin.rs 配方）。
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.0.lock().expect("no poison").clone()).expect("utf8")
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("no poison").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `set_default` 重建 callsite interest（换订阅者后首评估不残留 never）。
+    fn capture_log(buf: SharedBuf) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || buf.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        guard
     }
 
     fn install_provider() {
@@ -1609,16 +1698,27 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// 票 8k4s③：`echSockopt` + DoH 形态 `echConfigList` → 配置构建不 panic
-    /// （降级 warn 路径；ECH config 本身仍会 resolve 成 invalid）。
+    /// 票 8k4s③ + bd rruui G8（PM 审计裁决后）：`echSockopt` + DoH 形态
+    /// `echConfigList` ⇒ **照常装配**（Go 接受且生效的键，我方不得拒启）+ WARN 点名
+    /// 说明该键未应用。旧行为（仅 warn 后继续、但 warn 文案未说明"未应用"）已按
+    /// bd rruui G8 补齐诊断内容。
     #[test]
     fn pwh6_client_ech_sockopt_with_doh_config_builds() {
+        let log = SharedBuf::default();
+        let _guard = capture_log(log.clone());
+
         let json = serde_json::json!({
             "echConfigList": "https://1.1.1.1/dns-query",
             "echSockopt": { "domainStrategy": "UseIP" }
         });
-        let cfg = build_client_config("tls", Some(&json), "example.com").unwrap().unwrap();
+        let cfg = build_client_config("tls", Some(&json), "example.com")
+            .expect("echSockopt 是 Go 接受的键 ⇒ 不得拒启")
+            .expect("必须产出 ClientConfig");
         assert!(format!("{:?}", &*cfg.key_log).contains("NoKeyLog"));
+
+        let out = log.snapshot();
+        assert!(out.contains("echSockopt"), "WARN 必须点名该键: {out}");
+        assert!(out.contains("NOT applied"), "WARN 必须说明未应用: {out}");
     }
 
     /// bd 4w092(a)：ECH DoH（`://` 形态）走 rustls 原生桥，无法承载配置要求的

@@ -221,16 +221,19 @@ pub fn parse_vmess_config(data: &[u8]) -> Result<VmessOutboundConfig, String> {
         .unwrap_or_default()
         .to_string();
 
-    // alterId≠0 的 legacy VMess 不支持（AEAD-only）；数字/字符串形式都认
-    // （老配置生成器输出过字符串 alterId）。
+    // alterId≠0 = legacy VMess 配置残留。Go `infra/conf/vmess.go:20-24` 的
+    // VMessAccount **没有 alterId 字段** ⇒ encoding/json 忽略未知键、配置照常启动
+    // （出站 AEAD 握手本就不用 alterId）。这里同口径：只 warn 不拒启——旧 v2rayN
+    // 配置普遍带 `"alterId": 64`，拒启等于整出站消失（bd hsrtv）。
+    // 数字/字符串形式都认（老配置生成器输出过字符串 alterId）。
     let alter_id = user
         .get("alterId")
         .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok())))
         .unwrap_or(0);
     if alter_id != 0 {
+        // id 是客户端凭据（S-11）：只报 alterId，不落 UUID 原文。
         crate::VMESS_LOG
-            .warn(format!("vmess outbound: legacy VMess is not supported alter_id={alter_id}"));
-        return Err(VmessError::UnsupportedLegacyAlterId(alter_id).to_string());
+            .warn(format!("vmess outbound: ignoring legacy alterId={alter_id} (AEAD-only)"));
     }
     Ok(VmessOutboundConfig::new(
         uuid,
@@ -1350,9 +1353,11 @@ mod tests {
         assert!(parse_vmess_config(data.as_bytes()).is_err());
     }
 
-    /// alterId>0 的 legacy VMess 不支持（AEAD-only，对齐 Go v26 已删 alterId）。
+    /// bd hsrtv：`alterId` 是 Go 侧根本不存在的键（`infra/conf/vmess.go:20-24` 的
+    /// VMessAccount 无该字段 ⇒ encoding/json 忽略未知键），配置照常装配。
+    /// 旧断言钉住的是「整出站拒启」，与 Go 相反。
     #[test]
-    fn parse_vmess_config_alter_id_nonzero_fails() {
+    fn parse_vmess_config_alter_id_nonzero_ignored() {
         let data = r#"{
             "vnext": [{
                 "address": "server.example.com",
@@ -1360,13 +1365,13 @@ mod tests {
                 "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": 64 }]
             }]
         }"#;
-        let err = parse_vmess_config(data.as_bytes()).unwrap_err();
-        assert!(err.contains("alterId"), "unexpected error: {err}");
+        let cfg = parse_vmess_config(data.as_bytes()).expect("alterId≠0 不得拒启（Go 忽略未知键）");
+        assert_eq!(cfg.user_uuid.to_string(), "b831381d-6324-4d53-ad4f-8cda48b30811");
     }
 
-    /// 老配置生成器（v2rayN 等）会输出字符串形式 alterId，同样拒绝。
+    /// 老配置生成器（v2rayN 等）会输出字符串形式 alterId，同样只 warn 不拒启。
     #[test]
-    fn parse_vmess_config_alter_id_string_fails() {
+    fn parse_vmess_config_alter_id_string_ignored() {
         let data = r#"{
             "vnext": [{
                 "address": "server.example.com",
@@ -1374,7 +1379,10 @@ mod tests {
                 "users": [{ "id": "b831381d-6324-4d53-ad4f-8cda48b30811", "alterId": "64" }]
             }]
         }"#;
-        assert!(parse_vmess_config(data.as_bytes()).is_err());
+        assert!(
+            parse_vmess_config(data.as_bytes()).is_ok(),
+            "字符串 alterId 不得拒启（Go 忽略未知键）"
+        );
     }
 
     /// alterId==0（或缺失）走现有 AEAD 路径。

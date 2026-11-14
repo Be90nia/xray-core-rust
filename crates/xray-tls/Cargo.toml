@@ -70,6 +70,9 @@ futures-util = { workspace = true }
 # `#[tokio::test(start_paused = true)]` + `tokio::time::advance`：证书热重载的 3600 s
 # 周期在虚拟时间里推进（生产常量不因测试改短）。tokio `full` 不含 test-util。
 tokio = { workspace = true, features = ["test-util"] }
+# 日志捕获（断言 echSockopt 的 WARN 真的发出且含键名；同 xray-proxy-vmess
+# plugin.rs 的 capture_log 配方）。
+tracing-subscriber = { workspace = true }
 
 [features]
 default = []

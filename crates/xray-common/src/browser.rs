@@ -240,6 +240,20 @@ fn get_greased_ch_ua(major_version: i64, fork_name: &str) -> String {
     shuffled.join(", ")
 }
 
+/// Chrome 的 `Sec-CH-UA` 头值（GREASE 品牌 + Chromium + Google Chrome）。
+///
+/// 对齐 Go `utils.ChromeUACH`（`common/utils/browser.go:157`）=
+/// `getGreasedChUa(AnchoredChromeVersion, "chrome")`： 版本进程级锚定（与 [`chrome_version`]
+/// 同源），品牌顺序按版本洗牌。
+///
+/// 供 TCP 伪装头路径（`transport/internet/headers/http` 的默认 12 头）使用——
+/// Go 该路径用 `utils.ChromeUA` / `utils.ChromeUACH`（`infra/conf/transport_method.go:70-73`），
+/// 硬编码版本号会让所有部署的 UA 指纹完全一致（可被 DPI 按版本区分）。
+#[must_use]
+pub fn chrome_sec_ch_ua() -> String {
+    get_greased_ch_ua(chrome_version(), "chrome")
+}
+
 /// 按浏览器名生成动态版本 UA（H8：grpc 与 ws/xhttp 共享同一实现，
 /// 避免同进程 UA 版本自相矛盾）。
 pub fn build_user_agent(browser: &str) -> String {

@@ -351,6 +351,13 @@ pub(crate) fn build_hysteria_transport_config(
     if qc.disable_path_mtu_discovery {
         t.mtu_discovery_config(None);
     }
+    // quicParams.disableGSO（Go hysteria dialer.go:146 / hub.go:337
+    // `quic.Transport{DisableGSO: quicParams.DisableGSO}`）→ quinn 等价旋钮
+    // `TransportConfig::enable_segmentation_offload(false)`（GSO 批量发包关闭）。
+    // bd rruui G7：三键里唯一 quinn 有等价旋钮的 ⇒ 真接（此前恒 false 静默无效）。
+    if qc.disable_gso {
+        t.enable_segmentation_offload(false);
+    }
     let slot = crate::congestion::quinn_bridge::install_swappable_cc(&mut t);
     (t, slot)
 }

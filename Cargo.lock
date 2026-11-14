@@ -6777,6 +6777,7 @@ dependencies = [
  "tokio-btls",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
  "udf-skeleton",
  "udf-std-ext",
  "webpki-roots 1.0.11",

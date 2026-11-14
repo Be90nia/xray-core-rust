@@ -226,6 +226,29 @@ fn parse_reality_config(json: Option<&serde_json::Value>) -> io::Result<RealityC
         ));
     }
     let (spider_x, spider_y) = parse_spider_x(spider_x_raw);
+    // bd rruui G9：Go `transport/internet/reality/reality.go:225-300` 在**握手校验失败**
+    // （收到真证书 ⇒ 疑似 MITM/重定向）时起 goroutine 爬 dest 站点（http2 GET +
+    // padding cookie + href 采集 + `SpiderY` 的并发/间隔/回退延时），伪装成正常浏览
+    // 流量。本仓**未实现爬行本体**（`crate::lib` 已知缺口：spider_x 已解析保留，爬行未实现）
+    // ⇒ 用户显式配的 spiderX/spiderY 静默不生效。
+    //
+    // 为何是 WARN 而非拒启（与本仓同族处理一致，见 `config::LimitFallback`「接受配置
+    // 但不生效，解析点显式告警」）：
+    // - Go 侧 spiderX **默认值就是 "/"**（`transport_security.go:214-216`），且 v2rayN /
+    //   uriclient.py 生成的 REALITY 配置普遍带 `spiderX` ⇒ 拒启会打断大批 Go
+    //   兼容配置（且这些配置的连接成败与 Go 完全一致：Go 同样拒连，只多爬行流量）。
+    // - 差异仅在**握手失败后**的伪装流量形态（抗主动探测面），不影响连接语义。
+    // 故按「显式可见」处理：非默认 spider 参数 ⇒ 配置期 WARN 点名。
+    if spider_x_raw != "/" || spider_y.iter().any(|v| *v != 0) {
+        tracing::warn!(
+            target: "xray_reality::register",
+            spider_x = %spider_x_raw,
+            spider_y = ?spider_y,
+            "reality: spider crawl is not implemented by this build (Go reality.go:225-300 crawls \
+             the dest site over http2 after a failed handshake to mimic browsing traffic); \
+             spiderX/spiderY are parsed but have no effect"
+        );
+    }
 
     // 票 037f：`show`（Go transport_security.go:29）客户端同样消费——
     // reality.go:102-285 握手期 fmt.Printf debug 打印；Rust 客户端未实现
@@ -423,6 +446,25 @@ mod tests {
                 .unwrap();
         let r = parse_reality_config(Some(&v));
         assert!(r.is_err());
+    }
+
+    /// bd rruui G9：spiderX/spiderY 解析保留（Go 同口径），爬行本体未实现 ⇒
+    /// 非默认 spider 参数**不再静默**：配置期显式 WARN 点名。
+    #[test]
+    fn parse_reality_config_keeps_spider_params_and_marks_crawl_gap() {
+        let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let json: serde_json::Value = serde_json::json!({
+            "serverName": "a.com",
+            "publicKey": pub_b64,
+            "spiderX": "/?p=100-200&c=1-3",
+        });
+        let cfg = parse_reality_config(Some(&json)).expect("spiderX 必须被接受（Go 同口径）");
+        // Go 口径：p/c/t/i/r 从 query 抽进 spider_y 槽位，其余 query 保留在 spider_x。
+        assert_eq!(cfg.spider_y[0], 100);
+        assert_eq!(cfg.spider_y[1], 200);
+        assert_eq!(cfg.spider_y[2], 1);
+        assert_eq!(cfg.spider_y[3], 3);
+        assert!(cfg.spider_x.starts_with('/'), "spider_x 必须保留 '/' 前缀");
     }
 
     #[test]

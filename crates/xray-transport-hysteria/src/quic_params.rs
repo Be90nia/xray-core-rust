@@ -34,6 +34,7 @@ pub fn parse_quic_params(
 
     let get_u64 = |k: &str| obj.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let get_i64 = |k: &str| obj.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let get_bool = |k: &str| obj.get(k).and_then(serde_json::Value::as_bool).unwrap_or(false);
 
     // bbrProfile：小写化；""→standard（Go :2154-2159）
     let mut bbr_profile = obj
@@ -124,6 +125,18 @@ pub fn parse_quic_params(
     // debug（Go :2217-2220 设 HYSTERIA_*_DEBUG 环境变量；Rust CC 无 env 日志门面，忽略）
     let _ = obj.get("debug").and_then(serde_json::Value::as_bool);
 
+    // quinn 无等价旋钮的两键：逐键 WARN 点名 + 原因（bd rruui G7；口径同 bd doubj
+    // 在 `xray-transport/src/memory_settings.rs` 的同名键）。
+    // 只对**用户显式要求而本栈做不到**的取值报警，避免与 Go 零值同义时刷噪音：
+    // - `disableStatelessReset: true` —— 要求不发 stateless reset（Go hub.go:331-335 据此不设
+    //   StatelessResetKey）；quinn 端点恒发，无关闭开关。
+    // - `disableChromeParrot: false`（显式写出）—— 要求 Chrome 指纹模拟（Go dialer.go:95
+    //   `ChromeParrot: !DisableChromeParrot`）；quinn 无 quic-go 的 parrot。 `disableChromeParrot:
+    //   true` 是 Go 零值同义（本栈也不做 parrot）⇒ 不报警。
+    for msg in unsupported_quic_param_warnings(obj) {
+        crate::LOG.warn(msg);
+    }
+
     Ok(Some(QuicParams {
         congestion,
         bbr_profile,
@@ -147,12 +160,48 @@ pub fn parse_quic_params(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         max_incoming_streams,
-        // quinn 无 ChromeParrot/GSO/StatelessReset 等价旋钮（登记不动：Go v2.12.2
-        // quic-go 内部特性，quinn 侧无消费点）。
-        disable_chrome_parrot: false,
-        disable_gso: false,
-        disable_stateless_reset: false,
+        // quicParams 三键（Go `transport/internet/hysteria/{dialer,hub}.go` 消费）：
+        // - `disableGSO`：**真接**（quinn `TransportConfig::enable_segmentation_offload(false)` ≡
+        //   Go `quic.Transport{DisableGSO: ...}`）——消费点 `build_hysteria_transport_config`
+        //   （client + server 两侧共用）。
+        // - `disableChromeParrot` / `disableStatelessReset`：quinn 无等价旋钮（quic-go 的 Chrome
+        //   指纹模拟 / 无条件发 stateless reset）⇒ 用户**显式**要求本栈做不到的值时 逐键 WARN
+        //   点名（bd rruui G7；口径同 bd doubj 在 `xray-transport/src/memory_settings.rs`
+        //   的同名键）。
+        disable_chrome_parrot: get_bool("disableChromeParrot"),
+        disable_gso: get_bool("disableGSO"),
+        disable_stateless_reset: get_bool("disableStatelessReset"),
     }))
+}
+
+/// `quicParams` 里 quinn 无等价旋钮、只能 WARN 的键（bd rruui G7）。
+///
+/// 只对**用户显式要求而本栈做不到**的取值报警，避免与 Go 零值同义时刷噪音：
+/// - `disableStatelessReset: true` —— 要求不发 stateless reset；quinn 端点恒发。
+/// - `disableChromeParrot: false`（显式写出）—— 要求 Chrome 指纹模拟；quinn 无 quic-go 的
+///   parrot（`disableChromeParrot: true` 是 Go 零值同义 ⇒ 不报警）。
+///
+/// 返回文案由调用方 `LOG.warn` 逐条打出；独立成函数是为了让「WARN 可见」可断言。
+fn unsupported_quic_param_warnings(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let as_bool = |k: &str| obj.get(k).and_then(serde_json::Value::as_bool);
+    let mut out = Vec::new();
+    if as_bool("disableStatelessReset") == Some(true) {
+        out.push(
+            "finalmask.quicParams.disableStatelessReset=true is not supported: quinn endpoints \
+             always send stateless reset (no off switch)"
+                .to_string(),
+        );
+    }
+    if as_bool("disableChromeParrot") == Some(false) {
+        out.push(
+            "finalmask.quicParams.disableChromeParrot=false is not supported: quinn has no \
+             quic-go Chrome parrot emulation"
+                .to_string(),
+        );
+    }
+    out
 }
 
 fn parse_bandwidth_bps(s: &str) -> io::Result<u64> {
@@ -281,8 +330,47 @@ mod tests {
         assert!(parse_quic_params(Some(&v)).is_ok(), "interval<5 不再拒启（Go 对该键静默忽略）");
     }
 
-    // ===== parse_quic_params：校验（Go :2153-2215 逐条） =====
+    /// bd rruui G7：三键不再恒 false——`disableGSO` 真接（透到 quinn transport config），
+    /// `disableChromeParrot` / `disableStatelessReset` 解析保留（quinn 无旋钮 ⇒ 逐键
+    /// WARN 点名，禁纯静默）。
+    #[test]
+    fn quic_params_three_keys_are_parsed_not_hardcoded_false() {
+        let v = fm(
+            r#"{"quicParams":{"disableGSO":true,"disableChromeParrot":true,"disableStatelessReset":true}}"#,
+        );
+        let p = parse_quic_params(Some(&v)).unwrap().unwrap();
+        assert!(p.disable_gso, "disableGSO 必须透传（quinn 有等价旋钮）");
+        assert!(p.disable_chrome_parrot);
+        assert!(p.disable_stateless_reset);
+        // 缺省 = Go 零值（false）——不报警（避免零值刷噪音）。
+        let v = fm(r#"{"quicParams":{}}"#);
+        let p = parse_quic_params(Some(&v)).unwrap().unwrap();
+        assert!(!p.disable_gso && !p.disable_chrome_parrot && !p.disable_stateless_reset);
+    }
 
+    /// 用户**显式**要求本栈做不到的值时逐键 WARN 点名；零值同义不报警。
+    #[test]
+    fn unsupported_quic_param_warnings_name_explicit_requests_only() {
+        let obj = |s: &str| -> serde_json::Map<String, serde_json::Value> {
+            fm(s).as_object().unwrap().clone()
+        };
+        // 显式要求「不发 stateless reset」+「要 Chrome 指纹」⇒ 两条告警。
+        let warns = unsupported_quic_param_warnings(&obj(
+            r#"{"disableStatelessReset":true,"disableChromeParrot":false}"#,
+        ));
+        assert_eq!(warns.len(), 2, "{warns:?}");
+        assert!(warns[0].contains("disableStatelessReset"), "{warns:?}");
+        assert!(warns[1].contains("disableChromeParrot"), "{warns:?}");
+        // Go 零值同义 / 显式 true（不做 parrot）⇒ 不报警。
+        let warns = unsupported_quic_param_warnings(&obj(
+            r#"{"disableChromeParrot":true,"disableStatelessReset":false}"#,
+        ));
+        assert!(warns.is_empty(), "{warns:?}");
+        let warns = unsupported_quic_param_warnings(&obj("{}"));
+        assert!(warns.is_empty(), "{warns:?}");
+    }
+
+    // ===== parse_quic_params：校验（Go :2153-2215 逐条） =====
     #[test]
     fn validation_rejects_go_parity() {
         let bad = |json: &str| {

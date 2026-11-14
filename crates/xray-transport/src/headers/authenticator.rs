@@ -156,8 +156,8 @@ pub trait HeaderAuthenticator: Send + Sync {
 fn chrome_default_request_headers() -> Vec<HeaderNameValues> {
     vec![
         HeaderNameValues::new("Host", ["www.baidu.com", "www.bing.com"]),
-        HeaderNameValues::new("User-Agent", [CHROME_UA]),
-        HeaderNameValues::new("Sec-CH-UA", [CHROME_UACH]),
+        HeaderNameValues::new("User-Agent", [CHROME_UA.as_str()]),
+        HeaderNameValues::new("Sec-CH-UA", [CHROME_UACH.as_str()]),
         HeaderNameValues::new("Sec-CH-UA-Mobile", ["?0"]),
         HeaderNameValues::new("Sec-CH-UA-Platform", ["Windows"]),
         HeaderNameValues::new("Sec-Fetch-Mode", ["no-cors", "cors", "same-origin"]),
@@ -181,12 +181,24 @@ fn chrome_default_response_headers() -> Vec<HeaderNameValues> {
     ]
 }
 
-// Chrome UA 常量（对应 Go common/utils.ChromeUA / ChromeUACH）。
-// 取 Go v26.6.1 stable 值（Common-utils.go: CHROME 常量随版本同步）。
-// 精确字面值不参与行为契约，仅在测试中作为 fixture 出现。
-const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
-const CHROME_UACH: &str =
-    "\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"";
+/// Chrome UA（对应 Go `common/utils.ChromeUA`，`browser.go:156`）。
+///
+/// Go 侧是**包级变量**（进程启动时由 `AnchoredChromeVersion` 求值一次）⇒ 全进程
+/// 同一 UA；本仓取 [`xray_common::browser::build_user_agent`] 的同款进程级锚定值
+/// （`LazyLock`），语义等价。**不是**每次请求重算（否则同进程多 UA = 更强指纹）。
+///
+/// 修 F11：此前硬编码 `Chrome/130`，所有部署 UA 恒同版本（可被 DPI 按版本关联）；
+/// Go 侧版本随日期+CPU 种子抽样（2026-11 ≈ 150）。
+static CHROME_UA: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| xray_common::browser::build_user_agent("chrome"));
+
+/// Chrome `Sec-CH-UA` 值（对应 Go `common/utils.ChromeUACH`，`browser.go:157`
+/// = `getGreasedChUa(AnchoredChromeVersion, "chrome")`）。
+///
+/// GREASE 品牌字形/版本/顺序随 Chrome 版本洗牌（Go `getGreasedChOrder`）⇒ 与
+/// [`CHROME_UA`] 同源同版本（`xray_common::browser::chrome_sec_ch_ua`）。
+static CHROME_UACH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(xray_common::browser::chrome_sec_ch_ua);
 
 /// 错误：HTTP header 超过 `maxHeaderLength`（DDoS 防护）。
 ///
@@ -247,6 +259,32 @@ mod tests {
         let ua = cfg.header.iter().find(|h| h.name == "User-Agent").unwrap();
         assert_eq!(ua.value.len(), 1);
         assert!(ua.value[0].starts_with("Mozilla/5.0"));
+    }
+
+    /// bd rruui(F11)：UA / Sec-CH-UA 不得恒为硬编码 `Chrome/130`——Go
+    /// `common/utils.ChromeUA` 是**包级变量**（进程级锚定版本，随日期+CPU 种子抽样），
+    /// 本仓取 `xray_common::browser` 同源值 ⇒ 版本随进程抽样、UA 与 CH-UA 同版本。
+    #[test]
+    fn chrome_user_agent_is_process_anchored_and_not_hardcoded_130() {
+        let cfg = RequestConfig::chrome_default();
+        let ua = cfg.header.iter().find(|h| h.name == "User-Agent").unwrap();
+        let uach = cfg.header.iter().find(|h| h.name == "Sec-CH-UA").unwrap();
+        let ver = xray_common::browser::chrome_version();
+        assert!(
+            ua.value[0].contains(&format!("Chrome/{ver}.0.0.0")),
+            "UA 必须带进程锚定 Chrome 版本 {ver}: {}",
+            ua.value[0]
+        );
+        assert!(
+            !ua.value[0].contains("Chrome/130.0.0.0"),
+            "UA 不得恒为硬编码 Chrome/130: {}",
+            ua.value[0]
+        );
+        assert!(
+            uach.value[0].contains(&format!("\"Chromium\";v=\"{ver}\"")),
+            "Sec-CH-UA 必须与 UA 同版本 {ver}: {}",
+            uach.value[0]
+        );
     }
 
     #[test]

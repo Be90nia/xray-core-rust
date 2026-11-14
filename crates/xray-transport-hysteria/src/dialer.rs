@@ -64,6 +64,10 @@ pub struct QuicConfig {
     pub bbr_profile: String,
     /// Brutal 关闭丢泡补偿（Go v2.12.2 QuicParams.brutalDisableLossCompensation）。
     pub brutal_disable_loss_compensation: bool,
+    /// 禁用 UDP GSO 批量发包（Go `quicParams.DisableGSO`，hysteria dialer.go:146 /
+    /// hub.go:337 `quic.Transport{DisableGSO: ...}`）→ quinn
+    /// `TransportConfig::enable_segmentation_offload(false)`（bd rruui G7 真接）。
+    pub disable_gso: bool,
 }
 
 impl QuicConfig {
@@ -109,6 +113,7 @@ impl QuicConfig {
             brutal_up: p.brutal_up,
             bbr_profile: p.bbr_profile.clone(),
             brutal_disable_loss_compensation: p.brutal_disable_loss_compensation,
+            disable_gso: p.disable_gso,
         }
     }
 

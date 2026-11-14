@@ -22,8 +22,8 @@
 
 use std::{
     sync::{
-        Arc, LazyLock,
         atomic::{AtomicU64, Ordering},
+        Arc, LazyLock,
     },
     time::{Duration, Instant},
 };
@@ -32,16 +32,17 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::TcpStream,
 };
-use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
+use xray_app_dispatcher::{default::SimpleOhm, OutboundHandlerManager};
 use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
-use xray_frame::{LogFacade, deadline::Budget};
+use xray_frame::{deadline::Budget, LogFacade};
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
     encoding::{
-        VERSION, empty_addons,
+        empty_addons,
         server::{decode_request_header, encode_response_header},
+        VERSION,
     },
     encryption::vision_conn::VisionConn,
     validator::Validator,
@@ -813,26 +814,38 @@ where
     // → 重新 split；非 vision 同样 join+split（零开销适配器，统一类型）。
     // testseed：服务端用**本端账号**的 padding 参数（对应 Go EncodeBodyAddons →
     // NewVisionWriter(account.Testseed)——下行 seed 取服务端账户配置，不上 wire）。
+    //
+    // bd 32u7q：**非 vision 路径去掉 join + 二次 split**。
+    // 上游 `tokio::io::split` 已是 `Arc<std::sync::Mutex<S>>`（tokio 1.54 split.rs:38-40）
+    // ⇒ 再 join 再 split 会叠**第二把锁**（`Arc<Mutex<Join<R,W>>>`）：每次 poll_read/
+    // poll_write 先锁外层再锁内层（两层 OS 互斥），且内外层**读写共用同一把**（上行读与
+    // 下行写互相串行）。非 vision 无 VisionConn 状态机 ⇒ 不需要把两半合成单对象：
+    // 直接把上游两半交给 Link 即可（字节序/背压语义不变——仍是同一把 `Mutex<S>`，
+    // 上行读与下行写的互斥关系与 Go `net.Conn` 的读写并发不同但**与改前完全一致**：
+    // 改前也是 `Mutex<S>` 串行读写，改后仍是 `Mutex<S>` 串行读写，只是少一次加锁）。
+    // vision 路径保留 join+split：VisionConn 是带内部状态（padding / splice / 上下行
+    // pending）的单对象，读写两半必须共享它 ⇒ 需要 VisionConn 自身的一层互斥。
     let seed: &[u32] = decoded.user.as_ref().map_or(&[][..], |u| u.account.testseed.as_slice());
-    let is_vision = vision_uuid.is_some();
-    let stream: Box<dyn VlessStream> = match (vision_uuid, raw_tcp) {
-        (Some(uuid), Some(raw)) => Box::new(
-            VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
-                .with_padding_seed(seed),
-        ),
-        (Some(uuid), None) => Box::new(
-            VisionConn::new(tokio::io::join(reader, write_half), uuid).with_padding_seed(seed),
-        ),
-        (None, _) => Box::new(tokio::io::join(reader, write_half)),
-    };
-    let (rh, wh) = tokio::io::split(stream);
-    // F2 服务端写聚合：仅 flow=""（非 vision）TCP 分派启用——vision 帧写批
-    // 边界（IsCompleteRecord 语义）逐批原样；UDP/Mux/Rvs 分派不经此处。
-    // 聚合边界 = 单次 write_multi_buffer 调用（wire 写缓冲拼接，非应用帧）。
-    let link = if is_vision {
-        Link::new(new_reader(rh), new_writer(wh))
-    } else {
-        Link::new(new_reader(rh), new_coalescing_writer(wh))
+    let link = match (vision_uuid, raw_tcp) {
+        (Some(uuid), Some(raw)) => {
+            let stream: Box<dyn VlessStream> = Box::new(
+                VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
+                    .with_padding_seed(seed),
+            );
+            let (rh, wh) = tokio::io::split(stream);
+            Link::new(new_reader(rh), new_writer(wh))
+        },
+        (Some(uuid), None) => {
+            let stream: Box<dyn VlessStream> = Box::new(
+                VisionConn::new(tokio::io::join(reader, write_half), uuid).with_padding_seed(seed),
+            );
+            let (rh, wh) = tokio::io::split(stream);
+            Link::new(new_reader(rh), new_writer(wh))
+        },
+        // F2 服务端写聚合：仅 flow=""（非 vision）TCP 分派启用——vision 帧写批
+        // 边界（IsCompleteRecord 语义）逐批原样；UDP/Mux/Rvs 分派不经此处。
+        // 聚合边界 = 单次 write_multi_buffer 调用（wire 写缓冲拼接，非应用帧）。
+        (None, _) => Link::new(new_reader(reader), new_coalescing_writer(write_half)),
     };
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
@@ -1119,12 +1132,12 @@ mod tests {
 
     use super::*;
     use crate::{
-        MemoryAccount,
         encoding::{
-            VlessCommand,
             client::{decode_response_header, encode_request_header},
+            VlessCommand,
         },
         validator::{MemoryUser, MemoryValidator},
+        MemoryAccount,
     };
 
     /// 构造测试用 validator + 已注册用户的 UUID。
@@ -1256,6 +1269,95 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload, "should receive echo through vless proxy");
+    }
+
+    /// bd 32u7q：非 vision 路径去 join+二次 split 后，**流语义与背压行为不变**。
+    ///
+    /// 本用例钉两件事：
+    /// 1. **字节序/完整性**：大载荷（> 单次读窗，强制多次 poll）逐字节回显一致 ⇒ 去掉外层 split
+    ///    后上行读/下行写没有错序或截断。
+    /// 2. **背压**：载荷大于 socket 发送缓冲（默认 ~2MB Windows / 数 MB Linux）⇒ `write_all`
+    ///    必须**阻塞**而非丢弃；写完仍能完整读回 ⇒ 无丢字节。
+    #[tokio::test]
+    async fn vless_inbound_nonvision_large_transfer_preserves_bytes_and_backpressure() {
+        // echo server：读到多少回多少（不做分片假设，验证字节流完整）。
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_listener.local_addr().unwrap().port();
+        xray_common::testing::spawn("vless-large-transfer-echo", async move {
+            let (mut sock, _) = echo_listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let dial_fn = make_freedom_dial_fn();
+        ohm.set_default(Arc::new(DialBridge::new("freedom", dial_fn))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+
+        let (uuid, validator) = make_validator_with_user();
+        let vless_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vless_addr = vless_listener.local_addr().unwrap();
+        let ohm_clone = Arc::clone(&ohm);
+        let validator_clone = Arc::clone(&validator);
+        xray_common::testing::spawn("vless-large-transfer-serve", async move {
+            let _ = serve_vless(
+                vless_listener,
+                ohm_clone,
+                validator_clone,
+                None,
+                None,
+                None,
+                test_plugin_ctx(),
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vless_addr).await.unwrap();
+        let addons = empty_addons();
+        let dest_addr = Address::from_ipv4_bytes([127, 0, 0, 1]);
+        encode_request_header(
+            &mut client,
+            VERSION,
+            &uuid,
+            VlessCommand::Tcp,
+            Some(&dest_addr),
+            Some(echo_port),
+            &addons,
+        )
+        .await
+        .unwrap();
+        let _resp_addons = decode_response_header(&mut client, VERSION).await.unwrap();
+
+        // 载荷 > socket 发送缓冲 ⇒ 写侧必然经历背压（write_all 挂起等待对端读）。
+        const LEN: usize = 6 * 1024 * 1024;
+        let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+
+        // 收发并行：单线程顺序写 6MB 会自锁（写缓冲满 → 等对端读；对端回声又等我们读）。
+        let payload_for_read = payload.clone();
+        let (mut cr, mut cw) = client.into_split();
+        let reader = tokio::spawn(async move {
+            let mut got = vec![0u8; payload_for_read.len()];
+            cr.read_exact(&mut got).await.unwrap();
+            got
+        });
+        cw.write_all(&payload).await.unwrap();
+        let got = reader.await.unwrap();
+        assert_eq!(got.len(), LEN, "回显长度必须一致（无截断）");
+        assert!(got == payload, "回显字节必须逐字节一致（无错序/损坏）");
     }
 
     /// 无效用户（validator 中不存在）→ 连接被关闭，client 收到 EOF 或 decode 错误。
@@ -1499,7 +1601,7 @@ mod tests {
     /// [padding_len(2 BE)][content]` 帧。未包装 → 裸 echo 内容 → fail/超时。
     #[tokio::test]
     async fn vless_inbound_pads_downlink_when_flow_xrv() {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
 
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
         let (vless_addr, echo_port, uuid) =
@@ -1575,7 +1677,7 @@ mod tests {
 
         use tokio::{net::UdpSocket, time::timeout};
 
-        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
 
         // 1. UDP echo
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1650,9 +1752,9 @@ mod tests {
     /// （outbound 与 inbound 双端包装，padding 收发互解）。
     #[tokio::test]
     async fn vless_vision_e2e_client_and_server_roundtrip() {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
 
-        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         let (vless_addr, echo_port, uuid) =
             spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
@@ -1684,9 +1786,9 @@ mod tests {
     /// 无协商）——任意组合下 wire 帧格式不变，双向 echo 都必须照常成功。
     #[tokio::test]
     async fn vless_testseed_combinations_e2e_wire_unchanged() {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
 
-        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
 
         const SEED: &[u32] = &[7, 8, 9, 10];
         // (client_seed, server_seed)：同 seed / 仅客户端 / 仅服务端（全无为既有 e2e 覆盖）。
@@ -1725,9 +1827,9 @@ mod tests {
     /// 交付）照常走请求头 + echo；全链路 roundtrip 不受预连接影响。
     #[tokio::test]
     async fn vless_testpre_preconnect_e2e_roundtrip() {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
 
-        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
 
         // 多连接 echo（testpre worker 会预拨 + 补货，单 accept 不够）。
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1803,9 +1905,9 @@ mod tests {
     /// 回归：flow 为空时 make_dial_fn 返回裸连接（无 Vision 包装），链路照常。
     #[tokio::test]
     async fn vless_no_flow_e2e_make_dial_fn_roundtrip() {
-        use tokio::time::{Duration, timeout};
+        use tokio::time::{timeout, Duration};
 
-        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
+        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
         let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "", &[]).await;
 
         let cfg = Arc::new(VlessOutboundConfig::new(
