@@ -238,8 +238,8 @@ serena-cli undo                                                        # 改坏�
 - **解决**：`python tools/build_boringssl_asm.py`（用 `D:/Project/tools/nasm.exe` 编**带汇编**的 BoringSSL，产出 `target/boringssl-asm/prebuilt/{crypto.lib,ssl.lib,include/openssl}`），构建时加 `BORING_BSSL_PATH=<该目录>`（btls-sys 走预构建路线，**跳过 cmake → 不触发 NO_ASM**）
 - **实测（vless+tcp+tls + chrome 指纹，`D:/tmp/aj0n3_ab.py`）**：31.6 → **241.2 MB/s**（best 253.0），cli CPU 18.8s → **2.48s**；REALITY 组 33.4 → **241.2**。32/32 + interop 12/12 保持
 - **副作用（正向）**：开汇编后能探测 AES-NI → 协商 **TLS_AES_128_GCM_SHA256**，与 Go `crypto/tls` 偏好一致（Go 也是 AES-NI 硬件支持则优先 AES-GCM）
-- **体检**：`python tools/build_boringssl_asm.py --check`（查 CMakeCache 无 `OPENSSL_NO_ASM` + `CMAKE_ASM_NASM_COMPILER_WORKS=1` + crypto.lib 大小）
-- **交付铁律（三次中招教训，2026-11-08）**：任何 release 构建必带 `BORING_BSSL_PATH=target/boringssl-asm/prebuilt`；交付/换入 v2rayN 前必验（三选一）：①`grep rustc-link-search target/release/build/btls-sys-*/output` 指向 prebuilt ②`--check` 全绿 ③大小启发式 = NO_ASM exe 比汇编版**小 ~47KB**（实测 52,157,952 vs 52,205,056）。非汇编产物禁交付 v2rayN/生产——症状即"xhttp/带指纹卡 30 多 MB/s 上不去"
+- **体检**：`python tools/build_boringssl_asm.py --check`（查 CMakeCache 无 `OPENSSL_NO_ASM` + `CMAKE_ASM_NASM_COMPILER_WORKS=1` + crypto.lib 大小）。**三终态、缺 CMakeCache 不回绿**（bd uuw0e）：`0`=PASS（两条 ASM 判据全绿）／`1`=FAIL（有 `OPENSSL_NO_ASM`、探针 ≠1、产物缺件或体量像无汇编）／`3`=UNVERIFIED（找不到 `CMakeCache.txt`，两条判据**无法评估**——产物侧双证只够排除假货，不算验过，须补证）。判据逻辑自测：`python tools/build_boringssl_asm.py --self-test`（临时树三场景，零编译）
+- **交付铁律（三次中招教训，2026-11-08）**：任何 release 构建必带 `BORING_BSSL_PATH=target/boringssl-asm/prebuilt`；交付/换入 v2rayN 前必验（三选一）：①`grep rustc-link-search target/release/build/btls-sys-*/output` 指向 prebuilt ②`--check` 返 **0**（返 3=UNVERIFIED 视为未验过，须改用 ①/③ 补证）③大小启发式 = NO_ASM exe 比汇编版**小 ~47KB**（实测 52,157,952 vs 52,205,056）。非汇编产物禁交付 v2rayN/生产——症状即"xhttp/带指纹卡 30 多 MB/s 上不去"
 - **CI 产物现状（2026-11-08 复核）**：`release.yml` 已接 `setup-boringssl-asm` action 并在发布前硬断言（`BORING_BSSL_PATH` 未导出即 exit 1 + 复跑 `--check`，见 `release.yml:153-157`，bd jyipl/qscjv）⇒ 发布产物带汇编；**风险面收窄为本机手工构建**（绕过 action 直跑 cargo 仍会落 NO_ASM，故上条交付铁律适用于手工交付路径）
 
 ### vision splice 触发逻辑（雷区）
