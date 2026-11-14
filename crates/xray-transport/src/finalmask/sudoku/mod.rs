@@ -344,10 +344,23 @@ mod tests {
             matches!(tables[0].layout, Layout::Custom(_)),
             "customTable 必须选中 custom layout"
         );
-        // 与 customTables=["xxppvvvv"] 必须落到同一张表（同 password 同 pattern ⇒ 同缓存条目）
+        // 与 customTables=["xxppvvvv"] 必须落到**同一种表**（同 password 同 pattern）。
+        //
+        // 注意：这里不能断言 `Arc::ptr_eq`。`get_tables` 的插入是
+        // `cache.entry(key).or_insert(...)` —— 并发同 key 时先插入者赢，后到者仍返回
+        // 自己构建的那份 Arc，于是「两个写法返回同一 Arc」在并行测试下**必然偶发失败**
+        // （内容一致、只是身份不同）。契约是「选中 custom layout 且两张表同构」，按此断言。
         let listed = SudokuConfig { custom_tables: vec!["xxppvvvv".into()], ..single.clone() };
         let listed_tables = sudoku_tables(&listed).expect("tables");
-        assert!(Arc::ptr_eq(&tables[0], &listed_tables[0]), "两种写法必须同表");
+        assert!(
+            matches!(listed_tables[0].layout, Layout::Custom(_)),
+            "customTables 必须选中 custom layout"
+        );
+        assert_eq!(
+            tables[0].layout.hint_mask(),
+            listed_tables[0].layout.hint_mask(),
+            "两种写法必须落到同一张表（同一 custom 布局）"
+        );
     }
 
     #[tokio::test]

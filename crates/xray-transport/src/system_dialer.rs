@@ -1408,13 +1408,15 @@ mod tests {
     /// T2：全部地址失败时错误串含**每个尝试过的地址**（可观测性）。
     #[tokio::test]
     async fn all_addresses_failed_error_lists_every_addr() {
-        // 两个 bind 后立即释放的端口（无人监听 → connection refused）。
-        let closed = || {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
-        let addrs = [closed(), closed()];
+        // 两个**同时持有**的 socket 端口（先都 bind，拿到互不相同的端口，再一起释放
+        // ⇒ 释放后才无人监听）。不能「bind → 取地址 → 立刻 drop → 再 bind」：那样第二次
+        // bind 可以直接复用刚释放的同一端口，`assert_ne!` 偶发失败。
+        let l0 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let l1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addrs = [l0.local_addr().unwrap(), l1.local_addr().unwrap()];
         assert_ne!(addrs[0], addrs[1]);
+        drop(l0);
+        drop(l1);
         let err = match dial_first_reachable(None, &addrs, &SocketOptions::default()).await {
             Ok(_) => panic!("both addresses are dead"),
             Err(e) => e,
