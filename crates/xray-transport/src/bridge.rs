@@ -434,14 +434,15 @@ fn connection_limit_error() -> io::Error {
         plan.tier.as_str(),
         plan.total_budget
     );
-    // 出路必须可操作（bd 3gxez）：生效上限 = 账本余量 ÷ 每连接 pipe 双向 ⇒ 真正的杠杆
-    // 是「抬高可用内存预算（XRAY_MEM_LIMIT_MB / 更大的机器）」或「调小 policy
-    // `bufferSize`（每连接账面变小 ⇒ 同样预算装得下更多条）」；`XRAY_MAX_CONNS`
-    // 只能收紧（用户裁决 2026-11-13），不再当出路误导运维。
+    // 出路必须可操作（bd 3gxez）：生效上限 = `min(档位设计值, 账本余量 ÷ 每连接 pipe 双向)`
+    // ⇒ 真正的杠杆是「抬高可用内存预算（XRAY_MEM_LIMIT_MB / 更大的机器 ⇒ 换档）」或
+    // 「调小 policy `bufferSize`（账本余量不足时才 binding）」；`XRAY_MAX_CONNS` 只能把
+    // 上限压在账本余量之内（用户裁决 2026-11-13/14：不提供把总量吃满的放大入口），
+    // 不再把它写成无条件的出路。
     io::Error::other(format!(
         "connection limit reached: 已达本配置连接数上限 {} 条（tier {} / 预算 {}B；上限 = \
-         预算余量 ÷ 每连接 pipe 双向 —— 抬高 XRAY_MEM_LIMIT_MB 或调小 policy buffersize \
-         可提高，XRAY_MAX_CONNS 只能收紧）",
+         min(档位设计值, 预算余量 ÷ 每连接 pipe 双向) —— 抬高 XRAY_MEM_LIMIT_MB（跨档）或\
+         调小 policy buffersize（余量不足时）可提高，XRAY_MAX_CONNS 只在账本余量内生效）",
         limit,
         plan.tier.as_str(),
         plan.total_budget
@@ -1542,8 +1543,8 @@ mod tests {
     /// 触顶错误必须点名「生效条数 + 档位」并给出**可操作出路**（bd 3gxez）。
     ///
     /// 旧断言要求文案里出现 `XRAY_MAX_CONNS`（「可用 XRAY_MAX_CONNS 覆盖」）——那钉的是
-    /// 缺陷行为：该覆盖口**只能收紧**（用户裁决 2026-11-13 不提供手动放大入口），当出路
-    /// 写等于误导运维。现契约为「抬高内存预算 / 调小 policy buffersize」。
+    /// 缺陷行为：该覆盖口在账本余量之外无效（用户裁决 2026-11-13/14 不提供把总量吃满的
+    /// 放大入口），当无条件出路写等于误导运维。现契约为「抬高内存预算 / 调小 buffersize」。
     #[test]
     fn connection_limit_error_names_tier_limit() {
         let _g = global_state_guard();
@@ -1558,9 +1559,12 @@ mod tests {
         assert!(text.contains(plan.tier.as_str()), "必须点名档位：{text}");
         assert!(
             text.contains("buffersize") && text.contains("XRAY_MEM_LIMIT_MB"),
-            "必须给出可操作出路（提高预算 / 调小每连接 pipe 账面）：{text}"
+            "必须给出可操作出路（换档 / 调小每连接 pipe 账面）：{text}"
         );
-        assert!(text.contains("XRAY_MAX_CONNS 只能收紧"), "不得再把只收紧的口当出路：{text}");
+        assert!(
+            text.contains("XRAY_MAX_CONNS 只在账本余量内生效"),
+            "不得把只作上界兼收紧的口写成无条件出路：{text}"
+        );
     }
 
     /// 执行点（[`ConnSlot::try_acquire`] 的唯一读数 [`conn_limit`]）必须读装配期

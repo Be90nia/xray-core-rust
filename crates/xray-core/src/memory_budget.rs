@@ -37,12 +37,13 @@
 //! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
 //! `xray_frame::budget::plan::MemoryPlan` 按**探测到的可用内存**分档派生——
 //! ≤256MB→40MB / ≤512MB→96MB / ≤1GB→192MB / >1GB→`min(512MB, 可用/4)`。同一份
-//! 派生值给出桥每方向字节闸 + 未经本门时的**缺省**连接数（`总预算 / 3MiB` =
-//! 13/32/64/170）。**过门后的执行点上限 = 账本余量口径**（bd 3gxez）：
-//! `(预算 − 固定面 − 显式 socket) / 每连接 pipe(双向)` —— 档位设计表只是未装配
-//! 时的读数，不再当天花板（设计表的每连接单价含 2MiB「在途份额」，而在途已由
-//! D-01 裁定为瞬态背压上界 ⇒ 按它封顶会把小内存档压到账本余量以下，成片拒连；
-//! `XRAY_MAX_CONNS` 只收紧、不放大）。满载乘积
+//! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB` = 13/32/64/170，
+//! **并发能力不按闸反解**；触顶由桥 fail-visible 拒绝）。**口径史（bd 3gxez）**：
+//! 设计表的每连接单价 3MiB 含 2MiB「在途份额」，而账本只把 pipe 当常驻（缺省 1MiB）
+//! ⇒ 本配置的账本余量（tiny 19 / small 75 …）恒大于设计值。用户裁决 2026-11-14
+//! 「代码不回退、**总数压小**」⇒ 执行点上限 = `min(档位设计/显式值, 账本余量)`，
+//! **故意不用余量反解**（要的是低内存峰值，不是吃满预算）；抬容量只需改
+//! `budget_report_with` 那一行并重跑 `tests/conn_gate_ledger_cap.rs`。满载乘积
 //! （`max_conns × 2 × gate`）因此**过订**（3.3×–21×）——闸是瞬态背压上界，非每连接
 //! 常驻 ⇒ 该上界如实进 caps 栏 + WARN（bd 2026-11-08 D-01，口径经 PM 修正；
 //! 全局共享配额终态另票）。预算装不下时**不拒启**：按装得下的并发数降档并 warn，
@@ -323,19 +324,19 @@ pub fn budget_report_with(
     // `bufferSize 0`（Go 合法「不排队」）不占字节 ⇒ 装得下的条数不受限。
     let conns_fit = for_conns.checked_div(per_conn_pipe).unwrap_or(MIN_VIABLE_CONCURRENCY);
     let conns = conns_fit.min(MIN_VIABLE_CONCURRENCY);
-    // 运行期连接数上限 = **账本余量口径**（bd 3gxez）：上面算出的 `conns_fit`（预算 −
-    // 固定面 − 显式 socket，除以每连接 pipe 双向）就是本配置装得下的条数，直接写进执行点。
-    // 档位设计表（13/32/64/170 = 预算/3MiB）**不再当天花板**：它的每连接单价含 2MiB
-    // 「在途份额」，而 D-01 已裁定在途是瞬态背压上界（桥字节闸自身兜、只进 caps 栏）⇒
-    // 设计表把小内存档压到远低于账本装得下的条数（tiny 13 vs 20），多设备/浏览器并发
-    // 即触顶成片拒连（用户感知 = 不稳定）。设计表只剩「未过预算门」时的缺省读数。
-    // `XRAY_MAX_CONNS` 仍**只收紧**（用户裁决 2026-11-13：不提供手动放大入口）。
+    // 运行期连接数上限 = **保守语义**：档位派生值（或 `XRAY_MAX_CONNS` 显式值）与本配置
+    // 账本装得下的条数**取小**。
+    // **本配置余量通常更大（tiny 19 / small 75 …），但按用户裁决 2026-11-14「代码不回退、
+    // 总数压小」故意不用** —— 我们要的是低内存峰值，不是把预算吃满。口径史：设计表的
+    // 每连接单价 3MiB 含 2MiB「在途份额」，账本只把 pipe 当常驻（1MiB），两把尺子取小
+    // 会让设计表恒赢（bd 3gxez 根因）；抬容量只需把本行换成
+    // `explicit.map_or(conns_fit, |n| n.min(conns_fit))` 并重跑
+    // `crates/xray-core/tests/conn_gate_ledger_cap.rs`（该测试钉的正是本语义）。
+    // `XRAY_MAX_CONNS` 在此只作上界（压不到账本余量以上），收紧照常生效。
     // **降档值必须到执行点**（bd 2026-11-08 D-02）：桥上 `ConnSlot` 读的正是这里
     // 写入的同一份值；旧状只写 warn 文案，桥仍用档位原值。
-    let explicit = xray_frame::budget::plan::explicit_max_conns();
-    let max_conns = xray_frame::budget::plan::set_effective_max_conns(
-        explicit.map_or(conns_fit, |n| n.min(conns_fit)),
-    );
+    let max_conns =
+        xray_frame::budget::plan::set_effective_max_conns(plan.max_conns.min(conns_fit));
 
     // ── 3b) 瞬时上界入硬账（bd 2026-11-08 D-03 / security P2-2）──
     // 三项都**由远端/负载推高、装配期不可判定**，但真的会吃掉预算：
@@ -446,14 +447,12 @@ pub fn budget_report_with(
     // 告警面（全部走 warn，**不拒启**）：① 连接数降档；② 瞬时上界装不下。
     let mut notes: Vec<String> = Vec::new();
     // 装不下完整并发 ⇒ 降档运行（**不拒启**）：显式告警，让运维看得见少了多少条。
-    // 触发两条：① 装不满最小可跑并发；② 生效值低于「档位设计值 / XRAY_MAX_CONNS 显式值」
-    // （bd 3gxez 起设计值只是缺省读数，压制它的账本余量必须可见）。
     if conns_fit > 0 && (conns < MIN_VIABLE_CONCURRENCY || max_conns < plan.max_conns) {
         notes.push(format!(
             "内存降档运行（bd sfqlu）：档位 {}（{}，可用 {}B，来源 {}）总预算 {budget}B，\
              固定面 {fixed}B（{listeners} 个监听）+ 显式 socket {quic_explicit_booked}B 后\
              每连接 {per_conn_pipe}B pipe（双向）只装得下 {conns_fit} 条连接\
-             （最小可跑 {} 条 / 档位设计值 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
+             （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
             plan.tier.as_str(),
             plan.tier.label(),
             plan.available,
@@ -787,10 +786,10 @@ mod tests {
     /// 四档（256MB / 512MB / 1GB / 大机器）派生出的预算与**执行点**连接数上限必须自洽，
     /// 且生效值出现在报告的 caps 栏里（bd sfqlu 验收 5 · bd 3gxez 口径）。
     ///
-    /// 上限口径（bd 3gxez）：`(总预算 − 固定面) / 每连接 pipe(双向)` = 本配置**账本装得下**
-    /// 的条数，独立复算后逐档相等。旧断言钉的是「生效值 = 档位设计表 13/32/64/170」——那正是
-    /// 缺陷行为本身（设计表把 tiny 压到 13 条 ⇒ 20 并发成片拒连）；现在设计值只是**未过本门**
-    /// 时的缺省读数，只能当生效值的下界。并发能力仍不回退（更没按桥闸反解成 4/4/4/8 条）。
+    /// 口径：执行点上限 = `min(档位设计值, 账本余量)`。**用户裁决 2026-11-14「总数压小」**
+    /// ⇒ 缺省配置下生效值就是档位设计值 13/32/64/170（账本余量 19/75/… 更大，但故意
+    /// 不用：要的是低内存峰值）。本测试同时钉住「账本余量 ≥ 设计值」这一事实，防止有人
+    /// 误以为设计值已经是账本能装的极限。
     #[test]
     fn tier_plan_drives_budget_and_conn_cap() {
         let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -804,22 +803,24 @@ mod tests {
             (16 * 1024 * MIB, 512 * MIB, 170),
         ] {
             let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
-            assert_eq!(plan.max_conns, design_conns, "{available}B 档：未经预算门的缺省读数");
+            assert_eq!(plan.max_conns, design_conns, "{available}B 档：档位设计值");
             let report =
                 budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
             assert_eq!(report.budget, budget as usize, "{available}B 档总预算");
-            let expect = plan.total_budget.saturating_sub(fixed) / per_conn;
-            assert_eq!(report.max_conns, expect, "{available}B 档：生效上限 = 账本余量口径");
+            assert_eq!(report.max_conns, design_conns, "{available}B 档：生效上限 = 档位设计值");
+            let ledger = plan.total_budget.saturating_sub(fixed) / per_conn;
             assert!(
-                report.max_conns >= design_conns,
-                "{available}B 档：账本余量 {} 不得低于档位设计值 {design_conns}",
-                report.max_conns
+                ledger >= design_conns,
+                "{available}B 档：账本余量 {ledger} 小于设计值 {design_conns}（配置侧被压过？）"
             );
             assert!(report.is_ok(), "{available}B 档缺省配置必须过门：{:?}", report.violations);
             let summary = report.summary();
             assert!(summary.contains(&format!("{budget}B")), "摘要必须带总预算：{summary}");
             assert!(
-                report.caps.iter().any(|(n, _)| n.starts_with(&format!("max {expect} conns"))),
+                report
+                    .caps
+                    .iter()
+                    .any(|(n, _)| n.starts_with(&format!("max {design_conns} conns"))),
                 "连接数上限必须进 caps 栏：{:?}",
                 report.caps
             );
@@ -1002,8 +1003,8 @@ mod tests {
                 product,
                 product as f64 / report.budget as f64
             );
-            // ① 并发能力不回退：生效上限（bd 3gxez 起 = 账本余量口径）不得低于档位设计值。
-            assert!(report.max_conns >= conns, "{} 档并发能力回退了", report.tier);
+            // ① 生效上限 = 档位设计值（用户裁决 2026-11-14「总数压小」：账本余量更大但不用）。
+            assert_eq!(report.max_conns, conns, "{} 档生效上限必须回到档位设计值", report.tier);
             // ② 最坏上界必须在 caps 栏可见。
             let (name, value) = report
                 .caps
@@ -1066,8 +1067,8 @@ mod tests {
             let mut built = xray_conf::BuiltConfig::default();
             built.inbounds.push(quic_inbound("q1"));
             let report = budget_report_with(&built, plan).expect("report");
-            // 并发能力不回退：生效上限（bd 3gxez 起 = 账本余量口径）不得低于档位设计值。
-            assert!(report.max_conns >= tier_conns, "{available}B 档并发能力被改动了");
+            // 生效上限 = 档位设计值（用户裁决 2026-11-14「总数压小」，账本余量更大但不用）。
+            assert_eq!(report.max_conns, tier_conns, "{available}B 档并发能力被改动了");
 
             // 乘数 = min(档位并发, 预算余量装得下的满窗条数)——从报告自身两项硬账
             // 反算（不写字面量）：余量 = 预算 − 固定面 − 常态连接面。
@@ -1181,8 +1182,8 @@ mod tests {
             built.inbounds.push(xdrive_inbound("xd-in", true));
             built.outbounds.push(xdrive_outbound("xd-out", true));
             let report = budget_report_with(&built, plan).expect("report");
-            // 并发能力不回退：生效上限（bd 3gxez 起 = 账本余量口径）不得低于档位设计值。
-            assert!(report.max_conns >= tier_conns, "{available}B 档并发能力被改动了");
+            // 生效上限 = 档位设计值（用户裁决 2026-11-14「总数压小」，账本余量更大但不用）。
+            assert_eq!(report.max_conns, tier_conns, "{available}B 档并发能力被改动了");
 
             let read = |pred: &dyn Fn(&str) -> bool| {
                 report.hard.iter().find(|(n, _)| pred(n)).map(|(_, b)| *b).unwrap_or(0)

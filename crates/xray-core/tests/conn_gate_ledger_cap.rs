@@ -1,10 +1,15 @@
-//! bd 3gxez：小内存档的**执行点**连接上限必须 = 账本余量口径，不是档位设计表
-//! 13/32/64/170。
+//! bd 3gxez：小内存档的**执行点**连接数上限 = `min(档位设计值, 账本余量)`。
 //!
-//! 缺陷形态（修前实测）：`XRAY_MEM_LIMIT_MB=256`（tiny / 40MiB）下上限被设计表压到
-//! 13 条，20 并发即有 4-7 条在建连成功后 0 字节 EOF（`connection_limit_error`），
-//! 用户感知 = 不稳定。账本自己能装下的条数 = `(预算 − 固定面) / 每连接 pipe 双向`，
-//! 在 tiny 档比 13 多出 6-9 条（随核数变），在 512MB 档约为设计值 32 的 2.3 倍。
+//! 口径（用户裁决 2026-11-14「代码不回退、**总数压小**」）：
+//! - 设计表 `design_conn_cap` = 13/32/64/170（= 预算 / 3MiB，3MiB 含 2MiB 在途份额）；
+//! - 账本余量 = `(预算 − 固定面 − 显式 socket) / 每连接 pipe 双向`（缺省 1MiB/条）；
+//! - **余量恒大于设计值**（tiny 19 vs 13、small 75 vs 32），但**故意不用**——要的是低
+//!   内存峰值，不是把预算吃满。这是事实与决策，**不是缺陷**。
+//!
+//! 修前实测（release 二进制）：tiny 上限 13 ⇒ 20 并发有 4 条建连成功后 0 字节 EOF，
+//! 用户感知 = 不稳定。本单交付的是**可操作拒连文案 + 口径文档 + 根因 + 本语义锚**
+//! （容量不变）；将来要抬容量，只需把 `memory_budget::budget_report_with` 里
+//! `plan.max_conns.min(conns_fit)` 换成余量口径并改本文件期望。
 //!
 //! 本文件只有一个测试 ⇒ 独占进程：`XRAY_MAX_CONNS` 与 `MemoryPlan::cached()` 的进程级
 //! 静态值不受其它测试干扰，断言可确定性复现（同 `memory_budget_degrade_wiring.rs`）。
@@ -24,7 +29,7 @@ fn ledger_fit(plan: &MemoryPlan, listeners: usize) -> usize {
 }
 
 #[test]
-fn tiny_tier_conn_cap_follows_ledger_remainder() {
+fn tiny_tier_conn_cap_is_design_value_bounded_by_ledger() {
     // SAFETY: 本文件唯一测试，单线程；env 只在 `MemoryPlan::cached()` 首次读之前写。
     unsafe {
         std::env::remove_var("XRAY_MAX_CONNS");
@@ -32,42 +37,54 @@ fn tiny_tier_conn_cap_follows_ledger_remainder() {
     }
     let plan = *MemoryPlan::cached();
     assert_eq!(plan.tier.as_str(), "tiny", "档位必须由 XRAY_MEM_LIMIT_MB 钉死");
-    assert_eq!(plan.max_conns, 13, "未经预算门时执行点仍是档位设计值（13 条）");
+    assert_eq!(plan.max_conns, 13, "档位设计值 = 13 条");
 
-    // ① 过预算门后上限抬到账本余量（设计表不再是天花板）。
+    // ① 过预算门后上限仍是设计值（账本余量更大，但按裁决压小）。
     xray_core::memory_budget::check_startup_budget(&BuiltConfig::default())
         .expect("预算不足不得拒启（用户裁决 2026-11-07）");
     let fit = ledger_fit(&plan, 0);
-    assert_eq!(plan.effective_max_conns(), fit, "执行点上限必须 == 账本余量口径");
+    assert_eq!(plan.effective_max_conns(), plan.max_conns, "执行点上限 = 档位设计值 13 条");
     assert!(
         fit > plan.max_conns,
-        "设计值 13 仍是天花板：账本余量算出 {fit} 条（预算 {}B）——bd 3gxez 修复点回退",
-        plan.total_budget
+        "账本余量 {fit} 必须大于设计值 {}——余量更大是事实，压小是裁决（要低峰值）",
+        plan.max_conns
     );
-    println!("tiny: design 13 -> effective {fit} (budget {}B)", plan.total_budget);
+    println!(
+        "tiny: effective {} (= design) <= ledger fit {fit}; extra headroom intentionally unused \
+         (user ruling 2026-11-14)",
+        plan.effective_max_conns()
+    );
 
-    // 512MB 档（生产小节点主力）：余量口径约为设计值 32 的 2 倍以上。
+    // 512MB 档（生产小节点主力）：同样钉设计值 32，且账本余量 ≥ 2 倍。
     let small = MemoryPlan::from_available(512 * MIB);
     let small_report = xray_core::memory_budget::budget_report_with(&BuiltConfig::default(), small)
         .expect("report");
-    let small_fit = ledger_fit(&small, 0);
-    assert_eq!(small_report.max_conns, small_fit, "512MB 档同样按账本余量封顶");
+    assert_eq!(small_report.max_conns, small.max_conns, "512MB 档生效上限 = 设计值 32 条");
+    assert_eq!(small.max_conns, 32, "档位设计值锚");
     assert!(
-        small_report.max_conns >= 2 * small.max_conns,
-        "512MB 档账本余量 {} 应 ≥ 设计值 {} 的 2 倍",
-        small_report.max_conns,
-        small.max_conns
+        ledger_fit(&small, 0) >= 2 * small.max_conns,
+        "512MB 档账本余量 {} 应 ≥ 设计值 32 的 2 倍（余量存在但不用）",
+        ledger_fit(&small, 0)
     );
 
-    // ② 调大 XRAY_MAX_CONNS 不得越过账本余量（用户裁决 2026-11-13：不提供放大入口）。
-    // SAFETY: 同上单线程；`explicit_max_conns()` 每次调用都重读 env（装配期一次性消费）。
+    // ② `XRAY_MAX_CONNS` 放大仍受账本余量夹住（既有语义：它只是上界，不能吃满预算）。
+    // 用 `MemoryPlan::detect()` 现读 env（`cached()` 已固化，不响应后置 env）⇒ 生效值走
+    // 报告返回值，不碰进程级静态值。
+    // SAFETY: 同上单线程；env 只影响本函数后续的 `detect()`。
     unsafe { std::env::set_var("XRAY_MAX_CONNS", "1000") };
-    xray_core::memory_budget::check_startup_budget(&BuiltConfig::default()).expect("budget gate");
-    assert_eq!(plan.effective_max_conns(), fit, "显式放大不得越过账本余量");
+    let raised = MemoryPlan::detect();
+    assert_eq!(raised.max_conns, 1000, "显式值进 MemoryPlan");
+    let raised_report =
+        xray_core::memory_budget::budget_report_with(&BuiltConfig::default(), raised)
+            .expect("report");
+    assert_eq!(raised_report.max_conns, fit, "显式 1000 被账本余量 {fit} 夹住");
 
-    // ③ 收紧仍生效（「只能收紧」那一半语义不许退化）。
+    // ③ 收紧仍生效（「只作上界」的另一半语义不许退化）。
     // SAFETY: 同上。
     unsafe { std::env::set_var("XRAY_MAX_CONNS", "3") };
-    xray_core::memory_budget::check_startup_budget(&BuiltConfig::default()).expect("budget gate");
-    assert_eq!(plan.effective_max_conns(), 3, "XRAY_MAX_CONNS 收紧必须继续生效");
+    let tightened = MemoryPlan::detect();
+    let tightened_report =
+        xray_core::memory_budget::budget_report_with(&BuiltConfig::default(), tightened)
+            .expect("report");
+    assert_eq!(tightened_report.max_conns, 3, "XRAY_MAX_CONNS 收紧必须继续生效");
 }
