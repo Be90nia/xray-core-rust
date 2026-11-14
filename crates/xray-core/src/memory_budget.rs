@@ -27,6 +27,12 @@
 //! 3. 上限面（不判、只打印）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 //!    预约会误杀合法配置）、xhttp h2 send_buf（每连接、惰性分配）、DoH3 resolver
 //!    socket（装配期不可数）、桥在途。
+//! 4. **UDP dispatch 会话面（bd rmbby）**：每会话**常驻** `UDP_SESSION_RESIDENT_BYTES` （8KiB
+//!    池化读缓冲，建会话即占）进硬账——条数按**余量口径**反解 （余额 ÷ 常驻字节，上界 =
+//!    `MAX_UDP_SESSIONS`）并写进执行点 （`plan::set_effective_max_udp_sessions`，dispatcher
+//!    `establish` 读同一份值， 超限 fail-visible 拒建）；**瞬态** `2 × 256KiB` duplex 上限（lazy
+//!    背压兜底） 进 caps 栏。旧状该面零登记且上限跨档恒定（4096 条 ⇒ 最坏 ~2GiB）。
+//!    **禁**拿瞬态上界反解条数（512MB 档只剩 ~180 条 = 并发回退，D-01 同款教训）。
 //!
 //! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
 //! `xray_frame::budget::plan::MemoryPlan` 按**探测到的可用内存**分档派生——
@@ -41,6 +47,11 @@
 //! 故原「96MiB 不是运行期硬上界」口径不变。
 
 // 登记簿常量单一事实源 = `xray_frame::budget`（ADR-B 拆分）；此处只转出，不复制。
+// UDP 会话面常量单一事实源 = dispatcher 实现（同 `xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP`
+// 口径：登记簿直引实现常量，**禁复制值**——改实现值即改账面，无第二份真相源）。
+use xray_app_dispatcher::udp_session::{
+    MAX_UDP_SESSIONS, UDP_SESSION_RESIDENT_BYTES, UDP_SESSION_WORST_CASE_BYTES,
+};
 pub use xray_frame::budget::{
     BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES, DNS_CACHE_ESTIMATE_BYTES, DNS_CACHE_MAX_ENTRIES,
     DNS_PENDING_EST_BYTES, DNS_PENDING_MAX_ENTRIES, DNS_SINGLEFLIGHT_UNBOUNDED_NOTE,
@@ -379,12 +390,36 @@ pub fn budget_report_with(
     ) / H2_MAX_SEND_BUF_PER_CONN_BYTES;
     let masque_tunnels = if masque_endpoints > 0 { max_conns.min(masque_fit.max(1)) } else { 0 };
     let masque_send_buf_booked = masque_tunnels * H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    // UDP dispatch 会话（bd rmbby）：旧状该面**完全不在预算内**、`MAX_UDP_SESSIONS=4096`
+    // 跨档恒定 ⇒ 512MB 档最坏 `4096 × (8KiB + 2×256KiB) ≈ 2GiB` 静默吃穿。
+    // 两面分开记（口径见两条常量 doc）：
+    // - **常驻** 8KiB/条（池化读缓冲，建会话即占）= 稳态面 ⇒ 按**余量口径**反解本档
+    //   装得下的条数（余量 ÷ 常驻字节，上界 = 实现常量），该条数**写进执行点**
+    //   （`set_effective_max_udp_sessions`，dispatcher `establish` 读同一份值，超限 fail-visible
+    //   拒建）。**禁**按「最坏上界」反解条数：2GiB > 任何档预算 ⇒ 512MB 档只装得下 ~180 条会话 =
+    //   并发回退（bd 2026-11-08 D-01 同款教训）。
+    // - **瞬态** 2×256KiB duplex（lazy 背压兜底）⇒ caps 栏诚实上界（同
+    //   `BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES` 口径），不单独 WARN（恒真 = 噪音）。
+    let udp_fit = budget.saturating_sub(
+        fixed
+            + quic_explicit_booked
+            + conns * per_conn_pipe
+            + frag_booked
+            + quic_windows_booked
+            + tuic_inbox_booked
+            + xdrive_windows_booked
+            + masque_send_buf_booked,
+    ) / UDP_SESSION_RESIDENT_BYTES;
+    let udp_sessions = xray_frame::budget::plan::set_effective_max_udp_sessions(
+        udp_fit.clamp(1, MAX_UDP_SESSIONS),
+    );
+    let udp_resident_booked = udp_sessions * UDP_SESSION_RESIDENT_BYTES;
     let transient_booked = frag_booked
         + quic_windows_booked
         + tuic_inbox_booked
         + xdrive_windows_booked
         + masque_send_buf_booked;
-    let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe;
+    let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe + udp_resident_booked;
     let projected = steady_booked + transient_booked;
     if conns_fit == 0 {
         violations.push(format!(
@@ -423,6 +458,17 @@ pub fn budget_report_with(
             tuic_outbounds,
             xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP,
             tuic_inbox_conns + 1
+        ));
+    }
+    // UDP dispatch 会话上限被预算压低（bd rmbby）⇒ **独立 WARN**：这是**执行点真缩了**
+    // 的可行动事件（第 N+1 条会话会拿到 io::Error），不是上面那种「不受预算约束」的
+    // 诚实标注 ⇒ 必须让运维在启动日志里看到。常态档位装得下时不发（防噪音）。
+    if udp_sessions < MAX_UDP_SESSIONS {
+        notes.push(format!(
+            "UDP dispatch 会话上限按预算降为 {udp_sessions} 条（bd rmbby，只 WARN 不拒启）：\
+             预算余量只装得下 {udp_sessions} 条 × 每会话常驻 {UDP_SESSION_RESIDENT_BYTES}B\
+             （实现硬顶 {MAX_UDP_SESSIONS} 条），超限由 establish 拒建\
+             （fail-visible io::Error，不静默丢包）"
         ));
     }
     // 瞬时上界（xdns frag / QUIC 连接窗）超预算 = 只 WARN（用户裁决 2026-11-07）。
@@ -550,6 +596,15 @@ pub fn budget_report_with(
             ),
             full_load_product,
         ),
+        // bd rmbby：UDP 会话的 duplex 面 = **惰性背压兜底**（对端不读才涨到上限）⇒
+        // 诚实上界进 caps，不反解会话条数（反解 ⇒ 512MB 档只装得下 ~180 条 = 并发回退）。
+        (
+            format!(
+                "{udp_sessions} udp dispatch sessions x {UDP_SESSION_WORST_CASE_BYTES}B worst \
+                 (resident + 2 lazy duplex caps)"
+            ),
+            udp_sessions * UDP_SESSION_WORST_CASE_BYTES,
+        ),
         (format!("max {} conns (tier {})", max_conns, plan.tier.as_str()), max_conns),
     ];
 
@@ -594,6 +649,13 @@ pub fn budget_report_with(
                     "{masque_tunnels} masque tunnel h2 send_buf x {H2_MAX_SEND_BUF_PER_CONN_BYTES}B"
                 ),
                 masque_send_buf_booked,
+            ),
+            // UDP dispatch 会话常驻面（bd rmbby）：池化读缓冲，建会话即真占。
+            (
+                format!(
+                    "{udp_sessions} udp dispatch sessions x {UDP_SESSION_RESIDENT_BYTES}B resident"
+                ),
+                udp_resident_booked,
             ),
         ],
         caps,
@@ -2071,19 +2133,136 @@ mod tests {
     /// `+ BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES`（4MiB）入乘积；回退后上界
     /// = 66MiB（条目闸口径，见登记簿 doc 回退记录），继续入乘积 = 造假
     /// （8 × (pipe + 66MiB) ≫ 96MiB，而瞬态本就不该按常驻算）。
+    ///
+    /// **UDP 会话常驻面进乘积**（bd rmbby）：读缓冲是建会话即占的真常驻
+    /// （不是 duplex 那种惰性上界），满 4096 条 = 32MiB 必须在 96MiB 里装得下。
     #[test]
     fn ledger_total_stays_within_budget() {
         let pipe_bytes =
             i64::from(xray_features::policy::BufferPolicy::default().connection).max(0);
         let pipe_per_conn = (pipe_bytes * 2) as usize; // 双方向
+        let udp_sessions = MAX_UDP_SESSIONS * UDP_SESSION_RESIDENT_BYTES;
         let total = startup_fixed_floor_bytes_for_with_inflight(8, 1, HANDSHAKE_INFLIGHT_MAX)
-            + MIN_VIABLE_CONCURRENCY * pipe_per_conn;
+            + MIN_VIABLE_CONCURRENCY * pipe_per_conn
+            + udp_sessions;
         assert!(
             total <= XRAY_BUDGET_BYTES,
-            "总实算 {total}B（固定面 + {} 连接 × pipe 双向 {pipe_per_conn}B）超预算 {}B：\
+            "总实算 {total}B（固定面 + {} 连接 × pipe 双向 {pipe_per_conn}B + \
+             {MAX_UDP_SESSIONS} UDP 会话 × {UDP_SESSION_RESIDENT_BYTES}B）超预算 {}B：\
              分账须重审，禁自行放宽总额",
             MIN_VIABLE_CONCURRENCY,
             XRAY_BUDGET_BYTES
         );
+    }
+
+    // ── bd rmbby：UDP dispatch 会话面（三项验收）──
+
+    /// 从两栏取 UDP 会话账面 `(常驻, 最坏上界)`。
+    fn udp_session_columns(report: &BudgetReport) -> (usize, usize) {
+        let resident = report
+            .hard
+            .iter()
+            .find(|(n, _)| n.contains("udp dispatch sessions"))
+            .map(|(_, b)| *b)
+            .expect("hard 栏必须登记 UDP 会话常驻面");
+        let worst = report
+            .caps
+            .iter()
+            .find(|(n, _)| n.contains("udp dispatch sessions"))
+            .map(|(_, b)| *b)
+            .expect("caps 栏必须登记 UDP 会话最坏上界");
+        (resident, worst)
+    }
+
+    /// ① 小内存档（40MiB）过订 ⇒ 会话上限降档 + WARN 一次；账面自洽、不拒启。
+    ///
+    /// 旧状 `MAX_UDP_SESSIONS=4096` 跨档恒定 ⇒ 40MiB 档把 32MiB 常驻读缓冲
+    /// （还没算 duplex）静默吃进预算外。
+    #[test]
+    fn udp_sessions_degrade_on_tiny_tier() {
+        let report =
+            budget_report_with(&xray_conf::BuiltConfig::default(), plan_256mb()).expect("report");
+        assert!(report.is_ok(), "会话降档不得拒启：{:?}", report.violations);
+        let (resident, worst) = udp_session_columns(&report);
+        let cap = resident / UDP_SESSION_RESIDENT_BYTES;
+        assert!(cap < MAX_UDP_SESSIONS, "40MiB 档装不下 {MAX_UDP_SESSIONS} 条：实得 {cap}");
+        assert!(cap >= 1, "至少留 1 条会话");
+        let degraded = report.degraded.as_deref().unwrap_or_default();
+        assert!(
+            degraded.contains(&format!("UDP dispatch 会话上限按预算降为 {cap} 条")),
+            "WARN 条数必须等于账面条数 {cap}（禁只写文案不改账面）：{degraded}"
+        );
+        assert_eq!(
+            worst,
+            cap * UDP_SESSION_WORST_CASE_BYTES,
+            "caps 栏最坏上界 = 条数 × 单会话上界（duplex 不反解条数）"
+        );
+        assert!(
+            report.projected <= report.budget,
+            "常驻面必须收在预算内：{} > {}",
+            report.projected,
+            report.budget
+        );
+    }
+
+    /// ② 常态档位（96MiB 起）保持实现硬顶且**不告警**——防告警退化成噪音，
+    /// 也防「按最坏上界反解」把并发砍到 ~180 条（D-01 同款教训）。
+    #[test]
+    fn udp_sessions_intact_on_small_and_larger_tiers() {
+        for available in [512 * MIB, 1024 * MIB] {
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
+            let report =
+                budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
+            assert!(report.is_ok(), "{available}B 档不得拒启：{:?}", report.violations);
+            let (resident, worst) = udp_session_columns(&report);
+            assert_eq!(
+                resident / UDP_SESSION_RESIDENT_BYTES,
+                MAX_UDP_SESSIONS,
+                "{available}B 档会话上限必须保持实现硬顶（并发不回退）"
+            );
+            assert_eq!(worst, MAX_UDP_SESSIONS * UDP_SESSION_WORST_CASE_BYTES);
+            let degraded = report.degraded.as_deref().unwrap_or_default();
+            assert!(
+                !degraded.contains("UDP dispatch"),
+                "{available}B 档装得下 ⇒ 不得出 UDP 告警：{degraded}"
+            );
+        }
+    }
+
+    /// ③ 三联口径自洽（四档全扫）：单会话上界 = 常驻 + 双向 duplex；
+    /// 账面 = 条数 × 对应上界；常驻面收在预算内；最坏上界只进 caps。
+    // 打印三联表（取证须落数字，同 q1r4q 先例：显式 allow + 理由）。
+    #[allow(clippy::print_stdout)]
+    #[test]
+    fn udp_session_ledger_is_self_consistent_across_tiers() {
+        assert_eq!(UDP_SESSION_RESIDENT_BYTES, 8 * 1024, "常驻口径锚 = 池化读缓冲 8KiB");
+        assert_eq!(
+            UDP_SESSION_WORST_CASE_BYTES,
+            UDP_SESSION_RESIDENT_BYTES + 2 * 256 * 1024,
+            "单会话最坏上界 = 8KiB 常驻 + 双向 256KiB duplex（改实现常量即红）"
+        );
+        for available in [256 * MIB, 512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
+            let plan = xray_frame::budget::plan::MemoryPlan::from_available(available);
+            let report =
+                budget_report_with(&xray_conf::BuiltConfig::default(), plan).expect("report");
+            let (resident, worst) = udp_session_columns(&report);
+            let cap = resident / UDP_SESSION_RESIDENT_BYTES;
+            assert!(cap >= 1 && cap <= MAX_UDP_SESSIONS, "{available}B 档条数越界：{cap}");
+            assert_eq!(
+                worst / UDP_SESSION_WORST_CASE_BYTES,
+                cap,
+                "{available}B 档 caps 栏与 hard 栏条数必须同源"
+            );
+            assert!(
+                report.projected <= report.budget,
+                "{available}B 档账面超预算：{} > {}",
+                report.projected,
+                report.budget
+            );
+            println!(
+                "{} 档（预算 {}B）：上限 {cap} 条 / 常驻 {resident}B / 最坏 {worst}B",
+                report.tier, report.budget
+            );
+        }
     }
 }

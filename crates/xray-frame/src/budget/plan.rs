@@ -443,6 +443,36 @@ pub fn set_effective_max_conns(limit: usize) -> usize {
     limit
 }
 
+/// 装配期写入的运行期 UDP dispatch 会话上限（0 = 未写入 ⇒ 用实现常量上界）。
+///
+/// 与 [`set_effective_max_conns`] 同族（bd rmbby）：每会话有一条**常驻**缓冲
+/// （池化 8KiB 读缓冲），`MAX_UDP_SESSIONS` 跨档恒定会让小内存档在会话满时
+/// 静默吃穿预算 ⇒ 预算门按「余量 ÷ 每会话常驻字节」反解本档装得下的条数写进
+/// 这一个读数。执行点 `xray_app_dispatcher::udp_session` 的 `establish` 读同一
+/// 份值（超限 fail-visible 返回 `io::Error`，不静默丢包）；未经过预算门
+/// （单测 / 直跑）时为 0 ⇒ 用实现常量上界，行为与旧版一致。
+static EFFECTIVE_MAX_UDP_SESSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 读运行期生效的 UDP dispatch 会话上限；`None` = 预算门未写入 ⇒ 调用方用自己的
+/// 实现常量上界（`xray_app_dispatcher::udp_session::MAX_UDP_SESSIONS`）。
+#[must_use]
+pub fn effective_max_udp_sessions() -> Option<usize> {
+    match EFFECTIVE_MAX_UDP_SESSIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// 写入运行期生效的 UDP dispatch 会话上限（装配期一次性，`xray-core::memory_budget`
+/// 调）。夹到 `≥ 1`（写 0 = 全拒 ⇒ 服务不可用）；返回值即实际生效值（调用方据此
+/// 回填报告，免二次读全局）。
+pub fn set_effective_max_udp_sessions(limit: usize) -> usize {
+    let limit = limit.max(1);
+    EFFECTIVE_MAX_UDP_SESSIONS.store(limit, std::sync::atomic::Ordering::Relaxed);
+    limit
+}
+
 /// 解析 `XRAY_MEM_LIMIT_MB` 值（`"256"` → 256；空/非数字 → `None`）。
 fn parse_mb(raw: &str) -> Option<u64> {
     let mb: u64 = raw.trim().parse().ok()?;
@@ -868,5 +898,17 @@ mod tests {
         assert_eq!(xmux_pool_cap_with(512 * MIB, Some(1000)), 32);
         // 显式上限与派生值同源 ⇒ 一致。
         assert_eq!(xmux_pool_cap_with(1024 * MIB, Some(64)), 64);
+    }
+
+    /// bd rmbby：UDP 会话上限的**执行点读数**（未写入 ⇒ `None`，调用方回落实现常量；
+    /// 写入后原样读回，0 夹到 1）。
+    ///
+    /// 单测串行约束：本文件的其它用例不读此静态 ⇒ 写入不影响它们。
+    #[test]
+    fn effective_max_udp_sessions_roundtrips() {
+        assert_eq!(set_effective_max_udp_sessions(1234), 1234);
+        assert_eq!(effective_max_udp_sessions(), Some(1234));
+        assert_eq!(set_effective_max_udp_sessions(0), 1, "写 0 = 全拒 ⇒ 夹到 1");
+        assert_eq!(effective_max_udp_sessions(), Some(1));
     }
 }

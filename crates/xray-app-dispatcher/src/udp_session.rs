@@ -55,10 +55,31 @@ const MAX_DATAGRAM: usize = 65535;
 /// （bd tini5：1200 会话 × 64KiB ≈ 65MB 常驻）。
 const RECV_BUF: usize = 8 * 1024;
 
-/// 进程级并发 UDP dispatch 会话上限（bd tini5：会话无上限即内存无上限）。
-/// 4096 × (8KiB 读缓冲 + duplex 2×256KiB 上限) 属可控量级；超限 fail-visible
-/// （调用方拿 io 错误而不是静默丢包）。
-const MAX_UDP_SESSIONS: usize = 4096;
+/// 进程级并发 UDP dispatch 会话上限（bd tini5：会话无上限即内存无上限；bd rmbby：
+/// 本值是**实现硬顶**，运行期生效值由预算门按档位写入——
+/// `xray_frame::budget::plan::set_effective_max_udp_sessions`，执行点读同一份值，
+/// 见 `session_cap`）。超限 fail-visible（调用方拿 io 错误而不是静默丢包）。
+pub const MAX_UDP_SESSIONS: usize = 4096;
+
+/// 单会话**常驻**缓冲（字节）= 池化响应读缓冲（`establish` 即分配，会话存活期不放）。
+///
+/// 预算门按它反解本档装得下的会话条数（`xray-core::memory_budget`）；与
+/// [`UDP_SESSION_WORST_CASE_BYTES`] 分开登记，是因为两者的记账面不同：
+/// 本项是**稳态占用**（每满一条会话真占一份），duplex 是**惰性瞬态**（见下）。
+pub const UDP_SESSION_RESIDENT_BYTES: usize = RECV_BUF;
+
+/// 单会话**瞬态上界**（字节）= 常驻读缓冲 + 双向 duplex 上限。
+///
+/// duplex 是背压兜底上界而非预约：`tokio::io::duplex` 的缓冲按写入增长
+/// （`BytesMut::extend_from_slice`），对端不读时才会涨到上限 ⇒ 预算门把它登记进
+/// caps 栏（诚实上界，同 `BRIDGE_BACKPRESSURE_BOUND_PER_CONN_BYTES` 口径），
+/// **不**拿它反解会话条数（那样 512MB 档只装得下 ~180 条 = 功能回退）。
+pub const UDP_SESSION_WORST_CASE_BYTES: usize = RECV_BUF + 2 * DUPLEX_BUF;
+
+/// 运行期生效的会话上限：预算门写入值优先，未经预算门（单测/直跑）= [`MAX_UDP_SESSIONS`]。
+fn session_cap() -> usize {
+    xray_frame::budget::plan::effective_max_udp_sessions().unwrap_or(MAX_UDP_SESSIONS)
+}
 
 /// 当前存活会话数（`Inner::drop` 归还）。
 static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -252,16 +273,15 @@ impl UdpDispatchSession {
 
     /// 建立到 outbound 的 dispatch link（两条 duplex：请求/响应）。
     ///
-    /// 并发会话数受 [`MAX_UDP_SESSIONS`] 约束：超限返回 `io::Error`
-    /// （fail-visible，不静默丢弃数据报）。
+    /// 并发会话数受 [`session_cap()`]（预算门按档位写入，未写入 = [`MAX_UDP_SESSIONS`]）
+    /// 约束：超限返回 `io::Error`（fail-visible，不静默丢弃数据报）。
     fn establish(&mut self, dest: Destination) -> io::Result<()> {
         use std::sync::atomic::Ordering;
+        let cap = session_cap();
         let live = LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
-        if live > MAX_UDP_SESSIONS {
+        if live > cap {
             LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
-            return Err(io::Error::other(format!(
-                "udp dispatch sessions exceeded {MAX_UDP_SESSIONS}"
-            )));
+            return Err(io::Error::other(format!("udp dispatch sessions exceeded {cap}")));
         }
         let (req_local, req_link) = tokio::io::duplex(DUPLEX_BUF);
         let (resp_link, resp_local) = tokio::io::duplex(DUPLEX_BUF);
