@@ -25,12 +25,9 @@
 //!     `GenerateChunkNonce` + `ShakeSizeParser` + `AEADSizeParser`
 //!   - `encoding::server`：`ServerSession::DecodeRequestHeader`（AEAD 完整）+ `SessionHistory`
 //!
-//! - **trait + stub**（IO 边界，依赖 buf chunk reader/writer + cryption_io 完整链路）：
-//!   - `ClientSession::{EncodeRequestBody, DecodeResponseHeader, DecodeResponseBody}`
-//!   - `ServerSession::{DecodeRequestBody, EncodeResponseHeader, EncodeResponseBody}`
-//!   - `inbound`/`outbound`：Handler `Process` 主入口依赖 `transport::Link` 全链路
-//!
-//! 等上层 buf chunk 加密包装链 + transport 接入后，注入 trait 实现即可激活。
+//! 出站/入站主入口：`dispatcher::make_vmess_dial_fn` / `inbound::server::serve_vmess`。
+//! 早期「Handler + Processor」骨架（IO trait stub，全部返回 NotImplemented）无生产
+//! 调用方，已删除。
 
 // async-trait 展开对 trait 脱糖方法加 #[must_use]（其 expand.rs:69），clippy 1.99 起
 // 将 Pin<Box<dyn Future>> 判为已 must_use → double_must_use 误报；宏行为非本 crate 可控。
@@ -42,7 +39,6 @@ pub mod dispatcher;
 pub mod encoding;
 pub mod error;
 pub mod inbound;
-pub mod outbound;
 // P2 批次 B 插件化（差异表 §2.2 第 2 行）：L1/L4 面，aead/encoding wire 零改动。
 pub mod plugin;
 pub mod validator;

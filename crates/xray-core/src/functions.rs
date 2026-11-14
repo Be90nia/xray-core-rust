@@ -6047,6 +6047,170 @@ mod tests {
         echo_task.abort();
     }
 
+    /// VLESS **XRV 的 UDP 由 mux 承载**端到端（bd tkhd6）。
+    ///
+    /// 对齐 Go `proxy/vless/outbound/outbound.go:303-306`：`flow=xtls-rprx-vision`
+    /// 的 UDP 请求把命令改 `Mux`、地址改 `v1.mux.cool`，UDP 帧（XUDP/mux 同构线
+    /// 格式）直接进会话。链路：socks UDP relay → dispatcher → vless 出站
+    /// （命令 Mux）→ 服务端 vless inbound decode（dest=`v1.mux.cool`）→
+    /// MuxCarrierHandler → `ServerWorker` 解帧 → 子会话 → freedom UDP → echo 回程。
+    ///
+    /// XRV 两侧都必须跑在 TLS1.3 外层（Go `inbound.go:571-581`；本仓
+    /// `validate_flow` 同判）——故服务端自签证书 + 客户端 `pinnedPeerCertSha256`
+    /// 钉扎，不用 allowInsecure。
+    ///
+    /// 旧实现此路径在出站早失败（`... doesn't support UDP`），本用例即其回归门。
+    #[tokio::test]
+    async fn integration_vless_xrv_udp_over_mux() {
+        // 0. TLS1.3 自签证书 + pin
+        let (cert_pem, key_pem) =
+            xray_tls::certificate::generate_self_signed_cert(&["localhost"]).unwrap();
+        let (certs, _) = xray_tls::certificate::entry_certs_and_key(&serde_json::json!({
+            "certificate": cert_pem,
+        }))
+        .unwrap();
+        let pin = xray_tls::pin::generate_cert_hash_hex(certs[0].as_ref());
+        let server_tls = format!(
+            r#"{{"network":"tcp","security":"tls","tlsSettings":{{"minVersion":"1.3","certificates":[{{"certificate":[{:?}],"key":[{:?}]}}]}}}}"#,
+            cert_pem, key_pem
+        );
+
+        // 1. UDP echo server
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            #[allow(clippy::while_let_loop)] // 存量清零批次
+            loop {
+                match echo.recv_from(&mut buf).await {
+                    Ok((n, peer)) => {
+                        let _ = echo.send_to(&buf[..n], peer).await;
+                    },
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 2. 服务端：vless inbound（TLS1.3，client flow=XRV）+ freedom
+        let (server_ports, _si, _so, sh) = start_full_retrying_eaddrinuse(1, |ports| {
+            let server_port = ports[0];
+            let mut server_cfg = BuiltConfig::default();
+            server_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "vless".into(),
+                    data: br#"{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","flow":"xtls-rprx-vision"}],"decryption":"none"}"#.to_vec(),
+                },
+                tag: "vless-in".into(),
+                port: Some(server_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: Some(serde_json::from_str(&server_tls).unwrap()),
+                sniffing_json: None,
+            });
+            server_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "freedom".into(),
+                    data: FREEDOM_ALLOW_ALL_SETTINGS.to_vec(),
+                },
+                tag: "direct".into(),
+                send_through: None,
+                stream_settings_json: None,
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            });
+            server_cfg
+        })
+        .await;
+        let server_port = server_ports[0];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 3. 客户端：socks inbound（udp:true）+ vless outbound（TLS1.3 + pin，
+        //    users[].flow=XRV；**不开**出站级 mux——mux 承载由 flow 驱动）
+        let client_tls = serde_json::json!({
+            "network": "tcp",
+            "security": "tls",
+            "tlsSettings": { "serverName": "localhost", "pinnedPeerCertSha256": pin },
+        });
+        let (cports, _ci, _co, ch) = start_full_retrying_eaddrinuse(1, |ports| {
+            let client_port = ports[0];
+            let mut client_cfg = BuiltConfig::default();
+            client_cfg.inbounds.push(BuiltInbound {
+                entry: BuiltEntry {
+                    kind: "socks".into(),
+                    data: br#"{"auth":"noauth","udp":true}"#.to_vec(),
+                },
+                tag: "socks-in".into(),
+                port: Some(client_port),
+                listen: Some("127.0.0.1".into()),
+                stream_settings_json: None,
+                sniffing_json: None,
+            });
+            client_cfg.outbounds.push(BuiltOutbound {
+                entry: BuiltEntry {
+                    kind: "vless".into(),
+                    data: format!(
+                        r#"{{"vnext":[{{"address":"127.0.0.1","port":{server_port},"users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none","flow":"xtls-rprx-vision"}}]}}]}}"#
+                    )
+                    .into_bytes(),
+                },
+                tag: "proxy".into(),
+                send_through: None,
+                stream_settings_json: Some(client_tls.clone()),
+                proxy_settings_json: None,
+                mux_json: None,
+                target_strategy: None,
+            });
+            client_cfg
+        })
+        .await;
+        let client_port = cports[0];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 4. socks5 → UDP ASSOCIATE
+        let mut tcp =
+            TcpStream::connect(("127.0.0.1", client_port)).await.expect("connect socks control");
+        tcp.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut m = [0u8; 2];
+        tcp.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x00], "NoAuth method selected");
+        tcp.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut assoc = [0u8; 10];
+        tcp.read_exact(&mut assoc).await.unwrap();
+        assert_eq!(assoc[1], 0x00, "UDP ASSOC success");
+        let relay_port = u16::from_be_bytes([assoc[8], assoc[9]]);
+
+        // 5. UDP 数据报 → vless XRV mux 会话 → freedom UDP → echo 回程
+        let client_udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = b"xrv-udp-over-mux-echo";
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v.octets(),
+            _ => unreachable!(),
+        };
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+        pkt.extend_from_slice(&ip);
+        pkt.extend_from_slice(&echo_addr.port().to_be_bytes());
+        pkt.extend_from_slice(payload);
+        client_udp.send_to(&pkt, ("127.0.0.1", relay_port)).await.expect("send udp via socks");
+
+        let mut resp = vec![0u8; 65535];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_udp.recv_from(&mut resp),
+        )
+        .await
+        .expect("timeout waiting for udp echo over vless XRV mux")
+        .expect("recv udp echo");
+        assert!(n >= 10, "socks5 udp header at least 10 bytes, got {n}");
+        assert_eq!(&resp[10..n], &payload[..], "datagram roundtrip over vless XRV mux");
+
+        drop(client_udp);
+        drop(tcp);
+        for h in sh.iter().chain(ch.iter()) {
+            h.abort();
+        }
+        echo_task.abort();
+    }
+
     /// sgdkj 回归：mux 服务端上行投递对两种 UDP 入口一视同仁。
     ///
     /// socks UDP ASSOCIATE 与 dokodemo-door UDP 共用同一条 relay

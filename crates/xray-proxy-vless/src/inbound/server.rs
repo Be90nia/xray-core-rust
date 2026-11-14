@@ -1064,8 +1064,26 @@ where
         .ok_or_else(|| std::io::Error::other("vless decode: missing address for Mux command"))?;
     let dest = Destination::new(address, Port::new(decoded.port.unwrap_or(0)), Network::TCP);
     let stream = tokio::io::join(reader, writer);
-    let (rh, wh) = tokio::io::split(stream);
-    let link = Link::new(new_reader(rh), new_writer(wh));
+    // flow=xtls-rprx-vision 的 Mux 命令同样要过 Vision 层：Go `inbound.go:552-598`
+    // 对 XRV **无条件**套 `NewVisionReader/Writer`（Mux 只是 CanSpliceCopy=3 的臂，
+    // 关的是 splice 而不是 padding）。本仓此前只在 TCP 臂包装 → 客户端按 Go 语义
+    // 发的 vision 块会被 mux 帧解析器当垃圾（`meta_len too large`，bd tkhd6 实测）。
+    // Mux 臂恒不可 splice（Go :565）⇒ 用 no_splice 构造，且**不**接 splice 透传
+    // 指令（保持 bd tgf3v 定稿面不动）。
+    let link = match vision_uuid_bytes(decoded)? {
+        Some(uuid) => {
+            let seed: &[u32] =
+                decoded.user.as_ref().map_or(&[][..], |u| u.account.testseed.as_slice());
+            let stream: Box<dyn VlessStream> =
+                Box::new(VisionConn::new_server_no_splice(stream, uuid).with_padding_seed(seed));
+            let (rh, wh) = tokio::io::split(stream);
+            Link::new(new_reader(rh), new_writer(wh))
+        },
+        None => {
+            let (rh, wh) = tokio::io::split(stream);
+            Link::new(new_reader(rh), new_writer(wh))
+        },
+    };
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
 }

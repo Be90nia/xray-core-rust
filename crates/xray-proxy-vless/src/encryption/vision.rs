@@ -420,22 +420,20 @@ pub fn is_complete_record_slices(slices: &[std::io::IoSlice<'_>]) -> bool {
     header_left == 5
 }
 
-// === XRV -udp443 流控（对齐 Go `proxy/vless/encryption/vision.go` udp443 逻辑）===
-
-/// QUIC initial packet 类型（对齐 Go ` pktTypeUDP443` 常量）。
-///
-/// Go vision.go 对目标端口 443（QUIC/UDP）的流量做特殊处理：
-/// 识别 QUIC Initial 包类型，用于触发或抑制 splice（直接拷贝）。
-/// 仅在 splice 判定时使用，不影响加密层。
-pub const PKT_TYPE_UDP443_INITIAL: u8 = 0;
-pub const PKT_TYPE_UDP443_OTHER: u8 = 1;
-pub const PKT_TYPE_NOT_UDP443: u8 = 2;
+// === udp443 判定 ===
+//
+// Go 侧**没有**「包级 udp443 分类 / 连接级 splice 决策谓词」可接：udp443 是配置期
+// 门（`outbound.go:246-258` `allowUDP443`）+ 服务端协议拒（`inbound.go:556`），
+// splice 决策隐含在 VisionReader/Writer 状态机与 `IsRAWTransportWithoutSecurity`。
+// 等价行为现落点：**配置门**在 [`crate::dispatcher::establish_conn`]（UDP/443 且
+// 未放行 → 拒，随后转 mux 承载）；**splice 准入**在
+// `xray_common::platform::splice::bridge_splice_admission`（DialBridge）。故本模块
+// 只保留配置门所需的最小谓词。
 
 /// 判断 UDP 包是否目标端口 443（QUIC 流量）。
 ///
-/// 对应 Go vision.go 中 `isUDP443` 判定：splice 决策时，如果目标端口
-/// 是 443 且 transport 是 UDP（QUIC），则走 udp443 流控路径而非 TLS
-/// 检测路径。普通 TCP 443（HTTPS over TCP）仍走 TLS 检测。
+/// 对应 Go `outbound.go:246-258` 的配置期门（`allowUDP443`）：目标端口 443 且
+/// transport 是 UDP 才算。普通 TCP 443（HTTPS over TCP）不属此类。
 ///
 /// # 参数
 /// - `port`：目标端口（大端无关，已解析的 u16）
@@ -445,121 +443,12 @@ pub fn is_udp443(port: u16, is_udp: bool) -> bool {
     is_udp && port == 443
 }
 
-/// 分类 UDP 443 包类型（QUIC Initial vs 其他）。
-///
-/// 对应 Go vision.go 中对 udp443 流量的分类逻辑：
-/// - QUIC Initial 包（第一个 UDP 数据包，携带 ClientHello）→ [`PKT_TYPE_UDP443_INITIAL`]
-/// - 其他 udp443 包（后续 QUIC 帧）→ [`PKT_TYPE_UDP443_OTHER`]
-/// - 非 udp443 → [`PKT_TYPE_NOT_UDP443`]
-///
-/// QUIC Initial 包检测：前 2 字节（header form bit + fixed bit + long header）
-/// 首字节高 2 bit = 0b11 表示 Long Header（Initial/0-RTT/Handshake/Retry）。
-/// 更精确的 Initial 判定需查 QUIC version + packet type 字段。
-///
-/// # 参数
-/// - `buf`：UDP 数据包内容
-/// - `port`：目标端口
-/// - `is_udp`：传输层是否 UDP
-#[must_use]
-pub fn classify_udp443_packet(buf: &[u8], port: u16, is_udp: bool) -> u8 {
-    if !is_udp443(port, is_udp) {
-        return PKT_TYPE_NOT_UDP443;
-    }
-    // QUIC Long Header 检测：首字节 bit 7 (header form) = 1, bit 6 (fixed) = 1
-    // Long Header: 0b11xx_xxxx；Initial 包 type = 00（bit 4-3）
-    if !buf.is_empty() {
-        let first = buf[0];
-        if (first & 0b1100_0000) == 0b1100_0000 {
-            // Long Header; Initial packet type bits = 00 (bits 4-3)
-            let pkt_type = (first >> 4) & 0b11;
-            if pkt_type == 0b00 {
-                return PKT_TYPE_UDP443_INITIAL;
-            }
-        }
-    }
-    PKT_TYPE_UDP443_OTHER
-}
-
-/// UDP 443 流控决策：是否允许 splice（直接拷贝）。
-///
-/// 对应 Go vision.go 中 udp443 的 splice 决策：
-/// - 非 udp443 → 由上层 TLS 检测决定（返回 `None`，让调用方继续走 TLS 路径）
-/// - udp443 Initial 包（QUIC 握手）→ **不允许 splice**（需过滤 TLS）
-/// - udp443 后续包 → 允许 splice
-///
-/// 返回 `Some(true)` = 允许 splice，`Some(false)` = 禁止 splice，`None` = 非
-/// udp443，调用方应走 TLS 检测路径。
-#[must_use]
-pub fn udp443_splice_decision(buf: &[u8], port: u16, is_udp: bool) -> Option<bool> {
-    let pkt_type = classify_udp443_packet(buf, port, is_udp);
-    match pkt_type {
-        PKT_TYPE_NOT_UDP443 => None,
-        PKT_TYPE_UDP443_INITIAL => Some(false), // 握手包需过滤，不能 splice
-        PKT_TYPE_UDP443_OTHER => Some(true),
-        _ => None,
-    }
-}
-
-// === CanSpliceCopy 检测（对齐 Go vision.go `CanSpliceCopy`）===
-
-/// Splice 检测结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SpliceDecision {
-    /// 允许 splice（直接拷贝底层流，绕过加密/解密）。
-    Splice,
-    /// 禁止 splice，继续走加密层。
-    NoSplice,
-    /// 需要继续过滤更多包才能判定（返回缓冲区状态给调用方）。
-    Pending,
-}
-
-/// 检测当前状态是否满足 splice 条件。
-///
-/// 对应 Go vision.go `CanSpliceCopy`（实际在 outbound.go 的 splice 决策中调用）。
-///
-/// Splice 条件（全部满足）：
-/// 1. `state.enable_xtls`：已检测到 TLS 1.3 + 合适 cipher
-/// 2. `number_of_packet_to_filter <= 0`：过滤窗口已耗尽（确认是 TLS 流量）
-/// 3. 非 udp443 流量（udp443 有独立决策路径）
-///
-/// # 参数
-/// - `state`：连接级 TrafficState（来自 `xtls_filter_tls` 的累积结果）
-/// - `port`：目标端口
-/// - `is_udp`：传输层是否 UDP
-///
-/// # Returns
-/// - [`SpliceDecision::Splice`]：满足全部条件，可切换到直接拷贝
-/// - [`SpliceDecision::NoSplice`]：明确不满足（enable_xtls=false）
-/// - [`SpliceDecision::Pending`]：过滤窗口未耗尽，需更多包
-///
-/// # Ponytail / 平台限制
-/// 实际的 splice（绕过 TLS 直接拷贝底层 TCP）在 Go 端用 `unsafe.Pointer` 提取
-/// `tls.Conn` 内部的 raw TCP 连接，Rust 端没有等价物。本函数只做决策判定，
-/// 返回 `Splice` 时调用方应切换到 splice copy 路径（实际实现留 TODO）。
-#[must_use]
-pub fn can_splice_copy(state: &TrafficState, port: u16, is_udp: bool) -> SpliceDecision {
-    // udp443 走独立决策路径
-    if is_udp443(port, is_udp) {
-        // udp443 的 splice 决策不依赖 TLS 检测，直接交由 udp443_splice_decision
-        // 但 can_splice_copy 是连接级判定，需要包级决策在调用方逐包执行。
-        // 这里返回 NoSplice，让调用方走 udp443 逐包决策路径。
-        return SpliceDecision::NoSplice;
-    }
-
-    if !state.enable_xtls {
-        return SpliceDecision::NoSplice;
-    }
-
-    if state.number_of_packet_to_filter > 0 {
-        return SpliceDecision::Pending;
-    }
-
-    SpliceDecision::Splice
-}
 // splice copy 实际数据搬运：生产路径已由 `VisionConn` 通过 `raw_tcp_clone`
 // （accept 层 dup / `Connection::raw_tcp_clone`）实装——见 vision_conn.rs::DIRECT
-// 帧切换读通道到 `raw_fallback: Option<TcpStream>`，TLS 半关闭走裸 TCP。
-// 本模块只保留 `can_splice_copy`（决策 + udp443 分流），不重复提供 IO stub。
+// 帧切换读通道到 `raw_fallback: Option<TcpStream>`，TLS 半关闭走裸 TCP；准入判定见
+// `xray_common::platform::splice::bridge_splice_admission`。本模块不重复提供 IO 或
+// 决策 stub（原 `can_splice_copy` / `SpliceDecision` / udp443 包级分类已删——零生产
+// 调用，且 Go 无同名谓词可接）。
 
 #[cfg(test)]
 mod tests {
@@ -843,7 +732,7 @@ mod tests {
         assert!(!is_complete_record_slices(&slices));
     }
 
-    // === XRV -udp443 + CanSpliceCopy 测试 ===
+    // === XRV -udp443 配置门 ===
 
     #[test]
     fn is_udp443_true_for_udp_443() {
@@ -851,95 +740,6 @@ mod tests {
         assert!(!is_udp443(443, false)); // TCP 443 不是 udp443
         assert!(!is_udp443(8443, true)); // 非 443
         assert!(!is_udp443(80, true));
-    }
-
-    #[test]
-    fn classify_udp443_non_udp443() {
-        assert_eq!(classify_udp443_packet(&[0xC0], 80, true), PKT_TYPE_NOT_UDP443);
-        assert_eq!(classify_udp443_packet(&[0xC0], 443, false), PKT_TYPE_NOT_UDP443);
-    }
-
-    #[test]
-    fn classify_udp443_quic_initial() {
-        // QUIC Initial Long Header: 0b11_00_0000 = 0xC0
-        // header form=1, fixed=1, long=1, type=00(Initial)
-        let pkt = [0xC0u8, 0x00, 0x00, 0x00, 0x01]; // version + packet
-        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_INITIAL);
-    }
-
-    #[test]
-    fn classify_udp443_quic_handshake_not_initial() {
-        // QUIC Handshake Long Header: 0b11_10_0000 = 0xE0 (type=10)
-        let pkt = [0xE0u8, 0x00];
-        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_OTHER);
-    }
-
-    #[test]
-    fn classify_udp443_short_header() {
-        // Short Header: 0b01_000000 = 0x40 (header form=0)
-        let pkt = [0x40u8, 0x00];
-        assert_eq!(classify_udp443_packet(&pkt, 443, true), PKT_TYPE_UDP443_OTHER);
-    }
-
-    #[test]
-    fn classify_udp443_empty_buf() {
-        assert_eq!(classify_udp443_packet(&[], 443, true), PKT_TYPE_UDP443_OTHER);
-    }
-
-    #[test]
-    fn udp443_splice_initial_blocks() {
-        let pkt = [0xC0u8];
-        assert_eq!(udp443_splice_decision(&pkt, 443, true), Some(false));
-    }
-
-    #[test]
-    fn udp443_splice_other_allows() {
-        let pkt = [0x40u8]; // short header
-        assert_eq!(udp443_splice_decision(&pkt, 443, true), Some(true));
-    }
-
-    #[test]
-    fn udp443_splice_non_udp443_none() {
-        assert_eq!(udp443_splice_decision(&[0xC0], 443, false), None);
-        assert_eq!(udp443_splice_decision(&[0xC0], 80, true), None);
-    }
-
-    #[test]
-    fn can_splice_no_xtls() {
-        let state = TrafficState::new(vec![0u8; 16]);
-        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::NoSplice);
-    }
-
-    #[test]
-    fn can_splice_pending_when_filtering() {
-        let mut state = TrafficState::new(vec![0u8; 16]);
-        state.enable_xtls = true;
-        state.number_of_packet_to_filter = 3; // 仍在过滤窗口内
-        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::Pending);
-    }
-
-    #[test]
-    fn can_splice_ready_when_xtls_and_filtered() {
-        let mut state = TrafficState::new(vec![0u8; 16]);
-        state.enable_xtls = true;
-        state.number_of_packet_to_filter = 0; // 过滤窗口已耗尽
-        assert_eq!(can_splice_copy(&state, 443, false), SpliceDecision::Splice);
-    }
-
-    #[test]
-    fn can_splice_udp443_returns_no_splice() {
-        let mut state = TrafficState::new(vec![0u8; 16]);
-        state.enable_xtls = true;
-        state.number_of_packet_to_filter = 0;
-        // udp443 走独立路径，can_splice_copy 返回 NoSplice
-        assert_eq!(can_splice_copy(&state, 443, true), SpliceDecision::NoSplice);
-    }
-
-    #[test]
-    fn splice_decision_enum_equality() {
-        assert_eq!(SpliceDecision::Splice, SpliceDecision::Splice);
-        assert_ne!(SpliceDecision::Splice, SpliceDecision::NoSplice);
-        assert_ne!(SpliceDecision::Splice, SpliceDecision::Pending);
     }
 
     #[test]

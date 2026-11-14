@@ -469,23 +469,16 @@ async fn establish_conn(
     target_port: Port,
     handshake_timeout: std::time::Duration,
 ) -> Result<Box<dyn Connection>, String> {
-    let is_udp = command == VlessCommand::Udp;
-    // Go outbound.go:303-306 把 XRV flow 的 UDP 转 mux（v1.mux.cool）——Rust mux
-    // 未实现；且 Go 服务端本就拒 XRV+UDP（inbound.go:556 "doesn't support UDP"）。
-    // 早失败给可诊断错误，而不是静默按 TCP 发。
-    // flow 带 `-udp443` 时 Go 放行 UDP/443（outbound.go:246-258 `allowUDP443`）
-    // 再经 mux 承载：本仓无 mux 客户端，放行也无路可走，但错误文案必须区分
-    // 「Go 会拒」与「本仓缺 mux」，否则用户按 Go 文档改配置仍看不出原因。
-    if is_udp && config.flow == crate::FLOW_XRV {
-        if !config.allow_udp443 && crate::encryption::vision::is_udp443(target_port.value(), is_udp)
-        {
-            return Err("XTLS rejected UDP/443 traffic".to_string());
-        }
-        return Err(format!(
-            "{}{} doesn't support UDP (VLESS mux over UDP is not implemented)",
-            crate::FLOW_XRV,
-            if config.allow_udp443 { "-udp443" } else { "" }
-        ));
+    // Go outbound.go:246-258 + 303-306：XRV 的 UDP 一律转 mux 承载
+    // （命令= Mux、地址固定 `v1.mux.cool`、端口 666）；`-udp443` 只是「放行
+    // UDP/443」的配置门，不是「不走 mux」。UDP/443 的拒绝在请求头之前发生
+    // （Go 同序：拒了就不建 mux）。
+    let udp_via_mux = command == VlessCommand::Udp && config.flow == crate::FLOW_XRV;
+    if udp_via_mux
+        && !config.allow_udp443
+        && crate::encryption::vision::is_udp443(target_port.value(), true)
+    {
+        return Err("XTLS rejected UDP/443 traffic".to_string());
     }
     // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接。Go testpre>0 时
     //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨； worker 与消费者同
@@ -536,6 +529,9 @@ async fn establish_conn(
     // Mux/Rvs 携带固定域名，不写 address/port（`needs_address`）。
     let mut addons = empty_addons();
     addons.flow = config.flow.clone();
+    // mux 承载的 UDP（Go outbound.go:303-306 同一处改写）：命令换 Mux，wire 上
+    // 不写 address/port（解码端补 `v1.mux.cool`），真实目标随 mux 帧走。
+    let command = if udp_via_mux { VlessCommand::Mux } else { command };
     let (address, port) = if command.needs_address() {
         (Some(&target_addr), Some(target_port.value()))
     } else {
@@ -581,7 +577,13 @@ async fn establish_conn(
     // DecodeBodyAddons UDP → LengthPacketReader）。write 边界≈packet 边界，
     // read 剥 2B BE 前缀——inbound `handle_udp_relay` 消费同一 wire 格式。
     // wire 侧同时做 XUDP 帧 ↔ 裸载荷转换（bd t0ls1，目标 = 请求头目标）。
-    if is_udp {
+    //
+    // mux 承载的 UDP **不**经此层：mux 帧线格式与 XUDP 帧逐字节同构
+    // （`[2B len][2B sid][status][opt][?net+addr][2B dataLen][data]`，Go
+    // `common/xudp.PacketWriter` 就是往 mux 会话里写 XUDP 帧），而本层输入的
+    // link 表示正是 XUDP 帧 ⇒ 直接透传（Go 的 PacketWriter/Reader 在此处是恒等
+    // 变换，因为它拿到的 link 是裸载荷）。
+    if command == VlessCommand::Udp {
         conn = Box::new(VlessUdpFramedConn::new(
             conn,
             Destination::udp(target_addr.clone(), target_port),
@@ -802,36 +804,92 @@ mod tests {
         assert_eq!(decode_xudp(&got), vec![p1, p2], "读侧必须交付 XUDP 帧且载荷逐字节一致");
     }
 
-    /// XRV flow + UDP 目的地：mux 未实现 → 早失败（Go outbound.go:303-306 转 mux /
-    /// inbound.go:556 服务端拒——不允许静默按 TCP 发）。
+    /// XRV flow + UDP：转 mux 承载（Go outbound.go:303-306）——请求头命令改
+    /// `Mux`（wire 上不写 addr/port，服务端解码补 `v1.mux.cool`）。
+    ///
+    /// 帧透传面由端到端用例覆盖（`xray-core` `integration_vless_xrv_udp_over_mux`
+    /// + Go 互通台），此处只钉 wire 形态：真实目标（8.8.8.8:53）**不**进请求头。
     #[tokio::test]
-    async fn establish_conn_rejects_xrv_udp() {
-        let uuid = UUID::new();
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
+    async fn make_dial_fn_xrv_udp_encodes_mux_command() {
+        use tokio::net::TcpListener;
+        use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator as _,
+            encoding::server::decode_request_header,
+        };
+
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let validator = MemoryValidator::new();
+        let mut proto_account = ProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        let server = xray_common::testing::spawn("make-dial-fn-xrv-udp-mux", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let decoded =
+                decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
+            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+                .await
+                .unwrap();
+            (
+                decoded.command,
+                decoded.address.map(|a| a.to_string()),
+                decoded.port,
+                decoded.addons.flow,
+            )
+        });
+
         let cfg = Arc::new(
             VlessOutboundConfig::new(
-                uuid,
+                test_uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_flow(crate::FLOW_XRV),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([8, 8, 8, 8]), Port::new(53), Network::UDP);
+        let _conn = dial(&dest).await.expect("XRV+UDP must dial (mux 承载)");
+
+        let (command, address, port, flow) = server.await.unwrap();
+        assert_eq!(command, VlessCommand::Mux, "XRV+UDP 必须发 Mux 命令（Go outbound.go:303-306）");
+        assert_eq!(address.as_deref(), Some("v1.mux.cool"), "Mux 命令的服务端解码地址");
+        assert_eq!(port, None, "Mux 命令 wire 上不写 port（真实目标只随帧走）");
+        assert_eq!(flow, crate::FLOW_XRV);
+    }
+
+    /// UDP/443 且未配 `-udp443`：请求头之前拒（Go outbound.go:253-254）。
+    #[tokio::test]
+    async fn establish_conn_rejects_udp443_without_allow() {
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                UUID::new(),
                 Address::from_ipv4_bytes([127, 0, 0, 1]),
                 Port::new(443),
             )
             .with_flow(crate::FLOW_XRV),
         );
-        let dest =
-            Destination::new(Address::from_ipv4_bytes([8, 8, 8, 8]), Port::new(53), Network::UDP);
         let err = match establish_conn(
             cfg,
             None,
             None,
             VlessCommand::Udp,
-            dest.address().clone(),
-            dest.port(),
+            Address::from_ipv4_bytes([8, 8, 8, 8]),
+            Port::new(443),
             std::time::Duration::from_secs(1),
         )
         .await
         {
             Err(e) => e,
-            Ok(_) => panic!("XRV+UDP must be rejected"),
+            Ok(_) => panic!("UDP/443 without -udp443 must be rejected"),
         };
-        assert!(err.contains("doesn't support UDP"), "got: {err}");
+        assert_eq!(err, "XTLS rejected UDP/443 traffic");
     }
 
     /// 读一个 Vision padding 块：`[uuid(16, 仅首块)][command(1)][content_len(2 BE)]

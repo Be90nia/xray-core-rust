@@ -20,10 +20,11 @@
 //!   - `validator`：`Validator` trait + `MemoryValidator`（UUID 索引）
 //!   - `encoding`：请求/响应头编解码 + `Addons` + 长度前缀包读写
 //!   - `encryption`：XTLS Vision 加密（ml-kem + x25519-dalek + blake3 AEAD + VisionConn splice）
-//! - **trait + stub**（IO 边界）：
-//!   - `inbound`/`outbound`：Handler `Process` 主入口依赖 dispatcher 全链路集成
+//!   - `dispatcher`：出站拨号/请求头/出入站主体（含 XRV 的 UDP→mux 承载）
+//!   - `inbound::server`：入站解码 + fallback + reverse
 //!
-//! 加密层 + encoding 已完整实现（127 tests），inbound/outbound 集成待 dispatcher 接入。
+//! 出站/入站主入口即 `dispatcher::make_dial_fn` 与 `inbound::server::serve_vless`；
+//! 早期「Handler + Processor」骨架（IO trait stub）无生产调用方，已删除。
 
 pub mod account;
 pub mod dispatcher;
@@ -31,7 +32,6 @@ pub mod encoding;
 pub mod encryption;
 pub mod error;
 pub mod inbound;
-pub mod outbound;
 // P2 批次 B 插件化（差异表 §2.2 第 1 行）：L1/L4 面，encoding/encryption/inbound/outbound wire
 // 零改动。
 pub mod plugin;

@@ -9,12 +9,10 @@
 //! - **完整实现**：[`FallbackPolicy`]（`napfb[name][alpn][path]` 三级 map）+
 //!   [`extract_path_from_first_bytes`]（从 first buffer 字节 4 位置提取 path）。
 //!   这两个是纯算法，可独立单元测试。
-//! - **trait stub**：[`InboundProcessor::process`]（依赖 `xray_buf::BufferedReader`
-//!   + `tls.Conn` + `reality.ConnConnectionState` + retry + dispatcher 全链路）。
+//!
+//! 入站主流程的实装在 [`crate::inbound::server`]；本模块只留 fallback 策略。
 
 use std::collections::HashMap;
-
-use crate::error::{Result, VlessError};
 
 /// Fallback 路由策略：`name → alpn → path → FallbackDest` 三级 map。
 ///
@@ -119,39 +117,6 @@ impl FallbackPolicy {
 pub use xray_transport::fallback::extract_path_from_first_bytes;
 
 // ---------------------------------------------------------------------------
-
-/// 入站主流程 trait（占位）。
-///
-/// 实际实现需要：
-/// - 从 `xray_buf::BufferedReader` 预读首字节，判断是否 VLESS 请求
-/// - 解码请求头（[`crate::encoding::server::decode_request_header`]）
-/// - 解码响应头（[`crate::encoding::decode_response_header`]）
-/// - 桥接到 dispatcher
-/// - XRV flow：调用 `proxy.NewVisionWriter`
-/// - 失败时走 [`FallbackPolicy`] 路由
-///
-/// 当前所有实现返回 [`VlessError::NotImplemented`]。
-pub trait InboundProcessor: Send + Sync {
-    fn process(
-        &self,
-        conn: Box<dyn xray_transport::connection::Connection>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
-}
-
-/// 默认 stub 处理器。
-#[derive(Debug, Default)]
-pub struct StubProcessor;
-
-impl InboundProcessor for StubProcessor {
-    fn process(
-        &self,
-        _conn: Box<dyn xray_transport::connection::Connection>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        Box::pin(async {
-            Err(VlessError::NotImplemented("inbound Process requires full transport stack".into()))
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {
