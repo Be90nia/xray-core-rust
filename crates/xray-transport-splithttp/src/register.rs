@@ -720,41 +720,11 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         session_id_table: {
             let raw = get_str("sessionIDTable");
             // 命中预定义名（如 "HEX"）时替换为字面值，未命中按字面处理。
-            // 对应 Go transport_method.go:409-411 conf 层替换。
-            let resolved = match crate::config::lookup_predefined_session_id_table(&raw) {
+            // 对应 Go transport_method.go:420-422 conf 层替换（先替换再校验 roomSize）。
+            match crate::config::lookup_predefined_session_id_table(&raw) {
                 Some(s) => s.to_string(),
                 None => raw,
-            };
-            // 281r：roomSize = len(table)^length 必须 < 2^30，否则 token 空间过小致
-            // entropy 不足被探测区分。
-            //
-            // 已知偏离（bd 1a2yy）：Go `transport_method.go:421-424` 的 roomSize 是
-            // Σ_{k=from..to} table^k（`roomSize` 定义见 :521-529）且拒「太小」
-            // （room < 2<<30），方向与聚合都与此处相反（本节拒「太大」）——现状被
-            // bd 281r 测试钉住，按票面契约保持不动；修正需另票并改该测试的期望。
-            if let Some(len_range) = obj.get("sessionIDLength").and_then(parse_range) {
-                let table_len = resolved.len() as u64;
-                if table_len > 1 && len_range.to > 0 {
-                    let mut room = 1u64;
-                    for _ in 0..len_range.to {
-                        room = room.saturating_mul(table_len);
-                        if room >= (1u64 << 30) {
-                            break;
-                        }
-                    }
-                    if room >= (1u64 << 30) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "splithttpSettings sessionIDTable length {} ^ sessionIDLength.to {} \
-                                 must be < 2^30 (roomSize); reduce length or expand table",
-                                table_len, len_range.to
-                            ),
-                        ));
-                    }
-                }
             }
-            resolved
         },
         session_id_length: obj.get("sessionIDLength").and_then(parse_range),
         no_grpc_header: get_bool("noGRPCHeader"),
@@ -770,9 +740,8 @@ fn parse_splithttp_fields(obj: &serde_json::Map<String, serde_json::Value>) -> i
         xmux: Some(xmux),
         download_settings,
     };
-    // sessionIDTable / sessionIDLength 的 ASCII + from>0 校验在构造点统一执行，与
-    // proto 入口共用（bd 1a2yy：原内联在此处，`from_proto` 旁路）；roomSize 见上方
-    // 内联块（方向待另票修正）。
+    // sessionIDTable / sessionIDLength 的 ASCII + roomSize + from>0 校验在构造点统一
+    // 执行，与 proto 入口共用（bd 1a2yy 收口入口漂移；roomSize 方向见 bd bnt45）。
     crate::config::validate_session_id(&config.session_id_table, config.session_id_length)?;
     Ok(config)
 }
@@ -1194,18 +1163,23 @@ mod tests {
         assert_eq!((r.from, r.to), (500, 500));
     }
     /// sessionIDTable 预定义名（"HEX"）解析后替换为字面值。
+    ///
+    /// 必带 `sessionIDLength`：Go `transport_method.go:420-425` 的 roomSize 校验在
+    /// 只有表没有长度时取零值 `{0,0}` ⇒ Σ = 16^0 = 1 < 2<<30 ⇒ 拒启（Go 同）。
     #[test]
     fn parse_session_id_table_predefined_resolves_to_alphabet() {
-        let v: serde_json::Value = serde_json::from_str(r#"{"sessionIDTable":"HEX"}"#).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"sessionIDTable":"HEX","sessionIDLength":16}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
         assert_eq!(cfg.session_id_table, "0123456789ABCDEF");
     }
 
-    /// sessionIDTable 自定义字符串按字面透传。
+    /// sessionIDTable 自定义字符串按字面透传（9 字符表 + 长度 10 ⇒
+    /// 9^10 = 3486784401 ≥ 2<<30，Go `transport_method.go:422-425` 放行）。
     #[test]
     fn parse_session_id_table_custom_passes_through() {
         let v: serde_json::Value =
-            serde_json::from_str(r#"{"sessionIDTable":"abc123!@#"}"#).unwrap();
+            serde_json::from_str(r#"{"sessionIDTable":"abc123!@#","sessionIDLength":10}"#).unwrap();
         let cfg = parse_splithttp_config(Some(&v)).expect("parse ok");
         assert_eq!(cfg.session_id_table, "abc123!@#");
     }
@@ -1230,19 +1204,31 @@ mod tests {
         assert!(msg.contains("sessionIDTable"), "unexpected msg: {msg}");
     }
 
-    /// 281r：len(table)^length >= 2^30 拒绝配置。
-    /// 1 字符 table × 31 长度：1^31 = 1（合法）。
-    /// 2 字符 table × 31 长度：2^31 = 2G ≥ 2^30（拒绝）。
+    /// bd bnt45：roomSize 判据与 Go 同向。Go `transport_method.go:422-425` 拒
+    /// **Σ_{k=from..to} table^k < 2<<30**（`2<<30` = 2147483648，见 `:424`）
+    /// —— 拒「太小」，上界无限。旧断言方向相反（`len(table)^to = 2^31` 被判非法，
+    /// 常见配置 HEX + 长度 8 被拒启）；期望值由 Go 1.25 直跑 `roomSize`（`:523-533`）
+    /// + `:424` 比较逐例得出。
     #[test]
-    fn parse_session_id_table_room_size_too_small_rejected() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"sessionIDTable":"ab","sessionIDLength":{"from":31,"to":31}}"#,
-        )
-        .unwrap();
-        let r = parse_splithttp_config(Some(&v));
-        assert!(r.is_err(), "2^31 should be rejected");
-        let msg = r.unwrap_err().to_string();
-        assert!(msg.contains("2^30"), "unexpected msg: {msg}");
+    fn parse_session_id_table_room_size_matches_go_direction() {
+        let parse = |json: &str| {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            parse_splithttp_config(Some(&v))
+        };
+        // 旧断言的反例：2^31 == 2<<30，Go 用 `<` 比较 ⇒ 放行（旧实现判非法）。
+        let cfg = parse(r#"{"sessionIDTable":"ab","sessionIDLength":31}"#).expect("2^31 放行");
+        assert_eq!(cfg.session_id_length.unwrap().to, 31);
+        // 2^30 < 2<<30 ⇒ Go 拒「太小」。
+        let err = parse(r#"{"sessionIDTable":"ab","sessionIDLength":30}"#).expect_err("2^30 拒");
+        assert!(err.to_string().contains("too small"), "unexpected msg: {err}");
+        // 票面 bnt45 的拒启样例：HEX 16 字符表 + 长度 8 ⇒ 16^8 = 4.29e9 ≥ 2<<30 ⇒ 放行。
+        let cfg = parse(r#"{"sessionIDTable":"HEX","sessionIDLength":8}"#).expect("HEX+8 放行");
+        assert_eq!(cfg.session_id_length.unwrap().to, 8);
+        // 只有表没有长度 ⇒ Go 零值 {0,0} ⇒ Σ = 1 < 2<<30 ⇒ 拒（Go 同）。
+        let err = parse(r#"{"sessionIDTable":"HEX"}"#).expect_err("配表不配长度必须拒");
+        assert!(err.to_string().contains("too small"), "unexpected msg: {err}");
+        // 空表 ⇒ Go `:420` 的 gate 不成立 ⇒ 不做 roomSize 校验。
+        parse(r#"{"sessionIDLength":{"from":1,"to":2}}"#).expect("空表不校验 roomSize");
     }
     #[test]
     fn parse_session_id_length_valid_range() {

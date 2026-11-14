@@ -67,27 +67,84 @@ pub fn lookup_predefined_session_id_table(name: &str) -> Option<&'static str> {
     PREDEFINED_SESSION_ID_TABLE.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
 }
 
-/// `sessionIDTable` / `sessionIDLength` 校验（镜像 Go `transport_method.go:426-433`
-/// 的 `from > 0` 与 ASCII 两条）。
+/// Go `2<<30`（`infra/conf/transport_method.go:424`）= 2147483648：sessionID 空间下限。
+const GO_SESSION_ID_ROOM_FLOOR: u128 = 2u128 << 30;
+
+/// Go `roomSize`（`infra/conf/transport_method.go:523-533`）与上述下限的比较：
+/// `Σ_{k=from..=to} table_len^k >= 2<<30`。
+///
+/// Go 用 `big.Int` 精确求和（只为防溢出）；此处只需符号 ⇒ 饱和累加 + 够下限即停，
+/// 不必引入大整数。`k < 0` 的项按 Go `big.Int.Exp` 的「负指数返回 1」各贡献 1。
+/// `table_len` 由调用方保证 >= 1（Go 同款 gate：`sessionIDTable != ""`）。
+fn room_size_reaches_floor(table_len: usize, from: i32, to: i32) -> bool {
+    let (from, to) = (i64::from(from), i64::from(to));
+    if from > to {
+        return false; // Go 的 for 不进入 ⇒ Σ = 0
+    }
+    // 每项 >= 1 ⇒ 项数本身就是下界。
+    let terms = (to - from + 1) as u128;
+    let base = table_len as u128;
+    if base == 1 {
+        return terms >= GO_SESSION_ID_ROOM_FLOOR; // 1^k 与负指数项恒 1
+    }
+    if terms >= GO_SESSION_ID_ROOM_FLOOR {
+        return true;
+    }
+    // base >= 2：任一项 k >= 31 即单独越界（2^31 == 下限）。
+    if to >= 31 {
+        return true;
+    }
+    // 余下 to <= 30 ⇒ 非负指数项至多 31 个；负指数项（k < 0）各 1。
+    let mut sum = if from < 0 { (to.min(-1) - from + 1) as u128 } else { 0 };
+    let mut term: u128 = 1;
+    for k in 0..=to {
+        if k > 0 {
+            term = term.saturating_mul(base);
+        }
+        if k >= from {
+            sum = sum.saturating_add(term);
+        }
+    }
+    sum >= GO_SESSION_ID_ROOM_FLOOR
+}
+
+/// `sessionIDTable` / `sessionIDLength` 校验，镜像 Go `transport_method.go:420-433`
+/// 的三条（ASCII / roomSize / `from > 0`）。
 ///
 /// 供两条配置入口共用（JSON 解析与 [`Config::from_proto`]）：原实现内联在 JSON
 /// 解析里，proto 入口据此旁路校验，非 ASCII 表会让 [`Config::generate_session_id`]
 /// 静默退化成空 session id（bd 1a2yy）。
 ///
-/// roomSize 那条（`transport_method.go:421-424`）不在此处：现有 JSON 侧实现方向与
-/// Go 相反（Go 按 Σ table^k 求和、拒「太小」，此处拒「太大」），且已被 bd 281r 的
-/// 测试钉住——保持原状，不以错的规则污染新入口。
+/// roomSize 方向（bd bnt45）：Go `:422-425` 拒 **`Σ_{k=from..to} table^k < 2<<30`**
+/// —— 拒「太小」、上界无限。本仓原实现反着拒「太大」（`len(table)^to >= 2^30`），
+/// 把 `HEX` + `sessionIDLength` 8（16^8 = 4.29e9）这类常见配置拒启。现按 Go 的求和
+/// 式与方向重写；`sessionIDLength` 缺失按 Go 的零值 `{0,0}` 参与（Σ = table^0 = 1
+/// ⇒ 拒，与 Go 一致：配了 `sessionIDTable` 就必须配 `sessionIDLength`）。
 pub(crate) fn validate_session_id(table: &str, length: Option<RangeConfig>) -> std::io::Result<()> {
     // 预定义名先解析成字面字符集（proto 侧 Go conf 已替换；此处幂等）。
     let table = lookup_predefined_session_id_table(table).unwrap_or(table);
+    // ASCII 置于最前：Go 的顺序是 room(:422) → from(:427) → ASCII(:430)，两者皆错时
+    // 只有文案不同，此处优先报更具体的 ASCII。
     if table.as_bytes().iter().any(|b| *b >= 0x80) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "splithttpSettings.sessionIDTable must contain only ASCII characters",
         ));
     }
+    // Go `:420` 整块只在 sessionIDTable 非空时执行（空表 ⇒ sessionIDLength 被忽略，
+    // `GenerateSessionID` 走 UUID）。
+    if !table.is_empty() {
+        let range = length.unwrap_or_default();
+        if !room_size_reaches_floor(table.len(), range.from, range.to) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "splithttpSettings.sessionIDTable or sessionIDLength is too small \
+                 (need sum of table^k, k in [from, to], to reach 2<<30)",
+            ));
+        }
+    }
     let Some(len_range) = length else { return Ok(()) };
-    // Go transport_method.go:417-419：from <= 0 直接拒绝配置。
+    // Go transport_method.go:427-429：from <= 0 直接拒绝配置。
     if len_range.from <= 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1632,6 +1689,42 @@ mod tests {
         }
         assert_eq!(lookup_predefined_session_id_table(""), None);
         assert_eq!(lookup_predefined_session_id_table("nonexistent"), None);
+    }
+
+    /// bd bnt45：`room_size_reaches_floor` 与 Go `roomSize`（`transport_method.go:523-533`）
+    /// 加 `:424` 的 `2<<30` 比较逐例同判。期望列由 Go 1.25 直跑同一表达式得出。
+    #[test]
+    fn room_size_threshold_matches_go_truth_table() {
+        // (table_len, from, to, Σ >= 2<<30)
+        for (table_len, from, to, want) in [
+            (2, 31, 31, true),  // Σ = 2^31 == 下限（Go 用 `<` 比，边界放行）
+            (2, 30, 30, false), // 2^30
+            (2, 1, 31, true),   // Σ = 4294967294
+            (2, 5, 3, false),   // from > to ⇒ Σ = 0
+            (16, 8, 8, true),   // HEX + 长度 8：16^8 = 4294967296（旧实现误拒）
+            (16, 1, 8, true),
+            (16, 0, 0, false), // 无 sessionIDLength（Go 零值）⇒ Σ = 1
+            (16, 16, 16, true),
+            (1, 1, 64, false),  // 1^k 恒 1 ⇒ Σ = 64
+            (2, -5, 2, false),  // 负指数项各 1 ⇒ Σ = 12
+            (2, -5, 40, true),  // 2^40 单项越界
+            (3, 6, 6, false),   // 729
+            (3, 20, 20, true),  // 3486784401
+            (62, 6, 6, true),   // Base62 + 长度 6
+            (9, 9, 9, false),   // 387420489
+            (9, 10, 10, true),  // 3486784401
+            (5, 13, 13, false), // 1220703125
+        ] {
+            assert_eq!(
+                room_size_reaches_floor(table_len, from, to),
+                want,
+                "table_len={table_len} [{from}, {to}]"
+            );
+        }
+        // 极端区间不得让解析卡死：i32 全域项数已达下限（Go 同判真）。
+        assert!(room_size_reaches_floor(2, i32::MIN, i32::MAX));
+        // 1 字符表 + i32 全域：项数 = 2^31 == 下限 ⇒ 放行（Go 同）。
+        assert!(room_size_reaches_floor(1, 0, i32::MAX));
     }
 
     #[test]
