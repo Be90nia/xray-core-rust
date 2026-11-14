@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """CI 互通测试 (跨平台): dist/interop_matrix.py 的 POSIX 移植, 本地脚本零改动.
 
-- suite rust:        Rust client<->Rust server, 6 协议 x 2 轮 = 12 测
+- suite rust:        Rust client<->Rust server, 7 协议 x 2 轮 = 14 测
 - suite go:          Go client -> Rust server (官方 xray-core release 二进制), 默认 12 协议
 - suite rust_to_go:  Rust client -> Go server 反向 (26zn 战役暴露盲区补缺), 默认 12 协议
 - suite extra:       新协议 (splithttp/grpc/reality + hysteria2/anytls/tuic/naive + xdrive),
                      每协议 3 方向 (Rust<->Rust + Go->Rust + Rust->Go) = 3N 测;
                      Go 基线不支持的 proto 自动跳过 cross 方向, 仅 Rust<->Rust 保留.
 
-默认套件 = rust + go + rust_to_go + extra = 12+12+12+24 = 60 测 (Go 全支持口径;
+默认套件 = rust + go + rust_to_go + extra = 14+13+13+24 = 64 测 (Go 全支持口径;
 干跑按满矩阵列清单, 实跑由 runtime 探测门控自动跳过 Go 不支持的方向)
 (local 26.7.28 Go: hysteria2/anytls/tuic/naive 不支持, 实跑自动跳过相应 cross 方向)
 TLS 双向统一 pinnedPeerCertSha256 (bd 5x41: allowInsecure 配置期硬错), 证书由 openssl 现场生成.
@@ -41,7 +41,10 @@ import time
 UUID = 'b831381d-6324-4d53-ad4f-8cda48b30811'
 TPW = 'test-pass-12345'
 SS22_KEY = base64.b64encode(b'0123456789abcdef').decode()  # 16B for 2022-blake3-aes-128-gcm
-PROTOS = ['vmess', 'vless_vision_tls', 'trojan_tls', 'vless_ws', 'ss', 'ss2022']
+# vless_vision_enc（bd hr3el）：ENC(mlkem768) × vision 组合，三套件自动覆盖
+# Rust↔Rust / Go→Rust / Rust→Go 三角；Go 侧需基线 ≥ 26.11（ENC 支持）。
+PROTOS = ['vmess', 'vless_vision_tls', 'trojan_tls', 'vless_ws', 'ss', 'ss2022',
+          'vless_vision_enc']
 # 交叉套件新协议段：与 extra 套件共用 build_x/run_x_one（配置已随 extra 的 cross
 # 方向在 CI 双平台验证）。naive 不加（bd 88vp: Rust 无 naive inbound）。
 CROSS_X_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic']
@@ -64,6 +67,11 @@ EXTRA_PROTOS = ['splithttp', 'grpc', 'reality', 'hysteria2', 'anytls', 'tuic', '
 # VLESS ENC + mux 开启（Go validateXDrive / 本仓 xray-conf lint 同款）。
 XDRIVE_ENC = 'mlkem768x25519plus.native.0rtt.XKbaq1BuzJKKKPxZbwgRpn-gYQbnhrYketgezASCL1I'
 XDRIVE_DEC = 'mlkem768x25519plus.native.600s.UKfUEMDdjlEnycTMBP0a08acky8vRRKSrM1MRnaYk3s'
+# vision × VLESS ENC 组合（bd hr3el）：ENC 密钥对固定 —— X25519 seed 000102..1f /
+# pub 8f40..295f（pub[31]=0x5f<128，过 Go server.go:150 最高位检查），与
+# dist/interop_enc.py 同源；服务端 600s 发票据、客户端 0rtt（首连恒走 1-RTT）。
+VISION_ENC_SEED_B64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8'
+VISION_ENC_PUB_B64 = 'j0DFrbaPJWJK5bIU6nZ6bslNgp09e14a0bpvPiE4KF8'
 BASE_PORT = 18100
 IS_WIN = os.name == 'nt'
 EXE = '.exe' if IS_WIN else ''
@@ -146,6 +154,23 @@ def build(proto, P):
         co = {"protocol": "vless", "settings": {"vnext": [
             {"address": "127.0.0.1", "port": P,
              "users": [{"id": UUID, "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+            "streamSettings": {"network": "tcp", "security": "tls",
+                               "tlsSettings": {"serverName": "localhost", **tls_cli()}}}
+    elif proto == 'vless_vision_enc':
+        # bd tgf3v 修通后新增（bd hr3el 进 CI）：ENC 层在外层 TLS 之下，vision 在
+        # ENC 之上的明文层做 padding/DIRECT；外层必须是 TLS1.3（两侧 validate_flow
+        # 都要求）。备注：DIRECT 只在载荷本身是 TLS 时触发 —— 默认上游
+        # https://www.youtube.com/ 会触发（覆盖 ENC 之上的读写透传），
+        # --upstream local 的 HTTP echo 不触发（只覆盖 ENC+vision 的 padding 解包）。
+        dec = 'mlkem768x25519plus.native.600s.' + VISION_ENC_SEED_B64
+        enc = 'mlkem768x25519plus.native.0rtt.' + VISION_ENC_PUB_B64
+        si = {"port": P, "listen": "127.0.0.1", "protocol": "vless",
+              "settings": {"decryption": dec,
+                           "clients": [{"id": UUID, "flow": "xtls-rprx-vision"}]},
+              "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": tls_srv()}}
+        co = {"protocol": "vless", "settings": {"vnext": [
+            {"address": "127.0.0.1", "port": P,
+             "users": [{"id": UUID, "encryption": enc, "flow": "xtls-rprx-vision"}]}]},
             "streamSettings": {"network": "tcp", "security": "tls",
                                "tlsSettings": {"serverName": "localhost", **tls_cli()}}}
     elif proto == 'vless_ws':
