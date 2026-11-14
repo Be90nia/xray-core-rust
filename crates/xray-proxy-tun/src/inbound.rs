@@ -2931,7 +2931,10 @@ mod tests {
         let src = include_str!("inbound.rs");
         let start = src.find("fn rollback_start").expect("rollback_start 存在");
         let body = &src[start..];
-        let body = &body[..body.find("\n    }\n").expect("rollback_start 函数体有终点")];
+        // 行尾必须与平台无关：Windows runner 的 checkout 是 CRLF（`}\r\n`），
+        // 用 `"\n    }\n"` 会永不匹配而让本测试在 CI 恒红（本地 LF 却是绿的）。
+        let end = body.find("\n    }").expect("rollback_start 函数体有终点");
+        let body = &body[..end];
         let clear =
             body.find("self.leak_filter.lock().take()").expect("回滚必须清 leak_filter（F-01）");
         let close = body.find("device.close()").expect("回滚必须关设备");

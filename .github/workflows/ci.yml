@@ -140,6 +140,14 @@ jobs:
         uses: ./.github/actions/setup-boringssl-asm
       - run: cargo build --workspace --release
       - run: cargo build --workspace
+      # bd yc54c G6：Windows 腿此前「只编译、不执行」—— xdrive local.rs 的
+      # Windows 共享冲突重试路径零 CI 覆盖（仅真机可证）。复用本 job 已就绪的
+      # ASM btls 与已编译产物 ⇒ 增量成本只是测试二进制链接+运行。
+      # 只跑 --lib（单元测试）；integration 用例（drive_live/s3_live/s3_real_backend）
+      # 需真实云凭据与网络，不进 CI。
+      - name: Test xdrive on Windows (shared-folder retry path)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test -p xray-transport-xdrive --lib
       # 常态测试流程：CI 绿后从 artifact 下载对应平台二进制测试（发版需用户同意，
       # 测试阶段不打 tag）；同 commit 功能与 release 资产等价
       - name: Upload xray binary (per-platform)
