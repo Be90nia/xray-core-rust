@@ -1548,27 +1548,29 @@ mod tests {
         assert!(cr.is_err() || sr.is_err(), "server must require client cert");
     }
 
-    #[tokio::test]
-    async fn e2e_non_encipherment_usage_not_presented() {
-        // usage:"issue" 条目被过滤（对齐 Go BuildCertificates）→ 服务端回退自签名
-        // → 客户端（信任 CA 签发的证书）验证失败。对照组见 e2e_custom_ca_replaces_webpki_roots
-        //（默认 usage 的 CA 签发叶子证书会被正常送出并验证通过）。
+    #[test]
+    fn issue_usage_entry_is_config_error() {
+        // bd wr9e6：`usage:"issue"`（Go 按 SNI 现签，`tls/config.go:145-171`）本仓两个
+        // 后端都做不到（rustls resolver 只送静态 encipherment 条目 / btls 单证书），
+        // 故**配置期**即 `Unsupported` 硬错。改前这里断言「issue 条目被过滤 ⇒ 握手失败」
+        // ——那是把「启动成功但每次握手失败」这个 P1 症状钉成期望值，本工单消除的正是它。
         let (ca, ca_key) = make_ca("Filter Root CA");
         let (leaf_pem, leaf_key) = issue_leaf("localhost", &ca, &ca_key);
-        let (_sr, cr) = handshake_pair(
-            serde_json::json!({
+        let err = crate::server_config::build_server_config(
+            "tls",
+            Some(&serde_json::json!({
                 "certificates": [
                     { "certificate": leaf_pem, "key": leaf_key, "usage": "issue" },
                 ]
-            }),
-            serde_json::json!({
-                "disableSystemRoot": true,
-                "certificates": [{"certificate": ca.pem()}]
-            }),
-            "localhost",
+            })),
         )
-        .await;
-        assert!(cr.is_err(), "usage:issue entry must not be presented as server cert");
+        .expect_err("usage:issue entry must be rejected at config time, not at handshake time");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("issue"), "got: {err}");
+        assert!(
+            err.to_string().contains("usage:\"encipherment\""),
+            "error must name the way out: {err}"
+        );
     }
 
     // ===== pwh6: client 侧 TLS 字段族增量行为测试 =====

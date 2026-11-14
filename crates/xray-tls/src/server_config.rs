@@ -199,6 +199,22 @@ impl ResolvesServerCert for SniCertResolver {
     }
 }
 
+/// `certificates[].usage:"issue"`（Go `tls/config.go:145-171` 按 SNI 用 CA 现签）两个
+/// 后端都做不到：rustls resolver 只送静态 `encipherment` 条目，btls 是单证书 context。
+/// 静默丢弃 ⇒ 启动成功但每条握手失败（bd wr9e6），故配置期硬错。两个后端共用同一条
+/// 文案＝漂移防护（本票起因就是只修了一侧）。
+fn issue_usage_unsupported(backend: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "certificates[].usage:\"issue\" (per-SNI dynamic issuance) is not supported by the \
+             {backend} backend: it only serves static certificates, so every handshake would \
+             fail; replace the issue authority with a static certificate + key \
+             (usage:\"encipherment\")"
+        ),
+    )
+}
+
 // ============================================================
 // build_btls_server_context（btls 后端，bd mdpl2）
 // ============================================================
@@ -249,16 +265,7 @@ pub fn build_btls_server_context(
                 EntryUsage::Encipherment => {},
                 // Go `tls/config.go:145-171` + `:205-235` 按 SNI 用 issue 证书现签
                 // （getGetCertificateFunc）；btls 单证书后端无法等价 ⇒ 硬错。
-                // 静默跳过 = 无可用证书 ⇒ 启动成功但每次握手失败（bd wr9e6）。
-                EntryUsage::Issue => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "certificates[].usage:\"issue\" (per-SNI dynamic issuance) is not \
-                         supported by the btls backend: it serves a single static certificate, \
-                         so every handshake would fail; replace the issue authority with a \
-                         static certificate + key (usage:\"encipherment\")",
-                    ));
-                },
+                EntryUsage::Issue => return Err(issue_usage_unsupported("btls")),
             }
             let (certs, key) = entry_certs_and_key(entry)?;
             let Some(key) = key else {
@@ -379,6 +386,9 @@ pub fn build_btls_server_context(
 ///
 /// # 证书来源
 /// - `certificates[].certificateFile + keyFile`：可配置多张（启用 SNI 选择）
+/// - `usage`：`encipherment`（缺省）= 服务端证书；`verify` = mTLS 客户端 CA 池（Rust 扩展）；
+///   `issue`（Go 按 SNI 现签）本后端不支持 ⇒ 配置期 `Unsupported` 硬拒启（静默过滤 ⇒
+///   入站启动成功但每次握手失败，bd wr9e6）
 /// - 顶层 `cert` + `key`：单张内联 PEM（anytls 等用）
 /// - 均缺失：**不自签**（Go 语义：启动成功但每条连接报 `tls: no certificates
 ///   configured`）——构建期只 warn，握手由空 resolver 拒绝。
@@ -818,7 +828,8 @@ fn cert_reload_interval(json: &serde_json::Value) -> std::time::Duration {
 /// 从 `tlsSettings` JSON 解析全部命名证书。
 ///
 /// 返回 `(首轮快照条目, 重读源规格)`——两者一一对应（顺序 = SNI 无命中时的回退序）。
-/// 优先 `certificates[]`（file 或内联，支持多张，仅 `usage:"encipherment"`）；
+/// 优先 `certificates[]`（file 或内联，支持多张，仅 `usage:"encipherment"`；
+/// `usage:"verify"` 归 mTLS CA 池，`usage:"issue"` 硬错）；
 /// 若该数组为空且顶层存在内联 `cert`+`key`，则解析单张（不可热重载）。
 fn build_named_cert_keys(
     json: &serde_json::Value,
@@ -827,10 +838,13 @@ fn build_named_cert_keys(
     let mut specs = Vec::new();
     if let Some(arr) = json.get("certificates").and_then(|v| v.as_array()) {
         for entry in arr {
-            // Go BuildCertificates：仅 ENCIPHERMENT 条目用作服务端证书，
-            // "verify"（mTLS 客户端 CA）/"issue" 条目不参与。
-            if entry_usage(entry) != EntryUsage::Encipherment {
-                continue;
+            // Go BuildCertificates：仅 ENCIPHERMENT 条目用作服务端证书；
+            // "verify" 归 mTLS 客户端 CA 池（见 client_ca_root_store）；
+            // "issue"（Go 按 SNI 现签）本后端做不到 ⇒ 硬错，禁静默过滤（bd wr9e6）。
+            match entry_usage(entry) {
+                EntryUsage::Encipherment => {},
+                EntryUsage::Verify => continue,
+                EntryUsage::Issue => return Err(issue_usage_unsupported("rustls")),
             }
             let flags = cert_entry_flags(entry);
             if !flags.build_chain {
