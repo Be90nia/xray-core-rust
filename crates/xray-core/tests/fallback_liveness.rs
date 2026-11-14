@@ -32,6 +32,13 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// 串行化「探测空闲端口 → 释放 → 再绑定」窗口。
+///
+/// 同二进制内两个用例并行跑时会互相抢同一个探测端口 ⇒ CI 上偶发
+/// `Address already in use (os error 98)`（os error 98），属测试自身竞态而非产品缺陷。
+/// 用 tokio 互斥（跨 await 安全，不触发 clippy::await_holding_lock）串行化整段装配。
+static PORT_WINDOW: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// 回落探针的观测结果。
 struct FallbackProbe {
     /// fallback dest 实收字节（应 = 客户端发去的原始字节）。
@@ -45,6 +52,8 @@ struct FallbackProbe {
 /// `protocol` = `"vless"` | `"trojan"`；`settings_extra` = 各协议自己的 clients 段。
 /// 回落探针 = 「非协议流量（裸 HTTP）→ fallback dest」。
 async fn probe_fallback(protocol: &str, settings_extra: serde_json::Value) -> FallbackProbe {
+    // 端口窗口串行化：见 PORT_WINDOW 注释（守住整个探测→装配→起监听过程）。
+    let _port_window = PORT_WINDOW.lock().await;
     // fallback dest：先 bind 拿到地址（避免 join! 里 bind 与 connect 竞态）。
     let fb_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fallback listener");
     let fb_addr = fb_listener.local_addr().expect("fallback local_addr");
