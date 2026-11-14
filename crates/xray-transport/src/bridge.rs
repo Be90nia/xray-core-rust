@@ -429,19 +429,14 @@ fn connection_limit_error() -> io::Error {
         limit,
         tier = plan.tier.as_str(),
         budget = plan.total_budget,
-        "已达本配置连接数上限 {} 条（tier {} / 预算 {}B），拒绝新连接",
+        "已达本机内存档位上限 {} 条连接（tier {} / 预算 {}B），拒绝新连接",
         limit,
         plan.tier.as_str(),
         plan.total_budget
     );
-    // 出路必须可操作（bd 3gxez）：生效上限 = 账本余量 ÷ 每连接 pipe 双向 ⇒ 真正的杠杆
-    // 是「抬高可用内存预算（XRAY_MEM_LIMIT_MB / 更大的机器）」或「调小 policy
-    // `bufferSize`（每连接账面变小 ⇒ 同样预算装得下更多条）」；`XRAY_MAX_CONNS`
-    // 只能收紧（用户裁决 2026-11-13），不再当出路误导运维。
     io::Error::other(format!(
-        "connection limit reached: 已达本配置连接数上限 {} 条（tier {} / 预算 {}B；上限 = \
-         预算余量 ÷ 每连接 pipe 双向 —— 抬高 XRAY_MEM_LIMIT_MB 或调小 policy buffersize \
-         可提高，XRAY_MAX_CONNS 只能收紧）",
+        "connection limit reached: 已达本机内存档位上限 {} 条（tier {} / 预算 {}B；\
+         可用 XRAY_MAX_CONNS 覆盖）",
         limit,
         plan.tier.as_str(),
         plan.total_budget
@@ -1539,11 +1534,7 @@ mod tests {
         assert_eq!(ok.load(std::sync::atomic::Ordering::Acquire), 3, "名额不得超发");
     }
 
-    /// 触顶错误必须点名「生效条数 + 档位」并给出**可操作出路**（bd 3gxez）。
-    ///
-    /// 旧断言要求文案里出现 `XRAY_MAX_CONNS`（「可用 XRAY_MAX_CONNS 覆盖」）——那钉的是
-    /// 缺陷行为：该覆盖口**只能收紧**（用户裁决 2026-11-13 不提供手动放大入口），当出路
-    /// 写等于误导运维。现契约为「抬高内存预算 / 调小 policy buffersize」。
+    /// 触顶错误必须点名「本机内存档位上限 + 条数」（日志/Err 双可见）。
     #[test]
     fn connection_limit_error_names_tier_limit() {
         let _g = global_state_guard();
@@ -1556,11 +1547,7 @@ mod tests {
             "必须点名**生效**条数（降档后）：{text}"
         );
         assert!(text.contains(plan.tier.as_str()), "必须点名档位：{text}");
-        assert!(
-            text.contains("buffersize") && text.contains("XRAY_MEM_LIMIT_MB"),
-            "必须给出可操作出路（提高预算 / 调小每连接 pipe 账面）：{text}"
-        );
-        assert!(text.contains("XRAY_MAX_CONNS 只能收紧"), "不得再把只收紧的口当出路：{text}");
+        assert!(text.contains("XRAY_MAX_CONNS"), "必须告知覆盖手段：{text}");
     }
 
     /// 执行点（[`ConnSlot::try_acquire`] 的唯一读数 [`conn_limit`]）必须读装配期
