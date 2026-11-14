@@ -95,7 +95,7 @@ impl Handler {
     ///
     /// # Errors
     /// - 命令决策失败：见 [`Self::decide_command`]。
-    /// - flow 不合法：仅允许 `none` / `xtls-rprx-vision`。
+    /// - flow 不合法：仅允许 `none` / `xtls-rprx-vision` / `xtls-rprx-vision-udp443`。
     pub fn build_request(&self) -> Result<RequestParts<'_>> {
         let command = self.decide_command()?;
         let (addr, port) = if command.needs_address() {
@@ -109,11 +109,15 @@ impl Handler {
         };
 
         let mut addons = empty_addons();
-        if self.flow == crate::FLOW_XRV {
+        // `-udp443` 变体上 wire 前截成 XRV（Go proxy/vless/outbound/outbound.go:250
+        // `requestAddons.Flow = requestAddons.Flow[:16]`）；allow_udp443 已在配置面
+        // 归一进 [`crate::dispatcher::VlessOutboundConfig::allow_udp443`]。
+        if self.flow == crate::FLOW_XRV || self.flow == crate::FLOW_XRV_UDP443 {
             addons.flow = crate::FLOW_XRV.to_string();
         } else if self.flow != crate::FLOW_NONE {
             return Err(VlessError::Other(format!(
-                "unsupported flow: {} (only 'none' or 'xtls-rprx-vision')",
+                "unsupported flow: {} (only 'none', 'xtls-rprx-vision' or \
+                 'xtls-rprx-vision-udp443')",
                 self.flow
             )));
         }

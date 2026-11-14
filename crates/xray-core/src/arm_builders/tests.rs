@@ -368,6 +368,41 @@ fn blackhole_outbound_response_bad_json_is_error() {
     );
 }
 
+/// k873k G-4：未知 `response.type` 必须拒启（Go `infra/conf/blackhole.go:36-37`），
+/// 不得静默降级成 `None`（拼错 = 用户以为配了拦截/回包，实际什么都没做）。
+#[test]
+fn blackhole_unknown_response_type_is_error() {
+    let err = crate::outbound::parse_blackhole_response(br#"{"response":{"type":"htp"}}"#)
+        .expect_err("unknown response type must reject the config");
+    assert!(err.contains("blackhole response"), "error must name the bad type: {err}");
+    let err = crate::inbound::parse_blackhole_inbound_response(br#"{"response":{"type":"htp"}}"#)
+        .expect_err("inbound: unknown response type must reject");
+    assert!(err.to_string().contains("blackhole response"), "got: {err}");
+}
+
+/// k873k G-5：`type` 大小写不敏感（Go `:24` `strings.ToLower`），且入站有 `custom` 分支。
+#[test]
+fn blackhole_response_type_case_insensitive_and_custom_on_inbound() {
+    use xray_proxy_blackhole::ResponseConfig;
+    assert_eq!(
+        crate::outbound::parse_blackhole_response(br#"{"response":{"type":"HTTP"}}"#).unwrap(),
+        ResponseConfig::Http403
+    );
+    assert_eq!(
+        crate::inbound::parse_blackhole_inbound_response(br#"{"response":{"type":"Http"}}"#)
+            .unwrap(),
+        ResponseConfig::Http403
+    );
+    // 入站 custom（此前入站无该分支：配了 custom 静默无回包）。
+    assert_eq!(
+        crate::inbound::parse_blackhole_inbound_response(
+            br#"{"response":{"type":"custom","customResponseData":"eHlheQ=="}}"#
+        )
+        .unwrap(),
+        ResponseConfig::Custom(b"xyay".to_vec())
+    );
+}
+
 /// bd 16uis（d）：app kind 无 factory 必须拒启（旧实现 warn+skip，app 静默不生效）。
 #[test]
 fn app_kind_without_factory_is_fatal() {

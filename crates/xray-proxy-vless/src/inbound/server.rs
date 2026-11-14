@@ -22,8 +22,8 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -32,17 +32,16 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::TcpStream,
 };
-use xray_app_dispatcher::{default::SimpleOhm, OutboundHandlerManager};
+use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
-use xray_frame::{deadline::Budget, LogFacade};
+use xray_frame::{LogFacade, deadline::Budget};
 use xray_transport::{link::Link, system_listener::InboundTcpListener};
 
 use crate::{
     encoding::{
-        empty_addons,
+        VERSION, empty_addons,
         server::{decode_request_header, encode_response_header},
-        VERSION,
     },
     encryption::vision_conn::VisionConn,
     validator::Validator,
@@ -1132,12 +1131,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        MemoryAccount,
         encoding::{
-            client::{decode_response_header, encode_request_header},
             VlessCommand,
+            client::{decode_response_header, encode_request_header},
         },
         validator::{MemoryUser, MemoryValidator},
-        MemoryAccount,
     };
 
     /// 构造测试用 validator + 已注册用户的 UUID。
@@ -1601,7 +1600,7 @@ mod tests {
     /// [padding_len(2 BE)][content]` 帧。未包装 → 裸 echo 内容 → fail/超时。
     #[tokio::test]
     async fn vless_inbound_pads_downlink_when_flow_xrv() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
         use crate::encryption::vision::COMMAND_PADDING_CONTINUE;
         let (vless_addr, echo_port, uuid) =
@@ -1677,7 +1676,7 @@ mod tests {
 
         use tokio::{net::UdpSocket, time::timeout};
 
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
 
         // 1. UDP echo
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1752,9 +1751,9 @@ mod tests {
     /// （outbound 与 inbound 双端包装，padding 收发互解）。
     #[tokio::test]
     async fn vless_vision_e2e_client_and_server_roundtrip() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
         let (vless_addr, echo_port, uuid) =
             spawn_vless_proxy_with_echo(true, crate::FLOW_XRV, &[]).await;
 
@@ -1786,9 +1785,9 @@ mod tests {
     /// 无协商）——任意组合下 wire 帧格式不变，双向 echo 都必须照常成功。
     #[tokio::test]
     async fn vless_testseed_combinations_e2e_wire_unchanged() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
 
         const SEED: &[u32] = &[7, 8, 9, 10];
         // (client_seed, server_seed)：同 seed / 仅客户端 / 仅服务端（全无为既有 e2e 覆盖）。
@@ -1827,9 +1826,9 @@ mod tests {
     /// 交付）照常走请求头 + echo；全链路 roundtrip 不受预连接影响。
     #[tokio::test]
     async fn vless_testpre_preconnect_e2e_roundtrip() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
 
         // 多连接 echo（testpre worker 会预拨 + 补货，单 accept 不够）。
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1905,9 +1904,9 @@ mod tests {
     /// 回归：flow 为空时 make_dial_fn 返回裸连接（无 Vision 包装），链路照常。
     #[tokio::test]
     async fn vless_no_flow_e2e_make_dial_fn_roundtrip() {
-        use tokio::time::{timeout, Duration};
+        use tokio::time::{Duration, timeout};
 
-        use crate::dispatcher::{make_dial_fn, VlessOutboundConfig};
+        use crate::dispatcher::{VlessOutboundConfig, make_dial_fn};
         let (vless_addr, echo_port, uuid) = spawn_vless_proxy_with_echo(true, "", &[]).await;
 
         let cfg = Arc::new(VlessOutboundConfig::new(

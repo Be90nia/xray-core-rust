@@ -1052,7 +1052,8 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
     let v: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     // Go infra/conf/vless.go:263-271 扁平形式：顶层 address 非空 → 以顶层
     // id/flow/encryption/level/email 构造 vnext[0]（覆盖显式 vnext 数组）。
-    let v = if v.get("address").and_then(|a| a.as_str()).is_some() {
+    let simplified = v.get("address").and_then(|a| a.as_str()).is_some();
+    let v = if simplified {
         let mut obj = v.as_object().cloned().unwrap_or_default();
         obj.insert(
             "vnext".into(),
@@ -1104,7 +1105,11 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
         .ok_or_else(|| "missing vnext[0].users[0].id".to_string())?;
     let uuid = UUID::from_str(user_id)?;
     // 可选 user 字段：flow / encryption / level / email（对应 Go infra/conf outbound user）。
-    let flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let raw_flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("");
+    // Go infra/conf/vless.go:329-334：白名单仅 "" / XRV / XRV+"-udp443"，其余拒启；
+    // -udp443 上 wire 前截成 XRV（outbound.go:250）并把 allowUDP443 记进配置
+    // （归一化在 `with_flow` 内走同一份 `normalize_outbound_flow`）。
+    xray_proxy_vless::normalize_outbound_flow(raw_flow).map_err(|e| e.to_string())?;
     let encryption = user.get("encryption").and_then(|v| v.as_str()).unwrap_or("none").to_string();
     // Go infra/conf/vless.go:355-360：非空且非 none 的 encryption 解析失败 =
     // 启动硬错（拼错 mlkem 串静默降级明文是机密性回退）。空串/none 走明文
@@ -1124,6 +1129,14 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
         .map(String::from);
+    // Go infra/conf/vless.go:318-322：`reverse` 只在 simplified（扁平）形态可用，
+    // vnext 形态显式拒启（本仓此前两形态都接受 ⇒ Go 拒的配置跑成 Bridge，k873k G-13）。
+    if reverse_tag.is_some() && !simplified {
+        return Err(
+            r#"VLESS users: please use simplified outbound's config style to use "reverse""#
+                .to_string(),
+        );
+    }
     // testseed/testpre（Go infra/conf/vless.go:296-321）：simplified 顶层形式读
     // settings 顶层字段；标准 vnext 形式读 user json。Rust 统一为 user 字段
     // 优先、顶层回退（两分支各自语义等价覆盖）。
@@ -1141,7 +1154,7 @@ pub(crate) fn parse_vless_config(data: &[u8]) -> std::result::Result<VlessOutbou
         Address::Domain(address.to_string()),
         Port::new(u16::try_from(port).map_err(|_| "port out of range")?),
     )
-    .with_flow(flow)
+    .with_flow(raw_flow)
     .with_encryption(encryption.clone())
     .with_encryption_params(enc_params)
     .with_testseed(testseed)
@@ -1280,6 +1293,16 @@ pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig
     // 跑一侧拒，且用户以为噪声生效）。此处拒启。
     if let Some(w) = freedom_noise_removed_warning(&v) {
         return Err(std::io::Error::other(w));
+    }
+    // Go infra/conf/freedom.go:59-62：`ipsBlocked` 已删除并迁移到 `finalRules`，
+    // 配置期只 LogWarning（行为 = 忽略该键，与 Go 一致）；本仓此前完全静默
+    // （k873k G-15：按老文档写 ipsBlocked 毫无提示）。warn 不带取值（可能很长且
+    // 已废弃），只点名键与迁移目标。
+    if v.get("ipsBlocked").is_some_and(|x| !x.is_null()) {
+        tracing::warn!(
+            "freedom: `ipsBlocked` has been removed and migrated to `finalRules`; \
+             please update your config according to the release note"
+        );
     }
     // targetStrategy 非空则优先（Go freedom.go:62-64），否则回退 domainStrategy。
     let strategy_raw = v
@@ -1521,40 +1544,29 @@ pub(crate) fn wrap_dial_with_target_strategy(
 ///
 /// JSON 格式（Go `infra/conf/blackhole.go`）：
 /// - `{}` 或无 `response` → None
-/// - `{ "response": { "type": "none" } }` → None
+/// - `{ "response": { "type": "none" } }` → None（`type` 大小写不敏感，Go `:24` ToLower）
 /// - `{ "response": { "type": "http" } }` → Http403
 /// - `{ "response": { "type": "custom", "customResponseData": "<base64>" } }` → Custom （Go
 ///   :38-42：base64 标准解码，失败即 Build 硬错）
+/// - 未知 `type` → `Err`（Go `:36-37` `unknown blackhole response`，拒启）
+///
+/// 实现单份住在 [`xray_proxy_blackhole::response::response_config_from_json`]
+/// （与入站面、插件面同一份），本函数只做 JSON 解包。
 ///
 /// `pub(crate)`：P3-2 对拍测试（tests_config_parity）跨模块消费，语义零变化。
 ///
 /// # Errors
-/// 坏 JSON → `Err`（旧实现静默返回 `None`：用户以为配了 HTTP 403 回包，实际
-/// `response.type` 变成 none，bd 16uis）。
+/// 坏 JSON / 未知 `response.type` → `Err`（旧实现静默返回 `None`：用户以为配了
+/// HTTP 403 回包，实际 `response.type` 变成 none，bd 16uis / k873k G-4）。
 pub(crate) fn parse_blackhole_response(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_blackhole::ResponseConfig, String> {
-    use base64::Engine as _;
-    use xray_proxy_blackhole::ResponseConfig;
     if data.is_empty() {
-        return Ok(ResponseConfig::None);
+        return Ok(xray_proxy_blackhole::ResponseConfig::None);
     }
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| format!("blackhole outbound settings JSON: {e}"))?;
-    let Some(resp) = v.get("response") else {
-        return Ok(ResponseConfig::None);
-    };
-    match resp.get("type").and_then(|t| t.as_str()) {
-        Some("http") => Ok(ResponseConfig::Http403),
-        Some("custom") => {
-            let raw = resp.get("customResponseData").and_then(|d| d.as_str()).unwrap_or("");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(raw)
-                .map_err(|e| format!("failed to decode custom response data: {e}"))?;
-            Ok(ResponseConfig::Custom(bytes))
-        },
-        _ => Ok(ResponseConfig::None),
-    }
+    xray_proxy_blackhole::response::response_config_from_json(v.get("response"))
 }
 
 /// 解析 socks outbound settings JSON → (server_addr, optional (user, pass)).
@@ -1580,6 +1592,18 @@ pub(crate) fn parse_socks_outbound_config(
         .ok_or_else(|| "missing servers[0].port".to_string())?;
     let server_addr =
         format!("{address}:{}", u16::try_from(port).map_err(|_| "port out of range")?);
+    // Go `infra/conf/socks.go:79-80`：`level`/`email` 落 `ServerEndpoint.User`
+    // （出站 policy 档位 + stats 归属）。本仓 socks 出站不消费（client.rs 的
+    // `SOCKS_HANDSHAKE_TIMEOUT` 仍是 shortcut：policyManager 未接线）⇒ 接受配置
+    // 但 warn 点名（k873k G-10：此前完全静默）。
+    if first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) != 0
+        || first.get("email").and_then(|v| v.as_str()).is_some_and(|e| !e.is_empty())
+    {
+        tracing::warn!(
+            "socks outbound: `level`/`email` accepted but not consumed yet \
+             (Go maps them to ServerEndpoint.User; outbound policy/stats not wired)"
+        );
+    }
     // users[0] 可选
     let auth =
         first.get("users").and_then(|v| v.as_array()).and_then(|arr| arr.first()).and_then(|u| {

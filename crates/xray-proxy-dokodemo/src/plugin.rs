@@ -188,6 +188,16 @@ fn parse_config_section(section: &serde_json::Value) -> Result<Config, PluginErr
     if let Some(m) = settings.get("portMap").and_then(|x| x.as_object()) {
         for (k, v) in m {
             let val = v.as_str().ok_or_else(|| section_err("portMap 值必须是字符串"))?;
+            // Go dokodemo.go:39-43：value 必须过 `net.SplitHostPort`（host 可空、
+            // port 可空但冒号必须在且 port 为数字），否则整配置拒启。core 解析面
+            // （`inbound::parse_dokodemo_settings`）已同规校验，此面此前只插字符串
+            // （k873k G-8：坏 portMap 在插件装配路静默通过，运行期映射到非法目标）。
+            let (_, port_str) = val
+                .rsplit_once(':')
+                .ok_or_else(|| section_err(&format!("invalid portMap: {val} (missing port)")))?;
+            if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+                return Err(section_err(&format!("invalid portMap: {val} (bad port)")));
+            }
             cfg.port_map.insert(k.clone(), val.to_string());
         }
     }
@@ -277,6 +287,24 @@ mod tests {
         assert!(parsed.follow_redirect);
         assert_eq!(parsed.user_level, 2);
         assert_eq!(parsed.port_map.get("5353").map(String::as_str), Some("8.8.8.8:53"));
+    }
+
+    /// k873k G-8：`portMap` 值必须过 `host:port` 校验（Go `dokodemo.go:39-43`
+    /// `net.SplitHostPort` 失败即整配置拒启）；此前插件面只插字符串，坏值静默通过。
+    #[test]
+    fn section_port_map_value_validated() {
+        let bad = json!({"settings": {"portMap": {"80": "bad"}}});
+        let err = parse_config_section(&bad).expect_err("missing port must reject");
+        assert!(err.to_string().contains("portMap"), "实际: {err}");
+        let bad = json!({"settings": {"portMap": {"80": "h:99999"}}});
+        let err = parse_config_section(&bad).expect_err("bad port must reject");
+        assert!(err.to_string().contains("portMap"), "实际: {err}");
+        // Go 允许 host/port 各自为空（`SplitHostPort` 通过），故 ":8080"/"h:" 合法。
+        for ok in [":8080", "h:", "1.2.3.4:80"] {
+            let section = json!({"settings": {"portMap": {"80": ok}}});
+            parse_config_section(&section)
+                .unwrap_or_else(|e| panic!("{ok} 应被接受（Go SplitHostPort 通过）: {e}"));
+        }
     }
 
     #[test]

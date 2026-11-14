@@ -139,11 +139,14 @@ impl Lifecycle for LoopbackLifecycle {
 /// per-plugin 段 → 目标 inbound tag。
 ///
 /// xray JSON 布局：`{"settings": {"inboundTag": "..."}}`（无 `settings` 时退化
-/// 用段本体）。presence 校验与 xray-core `parse_loopback_config` 同规
-/// （src/outbound.rs）；**空 tag 硬拒**对齐 Go `Loopback.init`
-/// （proxy/loopback/loopback.go：`InboundTag == "" → newError`）——插件面是
-/// 新路径，config 边界 fail-fast，不改既有构造面（构造器仍允许空 tag，见
-/// lib.rs 既有单测）。sniffing 不解析，见模块文档。
+/// 用段本体）。`inboundTag` 键必须存在（键缺失 = 段写错，缺的是整段语义）；
+/// **空串在此面硬拒**是 Rust 插件的额外 fail-fast，**不是** Go 校验——
+/// Go `LoopbackConfig.Build`（infra/conf/loopback.go:14-22）只反序列化，
+/// `Loopback.init`（proxy/loopback/loopback.go:56-65）直接赋值 `l.inboundTag`，
+/// 全程无空串校验；空 tag 在 Go 侧只会在运行期回注时找不到入站而失败
+/// （k873k G-9：原注释声称「对齐 Go Loopback.init 的 newError」属引用不存在的证据）。
+/// 生产主路（`xray_core::outbound::parse_loopback_config`）与 Go 一致：不校验空 tag。
+/// sniffing 不解析，见模块文档。
 fn parse_section(section: &serde_json::Value) -> Result<String, PluginError> {
     let settings = section.get("settings").unwrap_or(section);
     let inbound_tag = settings
@@ -152,7 +155,7 @@ fn parse_section(section: &serde_json::Value) -> Result<String, PluginError> {
         .ok_or_else(|| PluginError::Other("loopback: missing settings.inboundTag".into()))?;
     if inbound_tag.is_empty() {
         return Err(PluginError::Other(
-            "loopback: settings.inboundTag is empty (Go Loopback.init rejects empty tag)".into(),
+            "loopback: settings.inboundTag is empty (Rust plugin fail-fast; Go accepts it)".into(),
         ));
     }
     Ok(inbound_tag.to_owned())
@@ -185,9 +188,11 @@ mod tests {
     }
 
     #[test]
-    fn section_empty_inbound_tag_rejected_go_parity() {
+    fn section_empty_inbound_tag_rejected_plugin_fail_fast() {
+        // k873k G-9：Go 不校验空 tag（infra/conf/loopback.go:14-22 只反序列化，
+        // Loopback.init 直接赋值）。插件面保留 fail-fast 属 Rust 超集，不是对齐 Go。
         let section = json!({"settings": {"inboundTag": ""}});
-        let err = parse_section(&section).expect_err("Go Loopback.init rejects empty tag");
+        let err = parse_section(&section).expect_err("plugin rejects empty tag (superset)");
         assert!(err.to_string().contains("empty"), "错误必须标明空 tag: {err}");
     }
 

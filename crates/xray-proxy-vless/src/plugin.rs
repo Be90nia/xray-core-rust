@@ -255,7 +255,8 @@ fn parse_section(section: &serde_json::Value) -> Result<VlessFace, PluginError> 
 /// `reverse.tag` 挂 user 上派生 Bridge 注册表（Go :302-308）。
 fn parse_outbound_config(settings: &serde_json::Value) -> Result<VlessOutboundConfig, PluginError> {
     // 扁平形式归一（xray-core 同款 json! 合成，testseed/testpre 顶层回退随之成立）。
-    let v = if settings.get("address").and_then(|a| a.as_str()).is_some() {
+    let simplified = settings.get("address").and_then(|a| a.as_str()).is_some();
+    let v = if simplified {
         serde_json::json!({
             "vnext": [{
                 "address": settings.get("address"),
@@ -314,7 +315,10 @@ fn parse_outbound_config(settings: &serde_json::Value) -> Result<VlessOutboundCo
     // MemoryAccount::InvalidUuid 之外的展示面纪律）。
     let uuid = UUID::parse(user_id)
         .ok_or_else(|| PluginError::Other("vless outbound users[0].id: invalid UUID".into()))?;
-    let flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Go infra/conf/vless.go:329-334：flow 白名单仅 "" / XRV / XRV+"-udp443"，
+    // 其余拒启（-udp443 由 `with_flow` 归一成 XRV + allow_udp443）。
+    let raw_flow = user.get("flow").and_then(|v| v.as_str()).unwrap_or("");
+    crate::normalize_outbound_flow(raw_flow).map_err(|e| PluginError::Other(e.into()))?;
     let encryption = user.get("encryption").and_then(|v| v.as_str()).unwrap_or("none").to_string();
     // Go infra/conf/vless.go:355-360：非空且非 none 的 encryption 解析失败 = 启动
     // 硬错；空串/none 走明文通过（Rust 缺字段 unwrap_or("none")，较 Go 宽松，
@@ -335,6 +339,13 @@ fn parse_outbound_config(settings: &serde_json::Value) -> Result<VlessOutboundCo
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
         .map(String::from);
+    // Go infra/conf/vless.go:318-322：`reverse` 只在 simplified（顶层 address）形态
+    // 可用，vnext 形态显式拒启（k873k G-13，与 xray-core 解析面同规）。
+    if reverse_tag.is_some() && !simplified {
+        return Err(PluginError::Other(
+            r#"VLESS users: please use simplified outbound's config style to use "reverse""#.into(),
+        ));
+    }
     // testseed/testpre（Go infra/conf/vless.go:296-321）：user 级优先、顶层回退。
     let testseed = user
         .get("testseed")
@@ -353,7 +364,7 @@ fn parse_outbound_config(settings: &serde_json::Value) -> Result<VlessOutboundCo
                 .map_err(|_| PluginError::Other("vless outbound: port out of range".into()))?,
         ),
     )
-    .with_flow(flow)
+    .with_flow(raw_flow)
     .with_encryption(encryption)
     .with_encryption_params(enc_params)
     .with_testseed(testseed)
@@ -435,6 +446,19 @@ fn parse_validator(settings: &serde_json::Value) -> Result<MemoryValidator, Plug
             let mut testseed = user_testseed(c);
             if testseed.len() < 4 {
                 testseed = cfg_testseed.clone();
+            }
+            // Go `infra/conf/vless.go:84-86`：入站 user 带 `encryption` = 硬错（per-user
+            // 加密会让用户以为启用了加密）；`:92-94`：入站 `reverse` 带 `sniffing` = 硬错
+            // （k873k G-12；此前两处都静默忽略/丢弃）。
+            if c.get("encryption").and_then(|x| x.as_str()).is_some_and(|e| !e.is_empty()) {
+                return Err(PluginError::Other(
+                    r#"VLESS users: "encryption" should not be in inbound settings"#.into(),
+                ));
+            }
+            if c.get("reverse").and_then(|r| r.get("sniffing")).is_some_and(|s| !s.is_null()) {
+                return Err(PluginError::Other(
+                    r#"VLESS users: inbound's "reverse" can't have "sniffing""#.into(),
+                ));
             }
             let proto = ProtoAccount {
                 id: id.to_string(),
@@ -863,15 +887,59 @@ mod tests {
 
     #[test]
     fn outbound_reverse_tag_wires_registry() {
-        // Go infra/conf/vless.go:302-308：reverse.tag 挂 user 上 → Bridge 注册表。
+        // Go infra/conf/vless.go:302-308：reverse.tag 挂 user 上 → Bridge 注册表；
+        // reverse 只允许 simplified（顶层 address）形态（`:318-322`）。
         let VlessFace::Outbound(config) = parse_section(&json!({
-            "vnext": [{ "address": "a.com", "port": 443,
-                        "users": [{ "id": UUID_A, "reverse": { "tag": "portal-1" } }] }]
+            "address": "a.com", "port": 443, "id": UUID_A,
+            "reverse": { "tag": "portal-1" }
         }))
         .expect("parse") else {
             panic!("出站段必须解析为 Outbound")
         };
         assert!(config.reverse.is_some(), "reverse.tag → Bridge 注册表接线");
+    }
+
+    #[test]
+    fn outbound_vnext_form_reverse_rejected() {
+        // Go infra/conf/vless.go:318-322：vnext 形态的 reverse 显式拒启（k873k G-13）。
+        let err = parse_err(&json!({
+            "vnext": [{ "address": "a.com", "port": 443,
+                        "users": [{ "id": UUID_A, "reverse": { "tag": "portal-1" } }] }]
+        }));
+        assert!(err.to_string().contains("simplified"), "实际: {err}");
+    }
+
+    #[test]
+    fn outbound_flow_udp443_normalized_and_unknown_rejected() {
+        // Go :331 白名单三值；`-udp443` 上 wire 前截成 XRV（outbound.go:250）。
+        let VlessFace::Outbound(config) = parse_section(&json!({
+            "vnext": [{ "address": "a.com", "port": 443,
+                        "users": [{ "id": UUID_A, "flow": "xtls-rprx-vision-udp443" }] }]
+        }))
+        .expect("parse") else {
+            panic!("出站段必须解析为 Outbound")
+        };
+        assert_eq!(config.flow, FLOW_XRV, "上 wire 的 flow 必须是 XRV");
+        assert!(config.allow_udp443, "-udp443 记进 allow_udp443");
+        let err = parse_err(&json!({
+            "vnext": [{ "address": "a.com", "port": 443,
+                        "users": [{ "id": UUID_A, "flow": "xtls-rprx-direct" }] }]
+        }));
+        assert!(err.to_string().contains("doesn't support"), "实际: {err}");
+    }
+
+    #[test]
+    fn inbound_user_encryption_and_reverse_sniffing_rejected() {
+        // Go infra/conf/vless.go:84-86 / :92-94（k873k G-12）。
+        let err = parse_err(&json!({
+            "clients": [{ "id": UUID_A, "encryption": "none" }], "decryption": "none"
+        }));
+        assert!(err.to_string().contains("should not be in inbound settings"), "实际: {err}");
+        let err = parse_err(&json!({
+            "clients": [{ "id": UUID_A, "reverse": { "tag": "p", "sniffing": { "enabled": true } } }],
+            "decryption": "none"
+        }));
+        assert!(err.to_string().contains("can't have \"sniffing\""), "实际: {err}");
     }
 
     #[test]

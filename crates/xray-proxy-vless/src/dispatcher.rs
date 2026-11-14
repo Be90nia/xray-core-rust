@@ -60,7 +60,13 @@ pub struct VlessOutboundConfig {
     pub stream_settings: Option<StreamSettings>,
     /// Flow 标识（如 `xtls-rprx-vision`）。空串表示无 flow。
     /// 对应 Go `infra/conf` outbound user 的 `flow` 字段。
+    ///
+    /// 配置面写 `xtls-rprx-vision-udp443` 时由 `crate::normalize_outbound_flow`
+    /// 归一成本值（= `xtls-rprx-vision`）并把差异记进 [`Self::allow_udp443`]。
     pub flow: String,
+    /// `flow` 曾带 `-udp443` 后缀（Go `proxy/vless/outbound/outbound.go:246-251`
+    /// `allowUDP443`）：允许 UDP/443 通过（Go 侧随后转 mux 承载）。
+    pub allow_udp443: bool,
     /// 加密方式（默认 `none`，对应 VLESS 无加密；其他值交给 encryption 层）。
     pub encryption: String,
     /// ENC 解析后参数（Go `infra/conf/vless.go:333-370` 出站 encryption 校验结果）。
@@ -97,6 +103,7 @@ impl VlessOutboundConfig {
             server_port,
             stream_settings: None,
             flow: String::new(),
+            allow_udp443: false,
             encryption: "none".to_string(),
             enc_params: None,
             level: 0,
@@ -117,9 +124,24 @@ impl VlessOutboundConfig {
     }
 
     /// 设置 flow（builder 风格）。
+    ///
+    /// 归一化规则单份住在 [`crate::normalize_outbound_flow`]：`xtls-rprx-vision-udp443`
+    /// → 上 wire 的 [`crate::FLOW_XRV`] + `allow_udp443 = true`（Go
+    /// outbound.go:246-251）。白名单外的值本 builder 原样保留（builder 无错误面），
+    /// 由配置解析面拒启。
     #[must_use]
     pub fn with_flow(mut self, flow: impl Into<String>) -> Self {
-        self.flow = flow.into();
+        let flow = flow.into();
+        match crate::normalize_outbound_flow(&flow) {
+            Ok((wire, allow_udp443)) => {
+                self.allow_udp443 = allow_udp443;
+                self.flow = wire.to_string();
+            },
+            Err(_) => {
+                self.allow_udp443 = false;
+                self.flow = flow;
+            },
+        }
         self
     }
 
@@ -451,8 +473,19 @@ async fn establish_conn(
     // Go outbound.go:303-306 把 XRV flow 的 UDP 转 mux（v1.mux.cool）——Rust mux
     // 未实现；且 Go 服务端本就拒 XRV+UDP（inbound.go:556 "doesn't support UDP"）。
     // 早失败给可诊断错误，而不是静默按 TCP 发。
+    // flow 带 `-udp443` 时 Go 放行 UDP/443（outbound.go:246-258 `allowUDP443`）
+    // 再经 mux 承载：本仓无 mux 客户端，放行也无路可走，但错误文案必须区分
+    // 「Go 会拒」与「本仓缺 mux」，否则用户按 Go 文档改配置仍看不出原因。
     if is_udp && config.flow == crate::FLOW_XRV {
-        return Err(format!("{} doesn't support UDP", crate::FLOW_XRV));
+        if !config.allow_udp443 && crate::encryption::vision::is_udp443(target_port.value(), is_udp)
+        {
+            return Err("XTLS rejected UDP/443 traffic".to_string());
+        }
+        return Err(format!(
+            "{}{} doesn't support UDP (VLESS mux over UDP is not implemented)",
+            crate::FLOW_XRV,
+            if config.allow_udp443 { "-udp443" } else { "" }
+        ));
     }
     // 1. 取连接：testpre 池命中（免 TCP 握手）→ 用预连接。Go testpre>0 时
     //    消费端阻塞等池（outbound.go:174-183 `<-h.preConns`），从不自拨； worker 与消费者同
@@ -898,6 +931,66 @@ mod tests {
 
         let flow = server.await.unwrap();
         assert_eq!(flow, "xtls-rprx-vision", "flow must reach server request header");
+    }
+
+    /// k873k G-2：`flow: "xtls-rprx-vision-udp443"` 是 Go 合法配置（`infra/conf/
+    /// vless.go:331`），必须能拨通，且**上 wire 的 flow 被截成 XRV**
+    /// （`proxy/vless/outbound/outbound.go:250` `Flow[:16]`）＋ `allow_udp443` 置位。
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)] // 测试/装配逐字段赋值对齐 Go 表意
+    async fn make_dial_fn_accepts_flow_udp443_and_truncates_on_wire() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        use xray_proto::xray::proxy::vless::Account as ProtoAccount;
+
+        use crate::{
+            MemoryAccount, MemoryUser, MemoryValidator, Validator as _,
+            encoding::server::decode_request_header,
+        };
+
+        let test_uuid = UUID::parse("b831381d-6324-4d53-ad4f-8cda48b30811").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let validator = MemoryValidator::new();
+        let mut proto_account = ProtoAccount::default();
+        proto_account.id = "b831381d-6324-4d53-ad4f-8cda48b30811".to_string();
+        let account = MemoryAccount::from_proto_account(&proto_account).unwrap();
+        validator.add(MemoryUser::new("u", 0, account)).unwrap();
+
+        let server = xray_common::testing::spawn("make-dial-fn-udp443-flow", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let decoded =
+                decode_request_header(false, &mut None, &mut sock, &validator).await.unwrap();
+            crate::encoding::server::encode_response_header(&mut sock, VERSION, &empty_addons())
+                .await
+                .unwrap();
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).await;
+            decoded.addons.flow
+        });
+
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                test_uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(addr.port()),
+            )
+            .with_flow(crate::FLOW_XRV_UDP443),
+        );
+        assert!(cfg.allow_udp443, "-udp443 记进 allow_udp443");
+        assert_eq!(cfg.flow, crate::FLOW_XRV, "配置内存态即归一为 XRV");
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(80));
+        let mut conn = dial(&dest).await.expect("Go 合法 flow 必须能拨通");
+        let _ = conn.write_all(b"x").await;
+
+        assert_eq!(
+            server.await.unwrap(),
+            crate::FLOW_XRV,
+            "wire 上的 flow 必须是截断后的 XRV（Go outbound.go:250）"
+        );
     }
 
     /// flow=XRV 时 make_dial_fn 返回的连接必须已包 VisionConn。线上形态：

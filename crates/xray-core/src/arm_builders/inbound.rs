@@ -29,7 +29,6 @@ use xray_features::inbound::InboundHandler as _;
 use xray_proxy_blackhole::BlackholeInboundHandler;
 use xray_proxy_dns::DnsInbound;
 use xray_proxy_freedom::FreedomInboundHandler;
-use xray_proxy_loopback::LoopbackHandler;
 use xray_proxy_trojan::serve_trojan;
 use xray_proxy_vless::{Validator as VlessValidator, VlessInboundOptions, serve_vless};
 use xray_proxy_vmess::serve_vmess;
@@ -45,15 +44,14 @@ use crate::{
         inbound_udpmask, is_transport_listener_protocol, parse_anytls_tls_acceptor,
         parse_blackhole_inbound_response, parse_dns_inbound_config, parse_dokodemo_settings,
         parse_freedom_inbound_dest, parse_http_config, parse_hysteria_inbound_config,
-        parse_loopback_config, parse_naive_inbound_settings, parse_reality_config,
-        parse_socks_http_configs, parse_socks_server_config, parse_ss_inbound_config,
-        parse_tuic_inbound_config, parse_wireguard_inbound_config, register_hysteria_user_manager,
-        register_ss_user_manager, register_trojan_user_manager, register_vless_user_manager,
-        register_vmess_user_manager, register_wg_user_manager, serve_dns, serve_dokodemo,
-        serve_dokodemo_udp_on, serve_http, serve_mixed, serve_mixed_conn, serve_reality_trojan,
-        serve_reality_vless, serve_ss, serve_unix_listener, spawn_inbound_serve,
-        spawn_transport_listener_inbound, ss_legacy_pipeline, ss_mode_conn_pipeline,
-        transport_conn_addrs,
+        parse_naive_inbound_settings, parse_reality_config, parse_socks_http_configs,
+        parse_socks_server_config, parse_ss_inbound_config, parse_tuic_inbound_config,
+        parse_wireguard_inbound_config, register_hysteria_user_manager, register_ss_user_manager,
+        register_trojan_user_manager, register_vless_user_manager, register_vmess_user_manager,
+        register_wg_user_manager, serve_dns, serve_dokodemo, serve_dokodemo_udp_on, serve_http,
+        serve_mixed, serve_mixed_conn, serve_reality_trojan, serve_reality_vless, serve_ss,
+        serve_unix_listener, spawn_inbound_serve, spawn_transport_listener_inbound,
+        ss_legacy_pipeline, ss_mode_conn_pipeline, ss_udp_listen_allowed, transport_conn_addrs,
     },
     outbound::dns_idle_timeout_for,
 };
@@ -649,7 +647,13 @@ pub(crate) async fn build_shadowsocks_inbound(
     // bd zhjhv：bind + mask 包装在**装配期**完成——地址取 TCP listener 的实际
     // 绑定地址（= 配置 `listen`，Go worker.go:413 `udp.ListenUDP(ctx, w.address,
     // w.port)`），失败即 `?` 拒启（Go udpWorker.Start() 返回 err）。
-    let inbound_udp = bind_ss_udp(&listener, inbound_udpmask(&settings)?).await?;
+    let inbound_udp = if ss_udp_listen_allowed(&ib.entry.data)? {
+        Some(bind_ss_udp(&listener, inbound_udpmask(&settings)?).await?)
+    } else {
+        // `network` 显式排除 udp（Go server.go:81-87 `Server.Network()`）→ 不 bind UDP。
+        tracing::info!(tag = %ib.tag, "shadowsocks inbound: network excludes udp, UDP relay disabled");
+        None
+    };
     tracing::info!(tag = %ib.tag, addr = %addr, "shadowsocks inbound listening");
     Ok(Some(spawn_inbound_serve(&plugin_ctx, ib.tag.clone(), shutdown_token, {
         let plugin_ctx = Arc::clone(&plugin_ctx);
@@ -659,7 +663,7 @@ pub(crate) async fn build_shadowsocks_inbound(
                 ohm,
                 inbound,
                 handshake_timeout_for(&policy, 0),
-                Some(inbound_udp),
+                inbound_udp,
                 plugin_ctx,
             )
             .await
@@ -1018,21 +1022,27 @@ pub(crate) async fn build_dns_inbound(
     })))
 }
 
-// loopback inbound：LoopbackHandler 注册（outbound-only，start/close no-op）
+// loopback 入站臂：**无监听、无 handler**（loopback 是出站件）。
+//
+// Go 侧 loopback 只实现 `proxy.Outbound`（`proxy/loopback/loopback.go`
+// `Process(ctx, link, dialer)`），把它写进 `inbounds[]` 时 `core.AddInboundHandler`
+// 的类型断言失败（`core/xray.go:107-109` "not an InboundHandler" → 启动失败）。
+// Rust 保留该入站臂只为「配置里写了 loopback 入站」不至于炸掉整配置：本臂
+// 只校验 settings 可解析（`inboundTag` 在场，含 sniffing 段一并校验），
+// 不 bind、不注册 handler —— 即**本臂没有任何运行期效果**。
+//
+// 真正的 loopback 能力在出站臂（[`super::outbound::build_loopback_outbound`]，
+// 与 Go 同侧）：那里由 `crate::outbound::parse_loopback_config` 解析
+// `inboundTag` + `sniffing` 并经 `with_sniffing_request` 注入
+// （k873k G-6：重分发嗅探已在出站臂接线；本臂此前 `LoopbackHandler::new(...)`
+// 构造完即 drop，是死构造）。
 pub(crate) async fn build_loopback_inbound(
     ib: &BuiltInbound,
 ) -> std::io::Result<Option<JoinHandle<()>>> {
-    let inbound_tag = parse_loopback_config(&ib.entry.data)?;
-    let _handler = LoopbackHandler::new(
-        &ib.tag,
-        xray_proto::xray::proxy::loopback::Config {
-            inbound_tag,
-            sniffing: None, /* Go tag2；JSON 配置面暂不解析（Go Config.Sniffing 仅 gRPC
-                             * 面使用） */
-        },
-    );
-    tracing::info!(tag = %ib.tag, "loopback inbound registered (outbound-only)");
-    // LoopbackHandler 的 InboundHandler::start 是 no-op，不 spawn task
+    // 复用出站臂的解析（tag + sniffing 同一份），settings 写坏在装配期 fail-visible。
+    crate::outbound::parse_loopback_config(&ib.entry.data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    tracing::info!(tag = %ib.tag, "loopback inbound accepted (outbound-only; no listener)");
     Ok(None)
 }
 

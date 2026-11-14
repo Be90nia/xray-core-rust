@@ -5121,9 +5121,18 @@ pub(crate) fn build_vless_validator(
             if testseed.len() < 4 {
                 testseed = cfg_testseed.clone();
             }
+            // Go `infra/conf/vless.go:84-86`：入站 user 带 `encryption` = 配置硬错
+            // （入站加密是 settings.decryption 的事，per-user encryption 会让用户
+            // 以为启用了加密）。此前硬写 "none" 静默忽略（k873k G-12）。
+            if c.get("encryption").and_then(|x| x.as_str()).is_some_and(|e| !e.is_empty()) {
+                return Err(std::io::Error::other(
+                    r#"VLESS users: "encryption" should not be in inbound settings"#,
+                ));
+            }
             // bd nip4p：`reverse` 此前整块丢弃 → vless 入站永远看不到
-            // user.reverse，portal 侧 100% 失效。Go `infra/conf/vless.go:88-91`：
-            // 配了 reverse 但 tag 空 = 配置硬错（对齐 conf 层拒启）。
+            // user.reverse，portal 侧 100% 失效。Go `infra/conf/vless.go:88-94`：
+            // 配了 reverse 但 tag 空 = 配置硬错（对齐 conf 层拒启）；入站 reverse
+            // 带 `sniffing` 亦硬错（入站侧无嗅探语义，k873k G-12）。
             let reverse = match c.get("reverse") {
                 None | Some(serde_json::Value::Null) => None,
                 Some(r) => {
@@ -5131,6 +5140,11 @@ pub(crate) fn build_vless_validator(
                     if tag.is_empty() {
                         return Err(std::io::Error::other(
                             r#"VLESS users: "tag" can't be empty for "reverse""#,
+                        ));
+                    }
+                    if r.get("sniffing").is_some_and(|s| !s.is_null()) {
+                        return Err(std::io::Error::other(
+                            r#"VLESS users: inbound's "reverse" can't have "sniffing""#,
                         ));
                     }
                     Some(xray_proto::xray::proxy::vless::Reverse {
@@ -5528,6 +5542,27 @@ fn parse_network_list(v: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// SS 入站是否应监听 UDP（对齐 Go `Server.Network()`，`proxy/shadowsocks/server.go:81-87`：
+/// `NetworkList` 为空则兜底 `[TCP]`；UDP 不在列表 → inbound manager 不建 UDP worker）。
+///
+/// 口径：
+/// - `network` **显式在场且不含 `udp`** → `false`（配置说只开 TCP 就不再收 UDP： 此前无条件 bind
+///   UDP，`"network":"tcp"` 的配置在本仓仍开 UDP 口 = 半开放面，k873k G-7）；
+/// - `network` 缺省 → `true`：Go 缺省是 **TCP-only**，本仓存量行为是双栈 bind， 改缺省会关掉既有 SS
+///   UDP relay（生产行为收窄），故**保留**双栈并在此显式登记差异；
+/// - 非法 JSON → `Err`（装配期拒启）。
+pub(crate) fn ss_udp_listen_allowed(data: &[u8]) -> std::io::Result<bool> {
+    if data.is_empty() {
+        return Ok(true);
+    }
+    let v: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
+    let Some(net) = v.get("network") else {
+        return Ok(true);
+    };
+    Ok(parse_network_list(net).iter().any(|n| n == "udp"))
+}
+
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
 /// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
 /// `network` / `allowedNetwork` 可选（两者皆缺默认 `"tcp"`；`network` 优先，
@@ -5643,7 +5678,19 @@ pub(crate) fn build_vmess_validator(
                     id.len()
                 ))
             })?;
-            let account = VmessMemoryAccount::new(uuid);
+            // Go `infra/conf/vmess.go:18-22`：user 的 `security` + `experiments` 都写进
+            // account proto（`tests_enabled`）。入站运行期只消费 `NoTerminationSignal`
+            // （`proxy/vmess/inbound/inbound.go:217`），`security` 是 client-only
+            // （`account.pb.go:30`）；`experiments` 此前整段丢弃 ⇒ 服务端 user 配
+            // NoTerminationSignal 时仍写终止 chunk（k873k G-11）。
+            let experiments = c.get("experiments").and_then(|x| x.as_str()).unwrap_or_default();
+            let account =
+                VmessMemoryAccount::from_proto(&xray_proto::xray::proxy::vmess::Account {
+                    id: uuid.to_string(),
+                    security_settings: None,
+                    tests_enabled: experiments.to_string(),
+                })
+                .map_err(|e| std::io::Error::other(format!("vmess account parse: {e}")))?;
             let user = VmessMemoryUser::new(email, account).with_level(level);
             if let Err(e) = VmessValidator::add(&validator, user) {
                 tracing::warn!(error = %e, "skip vmess user during validator build");
@@ -6211,22 +6258,6 @@ fn parse_dns_upstream(addr: &str) -> Option<(std::net::IpAddr, u16)> {
     Some((sa.ip(), sa.port()))
 }
 
-/// 从 inbound entry.data（JSON）解析 loopback 配置 → inbound_tag。
-///
-/// JSON 格式：`{"inboundTag":"..."}`。
-pub(crate) fn parse_loopback_config(data: &[u8]) -> std::io::Result<String> {
-    let v: serde_json::Value = serde_json::from_slice(data)
-        .map_err(|e| std::io::Error::other(format!("loopback inbound settings JSON: {e}")))?;
-    let inbound_tag = v
-        .get("inboundTag")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "loopback: missing inboundTag")
-        })?
-        .to_string();
-    Ok(inbound_tag)
-}
-
 /// 从 inbound entry.data（JSON）解析 tuic inbound 配置。
 ///
 /// JSON 格式：`{"uuid":"...","password":"...","serverName":"...",
@@ -6427,12 +6458,18 @@ pub(crate) fn parse_tun_inbound_config(data: &[u8]) -> std::io::Result<StackOpti
 
 /// 从 inbound entry.data（JSON）解析 blackhole inbound 响应配置。
 ///
-/// JSON 格式：`{"response":{"type":"none"}}` 或 `{"response":{"type":"http"}}`。
+/// JSON 格式：`{"response":{"type":"none"}}` / `{"response":{"type":"http"}}` /
+/// `{"response":{"type":"custom","customResponseData":"<base64>"}}`。
 /// 缺省时默认 None。
 ///
+/// 与出站面同一份实现（[`xray_proxy_blackhole::response::response_config_from_json`]）：
+/// 入站此前只有 `"http"` 一支且不做大小写归一 ⇒ `custom` 静默无回包、`"HTTP"`
+/// 静默无回包（k873k G-5）。
+///
 /// # Errors
-/// 坏 JSON → `Err`（旧实现 `unwrap_or_default()` 把写坏的配置静默降级成
-/// `response.type = none`，用户以为配了 HTTP 403 回包，bd 16uis）。
+/// 坏 JSON / 未知 `response.type`（Go `infra/conf/blackhole.go:36-37` 拒启）→ `Err`
+/// （旧实现 `unwrap_or_default()` 把写坏的配置静默降级成 `response.type = none`，
+/// 用户以为配了 HTTP 403 回包，bd 16uis / k873k G-4）。
 pub(crate) fn parse_blackhole_inbound_response(
     data: &[u8],
 ) -> std::io::Result<BlackholeResponseConfig> {
@@ -6441,12 +6478,8 @@ pub(crate) fn parse_blackhole_inbound_response(
     }
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("blackhole inbound settings JSON: {e}")))?;
-    let response_type =
-        v.get("response").and_then(|r| r.get("type")).and_then(|t| t.as_str()).unwrap_or("none");
-    Ok(match response_type {
-        "http" => BlackholeResponseConfig::Http403,
-        _ => BlackholeResponseConfig::None,
-    })
+    xray_proxy_blackhole::response::response_config_from_json(v.get("response"))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// 从 inbound entry.data（JSON）解析 freedom inbound 预定义目标地址。
@@ -12397,6 +12430,35 @@ mod tests {
         assert_eq!(VmessValidatorTrait::count(&*validator), 1);
     }
 
+    /// k873k G-11：入站 user 的 `experiments` 必须落进账户（Go
+    /// `infra/conf/vmess.go:18-22` → `tests_enabled`；运行期 `inbound.go:217` 消费
+    /// `NoTerminationSignal`）。validator 只按 auth_id 查（无按 UUID 取值面），
+    /// 故这里验「账户构造语义」+「该用户确实入表」两段。
+    #[test]
+    fn build_vmess_validator_parses_experiments_flags() {
+        let uuid = "66ad4540-b58c-4ad2-9926-ea63445a9b57";
+        // 1) 账户语义：`tests_enabled` → 两个开关（与 Go account.go:54-67 同规）。
+        let account = VmessMemoryAccount::from_proto(&xray_proto::xray::proxy::vmess::Account {
+            id: uuid.to_string(),
+            security_settings: None,
+            tests_enabled: "AuthenticatedLength|NoTerminationSignal".to_string(),
+        })
+        .expect("account");
+        assert!(account.no_termination_signal, "NoTerminationSignal 必须落进账户");
+        assert!(account.authenticated_length_experiment, "AuthenticatedLength 必须落进账户");
+
+        // 2) 接线：带 `experiments` 的入站配置照常入表（此前该键被整段丢弃）。
+        let settings = serde_json::json!({
+            "clients": [{ "id": uuid, "email": "exp@x",
+                          "experiments": "AuthenticatedLength|NoTerminationSignal" }]
+        });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let validator = super::build_vmess_validator(&data).unwrap();
+        use xray_proxy_vmess::Validator as VmessValidatorTrait;
+        assert_eq!(VmessValidatorTrait::count(&*validator), 1);
+        assert!(VmessValidatorTrait::remove(&*validator, "exp@x"), "user 必须入表");
+    }
+
     #[test]
     fn parse_http_config_extracts_accounts() {
         let settings = serde_json::json!({
@@ -12510,6 +12572,20 @@ mod tests {
         assert!(!s.allow_udp);
         assert!(!s.follow_redirect);
         assert!(s.dest.as_ref().unwrap().is_tcp());
+    }
+
+    /// k873k G-7：SS 入站 `network` 显式排除 udp 时不得 bind UDP（Go
+    /// `proxy/shadowsocks/server.go:81-87` `Server.Network()`）；缺省保留双栈（登记差异）。
+    #[test]
+    fn ss_udp_listen_allowed_follows_network() {
+        let allowed = |json: serde_json::Value| {
+            super::ss_udp_listen_allowed(&serde_json::to_vec(&json).unwrap()).unwrap()
+        };
+        assert!(allowed(serde_json::json!({"method": "aes-128-gcm", "password": "p"})));
+        assert!(allowed(serde_json::json!({"network": "tcp,udp"})));
+        assert!(allowed(serde_json::json!({"network": ["udp"]})));
+        assert!(!allowed(serde_json::json!({"network": "tcp"})));
+        assert!(!allowed(serde_json::json!({"network": ["tcp"]})));
     }
 
     #[test]

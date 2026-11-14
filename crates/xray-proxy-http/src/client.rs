@@ -6,18 +6,22 @@
 //! [`DialBridge`]: xray_app_dispatcher::default::DialBridge
 //! [`DialFn`]: xray_app_dispatcher::default::DialFn
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xray_app_dispatcher::default::DialFn;
 use xray_common::net::{address::Address, destination::Destination, port::Port};
-use xray_frame::PluginContext;
+use xray_frame::{LogFacade, PluginContext};
 use xray_transport::{
     connection::Connection,
     dialer::{StreamSettings, dial},
 };
 
 use crate::config::Account;
+
+/// 出站配置解析期诊断门面（坑约束 10：裸 tracing 事件被 L3 闸禁；域 = "http"，
+/// target 钉死 `xray_frame::http` + mask_secrets）。
+static PARSE_LOG: LazyLock<LogFacade> = LazyLock::new(|| LogFacade::new("http", vec![]));
 /// HTTP outbound 配置。
 #[derive(Debug, Clone)]
 pub struct HttpOutboundConfig {
@@ -101,6 +105,19 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
             Some(Account::new(user, pass))
         });
     let mut config = HttpOutboundConfig::new(Address::Domain(address.to_string()), Port::new(port));
+    // Go `infra/conf/http.go:61-62`：`level`/`email` 落 `ServerEndpoint.User`
+    // （出站 policy 档位 + stats 归属）。本仓出站链路不消费这两个字段（policy
+    // 只在入站面 ForLevel；出站握手超时仍取缺省），解析进来也无处可用 ⇒ 接受配置
+    // 但 warn 点名（k873k G-10：此前完全静默，用户以为 level 生效）。
+    if first.get("level").and_then(|v| v.as_u64()).unwrap_or(0) != 0
+        || first.get("email").and_then(|v| v.as_str()).is_some_and(|e| !e.is_empty())
+    {
+        PARSE_LOG.warn(
+            "level/email accepted but not consumed yet (Go maps them to ServerEndpoint.User; \
+             outbound policy/stats not wired)"
+                .to_string(),
+        );
+    }
     if let Some(a) = auth {
         config = config.with_auth(a);
     }

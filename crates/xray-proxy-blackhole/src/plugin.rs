@@ -12,21 +12,18 @@
 //!   fail-visible（tests/plugin_assembly.rs）。
 //!
 //! wire 零改动：响应体构造仍走 `response.rs`（`HTTP_403_RESPONSE` 常量与
-//! [`get_internal_response`] 解析语义原样复用），Http403 字节形态逐字节不变。
+//! `get_internal_response` 解析语义原样复用），Http403 字节形态逐字节不变。
 
 use std::sync::{Arc, OnceLock};
 
-use base64::Engine as _;
 use xray_frame::{
     ClauseId, Lifecycle, Plugin, PluginContract, PluginDep, PluginError, context::PluginContext,
 };
-use xray_proto::xray::proxy::blackhole::Config;
 
 use crate::{
-    BlackholeError,
     dispatcher::BlackholeHandler,
     inbound::BlackholeInboundHandler,
-    response::{ResponseConfig, get_internal_response, proto_response},
+    response::{ResponseConfig, response_config_from_json},
 };
 
 /// 通用条款适用子集（坑约束 1/2/3/5/6/7/8/9/10/11；4 = [`ClauseId::PoolDiscipline`]
@@ -158,33 +155,13 @@ impl Lifecycle for BlackholeLifecycle {
 ///
 /// xray JSON 布局：`{"settings": {"response": {"type": "http",
 /// "customResponseData": "<base64>"}}}`（无 `settings` 时退化用段本体）。
-/// `customResponseData` base64 标准解码对齐 Go conf 层（Go :38-42，解码失败
-/// 硬错）；type 的运行时解析权威仍是 [`get_internal_response`]（精确匹配，
-/// 单份实现不复制）。与 `xray-conf` 的 `parse_blackhole_response` 同规；
-/// conf 层收敛到本解析面属 P2 迁移，此处不回头改 conf。
+/// 语义单份住在 [`response_config_from_json`]（Go `infra/conf/blackhole.go:20-41`：
+/// type 先 ToLower、custom base64 解码失败硬错、未知 type 硬错），与
+/// xray-core 的出站/入站解析面共用同一实现（k873k G-4/G-5：本面此前的复制体
+/// 不做大小写归一，"HTTP" 在此面同样被误判）。
 fn parse_response_section(section: &serde_json::Value) -> Result<ResponseConfig, PluginError> {
     let settings = section.get("settings").unwrap_or(section);
-    let response = settings.get("response");
-    let (ty, data) = match response {
-        None => (String::new(), Vec::new()),
-        Some(resp) => {
-            let ty = resp.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_owned();
-            let data = match resp.get("customResponseData").and_then(|d| d.as_str()) {
-                Some(raw) => {
-                    base64::engine::general_purpose::STANDARD.decode(raw).map_err(|e| {
-                        PluginError::Other(
-                            format!("blackhole customResponseData base64 decode failed: {e}")
-                                .into(),
-                        )
-                    })?
-                },
-                None => Vec::new(),
-            };
-            (ty, data)
-        },
-    };
-    let config = Config { response: Some(proto_response(ty, data)) };
-    get_internal_response(&config).map_err(|e: BlackholeError| PluginError::Other(Box::new(e)))
+    response_config_from_json(settings.get("response")).map_err(|e| PluginError::Other(e.into()))
 }
 
 #[cfg(test)]
@@ -234,8 +211,10 @@ mod tests {
             }
         });
         let err = parse_response_section(&section).expect_err("bad base64 must fail");
+        // 文案与 Go `infra/conf/blackhole.go:33` 一致（「failed to decode custom
+        // response data: …」）——k873k G-4 起解析面收敛到 response.rs 单份实现。
         assert!(
-            err.to_string().contains("base64 decode failed"),
+            err.to_string().contains("failed to decode custom response data"),
             "错误必须标明 base64 解码失败: {err}"
         );
     }

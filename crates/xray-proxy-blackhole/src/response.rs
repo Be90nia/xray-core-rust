@@ -7,6 +7,7 @@
 
 use std::{future::Future, pin::Pin};
 
+use base64::Engine as _;
 use xray_buf::io::{self, Writer};
 use xray_proto::xray::proxy::blackhole::Config;
 
@@ -104,6 +105,36 @@ pub fn get_internal_response(config: &Config) -> Result<ResponseConfig, Blackhol
     }
 }
 
+/// conf 层 `settings.response` JSON → [`ResponseConfig`]（单份实现，三个解析面共用）。
+///
+/// 对齐 Go `infra/conf/blackhole.go:20-41` `BlackholeConfig.Build`：
+/// - `type` **先 `strings.ToLower`**（`:24`），故 `"HTTP"`/`"Custom"` 与 Go 同判；
+/// - `""`/`"none"` → [`ResponseConfig::None`]；`"http"` → [`ResponseConfig::Http403`]；
+/// - `"custom"` → 标准表 base64 解码 `customResponseData`，解码失败即 Err（`:31-35`）；
+/// - 其余 → Err（`:36-37` `unknown blackhole response`）：拼错的 type 必须拒启， 不得静默降级成
+///   none（「以为配了拦截/回包，实际什么都没有」）。
+///
+/// `response` 段缺省 → [`ResponseConfig::None`]（Go `v.Response == nil`）。
+pub fn response_config_from_json(
+    response: Option<&serde_json::Value>,
+) -> Result<ResponseConfig, String> {
+    let Some(resp) = response else {
+        return Ok(ResponseConfig::None);
+    };
+    let ty = resp.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_ascii_lowercase();
+    // Go 只在 custom 分支解码 base64（type=none 时 customResponseData 被忽略，不校验）。
+    let data = if ty == "custom" {
+        let raw = resp.get("customResponseData").and_then(|d| d.as_str()).unwrap_or_default();
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|e| format!("failed to decode custom response data: {e}"))?
+    } else {
+        Vec::new()
+    };
+    get_internal_response(&Config { response: Some(proto_response(ty, data)) })
+        .map_err(|e| e.to_string())
+}
+
 /// 构造 proto `Response` 消息（上层 adapter / 测试便捷函数）。
 #[must_use]
 pub fn proto_response(
@@ -152,6 +183,49 @@ mod tests {
 
     fn cfg_with_type(ty: &str) -> Config {
         Config { response: Some(crate::response::proto_response(ty.to_string(), Vec::new())) }
+    }
+
+    /// Go `infra/conf/blackhole.go:24` `strings.ToLower`：大小写不敏感。
+    #[test]
+    fn conf_json_lowercases_type() {
+        let resp = serde_json::json!({"type": "HTTP"});
+        assert_eq!(response_config_from_json(Some(&resp)).unwrap(), ResponseConfig::Http403);
+        let resp = serde_json::json!({"type": "Custom", "customResponseData": "eHlheQ=="});
+        assert_eq!(
+            response_config_from_json(Some(&resp)).unwrap(),
+            ResponseConfig::Custom(b"xyay".to_vec())
+        );
+        let resp = serde_json::json!({"type": "NONE"});
+        assert_eq!(response_config_from_json(Some(&resp)).unwrap(), ResponseConfig::None);
+    }
+
+    /// Go `:36-37`：未知 type 是 Build 硬错，不得静默降级 None。
+    #[test]
+    fn conf_json_unknown_type_is_err() {
+        let resp = serde_json::json!({"type": "htp"});
+        let err = response_config_from_json(Some(&resp)).expect_err("unknown type must err");
+        assert!(err.contains("htp"), "错误须点名坏值: {err}");
+    }
+
+    /// Go `:38-42`：custom 的 base64 解码失败即硬错；type≠custom 时不校验数据。
+    #[test]
+    fn conf_json_custom_base64_strictness() {
+        let bad = serde_json::json!({"type": "custom", "customResponseData": "!!!"});
+        assert!(response_config_from_json(Some(&bad)).is_err(), "坏 base64 必须硬错");
+        let ignored = serde_json::json!({"type": "none", "customResponseData": "!!!"});
+        assert_eq!(
+            response_config_from_json(Some(&ignored)).unwrap(),
+            ResponseConfig::None,
+            "Go 只在 custom 分支解码，其余分支忽略数据"
+        );
+    }
+
+    /// `response` 段缺省 → None（Go `v.Response == nil`）。
+    #[test]
+    fn conf_json_missing_response_is_none() {
+        assert_eq!(response_config_from_json(None).unwrap(), ResponseConfig::None);
+        let resp = serde_json::json!({});
+        assert_eq!(response_config_from_json(Some(&resp)).unwrap(), ResponseConfig::None);
     }
 
     #[tokio::test]

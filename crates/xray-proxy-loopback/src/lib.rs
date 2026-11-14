@@ -162,21 +162,12 @@ impl Debug for LoopbackHandler {
 }
 
 impl LoopbackHandler {
-    /// 用配置构造 Loopback handler。
+    /// 以 tag + inbound_tag 构造（唯一构造面）。
     ///
-    /// 对应 Go `Loopback.init(config, dispatcher)`——但 dispatcher 在切片2 留空，
-    /// 由 [`Self::with_sink`] 注入。
-    #[must_use]
-    pub fn new(tag: impl Into<String>, config: Config) -> Self {
-        Self {
-            tag: tag.into(),
-            inbound_tag: config.inbound_tag,
-            sniffing: SniffingRequest::default(),
-            sink: None,
-        }
-    }
-
-    /// 直接以 tag + inbound_tag 构造（测试便利）。
+    /// 对应 Go `Loopback.init(config, dispatcher)` 的 tag 半边：dispatcher（本仓
+    /// [`LoopbackSink`]）后置由 [`Self::with_sink`] 注入，sniffing 由
+    /// [`Self::with_sniffing_request`] 注入（`Config.Sniffing` 的 proto→
+    /// `SniffingRequest` 转换权威在 xray-core wiring；本 crate 不持有 proto 解析）。
     #[must_use]
     pub fn with_inbound_tag(tag: impl Into<String>, inbound_tag: impl Into<String>) -> Self {
         Self {
@@ -437,17 +428,12 @@ mod tests {
     }
 
     #[test]
-    fn handler_new_from_config_extracts_inbound_tag() {
-        let h = LoopbackHandler::new("loopback-out", cfg("target-in"));
+    fn handler_with_inbound_tag_constructor() {
+        let h = LoopbackHandler::with_inbound_tag("loopback-out", "target-in");
         assert_eq!(h.tag(), "loopback-out");
         assert_eq!(h.inbound_tag(), "target-in");
         assert!(!h.has_sink());
-    }
-
-    #[test]
-    fn handler_with_inbound_tag_constructor() {
-        let h = LoopbackHandler::with_inbound_tag("lb", "inbound-1");
-        assert_eq!(h.inbound_tag(), "inbound-1");
+        assert!(!h.sniffing.enabled, "无 with_sniffing_request → 零值（不嗅探）");
     }
 
     #[test]

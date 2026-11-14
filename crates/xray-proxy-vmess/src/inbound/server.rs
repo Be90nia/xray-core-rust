@@ -275,7 +275,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
                 .into())
         },
     };
-    let (header, _user) = match decoded {
+    let (header, user) = match decoded {
         Ok(v) => v,
         Err(e) => {
             // Go `server.go::DecodeRequestHeader`：认证失败先 AcknowledgeReceive（已读
@@ -351,7 +351,11 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
             Box::new(PlainSizeParser)
         };
     let global_padding = header.option.has(request_option::GLOBAL_PADDING);
-    let no_termination = header.option.has(request_option::NO_TERMINATION_SIGNAL);
+    // Go `proxy/vmess/inbound/inbound.go:217`：`request.Option.Has(ChunkStream) &&
+    // !account.NoTerminationSignal` —— 客户端 option 位**与**服务端账户开关都要
+    // 放行才写终止 chunk（账户侧来自 config `users[].experiments`，k873k G-11）。
+    let no_termination = header.option.has(request_option::NO_TERMINATION_SIGNAL)
+        || user.account.no_termination_signal;
 
     // 5. 发送响应头（客户端收到后开始 body 流）
     let resp_header = ResponseHeader {

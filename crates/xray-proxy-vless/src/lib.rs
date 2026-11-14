@@ -56,6 +56,31 @@ pub const FLOW_NONE: &str = "none";
 /// XTLS Vision flow 标识。
 pub const FLOW_XRV: &str = "xtls-rprx-vision";
 
+/// `FLOW_XRV` + `-udp443` 后缀：出站白名单第三值（Go `infra/conf/vless.go:331`）。
+///
+/// 它**不上 wire**——Go `proxy/vless/outbound/outbound.go:246-251` 把它截成
+/// [`FLOW_XRV`] 再编码请求头，仅多一个「放行 UDP/443」开关（放行后经 mux 承载）。
+pub const FLOW_XRV_UDP443: &str = "xtls-rprx-vision-udp443";
+
+/// 归一化 VLESS **出站** `flow`：返回 `(上 wire 的 flow, allow_udp443)`。
+///
+/// 对齐 Go 两处语义：
+/// - `infra/conf/vless.go:329-334`：白名单仅 `""` / [`FLOW_XRV`] / [`FLOW_XRV_UDP443`]，其余值
+///   Build 硬错（拒启）；
+/// - `proxy/vless/outbound/outbound.go:246-251`：`-udp443` 分支先置 `allowUDP443 = true`，再把 flow
+///   截成 [`FLOW_XRV`]（`[:16]`）后 fallthrough。
+///
+/// # Errors
+/// 非白名单值 → `Err`（文案对齐 Go `VLESS users: "flow" doesn't support "…"`）。
+pub fn normalize_outbound_flow(flow: &str) -> Result<(&'static str, bool), String> {
+    match flow {
+        "" | FLOW_NONE => Ok(("", false)),
+        FLOW_XRV => Ok((FLOW_XRV, false)),
+        FLOW_XRV_UDP443 => Ok((FLOW_XRV, true)),
+        other => Err(format!(r#"VLESS users: "flow" doesn't support "{other}" in this version"#)),
+    }
+}
+
 /// VLESS 反向代理固定域名（对应 Go `v1.rvs.cool`）。
 pub const RVS_DOMAIN: &str = "v1.rvs.cool";
 
