@@ -34,7 +34,9 @@ jobs:
       matrix:
         # macos-13(Intel) 已被 GitHub 淘汰，公开/私有仓均无 runner 分配，
         # 永久摘除（2026-09-14 实证：公开仓也永远排队）。
-        os: [macos-14, ubuntu-24.04]
+        # macos-14 在本账户解析成 'macos-14-arm64-us-default' 且报不支持（annotation
+        # 实证，2026-11-14；同 mobile.yml 的 iOS 门），换 macos-15。
+        os: [macos-15, ubuntu-24.04]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）
