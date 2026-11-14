@@ -1155,7 +1155,7 @@ mod tests {
         };
 
         let pipe_opt = xray_buf::pipe::PipeOption::default();
-        let (up_r, up_w) = xray_buf::pipe::new_with_option(pipe_opt);
+        let (up_r, mut up_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let (_dn_r, dn_w) = xray_buf::pipe::new_with_option(pipe_opt);
         let link = Link::new(Box::new(up_r) as Box<dyn Reader>, Box::new(dn_w) as Box<dyn Writer>);
         let dest = udp_dest("127.0.0.1", echo_port);
@@ -1165,7 +1165,6 @@ mod tests {
                 relay_policy(&ctx, &dest, link, &[], &policy).await
             });
 
-        let mut client_writer = Box::new(up_w) as Box<dyn Writer>;
         let mut frame = Vec::new();
         {
             let mut pw = PacketWriter::new(&mut frame, udp_dest("127.0.0.1", echo_port), [8; 8]);
@@ -1173,12 +1172,26 @@ mod tests {
         }
         let mut mb = MultiBuffer::new();
         mb.merge_bytes(&frame);
-        client_writer.write_multi_buffer(mb).await.unwrap();
-        drop(client_writer);
+        up_w.write_multi_buffer(mb).await.unwrap();
+        // 上行 EOF：pipe 的 EOF **只由显式 close() 传播**（drop 掉 Writer 不传播
+        // ——`PipeShared` 被读端 Arc 持有，state 仍是 Open）⇒ 必须 close，否则请求
+        // 泵永远等不到 EOF，relay 不会收口（改前该测试 drop 后不 close，500ms 超时
+        // 吞掉结果 ⇒ 挂起也不红，bd w5krw T-11）。
+        up_w.close().unwrap();
 
-        // request pump EOF 后 relay 的 response 侧仍挂在 recv_from（生产由
-        // link.writer 关闭驱动结束）——测试只等 request 侧排空即可
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), relay_task).await;
+        // 会话必须**收口**：请求方向 EOF（上游 close）→ 上行结束信号 →
+        // 响应方向切进 DownlinkOnly 空闲窗（Go `requestDone` 的
+        // `defer timer.SetTimeout(DownlinkOnly)`，freedom.go:418）→ 窗口耗尽响应泵
+        // 返回 → `relay_policy` 的 `resp_task.join()` 返回 ⇒ relay 整体结束。
+        // 收口即证明响应泵（task + UDP socket + 64KiB recv scratch）已随任务 drop
+        // 回收（bd 4zsk5）；改前此处是 500ms 超时吞掉结果（挂起也不红），
+        // 现在断言 relay 在窗口内真实结束（bd w5krw T-11）。
+        let relay_result = tokio::time::timeout(std::time::Duration::from_secs(5), relay_task)
+            .await
+            .expect("relay 未在 DownlinkOnly 空闲窗内收口 = 响应泵未回收");
+        relay_result
+            .expect("relay task join 失败")
+            .expect("relay 必须 Ok 收口（请求方向 EOF → 空闲窗耗尽）");
         let mut buf = [0u8; 64];
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(300), echo.recv_from(&mut buf))

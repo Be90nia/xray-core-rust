@@ -888,6 +888,13 @@ mod tests {
         );
     }
 
+    /// bd w5krw（T-2）：本用例只覆盖**字段通管道**（Go SplitHTTPConfig 30 字段全量
+    /// 对拍），fixture 一律用 **Go 合法值**——旧 fixture 用 `xPaddingMethod="garble"`
+    /// 与 `uplinkDataPlacement="query"`（mode=stream-up），而 Go v26.11.9 对这两值
+    /// **硬错**（`infra/conf/transport_method.go:364-370` `unsupported padding method`；
+    /// `:372-382` `unsupported uplink data placement`；Go probe 实跑同错），旧断言等于
+    /// 把「非法值必须被接受」钉成契约。本仓 conf 层**尚无**该枚举校验（产品缺口 bd
+    /// qbpxv），故此处只钉合法值的解析结果。
     #[test]
     fn parse_splithttp_config_all_fields() {
         // 对齐 Go SplitHTTPConfig 30 字段全量对拍
@@ -895,9 +902,9 @@ mod tests {
             r#"{"host":"h.com","path":"/p","mode":"stream-up",
                "xPaddingBytes":{"from":100,"to":200},
                "xPaddingObfsMode":true,"xPaddingKey":"k","xPaddingHeader":"X",
-               "xPaddingPlacement":"header","xPaddingMethod":"garble",
+               "xPaddingPlacement":"header","xPaddingMethod":"tokenish",
                "uplinkHTTPMethod":"PUT","sessionPlacement":"query","sessionKey":"sid",
-               "seqPlacement":"query","seqKey":"seq","uplinkDataPlacement":"query",
+               "seqPlacement":"query","seqKey":"seq","uplinkDataPlacement":"body",
                "uplinkDataKey":"d","uplinkChunkSize":{"from":1000,"to":2000},
                "scStreamUpServerSecs":{"from":1,"to":2},"serverMaxHeaderBytes":8192,
                "h2Params":{"maxConcurrentStreams":128},
@@ -915,13 +922,13 @@ mod tests {
         assert_eq!(cfg.x_padding_key, "k");
         assert_eq!(cfg.x_padding_header, "X");
         assert_eq!(cfg.x_padding_placement, "header");
-        assert_eq!(cfg.x_padding_method, "garble");
+        assert_eq!(cfg.x_padding_method, "tokenish");
         assert_eq!(cfg.uplink_http_method, "PUT");
         assert_eq!(cfg.session_placement, "query");
         assert_eq!(cfg.session_key, "sid");
         assert_eq!(cfg.seq_placement, "query");
         assert_eq!(cfg.seq_key, "seq");
-        assert_eq!(cfg.uplink_data_placement, "query");
+        assert_eq!(cfg.uplink_data_placement, "body");
         assert_eq!(cfg.uplink_data_key, "d");
         assert_eq!(cfg.uplink_chunk_size.as_ref().unwrap().from, 1000);
         assert_eq!(cfg.sc_stream_up_server_secs.as_ref().unwrap().to, 2);

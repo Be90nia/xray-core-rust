@@ -524,15 +524,30 @@ pub fn budget_report_with(
         ));
     }
     // 满载乘积**过订**：闸是瞬态背压上界（lazy 分配，正常链路远不满），不是每连接
-    // 常驻 ⇒ `max_conns × 2 × gate` 与预算是不同量纲，乘积必然超订。**禁静默**
+    // 常驻 ⇒ `max_conns × 2 × gate` 与预算是不同量纲，乘积必然过订。**禁静默**
     // （bd 2026-11-08 D-01）：登记成 caps 里的诚实上界 + 一条 WARN；**不**拿它反解
     // 并发数（反解会把四档并发砍到 4/4/4/8 条 = 功能回退，PM 打回）。
+    //
+    // bd zbsbc：**闸只封单连接，不封跨连接合计**。字节闸在
+    // `xray_transport::bridge` 的**每连接**桥函数体内构造（`ByteGate::new`，
+    // up/down 各一道 ⇒ 每连接 2 道，跨连接**无聚合闸**）⇒ N 条连接可同时各占
+    // 2×gate，最坏合计 = 本行 `full_load_product`，**不被任何机制兜住**。
+    // 旧文案宣称最坏合计另有机制限制 = 谎报容量边界，运维据此判断会错。
+    // 换算口径（建议、不反解）：要让最坏合计 ≤ 预算需并发 ≤ 预算 ÷ (2×闸)
+    // （四档 4/4/4/8 条）；bd 3gxez 裁决不据此反解（砍并发 = 功能回退），
+    // 故只 WARN + 登记 caps；确需收紧并发用 `XRAY_MAX_CONNS` 显式设置。
     let full_load_product = max_conns * 2 * plan.bridge_gate;
     if full_load_product > budget {
+        // 每连接 2 道方向闸 ⇒ 单连接在途上界 = 2×gate；跨连接无聚合闸。
+        let suggested_conns = budget / (2 * plan.bridge_gate);
         notes.push(format!(
             "满载乘积过订（bd 2026-11-08 D-01，只 WARN）：{max_conns} 条 × 2 方向 × {}B 闸 = \
-             {full_load_product}B，为预算 {budget}B 的 {:.2}× ——闸是**瞬态背压上界**（lazy，正常\
-             链路远不满），最坏情形由闸自身兜；**不**按乘积反解并发（否则并发砍到 4 条）",
+             {full_load_product}B，为预算 {budget}B 的 {:.2}× ——闸只封**单连接**（每连接自带 \
+             2 道方向闸、每方向 ≤ 闸值；单块超闸不阻塞、并发判定只允许少量超闸），\
+             **跨连接无聚合闸** ⇒ N 条连接可同时各占 2×闸，最坏合计（本行数值）\
+             **无任何机制兜住**；换算口径：要让最坏合计 ≤ 预算需并发 ≤ 预算 ÷ (2×闸) = \
+             {suggested_conns} 条，但按 bd 3gxez 裁决**不**据此反解（会砍到 4/4/4/8 = \
+             功能回退），只登记 caps + WARN；确需收紧并发用 `XRAY_MAX_CONNS` 显式设置",
             plan.bridge_gate,
             full_load_product as f64 / budget as f64,
         ));
@@ -600,10 +615,12 @@ pub fn budget_report_with(
         ),
         // D-01（PM 2026-11-08 修正）：满载乘积是**诚实的最坏上界**，不是稳态预算
         // ——闸 lazy 分配、正常链路远不满。登记在 caps（运维判据）+ WARN，禁静默。
+        // bd zbsbc：闸**只封单连接**（每连接 2 道方向闸），跨连接无聚合闸 ⇒ 本行
+        // 数值是「N 条连接各自占满」的合计上界，无任何机制兜住它。
         (
             format!(
                 "worst-case full-load bridge in-flight {full_load_product}B ({max_conns} conns x 2 \
-                 dirs x {}B gate; {:.2}x budget — transient backpressure bound, gate enforces)",
+                 dirs x {}B gate; {:.2}x budget — per-conn gate only, no cross-conn aggregate)",
                 plan.bridge_gate,
                 full_load_product as f64 / budget as f64
             ),
@@ -1022,6 +1039,22 @@ mod tests {
                 report.degraded
             );
         }
+    }
+
+    /// bd zbsbc：过订 WARN 必须陈述**诚实事实**——字节闸只封单连接（每连接 2 道
+    /// 方向闸），**跨连接无聚合闸** ⇒ 乘积上界不被任何机制兜住。旧文案宣称最坏合计
+    /// 另有机制限制 = 谎报容量边界（已改）。此处钉事实片段（不是整句），使旧叙事
+    /// 一旦回归即红。
+    #[test]
+    fn full_load_warn_states_no_cross_connection_aggregate_gate() {
+        let plan = xray_frame::budget::plan::MemoryPlan::from_available(256 * MIB);
+        let report = budget_report_with(&xray_conf::BuiltConfig::default(), plan)
+            .expect("缺省配置必须出报告");
+        let degraded = report.degraded.as_deref().expect("过订必须出 WARN（禁静默）");
+        assert!(
+            degraded.contains("跨连接无聚合闸"),
+            "WARN 必须陈述「跨连接无聚合闸」这一事实（bd zbsbc）：{degraded}"
+        );
     }
 
     /// E2（bd 2026-11-08 D-02）：降档 warn 文案承诺的条数 == 写进执行点的条数。
