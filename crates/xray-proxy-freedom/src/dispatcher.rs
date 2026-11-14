@@ -520,6 +520,65 @@ mod tests {
         w.shutdown();
     }
 
+    /// 行为层：Go 键 `redirect` 改写后，发往未监听目标端口的流量实际到达改写地址。
+    #[tokio::test]
+    async fn dispatcher_e2e_redirect_rewrites_target() {
+        // 改写目标 = 本地 echo server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("dispatcher-e2e-redirect-echo-accept", async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    },
+                }
+            }
+        });
+
+        // Go 配置形态：settings 里的 `redirect` 字符串（infra/conf/freedom.go:23）
+        let ov = crate::config::DestinationOverride::from_settings(&serde_json::json!({
+            "redirect": format!("127.0.0.1:{}", echo_addr.port()),
+        }))
+        .expect("redirect parses")
+        .expect("override set");
+        let config = Config { destination_override: Some(ov), ..Default::default() };
+
+        let ohm = SimpleOhm::new();
+        ohm.set_default(Arc::new(DialBridge::new(
+            "freedom-redirect",
+            make_dial_fn_with_config(config),
+        )));
+        let mut dispatcher = DefaultDispatcher::new();
+        dispatcher.ohm = Some(Arc::new(ohm));
+
+        // 原始目标 = 未监听的 127.0.0.1:1：不改写则拨号必失败
+        let dest =
+            Destination::new(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(1), Network::TCP);
+        let inbound = dispatcher
+            .dispatch(&dest, &SniffingRequest::default(), None, None)
+            .expect("dispatch returns inbound Link");
+
+        let mut w = inbound.writer;
+        let mut r = inbound.reader;
+        let payload = b"redirect rewrote the target";
+        let mut mb = MultiBuffer::new();
+        mb.merge_bytes(payload);
+        w.write_multi_buffer(mb).await.unwrap();
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), r.read_multi_buffer())
+            .await
+            .expect("timeout")
+            .unwrap();
+        assert_eq!(resp.to_vec(), payload, "echo 回包只可能来自 redirect 改写后的地址");
+        w.shutdown();
+    }
+
     /// bd g35 验收 3：UDP dest 经 DefaultDispatcher → FreedomDispatchBridge →
     /// freedom udp relay（XUDP 帧 ↔ UDP 数据报）直发语义回归（b2e）。
     #[tokio::test]

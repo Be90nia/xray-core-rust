@@ -141,9 +141,10 @@ fn socks_parity_inbounds_layout_users_alias() {
 
 #[test]
 fn freedom_parity_strategy_override_and_final_rules() {
+    // `redirect` 是 Go 键（infra/conf/freedom.go:23,166-180）；两路解析必须同构。
     let settings = json!({
         "domainStrategy": "UseIP",
-        "destinationOverride": {"server": {"address": "1.2.3.4", "port": 443}},
+        "redirect": "1.2.3.4:443",
         "userLevel": 1,
         "proxyProtocol": 2,
         "finalRules": [{"action": "allow"}],
@@ -159,6 +160,34 @@ fn freedom_parity_strategy_override_and_final_rules() {
     assert_eq!(built, ["freedom"]);
     // 同型全量对拍（无 fragment/noises 输入 → 两键两侧均 Default）。
     assert_eq!(plugin.built_config().expect("built"), &core);
+    assert_eq!(
+        core.destination_override.and_then(|o| o.server).map(|s| s.port),
+        Some(443),
+        "redirect 接线进 DestinationOverride.Server"
+    );
+}
+
+#[test]
+fn freedom_parity_redirect_wins_over_extension_key() {
+    // 双键并存 → Go 键 redirect 优先（两路同判）。
+    let settings = json!({
+        "redirect": ":8443",
+        "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}},
+    });
+    let core = crate::outbound::parse_freedom_config(&serde_json::to_vec(&settings).unwrap())
+        .expect("core parse");
+    let plugin = Arc::new(FreedomPlugin::default());
+    let built = build_plugins_from_config(
+        &root_with("freedom", settings),
+        &[Arc::clone(&plugin) as Arc<dyn Plugin>],
+    )
+    .expect("plugin build");
+    assert_eq!(built, ["freedom"]);
+    let plugin_cfg = plugin.built_config().expect("built");
+    assert_eq!(plugin_cfg, &core, "双键优先级两路必须同判");
+    let server = core.destination_override.and_then(|o| o.server).expect("override");
+    assert_eq!(server.port, 8443);
+    assert!(server.address.is_none());
 }
 
 #[test]

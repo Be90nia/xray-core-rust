@@ -175,7 +175,9 @@ impl Lifecycle for FreedomLifecycle {
 /// 同规 xray-core `outbound.rs::parse_freedom_config`（权威生产解析），字段
 /// 对齐 Go `infra/conf/freedom.go`：`targetStrategy` 非空优先、否则回退
 /// `domainStrategy`（Go :62-64；11 值全谱含 forceip 族，未知值硬错且错误
-/// 保留原始大小写，Go :65-88）；`finalRules` 单条非法整出站拒启（Go :186-191
+/// 保留原始大小写，Go :65-88）；`redirect`（`"host:port"` 字符串，Go
+/// `:23,166-180`）优先于本仓扩展 `destinationOverride`，非法形态整出站拒启；
+/// `finalRules` 单条非法整出站拒启（Go :186-191
 /// Build 硬错），缺 `finalRules` → 空表不注入 allow（FREEDOM-FINALRULES）。
 /// `fragment`/`noises` 按 freedom crate 自身 `Config` 语义接全（`fragment`
 /// 被 `FreedomHandler` process 消费做 FragmentConnection 包装；xray-core 权威
@@ -191,8 +193,10 @@ fn parse_settings_section(section: &serde_json::Value) -> Result<Config, PluginE
         Some(s) => parse_domain_strategy(s)?,
         None => DomainStrategy::AsIs,
     };
-    let destination_override =
-        settings.get("destinationOverride").and_then(DestinationOverride::from_json);
+    // `redirect`（Go 键，`infra/conf/freedom.go:23,166-180`）优先；本仓扩展
+    // `destinationOverride` 仅在其缺省时兜底。
+    let destination_override = DestinationOverride::from_settings(settings)
+        .map_err(|e| PluginError::Other(e.to_string().into()))?;
     let user_level = settings.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let proxy_protocol = settings.get("proxyProtocol").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
     let final_rules = match settings.get("finalRules").and_then(|r| r.as_array()) {
@@ -265,16 +269,28 @@ mod tests {
             "domainStrategy": "UseIP",
             "userLevel": 2,
             "proxyProtocol": 2,
-            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}},
+            "redirect": "9.9.9.9:1080",
             "finalRules": [{"action": "allow"}]
         }});
         let parsed = parse_settings_section(&section).expect("valid settings");
         assert_eq!(parsed.domain_strategy, DomainStrategy::UseIP as i32);
         assert_eq!(parsed.user_level, 2);
         assert_eq!(parsed.proxy_protocol, 2);
-        assert!(parsed.destination_override.is_some());
+        assert_eq!(
+            parsed.destination_override.and_then(|o| o.server).map(|s| s.port),
+            Some(1080),
+            "Go redirect 键接线"
+        );
         assert_eq!(parsed.final_rules.len(), 1);
         assert_eq!(parsed.final_rules[0].action, crate::config::RuleAction::Allow);
+    }
+
+    /// 非法 `redirect` → 整出站拒启（Go `FreedomConfig.Build` 语义）。
+    #[test]
+    fn section_invalid_redirect_rejects() {
+        let section = json!({"settings": {"redirect": "1.2.3.4"}});
+        let err = parse_settings_section(&section).expect_err("缺端口必须拒启");
+        assert!(err.to_string().contains("invalid redirect"), "got: {err}");
     }
 
     #[test]

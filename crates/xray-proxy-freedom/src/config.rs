@@ -9,6 +9,8 @@
 //!
 //! - **DomainStrategy**：DNS 解析策略（AS_IS / USE_IP / USE_IP4 / USE_IP6 / USE_IP46 / USE_IP64）
 //! - **DestinationOverride**：强制覆盖目标地址（用于透明代理重定向）
+//!   - 配置键 `redirect`：Go 键，`"host:port"` 字符串（`infra/conf/freedom.go:23`）
+//!   - 兼容键 `destinationOverride`：本仓扩展，Go 不认，仅 `redirect` 缺省时生效
 //! - **Fragment**：TCP 分片（绕过 SNI 审查）
 //! - **Noise**：填充噪声（绕过流量分析）
 //! - **FinalRules**：最终规则（Allow/Block 匹配 network + port + IP 规则：CIDR / `geoip:` / `ext:`
@@ -214,10 +216,12 @@ pub struct DestinationOverride {
 }
 
 impl DestinationOverride {
-    /// 从 freedom settings JSON 解析（Go `infra/conf/freedom.go` DestinationOverride）。
+    /// 从 `destinationOverride` 键解析（**非 Go 键**，本仓兼容扩展）。
     ///
     /// 形态：`{"server": {"address": "1.2.3.4" | "example.com", "port": 443}}`。
-    /// 无 `server` 键返回 `None`。
+    /// 无 `server` 键返回 `None`。键名取自 proto 字段 `destination_override`；
+    /// Go 的 JSON 配置层只有 `redirect` 字符串（`infra/conf/freedom.go:23`），
+    /// 不认此键——Go 用户的配置必须走 [`Self::from_redirect`]。
     pub fn from_json(v: &serde_json::Value) -> Option<Self> {
         let server = v.get("server")?;
         let address = server.get("address").and_then(|a| a.as_str()).map(|s| {
@@ -234,6 +238,89 @@ impl DestinationOverride {
             }),
         })
     }
+
+    /// Go `redirect` 键（`infra/conf/freedom.go:166-180`）：`"host:port"` 字符串。
+    ///
+    /// 语义 = Go `net.SplitHostPort` + `xnet.PortFromString`：host 非空则改写地址
+    /// （IP 或域名），port 恒改写；host 空（`":443"`）只改写端口。任一解析失败
+    /// Go 在 `Build` 期拒启（`invalid redirect address/port`），此处同形报错。
+    ///
+    /// # Errors
+    /// 缺端口 / 裸 IPv6（多冒号）/ 缺 `]` / 非十进制端口 / 端口 > 65535。
+    pub fn from_redirect(redirect: &str) -> Result<Self> {
+        let (host, port_str) = split_host_port(redirect)
+            .map_err(|e| invalid(format!("invalid redirect address: {redirect}: {e}")))?;
+        let port = parse_redirect_port(port_str)
+            .map_err(|e| invalid(format!("invalid redirect port: {redirect}: {e}")))?;
+        let address = if host.is_empty() {
+            None
+        } else {
+            Some(xray_proto::xray::common::net::IpOrDomain {
+                address: Some(address_str_to_ip_or_domain(host)),
+            })
+        };
+        Ok(Self {
+            server: Some(xray_proto::xray::common::protocol::ServerEndpoint {
+                address,
+                port,
+                user: None,
+            }),
+        })
+    }
+
+    /// freedom settings 解析入口：Go 键 `redirect` 优先，本仓扩展
+    /// `destinationOverride` 兜底（Go 只有 `redirect`，故两者并存时取 `redirect`）。
+    ///
+    /// `redirect` 缺失 / `null` / 空串 = 未配置（Go `len(c.Redirect) > 0`）；
+    /// 非字符串形态 Go 解码即失败，此处同样拒启。
+    ///
+    /// # Errors
+    /// `redirect` 非法（见 [`Self::from_redirect`]）或类型不是字符串。
+    pub fn from_settings(settings: &serde_json::Value) -> Result<Option<Self>> {
+        let extension = || settings.get("destinationOverride").and_then(Self::from_json);
+        match settings.get("redirect") {
+            None | Some(serde_json::Value::Null) => Ok(extension()),
+            Some(serde_json::Value::String(s)) if s.is_empty() => Ok(extension()),
+            Some(serde_json::Value::String(s)) => Self::from_redirect(s).map(Some),
+            Some(other) => Err(invalid(format!(
+                "invalid redirect address: {other}: expected \"host:port\" string"
+            ))),
+        }
+    }
+}
+
+/// Go `net.SplitHostPort`：`"host:port"` / `":port"` / `"[::1]:port"`；
+/// 缺端口、裸 IPv6（多冒号）、缺 `]` 一律报错（Go 侧即 `Build` 拒启）。
+fn split_host_port(s: &str) -> std::result::Result<(&str, &str), &'static str> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let Some((host, tail)) = rest.split_once(']') else {
+            return Err("missing ']' in address");
+        };
+        return match tail.strip_prefix(':') {
+            Some(port) => Ok((host, port)),
+            None => Err("missing port in address"),
+        };
+    }
+    let mut parts = s.rsplitn(2, ':');
+    let (Some(port), Some(host)) = (parts.next(), parts.next()) else {
+        return Err("missing port in address");
+    };
+    if host.contains(':') {
+        return Err("too many colons in address");
+    }
+    Ok((host, port))
+}
+
+/// Go `xnet.PortFromString`（`common/net/port.go:30-35`）：十进制、无符号、≤ 65535。
+fn parse_redirect_port(s: &str) -> std::result::Result<u32, &'static str> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("invalid port range");
+    }
+    let port = s.parse::<u32>().map_err(|_| "invalid port range")?;
+    if port > 65535 {
+        return Err("port is not a valid port");
+    }
+    Ok(port)
 }
 
 /// TCP 分片配置。对应 proto `Fragment`。
@@ -2091,13 +2178,13 @@ mod tests {
 
     // ===== destinationOverride 消费（Go :269-279 + isValidAddress）=====
 
-    /// Go 标准键 `destinationOverride.server.{address,port}` 生效：改写地址与端口。
+    /// 本仓扩展键 `destinationOverride.server.{address,port}` 生效：改写地址与端口。
     #[test]
-    fn destination_override_go_keys_rewrite_target() {
+    fn destination_override_extension_keys_rewrite_target() {
         let ov = DestinationOverride::from_json(&serde_json::json!(
             {"server": {"address": "9.9.9.9", "port": 1080}}
         ))
-        .expect("go keys");
+        .expect("extension keys");
         let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(5900));
         let rewritten = apply_destination_override(&dest, Some(&ov));
         assert_eq!(rewritten.address(), &Address::IPv4("9.9.9.9".parse().unwrap()));
@@ -2131,6 +2218,74 @@ mod tests {
     fn destination_override_absent_is_identity() {
         let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(443));
         assert_eq!(apply_destination_override(&dest, None), dest);
+    }
+
+    // ===== redirect（Go `infra/conf/freedom.go:23,166-180`）=====
+
+    /// `"host:port"` → 地址 + 端口都改写；`":port"` 只改写端口（Go 允许空 host）。
+    #[test]
+    fn redirect_parses_go_host_port_string() {
+        let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(443));
+        let ov = DestinationOverride::from_redirect("9.9.9.9:1080").expect("host:port");
+        let rewritten = apply_destination_override(&dest, Some(&ov));
+        assert_eq!(rewritten.address(), &Address::IPv4("9.9.9.9".parse().unwrap()));
+        assert_eq!(rewritten.port().value(), 1080);
+
+        // 空 host：Go `if len(host) > 0` 才赋 Address ⇒ 仅端口改写
+        let port_only = DestinationOverride::from_redirect(":8080").expect("port only");
+        let rewritten = apply_destination_override(&dest, Some(&port_only));
+        assert_eq!(rewritten.address(), dest.address());
+        assert_eq!(rewritten.port().value(), 8080);
+
+        // IPv6 带括号（Go SplitHostPort 剥括号 + ParseAddress）
+        let v6 = DestinationOverride::from_redirect("[::1]:1080").expect("ipv6");
+        assert_eq!(
+            apply_destination_override(&dest, Some(&v6)).address(),
+            &Address::IPv6("::1".parse().unwrap())
+        );
+    }
+
+    /// Go `Build` 拒启形态：缺端口 / 多冒号 / 空端口 / 非数字端口 / 超范围 / 缺 `]`。
+    #[test]
+    fn redirect_rejects_invalid_go_forms() {
+        for bad in ["1.2.3.4", "::1:443", "host:", "host:http", "host:70000", "[::1]"] {
+            let err = DestinationOverride::from_redirect(bad).expect_err(bad);
+            assert!(err.to_string().contains("invalid redirect"), "{bad} → {err}");
+        }
+    }
+
+    /// 双键并存：Go 键 `redirect` 优先；扩展键单独存在时仍生效（旧配置不失效）。
+    #[test]
+    fn redirect_wins_over_extension_key() {
+        let both = serde_json::json!({
+            "redirect": "1.1.1.1:8443",
+            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}}
+        });
+        let ov = DestinationOverride::from_settings(&both).unwrap().expect("override");
+        let dest = Destination::tcp(Address::Domain("example.com".into()), Port::new(443));
+        let rewritten = apply_destination_override(&dest, Some(&ov));
+        assert_eq!(rewritten.address(), &Address::IPv4("1.1.1.1".parse().unwrap()));
+        assert_eq!(rewritten.port().value(), 8443, "Go 键 redirect 优先");
+
+        // 只有扩展键 → 生效（兼容保留）
+        let ext = serde_json::json!({
+            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}}
+        });
+        let ov = DestinationOverride::from_settings(&ext).unwrap().expect("override");
+        assert_eq!(apply_destination_override(&dest, Some(&ov)).port().value(), 1080);
+
+        // 两者皆无 / redirect 空串 / null → 未配置
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({"redirect": ""}),
+            serde_json::json!({"redirect": null}),
+        ] {
+            assert!(DestinationOverride::from_settings(&settings).unwrap().is_none(), "{settings}");
+        }
+
+        // redirect 非字符串 → 拒启（Go 解码 string 字段即失败）
+        let bad = serde_json::json!({"redirect": {"server": {"port": 1}}});
+        assert!(DestinationOverride::from_settings(&bad).is_err());
     }
 
     // ===== FinalRuleConfig JSON（Go FreedomFinalRuleConfig + Build）=====

@@ -1312,10 +1312,10 @@ pub(crate) fn parse_freedom_config(data: &[u8]) -> std::io::Result<FreedomConfig
             .collect::<std::result::Result<Vec<_>, _>>()?,
         None => Vec::new(),
     };
-    // destinationOverride / proxyProtocol / finalRules（Go FreedomConfig json 键，
-    // freedom.go:19-29；解析在 freedom crate `from_json`，Go 语义对齐）
-    let destination_override =
-        v.get("destinationOverride").and_then(xray_proxy_freedom::DestinationOverride::from_json);
+    // redirect（Go 键，字符串 `"host:port"`，freedom.go:23,166-180）优先；本仓旧扩展
+    // `destinationOverride`（对象形态）降级为兼容键，仅在 redirect 缺省时生效。
+    let destination_override = xray_proxy_freedom::DestinationOverride::from_settings(&v)
+        .map_err(std::io::Error::other)?;
     // userLevel（Go infra/conf/freedom.go UserLevel json 键；czwu③ 出站 policy 档位）
     let user_level = v.get("userLevel").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let proxy_protocol = v.get("proxyProtocol").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
@@ -4475,13 +4475,14 @@ mod tests {
         assert!(err.to_string().contains("noise = { ... }"), "unexpected error: {err}");
     }
 
-    /// 装配接线：freedom settings JSON 的 destinationOverride / proxyProtocol /
-    /// finalRules 经 parse_freedom_config 进入强类型 Config（Go 标准键）。
+    /// 装配接线：freedom settings JSON 的 redirect / proxyProtocol /
+    /// finalRules 经 parse_freedom_config 进入强类型 Config（Go 键，
+    /// `infra/conf/freedom.go:23,166-180`）。
     #[test]
     fn parse_freedom_config_wires_override_proxy_protocol_and_final_rules() {
         let json = r#"{
             "domainStrategy": "UseIP",
-            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}},
+            "redirect": "9.9.9.9:1080",
             "proxyProtocol": 2,
             "finalRules": [
                 {"action": "block", "network": "tcp,udp", "port": "53", "ip": ["10.0.0.0/8"]}
@@ -4491,12 +4492,37 @@ mod tests {
         let ov = cfg.destination_override.expect("override parsed");
         let server = ov.server.expect("server set");
         assert_eq!(server.port, 1080);
+        assert!(server.address.is_some(), "redirect 带 host → 改写地址");
         assert_eq!(cfg.proxy_protocol, 2);
         assert_eq!(cfg.final_rules.len(), 1);
         let rule = xray_proxy_freedom::FinalRule::build(&cfg.final_rules[0]).unwrap();
         assert_eq!(rule.action, xray_proxy_freedom::RuleAction::Block);
         assert!(rule.apply(2, 53, Some("10.1.2.3".parse().unwrap())));
         assert!(!rule.apply(2, 53, Some("8.8.8.8".parse().unwrap())));
+    }
+
+    /// 双键并存：Go 键 `redirect` 优先，本仓扩展 `destinationOverride` 兜底；
+    /// 非法 `redirect` 整出站拒启（Go `Build` 语义）。
+    #[test]
+    fn parse_freedom_config_redirect_priority_and_errors() {
+        let both = br#"{
+            "redirect": ":8443",
+            "destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}}
+        }"#;
+        let cfg = parse_freedom_config(both).expect("valid freedom settings");
+        let server = cfg.destination_override.expect("override").server.expect("server");
+        assert_eq!(server.port, 8443, "redirect 优先");
+        assert!(server.address.is_none(), "空 host → 仅端口改写");
+
+        let ext_only =
+            br#"{"destinationOverride": {"server": {"address": "9.9.9.9", "port": 1080}}}"#;
+        let cfg = parse_freedom_config(ext_only).expect("extension key still accepted");
+        assert_eq!(cfg.destination_override.expect("override").server.expect("server").port, 1080);
+
+        for bad in [&b"{\"redirect\": \"1.2.3.4\"}"[..], &b"{\"redirect\": \"::1:443\"}"[..]] {
+            let err = parse_freedom_config(bad).expect_err("invalid redirect must reject outbound");
+            assert!(err.to_string().contains("invalid redirect"), "got: {err}");
+        }
     }
 
     /// vrll①：domainStrategy ToLower + forceip 族全谱（Go freedom.go:65-88）。
