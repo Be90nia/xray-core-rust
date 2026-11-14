@@ -771,9 +771,10 @@ where
     }
 
     // 3. 按 command 分派
+    let enc = options.as_ref().is_some_and(|o| o.decryption.is_some());
     match decoded.command {
         VlessCommand::Tcp => {
-            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access).await
+            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access, enc).await
         },
         VlessCommand::Udp => {
             handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout(), plugin_ctx)
@@ -794,6 +795,7 @@ async fn finish_tcp_dispatch<R, W>(
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     raw_tcp: Option<TcpStream>,
     access: &xray_app_dispatcher::AccessContext,
+    enc: bool,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -825,8 +827,12 @@ where
     // vision 路径保留 join+split：VisionConn 是带内部状态（padding / splice / 上下行
     // pending）的单对象，读写两半必须共享它 ⇒ 需要 VisionConn 自身的一层互斥。
     let seed: &[u32] = decoded.user.as_ref().map_or(&[][..], |u| u.account.testseed.as_slice());
-    let link = match (vision_uuid, raw_tcp) {
-        (Some(uuid), Some(raw)) => {
+    // ENC 在场时不给 vision splice 裸通道（bd ci3uy）：本仓 splice 只有「裸 TCP」形态，
+    // 而 Go `UnwrapRawConn` 在 ENC 下返回的是**ENC 之上**的 TLS 连接——拿裸 TCP 切直通
+    // 会把 payload 写到外层 TLS 之下，对端外层 TLS 直接 BAD_DECRYPT（HTTPS 载荷实测）。
+    // 无 raw 通道时 DIRECT 退化为「只关 padding」，payload 继续走 CommonConn 帧化。
+    let link = match (vision_uuid, raw_tcp, enc) {
+        (Some(uuid), Some(raw), false) => {
             let stream: Box<dyn VlessStream> = Box::new(
                 VisionConn::new_server(tokio::io::join(reader, write_half), uuid, raw)
                     .with_padding_seed(seed),
@@ -834,7 +840,15 @@ where
             let (rh, wh) = tokio::io::split(stream);
             Link::new(new_reader(rh), new_writer(wh))
         },
-        (Some(uuid), None) => {
+        (Some(uuid), Some(_), true) => {
+            let stream: Box<dyn VlessStream> = Box::new(
+                VisionConn::new_server_no_splice(tokio::io::join(reader, write_half), uuid)
+                    .with_padding_seed(seed),
+            );
+            let (rh, wh) = tokio::io::split(stream);
+            Link::new(new_reader(rh), new_writer(wh))
+        },
+        (Some(uuid), None, _) => {
             let stream: Box<dyn VlessStream> = Box::new(
                 VisionConn::new(tokio::io::join(reader, write_half), uuid).with_padding_seed(seed),
             );
@@ -844,7 +858,7 @@ where
         // F2 服务端写聚合：仅 flow=""（非 vision）TCP 分派启用——vision 帧写批
         // 边界（IsCompleteRecord 语义）逐批原样；UDP/Mux/Rvs 分派不经此处。
         // 聚合边界 = 单次 write_multi_buffer 调用（wire 写缓冲拼接，非应用帧）。
-        (None, _) => Link::new(new_reader(reader), new_coalescing_writer(write_half)),
+        (None, _, _) => Link::new(new_reader(reader), new_coalescing_writer(write_half)),
     };
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
@@ -1552,6 +1566,16 @@ mod tests {
         account_flow: &str,
         server_seed: &[u32],
     ) -> (std::net::SocketAddr, u16, UUID) {
+        spawn_vless_proxy_with_echo_enc(outer_tls13, account_flow, server_seed, None).await
+    }
+
+    /// 同上，可注入 VLESS ENC 服务端 decryption（bd ci3uy：ENC+vision 组合需要）。
+    async fn spawn_vless_proxy_with_echo_enc(
+        outer_tls13: bool,
+        account_flow: &str,
+        server_seed: &[u32],
+        decryption: Option<Arc<crate::encryption::ServerInstance>>,
+    ) -> (std::net::SocketAddr, u16, UUID) {
         let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_port = echo_listener.local_addr().unwrap().port();
         xray_common::testing::spawn("spawn-vless-proxy-with-echo-accept", async move {
@@ -1587,7 +1611,7 @@ mod tests {
                 validator,
                 None,
                 None,
-                Some(VlessInboundOptions { outer_tls13, ..Default::default() }),
+                Some(VlessInboundOptions { outer_tls13, decryption, ..Default::default() }),
                 test_plugin_ctx(),
             )
             .await;
@@ -1778,6 +1802,91 @@ mod tests {
             .expect("echo through vision-wrapped vless path")
             .unwrap();
         assert_eq!(&got, payload);
+    }
+
+    /// bd ci3uy：flow=XRV **与** VLESS ENC 同时启用时客户端同样必须包 VisionConn
+    /// （Go outbound.go:379-380 对 XRV 无条件 NewVisionReader，与 encryption 无关）。
+    /// 曾只对 `encryption == "none"` 包装 ⇒ 服务端照旧 padding 而客户端不解包，
+    /// 下行 vision 块头（uuid16+cmd+content_len+padding_len）泄漏进应用层。
+    #[tokio::test]
+    async fn vless_vision_enc_e2e_client_and_server_roundtrip() {
+        use base64::Engine as _;
+        use ml_kem::KeyExport as _;
+        use rand::RngCore as _;
+        use tokio::time::{Duration, timeout};
+
+        use crate::{
+            dispatcher::{VlessOutboundConfig, make_dial_fn},
+            encryption::{ClientEncParams, ServerInstance},
+        };
+
+        // ENC 密钥对（X25519 + ML-KEM-768）；构造同 encryption::tests。
+        let mut rng = rand::rng();
+        let mut x_priv = [0u8; 32];
+        rng.fill_bytes(&mut x_priv);
+        let x_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(x_priv)).to_bytes();
+        let mut seed = [0u8; 64];
+        rng.fill_bytes(&mut seed);
+        let ek = ml_kem::DecapsulationKey768::from_seed(ml_kem::Seed::from(seed))
+            .encapsulation_key()
+            .to_bytes();
+
+        let mut server = ServerInstance::new();
+        server
+            .init(vec![x_priv.to_vec(), seed.to_vec()], 0, 600, 600, "", test_plugin_ctx())
+            .unwrap();
+        let (vless_addr, echo_port, uuid) =
+            spawn_vless_proxy_with_echo_enc(true, crate::FLOW_XRV, &[], Some(Arc::new(server)))
+                .await;
+
+        let cfg = Arc::new(
+            VlessOutboundConfig::new(
+                uuid,
+                Address::from_ipv4_bytes([127, 0, 0, 1]),
+                Port::new(vless_addr.port()),
+            )
+            .with_flow(crate::FLOW_XRV)
+            // `encryption` 字符串是配置面元数据（真实开关是 `enc_params`，后者才触发握手）；
+            // 生产由 plugin 同时设两者，测试必须照此还原——否则回退成「只按 encryption 字符串
+            // 决定是否包 vision」时本用例会假绿（bd ci3uy 反向对照实测）。
+            .with_encryption(format!(
+                "mlkem768x25519plus.native.0rtt.{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x_pub)
+            ))
+            .with_encryption_params(Some(ClientEncParams {
+                keys: vec![x_pub.to_vec(), ek.to_vec()],
+                xor_mode: 0,
+                seconds: 1,
+                padding: String::new(),
+            })),
+        );
+        let dial = make_dial_fn(cfg);
+        let dest = Destination::tcp(Address::from_ipv4_bytes([127, 0, 0, 1]), Port::new(echo_port));
+        // 客户端 ephemeral X25519 pub 最高位 ~50% 被服务端拒（Go server.go:150 语义，
+        // 生产靠重连兜底）⇒ 重试 16 次（失败概率 2^-16）。
+        let mut dialed = None;
+        for _ in 0..16 {
+            match dial(&dest).await {
+                Ok(c) => {
+                    dialed = Some(c);
+                    break;
+                },
+                Err(e) if e.contains("highest bit") => continue,
+                Err(e) => panic!("dial: {e}"),
+            }
+        }
+        let mut conn = dialed.expect("dial after 16 ENC attempts");
+
+        let payload = b"vision+enc e2e roundtrip payload";
+        conn.write_all(payload).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut got = vec![0u8; payload.len()];
+        timeout(Duration::from_secs(10), conn.read_exact(&mut got))
+            .await
+            .expect("echo through vision+enc vless path")
+            .unwrap();
+        assert_eq!(&got, payload, "下行首字节起必须是应用数据（vision 块头已剥）");
     }
 
     /// 8i4c：testseed 有无 × 双端组合 e2e。testseed 是**本地 padding 参数**

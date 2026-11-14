@@ -222,6 +222,24 @@ where
     /// padding 不切 raw——对端仍在安全层内说话，提前直通裸流会读到密文。
     #[must_use]
     pub fn new_server(conn: C, user_uuid: Vec<u8>, raw_tcp: TcpStream) -> Self {
+        Self::new_server_with_raw(conn, user_uuid, Some(raw_tcp))
+    }
+
+    /// server 模式但**不给 splice 裸通道**：VLESS ENC（`CommonConn`）在场时使用。
+    ///
+    /// Go `UnwrapRawConn` 在 ENC 下返回的是 `commonConn.Conn`（**ENC 之上**的 TLS
+    /// 连接，proxy.go:719-729 `isEncryption` 跳过 TLS 解包），双向都按该层切直通；
+    /// 本仓 splice 通道只有「裸 TCP」一种形态，无法表达「ENC 之上的连接」这第二个
+    /// 持有者。若仍给裸通道，DIRECT 后 payload 会写到外层 TLS **之下** → 对端
+    /// 外层 TLS `BAD_DECRYPT`（bd ci3uy 实测形态）。无 raw 通道时 DIRECT 语义退化为
+    /// 「只关 padding」：payload 继续经 `CommonConn` 帧化，双端对称、功能正确，代价
+    /// 仅是没有 splice 优化的每字节拷贝。
+    #[must_use]
+    pub fn new_server_no_splice(conn: C, user_uuid: Vec<u8>) -> Self {
+        Self::new_server_with_raw(conn, user_uuid, None)
+    }
+
+    fn new_server_with_raw(conn: C, user_uuid: Vec<u8>, raw_tcp: Option<TcpStream>) -> Self {
         let uplink_uuid_pending = Some(user_uuid.clone());
         Self {
             inner: conn,
@@ -239,7 +257,7 @@ where
             uplink_traffic: TrafficState::new(user_uuid.clone()),
             downlink_traffic: TrafficState::new(user_uuid.clone()),
             raw_fallback: None,
-            raw_tcp: Some(raw_tcp),
+            raw_tcp,
             read_tmp: Vec::with_capacity(16 * 1024),
             padding_scratch: Vec::with_capacity(2048), // vision::BUF_SIZE
             splice_armed: false,

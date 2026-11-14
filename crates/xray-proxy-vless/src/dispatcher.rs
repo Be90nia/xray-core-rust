@@ -541,10 +541,11 @@ async fn establish_conn(
     //     才 flush；dial 阶段同步等待会让上行首包发不出去 → 双向互等 →
     //     服务端超时断开。vision 首块 uuid padding 尤甚，见 #9/#15/#32）。
     conn = Box::new(crate::encoding::client::ResponseHeaderReader::new(conn, VERSION));
-    // 3. flow=xtls-rprx-vision（encryption=none）：请求头写出后即包装 VisionConn——padding
-    //    从业务数据开始（对齐 Go outbound VisionWriter/ VisionReader 的包装时机，首块 padding
-    //    携带本账号 uuid）。 ENC(mlkem768)+vision 组合走 CommonConn，见 bd 4lf/byo。
-    if config.flow == crate::FLOW_XRV && config.encryption == "none" {
+    // 3. flow=xtls-rprx-vision：请求头写出后即包装 VisionConn（padding 从业务数据
+    //    开始，首块携带本账号 uuid）。判据只取 flow：Go outbound.go:379-380 与 inbound.go:605-613
+    //    对 XRV 都无条件包 vision，与 encryption 无关；曾按 `encryption == "none"` 跳过该层 → 下行
+    //    vision 块头泄漏到应用层（bd ci3uy）。
+    if config.flow == crate::FLOW_XRV {
         let uuid_bytes = config.user_uuid.as_bytes().to_vec();
         // testseed：账户本地 padding 参数注入（对应 Go EncodeBodyAddons →
         // NewVisionWriter(account.Testseed)；不上 wire，len<4 时 builder 内兜底默认）。
