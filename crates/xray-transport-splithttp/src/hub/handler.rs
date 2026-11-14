@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame};
@@ -603,7 +603,7 @@ async fn extract_packet_payload<B>(
     req: Request<B>,
     ctx: &HandlerContext,
     max_body: usize,
-) -> Result<Vec<u8>, StatusCode>
+) -> Result<Bytes, StatusCode>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt + 'static,
     B::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -613,13 +613,14 @@ where
     let (parts, body) = req.into_parts();
     let headers = &parts.headers;
 
-    let mut payload = Vec::new();
+    // header/cookie 前缀极短且通常为空：只有非空时才与 body 拼接（常态零拼接）。
+    let mut head: Vec<u8> = Vec::new();
 
     if placement == PLACEMENT_AUTO || placement == PLACEMENT_HEADER {
-        payload.extend_from_slice(&extract_header_payload(headers, key));
+        head.extend_from_slice(&extract_header_payload(headers, key));
     }
     if placement == PLACEMENT_AUTO || placement == PLACEMENT_COOKIE {
-        payload.extend_from_slice(&extract_cookie_payload(headers, key));
+        head.extend_from_slice(&extract_cookie_payload(headers, key));
     }
     if placement == PLACEMENT_AUTO || placement == PLACEMENT_BODY {
         // Go hub.go:288-300：先按 ContentLength 预检，再按上限读（`io.LimitReader`
@@ -628,11 +629,19 @@ where
         if content_length(headers).is_some_and(|len| len > max_body as u64) {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        let bytes = read_body_limited(body, max_body).await?;
-        payload.extend_from_slice(&bytes);
+        let body = read_body_limited(body, max_body).await?;
+        if head.is_empty() {
+            // 常态（placement=body，header/cookie 无载荷）：hyper 的 `Bytes` 所有权
+            // 直入 `Packet`，与 stream-up 路径同形（零拷贝，bd lrobv）。
+            return Ok(body);
+        }
+        let mut buf = BytesMut::with_capacity(head.len() + body.len());
+        buf.extend_from_slice(&head);
+        buf.extend_from_slice(&body);
+        return Ok(buf.freeze());
     }
 
-    Ok(payload)
+    Ok(Bytes::from(head))
 }
 
 /// `Content-Length`（缺失/非法 → `None`；此时一律走限读路径）。
@@ -647,11 +656,17 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 ///
 /// 对齐 Go `io.LimitReader(body, max+1)` + 事后 `len(payload) > max` 判长的
 /// 结果语义，但峰值驻留 = `max` 字节（不是 `max+1`，更不是对端声明的大小）。
-async fn read_body_limited<B>(mut body: B, max: usize) -> Result<Vec<u8>, StatusCode>
+///
+/// 单帧（h1 `Content-Length` 整段 / h2 单 DATA 帧）直接交出 hyper 的 `Bytes`
+/// 所有权（零拷贝）；多帧只在拼接时拷一次（`BytesMut` 一次分配）。旧实现
+/// 「先 extend 进 Vec 再 extend 进 payload」= 每字节两趟拷贝 + Vec 增长重分配
+/// （bd lrobv）。
+async fn read_body_limited<B>(mut body: B, max: usize) -> Result<Bytes, StatusCode>
 where
     B: hyper::body::Body<Data = Bytes> + Send + Unpin + BodyExt,
 {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut frames: Vec<Bytes> = Vec::new();
+    let mut total = 0usize;
     loop {
         let frame = match body.frame().await {
             None => break,
@@ -659,13 +674,25 @@ where
             // 读腿出错（对端中断/协议错）→ 400，与 Go readErr → BadRequest 一致。
             Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         };
-        let Some(data) = frame.data_ref() else { continue };
-        if data.len() > max - buf.len() {
+        // trailers 不承载 body 数据（`data_ref()` 为 None），跳过。
+        let Ok(data) = frame.into_data() else { continue };
+        if data.len() > max - total {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        buf.extend_from_slice(data);
+        total += data.len();
+        frames.push(data);
     }
-    Ok(buf)
+    match frames.len() {
+        0 => Ok(Bytes::new()),
+        1 => Ok(frames.swap_remove(0)),
+        _ => {
+            let mut buf = BytesMut::with_capacity(total);
+            for f in &frames {
+                buf.extend_from_slice(f);
+            }
+            Ok(buf.freeze())
+        },
+    }
 }
 
 /// 从 `{key}-{i}` header 序列提取并 base64 解码。
@@ -1439,6 +1466,53 @@ mod tests {
             .unwrap();
         let payload = extract_packet_payload(req, &ctx, TEST_MAX_POST).await.expect("上限内必须收");
         assert_eq!(payload.len(), TEST_MAX_POST);
+        // lrobv：单帧走 `Bytes` 所有权直传（零拷贝），字节内容必须逐字节原样。
+        assert!(payload.iter().all(|b| *b == 7), "单帧 payload 字节不得改动");
+    }
+
+    /// 逐帧产出确定字节的 body（第 i 帧整帧填 `(i % 251)`）。
+    struct PatternBody {
+        frames_left: usize,
+        chunk: usize,
+        frame_idx: usize,
+    }
+
+    impl hyper::body::Body for PatternBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            if self.frames_left == 0 {
+                return Poll::Ready(None);
+            }
+            self.frames_left -= 1;
+            let byte = (self.frame_idx % 251) as u8;
+            self.frame_idx += 1;
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![byte; self.chunk])))))
+        }
+    }
+
+    /// lrobv：1 MiB 多帧 body 逐字节往返（拼帧路径不得丢字节/重字节/错序）。
+    #[tokio::test]
+    async fn packet_up_body_multi_frame_roundtrip_1mib() {
+        const FRAMES: usize = 16;
+        const CHUNK: usize = 64 * 1024;
+        const TOTAL: usize = FRAMES * CHUNK;
+        let ctx = make_ctx("");
+        let req = Request::builder()
+            .method(Method::POST)
+            .body(PatternBody { frames_left: FRAMES, chunk: CHUNK, frame_idx: 0 })
+            .unwrap();
+        let payload = extract_packet_payload(req, &ctx, TOTAL).await.expect("上限内必须收");
+        assert_eq!(payload.len(), TOTAL, "1 MiB 逐帧拼接后长度必须精确");
+        let mut expected = Vec::with_capacity(TOTAL);
+        for i in 0..FRAMES {
+            expected.resize(expected.len() + CHUNK, (i % 251) as u8);
+        }
+        assert!(payload.as_ref() == expected.as_slice(), "1 MiB 往返必须逐字节一致");
     }
 
     /// dct2d：先头后体也守住总量（header payload 占满预算时 body 不再放行）。

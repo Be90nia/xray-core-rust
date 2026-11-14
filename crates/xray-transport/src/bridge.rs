@@ -689,9 +689,16 @@ where
     let p7lm_trace = p7lm_trace();
 
     let Link { mut reader, mut writer } = link;
-    // tokio::io::split（out_f1 33Mbps 实证拓扑，无锁）。自研 BiLock 轮转锁在
-    // join! 固定轮询顺序下被 up 大流量系统性抢占（50074b2 同源塌陷：VPS 实测
-    // up 1.58Mbps + strace「突发排空→恰 1 RTT 停顿」锁步签名），已整体删除。
+    // tokio::io::split（out_f1 33Mbps 实证拓扑）。**这是换锁不是去锁**（bd fwnr7 /
+    // LF-04 事实更正）：tokio 1.54.1 `io/split.rs:38-41,53-56` 的
+    // `Inner { stream: Mutex<T> }` 是 `Arc<std::sync::Mutex<T>>`，`with_lock`
+    // （:59-60）在**每次** poll_read/poll_write 取一次 OS 互斥锁，且读写半共用
+    // 同一把 ⇒ 串行点仍在，只是临界区收窄到单次 IO poll（不跨 await），且不需要
+    // 自研公平性推理。原先写的「无锁」是错的，而它曾是删除自研 BiLock 的唯一
+    // 书面理由——自研 BiLock 轮转锁的真实缺陷是 join! 固定轮询顺序下被 up 大流量
+    // 系统性抢占（50074b2 同源塌陷：VPS 实测 up 1.58Mbps + strace「突发排空→恰
+    // 1 RTT 停顿」锁步签名），已整体删除。真正去锁需 `TcpStream::into_split`
+    // 形态（`Connection` 抽象不支持，且 into_split 的半部 drop 会 shutdown(WR)）。
     // WriteHalf 转发 poll_write_vectored/is_write_vectored（y1yx 聚合写保持）。
     // 下行读侧聚合读（bd VISIONMAC，对齐 Go readv 批语义）：裸 TCP 时在 split
     // 前 dup 专用读腿（ReadHalf 不穿透 Connection trait），走 ReadVReader 多

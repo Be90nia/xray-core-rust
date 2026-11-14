@@ -126,6 +126,13 @@ pub struct VisionConn<C> {
     /// 记录解密 → BadRecordMac fatal alert → 双端皆死，macOS #08 实测）。
     /// 定时器到期后清 None，后续 raw 写零开销。
     raw_write_gate: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// 写侧 splice 观测（bd fwnr7 / LF-12）：整批含完整 record 组（DIRECT/END 可
+    /// 触发）的批数。
+    splice_complete_batches: u64,
+    /// 写侧 splice 观测（bd fwnr7 / LF-12）：批被切碎（已是 TLS app-data 且 TLS
+    /// 已识别，但不是完整 record 组）⇒ DIRECT 静默不触发的批数。「vision 开着
+    /// 但吞吐像 padding 态」的唯一现场证据（判定逻辑本身不改）。
+    splice_fragmented_batches: u64,
 }
 
 /// 上行待写帧：padded 帧字节 + 已写偏移 + 该帧对应的 caller 消费量 + 提交闸类别。
@@ -151,6 +158,12 @@ enum UpGate {
 /// raw 起步闸延迟：覆盖对端「收 DIRECT 帧 → 处理 → 切 raw 读」的调度
 /// 延迟。实测恶性窗口 ~1.5ms（loopback 合流），5ms=3x 余量；arm 受
 /// is_none 守卫仅建立一次，每次 splice 切换仅首个上游写承担一次。
+///
+/// **口径（bd fwnr7 / LF-11）**：这是 **每连接一次的墙钟延迟下限**——短连接
+/// （一次请求即断）的上行 TTFB 恒 +5ms，属刻意换正确性的代价，不是可优化
+/// 噪音。两条例外：①半关闭（`poll_shutdown`）时闸被取消，不再白等；②闸到期
+/// 即清（`raw_write_gate = None`），后续 raw 写零开销。**下探常数必须先实测**
+/// （1.5ms 窗口来自一次实测的余量推导，没有第二次独立实测前禁降到 2ms）。
 const RAW_WRITE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 #[allow(private_interfaces)] // InnerRawClone 为 crate 内实现细节，随公开方法泄露属刻意
@@ -189,6 +202,8 @@ where
             end_commit: false,
             is_server: false,
             raw_write_gate: None,
+            splice_complete_batches: 0,
+            splice_fragmented_batches: 0,
         }
     }
 
@@ -231,6 +246,8 @@ where
             end_commit: false,
             is_server: true,
             raw_write_gate: None,
+            splice_complete_batches: 0,
+            splice_fragmented_batches: 0,
         }
     }
 
@@ -370,6 +387,21 @@ where
                             // 该尾段仍不可达——需 record-framer 级改造（对齐 Go
                             // readFromUntil 精确读形态）方可根治，概率远低于
                             // 写侧激活竞态（本轮 macOS #08 实测定罪为写侧）。
+                            //
+                            // **建链契约（bd fwnr7 / LF-13，翻转即不可逆）**：读侧
+                            // 翻转的正确性依赖 inner 之下的读腿已按 **record 边界**
+                            // 聚合（`xray-transport/src/bridge.rs` 的 record 对齐读腿
+                            // 形态，即 `RecordFramer` 垫在 TLS 之下）。本层无类型化
+                            // 约束——任何新增/替换装配点若拿掉该读腿，尾段字节会
+                            // 静默丢失（不是报错，是永久停摆）。
+                            redline::event(
+                                RedlineSite::VisionSpliceEvent,
+                                tracing::Level::DEBUG,
+                                format_args!(
+                                    "vision downlink DIRECT flip: raw channel engaged \
+                                     (irreversible; requires record-aligned reader below TLS)"
+                                ),
+                            );
                         }
                     }
                     if !this.downlink_pending.is_empty() {
@@ -513,6 +545,28 @@ where
                 total >= 3 && probe[0] == 0x17 && probe[1] == 0x03 && probe[2] == 0x03;
             let whole_complete =
                 is_app_data && write_side.is_tls && is_complete_record_slices(bufs);
+            // 观测（bd fwnr7 / LF-12）：批被切碎时 DIRECT 静默不触发，现象是「vision
+            // 开着但吞吐像 padding 态」而全链路无任何告警。只计数 + 首现/每 1024 批
+            // 记一次 debug（逐批记会在高吞吐连接上刷屏）。判定逻辑本身不动。
+            if is_app_data && write_side.is_tls {
+                if whole_complete {
+                    this.splice_complete_batches += 1;
+                } else {
+                    this.splice_fragmented_batches += 1;
+                    let fragmented = this.splice_fragmented_batches;
+                    if fragmented == 1 || fragmented % 1024 == 0 {
+                        redline::event(
+                            RedlineSite::VisionSpliceEvent,
+                            tracing::Level::DEBUG,
+                            format_args!(
+                                "vision DIRECT not triggered: fragmented batch (batch_bytes={total}, \
+                                 complete_batches={}, fragmented_batches={fragmented})",
+                                this.splice_complete_batches
+                            ),
+                        );
+                    }
+                }
+            }
             let is_early_end =
                 !write_side.is_tls12_or_above && write_side.number_of_packet_to_filter <= 1;
             let batch_command = if whole_complete && write_side.enable_xtls {
@@ -600,6 +654,11 @@ where
         if let Some(raw) = this.raw_fallback.as_mut() {
             // splice 后对端已拆外层 TLS：半关闭通知必须走裸 TCP（inner 的
             // TLS close_notify 会被对端当 raw bytes 转发污染下游流）。
+            //
+            // 起步闸在此取消（bd fwnr7）：闸保护的是「首个 raw **数据**写」不被
+            // 对端 TLS 栈同段过读吞掉；半关闭不承载 raw 数据，且已经是终态
+            // （此后再写必然 EPIPE）⇒ 不再白等剩余时长。
+            this.raw_write_gate = None;
             return Pin::new(raw).poll_shutdown(cx);
         }
         Pin::new(&mut this.inner).poll_shutdown(cx)
@@ -737,6 +796,8 @@ fn locate_io_slice_span<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -2520,6 +2581,120 @@ mod tests {
             "repeated arm must not rebuild/reset the raw write gate"
         );
         assert!(!client.splice_armed, "repeated arm still consumes the flag");
+    }
+
+    /// 极简 tracing 订阅者：只捕获 event 的 message 字段（断言 debug 事件确实发射）。
+    struct CaptureEvents {
+        sink: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CaptureEvents {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Msg(String);
+            impl tracing::field::Visit for Msg {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut msg = Msg(String::new());
+            event.record(&mut msg);
+            if let Ok(mut sink) = self.sink.lock() {
+                sink.push(msg.0);
+            }
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// bd fwnr7 / LF-12：批被切碎（TLS app-data 但整批不含完整 record 组）⇒
+    /// DIRECT 静默不触发。此前该退化「无日志、无计数」——现场只剩「vision 开着
+    /// 但吞吐像 padding 态」。契约：切碎必须可见（计数 + debug 事件），而
+    /// 完整批必须照旧触发 DIRECT（判定逻辑不变）。
+    #[tokio::test]
+    async fn fragmented_batch_skips_direct_with_counter_and_event() {
+        let mock = DeferredFlushMock { flush_polls: 0 };
+        let mut client = VisionConn::new(mock, vec![0xABu8; 16]);
+        client.downlink_traffic.enable_xtls = true;
+        client.downlink_traffic.is_tls = true;
+        client.downlink_traffic.is_tls12_or_above = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        // current_thread 测试运行时：thread-local 订阅者跨 await 有效。
+        let _guard = tracing::subscriber::set_default(CaptureEvents { sink: Arc::clone(&events) });
+
+        // 切碎批：record 头声明的长度大于批内实际字节 ⇒ is_complete_record_slices false
+        client.write_all(&app[..app.len() - 1]).await.unwrap();
+        assert_eq!(client.splice_fragmented_batches, 1, "切碎批必须计数");
+        assert_eq!(client.splice_complete_batches, 0, "切碎批不算完整批");
+        assert!(!client.splice_armed, "切碎批不得判 DIRECT");
+        assert!(client.raw_fallback.is_none(), "切碎批不得激活 raw");
+        let captured = events.lock().unwrap().clone();
+        println!("[fwnr7] captured events after fragmented batch: {captured:?}");
+        assert!(
+            captured.iter().any(|m| m.contains("fragmented batch")),
+            "切碎必须发 debug 事件（此前静默），实际捕获: {captured:?}"
+        );
+
+        // 完整 record 组：照旧触发 DIRECT（判定逻辑未被本票改动）。
+        // DeferredFlushMock 的 poll_flush 首 poll 返回 Pending 且不注册 waker（模拟
+        // WouldBlock），因此这里不能 `await write_all`——按既有用例形态逐次 poll。
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(matches!(poll, Poll::Pending), "inner flush 未就绪时不得报写完成, got {poll:?}");
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(
+            matches!(poll, Poll::Ready(Ok(n)) if n == app.len()),
+            "闸门过后写必须完成, got {poll:?}"
+        );
+        assert_eq!(client.splice_complete_batches, 1, "完整批必须计入 complete");
+        assert_eq!(client.splice_fragmented_batches, 1, "完整批不得误计为切碎");
+        assert!(client.raw_fallback.is_some(), "完整批必须照旧翻转 DIRECT");
+    }
+
+    /// bd fwnr7 / LF-11：raw 起步闸可取消 —— 连接在半关闭时不再白等闸剩余时长
+    /// （闸保护的是首个 raw **数据**写，shutdown 不承载数据；此后再写必然 EPIPE）。
+    #[tokio::test]
+    async fn raw_write_gate_cancelled_by_shutdown() {
+        let mock = DeferredFlushMock { flush_polls: 0 };
+        let mut client = VisionConn::new(mock, vec![0xABu8; 16]);
+        client.downlink_traffic.enable_xtls = true;
+        client.downlink_traffic.is_tls = true;
+        client.downlink_traffic.is_tls12_or_above = true;
+        let app = build_tls_app_data(b"GET / HTTP/1.1\r\n\r\n");
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        // DIRECT 判定 → inner flush #1 Pending（DeferredFlushMock 不注册 waker）→ Pending
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(matches!(poll, Poll::Pending), "flush 未就绪时必须 Pending, got {poll:?}");
+        // flush #2 Ready → arm（建立起步闸）→ 写完成
+        let poll = Pin::new(&mut client).poll_write(&mut cx, &app);
+        assert!(matches!(poll, Poll::Ready(Ok(_))), "arm 后写必须完成, got {poll:?}");
+        assert!(client.raw_write_gate.is_some(), "arm 后起步闸必须建立");
+
+        let poll = Pin::new(&mut client).poll_shutdown(&mut cx);
+        assert!(matches!(poll, Poll::Ready(Ok(()))), "shutdown 不得停在起步闸上等待，got {poll:?}");
+        assert!(client.raw_write_gate.is_none(), "半关闭必须取消起步闸");
     }
 
     /// 帧感知读取对端 CommonConn 流上的 vision 帧，返回 (command, content)。
