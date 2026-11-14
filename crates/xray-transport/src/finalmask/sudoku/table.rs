@@ -558,12 +558,22 @@ fn table_cache() -> &'static parking_lot::Mutex<HashMap<TableCacheKey, Vec<Arc<T
 
 /// 规范化 customTables 列表（对应 Go `normalizedCustomPatterns`）。
 fn normalized_custom_patterns(
-    raw_patterns: &[String],
+    custom_tables: &[String],
+    custom_table: &str,
     mode: &'static str,
 ) -> Result<Vec<String>, String> {
     if mode == "prefer_ascii" {
         return Ok(vec![String::new()]);
     }
+
+    // Go `normalizedCustomPatterns`（table.go:161-166）：customTables 为空时回退单个
+    // customTable——漏这条会让配 customTable 的一侧落 entropy layout，与 Go 对端
+    // 双向解出垃圾字节（bd 7q5de F1）。
+    let raw_patterns: Vec<&str> = if custom_tables.is_empty() {
+        vec![custom_table]
+    } else {
+        custom_tables.iter().map(String::as_str).collect()
+    };
 
     let mut patterns = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -584,15 +594,16 @@ fn normalized_custom_patterns(
 
 /// 获取表集合（对应 Go `getTables`）。
 ///
-/// 参数：password、ascii 模式、customTables 列表。
+/// 参数：password、ascii 模式、customTables 列表、单个 customTable（列表为空时回退）。
 /// 返回每个 pattern 对应一张 table，编码时按 tableIndex 轮转使用。
 pub(crate) fn get_tables(
     password: &str,
     ascii: &str,
     custom_tables: &[String],
+    custom_table: &str,
 ) -> Result<Vec<Arc<Table>>, String> {
     let mode = normalize_ascii(ascii)?;
-    let patterns = normalized_custom_patterns(custom_tables, mode)?;
+    let patterns = normalized_custom_patterns(custom_tables, custom_table, mode)?;
 
     let key = TableCacheKey { password: password.to_string(), mode, patterns: patterns.clone() };
 
@@ -702,22 +713,22 @@ mod tests {
 
     #[test]
     fn get_tables_caches() {
-        let tables1 = get_tables("pw", "", &[]).unwrap();
-        let tables2 = get_tables("pw", "", &[]).unwrap();
+        let tables1 = get_tables("pw", "", &[], "").unwrap();
+        let tables2 = get_tables("pw", "", &[], "").unwrap();
         assert_eq!(tables1.len(), tables2.len());
         assert_eq!(tables1.len(), 1);
     }
 
     #[test]
     fn get_tables_ascii_mode() {
-        let tables = get_tables("pw", "ascii", &[]).unwrap();
+        let tables = get_tables("pw", "ascii", &[], "").unwrap();
         assert_eq!(tables.len(), 1);
         assert!(matches!(tables[0].layout, Layout::Ascii(_)));
     }
 
     #[test]
     fn get_tables_custom_mode() {
-        let tables = get_tables("pw", "", &["xxppvvvv".into()]).unwrap();
+        let tables = get_tables("pw", "", &["xxppvvvv".into()], "").unwrap();
         assert_eq!(tables.len(), 1);
         assert!(matches!(tables[0].layout, Layout::Custom(_)));
     }

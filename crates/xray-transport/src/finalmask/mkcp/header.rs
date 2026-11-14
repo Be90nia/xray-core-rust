@@ -105,26 +105,36 @@ impl Header for DnsHeader {
 
 /// 把域名打包成 DNS wire format（label 长度前缀 + 末尾 0）。
 ///
-/// 对应 Go `packDomainName`（简化版，不处理 `\.` 转义——真实场景的 domain 参数不含转义）。
+/// 对应 Go `packDomainName`；Go 侧调用点是 `packDomainName(domain+".")`
+/// （header_dns.go:32），本函数照抄该语义（末尾点等价于「终结最后一个 label」）——
+/// 域名自带末尾点时会产生一个空 label，长度比「先剥末尾点」多 1 字节；少这 1 字节
+/// 接收端剥头后整包错位（bd 7q5de F2）。
+///
+/// shortcut: 不处理 `\.` 转义（Go 的 `case '\\'` 分支）——配置域名不含转义即等价；
+/// 需要支持时按 Go 逐字节扫描改成可变缓冲。
 fn pack_domain_name(name: &str, out: &mut [u8]) -> io::Result<usize> {
-    let trimmed = name.strip_suffix('.').unwrap_or(name);
-    if trimmed.is_empty() {
-        out[0] = 0;
-        return Ok(1);
-    }
-    let mut off = 0usize;
-    for label in trimmed.split('.') {
-        if label.len() >= 0x40 {
+    let bytes = name.as_bytes();
+    let (mut off, mut begin) = (0usize, 0usize);
+    // 0..=len：`i == len` 就是 Go 追加的那个 `.`，同样终结最后一个 label。
+    for i in 0..=bytes.len() {
+        if i < bytes.len() && bytes[i] != b'.' {
+            continue;
+        }
+        let label_len = i - begin;
+        if label_len >= 0x40 {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "dns: label too long (>=64)"));
         }
-        if off + 1 + label.len() > out.len() {
+        if off + 1 + label_len > out.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "dns: buffer too small"));
         }
-        out[off] = label.len() as u8;
-        out[off + 1..off + 1 + label.len()].copy_from_slice(label.as_bytes());
-        off += 1 + label.len();
+        out[off] = label_len as u8;
+        out[off + 1..off + 1 + label_len].copy_from_slice(&bytes[begin..i]);
+        off += 1 + label_len;
+        begin = i + 1;
     }
-    out[off] = 0; // trailing zero
+    if off < out.len() {
+        out[off] = 0; // trailing zero
+    }
     Ok(off + 1)
 }
 
@@ -471,13 +481,16 @@ mod tests {
     }
 
     #[test]
-    fn dns_with_trailing_dot() {
+    fn dns_with_trailing_dot_gains_empty_label() {
+        // Go `packDomainName(domain+".")`：域名自带末尾点时多一个空 label（+1 字节）。
+        // 旧断言「两种写法字节相同」钉住的是「先剥末尾点」的错误行为（bd 7q5de F2，
+        // Go 实跑 "example.com"=29B / "example.com."=30B）。
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
         let na = pack_domain_name("a.b", &mut a).unwrap();
         let nb = pack_domain_name("a.b.", &mut b).unwrap();
-        assert_eq!(na, nb);
-        assert_eq!(a[..na], b[..nb]);
+        assert_eq!(a[..na], [1, b'a', 1, b'b', 0]);
+        assert_eq!(b[..nb], [1, b'a', 1, b'b', 0, 0]);
     }
 
     #[test]
@@ -491,6 +504,17 @@ mod tests {
     fn dns_header_size_matches_template() {
         let h = DnsHeader::new("www.example.com").unwrap();
         assert!(h.size() > 12 + 4); // 12B fixed + name + 4B type/class
+    }
+
+    #[test]
+    fn dns_header_size_equals_go_pack_domain_name() {
+        // Go `NewHeaderDNS` 调 `packDomainName(domain+".")`（header_dns.go:32）；
+        // 域名自带末尾点时末尾空 label 再贡献 1 字节。Rust 曾剥掉末尾点 ⇒ 头短 1 字节，
+        // 接收端剥头后整包错位（bd 7q5de F2）。数值由 Go 侧实跑 `NewHeaderDNS().Size()` 给出。
+        assert_eq!(DnsHeader::new("").unwrap().size(), 18);
+        assert_eq!(DnsHeader::new("example.com.").unwrap().size(), 30);
+        assert_eq!(DnsHeader::new("example.com").unwrap().size(), 29);
+        assert_eq!(DnsHeader::new("www.baidu.com").unwrap().size(), 31);
     }
 
     #[test]

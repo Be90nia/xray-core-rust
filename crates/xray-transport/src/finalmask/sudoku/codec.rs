@@ -311,7 +311,7 @@ mod tests {
     use super::{super::table::get_tables, *};
 
     fn make_tables() -> Vec<Arc<Table>> {
-        get_tables("test_codec", "", &[]).unwrap()
+        get_tables("test_codec", "", &[], "").unwrap()
     }
 
     #[test]

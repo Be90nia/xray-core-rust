@@ -15,6 +15,8 @@
 // 4t8 的 `Client(conn)/Server(conn) net.Conn` 包装层（Go http.go:284-308）
 // 把 reader/writer 串成异步包装。Rust 端异步包装是单独任务。
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::authenticator::{
     HeaderAuthenticator, HeaderConfig, HeaderError, HeaderNameValues, MAX_HEADER_LENGTH,
     RequestConfig, ResponseConfig, pick_string,
@@ -246,12 +248,30 @@ pub fn render_response(resp: &ResponseConfig) -> Vec<u8> {
     }
     if !resp.has_header("Date") {
         out.push_str("Date: ");
-        // 不引入 chrono；输出 RFC1123 的占位（精确日期由调用方注入）。
-        out.push_str("Thu, 01 Jan 1970 00:00:00 GMT");
+        // 走 ADR-2 进程级时钟能力入口（兜底 = 裸 SystemTime::now，测试可注入）
+        out.push_str(&http_date(xray_frame::compat::clock().now_system()));
         out.push_str(CRLF);
     }
     out.push_str(CRLF);
     out.into_bytes()
+}
+
+/// 渲染 Go `http.TimeFormat`（`Mon, 02 Jan 2006 15:04:05 GMT` = RFC1123 固定 GMT）。
+///
+/// 对应 Go `formResponseHeader` 的 `time.Now().Format(http.TimeFormat)`（http.go:248-252）。
+/// 日期段复用 udf `std_ext::clock::rfc3339`（免引入 chrono），星期由 epoch 天数直接推出
+/// （1970-01-01 是周四），不重复实现公历换算。
+fn http_date(time: SystemTime) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    // 固定布局 "YYYY-MM-DDTHH:MM:SSZ"：切片与解析失败均不可达，失败只退化不改格式。
+    let rfc = std_ext::clock::rfc3339::format_rfc3339_seconds(time);
+    let days = time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400);
+    let weekday = WEEKDAYS[((days + 4) % 7) as usize];
+    let month = MONTHS[rfc[5..7].parse::<usize>().unwrap_or(1).clamp(1, 12) - 1];
+    format!("{weekday}, {} {month} {} {} GMT", &rfc[8..10], &rfc[0..4], &rfc[11..19])
 }
 
 /// 默认 400 Bad Request 响应（对应 Go resp.go:resp400）。
@@ -321,9 +341,39 @@ mod tests {
         let s = std::str::from_utf8(&bytes).unwrap();
         // 默认 status="200" reason="OK" version="1.1"
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
-        // Date 由 has_header=false 触发 fallback
-        assert!(s.contains("\r\nDate: Thu, 01 Jan 1970 00:00:00 GMT\r\n"));
+        // Date 由 has_header=false 触发 fallback（原先此处断言 1970 常量 = 钉旧错误行为，
+        // bd 7q5de F3 改成「渲染时刻 UTC」契约，见下方两个用例）
+        assert!(s.contains("\r\nDate: "));
         assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    /// `http_date` 与 Go `time.Now().Format(http.TimeFormat)` 同格式
+    /// （`Mon, 02 Jan 2006 15:04:05 GMT`）。黄金值独立来源：
+    /// `python -c "datetime.fromtimestamp(1700000000, timezone.utc).strftime('%a, %d %b %Y %H:%M:%S
+    /// GMT')"` ⇒ `Tue, 14 Nov 2023 22:13:20 GMT`（含星期进位与月名）。
+    #[test]
+    fn http_date_matches_go_http_time_format() {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(http_date(t), "Tue, 14 Nov 2023 22:13:20 GMT");
+    }
+
+    #[test]
+    fn response_header_date_is_render_time_utc() {
+        // 修前恒定输出 `Thu, 01 Jan 1970 00:00:00 GMT`（注释称"由调用方注入"，实际无注入点）
+        // ⇒ 恒定强指纹（bd 7q5de F3）。
+        let resp = ResponseConfig::chrome_default();
+        let before = SystemTime::now();
+        let s = String::from_utf8(render_response(&resp)).expect("utf8");
+        let after = SystemTime::now();
+        let line = s
+            .split("\r\n")
+            .find(|l| l.starts_with("Date: "))
+            .expect("fallback 必须补 Date 行")
+            .to_string();
+        assert!(!line.contains("1970"), "Date 不得是 1970 常量：{line}");
+        let window =
+            [format!("Date: {}", http_date(before)), format!("Date: {}", http_date(after))];
+        assert!(window.contains(&line), "Date 必须是渲染时刻的 UTC：{line}");
     }
 
     #[test]

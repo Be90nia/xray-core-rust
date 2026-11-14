@@ -17,7 +17,7 @@ use std::{io, sync::Arc};
 
 use async_trait::async_trait;
 use codec::{Codec, PackedDecoder, PackedEncoder, decode_bytes};
-use table::{Layout, get_tables};
+use table::{Layout, Table, get_tables};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{AsyncIo, Tcpmask, UDP_SIZE, UdpIo, Udpmask};
@@ -37,6 +37,12 @@ pub struct SudokuConfig {
     pub padding_min: u32,
     /// padding 概率上限 [0, 100]。
     pub padding_max: u32,
+}
+
+/// 按配置取表集合（两个 mask 入口共用；customTable/customTables 回退语义见
+/// [`get_tables`]，漏传 `custom_table` 会让配 customTable 的一侧落 entropy layout）。
+fn sudoku_tables(config: &SudokuConfig) -> Result<Vec<Arc<Table>>, String> {
+    get_tables(&config.password, &config.ascii, &config.custom_tables, &config.custom_table)
 }
 
 /// 规范化 padding 概率（对应 Go `normalizedPadding`）。
@@ -62,8 +68,8 @@ impl Udpmask for SudokuConfig {
                 "sudoku udp mask must be the innermost mask in chain",
             ));
         }
-        let tables = get_tables(&self.password, &self.ascii, &self.custom_tables)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tables =
+            sudoku_tables(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let (p_min, p_max) = normalized_padding(self);
         Ok(Box::new(SudokuUdpConn::new(raw, tables, p_min, p_max)))
     }
@@ -120,7 +126,7 @@ async fn tcp_bridge(
     let (mut inner_r, mut inner_w) = tokio::io::split(inner);
     let (mut pipe_r, mut pipe_w) = tokio::io::split(pipe);
 
-    let tables = match get_tables(&config.password, &config.ascii, &config.custom_tables) {
+    let tables = match sudoku_tables(&config) {
         Ok(t) => t,
         Err(e) => {
             // 静默 return 会让 mask 完全不通且无痕（bd 08wkx-e）。
@@ -321,6 +327,27 @@ mod tests {
         assert_eq!(normalized_padding(&c), (100, 100));
         let c = SudokuConfig { padding_min: 50, padding_max: 30, ..Default::default() };
         assert_eq!(normalized_padding(&c), (50, 50));
+    }
+
+    #[test]
+    fn custom_table_field_feeds_tables_when_custom_tables_empty() {
+        // Go `normalizedCustomPatterns`：customTables 为空时回退单个 customTable
+        // （table.go:161-166）。此前 Rust 只传 customTables ⇒ 配 customTable 时落
+        // entropy layout，与 Go 对端**双向解出垃圾字节且双方都不报错**（bd 7q5de F1）。
+        let single = SudokuConfig {
+            password: "pw".into(),
+            custom_table: "xxppvvvv".into(),
+            ..Default::default()
+        };
+        let tables = sudoku_tables(&single).expect("tables");
+        assert!(
+            matches!(tables[0].layout, Layout::Custom(_)),
+            "customTable 必须选中 custom layout"
+        );
+        // 与 customTables=["xxppvvvv"] 必须落到同一张表（同 password 同 pattern ⇒ 同缓存条目）
+        let listed = SudokuConfig { custom_tables: vec!["xxppvvvv".into()], ..single.clone() };
+        let listed_tables = sudoku_tables(&listed).expect("tables");
+        assert!(Arc::ptr_eq(&tables[0], &listed_tables[0]), "两种写法必须同表");
     }
 
     #[tokio::test]
