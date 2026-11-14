@@ -62,6 +62,54 @@ pub use params::{
 pub mod adapter;
 pub use adapter::EncConnectionAdapter;
 
+/// vision DIRECT 之后的「明文透传」指令：vision 侧翻转，ENC 层消费。
+///
+/// 语义对齐 Go `UnwrapRawConn` 在 ENC 下的行为（`proxy/proxy.go:719-729`：命中
+/// `*encryption.CommonConn` 时 `conn = commonConn.Conn`，`isEncryption` 跳过 TLS 解包）
+/// ——DIRECT 之后 payload 走 **ENC 之上** 的连接（外层 TLS），ENC 帧化停止。
+///
+/// 读/写各自独立翻转（Go 的读侧在收到 DIRECT 时切、写侧在自己的 DIRECT 帧确认上线后
+/// 切），故用两个原子位而非单一开关：一侧先翻不影响另一侧仍在进行的帧化。
+#[derive(Debug, Default)]
+pub struct SpliceDirectives {
+    bits: std::sync::atomic::AtomicU8,
+}
+
+impl SpliceDirectives {
+    const RAW_READ: u8 = 1;
+    const RAW_WRITE: u8 = 2;
+
+    /// 读侧开始透传（收到对端 DIRECT 帧后调用）。
+    pub fn engage_read(&self) {
+        self.engage(Self::RAW_READ);
+    }
+
+    /// 写侧开始透传（本方 DIRECT 帧确认上线后调用）。
+    pub fn engage_write(&self) {
+        self.engage(Self::RAW_WRITE);
+    }
+
+    /// 读侧是否已透传。
+    #[must_use]
+    pub fn raw_read(&self) -> bool {
+        self.engaged(Self::RAW_READ)
+    }
+
+    /// 写侧是否已透传。
+    #[must_use]
+    pub fn raw_write(&self) -> bool {
+        self.engaged(Self::RAW_WRITE)
+    }
+
+    fn engage(&self, bit: u8) {
+        self.bits.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn engaged(&self, bit: u8) -> bool {
+        self.bits.load(std::sync::atomic::Ordering::Acquire) & bit != 0
+    }
+}
+
 /// XTLS Vision 加密会话包装的连接 trait。
 ///
 /// 实现者承担：
@@ -77,6 +125,12 @@ pub trait EncryptionConn:
     fn close(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// 安装 DIRECT 之后的明文透传指令（bd tgf3v）。
+    ///
+    /// 默认 no-op：只有需要停止改写的层（[`CommonConn`](common_conn::CommonConn) 的
+    /// ENC 帧化）承接。非 ENC 组合不安装 ⇒ 行为与安装前逐字节一致。
+    fn set_splice_directives(&mut self, _directives: std::sync::Arc<SpliceDirectives>) {}
 }
 /// 0-RTT 票据被服务端拒绝（会话过期/清失，server miss 回噪声，Go server.go:210-222）
 /// 的专用错误消息。`CommonConn` 检测到后清空缓存并以此消息返回；dispatcher 的

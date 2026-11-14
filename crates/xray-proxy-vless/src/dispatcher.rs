@@ -504,8 +504,14 @@ async fn establish_conn(
     //     之前执行 `h.encryption.Handshake(conn)`，用加密层 (CommonConn/XorConn)
     //     包装原始连接。timeout 包裹全程：服务端黑洞（accept 后不回握手响应）
     //     时本条拨号超时报错，连接不悬挂。
+    // DIRECT 之后的明文透传指令（bd tgf3v）：ENC 组合才建。装到 ENC 层（供其停止
+    // 帧化）+ vision 层（在既有 DIRECT 点翻转），两侧各持一个 Arc 克隆。
+    let splice_directives = config
+        .enc_params
+        .as_ref()
+        .map(|_| std::sync::Arc::new(crate::encryption::SpliceDirectives::default()));
     if let Some(client) = enc_client {
-        let enc_conn = match Budget::tokio()
+        let mut enc_conn = match Budget::tokio()
             .deadline(handshake_timeout)
             .timeout(client.handshake(conn))
             .await
@@ -518,6 +524,9 @@ async fn establish_conn(
                 ));
             },
         };
+        if let Some(directives) = splice_directives.as_ref() {
+            enc_conn.set_splice_directives(std::sync::Arc::clone(directives));
+        }
         conn = Box::new(crate::encryption::EncConnectionAdapter::new(enc_conn));
     }
 
@@ -550,6 +559,9 @@ async fn establish_conn(
         // testseed：账户本地 padding 参数注入（对应 Go EncodeBodyAddons →
         // NewVisionWriter(account.Testseed)；不上 wire，len<4 时 builder 内兜底默认）。
         let mut vision = VisionConn::new(conn, uuid_bytes).with_padding_seed(&config.testseed);
+        if let Some(directives) = splice_directives.clone() {
+            vision = vision.with_splice_directives(directives);
+        }
         // Go 行为：postRequest 等 500ms 拿首块 client data,若拿不到就手动
         // 发一个空 content 的 padding 块（mb[0]=nil → VisionWriter 强制
         // XtlsPadding(None, CommandPaddingContinue) → 首块只有 uuid + 随机

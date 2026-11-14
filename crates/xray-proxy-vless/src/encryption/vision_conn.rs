@@ -133,6 +133,10 @@ pub struct VisionConn<C> {
     /// 已识别，但不是完整 record 组）⇒ DIRECT 静默不触发的批数。「vision 开着
     /// 但吞吐像 padding 态」的唯一现场证据（判定逻辑本身不改）。
     splice_fragmented_batches: u64,
+    /// DIRECT 之后的明文透传指令（ENC 组合专用，bd tgf3v）：vision 在既有 DIRECT
+    /// 点翻转对应位，ENC 层（`CommonConn`）见位即停止帧化 ⇒ payload 走 ENC 之上
+    /// 的连接（对齐 Go `UnwrapRawConn`）。非 ENC 组合为 `None`（零影响）。
+    splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
 }
 
 /// 上行待写帧：padded 帧字节 + 已写偏移 + 该帧对应的 caller 消费量 + 提交闸类别。
@@ -204,6 +208,7 @@ where
             raw_write_gate: None,
             splice_complete_batches: 0,
             splice_fragmented_batches: 0,
+            splice_directives: None,
         }
     }
 
@@ -214,6 +219,20 @@ where
     #[must_use]
     pub fn with_padding_seed(mut self, seed: &[u32]) -> Self {
         self.padding_seed = crate::encryption::vision::normalize_padding_seed(seed);
+        self
+    }
+
+    /// 注入 DIRECT 之后的明文透传指令（ENC 组合用，bd tgf3v）。
+    ///
+    /// 装上后：读侧收到对端 DIRECT、写侧自家 DIRECT 帧确认上线时，各自翻转对应位，
+    /// ENC 层随即停止帧化 ⇒ payload 走 ENC 之上的连接（Go `UnwrapRawConn` 语义，
+    /// proxy/proxy.go:719-729）。非 ENC 组合不调用（保持 `None`）。
+    #[must_use]
+    pub fn with_splice_directives(
+        mut self,
+        directives: std::sync::Arc<crate::encryption::SpliceDirectives>,
+    ) -> Self {
+        self.splice_directives = Some(directives);
         self
     }
 
@@ -266,6 +285,7 @@ where
             raw_write_gate: None,
             splice_complete_batches: 0,
             splice_fragmented_batches: 0,
+            splice_directives: None,
         }
     }
 
@@ -375,6 +395,11 @@ where
                             this.downlink_padding = false;
                         } else if cmd == COMMAND_PADDING_DIRECT as i32 {
                             this.downlink_padding = false;
+                            // DIRECT：payload 改走 ENC 之上的连接（Go `UnwrapRawConn`）。
+                            // 无 raw 通道（ENC 组合）时这就是唯一生效的切换点。
+                            if let Some(directives) = this.splice_directives.as_ref() {
+                                directives.engage_read();
+                            }
                             if this.raw_fallback.is_none() {
                                 this.raw_fallback = this
                                     .raw_tcp
@@ -762,6 +787,11 @@ where
             self.splice_armed = false;
             // Direct commit：switch 帧已确认上线，此后 caller 写入走裸流
             self.uplink_padding = false;
+            // ENC 组合：让 ENC 层停止帧化，payload 直接落到 ENC 之上（Go
+            // VisionWriter 切 `buf.NewWriter(UnwrapRawConn(conn))` 的等价形态）。
+            if let Some(directives) = self.splice_directives.as_ref() {
+                directives.engage_write();
+            }
             // 仅首次 arm（结构保证）：重复置位不得重建/重置起步闸计时——
             // 5ms 余量收紧后重置会把 raw 写背压拖过 1.5ms 恶性窗口数倍。
             if self.raw_write_gate.is_none() {

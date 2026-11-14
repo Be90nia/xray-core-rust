@@ -62,6 +62,9 @@ pub struct CommonConn<C> {
     /// 首写时取出拼接后清空）。
     pre_write: Option<Vec<u8>>,
     closed: bool,
+    /// DIRECT 之后的明文透传指令（vision 翻转、本层消费，bd tgf3v）。
+    /// `None` = 未安装（非 ENC 组合 / 未包装 vision）⇒ 行为与安装前逐字节一致。
+    splice: Option<std::sync::Arc<super::SpliceDirectives>>,
 }
 
 impl<C> CommonConn<C> {
@@ -98,6 +101,7 @@ where
             write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
+            splice: None,
         }
     }
 
@@ -125,6 +129,7 @@ where
             write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
+            splice: None,
         }
     }
 
@@ -154,6 +159,7 @@ where
             write_buf: Vec::with_capacity(16 + TLS_RECORD_HEADER_LEN + MAX_SEGMENT + TAG_LEN),
             write_pending: None,
             closed: false,
+            splice: None,
         }
     }
 }
@@ -214,6 +220,20 @@ where
                     this.decrypted_pos = 0;
                 }
                 return Poll::Ready(Ok(()));
+            }
+
+            // 2'. DIRECT 之后：payload 走 **ENC 之上** 的连接（对齐 Go
+            //     `UnwrapRawConn` 的 readV 读腿，proxy/proxy.go:733-757）。仅读侧收到
+            //     对端 DIRECT 才翻转；已解密的残余明文已在步骤 1 交付。
+            //     翻转即弃残留窗口：raw_buf 里只可能是「对端发完 DIRECT 就不再续写」的
+            //     半条 record（Go 同款清空，common.go 的 rawInput 亦被清），留着会让后续
+            //     透传字节被当成 record 头误解析。
+            if this.splice.as_ref().is_some_and(|d| d.raw_read()) {
+                if !this.raw_buf.is_empty() {
+                    this.raw_buf.clear();
+                    this.raw_pos = 0;
+                }
+                return Pin::new(&mut this.conn).poll_read(cx, buf);
             }
 
             // 2. 尝试从 raw_buf 窗口提取完整 record
@@ -387,6 +407,14 @@ where
                 }
             }
 
+            // 2'. DIRECT 之后：payload 直写 **ENC 之上** 的连接（Go VisionWriter 切
+            //     `buf.NewWriter(UnwrapRawConn(conn))` 的等价形态，proxy/proxy.go:346-350）。
+            //     能走到这里说明 in-flight 帧已在步骤 1 发完——vision 只在自家 DIRECT 帧
+            //     flush 确认后才翻转写位，故帧边界不会被打断。
+            if this.splice.as_ref().is_some_and(|d| d.raw_write()) {
+                return Pin::new(&mut this.conn).poll_write(cx, buf);
+            }
+
             // 2. 构造新段（全部写入常驻 write_buf 复用，零堆分配——Go 池化等价物）
             let n = buf.len().min(MAX_SEGMENT);
             if n == 0 {
@@ -438,6 +466,10 @@ impl<C> super::EncryptionConn for CommonConn<C>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + Sync,
 {
+    fn set_splice_directives(&mut self, directives: std::sync::Arc<super::SpliceDirectives>) {
+        self.splice = Some(directives);
+    }
+
     fn close(&mut self) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt;
@@ -632,6 +664,60 @@ mod tests {
     /// MaxNonce 耗尽边界（票 8jp6，Go common.go:134-141）：双向 nonce 各自钉在
     /// MAX_NONCE，首个记录须以旧钥（回绕 nonce 0）解开并以该记录换派生新 AEAD；
     /// 读侧若无轮换，open 以 nonce=MaxNonce 校验 tag 必败。轮换后新 AEAD 继续互通。
+    /// bd tgf3v：DIRECT 之后的透传指令——读/写两侧**各自独立**生效；未翻位时仍严格
+    /// 帧化（写 = TLS record 头 + tag，读 = 明文当 record 解必报错），翻位后字节原样
+    /// 过线。透传是「ENC 之上」语义（Go `UnwrapRawConn`），不是解码失败后的兜底。
+    #[tokio::test]
+    async fn splice_directives_bypass_framing_per_direction() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::encryption::{EncryptionConn as _, SpliceDirectives};
+
+        let (local_io, mut peer) = tokio::io::duplex(64 * 1024);
+        let key = b"united-key".to_vec();
+        let mut conn = CommonConn::new(
+            local_io,
+            Aead::new(b"ctx", &key, true),
+            Aead::new(b"ctx", &key, true),
+            true,
+            key.clone(),
+        );
+        let directives = std::sync::Arc::new(SpliceDirectives::default());
+        conn.set_splice_directives(std::sync::Arc::clone(&directives));
+
+        // 写侧未翻位：走 ENC 帧化（首 3 字节恒为 TLS record 头 0x17 0x03 0x03）。
+        conn.write_all(b"abc").await.unwrap();
+        conn.flush().await.unwrap();
+        let mut header = [0u8; TLS_RECORD_HEADER_LEN];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..3], &[23, 3, 3], "未翻位必须仍是 ENC record");
+        let body = usize::from(header[3]) << 8 | usize::from(header[4]);
+        let mut rest = vec![0u8; body];
+        peer.read_exact(&mut rest).await.unwrap();
+        assert_eq!(body, 3 + TAG_LEN, "record 体 = 明文 + AEAD tag");
+
+        // 写侧翻位：payload 原样落到 inner（ENC 之上）。
+        directives.engage_write();
+        let plain = b"plain-payload";
+        conn.write_all(plain).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut got = vec![0u8; plain.len()];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, plain, "翻位后必须逐字节原样");
+
+        // 读侧未翻位：对端明文被当 record 头解析 ⇒ InvalidData（不是静默吞错）。
+        peer.write_all(b"not-a-record").await.unwrap();
+        let mut buf = [0u8; 32];
+        let err = conn.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // 读侧翻位（独立于写侧）：残留窗口被清空，后续字节原样读出。
+        directives.engage_read();
+        peer.write_all(b"read-plain").await.unwrap();
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"read-plain");
+    }
+
     #[tokio::test]
     async fn round_trip_rotates_at_max_nonce() {
         use crate::encryption::aead::MAX_NONCE;

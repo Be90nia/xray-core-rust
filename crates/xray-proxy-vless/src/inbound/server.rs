@@ -443,12 +443,24 @@ where
     // 连接先跑 ML-KEM-768/X25519 握手（1-RTT 或 0-RTT ticket）再进 VLESS 编码层。
     // decryption 与 fallbacks 在 Go conf 层互斥（vless.go:157-159），故握手置于
     // fallback 预读之前。
+    // DIRECT 之后的明文透传指令（bd tgf3v）：ENC 组合才建。装到 ENC 层（停止帧化）+
+    // vision 层（既有 DIRECT 点翻转）。对称于客户端 dispatcher 的同款接线。
+    let splice_directives = options
+        .as_ref()
+        .is_some_and(|o| o.decryption.is_some())
+        .then(|| std::sync::Arc::new(crate::encryption::SpliceDirectives::default()));
     let stream: std::pin::Pin<Box<dyn ErasedConn>> =
         match options.as_ref().and_then(|o| o.decryption.clone()) {
-            Some(dec) => Box::pin(dec.handshake(stream).await.map_err(|e| {
-                INBOUND_LOG.info(format!("vless enc handshake failed error={e}"));
-                std::io::Error::other(format!("vless enc handshake: {e}"))
-            })?),
+            Some(dec) => {
+                let mut enc = dec.handshake(stream).await.map_err(|e| {
+                    INBOUND_LOG.info(format!("vless enc handshake failed error={e}"));
+                    std::io::Error::other(format!("vless enc handshake: {e}"))
+                })?;
+                if let Some(directives) = splice_directives.as_ref() {
+                    enc.set_splice_directives(std::sync::Arc::clone(directives));
+                }
+                Box::pin(enc)
+            },
             None => Box::pin(stream),
         };
 
@@ -470,7 +482,16 @@ where
     // 无 fallback 策略：维持原直连路径（不做 first 预读；deadline 由
     // handle_connection 内部建立，语义同上）
     let Some(policy) = fallbacks else {
-        return handle_connection(stream, handler, validator, options, raw_tcp, plugin_ctx).await;
+        return handle_connection_inner(
+            stream,
+            handler,
+            validator,
+            options,
+            raw_tcp,
+            splice_directives,
+            plugin_ctx,
+        )
+        .await;
     };
 
     let (mut read_half, write_half) = tokio::io::split(stream);
@@ -539,7 +560,15 @@ where
             ..Default::default()
         };
         return finish_vless_dispatch(
-            reader, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
+            reader,
+            write_half,
+            decoded,
+            handler,
+            options,
+            raw_tcp,
+            access,
+            splice_directives,
+            plugin_ctx,
         )
         .await;
     }
@@ -664,6 +693,7 @@ async fn finish_vless_dispatch<R, W>(
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
     access: xray_app_dispatcher::AccessContext,
+    splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
     plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
@@ -715,13 +745,31 @@ where
         }
         let restored = AsyncReadExt::chain(std::io::Cursor::new(first[..n].to_vec()), reader);
         return finish_vless_command(
-            restored, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
+            restored,
+            write_half,
+            decoded,
+            handler,
+            options,
+            raw_tcp,
+            access,
+            splice_directives,
+            plugin_ctx,
         )
         .await;
     }
 
-    finish_vless_command(reader, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx)
-        .await
+    finish_vless_command(
+        reader,
+        write_half,
+        decoded,
+        handler,
+        options,
+        raw_tcp,
+        access,
+        splice_directives,
+        plugin_ctx,
+    )
+    .await
 }
 
 /// [`finish_vless_dispatch`] 的后半段：flow 五臂校验 → 响应头 → 按 command 分派。
@@ -737,6 +785,7 @@ async fn finish_vless_command<R, W>(
     options: Option<VlessInboundOptions>,
     raw_tcp: Option<TcpStream>,
     access: xray_app_dispatcher::AccessContext,
+    splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
     plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()>
 where
@@ -770,11 +819,19 @@ where
         access.allowed_network = Some(Network::UDP);
     }
 
-    // 3. 按 command 分派
-    let enc = options.as_ref().is_some_and(|o| o.decryption.is_some());
+    // 3. 按 command 分派（ENC 在场 ⇔ 透传指令已建，见 handle_connection_with_fallback）
     match decoded.command {
         VlessCommand::Tcp => {
-            finish_tcp_dispatch(reader, write_half, &decoded, handler, raw_tcp, &access, enc).await
+            finish_tcp_dispatch(
+                reader,
+                write_half,
+                &decoded,
+                handler,
+                raw_tcp,
+                &access,
+                splice_directives,
+            )
+            .await
         },
         VlessCommand::Udp => {
             handle_udp_relay(reader, write_half, &decoded, handler, udp_idle_timeout(), plugin_ctx)
@@ -795,7 +852,7 @@ async fn finish_tcp_dispatch<R, W>(
     handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
     raw_tcp: Option<TcpStream>,
     access: &xray_app_dispatcher::AccessContext,
-    enc: bool,
+    splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -831,6 +888,7 @@ where
     // 而 Go `UnwrapRawConn` 在 ENC 下返回的是**ENC 之上**的 TLS 连接——拿裸 TCP 切直通
     // 会把 payload 写到外层 TLS 之下，对端外层 TLS 直接 BAD_DECRYPT（HTTPS 载荷实测）。
     // 无 raw 通道时 DIRECT 退化为「只关 padding」，payload 继续走 CommonConn 帧化。
+    let enc = splice_directives.is_some();
     let link = match (vision_uuid, raw_tcp, enc) {
         (Some(uuid), Some(raw), false) => {
             let stream: Box<dyn VlessStream> = Box::new(
@@ -843,7 +901,10 @@ where
         (Some(uuid), Some(_), true) => {
             let stream: Box<dyn VlessStream> = Box::new(
                 VisionConn::new_server_no_splice(tokio::io::join(reader, write_half), uuid)
-                    .with_padding_seed(seed),
+                    .with_padding_seed(seed)
+                    .with_splice_directives(
+                        splice_directives.expect("enc arm implies directives present"),
+                    ),
             );
             let (rh, wh) = tokio::io::split(stream);
             Link::new(new_reader(rh), new_writer(wh))
@@ -1096,6 +1157,23 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     // §3.5.6 ①类托管：UDP uplink 拆分任务的 spawn 归 arm ctx。
     plugin_ctx: &Arc<xray_frame::PluginContext>,
 ) -> std::io::Result<()> {
+    // 公开入口（xray-core REALITY 路直调）：ENC 握手不在此处发生，故不建 DIRECT
+    // 透传指令（该路 ENC 握手缺口见 bd tgf3v 报告残留）。生产 tcp/tls 路经
+    // `handle_connection_with_fallback` → `handle_connection_inner` 注入。
+    handle_connection_inner(stream, handler, validator, options, raw_tcp, None, plugin_ctx).await
+}
+
+#[allow(clippy::too_many_arguments)] // 内层在公开入口基础上多一个 ENC 透传指令
+async fn handle_connection_inner<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    handler: &Arc<dyn xray_app_dispatcher::DispatchHandler>,
+    validator: &Arc<dyn Validator>,
+    options: Option<VlessInboundOptions>,
+    raw_tcp: Option<TcpStream>,
+    splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
+    // §3.5.6 ①类托管：UDP uplink 拆分任务的 spawn 归 arm ctx。
+    plugin_ctx: &Arc<xray_frame::PluginContext>,
+) -> std::io::Result<()> {
     let mut stream = stream;
 
     // 握手限时（Go inbound.go:281-284：decode 前 SetReadDeadline(policy 或
@@ -1127,7 +1205,15 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     };
     let (read_half, write_half) = tokio::io::split(stream);
     finish_vless_dispatch(
-        read_half, write_half, decoded, handler, options, raw_tcp, access, plugin_ctx,
+        read_half,
+        write_half,
+        decoded,
+        handler,
+        options,
+        raw_tcp,
+        access,
+        splice_directives,
+        plugin_ctx,
     )
     .await
 }
