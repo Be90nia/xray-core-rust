@@ -148,20 +148,26 @@ async fn missing_section_fails_fast_at_build() {
     assert!(matches!(err, PluginError::Config(_)), "实际: {err}");
 }
 
-/// L5 装配门负向：legacy `alterId`≠0 → build `Err`（同规生产
-/// `build_vmess_validator` 硬错，拒启不静默忽略）。
+/// L5：legacy `alterId`≠0 **不拒启**——同 Go `infra/conf/vmess.go:20-24`（VMessAccount
+/// 无 alterId 字段 ⇒ JSON 未知键被忽略、配置照常启动），也同规生产主路
+/// `build_vmess_validator`（xray-core/src/inbound.rs）的 WARN+忽略（bd fpmj8）。
 #[tokio::test]
-async fn legacy_alter_id_fails_fast_at_build() {
-    let err = Framework::builder(framework_options())
+async fn legacy_alter_id_is_warned_and_ignored_at_build() {
+    let plugin = Arc::new(VmessPlugin::default());
+    Framework::builder(framework_options())
         .expect("registry cap")
         .with_config(vmess_inbound_config(json!({
             "clients": [{ "id": UUID_A, "alterId": 64 }]
         })))
-        .register(Arc::new(VmessPlugin::default()) as Arc<dyn Plugin>)
+        .register(Arc::clone(&plugin) as Arc<dyn Plugin>)
         .expect("register")
         .build()
-        .expect_err("alterId=64 必须 fail-fast");
-    assert!(err.to_string().contains("not supported"), "实际: {err}");
+        .expect("alterId=64 必须照常建（Go 忽略未知键）");
+    assert_eq!(
+        Validator::count(&**plugin.built_validator().expect("built")),
+        1,
+        "alterId 是残留键，用户照常建"
+    );
 }
 
 /// L5 装配门负向：vnext 多成员 → build `Err`（Go 同规：多端点须拆多出站 + balancer）。

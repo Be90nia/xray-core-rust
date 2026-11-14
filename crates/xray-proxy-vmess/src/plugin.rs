@@ -7,14 +7,14 @@
 //!   fail-fast，坑约束 7 装配半边）。
 //! - **L3**：无裸能力（无 println/裸 spawn/裸 sleep/Instant）。
 //! - **L4**：`assert_plugin_contract!(VmessPlugin)`（tests/plugin_contract.rs）。
-//! - **L5**：装配门——缺段 / alterId≠0 / vnext 形态非法 → build `Err` → 整链 fail-visible。
+//! - **L5**：装配门——缺段 / vnext 形态非法 → build `Err` → 整链 fail-visible。
 //!
 //! wire 零改动：`aead/`（KDF + AuthID）、`encoding/`（body chunk / size parser）、
 //! `inbound/`、`outbound/` 一行不动。插件只做配置解析与构建接缝：
 //! - 出站面复用 crate 既有 [`parse_vmess_config`] + [`make_vmess_dial_fn`]（生产同源）；
 //! - 入站面用 crate 既有 [`MemoryAccount`] / [`MemoryUser`] / [`Validator`] 装配用户表。
 //! - 用户表语义同规 `xray-core` 的 `build_vmess_validator`：clients 覆盖 users。
-//! - `default.level` 为 level 回落；alterId≠0 与非法 UUID 硬错。
+//! - `default.level` 为 level 回落；alterId≠0 只 warn（同 Go 静默忽略，bd fpmj8）；非法 UUID 硬错。
 //! - 与 core 的解析面收敛属 P3 入口收口，此处不回头改 core。
 //!
 //! **AEAD KDF 是每连接 CPU 成本**（互喂禁入面）：插件不包装认证/加密路径，也不引入
@@ -34,7 +34,6 @@ use xray_frame::{
 use crate::{
     account::MemoryAccount,
     dispatcher::{VmessOutboundConfig, make_vmess_dial_fn, parse_vmess_config},
-    error::VmessError,
     validator::{MemoryUser, TimedUserValidator, Validator},
 };
 
@@ -199,7 +198,8 @@ fn parse_section(section: &serde_json::Value) -> Result<VmessFace, PluginError> 
 /// `{"clients":[{"id":"uuid","level":0,"alterId":0,"email":""}]}`）：
 /// - `clients` 键在场（非 null，含空数组）完全覆盖 `users`（Go vmess.go:73-75）；
 /// - `default.level` 是用户缺 level 时的回落（Go VMessDefaultConfig）；
-/// - `alterId`≠0 = legacy VMess 意图，AEAD-only 直接拒启（数字/字符串都认）；
+/// - `alterId`≠0 = legacy VMess 配置残留，只 warn 不拒启（Go 同语义：`infra/conf/vmess.go:20-24` 的
+///   Account 无 alterId 字段，JSON 未知键被忽略）；数字/字符串都认；
 /// - UUID 非法 / 重名用户分别硬错 / warn+skip。
 fn parse_inbound_validator(
     settings: &serde_json::Value,
@@ -227,13 +227,13 @@ fn parse_inbound_validator(
                 .get("alterId")
                 .and_then(|x| x.as_i64().or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok())))
                 .unwrap_or(0);
+            // Go `infra/conf/vmess.go:20-24` 的 VMessAccount 无 alterId 字段 ⇒
+            // encoding/json 忽略未知键、配置照常启动（AEAD 本就不用 alterId）。
+            // 同规生产 `build_vmess_validator`：只 warn 不拒启——旧 v2rayN 配置普遍带
+            // `"alterId": 64`，拒启等于整入站消失（bd fpmj8）。
             if alter_id != 0 {
-                crate::VMESS_LOG.warn(format!(
-                    "vmess inbound: legacy VMess is not supported alter_id={alter_id}"
-                ));
-                return Err(PluginError::Other(
-                    VmessError::UnsupportedLegacyAlterId(alter_id).to_string().into(),
-                ));
+                crate::VMESS_LOG
+                    .warn(format!("vmess inbound: ignoring legacy alterId={alter_id} (AEAD-only)"));
             }
             let uuid =
                 UUID::parse(id).ok_or_else(|| PluginError::Other("vmess invalid uuid".into()))?;
@@ -297,12 +297,18 @@ mod tests {
         assert_eq!(Validator::count(&*null_case), 1, "clients: null 回落 users");
     }
 
+    /// bd fpmj8：alterId≠0 只 warn 不拒启（Go `infra/conf/vmess.go:20-24` 的 Account
+    /// 无 alterId 字段 ⇒ encoding/json 忽略未知键、配置照常启动）。旧 v2rayN 配置普遍带
+    /// `"alterId": 64`，拒启等于整入站消失。字符串形态（老配置生成器输出）同等忽略。
     #[test]
-    fn legacy_alter_id_is_rejected_not_ignored() {
-        let err = parse_err(&json!({
-            "clients": [{ "id": UUID_A, "alterId": "64" }]
-        }));
-        assert!(err.to_string().contains("not supported"), "实际: {err}");
+    fn legacy_alter_id_is_warned_and_ignored() {
+        let VmessFace::Inbound(validator) =
+            parse_section(&json!({ "clients": [{ "id": UUID_A, "alterId": "64" }] }))
+                .expect("alterId≠0 不得拒启")
+        else {
+            panic!("入站段必须解析为 Inbound")
+        };
+        assert_eq!(Validator::count(&*validator), 1, "alterId 是残留键，用户照常建");
     }
 
     #[test]
@@ -379,13 +385,15 @@ mod tests {
     }
 
     #[test]
-    fn legacy_and_invalid_uuid_paths_never_leak_raw_uuid() {
+    fn legacy_alter_id_and_invalid_uuid_paths_never_leak_raw_uuid() {
         let log = SharedBuf::default();
         let _guard = capture_log(log.clone());
 
-        let err = parse_err(&json!({ "clients": [{ "id": UUID_A, "alterId": 64 }] })).to_string();
-        assert!(err.contains("legacy VMess"), "错误链: {err}");
-        assert!(!err.contains(UUID_A), "错误链泄露 UUID: {err}");
+        // alterId≠0 只 warn 不拒启（bd fpmj8）；诊断留 alterId，不落 UUID 凭据（S-11）。
+        assert!(
+            parse_section(&json!({ "clients": [{ "id": UUID_A, "alterId": 64 }] })).is_ok(),
+            "alterId≠0 不得拒启"
+        );
 
         let bad_id = "x".repeat(40);
         let err = parse_err(&json!({ "clients": [{ "id": bad_id }] })).to_string();
@@ -393,7 +401,7 @@ mod tests {
         assert!(!err.contains(&bad_id), "错误链泄露 UUID: {err}");
 
         let out = log.snapshot();
-        assert!(out.contains("legacy VMess"), "warn 必须仍有诊断信息: {out}");
+        assert!(out.contains("ignoring legacy alterId=64"), "warn 必须仍有诊断信息: {out}");
         assert!(!out.contains(UUID_A), "日志泄露 UUID: {out}");
     }
 }
