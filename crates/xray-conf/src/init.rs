@@ -890,6 +890,67 @@ mod tests {
             .expect("plain tcp/tls must pass");
     }
 
+    /// bd yc54c G3/G4 端到端：两类 Go 配置期硬错必须**在配置装载期**（`post_process`
+    /// = 生产 funnel）报，不是启动/拨号后才报——h3 的 brutal（Go
+    /// `transport_internet.go:277-283`）与 xmux 双上限互斥（Go `XDriveConfig.Build:1031`）。
+    #[test]
+    fn strictness_rejects_xdrive_h3_brutal_and_xmux_double_limit() {
+        let _g = TEST_LOCK.lock();
+        clear_stages();
+        register_builtin_stages();
+        let enc = "mlkem768x25519plus.native.0rtt.GS1D3kYFox-0dmcTK1u-2LaiSB-iM_Kve8N4bT--DhE";
+        let mk_xd = |ss: serde_json::Value| {
+            let mut cfg = Config {
+                outbound_configs: vec![crate::config::OutboundDetourConfig {
+                    protocol: "vless".into(),
+                    tag: "ob".into(),
+                    stream_settings: Some(ss),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            cfg.outbound_configs[0].settings = Some(json!({
+                "vnext": [{"address": "s.example.com", "port": 443,
+                            "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                                        "encryption": enc}]}]
+            }));
+            cfg.outbound_configs[0].mux = Some(crate::config::MuxConfig {
+                enabled: true,
+                concurrency: 128,
+                ..Default::default()
+            });
+            cfg
+        };
+        // h3 + brutal ⇒ 配置装载期拒。
+        let err = post_process(&mut mk_xd(json!({
+            "network": "xdrive", "security": "tls", "tlsSettings": {"alpn": ["h3"]},
+            "xdriveSettings": {"service": "local"},
+            "finalmask": {"quicParams": {"congestion": "brutal"}},
+        })))
+        .err()
+        .unwrap_or_else(|| panic!("h3 + brutal 必须在配置装载期拒"));
+        assert!(err.to_string().contains("XDRIVE: brutal is for Hysteria servers"), "{err}");
+        // xmux 双上限 ⇒ 配置装载期拒（旧时点差：拖到建池才失败）。
+        let err = post_process(&mut mk_xd(json!({
+            "network": "xdrive",
+            "xdriveSettings": {"service": "local", "xmux": {
+                "maxConnections": {"from": 1, "to": 1},
+                "maxConcurrency": {"from": 1, "to": 1},
+            }},
+        })))
+        .err()
+        .unwrap_or_else(|| panic!("xmux 双上限必须在配置装载期拒"));
+        assert!(err.to_string().contains("maxConnections cannot be specified together"), "{err}");
+        // 正例：h3 + bbr + 单侧 xmux 上限放行。
+        post_process(&mut mk_xd(json!({
+            "network": "xdrive", "security": "tls", "tlsSettings": {"alpn": ["h3"]},
+            "xdriveSettings": {"service": "local",
+                               "xmux": {"maxConnections": {"from": 2, "to": 2}}},
+            "finalmask": {"quicParams": {"congestion": "bbr"}},
+        })))
+        .unwrap_or_else(|e| panic!("h3 + bbr + 单侧上限必须放行: {e}"));
+    }
+
     #[test]
     fn strictness_allows_pinned_peer_cert_sha256() {
         let _g = TEST_LOCK.lock();

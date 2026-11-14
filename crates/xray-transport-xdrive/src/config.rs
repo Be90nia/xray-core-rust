@@ -126,6 +126,10 @@ impl Config {
         })
         .and_then(|config| {
             validate_service_shape(&config)?;
+            // xmux 双上限互斥（Go `XDriveConfig.Build:1031-1033`）在**配置装载期**拒：
+            // 调用连接期同一解析件（单源判据，禁复制）；旧时点差 = 拖到建池才失败
+            // （bd yc54c G4）。缺省填充结果在此丢弃——装配点自会再算一次。
+            crate::client::xdrive_xmux_config(config.xmux.as_ref(), &config.service, false)?;
             Ok(config)
         })
     }
@@ -305,6 +309,35 @@ mod tests {
             ),
             "{}",
             err
+        );
+    }
+
+    /// Go `XDriveConfig.Build:1031-1033`：双上限同配在**配置装载期**就拒（旧态 Rust
+    /// 拖到建池的 `xdrive_xmux_config`；同一件现被配置期调用，单源判据）。
+    #[test]
+    fn xmux_double_limit_rejected_at_config_time() {
+        let err = Config::from_config_json(Some(&serde_json::json!({
+            "service": "local",
+            "remoteFolder": "/tmp/x",
+            "xmux": {
+                "maxConnections": {"from": 1, "to": 1},
+                "maxConcurrency": {"from": 1, "to": 1},
+            },
+        })))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("maxConnections cannot be specified together with maxConcurrency"),
+            "{err}"
+        );
+        // 只配一个上限（Go `To > 0` 单侧）→ 放行。
+        assert!(
+            Config::from_config_json(Some(&serde_json::json!({
+                "service": "local",
+                "remoteFolder": "/tmp/x",
+                "xmux": {"maxConnections": {"from": 2, "to": 2}},
+            })))
+            .is_ok()
         );
     }
 }

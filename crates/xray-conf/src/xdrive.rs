@@ -96,6 +96,28 @@ pub fn validate_xdrive(
                 }
             }
         }
+        // brutal 面（Go `transport_internet.go:277-283`）：h3 只认 bbr/reno——brutal 是
+        // Hysteria 服务端的形态。Go 在 StreamConfig.Build 即拒；旧态 Rust 拖到 h3 建连
+        // （`apply_h3_cc`）才报 ⇒ 配置期硬错（bd yc54c G3）。Go 判据比对的是 Build 后
+        // 已 `ToLower` 的值（`transport_finalmask.go:1235`）⇒ 此处同样归一后比较，
+        // 文案里的取值也是归一形态。
+        let congestion = stream_settings
+            .and_then(|ss| ss.get("finalmask"))
+            .and_then(|fm| fm.get("quicParams"))
+            .and_then(|q| q.get("congestion"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if congestion == "brutal" || congestion == "force-brutal" {
+            return Err(lint_err(
+                kind,
+                tag,
+                &format!(
+                    "XDRIVE: brutal is for Hysteria servers, over h3 \"congestion\" is \"bbr\" \
+                     or \"reno\", not \"{congestion}\""
+                ),
+            ));
+        }
     }
     match kind {
         "outbound" => validate_outbound(kind, tag, settings, mux),
@@ -416,6 +438,54 @@ mod tests {
             .is_ok(),
             "缺 finalmask 门不触发"
         );
+    }
+
+    // ===== G3：h3 的 brutal 面（Go transport_internet.go:277-283）=====
+
+    #[test]
+    fn h3_rejects_brutal_congestion() {
+        let user = vnext_user(json!({"id": UUID, "encryption": CLIENT_ENC}));
+        let mux = mux_ok();
+        let ss = |alpn: serde_json::Value, congestion: &str| {
+            json!({
+                "network": "xdrive",
+                "security": "tls",
+                "tlsSettings": {"alpn": alpn},
+                "xdriveSettings": {"service": "local", "remoteFolder": "f"},
+                "finalmask": {"quicParams": {"congestion": congestion}},
+            })
+        };
+        let check = |alpn: serde_json::Value, congestion: &str| {
+            validate_xdrive(
+                "outbound",
+                "ob",
+                "vless",
+                Some(&user),
+                Some(&ss(alpn, congestion)),
+                Some(&mux),
+                None,
+            )
+        };
+        // 反例：h3 + brutal / force-brutal → 拒，文案逐字对齐 Go :279。
+        for bad in ["brutal", "force-brutal"] {
+            let err = check(json!(["h3"]), bad).expect_err("h3 + brutal 必须拒");
+            assert!(
+                err.to_string().contains(&format!(
+                    "XDRIVE: brutal is for Hysteria servers, over h3 \"congestion\" is \"bbr\" \
+                     or \"reno\", not \"{bad}\""
+                )),
+                "{err}"
+            );
+        }
+        // 大小写：Go Build 先 ToLower 再判 ⇒ "Brutal" 同拒，文案是归一形态。
+        let err = check(json!(["h3"]), "Brutal").expect_err("Brutal 归一后同拒");
+        assert!(err.to_string().contains("not \"brutal\""), "{err}");
+        // 正例：bbr / reno / 无 congestion 放行（Go 只截 brutal 与 force-brutal）。
+        for ok in ["bbr", "reno", ""] {
+            assert!(check(json!(["h3"]), ok).is_ok(), "{ok} 必须放行");
+        }
+        // 非 h3 ALPN → 门不触发（Go 判据在 xdriveH3 分支内）。
+        assert!(check(json!(["h2"]), "brutal").is_ok(), "非 h3 门不触发");
     }
 
     // ===== 出站六规则矩阵（正/反） =====
