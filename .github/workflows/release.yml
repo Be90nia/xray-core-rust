@@ -154,7 +154,29 @@ jobs:
             for f in crypto.lib ssl.lib include/openssl/ssl.h; do
               [ -e "$BORING_BSSL_PATH/$f" ] || { echo "::error::汇编预构建库缺 $f"; exit 1; }
             done
+            # 产物侧硬证据（bd jgj9l）：预构建目录存在 ≠ 构建出的二进制用了它。
+            # 历史上三次都是「目录在、产物静默回退 cmake→OPENSSL_NO_ASM」，门却绿。
+            # 唯一直接证据 = btls-sys 本次构建 output 里的 rustc-link-search。
+            out="$(ls -t "target/${{ matrix.target }}"/release/build/btls-sys-*/output 2>/dev/null | sed -n 1p || true)"
+            [ -n "$out" ] || { echo "::error::未找到 btls-sys 的构建 output，无法证明产物链的是预构建汇编库"; exit 1; }
+            if ! tr '\\' '/' < "$out" | grep -Fq -- 'boringssl-asm/prebuilt'; then
+              echo "::error::btls-sys 未链接 boringssl-asm/prebuilt（疑似回退 cmake→OPENSSL_NO_ASM 慢库，31.6 vs 241.2 MB/s，bd jyipl）"
+              sed -n '1,40p' "$out"
+              exit 1
+            fi
+            echo "[ok] btls-sys 链接到 boringssl-asm/prebuilt"
+            # 脚本三终态（bd uuw0e）：0=PASS / 1=FAIL / 3=UNVERIFIED。
+            # Windows 走预构建路线，本就没有 CMakeCache ⇒ rc=3 属预期，以产物侧证据为准；
+            # 但 rc=1（有 cache 且判红 / 产物缺件）必须拦。
+            set +e
             python3 tools/build_boringssl_asm.py --check --src "$BORING_BSSL_SOURCE_PATH" --dest "$BORING_BSSL_PATH"
+            rc=$?
+            set -e
+            case "$rc" in
+              0) echo "[ok] 脚本判据全绿" ;;
+              3) echo "[info] 脚本判 UNVERIFIED（预构建路线无 CMakeCache，以产物侧 link-search 证据为准）" ;;
+              *) echo "::error::build_boringssl_asm --check 判红（rc=$rc）"; exit 1 ;;
+            esac
           else
             cache="$(ls -t "target/${{ matrix.target }}"/release/build/btls-sys-*/out/build/CMakeCache.txt 2>/dev/null | sed -n 1p || true)"
             if [ -z "$cache" ]; then
@@ -167,6 +189,14 @@ jobs:
               exit 1
             fi
             echo "[ok] CMakeCache 无 OPENSSL_NO_ASM（汇编开）"
+            # 补第二条判据（bd jgj9l）：仅有「无 NO_ASM」不足以证明汇编真编了 ——
+            # NASM 汇编器不可用时 cmake 也可能不写 NO_ASM，但会缺 WORKS=1。
+            if ! grep -Fq 'CMAKE_ASM_NASM_COMPILER_WORKS:INTERNAL=1' "$cache"; then
+              echo "::error::CMakeCache 缺 CMAKE_ASM_NASM_COMPILER_WORKS=1 → NASM 汇编器不可用，汇编未编入"
+              grep -E 'CMAKE_ASM_NASM|OPENSSL_NO_ASM' "$cache" || true
+              exit 1
+            fi
+            echo "[ok] CMakeCache 含 CMAKE_ASM_NASM_COMPILER_WORKS=1（NASM 可用）"
           fi
 
       # bd 3t30l：发布产物此前「只构建、零测试」——发出去的二进制从未在任何门里跑过。
