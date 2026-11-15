@@ -281,7 +281,7 @@ fn warn_rejected<T>(log: &LogFacade, label: &str, spawned: &Result<Spawned<T>, S
 /// 收割语义与 JoinSet 归属（条目有界，panic 上报延迟 ≤ `REAP_EVERY` 次 spawn）。
 ///
 /// **本件不落拒发日志**（bd i43c3）：拒发告警归调用方——需要 WARN 的走
-/// [`spawn_reaping`]/[`spawn`]（内部 [`warn_rejected`]），自有计数面的走
+/// [`spawn_reaping`]/[`spawn`]（内部 `warn_rejected`），自有计数面的走
 /// [`crate::scope`]（计数 + DEBUG，禁 WARN）。
 #[inline(always)]
 pub fn spawn_reaping_ticked<T>(

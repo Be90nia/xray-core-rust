@@ -27,13 +27,21 @@
 //! - 广播唤醒（`notify_waiters`）而非 `notify_one`：被唤醒的等待者可能装不下
 //!   （大块优先），点对点唤醒会让其余等待者漏唤醒。公平性由 CAS 竞争提供：
 //!   先到先得，无饥饿保证但无忙旋。
+//! - **背压计数**（`InflightBudget::backpressure_waits`）与**峰值**（`InflightBudget::peak`）：
+//!   运维区别「闸在承载过载」与「网络故障」的判据（bd uaoby R-3）。
+//! - **实况重探测**（`InflightBudget::resample`）：启动档位是单点 `MemAvailable`
+//!   快照（开机时别人占着内存就永久落小档，bd uaoby R-4）。慢路径在触顶时每 4096
+//!   次背压至多重算一次容量（幅度 < 1/8 视为噪声不动），实况变差收紧、变好放宽。容量恒由实况派生 ⇒
+//!   物理装不下时仍是背压，不是拒绝。**只有合计这一把杠杆
+//!   跟随实况**：单连接闸（`bridge_gate`）与连接软上限仍是启动快照——它们不是内存
+//!   上界（前者只是单连接上界，后者触顶只 WARN），物理上界由本预算独立兜住。
 //!
 //! 归属（CLAUDE.md §3.5.5）：预算容量绑 Xray 内存档位（`MemoryPlan`）⇒ Xray 语义
 //! ⇒ 派生层 `xray-frame`。记账机制本身零 Xray 语义，将来随 `MemoryPlan` 一起上浮。
 
 use std::sync::{
     Arc, LazyLock,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 use tokio::sync::Notify;

@@ -302,7 +302,6 @@ async fn run(
         stats.push(h.clone());
         // 26 条链路共享并发预算：每链路 1/8 档，避免 26×32 打爆动态端口
         load.spawn(sc::s1_short_burst(
-            port,
             *port,
             echo_port,
             (args.concurrency / 8).max(1),
