@@ -1971,9 +1971,9 @@ mod tests {
         assert_eq!(H2_MAX_SEND_BUF_PER_CONN_BYTES, 16 * 1024 * 1024);
     }
 
-    /// 服务端 h2 send_buf 按**内存档位**三档取值：tiny 8MiB / small 16MiB /
-    /// medium/large 32MiB（32MiB 对齐客户端收窗；32MiB 是上限非预约，真实在途 = BDP）。
-    /// 四档全断言，禁写字面量散落（期望值由常量派生）。
+    /// 服务端 h2 send_buf 按**内存档位**取值：tiny 8MiB / small|medium|large 32MiB
+    /// （2026-11-15 回归修正：small 16→32MiB，32MiB 对齐客户端收窗；32MiB 是上限非
+    /// 预约，真实在途 = BDP）。四档全断言，禁写字面量散落（期望值由常量派生）。
     #[test]
     fn h2_server_send_buf_follows_memory_tier() {
         use xray_frame::budget::plan::MemoryTier;
@@ -1983,9 +1983,9 @@ mod tests {
             xray_transport::h2_window::H2_SERVER_MAX_SEND_BUF_SIZE,
         );
         assert_eq!(tiny, 8 * 1024 * 1024, "tiny 档 8MiB（≤256MB 机器不赌大缓冲）");
-        assert_eq!(small, H2_MAX_SEND_BUF_PER_CONN_BYTES, "small 档 = 客户端收窗档 16MiB");
-        // 档位单调递增（tiny < small < medium|large）。
-        assert!(tiny < small && small < large, "档位 send_buf 必须随档位单调递增");
+        assert_eq!(small, large, "small 档 = medium|large 同值 32MiB（2026-11-15 回归修正）");
+        // 档位单调**不降**（tiny < small == medium|large）。
+        assert!(tiny < small && small <= large, "档位 send_buf 不得随档位下降");
         for (tier, expect) in [
             (MemoryTier::Tiny, tiny),
             (MemoryTier::Small, small),
@@ -2013,9 +2013,9 @@ mod tests {
                 tier.as_str()
             );
         }
-        // 服务端不得低于客户端（下载在飞上限 = min(两端)，低于客户端即自钉）——唯 tiny 档
-        // 例外：该档按 8MiB 保守取值（2026-11-13 用户拍板）。
-        for tier in [MemoryTier::Medium, MemoryTier::Large] {
+        // 服务端不得低于客户端（下载在飞上限 = min(两端)，低于客户端即自钉）——仅 tiny
+        // 档例外：该档按 8MiB 保守取值（2026-11-13 用户拍板）。
+        for tier in [MemoryTier::Small, MemoryTier::Medium, MemoryTier::Large] {
             assert!(
                 xray_transport::h2_window::h2_server_max_send_buf_for(tier)
                     >= H2_MAX_SEND_BUF_PER_CONN_BYTES,

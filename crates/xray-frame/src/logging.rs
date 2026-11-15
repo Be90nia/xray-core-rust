@@ -170,8 +170,15 @@ impl LogFacade {
     /// 掩码表 = 门面自持表 ∪ 进程级表（[`set_global_secrets`]），因为生产站点
     /// 普遍以 `vec![]` 构造门面（bd zb34d）。
     pub fn emit(&self, level: tracing::Level, message: impl fmt::Display) {
-        let masked = mask_with_facade_secrets(&self.secrets, &message.to_string());
         let metadata = self.metadata_for(level);
+        // 手动构造 Event 不经过 tracing 宏的 enabled 门（`Dispatch::event`
+        // 不做级别判断），必须显式查询订阅者兴趣——否则 RUST_LOG /
+        // `log.loglevel` 对门面路径完全失效（bd xag3 生产实证：配置
+        // warning + RUST_LOG=info 仍输出 DEBUG 心跳 17k 行/48h）。
+        if !tracing::dispatcher::get_default(|dispatch| dispatch.enabled(metadata)) {
+            return;
+        }
+        let masked = mask_with_facade_secrets(&self.secrets, &message.to_string());
         let message_field =
             metadata.fields().field("message").expect("message field declared in emit metadata");
         let values = [(&message_field, Some(&masked as &dyn tracing::field::Value))];

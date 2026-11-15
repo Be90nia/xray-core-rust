@@ -122,7 +122,9 @@ async fn run(
     let watchdog = Watchdog::arm(deadline + Duration::from_secs(120), || {
         println!("[xray-stress] watchdog: run exceeded duration, terminating");
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        std::process::exit(0);
+        // 非零退出：挂死 run 必须让 CI 失败（exit(0) 会让后续门禁把挂死读成成功，
+        // 压测路径评审 F2）。3 = watchdog 专用码，区别于 load/探针失败。
+        std::process::exit(3);
     });
     let mut stats: Vec<StatsHandle> = Vec::new();
     // 负载 worker 与基础设施（协议链服务实例）分池：drain 观察窗停负载、

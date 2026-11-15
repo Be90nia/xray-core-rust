@@ -7,8 +7,8 @@
 //! 3.3×–21× 过订（bd zbsbc 实测）。旧处置是「如实登记进 caps 栏 + WARN」，
 //! 因为**收紧连接数**会直接砍并发（四档只剩 4/4/4/8 条 = 功能回退，PM 打回）。
 //!
-//! 本件是那条上界的替代答案：跨连接合计由**一个进程级预算**兜住，容量取档位总预算
-//! 的一半（`default_total()` 返回档位总预算/2），因此
+//! 本件是那条上界的替代答案：跨连接合计由**一个进程级预算**兜住，容量取
+//! `inflight_budget_bytes`（`max(总预算/2, min(并发×闸×2, 可用/4))`），因此
 //! - 并发数**不降**（预算按字节记账，不按连接数截断）；
 //! - 合计在途 ≤ 预算（构造上自洽：许可未归还前不会被超发）；
 //! - 预算耗尽时**等待（背压）而非拒绝**——对齐 Go：上游没有连接总数硬限制， 它靠动态缓冲 +
@@ -158,16 +158,16 @@ pub fn global() -> &'static Arc<InflightBudget> {
     &GLOBAL
 }
 
-/// 缺省容量 = 档位总预算的一半（字节）。
+/// 缺省容量 = [`MemoryPlan::inflight_budget_bytes`](crate::budget::plan::MemoryPlan::inflight_budget_bytes)
+/// （唯一事实源：`max(total_budget/2, min(max_conns × bridge_gate × 2, available/4))`）。
 ///
-/// 为什么不取满 `total_budget`：整机预算还要装固定面（池/缓存/握手在飞）与瞬态面
-/// （xdns frag / QUIC 窗 / TUIC 信箱），数据面在途只该占自己那一半。四档得
-/// 20 / 48 / 96 / `min(available/8, 256)` MiB，最小的 tiny 档（20MiB）仍是实测 BDP
-/// 上沿 3.56MB 的 5.6×——预算在正常链路上不 binding（不砍吞吐），只在「写端持续
-/// 灌、读端不读」的堆积形态下生效。
+/// 2026-11-15 生产回归后修正：旧口径「恒取 total_budget/2」在 small 档只有 48MiB，
+/// 10 条 60MB/s@200ms 连接需 ~120MB ⇒ 每条分 ~4.8MB，吞吐按比例砍半且全协议同抖。
+/// 新容量按「并发 × 单方向闸」与「物理可用 1/4」双上界派生，多连接测速不再 binding；
+/// 超并发时仍背压（物理内存装不下就是装不下）。
 #[must_use]
 pub fn default_total() -> usize {
-    (crate::budget::plan::MemoryPlan::cached().total_budget / 2).max(1)
+    crate::budget::plan::MemoryPlan::cached().inflight_budget_bytes()
 }
 
 #[cfg(test)]

@@ -76,10 +76,11 @@
 //!   桥函数体内构造（up/down 各一道 ⇒ 每连接 2 道），当时**跨连接无聚合闸** ⇒ N 条连接 可同时 各占
 //!   2×闸，合计上界 = `max_conns × 2 × bridge_gate`（= caps 栏那行）， 无机制把它压回
 //!   预算内。**2026-11-15 起该上界由下条的进程级 in-flight 预算兜住**：闸值仍不进 `max_conns`
-//!   反解（砍并发 = 功能回退，bd 3gxez 裁决不变），但合计在途被 `total_budget / 2`
+//!   反解（砍并发 = 功能回退，bd 3gxez 裁决不变），但合计在途被 `inflight_budget_bytes`
 //!   封顶，超出的部分走等待（背压）而非拒绝。
 //! - **全局共享配额** ✅ 已落地（2026-11-15）：进程级 in-flight 预算
-//!   `MemoryPlan::inflight_budget_bytes`（= `total_budget / 2`），桥每方向每块在 per-conn
+//!   `MemoryPlan::inflight_budget_bytes`（= `max(总预算/2, min(并发×闸×2,
+//!   可用/4))`），桥每方向每块在 per-conn
 //!   闸之外再取一道全局许可（`xray_frame::budget::inflight`）；耗尽时**等待 （背压）而非拒绝**，故
 //!   `max_conns` 不降、乘积过订被跨连接聚合闸兜住。 `max_conns`
 //!   也就从「硬上限」降级为**软上限**（超档只 WARN + 计数，见
@@ -459,16 +460,26 @@ impl MemoryPlan {
         }
     }
 
-    /// 进程级 in-flight 预算容量（字节）= 档位总预算的一半。
+    /// 进程级 in-flight 预算容量（字节）。
     ///
     /// 桥每方向每块在 per-conn 闸之外再取这道许可（`xray_frame::budget::inflight`）：
-    /// 跨连接合计在途被它封顶，取不到就等待（背压）。为什么是一半：整机预算还要
-    /// 装固定面与瞬态面（见 `xray-core::memory_budget`），数据面只该占自己那半；
-    /// 四档 = 20 / 48 / 96 / `min(available/8, 256)` MiB，最小档仍是实测 BDP 上沿
-    /// （3.56MB）的 5.6× ⇒ 正常链路不 binding（不砍吞吐）。
+    /// 跨连接合计在途被它封顶，取不到就等待（背压）。
+    ///
+    /// 容量 = `max(total_budget/2, min(max_conns × bridge_gate × 2, available/4))`。
+    ///
+    /// 为什么不再恒取 `total_budget/2`（2026-11-15 生产实测回归）：单连接满载需求 ≈
+    /// BDP = 吞吐 × RTT（60MB/s × 200ms = 12MB，恰为 small 档桥闸 12MiB），跨连接
+    /// 合计 = 并发数 × 12MB。small 档旧值 48MiB 只够 4 条连接全速（10 条各分 4.8MB
+    /// ⇒ 吞吐按比例掉到 ~24MB/s，用户侧观感 = 「60 对半砍」且 ws/xhttp 全族同抖）。
+    /// 新容量按「所有并发各拿满单方向闸」与「物理可用 1/4」双上界派生，正常多连接
+    /// 测速不再 binding；超并发时仍按比例背压（物理内存装不下就是装不下）。
+    /// 物理安全：176 512MiB 档 ⇒ 128MiB 在飞 + 账本常驻 ~82MB ≈ 41%，其余留给
+    /// 池/握手/瞬态面。
     #[must_use]
     pub fn inflight_budget_bytes(&self) -> usize {
-        (self.total_budget / 2).max(1)
+        let by_conns = self.max_conns.saturating_mul(self.bridge_gate).saturating_mul(2);
+        let by_mem = (self.available / 4) as usize;
+        (self.total_budget / 2).max(by_conns.min(by_mem))
     }
 
     /// 本档能否**装下一条按规划上界的连接**（绝对下限）。
@@ -776,6 +787,30 @@ mod tests {
                 plan.bridge_gate
             );
             assert!(plan.bridge_gate > 0);
+        }
+    }
+
+    /// 2026-11-15 回归钉子：进程级 in-flight 预算必须装下「10 条满载连接 × 单方向闸」。
+    ///
+    /// 现场：small 档旧口径预算 = 48MiB，而 10 条 60MB/s@200ms 连接需 ~120MB（每条
+    /// BDP ≈ 桥闸 12MiB）⇒ 每条只分到 ~4.8MB，吞吐按比例砍半且 ws/xhttp/httpupgrade
+    /// 全族同抖（用户侧「60 对半砍」）。预算回落到 `total_budget/2` 即本测试红。
+    #[test]
+    fn inflight_budget_covers_ten_full_gate_conns() {
+        for available in [256 * MIB, 512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
+            let plan = MemoryPlan::from_available(available);
+            let budget = plan.inflight_budget_bytes();
+            let need = plan.bridge_gate.saturating_mul(10);
+            assert!(
+                budget >= need,
+                "{available}B 档 in-flight 预算 {budget}B 装不下 10 条满载连接（需 {need}B）：\
+                 多连接测速会被预算钉成半速（2026-11-15 生产回归，禁回退到 total_budget/2）"
+            );
+            // 物理安全：不超过可用内存 1/4（除非旧下限 total_budget/2 更高）。
+            assert!(
+                budget <= (plan.available / 4) as usize || budget <= plan.total_budget / 2,
+                "{available}B 档预算 {budget}B 超出可用内存 1/4 且非旧下限"
+            );
         }
     }
 

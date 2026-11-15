@@ -6,18 +6,19 @@
 //! splithttp 侧 `pub use` 保持 `crate::transport::H2_*` 路径可用，xray-core
 //! `memory_budget` 交叉断言（bd sgdwm）与 client.rs 防回档测试不受影响。
 //!
-//! ## 服务端 send_buf 按**内存档位**三档取值（2026-11-13 用户拍板：8 / 16 / 32 MiB）
+//! ## 服务端 send_buf 按**内存档位**两档取值（2026-11-15 修正：small 16→32MiB）
 //!
 //! 吞吐 = min(发送端 send_buf, 接收端收窗) ÷ 端到端 RTT（32 MiB ÷ 0.45 s ≈ 71 MiB/s）。
 //! 档位唯一事实源 = `xray_frame::budget::plan::MemoryPlan`（进程级一次探测，见
 //! `h2_server_max_send_buf_for`）——**不新造自适应机制，也不按 RTT 自适应**（rjzw2 前科：
 //! 探测 RTT ≠ 端到端 RTT）：
 //! - `tiny`（≤256MB）→ 8 MiB
-//! - `small`（≤512MB）→ 16 MiB
-//! - `medium`（≤1GB）/ `large`（>1GB）→ 32 MiB（对齐客户端收窗）
+//! - `small`（≤512MB）/ `medium`（≤1GB）/ `large`（>1GB）→ 32 MiB（对齐客户端收窗）
 //!
-//! 32MiB 是**上限**不是预约——hyper 惰性分配，真实在途 = BDP ≈ 吞吐 × RTT（≈30MB 全机
-//! 总量），与档位预算不矛盾（512MB 档预算 96MiB 也够）。
+//! **2026-11-15 生产回归修正**：11-13 拍的 small=16MiB 在真实 CDN 路径（RTT 200-450ms）
+//! 把 512MB 档机器的下载在飞上限砍到一半（用户实测 60→30 MB/s，全 HTTP 族同抖）。
+//! 模块头自己的论证也支持 32MiB：「32MiB 是上限不是预约，真实在途 = BDP ≈ 30MB 全机
+//! 总量，512MB 档预算 96MiB 也够」。故 small 与 medium|large 同值，仅 tiny 保持 8MiB。
 
 use xray_frame::budget::plan::MemoryTier;
 
@@ -47,8 +48,13 @@ pub const H2_SERVER_INITIAL_CONNECTION_WINDOW: u32 = 32 * 1024 * 1024;
 pub const H2_SERVER_MAX_SEND_BUF_SIZE: usize = 32 * 1024 * 1024;
 /// 服务端 h2 每连接发送缓冲**tiny 档取值**（8MiB；≤256MB 机器不赌大缓冲）。
 pub const H2_SERVER_SEND_BUF_TINY_TIER: usize = 8 * 1024 * 1024;
-/// 服务端 h2 每连接发送缓冲**small 档取值**（16MiB = 客户端收窗档；≤512MB 机器）。
-pub const H2_SERVER_SEND_BUF_SMALL_TIER: usize = 16 * 1024 * 1024;
+/// 服务端 h2 每连接发送缓冲**small 档取值**（32MiB = `medium`/`large` 同值）。
+///
+/// 2026-11-15 由 16MiB 上调：small 机（≤512MB）在真实 CDN 路径 RTT 200-450ms 下，
+/// 16MiB 变成下载在飞硬上限 ⇒ 吞吐减半（用户实测 60→30，8/16/32 档位表拍板时
+/// 只有 loopback 台数据，RTT≈0 掩盖了这条限制）。真实在途 = BDP ≈ 30MB 全机
+/// 总量，512MB 档预算装得下（模块头论证同款）。
+pub const H2_SERVER_SEND_BUF_SMALL_TIER: usize = 32 * 1024 * 1024;
 
 /// 档位 → 服务端每连接 send_buf（**唯一映射点**；纯函数，单测按档注入不碰进程探测）。
 ///

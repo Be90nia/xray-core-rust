@@ -34,8 +34,12 @@ impl Write for SharedBuf {
 }
 
 fn capture(buf: SharedBuf) -> tracing::subscriber::DefaultGuard {
+    capture_at_max(tracing::Level::TRACE, buf)
+}
+
+fn capture_at_max(max: tracing::Level, buf: SharedBuf) -> tracing::subscriber::DefaultGuard {
     let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_max_level(max)
         .with_ansi(false)
         .with_writer(move || buf.clone())
         .finish();
@@ -77,6 +81,22 @@ fn empty_secrets_table_passes_through_verbatim() {
 
     let out = buf.snapshot();
     assert!(out.contains("key is s3cret"), "verbatim expected: {out}");
+}
+
+#[test]
+fn facade_respects_subscriber_level_gate() {
+    // 手动 Event 不经过 tracing 宏门；门面必须显式查 enabled。
+    // 复现 bd xag3 生产形态：warning 配置下 DEBUG/INFO 仍输出。
+    let buf = SharedBuf::default();
+    let _guard = capture_at_max(tracing::Level::WARN, buf.clone());
+    let facade = LogFacade::new("levelgate", vec![]);
+    facade.debug("suppressed-debug");
+    facade.info("suppressed-info");
+    facade.warn("passed-warn");
+    let out = buf.snapshot();
+    assert!(!out.contains("suppressed-debug"), "debug leaked through gate: {out}");
+    assert!(!out.contains("suppressed-info"), "info leaked through gate: {out}");
+    assert!(out.contains("passed-warn"), "warn must pass: {out}");
 }
 
 #[test]

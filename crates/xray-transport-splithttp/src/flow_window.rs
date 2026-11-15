@@ -127,7 +127,8 @@ mod tests {
 
     #[test]
     fn server_fallback_is_static_per_tier() {
-        // 窗值固定；send_buf 按档位（tiny 8MiB；small 16MiB；medium/large 32MiB）。
+        // 窗值固定；send_buf 按档位（tiny 8MiB；small|medium|large 32MiB，
+        // 2026-11-15 回归修正：small 16→32）。
         let (tiny, small, large) = (
             crate::transport::H2_SERVER_SEND_BUF_TINY_TIER,
             crate::transport::H2_SERVER_SEND_BUF_SMALL_TIER,
