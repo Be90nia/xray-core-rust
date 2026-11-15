@@ -19,6 +19,7 @@ use xray_features::{Feature, FeatureError, Result};
 
 use crate::{
     burst::{BurstObserver, HealthPingConfig, HealthPingSettings},
+    error::ObservatoryError,
     observer::{HttpProbeExecutor, ProbeExecutor},
 };
 
@@ -38,26 +39,36 @@ impl BurstObservatoryFeature {
     /// `ping_config` 是 JSON Value（BurstObservatoryConfig.ping_config），
     /// 反序列化为 [`HealthPingConfig`] 后用 [`HealthPingSettings::from_config`]
     /// 归一化（默认值/最小约束）。
-    pub fn new(subject_selector: Vec<String>, ping_config: Option<&serde_json::Value>) -> Self {
+    ///
+    /// `ping_config` 缺失 → `Err`（对应 Go `BurstObservatoryConfig.Build`
+    /// infra/conf/observatory.go:34-37 的硬错）；此前静默走默认会让观测循环
+    /// 跑在未经配置的默认探测 URL 上。
+    pub fn new(
+        subject_selector: Vec<String>,
+        ping_config: Option<&serde_json::Value>,
+    ) -> std::result::Result<Self, ObservatoryError> {
+        let Some(ping_config) = ping_config else {
+            return Err(ObservatoryError::InvalidConfig(
+                "burstObservatory requires a valid pingConfig".to_string(),
+            ));
+        };
         // u7nu：parse 失败时整体丢弃 → warn 后回退默认；不让子字段类型偏差
         // 致整段 pingConfig 静默弃用（如 Go `interval:"1m"` 字符串）。
-        let hp_config = ping_config.and_then(|v| {
-            match serde_json::from_value::<HealthPingConfig>(v.clone()) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!(
-                        "BurstObservatoryFeature: pingConfig parse failed: {e}, falling back to defaults"
-                    );
-                    None
-                }
-            }
-        });
+        let hp_config = match serde_json::from_value::<HealthPingConfig>(ping_config.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    "BurstObservatoryFeature: pingConfig parse failed: {e}, falling back to defaults"
+                );
+                None
+            },
+        };
         let settings = HealthPingSettings::from_config(hp_config.as_ref());
-        Self {
+        Ok(Self {
             observer: Arc::new(BurstObserver::new(settings)),
             subject_selector,
             executor: Mutex::new(None),
-        }
+        })
     }
 
     /// 获取内部 BurstObserver 引用（读观测快照）。
@@ -136,28 +147,54 @@ mod tests {
     use super::*;
     use crate::{config::ProbeResult, observer::FixedProbeExecutor};
 
+    /// 最小合法 pingConfig：destination 指向本地必败端口，探测循环不碰外网。
+    fn ping_json() -> serde_json::Value {
+        serde_json::json!({
+            "destination": "http://127.0.0.1:1/",
+            "interval": 3_600_000_000_000i64,
+            "timeout": 500_000_000i64,
+        })
+    }
+
+    #[test]
+    fn new_missing_ping_config_is_rejected() {
+        // Go BurstObservatoryConfig.Build（infra/conf/observatory.go:34-37）硬错拒启。
+        let err = match BurstObservatoryFeature::new(vec!["out-a".to_string()], None) {
+            Ok(_) => panic!("missing pingConfig must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("pingConfig"),
+            "error must name the missing field, got: {err}"
+        );
+    }
+
     #[test]
     fn new_empty_subject_noop() {
-        let f = BurstObservatoryFeature::new(Vec::new(), None);
+        let f =
+            BurstObservatoryFeature::new(Vec::new(), Some(&ping_json())).expect("valid pingConfig");
         assert!(f.start().is_ok(), "empty subject → noop");
     }
 
     #[test]
     fn start_without_executor_fails() {
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping_json()))
+            .expect("valid pingConfig");
         let err = f.start().expect_err("must fail without executor");
         assert!(matches!(err, FeatureError::StartFailed { .. }));
     }
 
     #[test]
     fn feature_name_is_burst_observatory() {
-        let f = BurstObservatoryFeature::new(Vec::new(), None);
+        let f =
+            BurstObservatoryFeature::new(Vec::new(), Some(&ping_json())).expect("valid pingConfig");
         assert_eq!(f.feature_name(), "burstObservatory");
     }
 
     #[tokio::test]
     async fn start_with_executor_runs_scheduler() {
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping_json()))
+            .expect("valid pingConfig");
         let executor: Arc<dyn ProbeExecutor> = Arc::new(FixedProbeExecutor::new().with_result(
             "out-a",
             ProbeResult { alive: true, delay: 100, last_error_reason: String::new() },
@@ -178,7 +215,8 @@ mod tests {
             "timeout": 3_000_000_000i64,
             "httpMethod": "GET",
         });
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping))
+            .expect("valid pingConfig");
         let s = f.observer.settings();
         assert_eq!(s.destination, "https://custom.test/204");
         assert_eq!(s.interval, 15_000_000_000);
@@ -198,13 +236,8 @@ mod tests {
     /// fail-fast（factory 阶段无 DepBag 的 f23r 语义保持）。
     #[tokio::test]
     async fn init_dependencies_wires_executor_and_start_succeeds() {
-        // destination 指向本地必败端口，探测循环不碰外网。
-        let ping = serde_json::json!({
-            "destination": "http://127.0.0.1:1/",
-            "interval": 3_600_000_000_000i64,
-            "timeout": 500_000_000i64,
-        });
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping_json()))
+            .expect("valid pingConfig");
         f.start().expect_err("without bag injection start must still fail");
 
         let sel: Arc<dyn xray_features::OutboundTagSelector> = Arc::new(NoTags);
@@ -217,7 +250,8 @@ mod tests {
 
     #[test]
     fn init_dependencies_without_selector_stays_unwired() {
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], None);
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&ping_json()))
+            .expect("valid pingConfig");
         f.init_dependencies(&xray_features::DepBag::new());
         let err = f.start().expect_err("no selector → no executor → StartFailed");
         assert!(matches!(err, FeatureError::StartFailed { .. }));
@@ -226,7 +260,8 @@ mod tests {
     fn new_with_unparseable_ping_config_falls_back_to_defaults() {
         // u7nu：parse 失败必须 warn 而非静默——用 garbage 字符串强制 parse 失败。
         let bad = serde_json::json!({"interval": "not-a-duration", "samplingCount": 5});
-        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&bad));
+        let f = BurstObservatoryFeature::new(vec!["out-a".to_string()], Some(&bad))
+            .expect("pingConfig present (parse failure keeps u7nu fallback)");
         let s = f.observer.settings();
         // 整段丢弃 → 走默认（DEFAULT_DESTINATION / DEFAULT_SAMPLING_COUNT=10）。
         assert_eq!(s.sampling_count, crate::DEFAULT_SAMPLING_COUNT);

@@ -152,8 +152,8 @@ impl LintStage<Config> for FakeDnsStage {
 /// 2. `outbounds[].mux.xudpProxyUDP443` 非法值（不在 `{reject, allow, skip}`）— Go
 ///    `MuxConfig.Build` 直接返回错误；Rust `Udp443Policy::from_mux` 返回 None 并被 `tracing::warn`
 ///    忽略（outbound.rs:516-518），降级为无策略。
-/// 3. `burstObservatory` 启用但 `pingConfig` 缺失——Go `BurstObservatoryConfig.Build` 必拒；Rust
-///    `burst_observatory_factory` 把 None 透传给 feature，启动后跑无 配置的观测循环。
+/// 3. `burstObservatory` 启用但 `pingConfig` 缺失——Go `BurstObservatoryConfig.Build` 必拒； Rust
+///    此处 + `burst_observatory_factory`（feature 构造函数）双层同拒（bd bqb28）。
 ///
 /// 阶段名 `Validation` 与 Go `RegisterConfigureFilePostProcessingStage` 命名风格一致。
 pub struct ValidationStage;

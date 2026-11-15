@@ -320,8 +320,10 @@ impl TunNetStack {
             if state == tcp::State::Listen {
                 return Ok(());
             }
-            // 占用（已 accept）或已失效：摘除后重建
+            // 占用（已 accept）或已失效：摘除后重建。socket 必须一并摘除——否则
+            // 每重建一次就永久泄漏一份收发缓冲（bd ndn15；对照 `sweep_tcp_listens`）。
             self.tcp_listens.remove(&dst);
+            self.sockets.remove(handle);
         }
         if self.tcp_listens.len() >= MAX_TCP_LISTENS {
             TCP_LISTEN_REJECTED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -1151,6 +1153,41 @@ mod tests {
         assert_eq!(stack.tcp_listens.len(), 1);
         assert_eq!(stack.check_tcp_accepts().len(), 1, "连接必须照常交付 accept");
         assert!(stack.tcp_listens.is_empty(), "accept 后条目摘除");
+    }
+
+    /// bd ndn15：重建分支必须连旧 listen socket 一起摘除。
+    ///
+    /// 触发面：同 dst 的 socket 已 Established（`check_tcp_accepts` 尚未收走）或
+    /// 已失效时再来一个 SYN → 旧实现只摘 `tcp_listens` 条目，socket 留在
+    /// `SocketSet` 里永久占住收发缓冲。断言 socket 总数不随重建增长。
+    #[test]
+    fn ensure_tcp_listen_rebuild_drops_old_socket() {
+        let mut stack = make_stack();
+        let src = ([10, 0, 0, 2], 5555u16);
+        let dst_addr = [93, 184, 216, 34];
+        let dst = IpEndpoint::new(
+            IpAddress::Ipv4(Ipv4Address::new(dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3])),
+            443,
+        );
+        stack.ensure_tcp_listen(dst).expect("listen");
+        // 握手到 Established（= 重建分支的触发态）。
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, 443), TCP_SYN, 1000, 0));
+        stack.poll(Instant::now());
+        let syn_ack_seq =
+            stack.drain_tx().iter().find_map(|p| tcp_seq(p)).expect("SYN-ACK with seq");
+        stack.ingest_rx(make_tcp_packet(src, (dst_addr, 443), TCP_ACK, 1001, syn_ack_seq + 1));
+        stack.poll(Instant::now());
+        let before = stack.sockets.iter().count();
+
+        stack.ensure_tcp_listen(dst).expect("rebuild");
+        assert_eq!(stack.sockets.iter().count(), before, "重建后不得残留旧 listen socket");
+        assert_eq!(stack.tcp_listens.len(), 1, "新 listen 入缓存");
+        let handle = stack.tcp_listens[&dst].handle;
+        assert_eq!(
+            stack.sockets.get_mut::<tcp::Socket<'static>>(handle).state(),
+            tcp::State::Listen,
+            "重建出的 socket 须在 Listen"
+        );
     }
 
     #[test]

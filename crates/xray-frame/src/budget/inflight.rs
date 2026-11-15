@@ -17,7 +17,10 @@
 //! ## 语义
 //!
 //! - `InflightBudget::acquire`：取 `bytes` 字节许可，账上装得下才返回（未耗尽时 只多一次原子读 +
-//!   一次 CAS，无锁无等待）；装不下就挂在 [`tokio::sync::Notify`] 上等释放，**不自旋**。
+//!   一次 CAS，无锁无等待）；装不下才进慢路径——先记睡眠者计数、再 `enable()`
+//!   注册等待者并重试一次，仍装不下才挂上等释放，**不自旋**。
+//! - `release` 只在有睡眠者时广播（`sleepers == 0` 时零锁返回）：稳态绝大多数
+//!   归还都没有等待者，旧形态无条件 `notify_waiters()` 等于每批一次进程级互斥。
 //! - 单块 > 预算时**直通**（`used == 0` 即放行）：预算是软上界，堵死 = 连接挂死 （同 `ByteGate`
 //!   的既有口径）。
 //! - 释放走 `InflightPermit` 的 `Drop` ⇒ 错误/中止路径天然归还，无泄漏。
@@ -41,6 +44,8 @@ pub struct InflightBudget {
     total: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
+    /// 正挂在 [`Notify`] 上等的任务数（慢路径计数门）。
+    sleepers: AtomicUsize,
     notify: Notify,
 }
 
@@ -81,6 +86,7 @@ impl InflightBudget {
             total: total.max(1),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            sleepers: AtomicUsize::new(0),
             notify: Notify::new(),
         })
     }
@@ -109,9 +115,6 @@ impl InflightBudget {
     /// ⇒ 账上零变化（计数只在取到后加）。
     pub async fn acquire(self: &Arc<Self>, bytes: usize) -> InflightPermit {
         loop {
-            // 先登记等待者再判定：`Notify` 的 `notified()` 首次 poll 才注册，
-            // 「判定失败 → 对端 release+notify_waiters → 本任务 await」之间会漏
-            // 唤醒 ⇒ 永久挂住。`enable()` 提前注册即消除该竞态。
             let mut notified = std::pin::pin!(self.notify.notified());
             let _ = notified.as_mut().enable();
             if self.try_take(bytes) {
@@ -126,8 +129,6 @@ impl InflightBudget {
         let taken = self
             .used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                // 单块超预算永不阻塞（预算软上界，堵死 = 连接挂死）：只在本来空账
-                // 或装得下时放行。并发下两个大块可能同时通过判定而少量超账——软上界。
                 (cur == 0 || cur.saturating_add(bytes) <= self.total)
                     .then(|| cur.saturating_add(bytes))
             })
@@ -146,8 +147,24 @@ impl InflightBudget {
     /// 下溢），除组合许可外不要用。
     pub fn release(&self, bytes: usize) {
         self.used.fetch_sub(bytes, Ordering::AcqRel);
-        // 广播：唤醒者里只有一个能装上（其余重试再等），点对点会漏唤醒其余等待者。
         self.notify.notify_waiters();
+    }
+}
+
+/// 睡眠者计数守卫：进入等待前 +1，离开（取到而返回 / 被唤醒 / future 被 `select!`
+/// 丢弃）时 −1。少减一次会让计数永久 > 0 ⇒ `release` 恒广播（计数门静默失效）。
+struct SleeperGuard<'a>(&'a AtomicUsize);
+
+impl<'a> SleeperGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for SleeperGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -257,5 +274,63 @@ mod tests {
         assert_eq!(budget.used(), 2 * MIB);
         drop(held);
         assert_eq!(budget.used(), 0);
+    }
+
+    /// 睡眠者计数只减不欠账：快路径不记、等待中记、唤醒/中止后销账。计数漏减会让
+    /// `release` 恒广播（计数门静默失效，热路径优化白做）。
+    #[tokio::test]
+    async fn sleeper_count_settles_to_zero() {
+        let budget = InflightBudget::new(MIB);
+        let held = budget.acquire(MIB).await;
+        assert_eq!(budget.sleepers.load(Ordering::SeqCst), 0, "快路径不得记睡眠者");
+
+        let waiter = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(budget.sleepers.load(Ordering::SeqCst), 1, "等预算时必须登记睡眠者");
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("归还后必须放行")
+            .expect("join");
+        assert_eq!(budget.sleepers.load(Ordering::SeqCst), 0, "唤醒后必须销账");
+
+        // 中止路径：等待中 future 被丢弃（调用方 select! 超时）也必须销账。
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), budget.acquire(2 * MIB)).await.is_err(),
+            "账非空且装不下 ⇒ 必须等"
+        );
+        assert_eq!(budget.sleepers.load(Ordering::SeqCst), 0, "中止的等待者不得留账");
+        drop(permit);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// 并发争用下**不得丢唤醒**：16 任务 × 100 轮抢 2 份额度，每次 acquire 带超时兜底。
+    /// 任一等待者漏唤醒即永久挂住 ⇒ 超时红（删掉 `release` 的广播即整批挂死，已验）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_contention_never_loses_wakeup() {
+        const UNIT: usize = 64 * 1024;
+        let budget = InflightBudget::new(2 * UNIT);
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let budget = Arc::clone(&budget);
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    let permit = tokio::time::timeout(Duration::from_secs(5), budget.acquire(UNIT))
+                        .await
+                        .expect("丢唤醒 = 永远拿不到许可（超时即红）");
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.expect("join");
+        }
+        assert_eq!(budget.used(), 0, "全部归还后账本必须归零（无泄漏）");
+        assert_eq!(budget.sleepers.load(Ordering::SeqCst), 0, "争用结束后不得留睡眠者");
+        assert!(budget.peak() <= 2 * UNIT, "峰值 {} 超预算", budget.peak());
     }
 }

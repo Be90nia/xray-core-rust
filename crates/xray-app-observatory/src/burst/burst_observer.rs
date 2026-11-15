@@ -17,8 +17,11 @@
 //! - tag 选择：scheduler 启动时注入 `TagSelector` 闭包 （对齐 Go
 //!   `outbound.HandlerSelector.Select`）
 //!
-//! 非目标：HTTP method 维度探测（Go `HealthPingSettings.HttpMethod`）、
-//! checkConnectivity（网络断开判定）、真 outbound 拨号。
+//! 非目标：HTTP method 维度探测（Go `HealthPingSettings.HttpMethod`）、真 outbound 拨号。
+//!
+//! 连通性判定（Go `healthping.go:272-283 checkConnectivity`）已实装：探测失败且
+//! `settings.connectivity` 非空时先直连探测该 URL，失败即判本机断网、不记样本
+//! （节点状态保活），恢复后自动回到正常记 RTT_FAILED 的路径。
 
 use std::{
     collections::HashMap,
@@ -35,8 +38,8 @@ use skeleton_infra::fx::FxScope;
 
 use super::{HealthPingRtts, HealthPingSettings, RTT_FAILED};
 use crate::{
-    config::{HealthPingMeasurement, ObservationResult, OutboundStatus},
-    observer::ProbeExecutor,
+    config::{HealthPingMeasurement, ObservationResult, OutboundStatus, ProbeResult},
+    observer::{HttpProbeExecutor, ProbeExecutor},
 };
 
 /// Clock 契约取纳秒（挂钟展示面）——healthping 时间戳统一入口（bd bf92）。
@@ -83,6 +86,9 @@ pub struct BurstObserver {
     /// 时间源契约（bd bf92）：样本/快照时间戳走 `skeleton::clock`。生产
     /// `SystemClock`；测试注入 `MockClock` 得确定性时间线。
     clock: Arc<dyn Clock>,
+    /// 本机连通性探测（Go `checkConnectivity`）：`settings.connectivity` 非空时
+    /// [`Self::new`] 直连构造（不经 outbound）；测试用 [`Self::with_connectivity_probe`] 覆盖。
+    connectivity: Option<Arc<dyn ProbeExecutor>>,
 }
 
 impl BurstObserver {
@@ -94,6 +100,16 @@ impl BurstObserver {
     pub fn new(settings: HealthPingSettings) -> Self {
         let capacity = settings.sampling_count.max(1) as usize;
         let validity_nanos = settings.interval * settings.sampling_count.max(1) as i64 * 2;
+        // Go `checkConnectivity` 用 `newDirectPingClient`（直连，不经 outbound）；
+        // connectivity 空串 = 不判定（Go healthping.go:275-277 恒 true）。
+        let connectivity = (!settings.connectivity.is_empty()).then(|| {
+            let timeout_ms = (settings.timeout / 1_000_000).max(1) as u64;
+            Arc::new(HttpProbeExecutor::new(
+                settings.connectivity.clone(),
+                settings.http_method.clone(),
+                timeout_ms,
+            )) as Arc<dyn ProbeExecutor>
+        });
         Self {
             settings,
             rtts: Mutex::new(HashMap::new()),
@@ -103,6 +119,7 @@ impl BurstObserver {
             scheduler: Mutex::new(None),
             fx: Arc::new(FxScope::new()),
             clock: Arc::new(SystemClock),
+            connectivity,
         }
     }
 
@@ -117,6 +134,37 @@ impl BurstObserver {
     /// 713x6：时钟句柄（executor 装配共享同一时钟源）。
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// 覆盖连通性探测 executor（对应 Go `newDirectPingClient`）——测试注入
+    /// mock，或调用方换用非 HTTP 探测实现。
+    #[must_use]
+    pub fn with_connectivity_probe(mut self, probe: Arc<dyn ProbeExecutor>) -> Self {
+        self.connectivity = Some(probe);
+        self
+    }
+
+    /// 单次探测结果 → 记入样本表的值。返回 `None` = 本轮不记（本机断网）。
+    ///
+    /// 对齐 Go `healthping.go:190-215` + `:219-225`：探测失败时先查连通性
+    /// （`checkConnectivity`，未配置 connectivity 视为连通）；断网则记 `rtt=0`，
+    /// 而收集侧的 `value > 0` 过滤使其**不入表** —— 节点状态因此保活，
+    /// 不像节点死那样记 RTT_FAILED。连通性正常才记 `RTT_FAILED`。
+    fn rtt_sample(&self, result: ProbeResult) -> Option<i64> {
+        if result.alive {
+            return Some(result.delay);
+        }
+        if let Some(probe) = self.connectivity.as_ref() {
+            // tag 参数对连通性探测无意义（HttpProbeExecutor 忽略它）。
+            if !probe.probe("").alive {
+                tracing::warn!(
+                    target: "xray_app_observatory",
+                    "burst healthping: network is down, skipping failed ping (connectivity check failed)"
+                );
+                return None;
+            }
+        }
+        Some(RTT_FAILED)
     }
 
     /// 获取归一化后的运行时设置（对应 Go `HealthPing.Settings`）。
@@ -137,9 +185,10 @@ impl BurstObserver {
         // 锁外探测（对齐 Go doCheck：MeasureDelay 不持 access 锁）。
         let mut results = Vec::with_capacity(tags.len());
         for tag in tags {
-            let result = executor.probe(tag);
-            let rtt = if result.alive { result.delay } else { RTT_FAILED };
-            results.push((tag.clone(), rtt));
+            // 本机断网 ⇒ None，不记样本（Go doCheck:219-225 的 value > 0 过滤）。
+            if let Some(rtt) = self.rtt_sample(executor.probe(tag)) {
+                results.push((tag.clone(), rtt));
+            }
         }
         // 短临界区：仅结果写回（对齐 Go PutResult）。
         let mut g = self.rtts.lock();
@@ -280,12 +329,16 @@ impl BurstObserver {
                     cancelled = true;
                     break;
                 }
-                // 真实探测：probe → rtt = alive ? delay : RTT_FAILED
-                let result = executor.probe(tag);
-                let rtt = if result.alive { result.delay } else { RTT_FAILED };
-                samples.push(rtt);
+                // 真实探测：probe → rtt（本机断网时 None，不记样本）
+                if let Some(rtt) = self.rtt_sample(executor.probe(tag)) {
+                    samples.push(rtt);
+                }
             }
-            collected.push((tag.clone(), samples));
+            // 空 samples 不建条目——Go 只在该 tag 有 >0 的 rtt 时才 PutResult
+            // 建 Results 项；凭空建条目会多出一个零样本的 OutboundStatus。
+            if !samples.is_empty() {
+                collected.push((tag.clone(), samples));
+            }
             if cancelled {
                 break; // Go healthping.go:224-228
             }
@@ -377,6 +430,18 @@ mod tests {
         Arc::new(BurstObserver::new(settings))
     }
 
+    /// 配了 connectivity + 注入 mock 连通性探测（`probe("")` 的返回值）的观察者。
+    fn observer_with_connectivity(connectivity_result: ProbeResult) -> Arc<BurstObserver> {
+        let settings = HealthPingSettings {
+            connectivity: "http://127.0.0.1:1/".into(),
+            sampling_count: 3,
+            ..HealthPingSettings::default()
+        };
+        Arc::new(BurstObserver::new(settings).with_connectivity_probe(Arc::new(
+            FixedProbeExecutor::new().with_result("", connectivity_result),
+        )))
+    }
+
     fn alive(delay: i64) -> ProbeResult {
         ProbeResult { alive: true, delay, last_error_reason: String::new() }
     }
@@ -411,6 +476,45 @@ mod tests {
         let out = obs.check(&["out-dead".to_string()], &executor);
         assert_eq!(out.get("out-dead"), Some(&RTT_FAILED));
         assert!(!super::super::is_valid_rtt(obs.latest_rtt("out-dead").unwrap()));
+    }
+
+    /// bd 524bb：本机断网（连通性探测失败）⇒ 失败探测不记样本，节点状态保活。
+    /// Go healthping.go:190-215 记 rtt=0、:219-225 的 `value > 0` 过滤使其不入表。
+    #[test]
+    fn connectivity_down_skips_failed_sample() {
+        let obs = observer_with_connectivity(dead("offline"));
+        let executor = FixedProbeExecutor::new().with_result("out-a", dead("timeout"));
+        assert!(obs.check(&["out-a".to_string()], &executor).is_empty(), "断网期间不产样本");
+        assert!(obs.latest_rtt("out-a").is_none(), "断网期间不得记 RTT_FAILED");
+        assert!(obs.create_result().is_empty(), "不得凭空建出零样本条目");
+    }
+
+    /// 连通性正常 ⇒ 探测失败照常记 RTT_FAILED（节点判死）。
+    #[test]
+    fn connectivity_up_records_rtt_failed() {
+        let obs = observer_with_connectivity(alive(5));
+        let executor = FixedProbeExecutor::new().with_result("out-a", dead("timeout"));
+        let out = obs.check(&["out-a".to_string()], &executor);
+        assert_eq!(out.get("out-a"), Some(&RTT_FAILED));
+        assert!(!super::super::is_valid_rtt(obs.latest_rtt("out-a").unwrap()));
+    }
+
+    /// 只有失败探测才查连通性——存活样本不受本机断网影响。
+    #[test]
+    fn connectivity_down_keeps_alive_sample() {
+        let obs = observer_with_connectivity(dead("offline"));
+        let executor = FixedProbeExecutor::new().with_result("out-a", alive(42));
+        assert_eq!(obs.check(&["out-a".to_string()], &executor).get("out-a"), Some(&42));
+    }
+
+    /// 生产路径 `do_check`（rounds = sampling_count）同样按连通性过滤。
+    #[test]
+    fn do_check_skips_samples_while_connectivity_down() {
+        let obs = observer_with_connectivity(dead("offline"));
+        let executor = FixedProbeExecutor::new().with_result("out-a", dead("timeout"));
+        obs.do_check(&["out-a".to_string()], &executor);
+        assert!(obs.latest_rtt("out-a").is_none());
+        assert!(obs.create_result().is_empty());
     }
 
     #[test]

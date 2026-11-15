@@ -511,7 +511,11 @@ fn burst_observatory_factory() -> FeatureFactory {
         let ping_config = json_cfg.ping_config.as_ref();
 
         let feature =
-            xray_app_observatory::BurstObservatoryFeature::new(subject_selector, ping_config);
+            xray_app_observatory::BurstObservatoryFeature::new(subject_selector, ping_config)
+                .map_err(|e| FeatureError::ConfigInvalid {
+                    name: "burstObservatory",
+                    message: e.to_string(),
+                })?;
         Ok(Arc::new(feature) as Arc<dyn Feature>)
     })
 }
@@ -1708,6 +1712,22 @@ mod tests {
                 xray_features::FeatureError::StartFailed { name: "burstObservatory", .. }
             ),
             "non-empty selector must reach executor check, got: {err:?}"
+        );
+    }
+
+    /// bd bqb28：`pingConfig` 缺失 = Go `BurstObservatoryConfig.Build` 硬错 →
+    /// factory 建 Feature 即失败（拒启），错误含缺失字段名。
+    #[test]
+    fn burst_factory_rejects_missing_ping_config() {
+        register_all_features();
+        let json = br#"{"subjectSelector": ["a", "b"]}"#;
+        let err = match registry::create_feature("burstObservatory", json) {
+            Ok(_) => panic!("missing pingConfig must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:?}").contains("pingConfig"),
+            "error must name the missing field, got: {err:?}"
         );
     }
 

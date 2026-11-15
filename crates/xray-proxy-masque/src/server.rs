@@ -209,8 +209,35 @@ impl TunnelHandle {
 }
 
 /// gate 分配结果（经 [`GateGrant::extra`] opaque 传递给 acceptor）。
+///
+/// **租约**（Go `defer s.release`）：Drop 即摘隧道表 + 归还地址池。隧道任务持有它
+/// 到任务结束，因此 accept/writer/assign/advertise/注册关闭/写泵建失败任一早退
+/// 路径都归还；连「hub 拿到 conn 但没送到 acceptor」也不泄漏（bd ioeeb）。
 struct TunnelAllocation {
     addrs: Vec<IpAddr>,
+    /// 归还口（弱引用：server 已销毁时无需归还）。
+    server: std::sync::Weak<MasqueServer>,
+}
+
+impl Drop for TunnelAllocation {
+    fn drop(&mut self) {
+        let Some(server) = self.server.upgrade() else { return };
+        // 先摘表（表句柄持有写泵队列 sender，drop 即让写泵收尾），再归还地址。
+        {
+            let mut map = server.tunnels.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            for addr in &self.addrs {
+                map.remove(addr);
+            }
+        }
+        for addr in &self.addrs {
+            for pool in &server.pools {
+                let mut p = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if p.prefix_contains(*addr) {
+                    p.release(addr);
+                }
+            }
+        }
+    }
 }
 
 /// MASQUE 服务端（Go `Server` 对应面）。
@@ -310,9 +337,8 @@ impl MasqueServer {
             Ok(GateGrant {
                 email,
                 level,
-                extra: Some(
-                    Arc::new(TunnelAllocation { addrs }) as Arc<dyn std::any::Any + Send + Sync>
-                ),
+                extra: Some(Arc::new(TunnelAllocation { addrs, server: Arc::downgrade(&server) })
+                    as Arc<dyn std::any::Any + Send + Sync>),
             })
         })
     }
@@ -463,17 +489,19 @@ async fn process_tunnel(server: Arc<MasqueServer>, conn: ServerConn) {
     // gate 产物面（accept 消费 conn 前取出）。
     let email = conn.grant.email.clone();
     let level = conn.grant.level;
-    // gate 分配结果（opaque 下转）。
-    let addrs = conn
-        .grant
-        .extra
-        .as_ref()
-        .and_then(|a| a.downcast_ref::<TunnelAllocation>().map(|a| a.addrs.clone()))
-        .unwrap_or_default();
-    if addrs.is_empty() {
+    // gate 租约（opaque 下转）：`addrs` 只经租约可取，租约活到任务结束即完成
+    // 摘表 + 池归还（Go `defer s.release`；任何早退路径都覆盖，bd ioeeb）。
+    let grant_extra = conn.grant.extra.clone();
+    let Some(allocation) = grant_extra.as_ref().and_then(|a| a.downcast_ref::<TunnelAllocation>())
+    else {
+        let _ = conn.reject(GateDeny::Unavailable);
+        return;
+    };
+    if allocation.addrs.is_empty() {
         let _ = conn.reject(GateDeny::Unavailable);
         return;
     }
+    let addrs: &[IpAddr] = &allocation.addrs;
     // accept：200 + upgraded IO（Go sconn.Accept()）。
     let stream = match conn.accept().await {
         Ok(s) => s,
@@ -498,7 +526,7 @@ async fn process_tunnel(server: Arc<MasqueServer>, conn: ServerConn) {
         LOG.warn(format!("masque: assign_addresses failed: {e}"));
         return;
     }
-    if let Err(e) = writer.advertise_route(&full_routes(&addrs)) {
+    if let Err(e) = writer.advertise_route(&full_routes(addrs)) {
         LOG.warn(format!("masque: advertise_route failed: {e}"));
         return;
     }
@@ -512,7 +540,7 @@ async fn process_tunnel(server: Arc<MasqueServer>, conn: ServerConn) {
                 LOG.warn("masque: server closed, tunnel rejected");
                 return;
             }
-            for addr in &addrs {
+            for addr in addrs {
                 map.insert(
                     *addr,
                     Arc::new(TunnelHandle {
@@ -594,23 +622,7 @@ async fn process_tunnel(server: Arc<MasqueServer>, conn: ServerConn) {
                 }
             } => {
                 let Some(entries) = req else { continue };
-                serve_address_request(&mut writer, &addrs, entries);
-            },
-        }
-    }
-
-    // 收尾（Go defer s.release）：表移除 + 池归还。
-    {
-        let mut map = server.tunnels.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for addr in &addrs {
-            map.remove(addr);
-        }
-    }
-    for addr in &addrs {
-        for pool in &server.pools {
-            let mut p = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if p.prefix_contains(*addr) {
-                p.release(addr);
+                serve_address_request(&mut writer, addrs, entries);
             }
         }
     }
@@ -1047,5 +1059,95 @@ mod tests {
         assert!(is_link_local_or_multicast(&IpAddr::V4("224.0.0.1".parse().unwrap())));
         assert!(!is_link_local_or_multicast(&IpAddr::V4("8.8.8.8".parse().unwrap())));
         assert!(is_link_local_or_multicast(&IpAddr::V6("fe80::1".parse().unwrap())));
+    }
+
+    /// 单 v4 /29 池的测试服务端（租约单测用；dispatch 不被调用）。
+    fn test_server() -> Arc<MasqueServer> {
+        #[derive(Debug)]
+        struct NullDispatch;
+        impl DispatchHandler for NullDispatch {
+            fn tag(&self) -> &str {
+                "masque-lease-test"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: xray_transport::link::Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                Box::pin(async {})
+            }
+        }
+        let settings = MasqueServerSettings {
+            users: vec![user("u@t", "p")],
+            addresses: vec![IpPrefix { addr: "10.0.0.2".parse().expect("addr"), prefix_len: 29 }],
+            mtu: MIN_PACKET_SIZE,
+        };
+        MasqueServer::new(
+            "masque-lease-test",
+            settings,
+            Arc::new(NullDispatch),
+            ComponentScope::new("masque-lease-test"),
+        )
+        .expect("server")
+    }
+
+    /// 池内可分配地址快照（取尽后全部归还，不改变占用态）。
+    fn free_addrs(server: &MasqueServer) -> Vec<IpAddr> {
+        let mut p = server.pools[0].lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = Vec::new();
+        while let Some(a) = p.allocate() {
+            out.push(a);
+        }
+        for a in &out {
+            p.release(a);
+        }
+        out
+    }
+
+    /// bd ioeeb：租约 Drop 必须摘表 + 归还地址池（Go `defer s.release`）。
+    ///
+    /// 走真实 gate 分配路径（`server.gate()` 产物即租约）：隧道任务/conn 任一
+    /// 结束形态都由 Drop 覆盖，否则池被早退隧道耗尽后全体 503。
+    #[tokio::test]
+    async fn gate_allocation_releases_pool_on_drop() {
+        let server = test_server();
+        let gateway = server.gate();
+        let meta = RequestMeta {
+            method: "CONNECT".parse().expect("method"),
+            path: String::new(),
+            query: None,
+            protocol: "connect-ip".into(),
+            authority: String::new(),
+            auth_user: Some("u@t".into()),
+            auth_pass: Some("p".into()),
+            peer: "127.0.0.1:1234".parse().expect("peer"),
+        };
+        let grant = gateway(&meta).expect("gate grants an address");
+        let leased = grant
+            .extra
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<TunnelAllocation>())
+            .expect("gate 产物须含租约")
+            .addrs
+            .clone();
+        assert_eq!(leased.len(), 1, "单 v4 池 = 一址");
+        // 租约占用期：池内只剩 4 条（/29 五个可分配地址，跳过服务器 10.0.0.2）。
+        assert_eq!(free_addrs(&server).len(), 4, "gate 已租走 1 条");
+        // 模拟已注册后早退：表条目也必须随租约 Drop 摘除。
+        let (queue_tx, _queue_rx) = mpsc::channel(1);
+        server.tunnels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(
+            leased[0],
+            Arc::new(TunnelHandle { queue_tx, user_email: "u@t".into(), user_level: 0 }),
+        );
+
+        drop(grant);
+        assert!(
+            server.tunnels.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
+            "租约 Drop 后隧道表条目必须摘除"
+        );
+        let free = free_addrs(&server);
+        assert_eq!(free.len(), 5, "租约 Drop 后池须恢复满载：{free:?}");
+        assert!(free.contains(&leased[0]), "早退隧道占的地址必须归还：{free:?}");
     }
 }
