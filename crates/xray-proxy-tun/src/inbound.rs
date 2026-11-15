@@ -841,6 +841,7 @@ async fn tun_driver_loop(
                                     Arc::clone(&dispatch),
                                     Arc::clone(&device),
                                     &scope,
+                                    user_level,
                                 );
                             } else {
                                 tcp_pkts.push(pkt.to_vec());
@@ -856,7 +857,8 @@ async fn tun_driver_loop(
 
                         // 锁外：accept 建桥（tokio::spawn 不再发生在临界区内）+
                         // 批聚合单次写回 TUN。
-                        dispatch_accepted(&netstack, accepted, &dispatch, &scope).await;
+                        dispatch_accepted(&netstack, accepted, &dispatch, &scope, user_level)
+                            .await;
                         write_tx_back(&device, tx_pkts).await;
                     }
                     Err(e) => {
@@ -894,7 +896,7 @@ async fn tun_driver_loop(
                     // 只收集 accept 事件，建桥 spawn 在锁外进行
                     (stack.check_tcp_accepts(), stack.drain_tx())
                 };
-                dispatch_accepted(&netstack, accepted, &dispatch, &scope).await;
+                dispatch_accepted(&netstack, accepted, &dispatch, &scope, user_level).await;
                 write_tx_back(&device, tx_pkts).await;
             }
         }
@@ -1255,6 +1257,7 @@ async fn run_udp_session(
         UdpDispatchSession::new(dispatch).with_access(xray_app_dispatcher::AccessContext {
             from: tun_src.to_string(),
             inbound_name: "tun".to_string(),
+            level: user_level,
             ..xray_app_dispatcher::AccessContext::default()
         });
     loop {
