@@ -114,9 +114,21 @@ impl InflightBudget {
     /// 中止语义：调用方用 `tokio::select!` 包住本 future 时，未取到许可即被丢弃
     /// ⇒ 账上零变化（计数只在取到后加）。
     pub async fn acquire(self: &Arc<Self>, bytes: usize) -> InflightPermit {
+        // 快路径：账上装得下就零锁返回——`Notify` 的入链/出链/广播全不进。旧形态
+        // 每批都先 `enable()` 注册等待者，稳态热路径上白付三次进程级互斥
+        //（tokio `Notify` 的 waiters 链表锁）。
+        if self.try_take(bytes) {
+            return InflightPermit { budget: Arc::clone(self), bytes };
+        }
         loop {
+            // 慢路径：先记睡眠者、再登记等待者，然后**立刻重试一次**。不丢唤醒靠的
+            // 是后两步与 `release` 的配合：`release` 先减账、再查睡眠者计数，所以
+            // 要么它的广播看见本任务（本任务已被登记），要么本任务这次重试看得见
+            // 那次减账——不存在「广播已发、账已减、本任务却没重试就睡下」的窗口。
+            let _sleeper = SleeperGuard::new(&self.sleepers);
             let mut notified = std::pin::pin!(self.notify.notified());
             let _ = notified.as_mut().enable();
+            // 登记与上一轮判定之间可能有归还落地：立刻重试一次，避免白睡一轮。
             if self.try_take(bytes) {
                 return InflightPermit { budget: Arc::clone(self), bytes };
             }
@@ -126,17 +138,17 @@ impl InflightBudget {
 
     /// 尝试占账（`fetch_update` 保证「判定 + 自增」不可分割，不会超发）。
     fn try_take(&self, bytes: usize) -> bool {
-        let taken = self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                (cur == 0 || cur.saturating_add(bytes) <= self.total)
-                    .then(|| cur.saturating_add(bytes))
-            })
-            .is_ok();
-        if taken {
-            self.peak.fetch_max(self.used.load(Ordering::Acquire), Ordering::AcqRel);
-        }
-        taken
+        let Ok(prev) = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            // 单块超预算永不阻塞（预算软上界，堵死 = 连接挂死）：只在本来空账
+            // 或装得下时放行。并发下两个大块可能同时通过判定而少量超账——软上界。
+            (cur == 0 || cur.saturating_add(bytes) <= self.total).then(|| cur.saturating_add(bytes))
+        }) else {
+            return false;
+        };
+        // 成功的 CAS 返回值 = 占账前的读数，故 `prev + bytes` 就是本次占账后的
+        // 真实 `used`（峰值只可能在占账后出现）——省掉一次 `used.load`。
+        self.peak.fetch_max(prev.saturating_add(bytes), Ordering::AcqRel);
+        true
     }
 
     /// 归还 `bytes` 字节（`InflightPermit::drop` 的实现路径）。
@@ -147,7 +159,14 @@ impl InflightBudget {
     /// 下溢），除组合许可外不要用。
     pub fn release(&self, bytes: usize) {
         self.used.fetch_sub(bytes, Ordering::AcqRel);
-        self.notify.notify_waiters();
+        // 无睡眠者就零锁返回：`notify_waiters` 恒进等待者链表锁（tokio 无空表短路），
+        // 而稳态绝大多数 release 都没有等待者。有睡眠者时仍**广播**（不能换
+        // `notify_one`：被唤醒者可能装不下大块，点对点会让其余等待者漏唤醒）。
+        // 查计数必须在减账**之后**：反了会让刚入列的等待者错过本次广播——它重试时
+        // 读到的还是没减的账 ⇒ 永久挂住。
+        if self.sleepers.load(Ordering::SeqCst) > 0 {
+            self.notify.notify_waiters();
+        }
     }
 }
 
