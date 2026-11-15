@@ -133,40 +133,66 @@ impl AuthValidator for StaticValidator {
     }
 }
 
+/// S3 QUIC 客户端素材：transport 与 dest 复用、config 每次新建客户端时重造
+/// （与原循环语义一致：连接缓存挂在 client 实例上，新建即新 QUIC 连接）。
+struct S3Dialer {
+    transport: Arc<QuinnHysteriaTransport>,
+    dest: DialDestination,
+    quic_params: Arc<xray_proto::xray::transport::internet::QuicParams>,
+}
+
+impl S3Dialer {
+    fn new(server_addr: SocketAddr) -> Self {
+        let client_tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        Self {
+            transport: Arc::new(
+                QuinnHysteriaTransport::new(client_tls, SocketAddr::from(([0, 0, 0, 0], 0)))
+                    .expect("quic transport"),
+            ),
+            dest: DialDestination { udp_addr: server_addr, host: "localhost".into() },
+            quic_params: Arc::new(xray_proto::xray::transport::internet::QuicParams::default()),
+        }
+    }
+
+    fn client(&self) -> HysteriaClient {
+        let config = Arc::new(xray_proto::xray::transport::internet::hysteria::Config {
+            auth: AUTH_SECRET.into(),
+            ..xray_proto::xray::transport::internet::hysteria::Config::default()
+        });
+        HysteriaClient::new(
+            self.dest.clone(),
+            config,
+            self.quic_params.clone(),
+            self.transport.clone(),
+        )
+    }
+}
+
+/// 结束态探针：一轮 dial→auth→roundtrip→drop（审计 F-9；s3 无 SOCKS 链）。
+pub async fn probe_quic_roundtrip(server_addr: SocketAddr) -> Result<()> {
+    let client = S3Dialer::new(server_addr).client();
+    roundtrip_once(&client, &[0xABu8; S3_PAYLOAD_LEN])
+        .await
+        .map_err(|e| StressError::Probe(format!("s3 quic end-state probe failed: {e}")))
+}
+
 /// S3 worker：deadline 前不断 dial → auth（0-RTT）→ roundtrip → drop。
 pub async fn s3_quic_reconnect_loop(
     server_addr: SocketAddr,
     deadline: Instant,
     stats: StatsHandle,
 ) {
-    let client_tls = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    let transport: Arc<QuinnHysteriaTransport> = Arc::new(
-        QuinnHysteriaTransport::new(client_tls, SocketAddr::from(([0, 0, 0, 0], 0)))
-            .expect("quic transport"),
-    );
-    let dest = DialDestination { udp_addr: server_addr, host: "localhost".into() };
-    let make_config = || {
-        Arc::new(xray_proto::xray::transport::internet::hysteria::Config {
-            auth: AUTH_SECRET.into(),
-            ..xray_proto::xray::transport::internet::hysteria::Config::default()
-        })
-    };
-    let quic_params = Arc::new(xray_proto::xray::transport::internet::QuicParams::default());
+    let dialer = S3Dialer::new(server_addr);
     let payload = vec![0xABu8; S3_PAYLOAD_LEN];
 
     #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
     while Instant::now() < deadline {
         #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
         let started = Instant::now();
-        let client = HysteriaClient::new(
-            dest.clone(),
-            make_config(),
-            quic_params.clone(),
-            transport.clone(),
-        );
+        let client = dialer.client();
         match roundtrip_once(&client, &payload).await {
             Ok(()) => {
                 stats.record_ok(0, payload.len() as u64 * 2, elapsed_ms(started));

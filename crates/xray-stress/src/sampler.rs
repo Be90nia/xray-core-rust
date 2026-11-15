@@ -1,7 +1,10 @@
 //! 采样器：进程 RSS / fd / tokio RuntimeMetrics / 每场景吞吐与延迟分位。
 //!
-//! CSV 追加（崩了可续，`run_id` 列区分 run），checkpoint 默认每 6h 覆盖写
-//! `summary-latest.md`（中间态 summary，崩了也有近时快照可看）。
+//! CSV 追加（崩了可续，`run_id` 列区分 run），checkpoint 按 [`checkpoint_interval`]
+//! 覆盖写 `summary-latest.md`（中间态 summary，崩了也有近时快照可看）。
+//!
+//! 吞吐列与 `samples_throughput` 一律是**窗口增量**（累计快照做差 / 采样间隔）：
+//! 直接用累计值会随 t² 单调暴涨，让衰减判定恒报 OK（审计 F-3）。
 
 use std::{
     io::Write as _,
@@ -40,8 +43,9 @@ pub struct Sampler {
     out_dir: std::path::PathBuf,
     csv: std::fs::File,
     stats: Vec<StatsHandle>,
-    prev_bytes: Vec<(String, u64)>,
-    /// (t_sec, aggregate bytes/s) 供 summary 吞吐衰减判定。
+    /// 每场景上一次的累计 (tx, rx) 字节快照，用于求窗口增量。
+    prev_bytes: Vec<(String, (u64, u64))>,
+    /// (t_sec, 窗口聚合 B/s) 供 summary 吞吐衰减判定；drain 段不入。
     pub samples_throughput: Vec<(f64, f64)>,
     /// (t_sec, rss_mb) 供 summary 泄漏判定。
     pub samples_rss: Vec<(f64, f64)>,
@@ -102,23 +106,32 @@ impl Sampler {
         }
 
         let mut rows = Vec::with_capacity(self.stats.len() + 1);
-        let mut agg_bytes = 0u64;
+        let mut agg_bps = 0.0;
+        // 首个采样窗没有前值，窗口增量恒 0——不是测量值，不进吞吐序列。
+        let has_baseline = !self.prev_bytes.is_empty();
+        let window = interval.as_secs_f64().max(1e-6);
         for h in &self.stats {
             let snap = h.snapshot();
-            let prev = self.prev_bytes.iter().find(|(n, _)| *n == snap.name).map(|(_, b)| *b);
-            let window = interval.as_secs_f64().max(1e-6);
-            let total = snap.bytes_tx + snap.bytes_rx;
-            let bps = prev.map_or(0.0, |p| (total.saturating_sub(p)) as f64 / window);
+            let cur = (snap.bytes_tx, snap.bytes_rx);
+            let prev = self.prev_bytes.iter().find(|(n, _)| *n == snap.name).map(|(_, v)| *v);
+            // 窗口增量：累计快照做差才是本窗口真实收发。用累计值除采样间隔会随
+            // t² 单调暴涨（审计 F-3）⇒ 吞吐衰减判定永不触发。
+            let (tx_bps, rx_bps) = prev.map_or((0.0, 0.0), |(ptx, prx)| {
+                (
+                    cur.0.saturating_sub(ptx) as f64 / window,
+                    cur.1.saturating_sub(prx) as f64 / window,
+                )
+            });
             self.prev_bytes.retain(|(n, _)| *n != snap.name);
-            self.prev_bytes.push((snap.name.clone(), total));
-            agg_bytes += total;
+            self.prev_bytes.push((snap.name.clone(), cur));
+            agg_bps += tx_bps + rx_bps;
             rows.push(SampleRow {
                 ts,
                 scenario: snap.name.clone(),
                 conn_ok: snap.conn_ok,
                 conn_fail: snap.conn_fail,
-                tx_bps: bps / 2.0,
-                rx_bps: bps / 2.0,
+                tx_bps,
+                rx_bps,
                 p50_ms: snap.percentile(0.50),
                 p95_ms: snap.percentile(0.95),
                 p99_ms: snap.percentile(0.99),
@@ -129,8 +142,10 @@ impl Sampler {
                 busy_s: 0.0,
             });
         }
-        self.samples_throughput
-            .push((elapsed, agg_bytes as f64 / interval.as_secs_f64().max(1e-6)));
+        // drain 段负载已停，吞吐归零会拉塌衰减判定的尾段均值 → 该序列不含 drain 采样。
+        if !drain && has_baseline {
+            self.samples_throughput.push((elapsed, agg_bps));
+        }
         rows.push(SampleRow {
             ts,
             scenario: if drain { "__drain__".into() } else { "__proc__".into() },
@@ -231,6 +246,12 @@ impl Sampler {
     }
 }
 
+/// checkpoint 周期 = `max(15min, duration/10)`：保证单 run 内必然触发。
+/// 审计 F-28：原固定 6h > 单 run 5h ⇒ `summary-latest.md` 永不落盘。
+pub fn checkpoint_interval(duration: Duration) -> Duration {
+    (duration / 10).max(Duration::from_secs(900))
+}
+
 /// (rss_mb, fd_count)。sysinfo 0.39：memory() = bytes；fd_count() macOS 返回 None。
 fn sample_process() -> (f64, Option<usize>) {
     let pid = sysinfo::get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from_u32(0));
@@ -239,5 +260,91 @@ fn sample_process() -> (f64, Option<usize>) {
     match sys.process(pid) {
         Some(p) => (p.memory() as f64 / 1024.0 / 1024.0, p.open_files()),
         None => (0.0, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::{StatsHandle, throughput_decay};
+
+    /// 用真实采样器跑 `windows` 个 1s 窗口：每窗前向 stats 灌 `per_window(i)` 字节。
+    /// 返回 (samples_throughput, metrics.csv 全文)。
+    fn run_windows(
+        per_window: impl Fn(usize) -> (u64, u64),
+        windows: usize,
+    ) -> (Vec<(f64, f64)>, String) {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("xray-stress-sampler-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let h = StatsHandle::new("s1-short");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let samples = rt.block_on(async {
+            let mut s =
+                Sampler::new("run-test", &dir, vec![h.clone()], Duration::from_secs(900)).unwrap();
+            for i in 0..windows {
+                let (tx, rx) = per_window(i);
+                h.record_ok(tx, rx, 1.0);
+                s.sample_once(i as f64, Duration::from_secs(1), false).unwrap();
+            }
+            s.samples_throughput
+        });
+        let csv = std::fs::read_to_string(dir.join("metrics.csv")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (samples, csv)
+    }
+
+    #[test]
+    fn throughput_is_window_increment_not_cumulative() {
+        let (samples, csv) = run_windows(|_| (2000, 1000), 6);
+        // 首窗无前值被剔除，其余每窗恒 3000 B/s（累计口径会给 3000/6000/9000…）
+        assert_eq!(samples.len(), 5);
+        for (t, bps) in &samples {
+            assert!((bps - 3000.0).abs() < 1e-6, "t={t} bps={bps} 仍随窗口累加");
+        }
+        // tx/rx 分列真实收发（旧实现两列各 bps/2 = 1500/1500）
+        let row = csv.lines().filter(|l| l.contains("s1-short")).nth(1).unwrap();
+        let cols: Vec<&str> = row.split(',').collect();
+        assert_eq!((cols[4], cols[5]), ("2000", "1000"), "tx/rx 必须分列真实收发");
+    }
+
+    #[test]
+    fn throughput_collapse_is_degraded_and_steady_is_ok() {
+        let steady = run_windows(|_| (5000, 5000), 40).0;
+        let (_, _, ratio) = throughput_decay(&steady).unwrap();
+        assert!(ratio >= 0.8, "稳态 run 应判 OK: ratio={ratio}");
+
+        // 后 20 窗吞吐降到 1/10（10× 崩塌）
+        let collapsed = run_windows(|i| if i < 20 { (5000, 5000) } else { (500, 500) }, 40).0;
+        let (head, tail, ratio) = throughput_decay(&collapsed).unwrap();
+        assert!(ratio < 0.8, "10× 崩塌必须判 DEGRADED: ratio={ratio} head={head} tail={tail}");
+    }
+
+    #[test]
+    fn checkpoint_interval_always_fires_within_run() {
+        // 5h run：6h 固定周期永不触发（F-28），新公式落 30min
+        assert_eq!(checkpoint_interval(Duration::from_secs(18_000)), Duration::from_secs(1_800));
+        // 短跑：下限 15min，20s 短跑不写 checkpoint
+        assert_eq!(checkpoint_interval(Duration::from_secs(20)), Duration::from_secs(900));
+        assert_eq!(checkpoint_interval(Duration::from_secs(600)), Duration::from_secs(900));
+    }
+
+    #[test]
+    fn checkpoint_writes_summary_latest_when_due() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("xray-stress-checkpoint-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let h = StatsHandle::new("s1-short");
+            let mut s = Sampler::new("run-cp", &dir, vec![h], Duration::from_millis(0)).unwrap();
+            assert!(s.maybe_checkpoint(Duration::from_secs(600), 5.0, "test").unwrap());
+            assert!(dir.join("summary-latest.md").exists(), "checkpoint 必须落盘");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

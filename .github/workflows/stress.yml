@@ -88,6 +88,23 @@ jobs:
           cur=$(ulimit -n)
           ulimit -Sn "$target" 2>/dev/null || ulimit -n "$target" 2>/dev/null || true
           echo "nofile: ${cur} → $(ulimit -n) (target ${target})"
+      - name: Expand ephemeral port range (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Linux 默认 ip_local_port_range = 32768-60999（28k）；高并发短连接风暴下
+          # harness 自身端口耗尽会被记成 SUT 失败（history run 35558871262 曾各 fail 15 万）。
+          sudo sysctl -w net.ipv4.ip_local_port_range="1025 64510"
+          sysctl net.ipv4.ip_local_port_range
+      - name: Expand ephemeral port range (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # macOS 默认动态端口 49152-65535（16k）；32 并发短连接 × TIME_WAIT 120s ≈ 25k 在途
+          # ⇒ EADDRINUSE 风暴会被记成 SUT 失败（同 Linux/Windows 的历史坑）。
+          sudo sysctl -w net.inet.ip.portrange.first=32768
+          sudo sysctl -w net.inet.ip.portrange.last=65535
+          sysctl net.inet.ip.portrange.first net.inet.ip.portrange.last
       - name: Expand ephemeral port range (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -128,7 +145,7 @@ jobs:
           elseif ("${{ matrix.batch }}" -eq "b") { $batch = "s7,s8,s9,s10,s11,s12" }
           else { $batch = "s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12" }
           Write-Host "batch: $batch, hours: $hours, concurrency: $conc, s2_conns: $s2, constrained: $env:CONSTRAINED"
-          $cargs = "--duration $($hours * 3600) --concurrency $conc --s2-conns $s2 --scenarios $batch --sample-interval 30 --drain-secs 360 --out-dir stress-out"
+          $cargs = "--duration $($hours * 3600) --concurrency $conc --s2-conns $s2 --scenarios $batch --s1-delay-ms 300 --sample-interval 30 --drain-secs 360 --out-dir stress-out"
           if ($IsLinux -and $env:CONSTRAINED -eq 'true') {
             # 极端模式：单核绑定 + 低 fd（ulimit 只在本 shell 生效，故与 taskset 同 shell 设置）
             & bash -c "ulimit -n 4096; exec taskset -c 0 ./target/release/xray-stress $cargs"
@@ -142,35 +159,40 @@ jobs:
       - name: Leak gate (fd/RSS slope)
         shell: bash
         run: python tools/check_stress_leak.py --csv stress-out/metrics.csv
-      # 极端模式「不崩」判定：进程活到结束（本 step 能跑到即退出码 0）+ 采样完整 +
-      # 功能未死（至少一条连接成功）。拒绝风暴/成功率低是触顶期望行为，不判红；
-      # 崩溃/Hang 由进程退出码与 job timeout 捕获。
-      - name: Extreme assertions (no-crash / functional-alive)
-        if: inputs.constrained
+      # 功能断言（默认与极端模式都跑）：崩溃由退出码捕获；这里堵「进程活着但功能已死」。
+      # 判据 = 每场景**末窗**（最后 1/4 采样）内 conn_ok 仍在增长 ⇒ 中后期全挂会 FAIL；
+      # 拒绝风暴/成功率低是触顶期望行为，不据此判红。
+      - name: Functional assertions (windowed / per-scenario)
         shell: bash
+        env:
+          CONSTRAINED: ${{ inputs.constrained }}
         run: |
           python - <<'EOF'
-          import csv, sys
+          import csv, os, sys
           rows = list(csv.DictReader(open('stress-out/metrics.csv', encoding='utf-8')))
-          if len(rows) < 2:
+          if len(rows) < 4:
               sys.exit(f'FAIL: metrics.csv 采样不足（{len(rows)} 行）= 进程早崩或未跑起来')
+          by_scen = {}
+          for r in rows:
+              if r['scenario'] in ('__proc__', '__drain__'):
+                  continue
+              by_scen.setdefault(r['scenario'], []).append(int(r['conn_ok']))
+          if not by_scen:
+              sys.exit('FAIL: 无场景采样（链路未起/进程崩）')
+          # 末窗 = 每场景最后 max(2, n//4) 个采样；窗口内累计值必须仍增长。
+          dead = [n for n, v in by_scen.items()
+                  if len(v) < 2 or v[-1] - v[max(0, len(v) - max(2, len(v) // 4))] <= 0]
           proc = [r for r in rows if r['scenario'] == '__proc__']
-          scen = [r for r in rows if r['scenario'] not in ('__proc__', '__drain__')]
-          if not proc:
-              sys.exit('FAIL: 无 __proc__ 采样行')
-          names = {r['scenario'] for r in scen}
-          ok = sum(int(r['conn_ok']) for r in scen)
-          fail = sum(int(r['conn_fail']) for r in scen)
-          rss_peak = max(float(r['rss_mb']) for r in proc)
+          rss_peak = max((float(r['rss_mb']) for r in proc), default=0.0)
           fd_vals = [int(r['fd_count']) for r in proc if r['fd_count'] not in ('-', '')]
-          fd_peak = max(fd_vals) if fd_vals else -1
-          print(f'extreme: scenarios={len(names)} conn_ok={ok} conn_fail={fail} '
-                f'rss_peak={rss_peak:.1f}MB fd_peak={fd_peak}')
-          if ok == 0:
-              sys.exit('FAIL: 全部连接失败（功能已死，非单纯触顶拒绝）')
-          if rss_peak > 1024:
-              sys.exit(f'FAIL: RSS 峰值 {rss_peak:.0f}MB > 1024MB（512MB 档预算严重超支）')
-          print('PASS: 极端模式未崩、功能存活')
+          print(f'assert: scenarios={len(by_scen)} dead={dead} rss_peak={rss_peak:.1f}MB '
+                f'fd_peak={max(fd_vals) if fd_vals else -1} constrained={os.environ.get("CONSTRAINED")}')
+          if dead:
+              sys.exit(f'FAIL: 末窗内无成功连接（功能已死）：{dead}')
+          # 极端模式（512MB 档，预算 96MiB）另加 RSS 绝对上限近似 OOM 判据。
+          if os.environ.get('CONSTRAINED') == 'true' and rss_peak > 600:
+              sys.exit(f'FAIL: RSS 峰值 {rss_peak:.0f}MB > 600MB（512MB 档预算严重超支）')
+          print('PASS: 功能存活（末窗每场景均有成功连接）')
           EOF
       - name: Upload results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

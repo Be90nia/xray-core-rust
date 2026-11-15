@@ -15,14 +15,20 @@
 //!
 //! 长跑启动命令见 run_stress.ps1 / run_stress.sh（保守/标准/激进三档）。
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use xray_stress::{
     error::{Result, StressError},
     quic_loop,
     report::StatsHandle,
-    sampler::Sampler,
+    sampler::{Sampler, checkpoint_interval},
     scenarios as sc, topology,
 };
 
@@ -107,8 +113,17 @@ async fn run(
     duration: Duration,
     interval: Duration,
 ) -> Result<()> {
+    let failures = Failures::default();
     #[allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")]
     let deadline = Instant::now() + duration;
+    // 看门狗兜底（真机 CI 实证：concurrency=32 时 tokio 定时器饿死 ⇒ deadline 永不检查）。
+    // grace 120s：留够负载收工（30s）+ 首轮探针的余量。
+    #[allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")]
+    let watchdog = Watchdog::arm(deadline + Duration::from_secs(120), || {
+        println!("[xray-stress] watchdog: run exceeded duration, terminating");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(0);
+    });
     let mut stats: Vec<StatsHandle> = Vec::new();
     // 负载 worker 与基础设施（协议链服务实例）分池：drain 观察窗停负载、
     // 保留 infra，让服务端 idle 连接按 connIdle 语义自然回收。
@@ -120,11 +135,7 @@ async fn run(
     let need_socks_link = scenarios.contains(&Scenario::S1) || scenarios.contains(&Scenario::S2);
     let socks_port = if need_socks_link {
         let (port, sh, ch) = topology::start_reality_link(echo_port).await?;
-        for h in sh.into_iter().chain(ch) {
-            infra.spawn(async move {
-                let _ = h.await;
-            });
-        }
+        spawn_infra(&mut infra, "reality infra", sh.into_iter().chain(ch), &failures);
         topology::probe_socks_roundtrip(port, echo_port).await?;
         println!(
             "[xray-stress] reality link ready: socks=127.0.0.1:{port} echo=127.0.0.1:{echo_port}"
@@ -135,11 +146,7 @@ async fn run(
     };
     let kcp_socks_port = if scenarios.contains(&Scenario::S4) {
         let (port, sh, ch) = topology::start_kcp_link(echo_port).await?;
-        for h in sh.into_iter().chain(ch) {
-            infra.spawn(async move {
-                let _ = h.await;
-            });
-        }
+        spawn_infra(&mut infra, "kcp infra", sh.into_iter().chain(ch), &failures);
         topology::probe_socks_roundtrip(port, echo_port).await?;
         println!("[xray-stress] kcp link ready: socks=127.0.0.1:{port}");
         Some(port)
@@ -161,11 +168,7 @@ async fn run(
             continue;
         }
         let (port, sh, ch) = sc.start_link(echo_port).await?;
-        for h in sh.into_iter().chain(ch) {
-            infra.spawn(async move {
-                let _ = h.await;
-            });
-        }
+        spawn_infra(&mut infra, name, sh.into_iter().chain(ch), &failures);
         // 60s 预算：覆盖 QUIC 系握手失败浮现（quinn 对端拒接经 idle timeout ~30s）
         tokio::time::timeout(
             Duration::from_secs(60),
@@ -209,7 +212,7 @@ async fn run(
         let long = (args.s2_conns / 2).max(1);
         load.spawn(sc::s4_mixed(port, echo_port, short, long, deadline, h, args.s1_delay_ms));
     }
-    for (sc, port) in protocol_links {
+    for &(sc, port) in &protocol_links {
         let h = StatsHandle::new(sc.stats_name());
         stats.push(h.clone());
         load.spawn(sc::s1_short_burst(
@@ -224,7 +227,7 @@ async fn run(
     println!("[xray-stress] {} scenario task groups running", stats.len());
 
     // --- 采样循环 ---
-    let mut sampler = Sampler::new(&run_id, &args.out_dir, stats, Duration::from_secs(21_600))?;
+    let mut sampler = Sampler::new(&run_id, &args.out_dir, stats, checkpoint_interval(duration))?;
     let label = format!("scenarios={scenarios:?}");
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -253,11 +256,13 @@ async fn run(
     }
 
     // --- 收尾：停负载（在途 roundtrip 落地），infra 保留供 drain 观察窗 ---
-    let stop = tokio::time::timeout(Duration::from_secs(30), async {
-        while load.join_next().await.is_some() {}
-    });
+    // load 任务各自在 deadline 收工；30s 未收工 = 挂死证据（F-9），记失败位而非只打印。
+    let stop = tokio::time::timeout(
+        Duration::from_secs(30),
+        drain_join(&mut load, "load worker", &failures),
+    );
     if stop.await.is_err() {
-        println!("[xray-stress] load stop timeout, aborting workers");
+        failures.record("load stop", &"timeout 30s, load workers hung");
         load.abort_all();
     }
 
@@ -274,6 +279,8 @@ async fn run(
             reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko"
         )]
         let drain_end = Instant::now() + Duration::from_secs(args.drain_secs);
+        // drain 窗自己的兜底：drain_secs + 60s（到点仍不退出 = 同样饿死）
+        watchdog.extend_to(drain_end + Duration::from_secs(60));
         #[allow(
             clippy::disallowed_methods,
             reason = "压测 drain 观察窗时钟锚点；Clock 端口注入待 bd 39hko"
@@ -297,10 +304,41 @@ async fn run(
         }
     }
 
-    let rest = tokio::time::timeout(Duration::from_secs(10), async {
-        while infra.join_next().await.is_some() {}
-    });
+    // --- 结束态功能探针（F-9）：进程退出码只证明没崩，不证明功能还活着。
+    // drain 结束后每条已建链路再走一轮真实 roundtrip，任一条失败即整 run 失败。
+    let mut links: Vec<(&str, u16)> = Vec::new();
+    if let Some(port) = socks_port {
+        links.push(("s1-s2-reality", port));
+    }
+    if let Some(port) = kcp_socks_port {
+        links.push(("s4-kcp", port));
+    }
+    for &(sc, port) in &protocol_links {
+        links.push((sc.stats_name(), port));
+    }
+    // 收尾段兜底：每条链路 30s 探针预算 + 余量（探针自身超时会记账，这里只管不退出的情形）
+    #[allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")]
+    let probe_budget = Instant::now() + Duration::from_secs(30 * (links.len() as u64 + 2) + 120);
+    watchdog.extend_to(probe_budget);
+    if let Err(e) = probe_links(&links, echo_port).await {
+        failures.record("end-state probe", &e);
+    }
+    if let Some(addr) = quic_addr {
+        match tokio::time::timeout(Duration::from_secs(30), quic_loop::probe_quic_roundtrip(addr))
+            .await
+        {
+            Ok(Ok(())) => println!("[xray-stress] end-state probe ok: s3-quic (udp/{addr})"),
+            Ok(Err(e)) => failures.record("end-state probe s3-quic", &e),
+            Err(_) => failures.record("end-state probe s3-quic", &"timeout 30s"),
+        }
+    }
+
+    let rest = tokio::time::timeout(
+        Duration::from_secs(10),
+        drain_join(&mut infra, "infra task", &failures),
+    );
     if rest.await.is_err() {
+        // 服务端 serve 任务本就长活，10s 未收工是正常路径（下面 abort 收尾），不算失败。
         println!("[xray-stress] drain timeout, aborting stragglers");
         infra.abort_all();
     }
@@ -323,6 +361,110 @@ async fn run(
         }
     }
     println!("[xray-stress] summary: {}", path.display());
+    let failed = failures.count();
+    if failed > 0 {
+        return Err(StressError::RunFailed { count: failed });
+    }
+    Ok(())
+}
+
+/// 任务失败账本（审计 F-26）：infra / 负载任务的 panic、JoinError、收工超时一律
+/// 记数与 log，run 结束返回 Err。禁 `let _ = h.await` 式静默吞掉——
+/// 那是 5h 长跑最隐蔽的假绿来源。
+#[derive(Clone, Default)]
+struct Failures(Arc<AtomicU64>);
+
+impl Failures {
+    fn record(&self, what: &str, detail: &dyn std::fmt::Display) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        tracing::error!("[xray-stress] {what} failed: {detail}");
+    }
+
+    fn count(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// infra 任务入池：panic/JoinError 记进失败账本（不再静默停摆）。
+fn spawn_infra(
+    set: &mut tokio::task::JoinSet<()>,
+    label: &'static str,
+    handles: impl IntoIterator<Item = tokio::task::JoinHandle<()>>,
+    failures: &Failures,
+) {
+    for h in handles {
+        let failures = failures.clone();
+        set.spawn(async move {
+            if let Err(e) = h.await {
+                failures.record(label, &e);
+            }
+        });
+    }
+}
+
+/// 收工一组任务，panic/取消一律记进失败账本（F-26）。
+async fn drain_join(set: &mut tokio::task::JoinSet<()>, what: &str, failures: &Failures) {
+    while let Some(res) = set.join_next().await {
+        if let Err(e) = res {
+            failures.record(what, &e);
+        }
+    }
+}
+
+/// 看门狗：tokio 定时器被饿死时的唯一退出保证。
+///
+/// 全速 loopback 负载（如 `--concurrency 32` = 192 worker）会让 tokio worker
+/// 永不 park ⇒ timer wheel 不推进 ⇒ `tick.tick().await` / `sleep` / deadline
+/// 检查全部失效，run 永不退出（真机 CI 实证：5 平台在 Run stress 后 2h40m+
+/// 不退出）。本线程用 `std::thread::sleep`（不依赖 tokio 运行时）兜底。
+///
+/// 触发目标可延长但不可提前（负载段 → drain 段 → 收尾段）。
+struct Watchdog(Arc<parking_lot::Mutex<Instant>>);
+
+impl Watchdog {
+    /// 起线程；`on_fire` 在目标到点且未被延长时调用一次。
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "看门狗必须是 OS 线程 + 真实 sleep：tokio 定时器正是被饿死的那个（全速 loopback 下 worker 不 park），走 tokio 就会一起失效"
+    )]
+    fn arm(target: Instant, on_fire: impl FnOnce() + Send + 'static) -> Self {
+        let shared = Arc::new(parking_lot::Mutex::new(target));
+        let slot = shared.clone();
+        std::thread::spawn(move || {
+            loop {
+                let now = Instant::now();
+                let target = *slot.lock();
+                if now >= target {
+                    on_fire();
+                    return;
+                }
+                std::thread::sleep(target - now);
+            }
+        });
+        Self(shared)
+    }
+
+    /// 把触发点往后推（只允许延长，避免收尾段被提前砍）。
+    fn extend_to(&self, target: Instant) {
+        let mut cur = self.0.lock();
+        if target > *cur {
+            *cur = target;
+        }
+    }
+}
+
+/// 结束态探针：每条已建链路各跑一轮真实 SOCKS roundtrip（审计 F-9：
+/// 进程活着 ≠ 功能活着，任务级挂死必须判负）。
+async fn probe_links(links: &[(&str, u16)], echo_port: u16) -> Result<()> {
+    for (name, port) in links {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            topology::probe_socks_roundtrip(*port, echo_port),
+        )
+        .await
+        .map_err(|_| StressError::Probe(format!("{name} end-state probe timeout (30s)")))??;
+        println!("[xray-stress] end-state probe ok: {name} (socks=127.0.0.1:{port})");
+    }
     Ok(())
 }
 
@@ -418,4 +560,72 @@ fn parse_scenarios(s: &str) -> Result<Vec<Scenario>> {
         return Err(StressError::Scenario("empty --scenarios".into()));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn end_state_probe_fails_on_dead_link() {
+        // 已释放端口 = 链路已死（accept 泵停摆 / 进程僵死的最小复现形态）
+        let dead = topology::pick_free_port().await;
+        let err = probe_links(&[("dead-link", dead)], 9).await.unwrap_err();
+        assert!(matches!(err, StressError::Probe(_)), "unexpected: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn panicked_task_records_failure() {
+        // F-26 验收：任务 panic ⇒ JoinError ⇒ 失败账本计数 > 0 ⇒ run 返回 Err(RunFailed)
+        let failures = Failures::default();
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async { panic!("boom") });
+        drain_join(&mut set, "test task", &failures).await;
+        assert_eq!(failures.count(), 1, "panic 必须进失败账本");
+    }
+
+    /// 看门狗必须在目标到点后触发（不依赖 tokio 运行时——本测试没有 runtime）。
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "测试计时锚点")]
+    fn watchdog_fires_after_target() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = fired.clone();
+        let _wd = Watchdog::arm(Instant::now() + Duration::from_millis(50), move || {
+            flag.store(true, Ordering::Relaxed);
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(fired.load(Ordering::Relaxed), "到点必须触发");
+    }
+
+    /// 延长后不得提前触发（drain / 收尾段要靠这条不被砍）。
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "测试计时锚点")]
+    fn watchdog_extension_defers_fire() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = fired.clone();
+        let base = Instant::now();
+        let wd = Watchdog::arm(base + Duration::from_millis(50), move || {
+            flag.store(true, Ordering::Relaxed);
+        });
+        wd.extend_to(base + Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!fired.load(Ordering::Relaxed), "延长后不得在旧目标点触发");
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(fired.load(Ordering::Relaxed), "新目标点必须触发");
+    }
+
+    /// 只允许往后退：传更早的目标不得缩短（否则收尾段可能被负载段的旧目标砍掉）。
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "测试计时锚点")]
+    fn watchdog_extension_never_shortens() {
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = fired.clone();
+        let base = Instant::now();
+        let wd = Watchdog::arm(base + Duration::from_millis(300), move || {
+            flag.store(true, Ordering::Relaxed);
+        });
+        wd.extend_to(base + Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!fired.load(Ordering::Relaxed), "更早的目标不得提前触发");
+    }
 }

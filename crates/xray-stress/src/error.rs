@@ -36,6 +36,14 @@ pub enum StressError {
     #[error("probe roundtrip: {0}")]
     Probe(String),
 
+    #[error(
+        "{count} run failure(s): task panic/join error/hang or end-state probe failure — see error logs"
+    )]
+    RunFailed {
+        /// 失败账本累计条数（infra/负载任务 panic、收工超时、结束态探针失败）。
+        count: u64,
+    },
+
     #[error("{name} link probe timeout (60s)")]
     ProbeTimeout {
         /// 场景显示名（PROTOCOL_SCENARIOS 表项，如 "s5-vmess-ws"）。

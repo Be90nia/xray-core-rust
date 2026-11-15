@@ -65,9 +65,18 @@ pub async fn s2_long_flow(
     for i in 0..n_conns {
         let stats = stats.clone();
         workers.spawn(async move {
-            if let Err(e) = s2_one_connection(socks_port, echo_port, deadline, &stats, i).await {
-                tracing::debug!("s2 conn {i} ended: {e}");
-                stats.record_fail();
+            // 单连接断开（ECONNRESET/服务端回收）只算一次失败：退避后重连，
+            // 直到 deadline——原实现失败即 worker 永久退场，剩余时长零负载（审计 F-27）。
+            #[allow(clippy::disallowed_methods, reason = "压测计时循环；Clock 端口注入待 bd 39hko")]
+            while Instant::now() < deadline {
+                match s2_one_connection(socks_port, echo_port, deadline, &stats, i).await {
+                    Ok(()) => break,
+                    Err(e) => {
+                        tracing::debug!("s2 conn {i} reset: {e}");
+                        stats.record_fail();
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    },
+                }
             }
         });
     }
@@ -154,4 +163,82 @@ pub async fn s4_mixed(
 
 fn ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    /// 假 SOCKS5 服务端：greet/CONNECT 应答后回显 `budget` 字节即关连接
+    /// （模拟「负载期间断开一条连接」），并计数 accept 次数。
+    /// 单 worker 串行处理即可——持久的只有一条被测连接。
+    async fn fake_socks(budget: usize) -> (u16, Arc<AtomicUsize>, tokio::task::JoinSet<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async move {
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                counter.fetch_add(1, Ordering::Relaxed);
+                if sock.read_exact(&mut [0u8; 3]).await.is_err() {
+                    continue;
+                }
+                if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                    continue;
+                }
+                if sock.read_exact(&mut [0u8; 10]).await.is_err() {
+                    continue;
+                }
+                if sock.write_all(&[0x05, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.is_err() {
+                    continue;
+                }
+                let mut echoed = 0;
+                while echoed < budget {
+                    let n = match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    if sock.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    echoed += n;
+                }
+                // 预算用完即关连接：客户端的下一次读写报错 → 触发重连路径
+            }
+        });
+        (port, accepts, set)
+    }
+
+    #[tokio::test]
+    async fn s2_worker_reconnects_after_connection_drop() {
+        // budget = 单个 chunk 上限（4MB）：保证每条连接至少完成一次 roundtrip，
+        // 之后服务端关连接，逼出「断连 → record_fail → 重连 → 继续 conn_ok」。
+        let (port, accepts, mut server) = fake_socks(4 * 1024 * 1024).await;
+        let stats = StatsHandle::new("s2-long");
+        #[allow(clippy::disallowed_methods, reason = "测试计时锚点（压测场景语义按 Instant 截止）")]
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // 挂死即失败：被测实现若在 30s 内不收工，测试必须红而不是卡住进程
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            s2_long_flow(port, 1, 1, deadline, stats.clone()),
+        )
+        .await
+        .expect("s2_long_flow 未在 deadline 后收工");
+        server.abort_all();
+
+        let snap = stats.snapshot();
+        let n_accept = accepts.load(Ordering::Relaxed);
+        assert!(snap.conn_fail >= 1, "断连必须记一次失败: fail={}", snap.conn_fail);
+        assert!(n_accept >= 2, "断连后必须重连（第二/第三次 accept）: accepts={n_accept}");
+        assert!(snap.conn_ok >= 2, "重连后必须继续产生成功计数: ok={}", snap.conn_ok);
+    }
 }
