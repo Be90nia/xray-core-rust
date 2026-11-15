@@ -31,7 +31,9 @@ use xray_app_dispatcher::{
     DispatchHandler, OutboundHandlerManager, UdpDispatchSession, default::SimpleOhm,
 };
 use xray_app_proxyman::ProxymanError;
-use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader, new_writer};
+use xray_buf::io::{
+    Reader, Writer, new_reader, new_reader_with_capacity, new_readv_reader, new_writer,
+};
 use xray_common::{
     net::{address::Address, destination::Destination, network::Network, port::Port},
     uuid::UUID,
@@ -1757,8 +1759,13 @@ pub async fn serve_dokodemo(
                             sni,
                         ) {
                             Some(dest) => {
+                                let readbuf = tls_stream.readbuf_size();
                                 let (read_half, write_half) = tokio::io::split(tls_stream);
-                                let link = Link::new(new_reader(read_half), new_writer(write_half));
+                                // bd 2bw8f：按入站 TLS 报告容量建读器（rustls 64K / btls 16K）。
+                                let link = Link::new(
+                                    new_reader_with_capacity(read_half, readbuf),
+                                    new_writer(write_half),
+                                );
                                 let _ =
                                     handler.dispatch_with_access(&dest, link, access.clone()).await;
                             },
@@ -2116,16 +2123,21 @@ pub enum SsInboundMode {
 ///
 /// 帧/seal 逻辑全在 `xray_proxy_ss::conn`（与出站同一份）；连接生命周期 = `dispatch`
 /// 的 await（不再需要连接级 scope 托管泵任务）。
+///
+/// `access` 带 SS 用户的 `level`（Go `sessionPolicy = ForLevel(request.User.Level)`，
+/// `proxy/shadowsocks/server.go:235`）：dispatcher 据此取 per-level policy
+/// （buffer 上限 + connIdle）。空 `AccessContext` = level 0，与未配 policy 等价。
 async fn ss_dispatch<C>(
     ss_stream: xray_proxy_ss::stream::SSStream<C>,
     dest: Destination,
     handler: std::sync::Arc<dyn DispatchHandler>,
+    access: xray_app_dispatcher::AccessContext,
 ) where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (r, w) = tokio::io::split(xray_proxy_ss::SsStreamConn::new(ss_stream));
     let link = Link::new(new_reader(r), xray_proxy_ss::conn::new_link_writer(w));
-    let _ = handler.dispatch(&dest, link).await;
+    let _ = handler.dispatch_with_access(&dest, link, access).await;
 }
 
 /// Legacy SS 单条 TCP 连接完整 pipeline：握手 → pump → dispatch。
@@ -2143,16 +2155,22 @@ pub(crate) async fn ss_legacy_pipeline<C>(
 {
     // 首包读超时：静默连接占位防护；transport 分支共用本函数，一并覆盖。
     let handshake = match tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await {
-        Ok(r) => r.map(|(header, ss_stream)| (header.address, header.port, ss_stream)),
+        Ok(r) => r,
         Err(_) => {
             tracing::debug!("ss legacy inbound handshake timeout");
             return;
         },
     };
     match handshake {
-        Ok((address, port, ss_stream)) => {
-            let dest = Destination::new(address, Port::new(port), Network::TCP);
-            ss_dispatch(ss_stream, dest, handler).await;
+        Ok((header, ss_stream)) => {
+            // 会话 policy 层级 = 命中用户的 level（Go server.go:235）。
+            let access = xray_app_dispatcher::AccessContext {
+                email: header.user.email.clone(),
+                level: header.user.level,
+                ..Default::default()
+            };
+            let dest = Destination::new(header.address, Port::new(header.port), Network::TCP);
+            ss_dispatch(ss_stream, dest, handler, access).await;
         },
         Err(e) => {
             tracing::debug!(error = %e, "ss inbound handshake failed");
@@ -2304,16 +2322,18 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
             let handshake = tokio::time::timeout(handshake_timeout, ib.handle_conn(stream)).await;
             let handshake = match handshake {
                 Ok(r) => r
-                    .map(|resp| (resp.address, resp.port, resp.stream))
+                    .map(|resp| (resp.address, resp.port, resp.stream, resp.user_email, resp.level))
                     .map_err(|e| std::io::Error::other(e.to_string())),
                 Err(_) => {
                     tracing::debug!("ss2022 inbound handshake timeout");
                     return;
                 },
             };
-            if let Ok((address, port, ss_stream)) = handshake {
+            if let Ok((address, port, ss_stream, email, level)) = handshake {
+                let access =
+                    xray_app_dispatcher::AccessContext { email, level, ..Default::default() };
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                ss_dispatch(ss_stream, dest, handler).await;
+                ss_dispatch(ss_stream, dest, handler, access).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
@@ -2323,16 +2343,18 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
                 tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, ib.handle_conn(stream)).await;
             let handshake = match handshake {
                 Ok(r) => r
-                    .map(|resp| (resp.address, resp.port, resp.stream))
+                    .map(|resp| (resp.address, resp.port, resp.stream, resp.user_email, resp.level))
                     .map_err(|e| std::io::Error::other(e.to_string())),
                 Err(_) => {
                     tracing::debug!("ss2022 multi inbound handshake timeout");
                     return;
                 },
             };
-            if let Ok((address, port, ss_stream)) = handshake {
+            if let Ok((address, port, ss_stream, email, level)) = handshake {
+                let access =
+                    xray_app_dispatcher::AccessContext { email, level, ..Default::default() };
                 let dest = Destination::new(address, Port::new(port), Network::TCP);
-                ss_dispatch(ss_stream, dest, handler).await;
+                ss_dispatch(ss_stream, dest, handler, access).await;
             } else if let Err(e) = handshake {
                 tracing::debug!(error = %e, "ss inbound handshake failed");
             }
@@ -2348,14 +2370,16 @@ pub(crate) async fn ss_mode_conn_pipeline<C>(
                     return;
                 },
             };
-            let Ok((_addr, port, prefix, tcp)) = handshake else {
+            let Ok((_addr, port, prefix, level, tcp)) = handshake else {
                 tracing::debug!("ss2022 relay inbound handshake failed");
                 return;
             };
+            // Go inbound_relay.go:202：会话 policy 取命中目标的 level。
+            let access = xray_app_dispatcher::AccessContext { level, ..Default::default() };
             let dest = Destination::new(_addr, Port::new(port), Network::TCP);
             let (r, w) = tokio::io::split(tcp);
             let link = Link::new(new_reader(SsRelayReader::new(prefix, r)), new_writer(w));
-            let _ = handler.dispatch(&dest, link).await;
+            let _ = handler.dispatch_with_access(&dest, link, access).await;
         },
     }
 }
@@ -5574,8 +5598,18 @@ pub(crate) fn build_vless_fallbacks(
             ));
         }
         if fb_type != "tcp" {
+            // bd p9gyj：`unix` 与 `serve` 都是显式拒启（禁静默降级到 tcp）。
+            // - `unix`：Go 能 `net.Dial("unix", peer)`，本仓 fallback 桥只建 TCP
+            //   连接（[`xray_transport::fallback`] 的拨号面），需新增 UnixStream 桥接
+            //   才可支持——本票未做（留能力缺口登记）。
+            // - `serve`（`"dest":"serve-ws-none"`）：**Go 运行期同样不可用**——Go 把它 原样交给
+            //   `net.Dial(fb.Type, fb.Dest)`（`proxy/vless/inbound/inbound.go:420`）， `"serve"`
+            //   不是合法 network ⇒ 每条 fallback 连接都在拨号期失败。本仓在 装配期就拒启 = 比 Go
+            //   的"每连接运行期报错"更早 fail-visible，语义不劣。
             return Err(std::io::Error::other(format!(
-                "VLESS fallbacks[{i}]: fallback type \"{fb_type}\" is not supported by this build (only \"tcp\")"
+                "VLESS fallbacks[{i}]: fallback type \"{fb_type}\" is not supported by this \
+                 build (only \"tcp\"; \"unix\" needs a UnixStream bridge, \"serve\"/\
+                 \"serve-ws-none\" is unusable upstream too — Go dials network \"serve\")"
             )));
         }
         policy.add(name, alpn, path, xray_proxy_vless::FallbackDest::new(dest, xver));
@@ -5662,17 +5696,19 @@ fn parse_network_list(v: &serde_json::Value) -> Vec<String> {
 /// 口径：
 /// - `network` **显式在场且不含 `udp`** → `false`（配置说只开 TCP 就不再收 UDP： 此前无条件 bind
 ///   UDP，`"network":"tcp"` 的配置在本仓仍开 UDP 口 = 半开放面，k873k G-7）；
-/// - `network` 缺省 → `true`：Go 缺省是 **TCP-only**，本仓存量行为是双栈 bind， 改缺省会关掉既有 SS
-///   UDP relay（生产行为收窄），故**保留**双栈并在此显式登记差异；
+/// - `network` **缺省（含空串/空数组）** → `false`：Go 缺省兜底 `[TCP]`。 bd p9gyj 起与 Go
+///   对齐——旧实现"缺省双栈 bind"是**独有偏差**（同一份配置在 Go 只开 TCP、在本仓多开一个 UDP
+///   口）；关掉后受影响配置需显式写 `"network":"tcp,udp"` （装配期 INFO 行会提示 `network excludes
+///   udp`）；
 /// - 非法 JSON → `Err`（装配期拒启）。
 pub(crate) fn ss_udp_listen_allowed(data: &[u8]) -> std::io::Result<bool> {
     if data.is_empty() {
-        return Ok(true);
+        return Ok(false);
     }
     let v: serde_json::Value = serde_json::from_slice(data)
         .map_err(|e| std::io::Error::other(format!("ss inbound settings JSON: {e}")))?;
     let Some(net) = v.get("network") else {
-        return Ok(true);
+        return Ok(false);
     };
     Ok(parse_network_list(net).iter().any(|n| n == "udp"))
 }
@@ -5866,6 +5902,9 @@ pub(crate) fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundM
             let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
             let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let c_method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
+            // Go shadowsocks.go:57 `Level: uint32(user.Level)`——会话建立后经
+            // dispatcher `ForLevel(level)` 取 policy（server.go:235）。
+            let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let cipher = ss_cipher_from_str(c_method).ok_or_else(|| {
                 std::io::Error::other(format!("unsupported ss cipher: {c_method}"))
             })?;
@@ -5876,7 +5915,7 @@ pub(crate) fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundM
             };
             let account = SsConfigMemoryAccount::from_proto(&proto)
                 .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
-            users.push(xray_proxy_ss::validator::MemoryUser::new(email, account));
+            users.push(xray_proxy_ss::validator::MemoryUser::new(email, account).with_level(level));
         }
         if users.is_empty() {
             return Err(std::io::Error::new(
@@ -5900,7 +5939,10 @@ pub(crate) fn parse_ss_inbound_config(data: &[u8]) -> std::io::Result<SsInboundM
     };
     let account = SsConfigMemoryAccount::from_proto(&proto)
         .map_err(|e| std::io::Error::other(format!("ss account parse: {e}")))?;
-    Ok(SsInboundMode::Legacy(Arc::new(SsInbound::new(account, "u@ss.local"))))
+    // 单用户形态的顶层 `level`（Go shadowsocks.go:99 `Level: uint32(v.Level)`）。
+    let level = v.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let user = xray_proxy_ss::validator::MemoryUser::new("u@ss.local", account).with_level(level);
+    Ok(SsInboundMode::Legacy(Arc::new(SsInbound::with_users(vec![user]))))
 }
 
 /// SS-2022 入站配置解析。
@@ -6019,9 +6061,12 @@ fn parse_ss2022_inbound_config(
         return Ok(SsInboundMode::Ss2022Multi(Arc::new(multi)));
     }
 
-    // 单用户模式
+    // 单用户模式（顶层 `level` → 会话 policy，Go buildShadowsocks2022
+    // `config.Level = int32(v.Level)` + inbound.go:145 ForLevel(user.Level)）。
+    let level = v.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let single = Ss2022Inbound::new(method, server_psk, "u@ss2022.local")
-        .map_err(|e| std::io::Error::other(format!("ss2022 single: {e}")))?;
+        .map_err(|e| std::io::Error::other(format!("ss2022 single: {e}")))?
+        .with_level(level);
     Ok(SsInboundMode::Ss2022(Arc::new(single)))
 }
 
@@ -6745,6 +6790,83 @@ mod tests {
             warns.iter().any(|w| w.contains("dispatch_link failed") && w.contains("ss-in")),
             "dispatch failure must warn with inbound tag + reason, got: {warns:?}"
         );
+    }
+
+    /// bd g3dat：SS legacy 用户 `level` 必须进会话 access（Go
+    /// `sessionPolicy = ForLevel(request.User.Level)`，server.go:235），
+    /// dispatcher 据此取 per-level policy（buffer 上限 + connIdle）。
+    /// 变异 = `ss_dispatch` 回退到无 access 的 `dispatch`（level 恒 0）→ 断言失败。
+    #[tokio::test]
+    async fn ss_legacy_pipeline_passes_user_level_to_dispatch() {
+        #[derive(Debug)]
+        struct AccessCapture(Arc<parking_lot::Mutex<Vec<xray_app_dispatcher::AccessContext>>>);
+        impl DispatchHandler for AccessCapture {
+            fn tag(&self) -> &str {
+                "ss-level-probe"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                Box::pin(async move {})
+            }
+
+            fn dispatch_with_access(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+                access: xray_app_dispatcher::AccessContext,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                self.0.lock().push(access);
+                Box::pin(async move {})
+            }
+        }
+
+        let account =
+            SsConfigMemoryAccount::from_proto(&xray_proto::xray::proxy::shadowsocks::Account {
+                password: "ss-level-pw".to_string(),
+                cipher_type: SsCipherType::Aes128Gcm.as_i32(),
+                iv_check: false,
+            })
+            .expect("ss account");
+
+        let ib = Arc::new(SsInbound::with_users(vec![
+            xray_proxy_ss::validator::MemoryUser::new("lv@ss.test", account.clone()).with_level(6),
+        ]));
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let handler: Arc<dyn DispatchHandler> = Arc::new(AccessCapture(Arc::clone(&seen)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("ss-level-pipeline", async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            ss_legacy_pipeline(ib, handler, conn, xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT)
+                .await;
+        });
+
+        let client =
+            xray_proxy_ss::client::Client::new(account, "127.0.0.1".to_string(), addr.port());
+        let _stream = client
+            .dial_target_for_proxy(&Address::Domain("level.test".into()), 443)
+            .await
+            .expect("ss client handshake");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                // 内层块：MutexGuard 不得跨 await（clippy await_holding_lock）
+                let snapshot = seen.lock();
+                if !snapshot.is_empty() || std::time::Instant::now() > deadline {
+                    assert_eq!(snapshot.len(), 1, "dispatch 必须恰好投递一次 access");
+                    assert_eq!(snapshot[0].level, 6, "用户 level 必须进会话 policy 层级");
+                    assert_eq!(snapshot[0].email, "lv@ss.test");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// bd b8i 对称面：不支持平台（Windows/macOS 等）tun inbound →
@@ -12471,20 +12593,26 @@ mod tests {
         }
     }
 
-    /// 3hsv③：unix / serve（serve-ws-none）目标本构建运行面未实现 → 显式
-    /// 拒启（此前静默放过、运行期 TcpStream 拨号必炸）。
+    /// 3hsv③ / bd p9gyj：unix / serve（serve-ws-none）目标本构建运行面未实现 →
+    /// 显式拒启（此前静默放过、运行期 TcpStream 拨号必炸）。文案必须**点名类型**
+    /// （运维要一眼看出是 `unix` 还是 `serve` 被拒）。
     #[test]
     fn vless_fallbacks_unsupported_type_rejected() {
         let cases = [
-            r#"{"decryption":"none","fallbacks":[{"dest":"/run/xray.sock"}]}"#,
-            r#"{"decryption":"none","fallbacks":[{"dest":"serve-ws-none"}]}"#,
+            (r#"{"decryption":"none","fallbacks":[{"dest":"/run/xray.sock"}]}"#, "unix"),
+            (r#"{"decryption":"none","fallbacks":[{"dest":"serve-ws-none"}]}"#, "serve"),
         ];
-        for json in cases {
+        for (json, ty) in cases {
             #[allow(clippy::err_expect)] // 存量清零批次
             let err = super::build_vless_fallbacks(json.as_bytes()).err().expect("must reject");
+            let msg = err.to_string();
             assert!(
-                err.to_string().contains("not supported"),
-                "expected unsupported-type hard error, got: {err}"
+                msg.contains("not supported"),
+                "expected unsupported-type hard error, got: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("\"{ty}\"")),
+                "拒启文案必须点名 fallback 类型 {ty}，实际 {msg}"
             );
         }
     }
@@ -12870,14 +12998,18 @@ mod tests {
         assert!(s.dest.as_ref().unwrap().is_tcp());
     }
 
-    /// k873k G-7：SS 入站 `network` 显式排除 udp 时不得 bind UDP（Go
-    /// `proxy/shadowsocks/server.go:81-87` `Server.Network()`）；缺省保留双栈（登记差异）。
+    /// k873k G-7 + bd p9gyj：SS 入站 `network` 决定是否 bind UDP（Go
+    /// `proxy/shadowsocks/server.go:81-87` `Server.Network()`）。**缺省 = TCP-only**
+    /// （Go 空列表兜底 `[TCP]`）——旧实现"缺省双栈"是本仓独有偏差，已对齐。
     #[test]
     fn ss_udp_listen_allowed_follows_network() {
         let allowed = |json: serde_json::Value| {
             super::ss_udp_listen_allowed(&serde_json::to_vec(&json).unwrap()).unwrap()
         };
-        assert!(allowed(serde_json::json!({"method": "aes-128-gcm", "password": "p"})));
+        // 缺省（无 network 键）= TCP-only，与 Go 一致。
+        assert!(!allowed(serde_json::json!({"method": "aes-128-gcm", "password": "p"})));
+        assert!(!allowed(serde_json::json!({"network": ""})));
+        assert!(!allowed(serde_json::json!({"network": []})));
         assert!(allowed(serde_json::json!({"network": "tcp,udp"})));
         assert!(allowed(serde_json::json!({"network": ["udp"]})));
         assert!(!allowed(serde_json::json!({"network": "tcp"})));
@@ -13655,8 +13787,11 @@ mod tests {
         };
         use xray_transport::finalmask::{UdpIo, build_udpmask_manager_from_json};
 
+        // bd p9gyj：ss 入站缺省 = TCP-only（Go `Server.Network()` 空列表兜底 `[TCP]`）
+        // ⇒ 要 UDP relay 必须显式声明 network。
         let users_json =
-            br#"{"users":[{"method":"aes-128-gcm","password":"ss-fm-pass"}]}"#.to_vec();
+            br#"{"users":[{"method":"aes-128-gcm","password":"ss-fm-pass"}],"network":"tcp,udp"}"#
+                .to_vec();
         let stream_json = serde_json::json!({
             "network": "tcp",
             "finalmask": { "udp": [ { "type": "mkcp-legacy", "settings": {} } ] }

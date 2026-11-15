@@ -420,13 +420,19 @@ impl ScopeRef {
             self.counts.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(ScopeClosed);
         }
-        crate::compat::spawn_reaping_ticked(
+        let spawned = crate::compat::spawn_reaping_ticked(
             &scope,
             &scope_log(),
             &self.label,
             Some(&self.tick),
             fut,
-        )
+        );
+        // 闸在预检与入集之间关闭（停机竞态窗口）：`spawn_tracked` 已 fail-closed 回
+        // `Err`，此处**补计数**——旧实现只在预检命中时计数，竞态窗口漏账（bd i43c3）。
+        if spawned.is_err() {
+            self.counts.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        spawned
     }
 
     /// 停机期拒发累计数（本账本，所有句柄共享同一读数）：站点 DEBUG 行带此值，
@@ -551,13 +557,20 @@ impl ComponentScope {
             self.counts.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(ScopeClosed);
         }
-        crate::compat::spawn_reaping_ticked(
+        let spawned = crate::compat::spawn_reaping_ticked(
             &self.scope,
             &self.log,
             &self.label,
             Some(&self.tick),
             fut,
-        )
+        );
+        // 闸在预检与入集之间关闭（停机竞态窗口）：`spawn_tracked` fail-closed 回 `Err`，
+        // 此处**补计数**（旧实现漏账，bd i43c3）；WARN 也归此处控制——`spawn_reaping_ticked`
+        // 自身不落拒发日志，不会被竞态窗口复活成 WARN 噪音（bd 9ka5w 口径）。
+        if spawned.is_err() {
+            self.counts.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        spawned
     }
 
     /// 增量收割已完成条目（udf `try_reap`）并上报 panic；返回收割条数。

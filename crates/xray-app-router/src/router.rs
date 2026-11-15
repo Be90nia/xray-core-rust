@@ -469,8 +469,11 @@ pub(crate) fn ctx_hash_key(ctx: &dyn RoutingContext) -> u64 {
 ///   却在直连一个固定出站，属静默降级。
 /// - 其余策略名报错（Go config.go:162-163 "unrecognized balancer type"）
 ///
-/// `strategy_settings`（TypedMessage 反序列化）当前不解析：LeastLoad 用
-/// `StrategyLeastLoadConfig::default()` 兜底（同 Go 缺省值）。
+/// `strategy_settings`（TypedMessage）在 `leastload` 分支**真实解码**为
+/// `StrategyLeastLoadConfig`（装配面见 `xray-core::wiring` 的
+/// `leastload_settings_to_typed_message`）：缺失 → Go conf 层的 `{}` 等价缺省值；
+/// 解码失败 → **硬错拒启**（Go `config.go:140-145` `GetInstance` 失败即 error，
+/// 静默用缺省参数跑观测策略会让运维的调优参数无声失效）。
 fn build_balancer(
     br: &BalancingRule,
     ohm: &Arc<dyn OutboundHandlerSelector>,
@@ -501,16 +504,14 @@ fn build_balancer(
         },
         "leastload" => {
             let obs = observer.ok_or_else(|| require_observer("leastload"))?;
-            let cfg = br
-                .strategy_settings
-                .as_ref()
-                .and_then(|ss| {
-                    // 反序列化 TypedMessage → StrategyLeastLoadConfig。
-                    // proto Any 解码需 xray-proto Any 支持；此处 try_decode 失败回退默认。
-                    let any = &ss.value;
-                    prost::Message::decode(any.as_slice()).ok()
-                })
-                .unwrap_or_default();
+            // TypedMessage.value 由装配面按 `StrategyLeastLoadConfig` 编码；解码失败
+            // = 硬错（禁 `.ok()` 吞成缺省参数，bd p9gyj）。
+            let cfg = match br.strategy_settings.as_ref() {
+                None => Default::default(),
+                Some(ss) => prost::Message::decode(ss.value.as_slice()).map_err(|e| {
+                    RouterError::Other(format!("leastload strategySettings decode: {e}"))
+                })?,
+            };
             Arc::new(
                 crate::strategy_leastload::LeastLoadStrategy::new(
                     &cfg,

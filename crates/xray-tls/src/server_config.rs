@@ -415,8 +415,9 @@ pub fn build_btls_server_context(
 /// - 证书级字段（Go `TLSCertConfig`，transport_security.go:248-257，作用于 `certificates[]`
 ///   每条目）：`ocspStapling`（uint64 热重载间隔秒，>0 启用 OCSP 装订，接线
 ///   `crate::ocsp_stapling`）；`oneTimeLoading`（bool，禁证书热重载——file 形态条目
-///   本会按周期重读，置 true 则只在装配期读一次）；`buildChain`（bool，Go v26.6.1 实际未消费
-///   BuildNameToCertificate 无条件调用；rustls resolver 恒用解析 names，no-op）。
+///   本会按周期重读，置 true 则只在装配期读一次）；`buildChain`（bool，Go v26.11.9 只在
+///   `usage:"issue"` 动态签发路径消费——`tls/config.go:155` 把 CA 证书 PEM 拼进 现签链；本仓
+///   `usage:"issue"` 装配期硬错（bd wr9e6）⇒ 该键在本仓无消费面，解析 仅为配置兼容）。
 pub fn build_server_config(
     security: &str,
     security_json: Option<&serde_json::Value>,
@@ -776,8 +777,9 @@ struct CertEntryFlags {
     /// Go `oneTimeLoading`：禁证书热重载——file 形态条目本会按周期重读，置 true 则
     /// 只在装配期读一次（Go `config.go:105-107`）。
     one_time_loading: bool,
-    /// Go `buildChain`：v26.6.1 实际未消费（BuildNameToCertificate 无条件调用）；
-    /// rustls resolver 恒用解析 names，no-op。
+    /// Go `buildChain`：只被 `usage:"issue"` 动态签发路径消费（`tls/config.go:155`
+    /// 把 CA 证书 PEM 拼进现签链）；本仓 `usage:"issue"` 装配期硬错 ⇒ 无消费面，
+    /// 解析仅为配置兼容（bd p9gyj 纠正旧注释"Go 未消费"）。
     build_chain: bool,
 }
 
@@ -847,10 +849,14 @@ fn build_named_cert_keys(
                 EntryUsage::Issue => return Err(issue_usage_unsupported("rustls")),
             }
             let flags = cert_entry_flags(entry);
-            if !flags.build_chain {
+            if flags.build_chain {
+                // 只有 `usage:"issue"` 的动态签发会用 `buildChain` 拼链（Go
+                // `tls/config.go:155`）；本后端 issue 已硬错 ⇒ 该 true 无效果，显式
+                // 留痕而非静默（bd p9gyj）。
                 tracing::debug!(
                     target: "xray_tls::server_config",
-                    "certificates[] entry buildChain=false: no-op (rustls resolver always uses parsed names)"
+                    "certificates[] entry buildChain=true: no-op (only Go's usage:\"issue\" \
+                     dynamic issuance consumes it; this build rejects usage:\"issue\")"
                 );
             }
             let (certs, key) = entry_certs_and_key(entry)?;
@@ -1380,7 +1386,8 @@ aZ9A3Sng12a1YFnJcLOELh+loNChRANCAATG2iorYlDeMjaVlb7XdvtKt1Og/t5H
     }
 
     /// 证书级 `buildChain`（Go TLSCertConfig）：两值均构建成功且配置不受影响
-    /// （票 8k4s②：Go v26.6.1 未消费该键，rustls resolver 恒用解析 names）。
+    /// （票 8k4s② + bd p9gyj：Go v26.11.9 只在 `usage:"issue"` 动态签发路径消费
+    /// 该键（`tls/config.go:155`），本仓 issue 装配期硬错 ⇒ 无消费面）。
     #[test]
     fn pwh6_build_chain_at_cert_level_accepts_both_bool_values() {
         install_provider();

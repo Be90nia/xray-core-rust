@@ -134,6 +134,23 @@ impl<S> InboundTlsStream<S> {
             Self::Btls(s) => s.ssl().ech_accepted(),
         }
     }
+
+    /// 明文「一批交付」所需的读窗口（bd 2bw8f，入站侧 F3 对偶）。
+    ///
+    /// 入站泵按本容量建读器（`xray_buf::io::new_reader_with_capacity`）：
+    /// rustls 每次 recv 吃满内部缓冲、多 record 批量解密 ⇒ 64KiB；btls
+    /// `SSL_read` 不跨 record ⇒ 16KiB 恰是「一 record 一 poll_read」。缺省
+    /// 8KiB 会把每个 16KiB record 劈成两次读（两次 memcpy + 两次 split 加锁）。
+    ///
+    /// 非 TLS 路径（裸 TCP / transport 已终结 TLS）不调本方法 ⇒ 池化 8KiB 不变。
+    #[must_use]
+    pub fn readbuf_size(&self) -> usize {
+        match self {
+            Self::Rustls(_) => 64 * 1024,
+            #[cfg(not(target_os = "ios"))]
+            Self::Btls(_) => crate::btls_client::TLS_RECORD_READBUF,
+        }
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for InboundTlsStream<S> {
@@ -436,11 +453,12 @@ mod tests {
             let sni = tls.server_name().map(str::to_string);
             let alpn = tls.alpn_protocol().map(<[u8]>::to_vec);
             let tls13 = tls.is_tls13();
+            let readbuf = tls.readbuf_size();
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).await?;
             tls.write_all(&buf).await?;
             tls.flush().await?;
-            Ok::<_, io::Error>((ech, sni, alpn, tls13))
+            Ok::<_, io::Error>((ech, sni, alpn, tls13, readbuf))
         });
 
         let client_ctx = {
@@ -459,8 +477,9 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
 
-        let (ech, sni, alpn, tls13) = server.await.unwrap().unwrap();
+        let (ech, sni, alpn, tls13, readbuf) = server.await.unwrap().unwrap();
         assert!(ech, "服务端必须报告 ECH accepted");
+        assert_eq!(readbuf, 16 * 1024, "btls SSL_read 不跨 record ⇒ 16KiB 读窗口（bd 2bw8f）");
         assert_eq!(sni.as_deref(), Some(INNER_NAME), "服务端应看到内层 SNI");
         assert_eq!(alpn.as_deref(), Some(&b"h2"[..]), "ALPN 必须协商成 h2");
         assert!(tls13, "BoringSSL 默认协商 TLS 1.3");
@@ -489,11 +508,12 @@ mod tests {
             let sni = tls.server_name().map(str::to_string);
             let alpn = tls.alpn_protocol().map(<[u8]>::to_vec);
             let tls13 = tls.is_tls13();
+            let readbuf = tls.readbuf_size();
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf).await?;
             tls.write_all(&buf).await?;
             tls.flush().await?;
-            Ok::<_, io::Error>((ech, sni, alpn, tls13))
+            Ok::<_, io::Error>((ech, sni, alpn, tls13, readbuf))
         });
 
         xray_common::ensure_default_crypto_provider();
@@ -515,8 +535,9 @@ mod tests {
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"ping");
 
-        let (ech, sni, alpn, tls13) = server.await.unwrap().unwrap();
+        let (ech, sni, alpn, tls13, readbuf) = server.await.unwrap().unwrap();
         assert!(!ech, "rustls 后端无服务端 ECH ⇒ 恒 false");
+        assert_eq!(readbuf, 64 * 1024, "rustls 多 record 批量解密 ⇒ 64KiB 读窗口（bd 2bw8f）");
         assert_eq!(sni.as_deref(), Some(INNER_NAME));
         assert_eq!(alpn.as_deref(), Some(&b"h2"[..]));
         assert!(tls13, "rustls 默认协商 TLS 1.3");

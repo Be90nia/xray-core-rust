@@ -33,7 +33,7 @@ use tokio::{
     net::TcpStream,
 };
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
-use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
+use xray_buf::io::{new_coalescing_writer, new_reader, new_reader_with_capacity, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
 use xray_frame::{LogFacade, deadline::Budget};
 use xray_transport::{
@@ -199,6 +199,10 @@ pub struct VlessInboundOptions {
     /// 跑在直连 TLS1.3/REALITY 上，transport 解包流或 TLS1.2 拒绝）。装配层注入：
     /// serve_vless TLS 分支查 rustls 协商版本，REALITY Verified 恒 true，其余 false。
     pub outer_tls13: bool,
+    /// 入站 TLS 读批窗口（bd 2bw8f）：serve_vless 的 TLS 分支按
+    /// `InboundTlsStream::readbuf_size` 逐连接覆写（rustls 64KiB / btls 16KiB）。
+    /// 缺省 0 = 保持池化 8KiB（裸 TCP / transport 已终结 TLS 的路径）。
+    pub tls_readbuf_size: usize,
 }
 /// VLESS inbound 服务入口。
 ///
@@ -301,9 +305,12 @@ pub async fn serve_vless(
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();
                         // lwep（Go inbound.go:571-574）：XRV 校验需要外层 TLS 版本。
+                        // bd 2bw8f：入站读批窗口随 TLS 后端（rustls 64K / btls 16K），
+                        // 缺省 8K 会把每个 16K record 劈两次读。
                         let mut options = options;
                         if let Some(o) = options.as_mut() {
                             o.outer_tls13 = tls_stream.is_tls13();
+                            o.tls_readbuf_size = tls_stream.readbuf_size();
                         }
                         // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS 隧道内）。
                         let io = xray_transport::headers::conn::maybe_wrap_server(
@@ -848,6 +855,8 @@ where
                 raw_tcp,
                 &access,
                 splice_directives,
+                // bd 2bw8f：入站 TLS 读批窗口（TLS 分支逐连接填，缺省 0 = 8KiB）。
+                options.as_ref().map_or(0, |o| o.tls_readbuf_size),
             )
             .await
         },
@@ -863,6 +872,7 @@ where
 }
 
 /// TCP 命令分派：vision 包装（可选） → split → dispatch。
+#[allow(clippy::too_many_arguments)] // 分派入口直译；readbuf 为 bd 2bw8f 读批窗口
 async fn finish_tcp_dispatch<R, W>(
     reader: R,
     write_half: W,
@@ -871,6 +881,8 @@ async fn finish_tcp_dispatch<R, W>(
     raw_tcp: Option<TcpStream>,
     access: &xray_app_dispatcher::AccessContext,
     splice_directives: Option<std::sync::Arc<crate::encryption::SpliceDirectives>>,
+    // 入站 TLS 读批窗口（bd 2bw8f）：16KiB record 一批交付；0 = 池化 8KiB。
+    readbuf: usize,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -937,7 +949,11 @@ where
         // F2 服务端写聚合：仅 flow=""（非 vision）TCP 分派启用——vision 帧写批
         // 边界（IsCompleteRecord 语义）逐批原样；UDP/Mux/Rvs 分派不经此处。
         // 聚合边界 = 单次 write_multi_buffer 调用（wire 写缓冲拼接，非应用帧）。
-        (None, _, _) => Link::new(new_reader(reader), new_coalescing_writer(write_half)),
+        (None, _, _) => Link::new(
+            // bd 2bw8f：按入站 TLS 报告容量建读器（0 = 池化 8KiB 不变）。
+            new_reader_with_capacity(reader, readbuf),
+            new_coalescing_writer(write_half),
+        ),
     };
     let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
     Ok(())
@@ -2663,6 +2679,7 @@ mod tests {
             outer_tls13: false,
             handshake_timeout: None,
             allowed_network: None,
+            tls_readbuf_size: 0,
         };
         xray_common::testing::spawn("vless-inbound-rvs-disabled-warns-and-skips", async move {
             let _ = serve_vless(
@@ -2737,6 +2754,7 @@ mod tests {
             handshake_timeout: None,
             outer_tls13: false,
             allowed_network: None,
+            tls_readbuf_size: 0,
         };
         xray_common::testing::spawn(
             "vless-inbound-rvs-enabled-with-registry-uses-registr",
@@ -3335,5 +3353,86 @@ mod tests {
             elapsed >= TLS_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(500),
             "窗未生效（清得太早，改前无界等待形态）: {elapsed:?}"
         );
+    }
+
+    /// bd 2bw8f：入站泵按 TLS 层报告的读批窗口建读器——16KiB record 一批交付；
+    /// 缺省 0 仍是池化 8KiB（同一 record 劈两批）。
+    ///
+    /// 负向对照：把 `finish_tcp_dispatch` 的 `readbuf` 传 0（= 改回 `new_reader`）
+    /// 第一条断言必红（8192 ≠ 16384）；删掉容量接线同理。
+    #[tokio::test]
+    async fn inbound_tls_readbuf_size_sets_first_batch() {
+        /// 单次 `poll_read` 至多交付 16KiB 的源（btls `SSL_read` 不跨 record 语义）。
+        struct RecordSource {
+            remaining: usize,
+        }
+
+        impl tokio::io::AsyncRead for RecordSource {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let n = self.remaining.min(16 * 1024).min(buf.remaining());
+                buf.initialize_unfilled_to(n).fill(0x5A);
+                buf.advance(n);
+                self.remaining -= n;
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        /// 记录下发给 outbound 的**首批**字节数（一批 = 一次 poll_read 的产物）。
+        #[derive(Debug)]
+        struct FirstBatch(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl xray_app_dispatcher::DispatchHandler for FirstBatch {
+            fn tag(&self) -> &str {
+                "first-batch"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                mut link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                let slot = Arc::clone(&self.0);
+                Box::pin(async move {
+                    let mb = link.reader.read_multi_buffer().await.expect("读首批");
+                    slot.store(mb.len(), std::sync::atomic::Ordering::SeqCst);
+                })
+            }
+        }
+
+        async fn first_batch(readbuf: usize) -> usize {
+            let slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+                Arc::new(FirstBatch(Arc::clone(&slot)));
+            let decoded = crate::encoding::server::DecodedRequest {
+                address: Some(Address::from_ipv4_bytes([127, 0, 0, 1])),
+                port: Some(443),
+                ..Default::default()
+            };
+            let access = xray_app_dispatcher::AccessContext::default();
+            finish_tcp_dispatch(
+                RecordSource { remaining: 16 * 1024 + 512 },
+                tokio::io::sink(),
+                &decoded,
+                &handler,
+                None,
+                &access,
+                None,
+                readbuf,
+            )
+            .await
+            .expect("dispatch");
+            slot.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            first_batch(64 * 1024).await,
+            16 * 1024,
+            "64KiB 窗口下 16KiB record 必须一批交付（回退 8KiB 则 8192）"
+        );
+        assert_eq!(first_batch(0).await, 8 * 1024, "缺省 0 必须保持池化 8KiB 批粒度");
     }
 }

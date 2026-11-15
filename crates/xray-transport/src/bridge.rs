@@ -11,6 +11,14 @@
 //! 3. `bridge_connections(inbound_conn, outbound_conn)` 双向转发字节流
 //!
 //! 客户端发的数据流向 outbound（→ 目标服务器），目标服务器的响应流向 inbound（→ 客户端）。
+//!
+//! ## 生产零消费登记（bd i43c3）
+//!
+//! [`bridge_connections`] / [`bridge_connections_with_splice`] /
+//! [`bridge_link_with_stream`] 是早期切片 API：**生产装配零消费**（生产主路一律走
+//! [`bridge_link_with_stream_full`]），仅 `crates/xray-proxy-{http,socks,trojan,vless}/tests`
+//! 的 e2e 与外部等价性用法引用。e2e 迁移到 `_full` 需要造 pipe [`Link`]，改动面大于
+//! 收益 ⇒ 按票面"从简"分支**保留并登记**，禁在新代码里继续引用（新接线一律 `_full`）。
 
 use std::io;
 
@@ -90,6 +98,10 @@ pub async fn bridge_connections_with_splice(
 
     // 池化读循环：替代 tokio::io::copy 的内置 Vec，每次循环取一次池化缓冲，
     // 读后整段 write_all 到底层（无中间 merge_bytes 拷贝，bd etks 同源优化）。
+    //
+    // bd i43c3：读/写/flush 错误一律**上浮**（旧实现写错即 `break` → 返回值恒
+    // `Ok(())`，中继侧 IO 错误在调用方眼里与正常 EOF 无法区分）。`shutdown`
+    // 错误沿用 Go `io.Copy` 口径不上浮（Go 的 Close 错误不参与 copy 结果）。
     async fn copy_pooled<R, W>(mut reader: R, mut writer: W) -> io::Result<()>
     where
         R: tokio::io::AsyncRead + Unpin,
@@ -98,29 +110,22 @@ pub async fn bridge_connections_with_splice(
         use tokio::io::AsyncWriteExt;
         let mut buf = xray_buf::alloc::alloc(xray_buf::alloc::DEFAULT_SIZE);
         buf.resize(xray_buf::alloc::DEFAULT_SIZE, 0);
-        loop {
-            let n = match reader.read(&mut buf).await {
-                Ok(n) => n,
-                Err(e) => {
-                    xray_buf::alloc::release(buf);
-                    return Err(e);
-                },
-            };
-            if n == 0 {
-                break;
-            }
-            if writer.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
-            // 写穿语义（同 write_all_mb）：TLS 层 SSL_write 缓冲语义下尾 chunk
-            // 不 flush 不上线；Go `crypto/tls` 的 Write 直接落底层 conn。
-            if writer.flush().await.is_err() {
-                break;
+        let result: io::Result<()> = async {
+            loop {
+                let n = reader.read(&mut buf).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                writer.write_all(&buf[..n]).await?;
+                // 写穿语义（同 write_all_mb）：TLS 层 SSL_write 缓冲语义下尾 chunk
+                // 不 flush 不上线；Go `crypto/tls` 的 Write 直接落底层 conn。
+                writer.flush().await?;
             }
         }
+        .await;
         xray_buf::alloc::release(buf);
         let _ = writer.shutdown().await;
-        Ok(())
+        result
     }
 
     let a_to_b = copy_pooled(&mut a_read, &mut b_write);
@@ -136,18 +141,6 @@ pub async fn bridge_connections_with_splice(
     };
 
     result
-}
-
-/// 单向桥接：从 `reader` 复制到 `writer`，EOF 或出错时返回。
-///
-/// 比 [`bridge_connections`] 更简单，用于只需要单向转发的场景（如 UDP 中继的
-/// 单向 copy）。通用泛型版，接受任何 `AsyncRead` + `AsyncWrite`。
-pub async fn copy_one_way<R, W>(mut reader: R, mut writer: W) -> io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    tokio::io::copy(&mut reader, &mut writer).await
 }
 
 /// 双向桥接 dispatcher [`Link`]（xray-buf Reader/Writer）与 AsyncRead+AsyncWrite stream。
@@ -2250,27 +2243,68 @@ mod tests {
         assert_eq!(got, b"frozen-downlink", "下行必须走零拷贝读腿，而非 AsyncRead 拷贝路径");
     }
 
+    /// bd i43c3：桥接写错必须上浮。旧 `copy_pooled` 写失败即 `break`（返回值恒
+    /// `Ok(())`）⇒ 中继侧 IO 错误与正常 EOF 无法区分。
+    ///
+    /// 构型：A = duplex（有数据可读）；B = 写恒 `BrokenPipe`、读恒 `Pending`
+    /// （保证先出结果的是 A→B 方向，判定不被对向 EOF 抢先）。
     #[tokio::test]
-    async fn copy_one_way_transfers_data() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn bridge_connections_propagates_write_error() {
+        struct WriteFails;
 
-        let (client, server) =
-            tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
-                listener.accept().await.unwrap().0
-            },);
+        impl tokio::io::AsyncRead for WriteFails {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
 
-        let mut client = client;
-        let server: Box<dyn Connection> = Box::new(TcpConnection::new(server));
+        impl tokio::io::AsyncWrite for WriteFails {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom")))
+            }
 
-        let (mut read, _write) = tokio::io::split(server);
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
 
-        client.write_all(b"one-way data").await.unwrap();
-        drop(client);
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
 
-        let mut buf = Vec::new();
-        copy_one_way(&mut read, &mut buf).await.unwrap();
-        assert_eq!(&buf, b"one-way data");
+        impl Connection for WriteFails {
+            fn remote_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+
+            fn local_addr(&self) -> std::io::Result<Option<SocketAddr>> {
+                Ok(None)
+            }
+        }
+
+        let (a_conn, mut a_peer) = tokio::io::duplex(1024);
+        a_peer.write_all(b"payload").await.unwrap();
+        let a: Box<dyn Connection> = Box::new(DuplexConnection::new(a_conn));
+        let b: Box<dyn Connection> = Box::new(WriteFails);
+        let res = bridge_connections(a, b).await;
+        assert!(
+            matches!(&res, Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe),
+            "写错必须上浮为 Err，实际 {res:?}"
+        );
     }
 
     #[tokio::test]

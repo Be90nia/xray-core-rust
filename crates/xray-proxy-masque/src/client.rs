@@ -489,7 +489,13 @@ async fn pump_client_to_udp(
                 let mut s = stack.lock().await;
                 s.poll(smoltcp::time::Instant::now());
                 s.with_udp_socket(handle, |sock| {
-                    let _ = sock.send_slice(&payload, endpoint);
+                    // bd i43c3：`Exhausted`（发送队列满/无路由）等错误此前被 `let _`
+                    // 吞掉 = 静默丢包；与下方 domain-target 分支同口径落 WARN（可观测丢弃）。
+                    if let Err(e) = sock.send_slice(&payload, endpoint) {
+                        LOG.warn(format!(
+                            "masque outbound: dropping XUDP frame (udp send failed: {e}) dest={dest}"
+                        ));
+                    }
                 });
                 s.poll(smoltcp::time::Instant::now());
             },

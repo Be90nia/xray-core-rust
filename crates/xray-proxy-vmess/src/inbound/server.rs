@@ -416,6 +416,15 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
     };
 
     // 7. TCP：duplex pump + dispatch；UDP：chunk 即 packet（Go 非 cone 语义）
+    // 会话 policy 层级：`ForLevel(request.User.Level)`（Go
+    // `proxy/vmess/inbound/inbound.go:276`）——dispatcher 据此取 per-level
+    // policy（buffer 上限 + connIdle）。VMess 无已认证前的 per-user 读点，
+    // 层级只能来自认证后的 user。
+    let access = xray_app_dispatcher::AccessContext {
+        email: user.email.clone(),
+        level: user.level,
+        ..Default::default()
+    };
     if header.command == Command::Udp {
         return pump_udp_session(
             stream_r,
@@ -430,6 +439,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
             resp_size_parser,
             global_padding,
             no_termination,
+            access,
         )
         .await;
     }
@@ -497,7 +507,7 @@ pub async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         let _ = w.shutdown_flush().await;
     };
 
-    let dispatch_fut = handler.dispatch(&dest, link);
+    let dispatch_fut = handler.dispatch_with_access(&dest, link, access);
     let _ = tokio::join!(req_task, resp_task, dispatch_fut);
     Ok(())
 }
@@ -560,13 +570,14 @@ async fn pump_udp_session<R, W>(
     mut resp_sp: Box<dyn SizeParser + Send>,
     global_padding: bool,
     no_termination: bool,
+    access: xray_app_dispatcher::AccessContext,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let udp_dest = Destination::udp(dest.address().clone(), dest.port());
-    let mut session = UdpDispatchSession::new(handler);
+    let mut session = UdpDispatchSession::new(handler).with_access(access);
 
     // up：解密 request chunk（与 pump_request_body 同构）→ channel 交 relay。
     let (up_tx, mut up_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -929,6 +940,102 @@ mod tests {
             "Go server.go:209 fixes the carrier domain"
         );
         assert_eq!(dest.port().value(), 0, "Mux command carries no port (Go server.go:210)");
+    }
+
+    /// bd g3dat：认证用户的 `level` 必须随 dispatch 进 dispatcher（Go
+    /// `sessionPolicy = ForLevel(request.User.Level)`，vmess/inbound.go:276），
+    /// 否则按 level 配的 buffer/connIdle 档位静默失效。
+    /// 变异 = 回退到 `handler.dispatch(...)`（无 access）→ 探针收不到 access。
+    #[tokio::test]
+    async fn vmess_user_level_reaches_dispatch_access() {
+        #[derive(Debug)]
+        struct AccessProbe {
+            seen: Arc<parking_lot::Mutex<Vec<xray_app_dispatcher::default::AccessContext>>>,
+        }
+        impl DispatchHandler for AccessProbe {
+            fn tag(&self) -> &str {
+                "vmess-access-probe"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                Box::pin(async move {})
+            }
+
+            fn dispatch_with_access(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+                access: xray_app_dispatcher::default::AccessContext,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                self.seen.lock().push(access);
+                Box::pin(async move {})
+            }
+        }
+
+        let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(AccessProbe { seen: Arc::clone(&seen) }));
+
+        // 用户配 level = 2（Go `users[].level`）。
+        let uuid = UUID::parse(SAMPLE_UUID_STR).expect("uuid");
+        let account = MemoryAccount::new(uuid);
+        let cmd_key = account.cmd_key();
+        let validator = TimedUserValidator::new();
+        validator
+            .add(MemoryUser::new("alice@example.com", account).with_level(2))
+            .expect("add user");
+        let validator = Arc::new(validator);
+
+        let vmess_listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let vmess_addr = vmess_listener.local_addr().unwrap();
+        xray_common::testing::spawn("vmess-inbound-access-level", async move {
+            let _ = serve_vmess(
+                test_ctx(),
+                vmess_listener,
+                ohm,
+                validator,
+                None,
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(vmess_addr).await.unwrap();
+        let client_session = ClientSession::new();
+        let dest = Destination::tcp(Address::new_domain("level.test"), Port::new(443));
+        let header = RequestHeader::new(VERSION, Command::Tcp, dest, SecurityType::Aes128Gcm);
+        let sealed_header =
+            client_session.encode_request_header(&header, &cmd_key).expect("encode header");
+        client.write_all(&sealed_header).await.unwrap();
+        // 响应头发出后服务端即 dispatch：读到它表示 access 已投递。
+        client_session
+            .decode_response_header_async(&mut client)
+            .await
+            .expect("decode response header");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                // 内层块：MutexGuard 不得跨 await（clippy await_holding_lock）
+                let snapshot = seen.lock();
+                if !snapshot.is_empty() || std::time::Instant::now() > deadline {
+                    assert_eq!(snapshot.len(), 1, "dispatch 必须恰好投递一次 access");
+                    assert_eq!(snapshot[0].level, 2, "用户 level 必须进会话 policy 层级");
+                    assert_eq!(snapshot[0].email, "alice@example.com");
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// 无效用户（validator 中不存在）→ server drain（Go 语义等满 60s handshake

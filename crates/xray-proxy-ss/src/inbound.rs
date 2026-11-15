@@ -232,4 +232,38 @@ mod tests {
         let emails = server.await.expect("server join");
         assert_eq!(emails, vec!["a@ss.test".to_string(), "b@ss.test".to_string()]);
     }
+
+    /// bd g3dat：命中用户的 `level` 随握手结果回传（会话 policy 层级来源，
+    /// Go `sessionPolicy = ForLevel(request.User.Level)`，server.go:235）。
+    /// 变异 = `parse_legacy_user` 不解析 level 或 validator 匹配丢 level → 得 0。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_handle_conn_reports_user_level() {
+        let account = make_account();
+        let ib = std::sync::Arc::new(SsInbound::with_users(vec![
+            MemoryUser::new("lv@ss.test", account.clone()).with_level(3),
+        ]));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let listener_addr = listener.local_addr().unwrap();
+
+        let server = xray_common::testing::spawn("ss-level-accept", async move {
+            let (conn, _) = listener.accept().await.expect("accept");
+            let (header, _ss) = ib.handle_conn(conn).await.expect("handshake");
+            (header.user.level, header.user.email)
+        });
+
+        let client =
+            crate::client::Client::new(account, "127.0.0.1".to_string(), listener_addr.port());
+        let _stream = client
+            .dial_target_for_proxy(
+                &xray_common::net::address::Address::Domain("echo.test".to_string()),
+                9527,
+            )
+            .await
+            .expect("dial");
+
+        let (level, email) = server.await.expect("server join");
+        assert_eq!(level, 3, "握手结果必须带回用户 level");
+        assert_eq!(email, "lv@ss.test");
+    }
 }

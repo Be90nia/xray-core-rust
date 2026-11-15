@@ -186,8 +186,10 @@ fn parse_wireguard_section(
 
 /// settings JSON → [`DeviceConfig`]。逐字段同规 xray-core
 /// `parse_wireguard_config`（Go `infra/conf/wireguard.go:17-68`）；`numWorkers`/
-/// `noKernelTun`/`users` 不在 JSON settings 面，保持 proto 缺省（core 解析
-/// 同构 `..Default::default()`，票 o7ns D2）。
+/// `users` 不在 JSON settings 面，保持 proto 缺省（core 解析同构
+/// `..Default::default()`，票 o7ns D2）。`noKernelTun` 的解析 + WARN 归权威解析面
+/// `xray-core::outbound::parse_wireguard_config`（本仓恒 userspace，插件路径不重复
+/// 消费，bd p9gyj）。
 fn parse_device_settings(v: &serde_json::Value) -> std::result::Result<DeviceConfig, String> {
     let secret_key = wg_get(v, "secretKey", "secret_key")
         .and_then(|x| x.as_str())

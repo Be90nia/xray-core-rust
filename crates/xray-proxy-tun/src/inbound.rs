@@ -481,9 +481,12 @@ impl InboundHandler for TunInboundHandler {
         // （B2 破环：任务体不得持账本 owner 强引用），owner 留本 handler 的字段。
         let scope = xray_frame::scope::ComponentScope::new(format!("tun:{}", self.tag));
         let driver_scope = scope.downgrade();
+        // 会话 policy 层级（Go `handler.go:171 ForLevel(config.UserLevel)`）：
+        // TUN 会话按配置的 userLevel 取 per-level policy（buffer/connIdle）。
+        let user_level = cfg.user_level;
         if scope
             .spawn(async move {
-                tun_driver_loop(dev, netstack, dispatch, driver_scope).await;
+                tun_driver_loop(dev, netstack, dispatch, driver_scope, user_level).await;
             })
             .is_err()
         {
@@ -790,6 +793,8 @@ async fn tun_driver_loop(
     netstack: Arc<AsyncMutex<TunNetStack>>,
     dispatch: Arc<dyn DispatchHandler>,
     scope: xray_frame::scope::ScopeRef,
+    // 会话 policy 层级（Go `handler.go:171 ForLevel(config.UserLevel)`）。
+    user_level: u32,
 ) {
     let mut timer = interval(POLL_INTERVAL);
     // Go time.Ticker 丢 tick 不补发（Burst 是 tokio 默认）
@@ -991,6 +996,7 @@ async fn write_tx_back(device: &TunDevice, tx_pkts: Vec<Vec<u8>>) {
 /// 对应 Go `udp_fullcone.go:HandlePacket`：按 src 懒建 `udpConn`，首次
 /// 确定 routing，后续包复用同一 session。响应回写由 owner task 持续
 /// recv 完成（票 8gr6：channel 化，收发无互斥）。
+#[allow(clippy::too_many_arguments)] // UDP 会话装配参数集（8gr6/ijn7 + 会话 policy 层级），打包聚合体属内部 API 变更
 fn handle_udp_packet(
     sessions: &UdpSessions,
     failed: &FailedDsts,
@@ -999,6 +1005,8 @@ fn handle_udp_packet(
     dispatch: Arc<dyn DispatchHandler>,
     device: Arc<TunDevice>,
     scope: &xray_frame::scope::ScopeRef,
+    // 会话 policy 层级（Go `handler.go:171 ForLevel(config.UserLevel)`）。
+    user_level: u32,
 ) {
     // 票 ijn7：目的组播/广播不进 relay；relay 刚失败过的目的地址在冷却窗内
     // 也不再新建会话（防「失败 → 立刻重建」的忙循环）。判定与计数在
@@ -1040,6 +1048,7 @@ fn handle_udp_packet(
                     Arc::clone(failed),
                     Arc::downgrade(&entry),
                     scope.clone(),
+                    user_level,
                 );
                 map.insert(meta.src, Arc::clone(&entry));
                 entry
@@ -1163,6 +1172,7 @@ fn spawn_udp_session_task(
     failed: FailedDsts,
     entry: std::sync::Weak<UdpSessionEntry>,
     scope: xray_frame::scope::ScopeRef,
+    user_level: u32,
 ) {
     // 票 euv9：reply 侧同样 bounded（下行响应由 owner task 产出、写回 task
     // 消费，device.send 慢时积压），满时丢包计数——见 [`try_enqueue_reply`]。
@@ -1177,6 +1187,7 @@ fn spawn_udp_session_task(
         failed,
         sessions,
         entry,
+        user_level,
     )) {
         Ok(handle) => handle,
         Err(_) => {
@@ -1224,6 +1235,8 @@ async fn run_udp_session(
     failed: FailedDsts,
     sessions: UdpSessions,
     entry: std::sync::Weak<UdpSessionEntry>,
+    // 会话 policy 层级（Go `handler.go:171 ForLevel(config.UserLevel)`）。
+    user_level: u32,
 ) {
     // bd kol4a：源（TUN 内层源 endpoint）+ 协议名随 relay 下传（GlobalID 白名单族
     // "tun"；Go xudp.go:69-70 白名单含 tun，Source = 内层源地址）。
@@ -1351,9 +1364,10 @@ async fn dispatch_accepted(
     events: Vec<TcpAcceptEvent>,
     dispatch: &Arc<dyn DispatchHandler>,
     scope: &xray_frame::scope::ScopeRef,
+    user_level: u32,
 ) {
     for event in events {
-        accept_tcp_connection(netstack, event, dispatch, scope).await;
+        accept_tcp_connection(netstack, event, dispatch, scope, user_level).await;
     }
 }
 
@@ -1364,6 +1378,8 @@ async fn accept_tcp_connection(
     event: TcpAcceptEvent,
     dispatch: &Arc<dyn DispatchHandler>,
     scope: &xray_frame::scope::ScopeRef,
+    // 会话 policy 层级（Go `handler.go:171 ForLevel(config.UserLevel)`）。
+    user_level: u32,
 ) {
     // 从 local endpoint 构建 destination
     let dest = match ip_endpoint_to_destination(&event.local) {
@@ -1408,9 +1424,15 @@ async fn accept_tcp_connection(
 
     // spawn dispatch（link → outbound）
     let dispatch = Arc::clone(dispatch);
+    let access = xray_app_dispatcher::AccessContext {
+        from: event.remote.to_string(),
+        inbound_name: "tun".to_string(),
+        level: user_level,
+        ..xray_app_dispatcher::AccessContext::default()
+    };
     if scope
         .spawn(async move {
-            dispatch.dispatch(&dest, link).await;
+            dispatch.dispatch_with_access(&dest, link, access).await;
         })
         .is_err()
     {
@@ -1999,8 +2021,14 @@ mod tests {
             let accepted = stack.check_tcp_accepts();
             drop(stack);
             let sref = scope.downgrade();
-            dispatch_accepted(&netstack, accepted, &(handler as Arc<dyn DispatchHandler>), &sref)
-                .await;
+            dispatch_accepted(
+                &netstack,
+                accepted,
+                &(handler as Arc<dyn DispatchHandler>),
+                &sref,
+                0,
+            )
+            .await;
         }
 
         // dispatch 在 spawn 的 task 里执行，current-thread runtime 需让出让其跑完
@@ -2036,8 +2064,14 @@ mod tests {
             let mut stack = netstack.lock().await;
             let accepted = stack.check_tcp_accepts();
             drop(stack);
-            dispatch_accepted(&netstack, accepted, &(dispatch as Arc<dyn DispatchHandler>), &sref)
-                .await;
+            dispatch_accepted(
+                &netstack,
+                accepted,
+                &(dispatch as Arc<dyn DispatchHandler>),
+                &sref,
+                0,
+            )
+            .await;
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no spurious dispatch");
     }
@@ -2098,6 +2132,7 @@ mod tests {
                 Arc::clone(&failed),
                 Arc::clone(&sessions),
                 Arc::downgrade(&old_entry),
+                0,
             ),
         );
         let (cmd_tx_new, _cmd_rx_new) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
@@ -2211,6 +2246,7 @@ mod tests {
                 failed,
                 sessions,
                 Arc::downgrade(&entry),
+                0,
             ),
         );
 
@@ -2336,6 +2372,7 @@ mod tests {
                 failed,
                 sessions,
                 Arc::downgrade(&entry),
+                0,
             ),
         );
 
@@ -2363,7 +2400,6 @@ mod tests {
             reply_rx.try_recv().is_err(),
             "cross-family reply must be dropped, not written back to tun"
         );
-
         // 会话存活的正向证明：第二包照常出站、owner 仍活着、回声仍被丢弃
         cmd_tx.send(SessionCmd::Send { dest, payload }).await.expect("send pkt2");
         let two_frames_min = 2 * frame_min;
@@ -2458,7 +2494,7 @@ mod tests {
         let scope = test_scope();
         let sref = scope.downgrade();
         // 锁外建桥 → dispatch 收到 SYN 的 dst（与真实 driver loop 两段式一致）
-        dispatch_accepted(&netstack, accepted2, &handler, &sref).await;
+        dispatch_accepted(&netstack, accepted2, &handler, &sref, 0).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         let dest = captured.lock().clone().expect("dispatch must fire from lock-external bridge");
         assert_eq!(dest.address(), &Address::IPv4(std::net::Ipv4Addr::new(93, 184, 216, 34)));
@@ -2921,8 +2957,100 @@ mod tests {
         );
     }
 
+    /// bd g3dat：TUN 会话的 access 必须带配置的 `userLevel`（Go
+    /// `handler.go:171 ForLevel(config.UserLevel)`）——否则按 level 配的
+    /// buffer/connIdle 档位对整个 TUN 数据面静默失效。
+    /// 变异 = AccessContext 不回填 level（或 run_udp_session 传 0）→ 断言失败。
+    #[tokio::test]
+    async fn udp_session_access_carries_configured_user_level() {
+        #[derive(Debug)]
+        struct AccessCapture {
+            seen: Arc<ParkMutex<Vec<xray_app_dispatcher::AccessContext>>>,
+        }
+        impl DispatchHandler for AccessCapture {
+            fn tag(&self) -> &str {
+                "tun-access-capture"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                Box::pin(async move {})
+            }
+
+            fn dispatch_with_access(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+                access: xray_app_dispatcher::AccessContext,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+                self.seen.lock().push(access);
+                Box::pin(async move {})
+            }
+        }
+
+        let seen = Arc::new(ParkMutex::new(Vec::new()));
+        let dispatch: Arc<dyn DispatchHandler> =
+            Arc::new(AccessCapture { seen: Arc::clone(&seen) });
+
+        let src = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(10, 0, 0, 2)),
+            12345,
+        );
+        let dst = smoltcp::wire::IpEndpoint::new(
+            smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(8, 8, 8, 8)),
+            53,
+        );
+        let dest = ip_endpoint_to_udp_destination(&dst).expect("udp dest");
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let (reply_tx, _reply_rx) = mpsc::channel(UDP_SESSION_QUEUE_CAP);
+        let failed: FailedDsts = Arc::new(ParkMutex::new(HashMap::new()));
+        let sessions: UdpSessions = Arc::new(ParkMutex::new(HashMap::new()));
+        let entry = Arc::new(UdpSessionEntry {
+            cmd_tx: cmd_tx.clone(),
+            src,
+            last_used_nanos: AtomicI64::new(now_nanos()),
+        });
+        let _owner = xray_common::testing::spawn(
+            "dispatch",
+            run_udp_session(
+                dispatch,
+                cmd_rx,
+                reply_tx,
+                src,
+                dst,
+                failed,
+                sessions,
+                Arc::downgrade(&entry),
+                4,
+            ),
+        );
+
+        cmd_tx
+            .send(SessionCmd::Send { dest, payload: bytes::Bytes::from(vec![0xABu8; 32]) })
+            .await
+            .expect("send pkt");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            {
+                // 内层块：MutexGuard 不得跨 await（clippy await_holding_lock）
+                let snapshot = seen.lock();
+                if !snapshot.is_empty() || std::time::Instant::now() > deadline {
+                    assert_eq!(snapshot.len(), 1, "establish 必须恰好投递一次 access");
+                    assert_eq!(snapshot[0].level, 4, "userLevel 必须进会话 policy 层级");
+                    assert_eq!(snapshot[0].inbound_name, "tun");
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// F-01（bd 4af7e）：`rollback_start` 必须清 `leak_filter`，且在设备下线之前。
-    ///
     /// 真机装过滤器要管理员 + 真实适配器（CI 两条都没有），故按源码顺序钉住契约：
     /// 漏掉这一步 = WFP 动态会话活到进程退出，`all`/`misconfigtun` 这类无接口条件的
     /// block 规则在设备已关的情况下继续切断非许可出站。

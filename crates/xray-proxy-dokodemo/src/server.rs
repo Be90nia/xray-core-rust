@@ -151,8 +151,19 @@ impl InboundHandler for DokodemoServer {
         if guard.is_some() {
             return Err(InboundError::AlreadyStarted(self.tag.clone()));
         }
-        // 切片2 固定绑定 127.0.0.1:0（端口由 OS 分配），与 socks/trojan/http 切片2 一致。
-        // 切片3 从 config 读取 bind 地址。
+        // 固定绑定 127.0.0.1:0（端口由 OS 分配）：`InboundHandler::start` 契约不带
+        // 监听地址（`inbound_handler(ctx, tag)` 只传 tag），dokodemo 配置面也不含
+        // listen（settings 里的 `port` 是 rewrite **目标**端口）。生产装配走
+        // `arm_builders` 的 `needs_listen_addr` 分支，由 core 按配置 `listen`/`port`
+        // 绑定——本路径只服务插件契约测试。
+        // bd i43c3：旧注释只说"切片3 再从 config 读"，运维看不到「配置的监听端口在
+        // 这条路径上被忽略」⇒ 启动期显式 WARN（每实例一次，非热路径）。
+        self.ctx.log().warn(format!(
+            "dokodemo inbound tag={} binds an ephemeral 127.0.0.1:0 via the plugin \
+             `start()` path; the configured listen address/port is only honored by the \
+             core arm_builders path (this path serves plugin contract tests)",
+            self.tag
+        ));
         let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener =
             TcpListener::bind(addr).await.map_err(|e| InboundError::ListenError(e.to_string()))?;

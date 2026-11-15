@@ -207,7 +207,10 @@ where
     T: Send + 'static,
 {
     let caps = caps();
-    spawn_reaping_ticked(caps.fx(), caps.log(), "compat::spawn", Some(&SPAWN_REAP_TICK), fut)
+    let spawned =
+        spawn_reaping_ticked(caps.fx(), caps.log(), "compat::spawn", Some(&SPAWN_REAP_TICK), fut);
+    warn_rejected(caps.log(), "compat::spawn", &spawned);
+    spawned
 }
 
 /// 增量收割：把已完成条目清出 udf `JoinSet`，其中 panic 载荷落 `log`（abort
@@ -257,12 +260,29 @@ pub fn spawn_reaping<T>(
 where
     T: Send + 'static,
 {
-    spawn_reaping_ticked(scope, log, label, None, fut)
+    let spawned = spawn_reaping_ticked(scope, log, label, None, fut);
+    warn_rejected(log, label, &spawned);
+    spawned
+}
+
+/// 拒发告警（bd i43c3）：**只给"本 scope 无计数面"的调用方**——[`crate::scope`] 的
+/// 两个句柄（`ComponentScope` / `ScopeRef`）按 bd 9ka5w 自有聚合计数，闸关拒发是
+/// 预期停机事件（统一 DEBUG、禁刷 WARN）；WARN 留在那儿会从竞态窗口"复活"，把
+/// 正常停机刷成噪音。
+#[inline(always)]
+fn warn_rejected<T>(log: &LogFacade, label: &str, spawned: &Result<Spawned<T>, ScopeClosed>) {
+    if spawned.is_err() {
+        log.warn(format!("{label}: spawn rejected (scope closed)"));
+    }
 }
 
 /// 同 [`spawn_reaping`]，`tick` 由**该 scope 自持**（每 scope 一个计数）：`None`
 /// = 逐次收割，`Some` = 每 [`REAP_EVERY`] 次收割一次。节流只改「何时收割」，不改
 /// 收割语义与 JoinSet 归属（条目有界，panic 上报延迟 ≤ `REAP_EVERY` 次 spawn）。
+///
+/// **本件不落拒发日志**（bd i43c3）：拒发告警归调用方——需要 WARN 的走
+/// [`spawn_reaping`]/[`spawn`]（内部 [`warn_rejected`]），自有计数面的走
+/// [`crate::scope`]（计数 + DEBUG，禁 WARN）。
 #[inline(always)]
 pub fn spawn_reaping_ticked<T>(
     scope: &FxScope,
@@ -277,11 +297,7 @@ where
     if tick.is_none_or(|t| t.fetch_add(1, Ordering::Relaxed) % REAP_EVERY == 0) {
         reap_into(scope, log, label);
     }
-    let spawned = scope.spawn_tracked(fut);
-    if spawned.is_err() {
-        log.warn(format!("{label}: spawn rejected (scope closed)"));
-    }
-    spawned
+    scope.spawn_tracked(fut)
 }
 
 #[cfg(test)]
@@ -389,6 +405,37 @@ mod tests {
             1,
             "Cancelled（abort）不得计入 panic 上报: {lines:?}"
         );
+    }
+
+    /// bd i43c3：`spawn_reaping_ticked` 自身**不落**拒发日志——口径归调用方
+    /// （`spawn_reaping`/`spawn` 保留 warn，见上一个用例；`crate::scope` 用聚合计数与
+    /// 站点 DEBUG，禁 WARN 从竞态窗口复活）。判据：闸关后直接调本口 → 回 `Err`
+    /// 且捕获窗内零日志（旧实现此处会打一条 "spawn rejected"）。
+    #[test]
+    fn spawn_reaping_ticked_does_not_log_on_reject() {
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            let _guard = tracing::subscriber::set_default(Capture(sink));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let scope = FxScope::new();
+                let log = LogFacade::new("test-quiet", Vec::new());
+                scope.close();
+                assert!(
+                    spawn_reaping_ticked(&scope, &log, "quiet-test", None, async {}).is_err(),
+                    "闸关必须拒发（fail-closed）"
+                );
+            });
+        })
+        .join()
+        .expect("测试线程");
+
+        let lines = captured.lock().unwrap_or_else(PoisonError::into_inner).join("\n");
+        assert!(!lines.contains("spawn rejected"), "本口不得落拒发日志（口径归调用方）: {lines:?}");
     }
 
     /// bd s3tig 验收：`spawn_reaping_ticked` 的节流两态——非触发位**不**收割

@@ -223,16 +223,24 @@ fn parse_inbound(settings: &serde_json::Value) -> Result<SsFace, PluginError> {
         .and_then(|x| x.as_str())
         .ok_or_else(|| PluginError::Other("ss inbound: missing password".into()))?;
     let account = legacy_account(password, method)?;
-    Ok(SsFace::LegacyInbound(Arc::new(SsInbound::new(account, "u@ss.local"))))
+    // 单用户形态的顶层 `level`（Go shadowsocks.go:99 `Level: uint32(v.Level)`）。
+    let level = settings.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let user = MemoryUser::new("u@ss.local", account).with_level(level);
+    Ok(SsFace::LegacyInbound(Arc::new(SsInbound::with_users(vec![user]))))
 }
 
 /// legacy 用户数组项 → [`MemoryUser`]（逐用户 `method`，缺省 `aes-128-gcm`；
-/// 同规 xray-core parse_ss_inbound_config，level 不在该解析面消费）。
+/// 同规 xray-core parse_ss_inbound_config）。
+///
+/// `level`（Go `infra/conf/shadowsocks.go:57 Level: uint32(user.Level)`）随用户
+/// 进 validator，会话建立时由 dispatcher 按 `ForLevel(level)` 取 policy
+/// （Go `proxy/shadowsocks/server.go:235`）。
 fn parse_legacy_user(c: &serde_json::Value) -> Result<MemoryUser, PluginError> {
     let password = c.get("password").and_then(|x| x.as_str()).unwrap_or("");
     let email = c.get("email").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let method = c.get("method").and_then(|x| x.as_str()).unwrap_or("aes-128-gcm");
-    Ok(MemoryUser::new(email, legacy_account(password, method)?))
+    let level = c.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    Ok(MemoryUser::new(email, legacy_account(password, method)?).with_level(level))
 }
 
 /// legacy 密码 + cipher 名 → [`MemoryAccount`]（同规 xray-core 的 ProtoAccount
@@ -340,9 +348,11 @@ fn parse_ss2022_inbound(method: &str, settings: &serde_json::Value) -> Result<Ss
             .map_err(|e| PluginError::Other(format!("ss2022 multi: {e}").into()));
     }
 
-    // 单用户模式。
+    // 单用户模式（顶层 `level`，Go buildShadowsocks2022 `config.Level`）。
+    let level = settings.get("level").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
     let single = Ss2022Inbound::new(method, server_psk, "u@ss2022.local")
-        .map_err(|e| PluginError::Other(format!("ss2022 single: {e}").into()))?;
+        .map_err(|e| PluginError::Other(format!("ss2022 single: {e}").into()))?
+        .with_level(level);
     Ok(SsFace::Ss2022(Arc::new(single)))
 }
 
@@ -360,5 +370,61 @@ fn parse_address_str(s: &str) -> Address {
         Address::IPv6(v6)
     } else {
         Address::Domain(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// legacy 解析结果里的用户 level（升序）。
+    fn legacy_levels(settings: &str) -> Vec<u32> {
+        let v: serde_json::Value = serde_json::from_str(settings).expect("json");
+        match parse_inbound(&v).expect("parse inbound") {
+            SsFace::LegacyInbound(ib) => {
+                let mut levels: Vec<u32> =
+                    ib.validator().get_all().iter().map(|u| u.level).collect();
+                levels.sort_unstable();
+                levels
+            },
+            _ => panic!("expected legacy inbound face"),
+        }
+    }
+
+    /// bd g3dat：用户级 `level` 进 validator（会话 policy 层级来源；Go
+    /// shadowsocks.go:57）。变异 = 不解析 level，两个用户都退化成 0。
+    #[test]
+    fn legacy_user_level_parsed() {
+        let levels = legacy_levels(
+            r#"{"method":"aes-128-gcm","users":[
+                 {"password":"pw-a","email":"a@ss","level":3},
+                 {"password":"pw-b","email":"b@ss"}
+               ]}"#,
+        );
+        assert_eq!(levels, vec![0, 3]);
+    }
+
+    /// 单用户形态的顶层 `level`（Go shadowsocks.go:99）同样进 validator。
+    #[test]
+    fn legacy_single_user_top_level_level_parsed() {
+        let levels = legacy_levels(r#"{"method":"aes-128-gcm","password":"pw","level":2}"#);
+        assert_eq!(levels, vec![2]);
+    }
+
+    /// ss2022 单用户顶层 `level`（Go buildShadowsocks2022 `config.Level`）落到
+    /// `Ss2022Inbound`；握手结果再带进会话 policy（inbound.go:145）。
+    #[test]
+    fn ss2022_single_user_top_level_level_parsed() {
+        use base64::Engine as _;
+        let psk = base64::engine::general_purpose::STANDARD.encode([0x11u8; 32]);
+        let settings = serde_json::json!({
+            "method": "2022-blake3-aes-256-gcm",
+            "password": psk,
+            "level": 4,
+        });
+        match parse_inbound(&settings).expect("parse inbound") {
+            SsFace::Ss2022(ib) => assert_eq!(ib.level(), 4),
+            _ => panic!("expected ss2022 single-user face"),
+        }
     }
 }

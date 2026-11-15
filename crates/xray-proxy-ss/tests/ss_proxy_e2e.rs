@@ -64,8 +64,13 @@ async fn ss_proxy_to_echo_target_e2e() {
         let (conn, _) = proxy_listener.accept().await.expect("proxy accept");
 
         // 读 IV + 解密首帧（addr+port）→ 返回 SSStream（继续 read_chunk 读 body）
-        let (header, mut ss_stream) =
-            read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
+        let (header, mut ss_stream) = read_request(
+            conn,
+            &xray_proxy_ss::validator::MemoryUser::new("u@x.com", server_account),
+            0,
+        )
+        .await
+        .expect("read_request");
 
         // 读 body chunk（已解密的明文 payload）
         let body = ss_stream.read_chunk().await.expect("read body chunk").expect("non-empty body");

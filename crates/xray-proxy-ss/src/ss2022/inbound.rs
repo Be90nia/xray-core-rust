@@ -56,6 +56,9 @@ pub struct InboundResult<C = TcpStream> {
     pub stream: SSStream<C>,
     /// 匹配的用户标识（email），单用户模式为配置的 email。
     pub user_email: String,
+    /// 匹配用户的策略层级（Go `ForLevel(User.Level)` 的入参；单用户模式为
+    /// 配置顶层 `level`）。会话建立后由装配层放进 `AccessContext.level`。
+    pub level: u32,
 }
 
 /// SS-2022 用户条目（PSK + email）。
@@ -80,6 +83,8 @@ pub struct Ss2022Inbound {
     psk: Vec<u8>,
     kind: CipherKind2022,
     email: String,
+    /// 用户策略层级（Go `ServerConfig.Level`；经 `ForLevel` 驱动会话 policy）。
+    level: u32,
     /// 时间戳容忍窗口（秒）——唯一来源 [`TIMESTAMP_TOLERANCE_SECS`]（30）。
     ///
     /// Go `stream.go:257/:434` 与 `packet.go:157` 同为硬编码 `diff > 30`，Go 侧
@@ -103,9 +108,18 @@ impl Ss2022Inbound {
             psk,
             kind,
             email: email.into(),
+            level: 0,
             timestamp_tolerance: TIMESTAMP_TOLERANCE_SECS as u64,
             replay: SaltReplayFilter::new(REPLAY_WINDOW),
         })
+    }
+
+    /// 设置用户策略层级（builder 风格；Go `ServerConfig.Level`，
+    /// `inbound.go:145 ForLevel(uint32(i.user.Level))`）。
+    #[must_use]
+    pub fn with_level(mut self, level: u32) -> Self {
+        self.level = level;
+        self
     }
 
     /// 处理入站 TCP 连接：读 salt → 派生 subkey → 解密 header → 解析目标。
@@ -127,6 +141,7 @@ impl Ss2022Inbound {
             port: result.1,
             stream: result.2,
             user_email: self.email.clone(),
+            level: self.level,
         })
     }
 
@@ -140,6 +155,12 @@ impl Ss2022Inbound {
     #[must_use]
     pub fn psk(&self) -> &[u8] {
         &self.psk
+    }
+
+    /// 返回用户策略层级（装配层构造时设置，握手结果会带进 `AccessContext`）。
+    #[must_use]
+    pub fn level(&self) -> u32 {
+        self.level
     }
 }
 
@@ -368,13 +389,18 @@ impl RelayInbound {
     /// - identitySubkey = blake3::derive_key("shadowsocks 2022 identity subkey", serverPSK||salt)
     ///
     /// 匹配 destination 后**剥掉 16B identity_header**，返回
-    /// `(dest地址, dest端口, salt前缀, 剩余连接)`——转发字节 = `[salt] ++ 剩余原始字节`，
-    /// 内层是端到端 EISS 加密，中继不解不改（回程同样原样）。
+    /// `(dest地址, dest端口, salt前缀, dest 策略层级, 剩余连接)`——转发字节 =
+    /// `[salt] ++ 剩余原始字节`，内层是端到端 EISS 加密，中继不解不改（回程同样原样）。
+    /// 层级随结果回传：Go `inbound_relay.go:202 ForLevel(targetDest.level)` 决定
+    /// 会话 policy，中继自己不解代码也就读不到 level。
     ///
     /// # Errors
     /// - [`SsError::Ss2022NoUserMatched`]：无 destination 身份匹配。
     /// - 透传 IO 错误。
-    pub async fn handle_conn_relay<C>(&self, mut conn: C) -> io::Result<(Address, u16, Vec<u8>, C)>
+    pub async fn handle_conn_relay<C>(
+        &self,
+        mut conn: C,
+    ) -> io::Result<(Address, u16, Vec<u8>, u32, C)>
     where
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     {
@@ -395,7 +421,7 @@ impl RelayInbound {
             .iter()
             .find(|d| crate::ss2022::key::psk_identity(&d.key) == decrypted[..])
             .ok_or_else(|| io::Error::other(SsError::Ss2022NoUserMatched.to_string()))?;
-        Ok((dest.address.clone(), dest.port, salt, conn))
+        Ok((dest.address.clone(), dest.port, salt, dest.level, conn))
     }
 
     /// 中继入站 UDP 帧改写（Go `RelayInbound.processUDP`）。
@@ -693,7 +719,7 @@ where
     // 下行首写时发 sing writeResponse 响应头（新 salt + echo request salt）
     stream.mark_server_response_2022(user.psk.clone(), kind, salt);
 
-    Ok(InboundResult { address, port, stream, user_email: user.email.clone() })
+    Ok(InboundResult { address, port, stream, user_email: user.email.clone(), level: user.level })
 }
 
 /// 验证时间戳：与当前时间差在 tolerance 内。
@@ -881,6 +907,57 @@ mod tests {
             .await
             .expect("multi-user roundtrip timed out")
             .unwrap();
+    }
+
+    /// bd g3dat：多用户模式把命中用户的 `level` 带进握手结果（会话 policy 层级
+    /// 来源，Go `inbound_multi.go:271 ForLevel(user.Level)`）。
+    /// 变异 = `InboundResult.level` 恒 0（不读 `user.level`）→ 断言失败。
+    #[tokio::test]
+    async fn multi_user_handle_conn_reports_matched_user_level() {
+        use base64::Engine as _;
+
+        use crate::ss2022::client::Client2022;
+
+        let server_psk = [0x11u8; 32];
+        let alice_psk = [0x22u8; 32];
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+
+        let inbound = std::sync::Arc::new(
+            MultiUserInbound::new(
+                "2022-blake3-aes-256-gcm",
+                &b64(&server_psk),
+                vec![Ss2022User { email: "alice".into(), level: 5, psk: alice_psk.to_vec() }],
+            )
+            .unwrap(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = xray_common::testing::spawn("ss2022-level-accept", async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let result = inbound.handle_conn(conn).await.unwrap();
+            (result.user_email, result.level)
+        });
+
+        let client = Client2022::new(
+            "2022-blake3-aes-256-gcm",
+            &[b64(&server_psk), b64(&alice_psk)],
+            "127.0.0.1",
+            addr.port(),
+        )
+        .unwrap();
+        let mut stream = client.dial_target("example.com", 443).await.unwrap();
+        // SS-2022 请求头与首段 body 合并单次写出（`dial_target` 只登记待发态）
+        // ⇒ 不写首段 body 服务端读不到请求头，握手不会完成。
+        stream.write_chunk(b"ping").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let (email, level) = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("level probe timed out")
+            .unwrap();
+        assert_eq!(email, "alice");
+        assert_eq!(level, 5, "命中用户的 level 必须随握手结果回传");
     }
 
     /// TCP salt 重放防护（对齐 Go sing `replay.NewSimple(60s)`，解密前 Check）：
@@ -1156,7 +1233,8 @@ mod tests {
                 let Ok((conn, _)) = relay_listener.accept().await else { break };
                 let relay = std::sync::Arc::clone(&relay);
                 xray_common::testing::spawn("test-task", async move {
-                    let Ok((_addr, _port, salt, client)) = relay.handle_conn_relay(conn).await
+                    let Ok((_addr, _port, salt, _level, client)) =
+                        relay.handle_conn_relay(conn).await
                     else {
                         return;
                     };

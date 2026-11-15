@@ -3522,7 +3522,29 @@ pub(crate) fn parse_wireguard_config(data: &[u8]) -> std::result::Result<DeviceC
         .and_then(|x| x.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<String>>())
         .unwrap_or_default();
-    Ok(DeviceConfig { secret_key, peers, endpoint, mtu, reserved, dns, ..Default::default() })
+    // Go wireguard.go:126 `config.NoKernelTun = c.NoKernelTun`。Rust 唯一实现是
+    // 用户态 netstack（无 kernel TUN 设备路径）⇒ 本仓**恒**以 userspace 运行，
+    // 该开关在本仓无消费面。缺省 false（Go 缺省 = 用内核 TUN）与显式 false 都
+    // 与用户意图不符，故一律 WARN（每次装配一条，非热路径），不静默照跑
+    // （bd p9gyj）。
+    let no_kernel_tun =
+        wg_get(&v, "noKernelTun", "no_kernel_tun").and_then(|x| x.as_bool()).unwrap_or(false);
+    if !no_kernel_tun {
+        tracing::warn!(
+            "wireguard settings: kernel TUN is not implemented in this build; always using the \
+             userspace netstack (add \"noKernelTun\":true to the settings to silence this warning)"
+        );
+    }
+    Ok(DeviceConfig {
+        secret_key,
+        peers,
+        endpoint,
+        mtu,
+        reserved,
+        dns,
+        no_kernel_tun,
+        ..Default::default()
+    })
 }
 
 /// 解析 loopback outbound settings JSON → (inbound_tag, 嗅探请求)。
@@ -4404,6 +4426,31 @@ mod tests {
         assert_eq!(peer.pre_shared_key, "dd".repeat(32), "base64 PSK normalized to hex");
         assert_eq!(peer.keep_alive, "15");
         assert_eq!(peer.allowed_ips, vec!["10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn parse_wireguard_config_no_kernel_tun_parsed() {
+        // bd p9gyj：Go wireguard.go:126 `config.NoKernelTun = c.NoKernelTun`；本仓恒 userspace
+        // ⇒ 值只作记录 + 缺省/显式 false 走 WARN（不静默照跑）。
+        let mk = |extra: &str| {
+            format!(
+                r#"{{"secretKey": "{}", "peers": [{{"publicKey": "{}", "endpoint": "e:1"}}]{extra}}}"#,
+                "aa".repeat(32),
+                "bb".repeat(32),
+            )
+        };
+        assert!(
+            parse_wireguard_config(mk(r#", "noKernelTun": true"#).as_bytes())
+                .unwrap()
+                .no_kernel_tun
+        );
+        assert!(!parse_wireguard_config(mk("").as_bytes()).unwrap().no_kernel_tun);
+        // snake_case 别名（本仓双读惯例）
+        assert!(
+            parse_wireguard_config(mk(r#", "no_kernel_tun": true"#).as_bytes())
+                .unwrap()
+                .no_kernel_tun
+        );
     }
 
     #[test]

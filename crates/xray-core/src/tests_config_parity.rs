@@ -756,14 +756,16 @@ async fn relay_target(
     let (mut client, server) = tokio::io::duplex(64);
     client.write_all(&wire).await.expect("write relay wire");
     drop(client);
-    let (addr, port, _, _) = relay.handle_conn_relay(server).await.expect("relay identity match");
+    let (addr, port, _, _, _) =
+        relay.handle_conn_relay(server).await.expect("relay identity match");
     (addr, port)
 }
 
 #[test]
 fn ss_parity_legacy_single_user() {
     // 扁平 password + method：两侧都产 Legacy 单用户，email 同缺省 `u@ss.local`。
-    let settings = json!({"method": "aes-256-gcm", "password": "pw-single"});
+    // `level` 顶层（Go shadowsocks.go:99）两套解析必须同值——会话 policy 层级来源。
+    let settings = json!({"method": "aes-256-gcm", "password": "pw-single", "level": 3});
     let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
         .expect("core parse");
     let plugin = build_ss_plugin(&settings);
@@ -782,7 +784,7 @@ fn ss_parity_legacy_multi_users_and_clients_alias() {
     // 逐用户 method（第二项缺 method → 两侧同缺省 aes-128-gcm）；`users` 主键、
     // `clients` 旧名回退（Go shadowsocks.go:46-47）。
     let users = json!([
-        {"method": "aes-256-gcm", "password": "pw1", "email": "a@x"},
+        {"method": "aes-256-gcm", "password": "pw1", "email": "a@x", "level": 4},
         {"password": "pw2", "email": "b@x"},
     ]);
     for key in ["users", "clients"] {
@@ -804,7 +806,9 @@ fn ss_parity_legacy_multi_users_and_clients_alias() {
 
 #[test]
 fn ss_parity_ss2022_single_user() {
-    let settings = json!({"method": "2022-blake3-aes-128-gcm", "password": b64_psk(0x11)});
+    // 顶层 `level`（Go buildShadowsocks2022 `config.Level`）两套解析必须同值。
+    let settings =
+        json!({"method": "2022-blake3-aes-128-gcm", "password": b64_psk(0x11), "level": 5});
     let core = crate::inbound::parse_ss_inbound_config(&serde_json::to_vec(&settings).unwrap())
         .expect("core parse");
     let plugin = build_ss_plugin(&settings);
@@ -816,6 +820,8 @@ fn ss_parity_ss2022_single_user() {
     };
     assert_eq!(plugin_in.kind(), core_in.kind());
     assert!(plugin_in.psk() == core_in.psk(), "server PSK");
+    assert_eq!(plugin_in.level(), 5, "plugin 侧 level");
+    assert_eq!(core_in.level(), 5, "core 侧 level");
 }
 
 #[test]

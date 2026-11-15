@@ -99,7 +99,7 @@ pub mod sockopt;
 pub mod tcp;
 pub mod udp;
 // 顶层 re-export。
-pub use bridge::{bridge_connections, bridge_connections_with_splice, copy_one_way};
+pub use bridge::{bridge_connections, bridge_connections_with_splice};
 pub use proxy_protocol::{build_proxy_header, read_proxy_protocol};
 
 /// 注册类 API 的幂等口（bd k2tq1）：`AlreadyExists`（并发/多入口重复注册，见

@@ -26,7 +26,7 @@ use tokio::{
     sync::Mutex,
 };
 use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
-use xray_buf::io::{new_reader, new_writer};
+use xray_buf::io::{new_reader_with_capacity, new_writer};
 use xray_common::net::{
     address::Address, destination::Destination, network::Network as CommonNetwork, port::Port,
 };
@@ -509,6 +509,8 @@ pub async fn serve_trojan(
                             .alpn_protocol()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
                             .unwrap_or_default();
+                        // bd 2bw8f：读批窗口随 TLS 后端（rustls 64K / btls 16K）。
+                        let readbuf = tls_stream.readbuf_size();
                         // Go hub.go:106-113：TLS 解包后 authConfig.Server（recorder 在其内，
                         // 只见解伪装后的字节——对齐 Go transport 层先解、proxy 后读）。
                         let recorder = RecordingStream {
@@ -528,6 +530,7 @@ pub async fn serve_trojan(
                             name,
                             alpn,
                             handshake_timeout,
+                            readbuf,
                         )
                         .await;
                     },
@@ -558,6 +561,7 @@ pub async fn serve_trojan(
                     String::new(),
                     String::new(),
                     handshake_timeout,
+                    0,
                 )
                 .await;
             }
@@ -597,6 +601,8 @@ pub async fn serve_trojan_conn<S: AsyncRead + AsyncWrite + Unpin + Send + 'stati
         tls_name,
         tls_alpn,
         handshake_timeout,
+        // transport 层已终结 TLS（读批由 transport hub 决定）⇒ 池化 8KiB。
+        0,
     )
     .await;
 }
@@ -613,6 +619,8 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
     tls_name: String,
     tls_alpn: String,
     handshake_timeout: std::time::Duration,
+    // 入站 TLS 读批窗口（bd 2bw8f）：16KiB record 一批交付；0 = 池化 8KiB。
+    readbuf: usize,
 ) {
     match trojan_server_handshake(&mut recorder, &validator, handshake_timeout).await {
         Ok((network, addr, port, user)) => {
@@ -623,7 +631,11 @@ async fn handle_trojan_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'st
             }
             let dest = Destination::new(addr, Port::new(port), CommonNetwork::TCP);
             let (read_half, write_half) = tokio::io::split(recorder.inner);
-            let link = Link::new(new_reader(read_half), new_writer(write_half));
+            let link = Link::new(
+                // bd 2bw8f：按入站 TLS 报告容量建读器（0 = 池化 8KiB 不变）。
+                new_reader_with_capacity(read_half, readbuf),
+                new_writer(write_half),
+            );
             SERVER_LOG
                 .debug(format!("trojan dispatching peer={peer} user={} dest={dest}", user.email));
             // per-user stats（Go trojan/inbound 认证后 ctx 带 user 语义）：
@@ -1302,5 +1314,77 @@ mod tests {
             elapsed >= TLS_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(500),
             "窗未生效（清得太早，改前无界等待形态）: {elapsed:?}"
         );
+    }
+
+    /// bd 2bw8f：入站泵按 TLS 层报告的读批窗口建读器——握手后余量一批交付；
+    /// 缺省 0 仍是池化 8KiB（同余量劈两批）。
+    ///
+    /// 负向对照：把 `handle_trojan_connection` 的 `readbuf` 传 0（= 改回
+    /// `new_reader`）第一条断言必红（8192 ≠ 16384）。
+    #[tokio::test]
+    async fn inbound_tls_readbuf_size_sets_first_batch() {
+        /// 记录下发给 outbound 的**首批**字节数（一批 = 一次 poll_read 的产物）。
+        #[derive(Debug)]
+        struct FirstBatch(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl DispatchHandler for FirstBatch {
+            fn tag(&self) -> &str {
+                "first-batch"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                mut link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                let slot = Arc::clone(&self.0);
+                Box::pin(async move {
+                    let mb = link.reader.read_multi_buffer().await.expect("读首批");
+                    slot.store(mb.len(), std::sync::atomic::Ordering::SeqCst);
+                })
+            }
+        }
+
+        /// 握手后余量 16KiB（= 一条 TLS record）：窗口 ≥ 16KiB ⇒ 一批交付。
+        async fn first_batch(readbuf: usize) -> usize {
+            const RECORD: usize = 16 * 1024;
+            let slot = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handler: Arc<dyn DispatchHandler> = Arc::new(FirstBatch(Arc::clone(&slot)));
+            let (mut client, server_io) = tokio::io::duplex(RECORD * 8);
+            let mut req = Vec::new();
+            write_request_header(
+                &mut req,
+                &MemoryAccount::new("password"),
+                TrojanNetwork::Tcp,
+                &Address::IPv4(std::net::Ipv4Addr::LOCALHOST),
+                443,
+            )
+            .unwrap();
+            req.extend(std::iter::repeat_n(0x5Au8, RECORD));
+            client.write_all(&req).await.unwrap();
+
+            handle_trojan_connection(
+                RecordingStream { inner: server_io, buf: Vec::with_capacity(256) },
+                make_validator_with_user("password"),
+                handler,
+                None,
+                "127.0.0.1:12345".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+                String::new(),
+                String::new(),
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+                readbuf,
+            )
+            .await;
+            drop(client);
+            slot.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        assert_eq!(
+            first_batch(64 * 1024).await,
+            16 * 1024,
+            "64KiB 窗口下 16KiB record 必须一批交付（回退 8KiB 则 8192）"
+        );
+        assert_eq!(first_batch(0).await, 8 * 1024, "缺省 0 必须保持池化 8KiB 批粒度");
     }
 }

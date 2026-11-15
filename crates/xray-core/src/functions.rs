@@ -5279,7 +5279,9 @@ mod tests {
             server_cfg.inbounds.push(BuiltInbound {
                 entry: BuiltEntry {
                     kind: "shadowsocks".into(),
-                    data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}]}"#
+                    // bd p9gyj：ss 缺省 TCP-only（Go `Server.Network()` 空列表兜底
+                    // `[TCP]`）⇒ UDP relay 必须显式声明 network，否则只绑 TCP。
+                    data: br#"{"clients":[{"password":"test-pass","method":"aes-256-gcm"}],"network":"tcp,udp"}"#
                         .to_vec(),
                 },
                 tag: "ss-in".into(),

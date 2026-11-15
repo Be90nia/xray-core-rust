@@ -381,6 +381,13 @@ impl ServerWorker {
             },
             Some(mut ex) => {
                 if ex.status == XudpStatus::Initializing {
+                    // 与 Go 逐字同源（`common/mux/server.go:207-213`）：同一 GlobalID
+                    // 撞上"正在初始化"的条目几乎不可能发生；Go 原文注释
+                    // 「It's not a good idea to return an err here, so just let client
+                    // wait. Client will receive an End frame after sending a Keep frame」
+                    // ⇒ **有意丢弃本帧内联数据并回 Ok**（返回 Err 会整条 mux 连接断，
+                    // 客户端永远收不到 End 帧）。本帧 `data` 随作用域 drop 回缓冲池，
+                    // 无泄漏；bd i43c3 复核结论 = 与 Go 一致，不改行为。
                     warn!("XUDP conflict {:?}", global_id);
                     return Ok(());
                 }

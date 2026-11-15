@@ -15,7 +15,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use xray_common::drain::Drainer as _;
 
 use crate::{
-    config::MemoryAccount,
     error::{Result, SsError},
     protocol::{RequestHeader, read_address_port_ss},
     stream::SSStream,
@@ -142,13 +141,14 @@ impl Server {
 /// server 端：从 TCP 连接读取首帧（addr+port）+ 构造 SSStream。
 ///
 /// 流程：
-/// 1. 读 IV（长度 = `account.cipher.iv_size()`）
+/// 1. 读 IV（长度 = `user.account.cipher.iv_size()`）
 /// 2. 构造 `SSStream::new_client`（nonce 从 `[0xFF;n]` 开始）
 /// 3. `read_chunk` 读首帧（addr+port，SS 地址格式）
 ///
 /// 返回的 `SSStream` 可继续 `read_chunk` 读 body。
 ///
-/// 单用户场景（已知 account）。多用户场景需先用 validator 匹配。
+/// `user` 是**认证命中的用户整体**（多用户场景先经 validator 匹配），其 `level`
+/// 随请求头下传供会话 policy 使用（Go `request.User = user`，protocol.go:114）。
 ///
 /// # Errors
 /// - [`crate::error::SsError::Io`]：TCP 读 IV/首帧失败。
@@ -157,13 +157,13 @@ impl Server {
 /// - 透传 `read_address_port_ss` 解析错误。
 pub async fn read_request<C>(
     mut conn: C,
-    account: &MemoryAccount,
-    user_email: &str,
+    user: &MemoryUser,
     behavior_seed: u64,
 ) -> Result<(RequestHeader, SSStream<C>)>
 where
     C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
+    let account = &user.account;
     let drainer = new_drainer(behavior_seed);
 
     // 读 IV
@@ -211,7 +211,10 @@ where
 
     let header = RequestHeader {
         version: crate::VERSION,
-        user: MemoryUser::new(user_email.to_string(), account.clone()),
+        // Go `request.User = user`（protocol.go:114）：认证命中的用户**整体**随
+        // 请求头下传，level 是会话 policy 层级（server.go:235 ForLevel(User.Level)）。
+        // 旧实现 `MemoryUser::new(email, account)` 重置 level=0 ⇒ per-user 档位失效。
+        user: user.clone(),
         command: RequestCommand::Tcp,
         address,
         port,
@@ -330,7 +333,7 @@ where
         Err(e) => return Err(bail(&drainer, &mut conn, e).await),
     };
     // 预读字节整体回放：read_request 会从头部重新读 IV（与 Go FullReader 同款）。
-    read_request(PrefixedReader::new(prefix, conn), &user.account, &user.email, behavior_seed).await
+    read_request(PrefixedReader::new(prefix, conn), &user, behavior_seed).await
 }
 
 #[cfg(test)]
@@ -417,8 +420,13 @@ mod tests {
         let server_handle =
             xray_common::testing::spawn("client-server-loopback-aes-128-accept", async move {
                 let (conn, _) = listener.accept().await.expect("accept");
-                let (header, mut stream) =
-                    read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
+                let (header, mut stream) = read_request(
+                    conn,
+                    &crate::validator::MemoryUser::new("u@x.com", server_account),
+                    0,
+                )
+                .await
+                .expect("read_request");
 
                 // 读 body chunk
                 let body = stream.read_chunk().await.expect("read body").expect("body");
@@ -466,8 +474,13 @@ mod tests {
         let server_handle =
             xray_common::testing::spawn("client-server-loopback-aes-256-accept", async move {
                 let (conn, _) = listener.accept().await.expect("accept");
-                let (_h, mut stream) =
-                    read_request(conn, &server_account, "u@x.com", 0).await.expect("read_request");
+                let (_h, mut stream) = read_request(
+                    conn,
+                    &crate::validator::MemoryUser::new("u@x.com", server_account),
+                    0,
+                )
+                .await
+                .expect("read_request");
                 let body = stream.read_chunk().await.expect("read").expect("body");
                 stream.write_chunk(b"resp").await.expect("write");
                 stream.flush().await.expect("flush");
