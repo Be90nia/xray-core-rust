@@ -620,7 +620,12 @@ impl XmuxConn for Arc<DefaultDialerClient> {
     }
 }
 
-/// h3（QUIC）客户端作为 xmux 连接单元。
+/// h3（QUIC）客户端作为 xmux 连接单元——**已建好**的连接（生产池单元是惰性的
+/// [`crate::h3_client::LazyH3Conn`]，它自己转发 [`XmuxConn::set_dial_failure_hook`]）。
+///
+/// 此处**不实现**该 hook：本类型没有「建连」步骤可失败；请求级失败会把连接标
+/// closed（`H3Conn::mark_closed`）⇒ 池按 `is_closed()` 即剪枝，僵尸预约随单元
+/// 一起丢弃，不占池位（bd gfech 的缺口只在惰性单元上）。
 impl XmuxConn for Arc<H3Conn> {
     fn is_closed(&self) -> bool {
         (**self).is_closed()

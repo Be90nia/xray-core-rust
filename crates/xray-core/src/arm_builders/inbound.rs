@@ -528,6 +528,8 @@ pub(crate) async fn build_dokodemo_inbound(
             port_map: settings.port_map,
             follow_redirect: settings.follow_redirect,
             tls,
+            // settings.userLevel → dispatch access level（Go dokodemo.go:142）
+            user_level: settings.user_level,
         };
         // bd jezb：内层 listener task 必须自己感知 shutdown token——旧形态由外层
         // await 持有 JoinHandle，token cancel 时 drop = detach（accept loop 继续跑，
@@ -558,6 +560,8 @@ pub(crate) async fn build_dokodemo_inbound(
         tracing::info!(tag = %ib.tag, addr = %addr, dest = ?dest, "dokodemo UDP inbound listening");
         let dest_udp = dest.clone();
         let follow_redirect = settings.follow_redirect;
+        // settings.userLevel → UDP 会话 access level（Go dokodemo.go:142，TCP/UDP 同源）
+        let user_level = settings.user_level;
         let stop = shutdown_token.clone();
         let udp_ctx = Arc::clone(&plugin_ctx);
         // bind 提前到 spawn 之前：Go 的 dokodemo 在 handler 构造期同步
@@ -574,7 +578,7 @@ pub(crate) async fn build_dokodemo_inbound(
         let serve = fx
             .spawn_tracked(async move {
                 tokio::select! {
-                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, udp_ctx) => {
+                    r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, user_level, udp_ctx) => {
                         if let Err(e) = r {
                             tracing::error!(error = %e, "dokodemo UDP inbound stopped");
                         }

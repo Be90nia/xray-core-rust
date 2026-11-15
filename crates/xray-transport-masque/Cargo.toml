@@ -39,6 +39,9 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# 告警取证（bd bqb28）：`masqueSettings.xmux` 被忽略必须真实发出 WARN——测试用
+# tracing 订阅者捕获真实事件（模式同 xray-app-dns jsonconf WarnCapture）。
+tracing = { workspace = true }
 # bd anygg G2 L2（network:"masque" 承载 VLESS 真实字节往返；workspace path 依赖，
 # 零新三方）：真实 proxy 层 users 源（serve() → 共享 gate 注册）+ 真 vless 双端
 # + freedom 桥。dev 环允许（xray-core dev-dep xray-cli 同款先例）。

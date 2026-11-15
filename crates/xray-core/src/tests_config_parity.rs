@@ -978,6 +978,7 @@ fn dokodemo_parity_inbound_full_fields() {
         "port": 8080,
         "network": "tcp,udp",
         "portMap": { "80": "192.168.99.1:9090" },
+        "userLevel": 2,
     });
     let core = crate::inbound::parse_dokodemo_settings(&serde_json::to_vec(&settings).unwrap())
         .expect("core parse");
@@ -1011,6 +1012,7 @@ fn dokodemo_parity_inbound_full_fields() {
     );
     assert_eq!(core.follow_redirect, p.follow_redirect);
     assert_eq!(core.port_map, p.port_map);
+    assert_eq!(core.user_level, p.user_level, "userLevel ↔ 插件 user_level");
 }
 
 // ── tuic：入站全字段（core `parse_tuic_inbound_settings` ↔ TuicPlugin built_config）──

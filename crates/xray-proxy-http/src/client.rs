@@ -121,13 +121,26 @@ pub fn parse_http_config(data: &[u8]) -> Result<HttpOutboundConfig, String> {
     if let Some(a) = auth {
         config = config.with_auth(a);
     }
-    // 6a5v：解析 servers[0].headers（HTTP header map），追加到 CONNECT 请求。
-    // 此前整段丢弃 → 伪装头/认证相关 header 静默无效。Go v26 outbound http
-    // 也消费此字段（http dialer → req.Header）。
+    // 6a5v：解析 header map 追加到 CONNECT 请求。
+    // Go `infra/conf/http.go` 的 `Headers` 是 **settings 顶层键**
+    //（`HTTPClientConfig.Headers` → `config.Header`）；`servers[0].headers` 是本仓
+    // 旧解析口（Go 无此字段），保留兼容不再作为唯一来源（bd xqf7v：只读
+    // servers[0] 时 Go 兼容配置的伪装头静默失效）。两层同 key 时顶层覆盖——
+    // Go 侧只有顶层一份来源，顶层即权威。
     if let Some(headers_v) = first.get("headers").and_then(|v| v.as_object()) {
         for (k, v) in headers_v {
             if let Some(v_str) = v.as_str() {
                 config = config.with_header(k.clone(), v_str.to_string());
+            }
+        }
+    }
+    if let Some(headers_v) = v.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in headers_v {
+            if let Some(v_str) = v.as_str() {
+                match config.headers.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case(k)) {
+                    Some(slot) => slot.1 = v_str.to_string(),
+                    None => config = config.with_header(k.clone(), v_str.to_string()),
+                }
             }
         }
     }
@@ -792,6 +805,69 @@ mod tests {
         let missing = r#"{ "servers": [{ "address": "proxy.example.com", "port": 443 }] }"#;
         let config = parse_http_config(missing.as_bytes()).unwrap();
         assert!(!config.h2, "h2 must default to false when absent");
+    }
+
+    /// bd xqf7v：Go 的 `headers` 是 settings 顶层键（`HTTPClientConfig.Headers`），
+    /// 只读 `servers[0].headers` 时 Go 兼容配置的伪装头静默失效。
+    #[test]
+    fn parse_http_config_top_level_headers_override_server_headers() {
+        let data = r#"{
+            "headers": { "X-Top": "top-value", "X-Both": "top" },
+            "servers": [{
+                "address": "proxy.example.com",
+                "port": 8080,
+                "headers": { "X-Server": "server-value", "X-Both": "server" }
+            }]
+        }"#;
+        let config = parse_http_config(data.as_bytes()).unwrap();
+        let get = |key: &str| {
+            config
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("X-Top"), Some("top-value"), "顶层 headers 必须解析: {:?}", config.headers);
+        assert_eq!(get("X-Server"), Some("server-value"), "servers[0] 兼容口保留");
+        assert_eq!(get("X-Both"), Some("top"), "同 key 顶层（Go 唯一来源）覆盖");
+    }
+
+    /// bd xqf7v：顶层 headers 必须真的出现在 CONNECT 请求里（解析进 config 但
+    /// 发射侧断链同样算失败）。
+    #[tokio::test]
+    async fn connect_request_carries_top_level_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inspector = xray_common::testing::spawn(
+            "connect-request-carries-top-level-headers-accept",
+            async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req: Vec<u8> = Vec::new();
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                }
+                sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                String::from_utf8(req).unwrap()
+            },
+        );
+
+        let data = format!(
+            r#"{{ "headers": {{ "X-Camouflage": "yes" }},
+                  "servers": [{{ "address": "127.0.0.1", "port": {port} }}] }}"#
+        );
+        let cfg = Arc::new(parse_http_config(data.as_bytes()).unwrap());
+        let dial_fn = make_http_dial_fn(cfg, test_ctx());
+        let dest = Destination::tcp(Address::new_domain("target.example.com"), Port::new(443));
+        let conn = dial_fn(&dest).await.expect("tunnel established");
+        drop(conn);
+
+        let request = inspector.await.unwrap();
+        assert!(
+            request.contains("X-Camouflage: yes"),
+            "顶层 headers 必须在 CONNECT 请求中可见: {request}"
+        );
     }
 
     /// bd 47ci3（A-7，Go client.go:253-260 + 391-402）：200 响应同批到达的隧道字节

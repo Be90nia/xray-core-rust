@@ -94,6 +94,11 @@ struct Inner {
     resp: DuplexStream,
     /// 响应方向半帧累积缓冲。
     accum: Vec<u8>,
+    /// `accum[..start]` 已消费（垃圾前缀）。
+    ///
+    /// 逐帧 `drain(..consumed)` 要把剩余字节整段前移：一次读入 K 帧时前 K-1 次
+    /// 搬移合计 O(K²)。改读游标 + 惰性 compact（见 [`Inner::consume`]）。
+    start: usize,
     /// 响应读缓冲（会话期常驻池化块：栈数组会把本 future 撑到 64KiB，构造期在调用方
     /// poll 栈上留同尺寸临时量 → 击穿 2MiB 线程栈；常驻省掉每包一次分配，池化再省掉
     /// 每会话一次 `vec![0u8; RECV_BUF]` 分配+清零，会话结束 `Drop` 回池复用）。
@@ -104,6 +109,23 @@ struct Inner {
     global_id: [u8; 8],
     /// 是否已发送 New 帧。
     new_sent: bool,
+}
+
+impl Inner {
+    /// 消费 `accum` 已解析前缀 `n` 字节。
+    ///
+    /// 只移动读游标，**已消费过半**才真搬一次（惰性 compact）——每帧摊销 O(载荷)
+    /// 而非把剩余字节整段前移。残留上界 = 2× 未消费字节（compact 阈值 `len/2`）。
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        if self.start >= self.accum.len() {
+            self.accum.clear();
+            self.start = 0;
+        } else if self.start > self.accum.len() / 2 {
+            self.accum.drain(..self.start);
+            self.start = 0;
+        }
+    }
 }
 
 impl Drop for Inner {
@@ -217,13 +239,13 @@ impl UdpDispatchSession {
             },
         };
         loop {
-            if !inner.accum.is_empty() {
+            if inner.start < inner.accum.len() {
                 // 借用式就地解析（bd lppdz）：不再为帧头/meta 落中间 Vec（旧的
                 // Cursor + PacketReader 路径每帧 2 次分配 + 2 次拷贝）。
                 // 载荷仍需**拥有型 Vec** 返回给调用方（本 API 契约：10+ 调用方
                 // 依赖 `(Destination, Vec<u8>)`，含 xray-core 红线文件）→ 载荷
                 // 一次分配 + 一次拷贝（残留 1 分配，报告登记）。
-                let parsed = match parse_packet_slice_at(&inner.accum[..]) {
+                let parsed = match parse_packet_slice_at(&inner.accum[inner.start..]) {
                     (Ok(p), _) => p,
                     (Err(PacketError::Io(e)), _)
                         if e.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -232,12 +254,13 @@ impl UdpDispatchSession {
                         None
                     },
                     (Err(e), consumed) => {
-                        // qyn8：协议解析错误先 drain 已消费的坏帧字节再报错。
-                        // 解析错误发生时至少已消费 2B 长度头，不 drain
+                        // qyn8：协议解析错误先消费已解析的坏帧字节再报错。
+                        // 解析错误发生时至少已消费 2B 长度头，不前进游标
                         // 则坏帧永久滞留 accum，容忍型调用方 continue 即在同一
                         // 字节上无限 Err（同步忙旋 100% CPU）。传输层错误不经
                         // 此路径（resp.read 的 io Err 由下方 `?` 直接传播）。
-                        inner.accum.drain(..consumed.min(inner.accum.len()));
+                        let live = inner.accum.len() - inner.start;
+                        inner.consume(consumed.min(live));
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             e.to_string(),
@@ -248,16 +271,16 @@ impl UdpDispatchSession {
                     let consumed = pkt.consumed;
                     // 残留 1 分配 + 1 拷贝（bd lppdz 登记）：本 API 的返回契约是
                     // `(Destination, Vec<u8>)`，载荷必须脱开 `accum` 独立存活
-                    // （借用与 `accum.drain` 互斥）→ 拥有型 Vec 无法零拷贝。要归零
+                    // （借用与游标前进互斥）→ 拥有型 Vec 无法零拷贝。要归零
                     // 需改 recv_packet 签名（10+ 调用方，含 xray-core
                     // inbound/outbound 红线文件），不属本票。
                     #[allow(
                         clippy::disallowed_methods,
-                        reason = "bd lppdz 残留：recv_packet 契约要求拥有型载荷 Vec，借用无法跨 accum.drain 存活"
+                        reason = "bd lppdz 残留：recv_packet 契约要求拥有型载荷 Vec，借用无法跨 accum 前进存活"
                     )]
                     let data = pkt.data.to_vec();
                     let target = pkt.target;
-                    inner.accum.drain(..consumed);
+                    inner.consume(consumed);
                     let source = target.unwrap_or_else(|| inner.dest.clone());
                     return Ok(Some((source, data)));
                 }
@@ -312,6 +335,7 @@ impl UdpDispatchSession {
             req: req_local,
             resp: resp_local,
             accum: Vec::new(),
+            start: 0,
             buf: Buffer::new_pooled(RECV_BUF),
             frame: Vec::with_capacity(666),
             global_id: rand::random(),
@@ -1274,6 +1298,95 @@ pub(crate) mod tests {
             spin.is_err(),
             "recv_packet must block after draining bad frame (busy-spin regression)"
         );
+    }
+
+    /// 回归钉：一次读入多帧时逐帧前进读游标（`accum[..start]` 留作垃圾前缀），
+    /// 已消费字节不再整段前移。断回退：改回 `accum.drain(..consumed)` 后
+    /// `start` 恒 0 且 `accum` 每帧缩短 → 本测试红。
+    #[tokio::test]
+    async fn recv_advances_cursor_without_shifting_consumed_prefix() {
+        const FRAMES: usize = 8;
+        const PAYLOAD: usize = 4;
+
+        #[derive(Debug)]
+        struct MultiFrameHandler;
+
+        impl DispatchHandler for MultiFrameHandler {
+            fn tag(&self) -> &str {
+                "multiframe"
+            }
+
+            fn dispatch(&self, _dest: &Destination, link: Link) -> crate::default::PinFuture<()> {
+                Box::pin(async move {
+                    use xray_buf::io::Writer;
+                    let mut bytes = Vec::new();
+                    for i in 0..FRAMES {
+                        FrameMetadata::keep_udp(
+                            Address::IPv4(Ipv4Addr::new(9, 9, 9, 9)),
+                            Port::new(53),
+                        )
+                        .write_to(&mut bytes)
+                        .unwrap();
+                        bytes.extend_from_slice(&(PAYLOAD as u16).to_be_bytes());
+                        bytes.extend_from_slice(&(i as u32).to_be_bytes());
+                    }
+                    let mut out = MultiBuffer::new();
+                    out.merge_bytes(&bytes);
+                    let mut writer = link.writer;
+                    let _ = writer.write_multi_buffer(out).await;
+                    // 保持写端打开（EOF 会结束会话）
+                    std::future::pending::<()>().await;
+                })
+            }
+        }
+
+        let mut probe = Vec::new();
+        FrameMetadata::keep_udp(Address::IPv4(Ipv4Addr::new(9, 9, 9, 9)), Port::new(53))
+            .write_to(&mut probe)
+            .unwrap();
+        probe.extend_from_slice(&(PAYLOAD as u16).to_be_bytes());
+        probe.extend_from_slice(&0u32.to_be_bytes());
+        let frame_len = probe.len();
+
+        let mut session = UdpDispatchSession::new(Arc::new(MultiFrameHandler));
+        let dest = udp_dest([8, 8, 4, 4], 53);
+        session.send_packet(&dest, b"ping").await.expect("send failed");
+
+        let mut saw_cursor = false;
+        let mut compactions = 0;
+        let mut prev_buffered = FRAMES * frame_len;
+        for i in 0..FRAMES {
+            let (source, payload) = session.recv_packet().await.unwrap().unwrap();
+            assert_eq!(source, udp_dest([9, 9, 9, 9], 53), "源 = 帧内 target");
+            assert_eq!(payload, (i as u32).to_be_bytes().to_vec(), "第 {i} 帧载荷");
+            let (start, buffered) = {
+                let inner = session.inner.as_ref().unwrap();
+                (inner.start, inner.accum.len())
+            };
+            if i + 1 < FRAMES {
+                assert_eq!(
+                    buffered - start,
+                    (FRAMES - i - 1) * frame_len,
+                    "未消费字节 = 剩余帧数 × 帧长"
+                );
+                if start > 0 {
+                    // 游标路径：已消费前缀原地留着，剩余字节不搬移。
+                    saw_cursor = true;
+                    assert_eq!(buffered, prev_buffered, "游标前进不得搬移剩余字节");
+                    assert!(start <= buffered / 2, "残留上界 = 2× 未消费字节（第 {i} 帧）");
+                } else {
+                    // 惰性 compact：真搬一次，搬完前缀归零。
+                    compactions += 1;
+                    assert!(buffered < prev_buffered, "compact 必须真搬移（第 {i} 帧）");
+                }
+                prev_buffered = buffered;
+            } else {
+                assert_eq!(buffered, 0, "最后一帧消费完必须清空 accum");
+                assert_eq!(start, 0, "清空后游标归零");
+            }
+        }
+        assert!(saw_cursor, "已消费前缀必须靠游标前进（回退到每帧 drain 则 start 恒 0）");
+        assert!(compactions >= 1, "越过一半必须 compact，否则 accum 无界增长");
     }
 
     /// q1r4q 回归钉：同一 UDP 帧流按不同分段方式（单段/碎片边界任意错位）

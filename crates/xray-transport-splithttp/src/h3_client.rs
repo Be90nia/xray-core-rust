@@ -200,6 +200,11 @@ pub struct LazyH3Conn {
     tls: RustlsClientConfig,
     quic_params: Option<xray_transport::memory_settings::QuicParamsConfig>,
     sockopt: xray_transport::sockopt::SocketOptions,
+    /// 池层注入的「建连失败」回调（bd gfech）。与 h2
+    /// [`crate::client::DefaultDialerClient`] 同语义：建连失败 ⇒ 归还本次取用预约 +
+    /// 标记该池单元不可复用。缺了它，缺省 `maxConcurrency=1` 下每个建连失败的单元
+    /// 都仍算「占用中」且 `is_closed()` 为 false ⇒ 池被僵尸单元占满、永不复用。
+    dial_failure: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl LazyH3Conn {
@@ -221,6 +226,7 @@ impl LazyH3Conn {
             tls,
             quic_params,
             sockopt,
+            dial_failure: parking_lot::Mutex::new(None),
         }
     }
 
@@ -231,9 +237,21 @@ impl LazyH3Conn {
         self.inner.get()
     }
 
+    /// 通知池层「本次建连失败」（bd gfech；池层在单元入池时注入回调）。
+    ///
+    /// 只在**建连失败**触发：建连成功后的请求级失败会把连接标 closed
+    /// （`H3Conn::mark_closed`）⇒ 池按 `is_closed()` 剪枝，无需再动预约账本。
+    fn notify_dial_failure(&self) {
+        let hook = self.dial_failure.lock().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     /// 取（必要时建立）QUIC/H3 连接。
     pub async fn get(&self) -> Result<Arc<H3Conn>> {
-        self.inner
+        let conn = self
+            .inner
             .get_or_try_init(|| async {
                 H3Conn::connect_with_quic_params(
                     self.config.clone(),
@@ -246,13 +264,21 @@ impl LazyH3Conn {
                 .await
             })
             .await
-            .cloned()
+            .cloned();
+        if conn.is_err() {
+            self.notify_dial_failure();
+        }
+        conn
     }
 }
 
 impl crate::mux::XmuxConn for LazyH3Conn {
     fn is_closed(&self) -> bool {
         self.inner.get().is_some_and(|c| (**c).is_closed())
+    }
+
+    fn set_dial_failure_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.dial_failure.lock() = Some(hook);
     }
 }
 
@@ -1269,6 +1295,43 @@ mod tests {
         let dbg = format!("{:?}", build_h3_transport_config(&cfg, Some(&qp_init)).unwrap());
         assert!(dbg.contains("stream_receive_window: 1048576"), "{dbg}");
         assert!(dbg.contains("max_concurrent_bidi_streams: 100"), "0 = 不动 quinn 缺省: {dbg}");
+    }
+
+    /// bd gfech 回归：h3 池单元（惰性建连）必须转发池层的「建连失败」回调。
+    ///
+    /// 旧实现 `XmuxConn for LazyH3Conn` 只实现 `is_closed`（hook 走 trait 缺省空实现）
+    /// ⇒ 建连失败后预约恒为 1、`is_closed()` 恒 false ⇒ 缺省 `maxConcurrency=1` 下
+    /// 该单元永久「占用中」，永不复用，池被僵尸单元占满。
+    ///
+    /// 建连失败用非法 `quicParams`（窗口超 VarInt 边界）确定性触发：不碰网络、
+    /// 不依赖超时。
+    #[tokio::test]
+    async fn lazy_h3_connect_failure_releases_pool_reservation() {
+        use std::sync::Arc;
+
+        use crate::mux::XmuxManager;
+
+        let mut qp = qp_from_json("", "");
+        qp.init_stream_receive_window = u64::MAX;
+
+        let manager = XmuxManager::new(XmuxConfig::default(), move || {
+            let tls = rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            crate::h3_client::LazyH3Conn::new(
+                Arc::new(Config::default()),
+                "127.0.0.1:443".parse().expect("literal addr"),
+                "example.com".to_string(),
+                tls,
+                Some(qp.clone()),
+                xray_transport::sockopt::SocketOptions::default(),
+            )
+        });
+
+        let client = manager.get_xmux_client();
+        assert_eq!(client.reserved(), 1, "取用即预约（池层记账）");
+        assert!(client.conn.get().await.is_err(), "非法 quicParams 必须让建连失败");
+        assert_eq!(client.reserved(), 0, "建连失败必须归还预约（否则该单元永不复用）");
     }
 
     /// bd fgzb：`XRAY_H3_ZERO_RTT` 开关语义——未设/空/其他值 = 开（对齐 Go

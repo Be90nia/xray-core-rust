@@ -33,6 +33,9 @@ impl Config {
     ///
     /// 校验顺序对齐 Go `Build()`：warp（含 user/pass 冲突）→ path → host → headers →
     /// user/pass。
+    ///
+    /// `xmux` **不解析**（本实现每 outbound 一条隧道，无 xmux 多路复用）——显式
+    /// 出现即 WARN 点名，不静默丢弃（bd bqb28；Go 侧解析见 `transport_method.go:943-958`）。
     pub fn from_json(v: Option<&serde_json::Value>) -> Result<Config> {
         let Some(v) = v else {
             return Ok(Config {
@@ -45,6 +48,18 @@ impl Config {
         let obj = v.as_object().ok_or_else(|| {
             MasqueError::Protocol("masqueSettings: settings must be a JSON object".into())
         })?;
+
+        // Go `MasqueConfig.Build`（transport_method.go:853-958）解析 xmux（缺省
+        // `maxConnections{1,1}` + `hMaxReusableSecs{1800,3000}`，双上限互斥硬错）并交给
+        // 传输层复用连接；本 crate 每 outbound 连接一条隧道、无 xmux 多路复用
+        // （shortcut 登记在 xray-proxy-masque/client.rs）⇒ 解析出来也没有消费方。
+        // 禁静默：显式写了 xmux 就点名告知不生效（缺省套用面无用户可见配置可提，不刷）。
+        if obj.get("xmux").is_some_and(|x| !x.is_null()) {
+            crate::LOG.warn(
+                "masqueSettings.xmux is ignored: this implementation opens one tunnel per \
+                 outbound connection (Go xmux multiplexing is not implemented)",
+            );
+        }
 
         let mut host = obj.get("host").and_then(|h| h.as_str()).unwrap_or("").to_string();
         let mut path = obj.get("path").and_then(|p| p.as_str()).unwrap_or("").to_string();
@@ -416,5 +431,79 @@ mod tests {
     fn non_object_settings_rejected() {
         assert!(Config::from_json(Some(&json!("masque"))).is_err());
         assert!(Config::from_json(Some(&json!(42))).is_err());
+    }
+
+    /// 极简 WARN 捕获订阅者（模式取自 xray-app-dns jsonconf / xray-tls WarnCapture）：
+    /// 断言告警是**真实 tracing 事件**，不是 mock。
+    #[derive(Clone, Default)]
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for WarnCapture {
+        fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+            meta.level() <= &tracing::Level::WARN
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Fmt(String);
+            impl tracing::field::Visit for Fmt {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!("{}={value} ", field.name()));
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+            let mut v = Fmt(String::new());
+            event.record(&mut v);
+            self.0.lock().expect("warn slot").push(v.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// bd bqb28 F-1 回归：`masqueSettings.xmux` 必须**点名** WARN，不得静默忽略。
+    ///
+    /// Go `MasqueConfig.Build`（transport_method.go:943-958）解析 xmux 并交给传输层
+    /// 复用连接；本实现每 outbound 一条隧道（无多路复用）⇒ 写 xmux 的用户必须被告知
+    /// 该项不生效，且配置本身照常放行（Go 合法配置不得拒启）。
+    #[test]
+    fn xmux_key_warns_instead_of_silent_ignore() {
+        let capture = WarnCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let cfg = Config::from_json(Some(&json!({
+                "xmux": { "maxConnections": { "from": 2, "to": 2 } }
+            })))
+            .expect("Go-valid xmux must not be rejected");
+            assert_eq!(cfg.path, DEFAULT_PATH, "其余字段照常解析");
+        });
+        let warns = capture.0.lock().expect("warn slot");
+        assert!(
+            warns.iter().any(|w| w.contains("xmux")),
+            "explicit masqueSettings.xmux must be reported, got: {warns:?}"
+        );
+        drop(warns);
+
+        // 未写 xmux（缺省套用面无用户可见配置）不得刷告警。
+        let quiet = WarnCapture::default();
+        tracing::subscriber::with_default(quiet.clone(), || {
+            Config::from_json(Some(&json!({ "host": "example.com:8443" })))
+                .expect("valid settings");
+        });
+        assert!(quiet.0.lock().expect("warn slot").is_empty(), "no warn when xmux is absent");
     }
 }

@@ -229,7 +229,16 @@ async fn write_meta_with_frame(
     data: MultiBuffer,
     scratch: &mut Vec<u8>,
 ) -> Result<(), MuxError> {
-    let data_len = data.len() as u16;
+    // 载荷长度字段是 u16（Go `serial.WriteUint16`，writer.go:82 同样无守卫）——
+    // `as u16` 把 65536 静默截成 0，读端把整块载荷当「空数据」后帧序失步、carrier
+    // 静默死亡（bd gfech）。Go 侧同为截断，本仓选择 fail-visible。
+    let Ok(data_len) = u16::try_from(data.len()) else {
+        return Err(MuxError::Io(format!(
+            "mux frame payload {} exceeds u16 length field max {}",
+            data.len(),
+            u16::MAX
+        )));
+    };
     // 直序进池化 Buffer（wfx8-3，对齐 Go FrameMetadata.WriteTo(buf.Buffer) 直写
     // 形态）：meta 序列化走调用方 scratch（fzir 池化，7681f7cc 范式），免每数据帧
     // 一次 Vec 分配 + Buffer::from_vec 的二次拷贝。
@@ -434,6 +443,29 @@ mod tests {
         mb.push(Buffer::from_vec(b"first".to_vec()));
         mb.push(Buffer::from_vec(b"second".to_vec()));
         assert!(w.write(mb).await.is_ok());
+    }
+
+    /// bd gfech 回归：载荷长度字段是 u16，超限必须 fail-visible。
+    ///
+    /// 旧实现 `data.len() as u16` 把 65536 截成 0（Go writer.go:82 同病）——读端
+    /// 由长度 0 判定「本帧无载荷」，整块数据被当成下一帧帧头解析，帧序失步。
+    /// 断言两边都钉住：超限 Err（并报出真实长度）、u16::MAX 仍可写。
+    #[tokio::test]
+    async fn payload_over_u16_max_is_rejected_not_truncated() {
+        let mut w = create_mux_writer(TransferType::Packet);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(vec![0u8; 65_536]));
+        let err = w.write(mb).await.expect_err("65536B payload cannot fit the u16 length field");
+        assert!(
+            err.to_string().contains("65536"),
+            "error must name the offending length (否则与截断形态无法区分), got {err}"
+        );
+
+        // 边界：65535 = u16::MAX 必须照旧可写（守卫不得收窄成非法区间）。
+        let mut w = create_mux_writer(TransferType::Packet);
+        let mut mb = MultiBuffer::new();
+        mb.push(Buffer::from_vec(vec![0u8; u16::MAX as usize]));
+        w.write(mb).await.expect("65535B payload is representable");
     }
 
     /// bd txhn 回归：共享写端上多个 MuxWriter 并发整帧写入必须帧原子。

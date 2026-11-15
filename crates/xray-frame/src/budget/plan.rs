@@ -783,6 +783,11 @@ mod tests {
     }
 
     /// 闸恒 ≥ 实测 BDP 上沿（3.56MB）：四档都不许低于 4MiB，否则重犯 u440m。
+    ///
+    /// 2026-11-15 补钉（用户实测口径）：闸 = `总预算/2` 钳 `[4MiB, 32MiB]`。
+    /// 旧 `/8` 口径给四档 5/12/24/32MiB，small 档 12MiB 从中间横切真实 CDN
+    /// BDP（60MB/s × 0.45s ≈ 27MB）⇒ 吞吐被钉成 闸/RTT ≈ 26.7MB/s
+    /// （用户「60 对半砍」；桥全协议共用 ⇒ ws/xhttp/httpupgrade 同抖）。
     #[test]
     fn bridge_gate_never_below_measured_bdp() {
         for avail in [64 * MIB, 256 * MIB, 512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
@@ -793,6 +798,28 @@ mod tests {
                 plan.bridge_gate
             );
             assert!(plan.bridge_gate > 0);
+            // 闸恒 = 总预算/2（钳在上下界内）：改回 `/8` 或改别的除数即红。
+            assert_eq!(
+                plan.bridge_gate,
+                (plan.total_budget / 2).clamp(BRIDGE_GATE_MIN_BYTES, BRIDGE_GATE_MAX_BYTES),
+                "{avail}B 档闸 {}B ≠ total_budget/2 的钳位结果",
+                plan.bridge_gate
+            );
+            // 上界绝不越：闸是瞬态背压上界（lazy），抬高不涨常驻但也没收益。
+            assert!(
+                plan.bridge_gate <= BRIDGE_GATE_MAX_BYTES,
+                "{avail}B 档闸 {}B 越过 32MiB 上界",
+                plan.bridge_gate
+            );
+        }
+        // 上界常量本身直钉 32MiB：三档「顶到上界」用常量做断言会随常量一起变绿，
+        // 故此处写字面值（常量被调小则本断言红）。
+        for avail in [512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
+            assert_eq!(
+                MemoryPlan::from_available(avail).bridge_gate,
+                32 * MIB as usize,
+                "{avail}B 档闸必须顶到 32MiB（用户实测口径；回落到 12/24MiB = 半速回归）"
+            );
         }
     }
 
@@ -808,10 +835,7 @@ mod tests {
             let plan = MemoryPlan::from_available(available);
             let budget = plan.inflight_budget_bytes();
             // 需求 = 10 条满载在飞，但不超过物理允许（可用 1/4）。
-            let need = plan
-                .bridge_gate
-                .saturating_mul(10)
-                .min((plan.available / 4) as usize);
+            let need = plan.bridge_gate.saturating_mul(10).min((plan.available / 4) as usize);
             assert!(
                 budget >= need,
                 "{available}B 档 in-flight 预算 {budget}B 装不下 {need}B（10 条满载 ∩ 可用1/4）：\

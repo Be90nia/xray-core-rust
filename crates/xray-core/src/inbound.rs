@@ -1558,6 +1558,9 @@ pub struct DokodemoTcpOptions {
     pub follow_redirect: bool,
     /// TLS acceptor（streamSettings `security:tls` 时；后端 rustls / btls 由装配期选路）。
     pub tls: Option<Arc<xray_tls::inbound_acceptor::InboundTlsAcceptor>>,
+    /// settings.userLevel → dispatch access level（Go `Process`：
+    /// `inbound.User.Level = config.UserLevel`，dispatcher 据此 `ForLevel` 取会话策略）。
+    pub user_level: u32,
 }
 
 /// 字符串解析为 [`Address`]：IPv4 → IPv6 → 域名。
@@ -1669,11 +1672,20 @@ pub async fn serve_dokodemo(
     let handler = ohm
         .get_default_handler()
         .ok_or_else(|| std::io::Error::other("no default outbound handler registered"))?;
+    // Go `Process`：`inbound.User = &MemoryUser{Level: config.UserLevel}` →
+    // dispatcher `policy.ForLevel(inbound.User.Level)` 取会话策略
+    //（timeouts/buffer）。level 0 = 默认档，与未配置时同行为（bd 307tw）。
+    let access = xray_app_dispatcher::AccessContext {
+        inbound_name: "dokodemo-door".to_string(),
+        level: opts.user_level,
+        ..xray_app_dispatcher::AccessContext::default()
+    };
     tracing::info!(
         addr = %listener.local_addr()?,
         dest = ?opts.dest,
         follow_redirect = opts.follow_redirect,
         tls = opts.tls.is_some(),
+        level = access.level,
         "dokodemo inbound listening"
     );
     // mask 生效时 conn 的 local_addr 随 TcpStream 进了 dyn 包装，拿不到：
@@ -1693,6 +1705,8 @@ pub async fn serve_dokodemo(
         };
         let handler = Arc::clone(&handler);
         let opts = opts.clone();
+        // per-connection access（level 来自 settings.userLevel，Go `inbound.User`）
+        let access = access.clone();
         // scope 生命周期锚（裸 spawn detach 语义等价）
         let task_ctx = Arc::clone(&plugin_ctx);
         plugin_ctx
@@ -1745,7 +1759,8 @@ pub async fn serve_dokodemo(
                             Some(dest) => {
                                 let (read_half, write_half) = tokio::io::split(tls_stream);
                                 let link = Link::new(new_reader(read_half), new_writer(write_half));
-                                let _ = handler.dispatch(&dest, link).await;
+                                let _ =
+                                    handler.dispatch_with_access(&dest, link, access.clone()).await;
                             },
                             None => tracing::warn!(
                                 "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
@@ -1765,7 +1780,7 @@ pub async fn serve_dokodemo(
                         // 拆流按连接类型分发（裸 TCP → readv 聚合读；mask 生效 → 顺序读）
                         let (reader, writer) = stream.into_link_io();
                         let link = Link::new(reader, writer);
-                        let _ = handler.dispatch(&dest, link).await;
+                        let _ = handler.dispatch_with_access(&dest, link, access.clone()).await;
                     },
                     None => tracing::warn!(
                         "dokodemo: no valid destination (followRedirect without original dst/SNI), rejecting connection (Go dokodemo.go:137)"
@@ -1809,14 +1824,18 @@ pub async fn serve_dokodemo_udp(
         udpmask,
     )
     .await?;
-    serve_dokodemo_udp_on(hub, handler, dest, plugin_ctx).await
+    serve_dokodemo_udp_on(hub, handler, dest, 0, plugin_ctx).await
 }
 
 /// 已建 `UdpHub` 的 dokodemo UDP 服务循环（测试/组合入口）。
+///
+/// `user_level`：settings.userLevel → 会话 access level（Go `Process` 的
+/// `inbound.User.Level`，UDP 与 TCP 同一来源）。
 pub async fn serve_dokodemo_udp_on(
     hub: xray_transport::udp::hub::UdpHub,
     handler: Arc<dyn DispatchHandler>,
     dest: Option<Destination>,
+    user_level: u32,
     plugin_ctx: Arc<PluginContext>,
 ) -> std::io::Result<()> {
     let local = hub.local_addr().ok();
@@ -1879,6 +1898,7 @@ pub async fn serve_dokodemo_udp_on(
                                     first_dest,
                                     relay_hub,
                                     overridden,
+                                    user_level,
                                 )
                                 .await;
                             })
@@ -1947,11 +1967,14 @@ async fn dokodemo_peer_relay(
     default_dest: Destination,
     hub: Arc<xray_transport::udp::hub::UdpHub>,
     overridden: bool,
+    user_level: u32,
 ) {
     let mut session =
         UdpDispatchSession::new(handler).with_access(xray_app_dispatcher::AccessContext {
             from: peer.to_string(),
             inbound_name: "dokodemo-door".to_string(),
+            // Go `Process`：`inbound.User.Level = config.UserLevel`（UDP 同源）
+            level: user_level,
             ..xray_app_dispatcher::AccessContext::default()
         });
     #[cfg(target_os = "linux")]
@@ -5601,6 +5624,9 @@ pub(crate) struct DokodemoInboundSettings {
     pub(crate) follow_redirect: bool,
     /// 端口映射：监听端口字符串 → "host:port"。
     pub(crate) port_map: HashMap<String, String>,
+    /// 用户级别（Go `DokodemoDoor.Process`：`inbound.User.Level = config.UserLevel`
+    /// → dispatcher `ForLevel(level)` 取会话策略）。0 = 默认档。
+    pub(crate) user_level: u32,
 }
 
 /// JSON 数值 → 端口（`0..=65535`）。越界**报错**，不用 `as u16` 静默回绕
@@ -5653,6 +5679,7 @@ pub(crate) fn ss_udp_listen_allowed(data: &[u8]) -> std::io::Result<bool> {
 
 /// 从 inbound entry.data（JSON）解析完整 dokodemo 设置。
 /// JSON 格式：`{"address":"1.2.3.4","port":80,"network":"tcp,udp","followRedirect":true}`。
+/// `userLevel` 可选（Go `UserLevel uint32`，缺省 0）。
 /// `network` / `allowedNetwork` 可选（两者皆缺默认 `"tcp"`；`network` 优先，
 /// 值支持逗号串与字符串数组）；`followRedirect` 可选（默认 `false`）；
 /// `address`/`port` 可选（Go dokodemo.go:26-31：address→RewriteAddress、
@@ -5704,6 +5731,26 @@ pub(crate) fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoIn
         }
     }
 
+    // userLevel（Go `infra/conf/dokodemo.go` `UserLevel uint32`）：非负整数，
+    // 越界 = conf 错（Go JSON 解 uint32 超范围同样报错）。
+    let user_level = match v.get("userLevel").filter(|x| !x.is_null()) {
+        None => 0,
+        Some(x) => {
+            let raw = x.as_u64().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dokodemo inbound userLevel must be a non-negative integer",
+                )
+            })?;
+            u32::try_from(raw).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("dokodemo inbound userLevel {raw} exceeds u32"),
+                )
+            })?
+        },
+    };
+
     // address/port 独立可选：仅 address 时 port=0（serve 侧回填本地端口）。
     let dest = address.map(|address| {
         let port = port.unwrap_or(0);
@@ -5713,7 +5760,14 @@ pub(crate) fn parse_dokodemo_settings(data: &[u8]) -> std::io::Result<DokodemoIn
             Destination::new(address, Port::new(port), Network::TCP)
         }
     });
-    Ok(DokodemoInboundSettings { dest, allow_tcp, allow_udp, follow_redirect, port_map })
+    Ok(DokodemoInboundSettings {
+        dest,
+        allow_tcp,
+        allow_udp,
+        follow_redirect,
+        port_map,
+        user_level,
+    })
 }
 
 /// 从 inbound entry.data（JSON）解析 vmess clients → TimedUserValidator。
@@ -11328,8 +11382,8 @@ mod tests {
         let dest =
             Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         tokio::spawn(async move {
-            let _ =
-                serve_dokodemo_udp_on(hub, handler, Some(dest), test_plugin_ctx("dokodemo")).await;
+            let _ = serve_dokodemo_udp_on(hub, handler, Some(dest), 0, test_plugin_ctx("dokodemo"))
+                .await;
         });
 
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -11341,6 +11395,81 @@ mod tests {
                 .expect("response via dispatcher within 5s")
                 .unwrap();
         assert_eq!(&rbuf[..n], b"dokodemo-via-dispatch");
+    }
+
+    /// bd 307tw：UDP 会话同样把 settings.userLevel 带进 access.level（Go
+    /// dokodemo.go:142 的 `inbound.User.Level` 对 TCP/UDP 同源；dispatcher 据此
+    /// `policy_for_level(level)` 取会话策略）。
+    #[derive(Debug)]
+    struct LevelCaptureUdpDispatch {
+        level: Arc<parking_lot::Mutex<Option<u32>>>,
+    }
+
+    impl LevelCaptureUdpDispatch {
+        fn respond(dest: &Destination, link: Link) -> xray_app_dispatcher::default::PinFuture<()> {
+            let source = Destination::udp(dest.address().clone(), dest.port());
+            Box::pin(async move {
+                let Link { mut writer, .. } = link;
+                let mut frame = Vec::new();
+                let mut pw = xray_xudp::packet::PacketWriter::new(&mut frame, source, [0u8; 8]);
+                let _ = pw.write_packet(b"level-udp");
+                drop(pw);
+                let mut mb = xray_buf::multi::MultiBuffer::new();
+                mb.merge_bytes(&frame);
+                let _ = writer.write_multi_buffer(mb).await;
+            })
+        }
+    }
+
+    impl xray_app_dispatcher::DispatchHandler for LevelCaptureUdpDispatch {
+        fn tag(&self) -> &str {
+            "level-capture-udp"
+        }
+
+        fn dispatch(
+            &self,
+            dest: &Destination,
+            link: Link,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            Self::respond(dest, link)
+        }
+
+        fn dispatch_with_access(
+            &self,
+            dest: &Destination,
+            link: Link,
+            access: xray_app_dispatcher::AccessContext,
+        ) -> xray_app_dispatcher::default::PinFuture<()> {
+            *self.level.lock() = Some(access.level);
+            Self::respond(dest, link)
+        }
+    }
+
+    #[tokio::test]
+    async fn dokodemo_udp_user_level_reaches_dispatch() {
+        let hub =
+            xray_transport::udp::hub::UdpHub::listen("127.0.0.1:0".parse().unwrap(), &[], None)
+                .await
+                .unwrap();
+        let local = hub.local_addr().unwrap();
+        let level = Arc::new(parking_lot::Mutex::new(None));
+        let handler: Arc<dyn xray_app_dispatcher::DispatchHandler> =
+            Arc::new(LevelCaptureUdpDispatch { level: Arc::clone(&level) });
+        let dest =
+            Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
+        tokio::spawn(async move {
+            let _ = serve_dokodemo_udp_on(hub, handler, Some(dest), 9, test_plugin_ctx("dokodemo"))
+                .await;
+        });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", local).await.unwrap();
+        let mut rbuf = [0u8; 1500];
+        tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut rbuf))
+            .await
+            .expect("response via dispatcher within 5s")
+            .unwrap();
+        assert_eq!(*level.lock(), Some(9), "userLevel 必须进 UDP 会话 access.level");
     }
 
     /// per-peer：每个 peer 的 dispatch 会话各自回发标记帧——两个客户端并发，
@@ -11388,8 +11517,8 @@ mod tests {
         let dest =
             Destination::udp(Address::IPv4(std::net::Ipv4Addr::new(8, 8, 8, 8)), Port::new(53));
         tokio::spawn(async move {
-            let _ =
-                serve_dokodemo_udp_on(hub, handler, Some(dest), test_plugin_ctx("dokodemo")).await;
+            let _ = serve_dokodemo_udp_on(hub, handler, Some(dest), 0, test_plugin_ctx("dokodemo"))
+                .await;
         });
 
         let client_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -11423,6 +11552,7 @@ mod tests {
             port_map: HashMap::new(),
             follow_redirect: false,
             tls: None,
+            user_level: 0,
         }
     }
 
@@ -11820,6 +11950,7 @@ mod tests {
             port_map: [(port.to_string(), "192.168.99.1:9090".to_string())].into_iter().collect(),
             follow_redirect: false,
             tls: None,
+            user_level: 0,
         };
         tokio::spawn(async move {
             let _ = serve_dokodemo(listener, ohm, opts, test_plugin_ctx("dokodemo")).await;
@@ -11837,6 +11968,81 @@ mod tests {
             Address::IPv4(v4) => assert_eq!(v4.octets(), [192, 168, 99, 1]),
             other => panic!("expected mapped IPv4, got {other:?}"),
         }
+    }
+
+    /// bd 307tw：settings.userLevel 必须随 dispatch 抵达 access.level——dispatcher
+    /// 据此 `policy_for_level(level)` 取会话策略（Go dokodemo.go:142
+    /// `inbound.User.Level = config.UserLevel`）。
+    #[tokio::test]
+    async fn dokodemo_tcp_user_level_reaches_dispatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Debug)]
+        struct LevelCapture {
+            level: parking_lot::Mutex<Option<u32>>,
+        }
+
+        impl xray_app_dispatcher::DispatchHandler for LevelCapture {
+            fn tag(&self) -> &str {
+                "level-capture"
+            }
+
+            fn dispatch(
+                &self,
+                _dest: &Destination,
+                _link: Link,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                // 旧路径（无 access）不得再被 dokodemo 走：捕获不到即测试红。
+                Box::pin(std::future::ready(()))
+            }
+
+            fn dispatch_with_access(
+                &self,
+                _dest: &Destination,
+                link: Link,
+                access: xray_app_dispatcher::AccessContext,
+            ) -> xray_app_dispatcher::default::PinFuture<()> {
+                *self.level.lock() = Some(access.level);
+                Box::pin(async move {
+                    let Link { mut writer, mut reader } = link;
+                    let mut mb = xray_buf::multi::MultiBuffer::new();
+                    mb.merge_bytes(b"ok");
+                    let _ = writer.write_multi_buffer(mb).await;
+                    // drain 入站：socket 带未读数据关闭会触发 RST
+                    loop {
+                        match reader.read_multi_buffer().await {
+                            Ok(mb) if mb.is_empty() => break,
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                })
+            }
+        }
+
+        let ohm = Arc::new(SimpleOhm::new());
+        let capture = Arc::new(LevelCapture { level: parking_lot::Mutex::new(None) });
+        ohm.set_default(Arc::clone(&capture) as Arc<dyn DispatchHandler>);
+
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut opts = tcp_opts();
+        opts.user_level = 7;
+        tokio::spawn(async move {
+            let _ = serve_dokodemo(listener, ohm, opts, test_plugin_ctx("dokodemo")).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 2];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ok");
+        assert_eq!(*capture.level.lock(), Some(7), "userLevel 必须进 dispatch access.level");
     }
 
     /// i09 e2e：dokodemo + TLS + followRedirect——客户端 SNI 覆盖 dest.address
@@ -11930,6 +12136,7 @@ mod tests {
             port_map: HashMap::new(),
             follow_redirect: true,
             tls: Some(tls),
+            user_level: 0,
         };
         tokio::spawn(async move {
             let _ = serve_dokodemo(listener, ohm, opts, test_plugin_ctx("dokodemo")).await;
@@ -11984,6 +12191,7 @@ mod tests {
             port_map: HashMap::new(),
             follow_redirect: true,
             tls: None,
+            user_level: 0,
         };
         tokio::spawn(async move {
             let _ = serve_dokodemo(listener, ohm, opts, test_plugin_ctx("dokodemo")).await;
@@ -12749,6 +12957,22 @@ mod tests {
         assert!(!s.allow_udp);
     }
 
+    /// bd 307tw：Go `infra/conf/dokodemo.go` `UserLevel uint32`——解析产物必须带
+    /// 该字段（旧产物无字段 ⇒ 按 level 配的会话策略永远落 0 档）。
+    #[test]
+    fn parse_dokodemo_settings_user_level() {
+        let settings = serde_json::json!({ "address": "1.2.3.4", "port": 80, "userLevel": 2 });
+        let data = serde_json::to_vec(&settings).unwrap();
+        let s = super::parse_dokodemo_settings(&data).unwrap();
+        assert_eq!(s.user_level, 2);
+        // 缺省 = 0（Go uint32 零值）
+        let s = super::parse_dokodemo_settings(br#"{"address":"1.2.3.4"}"#).unwrap();
+        assert_eq!(s.user_level, 0);
+        // 超 u32（Go 解 uint32 同样报错）→ 显式硬错
+        let err = super::parse_dokodemo_settings(br#"{"userLevel": 4294967296}"#).unwrap_err();
+        assert!(err.to_string().contains("userLevel"), "got: {err}");
+    }
+
     #[test]
     fn is_mux_destination_detects_mux_cool() {
         let dest = Destination::new(
@@ -13200,6 +13424,7 @@ mod tests {
                     port_map: HashMap::new(),
                     follow_redirect: false,
                     tls: None,
+                    user_level: 0,
                 },
                 test_plugin_ctx("dokodemo"),
             ));

@@ -541,8 +541,9 @@ fn headers_indicate_chunked(headers: &HashMap<String, Vec<String>>) -> bool {
 /// plain HTTP 转发（对应 Go `handlePlainHTTP`）。
 ///
 /// 每次调用拨一条新上游连接（对齐 Go `Dispatch` 每请求新 link）。请求体按
-/// Content-Length 定长原样透传（不解码不重编码）；chunked 请求体不支持，回
-/// 400 明确报错。响应按上游可定界性分派：
+/// Content-Length 定长原样透传（不解码不重编码）；chunked 请求体同样原样透传
+/// chunked 帧（Go 走 `ReadRequest` 解码 + `request.Write` 重编码，转发语义相同），
+/// 非法帧回 400。响应按上游可定界性分派：
 /// - Content-Length >= 0 → 回写 keep-alive 头，body 定长透传，返回 [`PlainOutcome::WaitAnother`]；
 /// - chunked / close-delimited → 回写 close 头，body 原样透传，返回 [`PlainOutcome::Close`]；
 /// - 读响应失败 → 503 + close 头，返回 [`PlainOutcome::WaitAnother`]（对齐 Go： 503 分支不重置
@@ -558,15 +559,16 @@ where
     // 不弱于 Go：TE 声明在 1.0 侧被剥除，1.1 chunked 仍显式拒绝。
     if hs.http_version == HttpVersion::H10 {
         hs.headers.remove("transfer-encoding");
-    } else if headers_indicate_chunked(&hs.headers) {
-        // chunked 请求体明确报错（Go 经 ReadRequest 解码支持；本实现原样透传
-        // 无 body 边界解析，静默截断不可接受）
-        CONN_LOG.warn(format!(
-            "chunked request body not supported by plain HTTP forwarding method={}",
-            hs.method
-        ));
-        let _ = client.write_all(RESPONSE_BAD_REQUEST).await;
-        return Ok(PlainOutcome::Close);
+    }
+    // Go `net/http` `ReadRequest`（`parseTransferEncoding` + `chunkedReader`）解
+    // chunked 请求体，`request.Write` 再按 chunked 重编码 ⇒ 代理侧语义 = 请求体
+    // 完整转发。本实现同响应侧口径：chunked **帧原样透传**（size 行/数据/CRLF/
+    // trailer 逐帧复制，不解码不重编码），终止块即请求体结束（bd yhyjn：此前
+    // 直接 400，`curl -T -` 式流式上传必失败）。
+    // TE 在场时 CL 一并剥除——Go `fixLength` chunked 优先，两者并存是请求走私面。
+    let req_chunked = headers_indicate_chunked(&hs.headers);
+    if req_chunked {
+        hs.headers.remove("content-length");
     }
     let req_body_len = parse_content_length(&hs.headers)?;
 
@@ -585,7 +587,15 @@ where
     // requestDone：Connection: close + 请求头 + body 定长透传
     let forwarded = build_forwarded_request(&hs.method, &path, &hs.headers);
     upstream.write_all(&forwarded).await?;
-    if let Some(n) = req_body_len {
+    if req_chunked {
+        if let Err(e) = forward_chunked_frames(client, &mut upstream).await {
+            // 非法 chunked 帧（size 行不可解析 / 提前 EOF）→ 400 + close，保持
+            // fail-visible（上游半截请求随 upstream drop 断开）。
+            CONN_LOG.warn(format!("malformed chunked request body method={} error={e}", hs.method));
+            let _ = client.write_all(RESPONSE_BAD_REQUEST).await;
+            return Ok(PlainOutcome::Close);
+        }
+    } else if let Some(n) = req_body_len {
         copy_exact_n(client, &mut upstream, n).await?;
     }
     // 转发请求带 Connection: close，上游响应完即关——响应读取阶段无独立
@@ -657,7 +667,7 @@ where
     client.write_all(&head).await?;
     if !bodyless {
         if chunked_resp {
-            forward_chunked_body(&mut upstream, client).await?;
+            forward_chunked_frames(&mut upstream, client).await?;
         } else if declared_len.is_none() {
             // close-delimited：透传到上游 EOF
             let mut buf = [0u8; 8192];
@@ -954,39 +964,39 @@ where
     Ok(())
 }
 
-/// chunked 响应体透传：逐帧 size 行/数据/CRLF/trailer 原样转发，到终止块
-/// （size 0 + trailer 结束）为止，不等 EOF——close-delimited 兜底路径才有
-/// EOF 语义。帧字节原样透传（不解码重编码），客户端按原 transfer-encoding 解析。
-async fn forward_chunked_body<R, W>(upstream: &mut R, client: &mut W) -> Result<()>
+/// chunked 帧透传（请求体/响应体通用）：逐帧 size 行/数据/CRLF/trailer 原样转发，
+/// 到终止块（size 0 + trailer 结束）为止，不等 EOF——close-delimited 兜底路径才有
+/// EOF 语义。帧字节原样透传（不解码重编码），对端按原 transfer-encoding 解析。
+async fn forward_chunked_frames<R, W>(from: &mut R, to: &mut W) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     loop {
-        let size_line = read_http_line(upstream).await?;
+        let size_line = read_http_line(from).await?;
         let size =
             usize::from_str_radix(size_line.split(';').next().unwrap_or_default().trim(), 16)
                 .map_err(|_| {
                     HttpProxyError::InvalidRequest(format!("malformed chunk size: {size_line:?}"))
                 })?;
-        client.write_all(&latin1_encode(&size_line)).await?;
-        client.write_all(b"\r\n").await?;
+        to.write_all(&latin1_encode(&size_line)).await?;
+        to.write_all(b"\r\n").await?;
         if size == 0 {
             // trailer 段透传到空行（无 trailer 时首行即空）
             loop {
-                let line = read_http_line(upstream).await?;
-                client.write_all(&latin1_encode(&line)).await?;
-                client.write_all(b"\r\n").await?;
+                let line = read_http_line(from).await?;
+                to.write_all(&latin1_encode(&line)).await?;
+                to.write_all(b"\r\n").await?;
                 if line.is_empty() {
                     return Ok(());
                 }
             }
         }
-        copy_exact_n(upstream, client, size as u64).await?;
-        // 数据帧分隔 CRLF：upstream 侧消费后原样转发（client 侧帧完整性）
+        copy_exact_n(from, to, size as u64).await?;
+        // 数据帧分隔 CRLF：读侧消费后原样转发（写侧帧完整性）
         let mut crlf = [0u8; 2];
-        upstream.read_exact(&mut crlf).await?;
-        client.write_all(&crlf).await?;
+        from.read_exact(&mut crlf).await?;
+        to.write_all(&crlf).await?;
     }
 }
 
@@ -2268,28 +2278,42 @@ mod tests {
 
     // ===== plain HTTP TE 语义（Go net/http transfer.go parseTransferEncoding）=====
 
-    /// 驱动一次 `handle_plain_http`：mock 上游回显收到的请求头 + 固定 200 响应，
-    /// 返回 (上游 task 句柄, 客户端收到的响应头, handler 结论)。提前 return 的
-    /// 路径（如 400）不会拨上游——句柄保持 pending，调用方按需 await。
+    /// 驱动一次 `handle_plain_http`：mock 上游收齐请求（头 + body）后回固定 200
+    /// 响应，返回 (上游 task 句柄, 客户端收到的响应, handler 结论)。`body` 由
+    /// 客户端写入（chunked 用例传完整帧序列）；上游读到终止块（chunked）或头
+    /// 结束即回响应。
     async fn run_plain_http(
         http_version: HttpVersion,
         headers: &[(&str, &str)],
-    ) -> (tokio::task::JoinHandle<String>, String, PlainOutcome) {
+        body: &[u8],
+    ) -> (tokio::task::JoinHandle<Vec<u8>>, String, PlainOutcome) {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
+        // 上游实际收到的定界方式：HTTP/1.0 的 TE 被服务端剥除（Go parseTransferEncoding），
+        // 1.1 chunked 才是帧透传。
+        let chunked = http_version != HttpVersion::H10
+            && headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("transfer-encoding")
+                    && v.to_ascii_lowercase().contains("chunked")
+            });
         let upstream = xray_common::testing::spawn("run-plain-http-accept", async move {
             let (mut sock, _) = upstream_listener.accept().await.unwrap();
             let mut head = Vec::new();
             let mut buf = [0u8; 1024];
             loop {
                 let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
                 head.extend_from_slice(&buf[..n]);
-                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let head_done = head.windows(4).any(|w| w == b"\r\n\r\n");
+                // chunked：等终止块（0 + 空行）；否则头结束即回。
+                if head_done && (!chunked || head.ends_with(b"0\r\n\r\n")) {
                     break;
                 }
             }
             let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
-            String::from_utf8(head).unwrap()
+            head
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2300,6 +2324,9 @@ mod tests {
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let mut server_stream = BufReader::new(server_side.await.unwrap());
+        if !body.is_empty() {
+            client.write_all(body).await.unwrap();
+        }
 
         let dest = parse_host_port(&format!("127.0.0.1:{}", upstream_addr.port()), 80).unwrap();
         let mut hs = HandshakeResult {
@@ -2324,9 +2351,10 @@ mod tests {
         let (upstream, client_resp, outcome) = run_plain_http(
             HttpVersion::H10,
             &[("transfer-encoding", "chunked"), ("host", "127.0.0.1")],
+            b"",
         )
         .await;
-        let upstream_head = upstream.await.unwrap();
+        let upstream_head = String::from_utf8_lossy(&upstream.await.unwrap()).into_owned();
         assert!(
             !upstream_head.to_ascii_lowercase().contains("transfer-encoding"),
             "1.0 TE must be stripped, forwarded head = {upstream_head}"
@@ -2335,13 +2363,37 @@ mod tests {
         assert_eq!(outcome, PlainOutcome::WaitAnother);
     }
 
+    /// bd yhyjn：Go 经 `ReadRequest` 解 chunked 请求体（2026-10-28 差分矩阵 A12
+    /// 两侧一致成功），本实现按 chunked 帧原样透传——体完整到上游、客户端拿 200。
     #[tokio::test]
-    async fn plain_http_h11_chunked_still_rejected() {
-        // 1.1 chunked 请求体维持既有 400 拒绝（本实现无 body 帧解析）；
-        // 提前 return 未拨上游（句柄 pending），不 await。
+    async fn plain_http_h11_chunked_body_forwarded_to_upstream() {
+        let (upstream, client_resp, outcome) = run_plain_http(
+            HttpVersion::H11,
+            &[("transfer-encoding", "chunked"), ("host", "127.0.0.1")],
+            b"5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        let upstream_bytes = upstream.await.unwrap();
+        let forwarded = String::from_utf8_lossy(&upstream_bytes).into_owned();
+        assert!(
+            forwarded.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+            "chunked 请求必须带 TE 头转发: {forwarded}"
+        );
+        assert!(
+            forwarded.ends_with("5\r\nhello\r\n0\r\n\r\n"),
+            "chunked 帧必须逐字节到达上游: {forwarded}"
+        );
+        assert!(client_resp.starts_with("HTTP/1.1 200"), "got: {client_resp}");
+        assert_eq!(outcome, PlainOutcome::WaitAnother);
+    }
+
+    /// bd yhyjn：非法 chunked 帧维持 fail-visible（400 + close），不静默吞。
+    #[tokio::test]
+    async fn plain_http_h11_malformed_chunked_returns_400() {
         let (_upstream, client_resp, outcome) = run_plain_http(
             HttpVersion::H11,
             &[("transfer-encoding", "chunked"), ("host", "127.0.0.1")],
+            b"zz\r\nhello\r\n0\r\n\r\n",
         )
         .await;
         assert!(client_resp.starts_with("HTTP/1.1 400"), "got: {client_resp}");

@@ -104,16 +104,18 @@ pub struct NameServerJson {
     /// 本 server 的查询策略覆写。
     #[serde(rename = "queryStrategy")]
     pub query_strategy: Option<String>,
-    /// 仅解析这些域名时使用本 server。对应 Go `domains`。
+    /// 仅解析这些域名时使用本 server。对应 Go `domains`（Go 类型 `StringList`：
+    /// 字符串形态按逗号切分）。
+    #[serde(deserialize_with = "deserialize_string_list")]
     pub domains: Option<Vec<String>>,
     /// 期望返回的 IP 列表（CIDR）。对应 Go `expectedIPs`。
-    #[serde(rename = "expectedIPs")]
+    #[serde(rename = "expectedIPs", deserialize_with = "deserialize_string_list")]
     pub expected_ips: Option<Vec<String>>,
     /// 期望 IP 列表旧名（`expectedIPs` 为空时回填）。对应 Go `expectIPs`
     /// （infra/conf/dns.go:26、dns.go:94-96）。
-    #[serde(rename = "expectIPs")]
+    #[serde(rename = "expectIPs", deserialize_with = "deserialize_string_list")]
     pub expect_ips: Option<Vec<String>>,
-    #[serde(rename = "unexpectedIPs")]
+    #[serde(rename = "unexpectedIPs", deserialize_with = "deserialize_string_list")]
     pub unexpected_ips: Option<Vec<String>>,
     /// 本 server 的 tag（路由引用用）。对应 Go `tag`。
     pub tag: Option<String>,
@@ -173,6 +175,32 @@ where
         .map(name_server_from_json)
         .collect::<Result<Vec<_>, _>>()
         .map_err(serde::de::Error::custom)
+}
+
+/// Go `infra/conf.StringList.UnmarshalJSON`（infra/conf/common.go:28-46）语义的
+/// `Option<Vec<String>>` 形态：**字符串**按 `,` 切分（不 trim、不丢空串），
+/// **数组**元素原样（元素内不再切），数组内非字符串条目硬错（静默丢会让规则变宽）。
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        // Go `strings.Split(rawstr, ",")`：不 trim。
+        Some(serde_json::Value::String(s)) => Ok(Some(s.split(',').map(str::to_string).collect())),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|x| {
+                x.as_str().map(str::to_string).ok_or_else(|| {
+                    D::Error::custom(format!("string list entry is not a string: {x}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(other) => Err(D::Error::custom(format!("unknown format of a string list: {other}"))),
+    }
 }
 
 impl DnsAppConfig {
@@ -1367,6 +1395,49 @@ mod tests {
 
         let built = cfg.build().unwrap();
         assert_eq!(built.clients.len(), 3, "string entry must build like object");
+    }
+
+    /// 回归钉：Go 的 nameserver 四列表字段是 `StringList`（infra/conf/common.go:28-46），
+    /// 字符串形态按逗号切分——只收 `Vec<String>` 时 `"domains": "geosite:cn"` 直接
+    /// 反序列化失败（整份 dns 配置拒启，Go 却能起）。
+    #[test]
+    fn string_list_fields_accept_comma_separated_string() {
+        let cfg: DnsAppConfig = serde_json::from_str(
+            r#"{"servers": [{
+                "address": "8.8.8.8",
+                "domains": "geosite:cn,domain:example.com",
+                "expectedIPs": "1.1.1.0/24",
+                "expectIPs": "geoip:cn,geoip:us",
+                "unexpectedIPs": "10.0.0.0/8"
+            }]}"#,
+        )
+        .expect("Go StringList string form must parse");
+        let ns = &cfg.servers[0];
+        assert_eq!(
+            ns.domains,
+            Some(vec!["geosite:cn".to_string(), "domain:example.com".to_string()]),
+            "字符串形态按逗号切分"
+        );
+        assert_eq!(ns.expected_ips, Some(vec!["1.1.1.0/24".to_string()]));
+        assert_eq!(ns.expect_ips, Some(vec!["geoip:cn".to_string(), "geoip:us".to_string()]));
+        assert_eq!(ns.unexpected_ips, Some(vec!["10.0.0.0/8".to_string()]));
+
+        // 数组形态不变（元素内不再切分——Go 只对字符串形态 split）。
+        let cfg: DnsAppConfig = serde_json::from_str(
+            r#"{"servers": [{"address": "8.8.8.8", "domains": ["geosite:cn,geoip:us"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.servers[0].domains,
+            Some(vec!["geosite:cn,geoip:us".to_string()]),
+            "数组元素原样保留，不做二次切分"
+        );
+
+        // 缺省 / null → None（不因 deserialize_with 变成 Some(空)）。
+        let cfg: DnsAppConfig =
+            serde_json::from_str(r#"{"servers": [{"address": "8.8.8.8", "domains": null}]}"#)
+                .unwrap();
+        assert_eq!(cfg.servers[0].domains, None);
     }
 
     // ===== alwc：Go 方言键补齐 + 未知键不静默 =====
