@@ -40,7 +40,9 @@ async fn run_ss_e2e(ct: CipherType) {
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.unwrap();
         let (header, mut ss_stream) =
-            read_request(conn, &account_clone, "alice", 0).await.expect("read_request");
+            read_request(conn, &MemoryUser::new("alice", account_clone), 0)
+                .await
+                .expect("read_request");
 
         // 读 body chunk
         let body = ss_stream.read_chunk().await.expect("read_chunk").expect("chunk data");

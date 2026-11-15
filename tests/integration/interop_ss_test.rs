@@ -23,6 +23,7 @@ use xray_proxy_ss::{
     config::{CipherType, MemoryAccount as SsAccount},
     server::read_request,
     stream::ChunkOut,
+    validator::MemoryUser,
 };
 
 // Test password.
@@ -141,7 +142,7 @@ async fn rust_ss_server_reads_go_client_request() {
 
     let server_handle = tokio::spawn(async move {
         let (conn, _) = listener.accept().await.expect("accept");
-        read_request(conn, &account_clone, "interop", 0).await
+        read_request(conn, &MemoryUser::new("interop", account_clone), 0).await
     });
 
     // Rust SS client connects to Rust SS server (self-test to verify server works)
