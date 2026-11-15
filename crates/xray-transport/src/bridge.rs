@@ -324,27 +324,51 @@ fn p7lm_trace() -> bool {
     *P7LM_TRACE
 }
 
-// ── 内存自适应的在途字节闸 + 连接数上限（bd sfqlu，2026-11-07 用户拍板）──
+// ── 内存自适应的在途字节闸 + 连接数软上限（bd sfqlu / 3gxez，2026-11-07/15 用户拍板）──
 //
-// 分工：**单连接窗口不压缩**（BDP 是吞吐命脉，u440m 砍到 2MiB 即 −6.1%），
-// 内存靠**连接数上限**（`总预算 / 每连接规划上界`）控制。字节闸只在「生产者远快于
-// 消费者」的满载瞬态兜底，闸值恒 ≥ 实测 BDP 上沿（3.56MB）⇒ 正常链路不 binding。
+// 分工：**单连接窗口不压缩**（BDP 是吞吐命脉，u440m 砍到 2MiB 即 −6.1%）；内存上界
+// 由**进程级 in-flight 预算**（`xray_frame::budget::inflight`，档位总预算一半）兜，
+// 超出走等待（背压），**不按连接条数拒绝**（Go 上游无连接总数硬限制）。字节闸只在
+// 「生产者远快于消费者」的满载瞬态兜底，闸值恒 ≥ 实测 BDP 上沿（3.56MB）⇒ 正常链路
+// 不 binding。连接条数只是**软上限**（超档 warn + 计数，见 [`conn_stats`]）。
 
-/// 每方向在途字节闸。
+/// 每连接、每方向的在途字节闸——**双层**（2026-11-15，bd 3gxez 终态）。
 ///
-/// 闸值 = [`xray_frame::budget::plan::MemoryPlan::bridge_gate`]（四档 5/12/24/32 MiB）。
+/// 上层（本结构，`cap` = [`xray_frame::budget::plan::MemoryPlan::bridge_gate`]，四档
+/// 5/12/24/32 MiB）封**单连接**：防一条连接把整机预算独占。下层是进程级 in-flight
+/// 预算（`xray_frame::budget::inflight`，= 档位总预算一半）封**跨连接合计**：N 条连接
+/// 同时各占满闸也不再超预算。
 /// 为什么不是 u440m 的固定 2MiB：RTT 161.6ms 下 BDP 2.39–3.56MB > 2MiB ⇒ 闸把吞吐
-/// 钉在 ≈12.9MB/s（A/B 中位比 0.939，超 5% 门已回退）。闸的用途只是把「64 条目 ×
-/// 512KiB = 32MiB/方向」的满载瞬态收成有限值。
+/// 钉在 ≈12.9MB/s（A/B 中位比 0.939，超 5% 门已回退）。上层闸的用途只是把「64 条目 ×
+/// 512KiB = 32MiB/方向」的满载瞬态收成有限值；下层闸用途是把跨连接合计压进预算。
+/// 两级都装不下时**等待（背压）**，不拒绝、不丢数据。
 struct ByteGate {
     cap: usize,
     inflight: std::sync::atomic::AtomicUsize,
     notify: tokio::sync::Notify,
+    global: std::sync::Arc<xray_frame::budget::inflight::InflightBudget>,
 }
 
-/// 在途字节许可（随块 move 到写腿，写完 drop 即归还）。
+/// 本闸的在途字节许可（drop 即归还本连接的账）。
+struct ConnPermit {
+    gate: std::sync::Arc<ByteGate>,
+    bytes: usize,
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.gate.inflight.fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+        self.gate.notify.notify_one();
+    }
+}
+
+/// 一块数据携带的**一道**许可：per-conn 方向闸 + 进程级预算合成一份（drop 同时归还）。
+///
+/// 随块 move 到写腿，写完 drop 即两级**成对**归还：写腿的每条退出路径（正常、
+/// 写错、`Aborted`）都是 break 出循环 ⇒ 局部的 `_permit` 随作用域 drop，无泄漏。
 struct GatePermit {
     gate: std::sync::Arc<ByteGate>,
+    global: std::sync::Arc<xray_frame::budget::inflight::InflightBudget>,
     bytes: usize,
 }
 
@@ -352,40 +376,67 @@ impl Drop for GatePermit {
     fn drop(&mut self) {
         self.gate.inflight.fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
         self.gate.notify.notify_one();
+        self.global.release(self.bytes);
     }
 }
 
 impl ByteGate {
     fn new(cap: usize) -> std::sync::Arc<Self> {
+        Self::with_budget(cap, std::sync::Arc::clone(xray_frame::budget::inflight::global()))
+    }
+
+    /// 显式注入全局预算（单测用独立实例，不碰进程单例）。
+    fn with_budget(
+        cap: usize,
+        global: std::sync::Arc<xray_frame::budget::inflight::InflightBudget>,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cap,
             inflight: std::sync::atomic::AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
+            global,
         })
     }
 
-    /// 取 `bytes` 字节在途许可；未超闸时**零等待**（一次原子读 + 一次原子加）。
+    /// 取 `bytes` 字节在途许可（两层）；未超闸时**零等待**（各一次原子读 + 一次 CAS）。
     async fn acquire(self: &std::sync::Arc<Self>, bytes: usize) -> GatePermit {
+        self.acquire_conn(bytes).await;
+        // 本连接那一半已记在 `self.inflight` 上；这里等全局额度。被中止时（调用方
+        // `select!` 丢弃 future）用临时守卫归还本连接那一半，账本不会泄漏。
+        let conn_guard = ConnPermit { gate: std::sync::Arc::clone(self), bytes };
+        let (global, bytes) = self.global.acquire(bytes).await.into_parts();
+        std::mem::forget(conn_guard);
+        GatePermit { gate: std::sync::Arc::clone(self), global, bytes }
+    }
+
+    async fn acquire_conn(&self, bytes: usize) {
         loop {
             let inflight = self.inflight.load(std::sync::atomic::Ordering::Acquire);
             // 单个超闸块永不阻塞（闸是软上界，堵死 = 连接挂死）：只在闸内叠加时等。
             // 并发下两个块可能同时通过判定而超闸少量——软上界，不追精确。
             if inflight == 0 || inflight + bytes <= self.cap {
                 self.inflight.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
-                return GatePermit { gate: std::sync::Arc::clone(self), bytes };
+                return;
             }
             self.notify.notified().await;
         }
     }
 }
 
-/// 进程内在跑的双向桥数（= 代理连接数）。
+/// 进程内在跑的双向桥数（= 代理连接数；**软上限计数面**，不拒连）。
 static ACTIVE_BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 在跑连接数的历史峰值（条）——压测/运维判据（`conn_stats`）。
+static PEAK_BRIDGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 超软上限仍放行的累计次数（不拒连，只记账 + 限频告警）。
+static SOFT_LIMIT_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 连接名额（drop 即归还）。触顶 = [`ConnSlot::try_acquire`] 返 `None`。
+/// 超软上限告警限频：首次必报，其后每 N 次一条（计数逐次累加，不丢账）。
+const SOFT_LIMIT_WARN_EVERY: u64 = 256;
+
+/// 连接名额（drop 即归还）。
 struct ConnSlot;
 
-/// 连接数上限（执行点唯一读数）。
+/// 连接数**软上限**（执行点唯一读数）。
 ///
 /// 读 [`xray_frame::budget::plan::MemoryPlan::effective_max_conns`] 而非档位原值
 /// `max_conns`：装配期预算门按本配置算出的**降档值**写在那里（bd 2026-11-08
@@ -395,21 +446,54 @@ fn conn_limit() -> usize {
 }
 
 impl ConnSlot {
-    /// 取一个连接名额；已达本机档位上限 → `None`（调用方 fail-visible 拒绝）。
-    fn try_acquire() -> Option<Self> {
-        try_take_slot(&ACTIVE_BRIDGES, conn_limit()).then_some(Self)
+    /// 取一个连接名额。
+    ///
+    /// **不按条数拒绝**（用户裁决 2026-11-15：Go Xray 没有连接总数硬限制，它靠动态
+    /// 缓冲 + 背压）。超软上限只 `warn`（限频）+ 计数；内存上界由 in-flight 预算兜
+    /// （取不到许可就等）。唯一拒连条件是本档**连一条满额连接都装不下**
+    /// （`can_admit_single_conn` = false）——那时放行必 OOM。
+    fn acquire() -> io::Result<Self> {
+        let plan = xray_frame::budget::plan::MemoryPlan::cached();
+        if !plan.can_admit_single_conn() {
+            return Err(connection_limit_error());
+        }
+        let limit = conn_limit();
+        let (active, over) = admit(&ACTIVE_BRIDGES, &PEAK_BRIDGES, limit);
+        if over {
+            let hits = SOFT_LIMIT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if hits == 1 || hits % SOFT_LIMIT_WARN_EVERY == 0 {
+                tracing::warn!(
+                    target: "xray_frame::bridge",
+                    active,
+                    limit,
+                    hits,
+                    tier = plan.tier.as_str(),
+                    budget = plan.total_budget,
+                    "连接数超软上限（**不拒连**）：在跑 {} 条 > 软上限 {} 条；累计 {} 次。\
+                     内存上界由 in-flight 预算 {}B 兜（超出走背压）",
+                    active,
+                    limit,
+                    hits,
+                    plan.inflight_budget_bytes(),
+                );
+            }
+        }
+        Ok(Self)
     }
 }
 
-/// 原子占名额（`fetch_update` 保证「判定 + 自增」不可分割，不会超发）。
-fn try_take_slot(active: &std::sync::atomic::AtomicUsize, limit: usize) -> bool {
-    active
-        .fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |cur| (cur < limit).then_some(cur + 1),
-        )
-        .is_ok()
+/// 计入一条在跑连接，返回（在跑条数, 是否超软上限）。
+///
+/// 拆成纯函数：单测用独立计数器验证「超上限照样放行 + 计数 + 峰值」，
+/// 不碰进程级静态值（同进程其它用例会并发读写）。
+fn admit(
+    active: &std::sync::atomic::AtomicUsize,
+    peak: &std::sync::atomic::AtomicUsize,
+    limit: usize,
+) -> (usize, bool) {
+    let now = active.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    peak.fetch_max(now, std::sync::atomic::Ordering::AcqRel);
+    (now, now > limit)
 }
 
 impl Drop for ConnSlot {
@@ -418,34 +502,64 @@ impl Drop for ConnSlot {
     }
 }
 
-/// 连接数触顶的 fail-visible 拒绝（日志 + `Err`）：绝不静默降级、绝不放任 OOM。
+/// 桥连接面的运行期读数（[`conn_stats`] 返回）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnStats {
+    /// 当前在跑的双向桥数（条）。
+    pub active: usize,
+    /// 历史峰值（条）。
+    pub peak: usize,
+    /// 软上限（超档只告警，不拒连）。
+    pub soft_limit: usize,
+    /// 超软上限仍放行的累计次数。
+    pub soft_limit_hits: u64,
+    /// 进程级 in-flight 预算当前占用（字节）。
+    pub inflight_used: usize,
+    /// 进程级 in-flight 预算容量（字节）。
+    pub inflight_total: usize,
+}
+
+/// 连接面统计（压测与生产可读）：条数软上限 + in-flight 预算读数。
+///
+/// 「超软上限仍放行」的次数（`soft_limit_hits`）就是旧版会被硬拒的连接数——
+/// 这个数字单调增说明软上限确实在承载过载，而不是偶发抖动。
+#[must_use]
+pub fn conn_stats() -> ConnStats {
+    use std::sync::atomic::Ordering;
+    let inflight = xray_frame::budget::inflight::global();
+    ConnStats {
+        active: ACTIVE_BRIDGES.load(Ordering::Acquire),
+        peak: PEAK_BRIDGES.load(Ordering::Acquire),
+        soft_limit: conn_limit(),
+        soft_limit_hits: SOFT_LIMIT_HITS.load(Ordering::Relaxed),
+        inflight_used: inflight.used(),
+        inflight_total: inflight.total(),
+    }
+}
+
+/// 本档连一条满额连接都装不下时的拒连（`Err` + 日志）：绝不静默降级、绝不放任 OOM。
 fn connection_limit_error() -> io::Error {
     let plan = xray_frame::budget::plan::MemoryPlan::cached();
-    // 报执行点的**生效**值（降档后），不是档位原值——运维看到的数字必须与
-    // `ConnSlot` 拒绝时用的那个一致（bd 2026-11-08 D-02）。
-    let limit = conn_limit();
     tracing::error!(
         target: "xray_frame::bridge",
-        limit,
         tier = plan.tier.as_str(),
         budget = plan.total_budget,
-        "已达本配置连接数上限 {} 条（tier {} / 预算 {}B），拒绝新连接",
-        limit,
+        per_conn = xray_frame::budget::plan::PER_CONN_UPPER_BYTES,
+        "本档预算连一条满额连接都装不下（tier {} / 预算 {}B < 每连接 {}B），拒绝新连接",
         plan.tier.as_str(),
-        plan.total_budget
+        plan.total_budget,
+        xray_frame::budget::plan::PER_CONN_UPPER_BYTES
     );
-    // 出路必须可操作（bd 3gxez）：生效上限 = `min(档位设计值, 账本余量 ÷ 每连接 pipe 双向)`
-    // ⇒ 真正的杠杆是「抬高可用内存预算（XRAY_MEM_LIMIT_MB / 更大的机器 ⇒ 换档）」或
-    // 「调小 policy `bufferSize`（账本余量不足时才 binding）」；`XRAY_MAX_CONNS` 只能把
+    // 出路必须可操作（bd 3gxez）：真正的杠杆是「抬高可用内存预算（XRAY_MEM_LIMIT_MB /
+    // 更大的机器 ⇒ 换档）」或「调小 policy `bufferSize`」；`XRAY_MAX_CONNS` 只能把
     // 上限压在账本余量之内（用户裁决 2026-11-13/14：不提供把总量吃满的放大入口），
     // 不再把它写成无条件的出路。
     io::Error::other(format!(
-        "connection limit reached: 已达本配置连接数上限 {} 条（tier {} / 预算 {}B；上限 = \
-         min(档位设计值, 预算余量 ÷ 每连接 pipe 双向) —— 抬高 XRAY_MEM_LIMIT_MB（跨档）或\
-         调小 policy buffersize（余量不足时）可提高，XRAY_MAX_CONNS 只在账本余量内生效）",
-        limit,
+        "memory budget below one connection: 本档预算 {}B（tier {}）连一条满额连接（{}B）\
+         都装不下 —— 抬高 XRAY_MEM_LIMIT_MB（跨档）或调小 policy buffersize 后重试",
+        plan.total_budget,
         plan.tier.as_str(),
-        plan.total_budget
+        xray_frame::budget::plan::PER_CONN_UPPER_BYTES
     ))
 }
 
@@ -642,8 +756,10 @@ fn first_leg_error(legs: impl IntoIterator<Item = LegExit>) -> io::Result<()> {
 ///
 /// **bd sfqlu 重新引入（口径已修正）**：字节闸回来了，但值不再是拍定的 2MiB，
 /// 而是按本机内存档位派生（`ByteGate`，四档 5/12/24/32 MiB/方向）——下限
-/// 4MiB 即「≥ 实测 BDP 上沿 3.56MB」，正常链路不 binding；内存上界改由
-/// **连接数上限**（`ConnSlot`）兜，不再靠压单连接窗口。u440m 的教训因此保留：
+/// 4MiB 即「≥ 实测 BDP 上沿 3.56MB」，正常链路不 binding。**2026-11-15 起双层**
+/// （bd 3gxez 终态）：本闸仍封单连接，其下再加进程级 in-flight 预算
+/// （档位总预算一半）封跨连接合计，取不到许可就走背压等待；连接条数因此只是
+/// **软上限**（[`conn_stats`] 可读），不拒连。u440m 的教训因此保留：
 /// 闸值低于 BDP = 直接砍吞吐。
 ///
 /// 双向桥接 dispatcher [`Link`] 与 AsyncRead+AsyncWrite stream。
@@ -678,9 +794,10 @@ where
     use tokio::{io::AsyncWriteExt, time::timeout};
     use xray_buf::io::{Reader, Writer, new_reader, new_readv_reader_whole};
 
-    // bd sfqlu：连接数上限 = 总预算 / 每连接规划上界（四档 13/32/64/170 条）。
-    // 触顶 fail-visible 拒绝（日志 + Err，连接随 drop 关闭），静默降级/自作 OOM 都不允许。
-    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
+    // bd sfqlu：连接数**软上限**（档位设计值 13/32/64/170 条）。超档只 warn + 计数，
+    // 不拒连（Go 上游无连接总数硬限制）；内存上界由进程级 in-flight 预算兜（背压）。
+    // 唯一拒连 = 本档连一条满额连接都装不下（`can_admit_single_conn`）。
+    let _conn_slot = ConnSlot::acquire()?;
 
     let conn_idle = policy.connection_idle;
     let uplink_only = policy.uplink_only;
@@ -1146,8 +1263,8 @@ where
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
 
-    // bd sfqlu：连接数上限（同 bridge_link_with_stream_full，触顶 fail-visible 拒绝）。
-    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
+    // bd sfqlu：连接数软上限（同上，超档只 warn + 计数，不拒连）。
+    let _conn_slot = ConnSlot::acquire()?;
 
     // 准入已要求出站 raw；克隆失败（理论不可达）时下行退化为立即结束，
     // 上行照常泵完（连接可用性不受影响）。
@@ -1296,8 +1413,8 @@ pub async fn bridge_link_with_link(
     let uplink_only = policy.uplink_only;
     let downlink_only = policy.downlink_only;
 
-    // bd sfqlu：连接数上限（同 bridge_link_with_stream_full，触顶 fail-visible 拒绝）。
-    let _conn_slot = ConnSlot::try_acquire().ok_or_else(connection_limit_error)?;
+    // bd sfqlu：连接数软上限（同上，超档只 warn + 计数，不拒连）。
+    let _conn_slot = ConnSlot::acquire()?;
 
     let Link { reader: mut a_reader, writer: mut a_writer } = link_a;
     let Link { reader: mut b_reader, writer: mut b_writer } = link_b;
@@ -1518,63 +1635,110 @@ mod tests {
             .expect("超闸单块必须放行（堵死 = 连接挂死）");
     }
 
-    /// 连接名额的「判定 + 自增」必须原子且不超发；触顶返 false（fail-visible 拒绝）。
+    /// 连接数**软上限**：超档照样放行（用户裁决 2026-11-15：Go 上游没有连接总数硬
+    /// 限制，靠动态缓冲 + 背压），只记账 + 峰值；对齐 bd 3gxez 验收口径 ok40/fail0。
     ///
     /// 用独立计数器测（不碰全局 `ACTIVE_BRIDGES`：同进程其它桥测试会并发读写它）。
     #[test]
-    fn conn_slot_limit_is_atomic_and_rejects_past_cap() {
+    fn conn_slot_admits_past_soft_limit_and_tracks_peak() {
         let active = std::sync::atomic::AtomicUsize::new(0);
-        assert!(try_take_slot(&active, 2));
-        assert!(try_take_slot(&active, 2));
-        assert!(!try_take_slot(&active, 2), "已达上限必须拒绝（不静默放行）");
-        assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 2, "拒绝时不得自增");
-        assert!(try_take_slot(&active, 3), "上限提高后可再取（覆盖 XRAY_MAX_CONNS）");
-
-        // 并发下不超发：8 个任务抢 3 个名额，恰好 3 个成功。
-        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ok = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                let active = std::sync::Arc::clone(&active);
-                let ok = std::sync::Arc::clone(&ok);
-                scope.spawn(move || {
-                    if try_take_slot(&active, 3) {
-                        ok.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                    }
-                });
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let mut over = 0;
+        for _ in 0..40 {
+            let (now, is_over) = admit(&active, &peak, 32);
+            if is_over {
+                over += 1;
             }
-        });
-        assert_eq!(ok.load(std::sync::atomic::Ordering::Acquire), 3, "名额不得超发");
+            assert!(now <= 40);
+        }
+        assert_eq!(
+            active.load(std::sync::atomic::Ordering::Acquire),
+            40,
+            "超软上限必须全部放行并计入（不拒连）"
+        );
+        assert_eq!(peak.load(std::sync::atomic::Ordering::Acquire), 40, "峰值必须记到 40");
+        assert_eq!(over, 8, "只有超出上限的 8 条计入超档");
+
+        for _ in 0..40 {
+            active.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 0, "名额归还后归零");
+        assert_eq!(peak.load(std::sync::atomic::Ordering::Acquire), 40, "峰值只增不减");
     }
 
-    /// 触顶错误必须点名「生效条数 + 档位」并给出**可操作出路**（bd 3gxez）。
-    ///
-    /// 旧断言要求文案里出现 `XRAY_MAX_CONNS`（「可用 XRAY_MAX_CONNS 覆盖」）——那钉的是
-    /// 缺陷行为：该覆盖口在账本余量之外无效（用户裁决 2026-11-13/14 不提供把总量吃满的
-    /// 放大入口），当无条件出路写等于误导运维。现契约为「抬高内存预算 / 调小 buffersize」。
+    /// 真实入口：40 条并发名额**全成功**（小内存档同样不拒连）。
     #[test]
-    fn connection_limit_error_names_tier_limit() {
+    fn conn_slot_acquire_never_rejects() {
+        let _g = global_state_guard();
+        let held: Vec<ConnSlot> = (0..40)
+            .map(|_| ConnSlot::acquire().expect("软上限不得拒连（Go 无连接总数硬限制）"))
+            .collect();
+        assert_eq!(held.len(), 40);
+        let stats = conn_stats();
+        assert!(stats.active >= 40, "统计必须反映在跑条数：{stats:?}");
+        assert!(stats.peak >= 40, "峰值必须 ≥ 40：{stats:?}");
+        assert_eq!(stats.soft_limit, conn_limit(), "软上限口径同源");
+        assert!(stats.inflight_total > 0, "in-flight 预算必须可见：{stats:?}");
+        drop(held);
+    }
+
+    /// 双层闸：两个连接各自的 per-conn 闸都装得下，但**全局预算**装不下 ⇒ 第二块
+    /// 必须等（背压），归还后放行 ⇒ 跨连接合计被全局预算封顶（bd zbsbc 的最坏情形）。
+    #[tokio::test]
+    async fn global_inflight_budget_bounds_cross_connection_sum() {
+        let global = xray_frame::budget::inflight::InflightBudget::new(4 * 1024 * 1024);
+        let a = ByteGate::with_budget(8 * 1024 * 1024, std::sync::Arc::clone(&global));
+        let b = ByteGate::with_budget(8 * 1024 * 1024, std::sync::Arc::clone(&global));
+
+        let pa = a.acquire(3 * 1024 * 1024).await; // 全局 3MiB
+        let pb = b.acquire(1024 * 1024).await; // 全局 4MiB（满）
+        assert_eq!(global.used(), 4 * 1024 * 1024);
+
+        // per-conn 闸还有 4MiB 空间，阻塞只能来自全局预算 ⇒ 证明是双层而非单层。
+        let blocked = tokio::spawn({
+            let gate = std::sync::Arc::clone(&a);
+            async move { gate.acquire(1024 * 1024).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!blocked.is_finished(), "全局预算满时必须等待（不得超发）");
+        // 本连接闸上限 8MiB，3+1=4MiB 仍有余量 ⇒ 阻塞只能来自全局层（证明是双层）。
+        assert_eq!(
+            a.inflight.load(std::sync::atomic::Ordering::Acquire),
+            4 * 1024 * 1024,
+            "本连接闸未触顶（4MiB ≤ 8MiB）⇒ 阻塞必须来自全局预算层"
+        );
+
+        drop(pb);
+        let pc = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("归还后必须放行")
+            .expect("join");
+        drop(pc);
+        drop(pa);
+        assert_eq!(global.used(), 0, "全部归还后全局账本必须归零（无泄漏）");
+    }
+
+    /// 拒连文案只在**绝对下限**（连一条满额连接都装不下）触发，且必须给出可操作出路。
+    ///
+    /// 旧契约是「已达连接数上限」的硬拒文案（用户裁决 2026-11-15 废除：Go 上游无连接
+    /// 总数硬限制）。现契约：条数超档只 WARN + 计数（[`conn_stats`]），唯一 `Err` 是
+    /// 内存预算装不下单条连接——那时唯一可操作杠杆是换档/调小 buffersize。
+    #[test]
+    fn connection_limit_error_names_absolute_floor() {
         let _g = global_state_guard();
         let err = connection_limit_error();
         let text = err.to_string();
         let plan = xray_frame::budget::plan::MemoryPlan::cached();
-        assert!(text.contains("connection limit reached"), "{text}");
-        assert!(
-            text.contains(&plan.effective_max_conns().to_string()),
-            "必须点名**生效**条数（降档后）：{text}"
-        );
+        assert!(text.contains("memory budget below one connection"), "{text}");
         assert!(text.contains(plan.tier.as_str()), "必须点名档位：{text}");
+        assert!(text.contains(&plan.total_budget.to_string()), "必须点名本档预算：{text}");
         assert!(
             text.contains("buffersize") && text.contains("XRAY_MEM_LIMIT_MB"),
             "必须给出可操作出路（换档 / 调小每连接 pipe 账面）：{text}"
         );
-        assert!(
-            text.contains("XRAY_MAX_CONNS 只在账本余量内生效"),
-            "不得把只作上界兼收紧的口写成无条件出路：{text}"
-        );
     }
 
-    /// 执行点（[`ConnSlot::try_acquire`] 的唯一读数 [`conn_limit`]）必须读装配期
+    /// 执行点（[`ConnSlot::acquire`] 的唯一读数 [`conn_limit`]）必须读装配期
     /// 降档值，不是档位原值（bd 2026-11-08 D-02）。
     ///
     /// 本进程只有本用例写该静态值（`GLOBAL_STATE` 串行化其它读它的用例）。

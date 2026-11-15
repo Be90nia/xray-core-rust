@@ -34,6 +34,10 @@
 /// ⇒ 判据 ②；探测机制零语义 ⇒ udf 提炼候选，件内有标注）。
 pub mod plan;
 
+/// 进程级 in-flight 字节预算（跨连接聚合闸，`plan.rs` 记的「全局共享配额终态」）：
+/// 桥的每连接方向闸之上再取一道全局许可，耗尽时等待（背压）而非拒绝。
+pub mod inflight;
+
 /// 整机 256MB 分账后 xray 的保守预算（96MB；留 24MB 给抖动/page cache）。
 pub const XRAY_BUDGET_BYTES: usize = 96 * 1024 * 1024;
 

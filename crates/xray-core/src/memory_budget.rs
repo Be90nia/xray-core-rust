@@ -37,16 +37,18 @@
 //! **内存自适应（bd sfqlu，2026-11-07 用户拍板）**：总预算不再钉 96MB，改由
 //! `xray_frame::budget::plan::MemoryPlan` 按**探测到的可用内存**分档派生——
 //! ≤256MB→40MB / ≤512MB→96MB / ≤1GB→192MB / >1GB→`min(512MB, 可用/4)`。同一份
-//! 派生值同时给出桥每方向字节闸与**连接数上限**（`总预算 / 3MiB` = 13/32/64/170，
-//! **并发能力不按闸反解**；触顶由桥 fail-visible 拒绝）。**口径史（bd 3gxez）**：
+//! 派生值同时给出桥每方向字节闸与**连接数软上限**（`总预算 / 3MiB` = 13/32/64/170，
+//! **并发能力不按闸反解**；超档只 warn + 计数，不拒连）。**口径史（bd 3gxez）**：
 //! 设计表的每连接单价 3MiB 含 2MiB「在途份额」，而账本只把 pipe 当常驻（缺省 1MiB）
 //! ⇒ 本配置的账本余量（tiny 19 / small 75 …）恒大于设计值。用户裁决 2026-11-14
 //! 「代码不回退、**总数压小**」⇒ 执行点上限 = `min(档位设计/显式值, 账本余量)`，
 //! **故意不用余量反解**（要的是低内存峰值，不是吃满预算）；抬容量只需改
 //! `budget_report_with` 那一行并重跑 `tests/conn_gate_ledger_cap.rs`。满载乘积
 //! （`max_conns × 2 × gate`）因此**过订**（3.3×–21×）——闸是瞬态背压上界，非每连接
-//! 常驻 ⇒ 该上界如实进 caps 栏 + WARN（bd 2026-11-08 D-01，口径经 PM 修正；
-//! 全局共享配额终态另票）。预算装不下时**不拒启**：按装得下的并发数降档并 warn，
+//! 常驻 ⇒ 该上界如实进 caps 栏 + WARN（bd 2026-11-08 D-01），但**跨连接合计自
+//! 2026-11-15 起由进程级 in-flight 预算兜住**（`MemoryPlan::inflight_budget_bytes`
+//! = 总预算一半，取不到许可走背压等待，不拒连），故乘积是可核对的闸值上界而非
+//! 可实际发生的在途合计。预算装不下时**不拒启**：按装得下的并发数降档并 warn，
 //! **降档值写进执行点**（`xray_frame::budget::plan::set_effective_max_conns`，桥读
 //! 同一份值，D-02；只有连 1 条连接都装不下才拒）。96MB 仍是 `min` 上沿的默认设计点，
 //! 故原「96MiB 不是运行期硬上界」口径不变。
@@ -452,7 +454,8 @@ pub fn budget_report_with(
             "内存降档运行（bd sfqlu）：档位 {}（{}，可用 {}B，来源 {}）总预算 {budget}B，\
              固定面 {fixed}B（{listeners} 个监听）+ 显式 socket {quic_explicit_booked}B 后\
              每连接 {per_conn_pipe}B pipe（双向）只装得下 {conns_fit} 条连接\
-             （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数上限降为 {max_conns} 条，不拒启",
+             （最小可跑 {} 条 / 档位上限 {} 条）⇒ 本配置连接数**软上限**降为 {max_conns} 条\
+             （超档只告警 + 计数，不拒连），不拒启",
             plan.tier.as_str(),
             plan.tier.label(),
             plan.available,
@@ -528,26 +531,21 @@ pub fn budget_report_with(
     // （bd 2026-11-08 D-01）：登记成 caps 里的诚实上界 + 一条 WARN；**不**拿它反解
     // 并发数（反解会把四档并发砍到 4/4/4/8 条 = 功能回退，PM 打回）。
     //
-    // bd zbsbc：**闸只封单连接，不封跨连接合计**。字节闸在
-    // `xray_transport::bridge` 的**每连接**桥函数体内构造（`ByteGate::new`，
-    // up/down 各一道 ⇒ 每连接 2 道，跨连接**无聚合闸**）⇒ N 条连接可同时各占
-    // 2×gate，最坏合计 = 本行 `full_load_product`，**不被任何机制兜住**。
-    // 旧文案宣称最坏合计另有机制限制 = 谎报容量边界，运维据此判断会错。
-    // 换算口径（建议、不反解）：要让最坏合计 ≤ 预算需并发 ≤ 预算 ÷ (2×闸)
-    // （四档 4/4/4/8 条）；bd 3gxez 裁决不据此反解（砍并发 = 功能回退），
-    // 故只 WARN + 登记 caps；确需收紧并发用 `XRAY_MAX_CONNS` 显式设置。
+    // 2026-11-15 起该上界**由进程级 in-flight 预算兜住**（bd 3gxez 终态）：
+    // `xray_transport::bridge` 的每条泵在 per-conn 闸之外再取一道全局许可
+    // （`xray_frame::budget::inflight`，= [MemoryPlan::inflight_budget_bytes]），
+    // 跨连接合计被它封顶，取不到许可就等（背压，不拒绝、不丢数据）。故本行是
+    // 「闸值本身的乘积上界」，**不是**可实际发生的在途合计。
     let full_load_product = max_conns * 2 * plan.bridge_gate;
+    let inflight_budget = plan.inflight_budget_bytes();
     if full_load_product > budget {
-        // 每连接 2 道方向闸 ⇒ 单连接在途上界 = 2×gate；跨连接无聚合闸。
-        let suggested_conns = budget / (2 * plan.bridge_gate);
         notes.push(format!(
             "满载乘积过订（bd 2026-11-08 D-01，只 WARN）：{max_conns} 条 × 2 方向 × {}B 闸 = \
              {full_load_product}B，为预算 {budget}B 的 {:.2}× ——闸只封**单连接**（每连接自带 \
-             2 道方向闸、每方向 ≤ 闸值；单块超闸不阻塞、并发判定只允许少量超闸），\
-             **跨连接无聚合闸** ⇒ N 条连接可同时各占 2×闸，最坏合计（本行数值）\
-             **无任何机制兜住**；换算口径：要让最坏合计 ≤ 预算需并发 ≤ 预算 ÷ (2×闸) = \
-             {suggested_conns} 条，但按 bd 3gxez 裁决**不**据此反解（会砍到 4/4/4/8 = \
-             功能回退），只登记 caps + WARN；确需收紧并发用 `XRAY_MAX_CONNS` 显式设置",
+             2 道方向闸、每方向 ≤ 闸值；单块超闸不阻塞）；跨连接合计由**进程级 in-flight \
+             预算 {inflight_budget}B 兜住**（取不到许可走背压等待，不拒连），故本行数值不是\
+             可实际发生的在途合计；按 bd 3gxez 裁决仍**不**据此反解并发（会砍到 4/4/4/8 = \
+             功能回退）",
             plan.bridge_gate,
             full_load_product as f64 / budget as f64,
         ));
@@ -613,14 +611,22 @@ pub fn budget_report_with(
             format!("bridge byte gate {}B/dir x 2 dirs per conn", plan.bridge_gate),
             2 * plan.bridge_gate,
         ),
-        // D-01（PM 2026-11-08 修正）：满载乘积是**诚实的最坏上界**，不是稳态预算
-        // ——闸 lazy 分配、正常链路远不满。登记在 caps（运维判据）+ WARN，禁静默。
-        // bd zbsbc：闸**只封单连接**（每连接 2 道方向闸），跨连接无聚合闸 ⇒ 本行
-        // 数值是「N 条连接各自占满」的合计上界，无任何机制兜住它。
+        // 全局预算（2026-11-15，bd 3gxez）：跨连接 in-flight 合计的**执行点**上界
+        // ——不是账面登记，是真闸（取不到许可走背压）。单独一行，运维可直接对账。
         (
             format!(
-                "worst-case full-load bridge in-flight {full_load_product}B ({max_conns} conns x 2 \
-                 dirs x {}B gate; {:.2}x budget — per-conn gate only, no cross-conn aggregate)",
+                "process bridge in-flight budget {inflight_budget}B (aggregate cap over all \
+                 conns, backpressure not reject)"
+            ),
+            inflight_budget,
+        ),
+        // D-01（PM 2026-11-08 修正）：满载乘积是**闸值本身**的最坏乘积，不是稳态预算
+        // 也不是可实际发生的在途合计——闸 lazy 分配、正常链路远不满，且跨连接合计被
+        // 上面那行 in-flight 预算封顶。登记在 caps（运维判据）+ WARN，禁静默。
+        (
+            format!(
+                "worst-case full-load bridge gate product {full_load_product}B ({max_conns} conns \
+                 x 2 dirs x {}B gate; {:.2}x budget — capped by the in-flight budget above)",
                 plan.bridge_gate,
                 full_load_product as f64 / budget as f64
             ),
@@ -1026,7 +1032,7 @@ mod tests {
             let (name, value) = report
                 .caps
                 .iter()
-                .find(|(n, _)| n.starts_with("worst-case full-load bridge in-flight"))
+                .find(|(n, _)| n.starts_with("worst-case full-load bridge gate product"))
                 .unwrap_or_else(|| {
                     panic!("{} 档 caps 缺满载上界行：{:?}", report.tier, report.caps)
                 });
@@ -1041,19 +1047,32 @@ mod tests {
         }
     }
 
-    /// bd zbsbc：过订 WARN 必须陈述**诚实事实**——字节闸只封单连接（每连接 2 道
-    /// 方向闸），**跨连接无聚合闸** ⇒ 乘积上界不被任何机制兜住。旧文案宣称最坏合计
-    /// 另有机制限制 = 谎报容量边界（已改）。此处钉事实片段（不是整句），使旧叙事
-    /// 一旦回归即红。
+    /// 过订 WARN 必须陈述**新事实**：乘积上界由进程级 in-flight 预算兜住（取不到许可
+    /// 走背压），旧叙事（「跨连接无聚合闸 ⇒ 无任何机制兜住」，bd zbsbc 的诚实登记）
+    /// 已随 2026-11-15 落地作废。此处钉事实片段，使旧叙事一旦回归即红。
     #[test]
-    fn full_load_warn_states_no_cross_connection_aggregate_gate() {
+    fn full_load_warn_states_inflight_budget_caps_aggregate() {
         let plan = xray_frame::budget::plan::MemoryPlan::from_available(256 * MIB);
         let report = budget_report_with(&xray_conf::BuiltConfig::default(), plan)
             .expect("缺省配置必须出报告");
         let degraded = report.degraded.as_deref().expect("过订必须出 WARN（禁静默）");
         assert!(
-            degraded.contains("跨连接无聚合闸"),
-            "WARN 必须陈述「跨连接无聚合闸」这一事实（bd zbsbc）：{degraded}"
+            degraded.contains("进程级 in-flight 预算"),
+            "WARN 必须点名兜住合计的那道闸（2026-11-15 终态）：{degraded}"
+        );
+        assert!(degraded.contains("背压"), "WARN 必须说明超额语义 = 背压等待而非拒绝：{degraded}");
+        assert!(
+            !degraded.contains("无任何机制兜住"),
+            "旧叙事（无机制兜住）已作废，不得回归：{degraded}"
+        );
+        // caps 栏必须单列全局预算一行（运维可直接对账）。
+        assert!(
+            report
+                .caps
+                .iter()
+                .any(|(n, b)| n.contains("in-flight budget") && *b == plan.inflight_budget_bytes()),
+            "caps 必须登记 in-flight 预算执行点上界：{:?}",
+            report.caps
         );
     }
 
@@ -1069,7 +1088,7 @@ mod tests {
         let report = budget_report_with(&built, plan_256mb()).expect("report");
         let degraded = report.degraded.as_deref().expect("超预算配置必须降档并 warn");
         assert!(
-            degraded.contains(&format!("连接数上限降为 {} 条", report.max_conns)),
+            degraded.contains(&format!("连接数**软上限**降为 {} 条", report.max_conns)),
             "warn 文案的条数必须等于写入执行点的值 {}：{degraded}",
             report.max_conns
         );

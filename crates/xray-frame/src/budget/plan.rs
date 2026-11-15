@@ -72,14 +72,18 @@
 //! - **过订如实进预算门 caps 栏 + WARN**（`xray-core::memory_budget`）：旧状 caps 里只有「闸
 //!   per-conn」单值，乘积面不可见 ⇒ 运维无从判断最坏情形；
 //!   现在把乘积上界写成一条显式记录并告警，**禁静默**。
-//! - 最坏情形**无机制兜住**（bd zbsbc）：字节闸在 `xray_transport::bridge` 的**每连接**
-//!   桥函数体内构造（up/down 各一道 ⇒ 每连接 2 道），**跨连接无聚合闸** ⇒ N 条连接 可同时 各占
+//! - 最坏情形**曾无机制兜住**（bd zbsbc）：字节闸在 `xray_transport::bridge` 的**每连接**
+//!   桥函数体内构造（up/down 各一道 ⇒ 每连接 2 道），当时**跨连接无聚合闸** ⇒ N 条连接 可同时 各占
 //!   2×闸，合计上界 = `max_conns × 2 × bridge_gate`（= caps 栏那行）， 无机制把它压回
-//!   预算内。要让合计 ≤ 预算需并发 ≤ `预算 ÷ (2×闸)`（四档 4/4/4/8 条）， 但按 bd 3gxez
-//!   裁决不据此反解（砍并发 = 功能回退）；需收紧并发用 `XRAY_MAX_CONNS`。
-//! - **全局共享配额**（进程级 in-flight 预算 `total_budget/2`，每连接 `min(per_conn_gate,
-//!   全局剩余)`，乘积由构造自洽且并发不降）是正确终态，但属 bridge 数据面改造 + 必带 A/B
-//!   门，**本轮不做**（另开票）。
+//!   预算内。**2026-11-15 起该上界由下条的进程级 in-flight 预算兜住**：闸值仍不进 `max_conns`
+//!   反解（砍并发 = 功能回退，bd 3gxez 裁决不变），但合计在途被 `total_budget / 2`
+//!   封顶，超出的部分走等待（背压）而非拒绝。
+//! - **全局共享配额** ✅ 已落地（2026-11-15）：进程级 in-flight 预算
+//!   [`MemoryPlan::inflight_budget_bytes`]（= `total_budget / 2`），桥每方向每块在 per-conn
+//!   闸之外再取一道全局许可（`xray_frame::budget::inflight`）；耗尽时**等待 （背压）而非拒绝**，故
+//!   `max_conns` 不降、乘积过订被跨连接聚合闸兜住。 `max_conns`
+//!   也就从「硬上限」降级为**软上限**（超档只 WARN + 计数，见
+//!   `xray_transport::bridge::conn_stats`）——Go 上游本无连接总数硬限制。
 
 use std::sync::LazyLock;
 
@@ -344,13 +348,18 @@ pub struct MemoryPlan {
     pub total_budget: usize,
     /// 桥**每方向**字节闸（字节）。
     pub bridge_gate: usize,
-    /// 连接数上限（条；触顶 fail-visible 拒绝）。
+    /// 连接数上限（条；**软上限**——超档只 WARN + 计数，不拒连）。
     ///
     /// = `total_budget / PER_CONN_UPPER_BYTES`（或 `XRAY_MAX_CONNS` 显式值）。装配期
     /// `xray-core::memory_budget` 把它与本配置**账本余量**取小后写进执行点
     /// （`(预算 − 固定面 − 显式 socket) / 每连接 pipe 双向`，bd 3gxez）：余量通常更大
     /// （tiny 19 vs 13），但用户裁决 2026-11-14「总数压小」明确不把预算吃满 ⇒
     /// 缺省配置下生效值就是本字段值。
+    ///
+    /// **2026-11-15 起语义 = 软上限**（用户裁决：Go Xray 没有连接总数硬限制，动态
+    /// 缓冲 + 背压才是它的机制）。超档不再拒连，只 warn（限频）+ 计数
+    /// （`xray_transport::bridge::conn_stats`）；内存上界由进程级 in-flight 预算
+    /// （[`Self::inflight_budget_bytes`]）兜，取不到许可就等待。
     pub max_conns: usize,
     /// 探测来源（日志用）。
     pub source: &'static str,
@@ -440,12 +449,36 @@ impl MemoryPlan {
     /// 预算门算出的降档只写进 warn 文案，桥上仍读档位原值 ⇒ 运维看到的数字
     /// 不是生效的数字。装配期写入的是 `min(本档派生值, 账本余量)`（bd 3gxez），
     /// 因此 **≤ 本档派生值**（余量更大也不放宽，见 `max_conns` 的裁决说明）。
+    ///
+    /// **2026-11-15 起是软上限**：桥只拿它做「超档 WARN + 计数」的门槛，不拒连。
     #[must_use]
     pub fn effective_max_conns(&self) -> usize {
         match EFFECTIVE_MAX_CONNS.load(std::sync::atomic::Ordering::Relaxed) {
             0 => self.max_conns,
             n => n,
         }
+    }
+
+    /// 进程级 in-flight 预算容量（字节）= 档位总预算的一半。
+    ///
+    /// 桥每方向每块在 per-conn 闸之外再取这道许可（`xray_frame::budget::inflight`）：
+    /// 跨连接合计在途被它封顶，取不到就等待（背压）。为什么是一半：整机预算还要
+    /// 装固定面与瞬态面（见 `xray-core::memory_budget`），数据面只该占自己那半；
+    /// 四档 = 20 / 48 / 96 / `min(available/8, 256)` MiB，最小档仍是实测 BDP 上沿
+    /// （3.56MB）的 5.6× ⇒ 正常链路不 binding（不砍吞吐）。
+    #[must_use]
+    pub fn inflight_budget_bytes(&self) -> usize {
+        (self.total_budget / 2).max(1)
+    }
+
+    /// 本档能否**装下一条按规划上界的连接**（绝对下限）。
+    ///
+    /// 唯一的拒连判据：连一条满额连接（[`PER_CONN_UPPER_BYTES`]）都装不下时，
+    /// 放行只会立刻 OOM ⇒ 该拒（且文案给出路）。四档总预算恒 ≥ 40MiB > 3MiB，
+    /// 故真实配置下恒 true——这是防御性护栏，不是常态路径。
+    #[must_use]
+    pub fn can_admit_single_conn(&self) -> bool {
+        self.total_budget >= PER_CONN_UPPER_BYTES
     }
 }
 
