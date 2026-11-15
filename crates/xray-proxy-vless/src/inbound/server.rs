@@ -3276,6 +3276,7 @@ mod tests {
     /// R-1 回归（audit 2026-11-15）：半开连接（TCP 建连后不发 ClientHello）在
     /// `TLS_HANDSHAKE_TIMEOUT` 窗尾被清——改前 `acc.accept` 裸等，该任务 + fd
     /// 永久占用（accept 环仍活，故只能靠对端 EOF 判定）。
+    #[allow(clippy::disallowed_methods, reason = "测试耗时断言配套，非生产时钟取用")]
     #[tokio::test]
     async fn vless_tls_handshake_half_open_peer_is_closed_within_window() {
         let _ = rustls::crypto::ring::default_provider().install_default();

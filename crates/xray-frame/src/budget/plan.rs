@@ -79,7 +79,7 @@
 //!   反解（砍并发 = 功能回退，bd 3gxez 裁决不变），但合计在途被 `total_budget / 2`
 //!   封顶，超出的部分走等待（背压）而非拒绝。
 //! - **全局共享配额** ✅ 已落地（2026-11-15）：进程级 in-flight 预算
-//!   [`MemoryPlan::inflight_budget_bytes`]（= `total_budget / 2`），桥每方向每块在 per-conn
+//!   `MemoryPlan::inflight_budget_bytes`（= `total_budget / 2`），桥每方向每块在 per-conn
 //!   闸之外再取一道全局许可（`xray_frame::budget::inflight`）；耗尽时**等待 （背压）而非拒绝**，故
 //!   `max_conns` 不降、乘积过订被跨连接聚合闸兜住。 `max_conns`
 //!   也就从「硬上限」降级为**软上限**（超档只 WARN + 计数，见
