@@ -17,7 +17,9 @@ use skeleton_infra::fx::FxScope;
 use tokio::sync::Notify;
 
 use crate::{
-    accept_policy::{AcceptErrorKind, backoff_if_resource, classify, supervise_accept_loop},
+    accept_policy::{
+        AcceptErrorKind, backoff_if_not_connection, classify, repeat_hint, supervise_accept_loop,
+    },
     listener_registry::{ConnHandler, TransportListener},
     sockopt::SocketOptions,
     system_listener::{DefaultListener, SystemListener},
@@ -138,13 +140,17 @@ async fn keep_accepting(
                         match classify(&e) {
                             AcceptErrorKind::Resource => {
                                 crate::LOG.warn(format!("tag=tcp local={local} error={e} tcp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
-                                backoff_if_resource(&e).await;
+                                backoff_if_not_connection(&e).await;
                             }
                             AcceptErrorKind::Connection => {
                                 crate::LOG.debug(format!("tag=tcp error={e} tcp inbound: 单连接级 accept 错误，继续监听"));
                             }
                             AcceptErrorKind::Unknown => {
-                                crate::LOG.warn(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别），继续监听"));
+                                match repeat_hint(&e) {
+                                    Some(n) => crate::LOG.debug(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别）连续第 {n} 次，退避 500ms 后继续")),
+                                    None => crate::LOG.warn(format!("tag=tcp error={e} tcp inbound: accept 错误（未知类别），退避 500ms 后继续")),
+                                }
+                                backoff_if_not_connection(&e).await;
                             }
                         }
                     }
@@ -298,13 +304,17 @@ async fn keep_accepting_unix(
                         match classify(&e) {
                             AcceptErrorKind::Resource => {
                                 crate::LOG.warn(format!("tag=tcp-unix path={path} error={e} unix inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
-                                backoff_if_resource(&e).await;
+                                backoff_if_not_connection(&e).await;
                             }
                             AcceptErrorKind::Connection => {
                                 crate::LOG.debug(format!("tag=tcp-unix path={path} error={e} unix inbound: 单连接级 accept 错误，继续监听"));
                             }
                             AcceptErrorKind::Unknown => {
-                                crate::LOG.warn(format!("tag=tcp-unix path={path} error={e} unix inbound: accept 错误（未知类别），继续监听"));
+                                match repeat_hint(&e) {
+                                    Some(n) => crate::LOG.debug(format!("tag=tcp-unix path={path} error={e} unix inbound: accept 错误（未知类别）连续第 {n} 次，退避 500ms 后继续")),
+                                    None => crate::LOG.warn(format!("tag=tcp-unix path={path} error={e} unix inbound: accept 错误（未知类别），退避 500ms 后继续")),
+                                }
+                                backoff_if_not_connection(&e).await;
                             }
                         }
                     }

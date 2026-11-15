@@ -21,7 +21,11 @@ use xray_common::{
 };
 use xray_crypto::aead::{AeadCipher, Aes128Gcm, ChaCha20Poly1305Aead};
 use xray_frame::{PluginContext, deadline::Budget};
-use xray_transport::{link::Link, system_listener::InboundTcpListener};
+use xray_transport::{
+    link::Link,
+    system_listener::InboundTcpListener,
+    tls_handshake_gate::{TLS_HANDSHAKE_TIMEOUT, accept_stream_with_timeout},
+};
 
 use crate::{
     encoding::{
@@ -195,12 +199,15 @@ pub async fn serve_vmess(
         let history = Arc::clone(&history);
         let tls = tls.clone();
         let header = header.clone();
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        ctx.spawn(async move {
+        // 停机竞态（A1，audit 2026-11-15）：arm scope 闸已关 = 预期拒发（账本已计数
+        // `rejected_spawns`）⇒ debug 留痕、连接随 drop 关闭；旧 `.expect` 会在
+        // 「accept 已出连接 + 闸刚关」窗口炸掉整个 accept 循环。
+        let spawned = ctx.spawn(async move {
             let result = if let Some(acc) = tls {
-                match acc.accept(stream).await {
+                match accept_stream_with_timeout(acc.accept(stream), TLS_HANDSHAKE_TIMEOUT).await {
                     Ok(tls_stream) => {
-                        // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS 隧道内）。
+                        // Go hub.go:106-113：TLS 解包后 authConfig.Server（伪装在 TLS
+                        // 隧道内）。
                         let conn = xray_transport::headers::conn::maybe_wrap_server(
                             tls_stream,
                             header.as_deref(),
@@ -214,6 +221,14 @@ pub async fn serve_vmess(
                             handshake_timeout,
                         )
                         .await
+                    },
+                    // 半开连接在窗尾被清：预期丢弃走 debug（R-1，audit 2026-11-15）。
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        crate::VMESS_LOG.debug(format!(
+                            "vmess TLS handshake timeout after {TLS_HANDSHAKE_TIMEOUT:?}, \
+                             closing silent connection peer={peer}"
+                        ));
+                        return;
                     },
                     Err(e) => {
                         crate::VMESS_LOG.warn(format!("vmess TLS accept failed error={e}"));
@@ -232,8 +247,10 @@ pub async fn serve_vmess(
                 crate::VMESS_LOG
                     .info(format!("vmess connection ended with error peer={peer} error={e}"));
             }
-        })
-        .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        });
+        if spawned.is_err() {
+            crate::VMESS_LOG.debug("arm scope closed at shutdown, dropping connection");
+        }
     }
 }
 
@@ -1188,6 +1205,65 @@ mod tests {
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "paused clock must auto-advance past the 60s deadline"
+        );
+    }
+
+    /// R-1 回归（audit 2026-11-15）：半开连接（TCP 建连后不发 ClientHello）在
+    /// `TLS_HANDSHAKE_TIMEOUT` 窗尾被清（改前 `acc.accept` 裸等 = 任务 + fd 永久占用）。
+    #[tokio::test]
+    async fn vmess_tls_handshake_half_open_peer_is_closed_within_window() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(
+            Arc::new(server_config).into(),
+        ));
+
+        let ohm = make_ohm_with_freedom();
+        let (validator, _cmd_key) = make_validator_with_user();
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("vmess-tls-half-open-serve", async move {
+            let _ = serve_vmess(
+                test_ctx(),
+                listener,
+                ohm,
+                validator,
+                Some(acceptor),
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut probe = [0u8; 1];
+        let read = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5),
+            async { client.read(&mut probe).await },
+        )
+        .await
+        .expect("半开连接必须在窗尾被清（改前 = 无界等待）");
+        let elapsed = started.elapsed();
+        assert!(matches!(read, Ok(0) | Err(_)), "窗尾必须关闭连接: {read:?}");
+        assert!(
+            elapsed >= TLS_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(500),
+            "窗未生效（清得太早，改前无界等待形态）: {elapsed:?}"
         );
     }
 }

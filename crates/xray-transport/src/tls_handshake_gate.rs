@@ -12,7 +12,7 @@
 //! 单连接级 [`io::ErrorKind::TimedOut`]。各 transport 的接线（对齐 Go
 //! ReadHeaderTimeout 口径）由各 transport crate 完成。
 
-use std::{io, time::Duration};
+use std::{future::Future, io, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -40,6 +40,29 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     match tokio::time::timeout(within, acceptor.accept(stream)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TLS handshake timeout (peer connected but never completed the handshake)",
+        )),
+    }
+}
+
+/// 同款超时窗的**泛型 acceptor** 形态（R-1，audit 2026-11-15）。
+///
+/// [`accept_tls_with_timeout`] 只吃 `tokio_rustls::TlsAcceptor`；入站面真实类型是
+/// `xray_tls::inbound_acceptor::InboundTlsAcceptor`（rustls / btls 后端二选一枚举，
+/// 其 `accept` 契约写明「超时由调用方包」；本 crate 不依赖 xray-tls，故只作文本引用）。
+/// 本函数包**任意** accept future：超时归一 [`io::ErrorKind::TimedOut`]，底层 stream
+/// 随 future drop 释放。
+///
+/// # Errors
+/// 握手失败（协议错误/对端断开）或超时时返回 `io::Error`。
+pub async fn accept_stream_with_timeout<T>(
+    fut: impl Future<Output = io::Result<T>>,
+    within: Duration,
+) -> io::Result<T> {
+    match tokio::time::timeout(within, fut).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -233,5 +256,22 @@ mod tests {
         tls.flush().await.unwrap();
 
         assert_eq!(client_task.await.unwrap(), *b"pong");
+    }
+
+    /// 泛型 accept 窗（R-1）：永不完成的 accept future 在窗尾归一 `TimedOut`，
+    /// 且**不吃**成功路径（Ok 原样透传）。
+    #[tokio::test]
+    async fn generic_accept_window_times_out_and_passes_success() {
+        let err = accept_stream_with_timeout(
+            std::future::pending::<io::Result<()>>(),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("永不完成的 accept 必须超时");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        accept_stream_with_timeout(async { Ok::<_, io::Error>(7u8) }, Duration::from_secs(1))
+            .await
+            .expect("成功路径必须原样透传");
     }
 }

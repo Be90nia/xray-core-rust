@@ -50,3 +50,7 @@ xray-tls = { path = "../xray-tls" }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 xray-proxy-freedom = { path = "../xray-proxy-freedom" }
+# R-1 半开 TLS 握手回归：自签服务端证书（workspace 既有版本，同 xray-transport）
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = "0.13"

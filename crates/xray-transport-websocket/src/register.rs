@@ -21,7 +21,9 @@ use std::{io, net::SocketAddr, sync::Arc};
 use xray_common::net::destination::Destination;
 use xray_frame::scope::ComponentScope;
 use xray_transport::{
-    accept_policy::{AcceptErrorKind, backoff_if_resource, supervise_accept_loop},
+    accept_policy::{
+        AcceptErrorKind, backoff_if_not_connection, repeat_hint, supervise_accept_loop,
+    },
     connection::Connection,
     dialer::{StreamSettings, TransportDialFn, register_transport_dialer},
     handshake_gate::HandshakeGate,
@@ -274,14 +276,20 @@ fn spawn_ws_accept_loop(
                                 AcceptErrorKind::Resource => {
                                     crate::LOG.warn(format!("tag={tag} local={ident} error={e} ws inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
                                     if let WsError::Io(io_err) = &e {
-                                        backoff_if_resource(io_err).await;
+                                        backoff_if_not_connection(io_err).await;
                                     }
                                 }
                                 AcceptErrorKind::Connection => {
                                     crate::LOG.debug(format!("tag={tag} error={e} ws inbound: 单连接级 accept 错误，继续监听"));
                                 }
                                 AcceptErrorKind::Unknown => {
-                                    crate::LOG.warn(format!("tag={tag} local={ident} error={e} ws inbound: accept 错误（未知类别），继续监听"));
+                                    // A3：同文本连续重复降 debug，且退避 500ms（改前裸 continue 会忙旋）。
+                                    let io_err = io::Error::other(e.to_string());
+                                    match repeat_hint(&io_err) {
+                                        Some(n) => crate::LOG.debug(format!("tag={tag} local={ident} error={e} ws inbound: accept 错误（未知类别）连续第 {n} 次，退避 500ms 后继续")),
+                                        None => crate::LOG.warn(format!("tag={tag} local={ident} error={e} ws inbound: accept 错误（未知类别），退避 500ms 后继续")),
+                                    }
+                                    backoff_if_not_connection(&io_err).await;
                                 }
                             }
                         }

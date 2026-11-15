@@ -9,7 +9,8 @@
 //!    `ConnectionClosed`、tungstenite `AlreadyClosed`）——永不作为退出
 //!    条件（生产实证：26.10.10/26.10.11 上 443 监听因此静默消失，日志零线索）。
 //! 2. **错误分级**：资源/瞬时类（EMFILE/ENFILE/EAGAIN/ENOMEM/EINTR）→ `warn` + 退避 500ms +
-//!    继续；单连接级（握手失败、对端中途断开）→ `debug` + 继续； 其它未知 → `warn` + 继续。
+//!    继续；单连接级（握手失败、对端中途断开）→ `debug` + 继续； 其它未知 → `warn`
+//!    （同文本连续重复降 `debug`，见 [`repeat_hint`]）+ 退避 500ms + 继续。
 //! 3. **循环意外退出（非显式 close）必须 `error!` 留痕**，含 tag、local 与最后 错误（"发现 443
 //!    跪了就写日志"）。
 //! 4. 文本兜底匹配**大小写不敏感**（glibc 是 "Too many open files"，小写匹配 永不命中）。
@@ -18,7 +19,7 @@ use std::{future::Future, io, time::Duration};
 
 use skeleton_infra::fx::TaskError;
 
-/// 资源/瞬时类退避时长（与 xray-core `accept_fd_backoff` 的 500ms 一致）。
+/// 资源/瞬时类与未知类退避时长（与 xray-core `accept_fd_backoff` 的 500ms 一致）。
 const BACKOFF: Duration = Duration::from_millis(500);
 
 /// accept 错误分类（决定日志级别与是否退避；不含退出——退出只来自显式 close）。
@@ -60,10 +61,38 @@ pub fn classify(e: &io::Error) -> AcceptErrorKind {
     }
 }
 
-/// 资源类错误退避 500ms 后返回；其他错误立即返回（循环 continue 前调用）。
-pub async fn backoff_if_resource(e: &io::Error) {
-    if matches!(classify(e), AcceptErrorKind::Resource) {
+/// 非单连接级错误退避 500ms 后返回；单连接级错误（握手失败 / 对端断开）立即返回
+/// （循环 continue 前调用）。
+///
+/// `Unknown` 也退避（A3，audit 2026-11-15）：未知错误原样 continue 会构成忙旋 +
+/// warn 洪水；退避不改变「永不退出」铁律，只把循环节奏压到 2 次/秒。
+pub async fn backoff_if_not_connection(e: &io::Error) {
+    if !matches!(classify(e), AcceptErrorKind::Connection) {
         tokio::time::sleep(BACKOFF).await;
+    }
+}
+
+/// 同错误文本连续重复的采样（A3 warn 限频）：首现 / 换文本 → `None`（应 `warn`）；
+/// 连续重复 → `Some(累计次数)`（应降 `debug`，带计数）。
+///
+/// `Resource` 类恒 `None`：EMFILE/ENFILE 的可见性不得被降级（既有路径不变）。
+pub fn repeat_hint(e: &io::Error) -> Option<u64> {
+    use std::sync::Mutex;
+    static REPEAT: Mutex<Option<(String, u64)>> = Mutex::new(None);
+    if matches!(classify(e), AcceptErrorKind::Resource) {
+        return None;
+    }
+    let text = e.to_string();
+    let mut slot = REPEAT.lock().unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_mut() {
+        Some((last, n)) if *last == text => {
+            *n = n.saturating_add(1);
+            Some(*n)
+        },
+        _ => {
+            *slot = Some((text, 1));
+            None
+        },
     }
 }
 
@@ -186,11 +215,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backoff_skips_non_resource_errors_immediately() {
-        // 非资源类零 sleep 直达返回（时序断言只排除断言里误入 sleep 路径）
+    async fn backoff_skips_connection_errors_immediately() {
+        // 单连接级零 sleep 直达返回（时序断言只排除断言里误入 sleep 路径）
         let start = xray_frame::compat::clock().now_instant();
-        backoff_if_resource(&io::Error::from(io::ErrorKind::ConnectionReset)).await;
+        backoff_if_not_connection(&io::Error::from(io::ErrorKind::ConnectionReset)).await;
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    /// A3：未知类错误也退避（改前 Unknown 直接 continue ⇒ 忙旋 + warn 洪水）。
+    #[tokio::test]
+    async fn unknown_error_backs_off_for_500ms() {
+        let start = xray_frame::compat::clock().now_instant();
+        backoff_if_not_connection(&io::Error::other("synthetic unknown accept error")).await;
+        assert!(start.elapsed() >= Duration::from_millis(450), "未知类必须退避 500ms");
+    }
+
+    /// A3：同文本连续重复降级；`Resource`（EMFILE）恒不降级。
+    #[test]
+    fn repeat_hint_demotes_only_non_resource_repeats() {
+        let uniq = format!("synthetic unknown accept error {}", std::process::id());
+        let e = io::Error::other(uniq);
+        assert_eq!(repeat_hint(&e), None, "首现必须 warn");
+        assert_eq!(repeat_hint(&e), Some(2), "连续重复降 debug 并计数");
+        let emfile = io::Error::other("Too many open files");
+        assert_eq!(repeat_hint(&emfile), None, "EMFILE 必须持续 warn（不降级）");
+        assert_eq!(repeat_hint(&emfile), None, "EMFILE 重复也不降级");
     }
 
     // ===== supervise_accept_loop（测试③：意外退出 → error 级日志）=====

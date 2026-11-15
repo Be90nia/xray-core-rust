@@ -32,7 +32,11 @@ use xray_common::net::{
 };
 use xray_features::inbound::{InboundError, InboundHandler};
 use xray_frame::LogFacade;
-use xray_transport::{link::Link, system_listener::InboundTcpListener};
+use xray_transport::{
+    link::Link,
+    system_listener::InboundTcpListener,
+    tls_handshake_gate::{TLS_HANDSHAKE_TIMEOUT, accept_stream_with_timeout},
+};
 
 use crate::{
     fallback::FallbackPolicy,
@@ -491,10 +495,12 @@ pub async fn serve_trojan(
         let fb_policy = fallbacks.clone();
         let tls = tls.clone();
         let header = header.clone();
-        // for_plugin/装配根 scope 均不 close——闸关态=装配 bug，fail-visible。
-        ctx.spawn(async move {
+        // 停机竞态（A1，audit 2026-11-15）：arm scope 闸已关 = 预期拒发（账本已计数
+        // `rejected_spawns`）⇒ debug 留痕、连接随 drop 关闭；旧 `.expect` 会在
+        // 「accept 已出连接 + 闸刚关」窗口炸掉整个 accept 循环。
+        let spawned = ctx.spawn(async move {
             if let Some(acc) = tls {
-                match acc.accept(stream).await {
+                match accept_stream_with_timeout(acc.accept(stream), TLS_HANDSHAKE_TIMEOUT).await {
                     Ok(tls_stream) => {
                         // fallback 路由需要 TLS 层 SNI/ALPN（Go：connectionState.ServerName /
                         // NegotiatedProtocol）
@@ -525,6 +531,13 @@ pub async fn serve_trojan(
                         )
                         .await;
                     },
+                    // 半开连接在窗尾被清：预期丢弃走 debug（R-1，audit 2026-11-15）。
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        SERVER_LOG.debug(format!(
+                            "trojan TLS handshake timeout after {TLS_HANDSHAKE_TIMEOUT:?}, \
+                         closing silent connection peer={peer}"
+                        ))
+                    },
                     Err(e) => SERVER_LOG.warn(format!("trojan TLS accept failed error={e}")),
                 }
             } else {
@@ -548,8 +561,10 @@ pub async fn serve_trojan(
                 )
                 .await;
             }
-        })
-        .expect("plugin ctx FxScope is never closed (assembly-owned)");
+        });
+        if spawned.is_err() {
+            SERVER_LOG.debug("arm scope closed at shutdown, dropping connection");
+        }
     }
 }
 
@@ -1225,5 +1240,66 @@ mod tests {
                 "prefix {first:#04x} must be rejected as invalid version"
             );
         }
+    }
+
+    /// R-1 回归（audit 2026-11-15）：半开连接（TCP 建连后不发 ClientHello）在
+    /// `TLS_HANDSHAKE_TIMEOUT` 窗尾被清（改前 `acc.accept` 裸等 = 任务 + fd 永久占用）。
+    #[tokio::test]
+    async fn trojan_tls_handshake_half_open_peer_is_closed_within_window() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(
+            Arc::new(server_config).into(),
+        ));
+
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn DispatchHandler>);
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("trojan-tls-half-open-serve", async move {
+            let _ = serve_trojan(
+                Arc::new(xray_frame::PluginContext::for_plugin("trojan")),
+                listener,
+                ohm,
+                make_validator_with_user("password"),
+                None,
+                Some(acceptor),
+                xray_features::policy::DEFAULT_HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut probe = [0u8; 1];
+        let read = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5),
+            async { client.read(&mut probe).await },
+        )
+        .await
+        .expect("半开连接必须在窗尾被清（改前 = 无界等待）");
+        let elapsed = started.elapsed();
+        assert!(matches!(read, Ok(0) | Err(_)), "窗尾必须关闭连接: {read:?}");
+        assert!(
+            elapsed >= TLS_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(500),
+            "窗未生效（清得太早，改前无界等待形态）: {elapsed:?}"
+        );
     }
 }

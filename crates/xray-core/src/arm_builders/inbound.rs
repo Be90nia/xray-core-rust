@@ -37,8 +37,8 @@ use xray_transport::{connection::Connection as _, system_listener::InboundTcpLis
 
 use crate::{
     inbound::{
-        DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, PeekAhead, SsInboundMode,
-        bind_ss_udp, build_tls_acceptor, build_trojan_fallbacks, build_trojan_users,
+        DokodemoTcpOptions, HysteriaTcpDispatch, InboundRuntime, PeekAhead, SpawnAtShutdown as _,
+        SsInboundMode, bind_ss_udp, build_tls_acceptor, build_trojan_fallbacks, build_trojan_users,
         build_trojan_validator_shared, build_vless_decryption, build_vless_fallbacks,
         build_vless_validator, build_vmess_validator, handshake_timeout_for, inbound_tcpmask,
         inbound_udpmask, is_transport_listener_protocol, parse_anytls_tls_acceptor,
@@ -534,8 +534,8 @@ pub(crate) async fn build_dokodemo_inbound(
         // RemoveInbound 后端口仍可连）。
         let stop = shutdown_token.clone();
         let tcp_ctx = Arc::clone(&plugin_ctx);
-        handles.push(
-            fx.spawn_tracked(async move {
+        let serve = fx
+            .spawn_tracked(async move {
                 tokio::select! {
                     r = serve_dokodemo(listener, ohm_tcp, opts, tcp_ctx) => {
                         if let Err(e) = r {
@@ -545,8 +545,8 @@ pub(crate) async fn build_dokodemo_inbound(
                     _ = stop.cancelled() => {},
                 }
             })
-            .expect("internal FxScope is never closed"),
-        );
+            .at_shutdown_handle("dokodemo tcp serve");
+        handles.extend(serve);
     }
     if settings.allow_udp {
         let bind_addr: std::net::SocketAddr = addr.parse().map_err(|e| {
@@ -571,8 +571,8 @@ pub(crate) async fn build_dokodemo_inbound(
             udp_mask,
         )
         .await?;
-        handles.push(
-            fx.spawn_tracked(async move {
+        let serve = fx
+            .spawn_tracked(async move {
                 tokio::select! {
                     r = serve_dokodemo_udp_on(hub, dispatch, dest_udp, udp_ctx) => {
                         if let Err(e) = r {
@@ -582,8 +582,8 @@ pub(crate) async fn build_dokodemo_inbound(
                     _ = stop.cancelled() => {},
                 }
             })
-            .expect("internal FxScope is never closed"),
-        );
+            .at_shutdown_handle("dokodemo udp serve");
+        handles.extend(serve);
     }
     if handles.is_empty() {
         return Err(std::io::Error::new(
@@ -1483,7 +1483,7 @@ pub(crate) fn unix_socks_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
                     )
                     .await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("mixed (uds) conn");
         })
     })))
 }
@@ -1534,7 +1534,7 @@ pub(crate) fn unix_vless_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
                         );
                     }
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("vless (uds) conn");
         })
     })))
 }
@@ -1574,7 +1574,7 @@ pub(crate) fn unix_vmess_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<UnixS
                         );
                     }
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("vmess (uds) conn");
         })
     })))
 }
@@ -1617,7 +1617,7 @@ pub(crate) fn unix_trojan_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result<Unix
                     )
                     .await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("trojan (uds) conn");
         })
     })))
 }
@@ -1651,7 +1651,7 @@ pub(crate) fn unix_shadowsocks_serve(ctx: UnixInboundCtx<'_>) -> std::io::Result
                     let _ctx = Arc::clone(&task_ctx);
                     ss_legacy_pipeline(inbound, handler, conn, hs_timeout).await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("ss legacy (uds) conn");
         })
     })))
 }

@@ -143,13 +143,15 @@ enum XhSource {
     Unix(xray_transport::system_listener::UnixListener),
 }
 
-/// accept 错误分类处置（Resource 退避 / 单连接 debug / 未知 warn），永不退出。
+/// accept 错误分类处置（Resource 退避 / 单连接 debug / 未知 warn+退避），永不退出。
 async fn log_xh_accept_err(e: &io::Error, tag: &str, log_ident: &str) {
-    use xray_transport::accept_policy::{AcceptErrorKind, backoff_if_resource, classify};
+    use xray_transport::accept_policy::{
+        AcceptErrorKind, backoff_if_not_connection, classify, repeat_hint,
+    };
     match classify(e) {
         AcceptErrorKind::Resource => {
             crate::LOG.warn(format!("tag={tag} local={log_ident} error={e} splithttp inbound: 资源/瞬时类 accept 错误，退避 500ms 后继续"));
-            backoff_if_resource(e).await;
+            backoff_if_not_connection(e).await;
         },
         AcceptErrorKind::Connection => {
             crate::LOG.debug(format!(
@@ -157,7 +159,11 @@ async fn log_xh_accept_err(e: &io::Error, tag: &str, log_ident: &str) {
             ));
         },
         AcceptErrorKind::Unknown => {
-            crate::LOG.warn(format!("tag={tag} local={log_ident} error={e} splithttp inbound: accept 错误（未知类别），继续监听"));
+            match repeat_hint(e) {
+                Some(n) => crate::LOG.debug(format!("tag={tag} local={log_ident} error={e} splithttp inbound: accept 错误（未知类别）连续第 {n} 次，退避 500ms 后继续")),
+                None => crate::LOG.warn(format!("tag={tag} local={log_ident} error={e} splithttp inbound: accept 错误（未知类别），退避 500ms 后继续")),
+            }
+            backoff_if_not_connection(e).await;
         },
     }
 }

@@ -96,15 +96,76 @@ use xray_transport::{
 };
 use xray_transport_hysteria::quinn_adapter::QuinnListenerFactory;
 
-/// accept 错误退避：fd 耗尽（EMFILE/ENFILE）时睡眠 500ms 再重试——否则 accept 立即
-/// 失败-continue 构成忙旋 + warn 日志洪水（audit 高并发 HC-2，意图对齐 0bb4176d 与
-/// ws register.rs 样板）。判别用大小写不敏感 `contains("too many")`：样板的小写匹配
-/// 对 glibc 大写 "Too many open files" 永不命中（静默失效）；kind 判别不可用的原因：
-/// `ErrorKind::ProcessFdQuotaExceeded/SystemFdQuotaExceeded` 仍属 unstable
-/// io_error_more（1.98.0-nightly 实测 E0599）。其他错误不睡眠，维持原行为。
-async fn accept_fd_backoff(e: &std::io::Error) {
-    if e.to_string().to_lowercase().contains("too many") {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+/// accept 错误日志 + 退避（8 站共用；分级口径 = `xray_transport::accept_policy`）。
+///
+/// 改前只匹配 "too many" 文本：未知类错误既无退避（accept 立即失败-continue =
+/// 忙旋 + warn 洪水）也不降噪（A3，audit 2026-11-15）。现口径：
+/// - 资源类（EMFILE/ENFILE/EAGAIN…）→ `warn`（可见性不得降级，既有路径不变）+ 退避；
+/// - 单连接级 → `debug`；
+/// - 其它未知 → `warn`，同文本连续重复降 `debug` 并带计数（`repeat_hint`）+ 退避。
+///
+/// 退避 500ms = accept_policy `BACKOFF`（不再本地复制常量）。
+async fn log_and_backoff_accept(what: &str, e: &std::io::Error) {
+    use xray_transport::accept_policy::{
+        AcceptErrorKind, backoff_if_not_connection, classify, repeat_hint,
+    };
+    match classify(e) {
+        AcceptErrorKind::Resource => {
+            tracing::warn!(error = %e, "{what}: 资源/瞬时类 accept 错误，退避 500ms 后继续");
+        },
+        AcceptErrorKind::Connection => {
+            tracing::debug!(error = %e, "{what}: 单连接级 accept 错误，继续监听");
+        },
+        AcceptErrorKind::Unknown => match repeat_hint(e) {
+            Some(n) => tracing::debug!(
+                error = %e,
+                "{what}: accept 错误（未知类别）连续第 {n} 次，退避 500ms 后继续"
+            ),
+            None => tracing::warn!(
+                error = %e,
+                "{what}: accept 错误（未知类别），退避 500ms 后继续"
+            ),
+        },
+    }
+    backoff_if_not_connection(e).await;
+}
+
+/// 托管 spawn 的停机态归一（A1，audit 2026-11-15）。
+///
+/// 账本闸已关（`Err(ScopeClosed)`）是**设计内的停机正常返回**——账本自己已计数
+/// （`rejected_spawns`），`xray_frame::scope` 文档明写「Upgrade 失败/闸关即
+/// `Err(ScopeClosed)`，fail-visible 但不 panic」。旧 `.expect("arm FxScope is
+/// never closed")` 把这段正常返回炸成任务 panic：停机竞态下（accept 已出连接、
+/// 闸刚关）正好命中，panic 落在 arm 任务里污染停机清算。
+///
+/// 两个入口：丢弃句柄（accept 泵绝大多数站点）与需要句柄（如 `abort()` 中继）。
+pub(crate) trait SpawnAtShutdown<T> {
+    /// 丢弃句柄形态：停机拒发只留 debug。
+    fn at_shutdown(self, what: &str);
+    /// 需要句柄的站点：停机拒发回 `None`（调用方按「无任务」分支继续）。
+    fn at_shutdown_handle(self, what: &str) -> Option<skeleton_infra::fx::Spawned<T>>;
+}
+
+impl<T> SpawnAtShutdown<T>
+    for Result<skeleton_infra::fx::Spawned<T>, skeleton_infra::fx::ScopeClosed>
+{
+    fn at_shutdown(self, what: &str) {
+        match self {
+            Ok(_) => {},
+            Err(skeleton_infra::fx::ScopeClosed) => {
+                tracing::debug!(what, "arm scope closed at shutdown; task not spawned");
+            },
+        }
+    }
+
+    fn at_shutdown_handle(self, what: &str) -> Option<skeleton_infra::fx::Spawned<T>> {
+        match self {
+            Ok(handle) => Some(handle),
+            Err(skeleton_infra::fx::ScopeClosed) => {
+                tracing::debug!(what, "arm scope closed at shutdown; task not spawned");
+                None
+            },
+        }
     }
 }
 
@@ -601,8 +662,7 @@ pub(crate) async fn serve_mixed(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "mixed accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("mixed accept failed", &e).await;
                 continue;
             },
         };
@@ -626,7 +686,7 @@ pub(crate) async fn serve_mixed(
                 )
                 .await
             })
-            .expect("arm FxScope is never closed");
+            .at_shutdown("mixed conn");
     }
 }
 
@@ -689,7 +749,7 @@ pub(crate) async fn serve_mixed_conn<S>(
                 if is_mux_destination(&dest) {
                     // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
                     ctx.spawn(handle_mux_inbound_link(link, handler, None))
-                        .expect("arm FxScope is never closed");
+                        .at_shutdown("mixed mux carrier");
                 } else {
                     let _ = handler.dispatch_with_access(&dest, link, access).await;
                 }
@@ -704,11 +764,13 @@ pub(crate) async fn serve_mixed_conn<S>(
                     .spawn(async move {
                         let _ = handle_udp_associate(temp_udp, udp_handler, udp_idle).await;
                     })
-                    .expect("arm FxScope is never closed");
+                    .at_shutdown_handle("mixed udp associate relay");
                 // 控制连接 EOF/错误（客户端关闭）即终止 relay
                 let mut drop_buf = [0u8; 64];
                 let _ = stream.read(&mut drop_buf).await;
-                relay.abort();
+                if let Some(relay) = relay {
+                    relay.abort();
+                }
             },
             Err(e) => tracing::debug!(error = %e, "mixed socks handshake failed"),
         }
@@ -755,7 +817,7 @@ pub(crate) async fn serve_mixed_conn<S>(
             if is_mux_destination(&dest) {
                 // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
                 ctx.spawn(handle_mux_inbound_link(link, handler, None))
-                    .expect("arm FxScope is never closed");
+                    .at_shutdown("socks mux carrier");
             } else {
                 let _ = handler.dispatch_with_access(&dest, link, access).await;
             }
@@ -790,8 +852,7 @@ pub async fn serve_http(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "http accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("http accept failed", &e).await;
                 continue;
             },
         };
@@ -861,14 +922,14 @@ pub async fn serve_http(
                         );
                         // W4 面 6：carrier 归 arm scope（与 inbound 同寿命）。
                         ctx.spawn(handle_mux_inbound_link(link, handler, None))
-                            .expect("arm FxScope is never closed");
+                            .at_shutdown("http mux carrier");
                         return;
                     }
                     let _ = handler.dispatch_with_access(&dest, link, access).await;
                     return;
                 }
             })
-            .expect("arm FxScope is never closed");
+            .at_shutdown("http conn");
     }
 }
 
@@ -1626,8 +1687,7 @@ pub async fn serve_dokodemo(
         let (stream, _peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "dokodemo accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("dokodemo accept failed", &e).await;
                 continue;
             },
         };
@@ -1713,7 +1773,7 @@ pub async fn serve_dokodemo(
                 }
             }
             })
-            .expect("arm FxScope is never closed");
+            .at_shutdown("dokodemo conn");
     }
 }
 
@@ -1822,7 +1882,7 @@ pub async fn serve_dokodemo_udp_on(
                                 )
                                 .await;
                             })
-                            .expect("arm FxScope is never closed");
+                            .at_shutdown("dokodemo udp peer session");
                         e.insert(PeerSession { tx, last_active: Budget::tokio() })
                     }
                 };
@@ -2174,7 +2234,7 @@ pub async fn serve_ss(
                     },
                 };
             })
-            .expect("arm FxScope is never closed");
+            .at_shutdown("ss mode loop");
     }
     tracing::info!(addr = %listener.local_addr()?, "ss inbound listening");
     loop {
@@ -2183,8 +2243,7 @@ pub async fn serve_ss(
         let (stream, _peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "ss accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("ss accept failed", &e).await;
                 continue;
             },
         };
@@ -2197,7 +2256,7 @@ pub async fn serve_ss(
                 let _ctx = Arc::clone(&task_ctx);
                 ss_mode_conn_pipeline(mode, handler, stream, handshake_timeout).await;
             })
-            .expect("arm FxScope is never closed");
+            .at_shutdown("ss conn pipeline");
     }
 }
 
@@ -2312,6 +2371,16 @@ type SsUdpItem = (Destination, Vec<u8>, xray_proxy_ss::config::MemoryAccount);
 /// SS UDP per-client 会话空闲淘汰时限（Go `CancelAfterInactivity(1min)`）。
 const SS_UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// SS UDP per-client 会话数上限（C1，audit 2026-11-15；口径搬 dokodemo 的
+/// [`DOKODEMO_UDP_MAX_SESSIONS`]）：源地址可伪造 ⇒ 无门即"任意会话数"，每个会话
+/// 含 64KiB 回包缓冲 + 16 深队列。4096 会话对正常客户端量级零感知，空闲 60s 回收。
+const SS_UDP_MAX_SESSIONS: usize = 4096;
+
+/// SS UDP 会话准入判定：既有 client 恒放行，新 client 仅在表未满时放行（超限丢包）。
+fn ss_udp_admits(count: usize, is_new_client: bool) -> bool {
+    !is_new_client || count < SS_UDP_MAX_SESSIONS
+}
+
 /// SS-2022 UDP AEAD 会话表存活期（bd 29nk，对齐 sing-shadowsocks
 /// `udpSessions: LruCache{WithAge(udpTimeout)}`——Go Xray inbound.go:57
 /// `NewServiceWithPassword(..., 500, ...)` 传 udpTimeout=500s）。
@@ -2387,6 +2456,19 @@ pub async fn serve_ss_udp(
         };
         let dest = Destination::new(header.address.clone(), Port::new(header.port), Network::UDP);
         let item = (dest, payload, header.user.account.clone());
+        // 会话表容量门（C1）：超限的新 client 包直接丢（有损 UDP 语义，不阻塞、不 panic），
+        // 既有 client 恒放行。
+        if !ss_udp_admits(clients.len(), !clients.contains_key(&client)) {
+            dropped = dropped.saturating_add(1);
+            if dropped == 1 || dropped % 1024 == 0 {
+                tracing::warn!(
+                    dropped,
+                    limit = SS_UDP_MAX_SESSIONS,
+                    "ss udp session table full, packet dropped"
+                );
+            }
+            continue;
+        }
         let tx = clients.entry(client).or_insert_with(|| {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             let relay_udp = Arc::clone(&udp);
@@ -2398,7 +2480,7 @@ pub async fn serve_ss_udp(
                     let _ctx = ctx_pin;
                     ss_udp_client_relay(relay_udp, client, rx, relay_handler).await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("ss udp client relay");
             tx
         });
         if udp_try_dispatch(tx, item, &mut dropped) {
@@ -2595,7 +2677,7 @@ pub async fn serve_ss2022_udp(
                     )
                     .await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("ss relay udp client relay");
             tx
         });
         if udp_try_dispatch(tx, (dest, payload, client), &mut dropped) {
@@ -2654,7 +2736,7 @@ pub async fn serve_ss2022_relay_udp(
                     let _ctx = ctx_pin;
                     ss2022_udp_client_relay(relay_udp, client, None, rx, relay_handler).await;
                 })
-                .expect("arm FxScope is never closed");
+                .at_shutdown("ss2022 udp client relay");
             tx
         });
         if udp_try_dispatch(tx, (dest, frame, client), &mut dropped) {
@@ -2816,7 +2898,7 @@ pub async fn serve_dns(
                 dns_udp_recv_loop(udp, udp_inbound).await
             }
         })
-        .expect("arm FxScope is never closed");
+        .at_shutdown_handle("dns udp recv loop");
     // TCP accept loop
     let tcp_inbound = Arc::clone(&inbound);
     // scope 生命周期锚（loop 任务）+ 嵌套 per-conn spawn 句柄（克隆体各自再锚）
@@ -2838,16 +2920,19 @@ pub async fn serve_dns(
                                     tracing::debug!(error = %e, "dns tcp conn failed");
                                 }
                             })
-                            .expect("arm FxScope is never closed");
+                            .at_shutdown("dns tcp conn");
                     },
                     Err(e) => {
-                        tracing::warn!(error = %e, "dns tcp accept failed");
-                        accept_fd_backoff(&e).await;
+                        log_and_backoff_accept("dns tcp accept failed", &e).await;
                     },
                 }
             }
         })
-        .expect("arm FxScope is never closed");
+        .at_shutdown_handle("dns tcp accept loop");
+    // 启动即遇停机（arm scope 闸已关）：无任务可监视，直接收（debug 已留痕）。
+    let (Some(udp_handle), Some(tcp_handle)) = (udp_handle, tcp_handle) else {
+        return Ok(());
+    };
     // 等待任一 task 结束（正常情况不会结束）
     tokio::select! {
         r = udp_handle.join() => {
@@ -3737,7 +3822,7 @@ pub(crate) fn spawn_inbound_serve(
                 }
             }
         })
-        .expect("arm FxScope is never closed");
+        .at_shutdown_handle("inbound serve task");
     // 外层壳：JoinHandle 外返契约（InboundRuntime → spawn_inbounds → functions.rs
     // 消费链，改返回类型超出本波文件面）+ panic 监督（51d50459 语义保留）+ 停机
     // 监视（bd a9xgp）。例外登记（W4 面 6）：JoinHandle 外返契约，与 tun 保留同源。
@@ -3761,6 +3846,12 @@ pub(crate) fn spawn_inbound_serve(
     )]
     tokio::spawn(async move {
         let arm = arm_anchor;
+        // 启动即遇停机（arm scope 闸已关，A1）：无 serve 任务可监视——只做幂等排空，
+        // 不再 `.expect` 炸壳。
+        let Some(inner) = inner else {
+            drain_report(&tag, arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await);
+            return;
+        };
         tokio::select! {
             _ = watch_token.cancelled() => {
                 drain_report(&tag, arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await);
@@ -4180,8 +4271,7 @@ pub(crate) async fn serve_reality_vless(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "reality inbound accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("reality inbound accept failed", &e).await;
                 continue;
             },
         };
@@ -4373,8 +4463,7 @@ pub(crate) async fn serve_reality_trojan(
         let (stream, peer) = match listener.accept_masked().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(error = %e, "trojan+reality inbound accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("trojan+reality inbound accept failed", &e).await;
                 continue;
             },
         };
@@ -4810,8 +4899,7 @@ pub(crate) async fn serve_unix_listener(
         match listener.accept().await {
             Ok(conn) => on_conn(conn),
             Err(e) => {
-                tracing::warn!(error = %e, "unix inbound accept failed");
-                accept_fd_backoff(&e).await;
+                log_and_backoff_accept("unix inbound accept failed", &e).await;
             },
         }
     }
@@ -13617,6 +13705,49 @@ mod tests {
         assert!(dokodemo_udp_admits(DOKODEMO_UDP_MAX_SESSIONS - 1, true));
         // 每 peer 队列深度确实压到 16（票据「缓冲按需」面）。
         assert_eq!(DOKODEMO_UDP_PEER_QUEUE, 16);
+    }
+
+    /// C1（audit 2026-11-15）：SS UDP 会话表容量门——伪造源地址洪泛不建新会话
+    /// （包被丢），既有合法会话不受影响，表规模恒 ≤ 上限。
+    ///
+    /// 真跑 4096 个 relay 任务代价过大，这里按主循环的准入序列复刻（同 dokodemo
+    /// 容量门的既有做法）：先占一个合法槽，再灌 2×上限 个伪造地址。
+    #[test]
+    fn ss_udp_session_table_respects_cap() {
+        let mut table: std::collections::HashSet<std::net::SocketAddr> = Default::default();
+        let mut dropped = 0usize;
+        let admit = |addr: std::net::SocketAddr,
+                     table: &mut std::collections::HashSet<std::net::SocketAddr>,
+                     dropped: &mut usize| {
+            if ss_udp_admits(table.len(), !table.contains(&addr)) {
+                table.insert(addr);
+                true
+            } else {
+                *dropped += 1;
+                false
+            }
+        };
+
+        // 合法会话（先到）必被准入。
+        let legit: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        assert!(admit(legit, &mut table, &mut dropped));
+
+        // 伪造源地址洪泛 2×上限：表恒 ≤ 上限，多余包被丢。
+        for i in 0..(SS_UDP_MAX_SESSIONS * 2) {
+            let forged = std::net::SocketAddr::from((
+                [198, 51, 100, (i % 254) as u8],
+                20_000 + (i % 40_000) as u16,
+            ));
+            admit(forged, &mut table, &mut dropped);
+        }
+        assert_eq!(table.len(), SS_UDP_MAX_SESSIONS, "会话数不得超门");
+        assert!(dropped > 0, "超限包必须被丢");
+
+        // 既有合法会话不受影响（仍在表内，再来包仍准入且不新建会话）。
+        assert!(table.contains(&legit));
+        assert!(ss_udp_admits(table.len(), !table.contains(&legit)));
+        assert!(admit(legit, &mut table, &mut dropped));
+        assert_eq!(table.len(), SS_UDP_MAX_SESSIONS);
     }
 
     /// bd ym0z8：同 tag **并发** `start_inbound` —— 20 个并发只有一个成功，其余

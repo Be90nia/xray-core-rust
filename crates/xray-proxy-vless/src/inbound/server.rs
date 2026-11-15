@@ -36,7 +36,11 @@ use xray_app_dispatcher::{OutboundHandlerManager, default::SimpleOhm};
 use xray_buf::io::{new_coalescing_writer, new_reader, new_writer};
 use xray_common::net::{destination::Destination, network::Network, port::Port};
 use xray_frame::{LogFacade, deadline::Budget};
-use xray_transport::{link::Link, system_listener::InboundTcpListener};
+use xray_transport::{
+    link::Link,
+    system_listener::InboundTcpListener,
+    tls_handshake_gate::{TLS_HANDSHAKE_TIMEOUT, accept_stream_with_timeout},
+};
 
 use crate::{
     encoding::{
@@ -284,7 +288,12 @@ pub async fn serve_vless(
                 // 记录边界限长读，裸尾留在内核缓冲，raw_tcp 克隆（dup 共享
                 // 内核缓冲游标）切 DIRECT 后天然读到完整裸流。
                 // 两个后端都要过 framer（btls/BoringSSL 的 BIO 同样会预读）。
-                match acc.accept(xray_transport::record_framer::RecordFramer::new(stream)).await {
+                match accept_stream_with_timeout(
+                    acc.accept(xray_transport::record_framer::RecordFramer::new(stream)),
+                    TLS_HANDSHAKE_TIMEOUT,
+                )
+                .await
+                {
                     Ok(tls_stream) => {
                         let name = tls_stream.server_name().unwrap_or("").to_string();
                         let alpn = tls_stream
@@ -306,6 +315,15 @@ pub async fn serve_vless(
                             raw_tcp, &task_ctx,
                         )
                         .await
+                    },
+                    // 半开连接（连了不发 ClientHello）在窗尾被清：预期丢弃走 debug，
+                    // 不刷 warn 洪水（R-1，audit 2026-11-15）。
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        INBOUND_LOG.debug(format!(
+                            "vless TLS handshake timeout after {TLS_HANDSHAKE_TIMEOUT:?}, \
+                             closing silent connection peer={peer}"
+                        ));
+                        return;
                     },
                     Err(e) => {
                         INBOUND_LOG.warn(format!("vless TLS accept failed error={e}"));
@@ -3253,5 +3271,68 @@ mod tests {
             "闸关路径必须早于 idle deadline 收尾，took {elapsed:?}"
         );
         assert_eq!(closed_scope_rejected_conns(), before + 1, "闸关拒发必须计数");
+    }
+
+    /// R-1 回归（audit 2026-11-15）：半开连接（TCP 建连后不发 ClientHello）在
+    /// `TLS_HANDSHAKE_TIMEOUT` 窗尾被清——改前 `acc.accept` 裸等，该任务 + fd
+    /// 永久占用（accept 环仍活，故只能靠对端 EOF 判定）。
+    #[tokio::test]
+    async fn vless_tls_handshake_half_open_peer_is_closed_within_window() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap(),
+            )
+            .unwrap();
+        let acceptor = Arc::new(xray_tls::inbound_acceptor::InboundTlsAcceptor::Rustls(
+            Arc::new(server_config).into(),
+        ));
+
+        let (_, validator) = make_validator_with_user();
+        let ohm = Arc::new(SimpleOhm::new());
+        ohm.set_default(Arc::new(DialBridge::new("freedom", make_freedom_dial_fn()))
+            as Arc<dyn xray_app_dispatcher::DispatchHandler>);
+        let listener = InboundTcpListener::bind(
+            "127.0.0.1:0",
+            xray_transport::sockopt::SocketOptions::default(),
+        )
+        .await
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+        xray_common::testing::spawn("vless-tls-half-open-serve", async move {
+            let _ = serve_vless(
+                listener,
+                ohm,
+                validator,
+                Some(acceptor),
+                None,
+                None,
+                test_plugin_ctx(),
+            )
+            .await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let started = std::time::Instant::now();
+        let mut probe = [0u8; 1];
+        let read = tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT + std::time::Duration::from_secs(5),
+            async { client.read(&mut probe).await },
+        )
+        .await
+        .expect("半开连接必须在窗尾被清（改前 = 无界等待）");
+        let elapsed = started.elapsed();
+        assert!(matches!(read, Ok(0) | Err(_)), "窗尾必须关闭连接: {read:?}");
+        assert!(
+            elapsed >= TLS_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(500),
+            "窗未生效（清得太早，改前无界等待形态）: {elapsed:?}"
+        );
     }
 }
