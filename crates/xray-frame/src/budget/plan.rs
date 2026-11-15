@@ -400,10 +400,16 @@ impl MemoryPlan {
         let available = if available == 0 { FALLBACK_AVAILABLE_BYTES } else { available };
         let tier = MemoryTier::from_available(available);
         let total_budget = tier.total_budget(available);
-        // 每方向闸 = 总预算/8，钳在 [4MiB, 32MiB]：四档得 5 / 12 / 24 / 32 MiB，
-        // 恒 ≥ 实测 BDP 上沿 ⇒ 正常链路上闸不 binding（不砍吞吐），只在生产者
-        // 远快于消费者时兜住内存。
-        let bridge_gate = (total_budget / 8).clamp(BRIDGE_GATE_MIN_BYTES, BRIDGE_GATE_MAX_BYTES);
+        // 每方向闸 = 总预算/2，钳在 [4MiB, 32MiB]：四档得 20 / 32 / 32 / 32 MiB。
+        //
+        // 2026-11-15 修正（生产回归，用户实测 60→30）：旧式 `/8 clamp(4,32)` 给四档
+        // 5/12/24/32，其中 **small 档 12MiB**。原注释「恒 ≥ 实测 BDP 上沿（3.56MB）
+        // ⇒ 正常链路上闸不 binding」的前提是低 RTT 低带宽；真实 CDN 路径
+        // BDP = 60MB/s × 0.45s ≈ **27MB**，12MiB 闸从中间横切 ⇒ 吞吐 = 12MiB/RTT
+        // ≈ 26.7MB/s（恰好用户「60 对半砍」），且桥是全协议共用 ⇒ ws/xhttp/
+        // httpupgrade 同抖。闸是**瞬态背压上界**（lazy 分配，正常在途 = BDP），
+        // 抬高不涨常驻；跨连接合计由进程级 in-flight 预算兜（`inflight_budget_bytes`）。
+        let bridge_gate = (total_budget / 2).clamp(BRIDGE_GATE_MIN_BYTES, BRIDGE_GATE_MAX_BYTES);
         // 连接数上限只按**每连接规划上界**反解（bd sfqlu 原式，保持并发能力）。
         // **不用** `2 × gate` 反解（D-01 口径修正 2026-11-08 PM 打回）：闸是**瞬态
         // 背压上界**（lazy 分配，正常链路远不满），拿它当每连接常驻会把四档并发
@@ -706,19 +712,19 @@ mod tests {
         let tiny = MemoryPlan::from_available(256 * MIB);
         assert_eq!(tiny.tier, MemoryTier::Tiny);
         assert_eq!(tiny.total_budget, 40 * MIB as usize);
-        assert_eq!(tiny.bridge_gate, 5 * MIB as usize);
+        assert_eq!(tiny.bridge_gate, 20 * MIB as usize);
         assert_eq!(tiny.max_conns, 13);
 
         let small = MemoryPlan::from_available(512 * MIB);
         assert_eq!(small.tier, MemoryTier::Small);
         assert_eq!(small.total_budget, 96 * MIB as usize);
-        assert_eq!(small.bridge_gate, 12 * MIB as usize);
+        assert_eq!(small.bridge_gate, BRIDGE_GATE_MAX_BYTES);
         assert_eq!(small.max_conns, 32);
 
         let medium = MemoryPlan::from_available(1024 * MIB);
         assert_eq!(medium.tier, MemoryTier::Medium);
         assert_eq!(medium.total_budget, 192 * MIB as usize);
-        assert_eq!(medium.bridge_gate, 24 * MIB as usize);
+        assert_eq!(medium.bridge_gate, BRIDGE_GATE_MAX_BYTES);
         assert_eq!(medium.max_conns, 64);
 
         // 「不设」= 大盘机器：min(512MB, 可用/4)，闸钳到上沿 32MiB。
@@ -790,20 +796,25 @@ mod tests {
         }
     }
 
-    /// 2026-11-15 回归钉子：进程级 in-flight 预算必须装下「10 条满载连接 × 单方向闸」。
+    /// 2026-11-15 回归钉子：进程级 in-flight 预算必须装下「10 条满载连接 × 单方向闸」，
+    /// 或物理可用 1/4（取较小者——小机带宽本就不支撑 10 条满载）。
     ///
     /// 现场：small 档旧口径预算 = 48MiB，而 10 条 60MB/s@200ms 连接需 ~120MB（每条
-    /// BDP ≈ 桥闸 12MiB）⇒ 每条只分到 ~4.8MB，吞吐按比例砍半且 ws/xhttp/httpupgrade
+    /// BDP ≈ 桥闸）⇒ 每条只分到 ~4.8MB，吞吐按比例砍半且 ws/xhttp/httpupgrade
     /// 全族同抖（用户侧「60 对半砍」）。预算回落到 `total_budget/2` 即本测试红。
     #[test]
     fn inflight_budget_covers_ten_full_gate_conns() {
         for available in [256 * MIB, 512 * MIB, 1024 * MIB, 16 * 1024 * MIB] {
             let plan = MemoryPlan::from_available(available);
             let budget = plan.inflight_budget_bytes();
-            let need = plan.bridge_gate.saturating_mul(10);
+            // 需求 = 10 条满载在飞，但不超过物理允许（可用 1/4）。
+            let need = plan
+                .bridge_gate
+                .saturating_mul(10)
+                .min((plan.available / 4) as usize);
             assert!(
                 budget >= need,
-                "{available}B 档 in-flight 预算 {budget}B 装不下 10 条满载连接（需 {need}B）：\
+                "{available}B 档 in-flight 预算 {budget}B 装不下 {need}B（10 条满载 ∩ 可用1/4）：\
                  多连接测速会被预算钉成半速（2026-11-15 生产回归，禁回退到 total_budget/2）"
             );
             // 物理安全：不超过可用内存 1/4（除非旧下限 total_budget/2 更高）。
