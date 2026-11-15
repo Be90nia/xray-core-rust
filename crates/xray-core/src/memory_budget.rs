@@ -27,6 +27,16 @@
 //! 3. 上限面（不判、只打印）：QUIC 缺省 socket（Linux `rmem_max` 钳制 ⇒ 按 16MiB
 //!    预约会误杀合法配置）、xhttp h2 send_buf（每连接、惰性分配）、DoH3 resolver
 //!    socket（装配期不可数）、桥在途。
+//!
+//!    **每连接派生面（bd p5m5m）**：这三种面装配期零占用、运行期按连接线性涨——
+//!    TLS 记录层缓冲（[`TLS_CONN_STATE_EST_BYTES`]）、xhttp 服务端/客户端 h2
+//!    send_buf（档位真缓冲 / 16MiB hyper 覆写值）、tokio worker 栈
+//!    （[`TOKIO_THREAD_STACK_BYTES`] × 核数）。乘数一律**余量口径**（预算 − 常态
+//!    账面 ÷ 单价，顺序扣除，上界 = 运行期连接上限），装不下只 WARN（一次/进程）。
+//!    h2 SETTINGS 流窗/连窗是**零预分配信用计数器** ⇒ 只登记单价并显式标
+//!    `not memory`，**禁**乘条数记成内存。固定面则**逐项**入硬账
+//!    （[`startup_fixed_floor_items_for_with_inflight`]）——xray_buf 池/共享块池/
+//!    DNS 缓存/TLS session cache/握手在途各自可见，合计不变。
 //! 4. **UDP dispatch 会话面（bd rmbby）**：每会话**常驻** `UDP_SESSION_RESIDENT_BYTES` （8KiB
 //!    池化读缓冲，建会话即占）进硬账——条数按**余量口径**反解 （余额 ÷ 常驻字节，上界 =
 //!    `MAX_UDP_SESSIONS`）并写进执行点 （`plan::set_effective_max_udp_sessions`，dispatcher
@@ -70,11 +80,13 @@ pub use xray_frame::budget::{
     QUIC_STREAM_RECEIVE_WINDOW_BYTES, QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
     QUIC_UDP_DEFAULT_RECV_BUFFER_BYTES, RESERVE_MARGIN_MIN_BYTES, SOCKET_KERNEL_BOOKKEEPING_FACTOR,
     SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES, SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES,
-    SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES, TLS_SESSION_CACHE_ESTIMATE_BYTES,
-    TLS_SESSION_CACHE_MAX_ENTRIES, WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES,
-    XDRIVE_H2_SEND_BUF_PER_CONN_BYTES, XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES, XRAY_BUDGET_BYTES,
-    XRAY_BUF_POOL_TOTAL_MAX_BYTES, set_effective_handshake_inflight, startup_fixed_floor_bytes,
+    SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES, TLS_CONN_STATE_EST_BYTES,
+    TLS_SESSION_CACHE_ESTIMATE_BYTES, TLS_SESSION_CACHE_MAX_ENTRIES, TOKIO_THREAD_STACK_BYTES,
+    WS_PER_CONN_BUFFER_BOOKED_BYTES, XDNS_FRAG_WORST_CASE_BYTES, XDRIVE_H2_SEND_BUF_PER_CONN_BYTES,
+    XDRIVE_SESSION_WAL_BUFFER_BOOKED_BYTES, XRAY_BUDGET_BYTES, XRAY_BUF_POOL_TOTAL_MAX_BYTES,
+    effective_handshake_inflight, set_effective_handshake_inflight, startup_fixed_floor_bytes,
     startup_fixed_floor_bytes_for, startup_fixed_floor_bytes_for_with_inflight,
+    startup_fixed_floor_items_for_with_inflight,
 };
 
 /// 单项每连接缓冲预算校验（字节；`origin` 指明值的来源，进错误文案）。
@@ -104,6 +116,16 @@ fn stream_network(
     let name =
         ss.and_then(|v| v.get("method").or_else(|| v.get("network"))).and_then(|v| v.as_str())?;
     xray_common::net::transport::canonical_transport_protocol(name)
+}
+
+/// streamSettings 是否 TLS 终结面（`security` = `tls`/`reality`，大小写不敏感）。
+///
+/// 每 TLS 连接一份记录层缓冲（[`TLS_CONN_STATE_EST_BYTES`]）⇒ 预算门 caps 栏按
+/// 端点数可见（bd p5m5m）。`reality` 走同一 TLS 栈（btls/uTLS），故同计。
+fn tls_security(ss: Option<&serde_json::Value>) -> bool {
+    ss.and_then(|v| v.get("security"))
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("tls") || s.eq_ignore_ascii_case("reality"))
 }
 
 /// 预算门两栏报告（bd 258qt / pyka7 / nlhht 的口径修正）。
@@ -277,12 +299,18 @@ pub fn budget_report_with(
     // 纯 transport 形态都带 `network:"masque"` ⇒ 统一按 streamSettings 计数；每条
     // 连接一条 CONNECT-IP 隧道（R15 shortcut），隧道 h2 send_buf 上界入硬账。
     let mut masque_endpoints = 0usize;
+    // TLS 终结端点数（bd p5m5m）：每 TLS 连接一份记录层缓冲，属**每连接派生面**
+    // （装配期零连接）⇒ 只进 caps 栏，条数按预算余量反解。
+    let mut tls_endpoints = 0usize;
     let stream_settings = built
         .inbounds
         .iter()
         .map(|i| i.stream_settings_json.as_ref())
         .chain(built.outbounds.iter().map(|o| o.stream_settings_json.as_ref()));
     for ss in stream_settings {
+        if tls_security(ss) {
+            tls_endpoints += 1;
+        }
         match stream_network(ss) {
             Some(xray_common::net::transport::TransportProtocol::Quic) => {
                 quic_endpoints += 1;
@@ -332,7 +360,9 @@ pub fn budget_report_with(
     let hs_per_listener =
         (hs_avail / HANDSHAKE_TASK_EST_BYTES / listeners.max(1)).min(HANDSHAKE_INFLIGHT_MAX);
     set_effective_handshake_inflight(hs_per_listener);
-    let fixed = startup_fixed_floor_bytes_for(cores, listeners);
+    // 固定底数用**本次反解值**算（不读进程级 static）——static 被同进程其它实例/测试
+    // 并发改写时读它会与报告内其它数字不一致（bd p5m5m 实测过该竞态）。
+    let fixed = startup_fixed_floor_bytes_for_with_inflight(cores, listeners, hs_per_listener);
     // 固定面与显式 socket 先扣，剩下的才是连接可用额。不足 = 一条满额 pipe 都装不下。
     let for_conns = budget.saturating_sub(fixed + quic_explicit_booked);
     // `bufferSize 0`（Go 合法「不排队」）不占字节 ⇒ 装得下的条数不受限。
@@ -448,6 +478,30 @@ pub fn budget_report_with(
         + masque_send_buf_booked;
     let steady_booked = fixed + quic_explicit_booked + conns * per_conn_pipe + udp_resident_booked;
     let projected = steady_booked + transient_booked;
+
+    // ── 3c) 每连接派生面（bd p5m5m，caps 栏；不进 projected）──
+    // 三种面装配期零占用、运行期按连接线性涨：TLS 记录层缓冲、xhttp 服务端 h2
+    // send_buf（档位真缓冲）、xhttp 客户端 h2 send_buf（16MiB，hyper 覆写值）。
+    // 乘数 = **余量口径**：（预算 − 常态账面）÷ 每连接单价，顺序扣除、上界 = 运行期
+    // 连接上限。禁按档位最大并发乘（16/32MiB × 32 条 = 0.5–1GiB 恒 10× 超账 ⇒
+    // 告警退化成噪音，D-01 同款教训）。真装不下时只 WARN（用户裁决：不拒启）。
+    let residual = budget.saturating_sub(steady_booked);
+    let tls_fit = residual / TLS_CONN_STATE_EST_BYTES;
+    let tls_conns = if tls_endpoints > 0 { max_conns.min(tls_fit) } else { 0 };
+    let tls_booked = tls_conns * TLS_CONN_STATE_EST_BYTES;
+    let xhttp_conn_booked = xhttp_conn_booked_bytes(plan.tier);
+    let xhttp_server_fit = residual.saturating_sub(tls_booked) / xhttp_conn_booked;
+    let xhttp_server_conns = if splithttp > 0 { max_conns.min(xhttp_server_fit) } else { 0 };
+    let xhttp_server_booked = xhttp_server_conns * xhttp_conn_booked;
+    let xhttp_client_fit =
+        residual.saturating_sub(tls_booked + xhttp_server_booked) / H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    let xhttp_client_conns = if splithttp > 0 { max_conns.min(xhttp_client_fit) } else { 0 };
+    let xhttp_client_booked = xhttp_client_conns * H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    // tokio 线程栈：worker 栈随 runtime 构建常驻（核数 × 2MiB）；spawn_blocking
+    // 线程按需 spawn（同栈档，容量由 xray-cli 的 `XRAY_MAX_BLOCKING_THREADS` 管，
+    // 装配期 0 条）⇒ 只记 worker 面，lazy 面写进 caps 标签。
+    let tokio_stacks_booked = cores * TOKIO_THREAD_STACK_BYTES;
+
     if conns_fit == 0 {
         violations.push(format!(
             "actual occupancy {steady_booked}B > budget {budget}B even for 1 conn: fixed {fixed}B \
@@ -562,22 +616,82 @@ pub fn budget_report_with(
             full_load_product as f64 / budget as f64,
         ));
     }
+    // 每连接派生面装不下运行期并发上限 ⇒ **明示超订**（bd p5m5m）：这些面装配期
+    // 零占用、运行期按连接线性涨，装不下的条数不受预算约束。`check_startup_budget`
+    // 每次启动只调一次 ⇒ 本告警天然限频（一次/进程），不引入运行期观测任务。
+    let mut per_conn_over: Vec<String> = Vec::new();
+    if tls_endpoints > 0 && tls_conns < max_conns {
+        per_conn_over
+            .push(format!("TLS 记录层状态 {tls_conns} 条（{TLS_CONN_STATE_EST_BYTES}B/条）"));
+    }
+    if splithttp > 0 && xhttp_server_conns < max_conns {
+        per_conn_over.push(format!(
+            "xhttp 服务端 h2 send_buf {xhttp_server_conns} 条（{xhttp_conn_booked}B/条，档位 {}）",
+            plan.tier.as_str()
+        ));
+    }
+    if splithttp > 0 && xhttp_client_conns < max_conns {
+        per_conn_over.push(format!(
+            "xhttp 客户端 h2 send_buf {xhttp_client_conns} 条（{H2_MAX_SEND_BUF_PER_CONN_BYTES}B/条）"
+        ));
+    }
+    if !per_conn_over.is_empty() {
+        notes.push(format!(
+            "每连接派生面超订（bd p5m5m，只 WARN 不拒启）：{}；运行期连接上限 {max_conns} 条，\
+             第 N+1 条起该面内存不受预算约束（账面见 caps 栏，乘数 = 余量装得下的条数，\
+             非档位最大并发）",
+            per_conn_over.join("；")
+        ));
+    }
     let degraded = (!notes.is_empty()).then(|| notes.join("；"));
 
     // ── 4) 上限面（打印用；不进 projected）──
-    // xhttp 每连接账面按**档位实际生效值**打（send_buf 8MiB@tiny / 16MiB@small /
-    // 32MiB@medium|large + 空闲连接池余量）：打印值必须与 transport 侧实际定窗一致。
-    let xhttp_conn_booked = xhttp_conn_booked_bytes(plan.tier);
-    let caps = vec![
+    // xhttp 每连接账面按**档位实际生效值**打（send_buf 8MiB@tiny / 32MiB@small+
+    // 空闲连接池余量）：打印值必须与 transport 侧实际定窗一致。
+    // **每连接派生面在前**（bd p5m5m）：条数 = 余量装得下的条数（0 = 本面在余量内
+    // 一条都装不下，全超订），字节 = 条数 × 单价 ——「上限 ≠ 预约」，装配期真占用 0。
+    let mut caps: Vec<(String, usize)> = Vec::new();
+    if tls_endpoints > 0 {
+        caps.push((
+            format!(
+                "{tls_endpoints} tls endpoints: {tls_conns}/{max_conns} conns x \
+                 {TLS_CONN_STATE_EST_BYTES}B per-conn tls record state (residual fit {tls_fit})"
+            ),
+            tls_booked,
+        ));
+    }
+    if splithttp > 0 {
+        caps.push((
+            format!(
+                "{splithttp} xhttp: {xhttp_server_conns}/{max_conns} conns x \
+                 {xhttp_conn_booked}B per-conn h2 send_buf (residual fit {xhttp_server_fit}, \
+                 tier {})",
+                plan.tier.as_str()
+            ),
+            xhttp_server_booked,
+        ));
+        caps.push((
+            format!(
+                "{splithttp} xhttp: {xhttp_client_conns}/{max_conns} conns x \
+                 {H2_MAX_SEND_BUF_PER_CONN_BYTES}B per-conn h2 client send_buf \
+                 (residual fit {xhttp_client_fit})"
+            ),
+            xhttp_client_booked,
+        ));
+    }
+    caps.push((
+        format!(
+            "{cores} tokio worker stacks x {TOKIO_THREAD_STACK_BYTES}B (+ spawn_blocking threads \
+             on demand, same stack size, capped by XRAY_MAX_BLOCKING_THREADS)"
+        ),
+        tokio_stacks_booked,
+    ));
+    caps.extend([
         (
             format!(
                 "{quic_default} QUIC x {QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES}B default socket"
             ),
             quic_default * QUIC_UDP_DEFAULT_RECV_BUFFER_BOOKED_BYTES,
-        ),
-        (
-            format!("{splithttp} xhttp x {xhttp_conn_booked}B per-conn h2 send_buf cap"),
-            splithttp * xhttp_conn_booked,
         ),
         // bd yc54c G5：xdrive 会话缓冲面上限面（WAL 段缓冲 + h2 send buf，均
         // 惰性/会话级，装配期零会话 ⇒ 不进硬账）。
@@ -618,6 +732,22 @@ pub fn budget_report_with(
             ),
             QUIC_STREAM_RECEIVE_WINDOW_BYTES,
         ),
+        // h2 SETTINGS 流窗/连窗是**零预分配信用计数器**（登记簿同 item doc）⇒ 只用单价
+        // 登记防回档，**禁**乘连接数记成内存（乘了就是造假账）。
+        (
+            format!(
+                "per h2 stream {SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES}B server flow window \
+                 (credit counter, zero preallocation — not memory)"
+            ),
+            SPLITHTTP_H2_SERVER_STREAM_WINDOW_BYTES as usize,
+        ),
+        (
+            format!(
+                "per h2 stream {SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES}B client flow window \
+                 (credit counter, zero preallocation — not memory)"
+            ),
+            SPLITHTTP_H2_CLIENT_FLOW_WINDOW_BYTES as usize,
+        ),
         // bd sfqlu：档位派生值全部进上限面（运维核对用，不进硬账）。
         (
             format!("bridge byte gate {}B/dir x 2 dirs per conn", plan.bridge_gate),
@@ -654,7 +784,59 @@ pub fn budget_report_with(
             udp_sessions * UDP_SESSION_WORST_CASE_BYTES,
         ),
         (format!("max {} conns (tier {})", max_conns, plan.tier.as_str()), max_conns),
-    ];
+    ]);
+
+    // 固定面**逐项**入硬账（bd p5m5m）：旧状只一条聚合行 ⇒ 池/缓存各占多少看不见，
+    // 审计据此判「buffer pool 未入账」（实际在账内但不显示）。合计仍 = `fixed`。
+    let mut hard: Vec<(String, usize)> =
+        startup_fixed_floor_items_for_with_inflight(cores, listeners, hs_per_listener);
+    debug_assert_eq!(
+        hard.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+        fixed,
+        "逐项固定面之和必须等于固定底数（同一次算式，禁两处）"
+    );
+    hard.extend([
+        ("explicit udp sockets".to_string(), quic_explicit_booked),
+        (format!("{conns} conns x {per_conn_pipe}B pipe(2-way)"), conns * per_conn_pipe),
+        // 瞬时面上界三项：进硬账（可对账），超预算只 WARN（见 degraded）。
+        (
+            format!("{xdns_servers} xdns frag worst case x {XDNS_FRAG_WORST_CASE_BYTES}B"),
+            frag_booked,
+        ),
+        (
+            format!(
+                "{quic_conns} QUIC conn receive window x {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
+            ),
+            quic_windows_booked,
+        ),
+        (
+            format!(
+                "{tuic_inbox_conns} tuic dgram inbox x {}B",
+                xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP
+            ),
+            tuic_inbox_booked,
+        ),
+        (
+            format!(
+                "{xdrive_h3_conns} xdrive h3 conn receive window x \
+                 {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
+            ),
+            xdrive_windows_booked,
+        ),
+        (
+            format!(
+                "{masque_tunnels} masque tunnel h2 send_buf x {H2_MAX_SEND_BUF_PER_CONN_BYTES}B"
+            ),
+            masque_send_buf_booked,
+        ),
+        // UDP dispatch 会话常驻面（bd rmbby）：池化读缓冲，建会话即真占。
+        (
+            format!(
+                "{udp_sessions} udp dispatch sessions x {UDP_SESSION_RESIDENT_BYTES}B resident"
+            ),
+            udp_resident_booked,
+        ),
+    ]);
 
     Ok(BudgetReport {
         projected,
@@ -662,50 +844,7 @@ pub fn budget_report_with(
         available: plan.available,
         tier: plan.tier.as_str(),
         max_conns,
-        hard: vec![
-            (format!("fixed floor ({listeners} listeners)"), fixed),
-            ("explicit udp sockets".to_string(), quic_explicit_booked),
-            (format!("{conns} conns x {per_conn_pipe}B pipe(2-way)"), conns * per_conn_pipe),
-            // 瞬时面上界三项：进硬账（可对账），超预算只 WARN（见 degraded）。
-            (
-                format!("{xdns_servers} xdns frag worst case x {XDNS_FRAG_WORST_CASE_BYTES}B"),
-                frag_booked,
-            ),
-            (
-                format!(
-                    "{quic_conns} QUIC conn receive window x \
-                     {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
-                ),
-                quic_windows_booked,
-            ),
-            (
-                format!(
-                    "{tuic_inbox_conns} tuic dgram inbox x {}B",
-                    xray_proxy_tuic::udp::DGRAM_INBOX_BYTE_CAP
-                ),
-                tuic_inbox_booked,
-            ),
-            (
-                format!(
-                    "{xdrive_h3_conns} xdrive h3 conn receive window x \
-                     {QUIC_CONN_RECEIVE_WINDOW_BOOKED_BYTES}B"
-                ),
-                xdrive_windows_booked,
-            ),
-            (
-                format!(
-                    "{masque_tunnels} masque tunnel h2 send_buf x {H2_MAX_SEND_BUF_PER_CONN_BYTES}B"
-                ),
-                masque_send_buf_booked,
-            ),
-            // UDP dispatch 会话常驻面（bd rmbby）：池化读缓冲，建会话即真占。
-            (
-                format!(
-                    "{udp_sessions} udp dispatch sessions x {UDP_SESSION_RESIDENT_BYTES}B resident"
-                ),
-                udp_resident_booked,
-            ),
-        ],
+        hard,
         caps,
         degraded,
         violations,
@@ -1156,7 +1295,13 @@ mod tests {
             let read = |pred: &dyn Fn(&str) -> bool| {
                 report.hard.iter().find(|(n, _)| pred(n)).map(|(_, b)| *b).unwrap_or(0)
             };
-            let fixed = read(&|n| n.starts_with("fixed floor"));
+            // 固定面自 bd p5m5m 起逐项入账（行名以 `floor: ` 开头）⇒ 按前缀求和。
+            let fixed: usize = report
+                .hard
+                .iter()
+                .filter(|(n, _)| n.starts_with("floor: "))
+                .map(|(_, bytes)| *bytes)
+                .sum();
             let conns_pipe = read(&|n| n.contains("conns x") && n.contains("pipe"));
             let explicit = read(&|n| n == "explicit udp sockets");
             let booked = read(&|n| n.contains("QUIC conn receive window x"));
@@ -1273,7 +1418,13 @@ mod tests {
             // 乘数口径与 QUIC 同构：min(并发上限, 扣除前序账面后的余量装得下条数)。
             // 从报告自身反算（不写字面量）：本配置无 quic/xdns/tuic 端点 ⇒
             // 余量 = 预算 − 固定面 − 常态连接面。
-            let fixed = read(&|n| n.starts_with("fixed floor"));
+            // 固定面自 bd p5m5m 起逐项入账（行名以 `floor: ` 开头）⇒ 按前缀求和。
+            let fixed: usize = report
+                .hard
+                .iter()
+                .filter(|(n, _)| n.starts_with("floor: "))
+                .map(|(_, bytes)| *bytes)
+                .sum();
             let conns_pipe = read(&|n| n.contains("conns x") && n.contains("pipe"));
             let explicit = read(&|n| n == "explicit udp sockets");
             let fit = report.budget.saturating_sub(fixed + explicit + conns_pipe)
@@ -1479,6 +1630,36 @@ mod tests {
             proxy_settings_json: None,
             mux_json: None,
             target_strategy: None,
+        }
+    }
+
+    /// TLS 终结的 xhttp 入站（`security: "tls"` ⇒ 每连接 TLS 记录层缓冲面，bd p5m5m）。
+    fn tls_splithttp_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            stream_settings_json: Some(
+                serde_json::json!({"network": "splithttp", "security": "tls"}),
+            ),
+            ..splithttp_inbound(tag)
+        }
+    }
+
+    /// TLS 终结的 xhttp 出站（同上）。
+    fn tls_xhttp_outbound(tag: &str) -> BuiltOutbound {
+        BuiltOutbound {
+            stream_settings_json: Some(
+                serde_json::json!({"network": "splithttp", "security": "tls"}),
+            ),
+            ..xhttp_outbound(tag)
+        }
+    }
+
+    /// REALITY 入站：走同一 TLS 栈（btls/uTLS）⇒ 同计每连接 TLS 面。
+    fn reality_inbound(tag: &str) -> BuiltInbound {
+        BuiltInbound {
+            stream_settings_json: Some(
+                serde_json::json!({"network": "tcp", "security": "reality"}),
+            ),
+            ..splithttp_inbound(tag)
         }
     }
 
@@ -2373,5 +2554,149 @@ mod tests {
                 report.tier, report.budget
             );
         }
+    }
+
+    /// bd p5m5m：每连接派生面（TLS 记录层 / xhttp h2 send_buf）入 caps，乘数 =
+    /// **余量口径**（预算余量装得下的条数）——不是档位最大并发。
+    ///
+    /// 场景取压测实测形态（12 条连接 + h2 流窗并存）：small 档（96MiB）下 16/32MiB
+    /// 级 send_buf 只装得下个位数条 ⇒ caps 如实显示「N/max_conns 条」，且只 WARN
+    /// 不拒启（用户裁决 2026-11-07）。
+    #[test]
+    fn per_conn_faces_book_residual_fit_not_max_conns() {
+        const STRESS_CONNS: usize = 12;
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(tls_splithttp_inbound("xhttp-tls-in"));
+        built.outbounds.push(tls_xhttp_outbound("xhttp-tls-out"));
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        assert!(report.is_ok(), "每连接面上限不得拒启（只 WARN）：{:?}", report.violations);
+
+        let cap = |key: &str| -> usize {
+            report
+                .caps
+                .iter()
+                .find(|(n, _)| n.contains(key))
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or_else(|| panic!("caps 栏必须有 `{key}` 行：{:?}", report.caps))
+        };
+        let tls_booked = cap("per-conn tls record state");
+        let server_booked = cap("per-conn h2 send_buf");
+        let client_booked = cap("per-conn h2 client send_buf");
+
+        // 本配置无瞬时面（无 quic/xdns/tuic/xdrive/masque 端点）⇒ projected = 常态账面。
+        let residual = report.budget - report.projected;
+        let per_conn_server = xhttp_conn_booked_bytes(plan_96mb().tier);
+        let tls_expect =
+            (residual / TLS_CONN_STATE_EST_BYTES).min(report.max_conns) * TLS_CONN_STATE_EST_BYTES;
+        assert_eq!(tls_booked, tls_expect, "TLS 面 = min(余量条数, 上限) × 单价");
+        let server_fit = residual.saturating_sub(tls_booked) / per_conn_server;
+        assert_eq!(
+            server_booked,
+            server_fit.min(report.max_conns) * per_conn_server,
+            "服务端 h2 send_buf = min(余量条数, 上限) × 单价"
+        );
+        let client_fit =
+            residual.saturating_sub(tls_booked + server_booked) / H2_MAX_SEND_BUF_PER_CONN_BYTES;
+        assert_eq!(
+            client_booked,
+            client_fit.min(report.max_conns) * H2_MAX_SEND_BUF_PER_CONN_BYTES,
+            "客户端 h2 send_buf = min(余量条数, 上限) × 单价"
+        );
+
+        // 余量口径反证：按档位最大并发乘必是 10× 级超账（D-01 教训），实测值必须远小于它。
+        let max_conns_product =
+            report.max_conns * (per_conn_server + H2_MAX_SEND_BUF_PER_CONN_BYTES);
+        assert!(max_conns_product > report.budget, "前提：按档位最大并发乘必超预算");
+        assert!(
+            server_booked + client_booked < max_conns_product,
+            "乘数不得用档位最大并发：{server_booked} + {client_booked} vs {max_conns_product}"
+        );
+        assert!(
+            client_booked / H2_MAX_SEND_BUF_PER_CONN_BYTES <= STRESS_CONNS,
+            "96MiB 档装不下 {STRESS_CONNS} 条 16MiB send_buf（实得 {}）",
+            client_booked / H2_MAX_SEND_BUF_PER_CONN_BYTES
+        );
+
+        // 超订 WARN：装配期单次调用 ⇒ 天然限频；条数必须与 caps 同源。
+        let degraded = report.degraded.as_deref().unwrap_or_default();
+        assert!(degraded.contains("每连接派生面超订"), "必须出超订 WARN：{degraded}");
+        assert!(
+            degraded.contains(&format!(
+                "xhttp 服务端 h2 send_buf {} 条",
+                server_booked / per_conn_server
+            )),
+            "WARN 条数必须与 caps 同源：{degraded}"
+        );
+        // tokio 线程栈面可见（worker 数 × 2MiB；spawn_blocking 惰性面在标签里说明）。
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        assert_eq!(cap("tokio worker stacks"), cores * TOKIO_THREAD_STACK_BYTES);
+    }
+
+    /// bd p5m5m：TLS 每连接面只在有 TLS 终结端点时出现（`tls`/`reality` 同计），
+    /// 且**只进 caps**（装配期零连接，不进硬账）——防噪音与防假账两向。
+    #[test]
+    fn tls_conn_state_caps_only_for_tls_endpoints() {
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(splithttp_inbound("xhttp-plain"));
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        assert!(
+            !report.caps.iter().any(|(n, _)| n.contains("tls record state")),
+            "无 TLS 端点不得出该行（防噪音）：{:?}",
+            report.caps
+        );
+
+        let mut built = xray_conf::BuiltConfig::default();
+        built.inbounds.push(reality_inbound("reality-in"));
+        let report = budget_report_with(&built, plan_96mb()).expect("report");
+        assert!(
+            report.caps.iter().any(|(n, _)| n.contains("1 tls endpoints")),
+            "reality 走同一 TLS 栈，必须计入每连接 TLS 面：{:?}",
+            report.caps
+        );
+        assert!(
+            report.hard.iter().all(|(n, _)| !n.contains("tls record state")),
+            "每连接 TLS 面只进 caps（装配期零连接）：{:?}",
+            report.hard
+        );
+    }
+
+    /// bd p5m5m：固定面（池/缓存/握手在途）**逐项**入硬账且合计不变——审计此前
+    /// 判「buffer pool 未入账」，实际在账但被一条聚合行藏住；逐项后各面可见。
+    #[test]
+    fn hard_floor_is_itemized_and_sums_to_total() {
+        let report = budget_report(&xray_conf::BuiltConfig::default()).expect("report");
+        for key in [
+            "floor: xray_buf pool",
+            "floor: splithttp shared block pool",
+            "floor: hysteria udphop shared pool",
+            "floor: dns cache estimate",
+            "floor: dns pending estimate",
+            "floor: tls session cache estimate",
+            "in-flight handshakes",
+        ] {
+            assert!(
+                report.hard.iter().any(|(n, _)| n.contains(key)),
+                "硬账必须逐项可见 `{key}`（bd p5m5m）：{:?}",
+                report.hard
+            );
+        }
+        assert_eq!(
+            report.hard.iter().map(|(_, bytes)| bytes).sum::<usize>(),
+            report.projected,
+            "逐项化不得改总分"
+        );
+        // 逐项之和 = 登记簿固定底数（同一算式，禁两处；缺省配置 0 监听）。
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let floor: usize = report
+            .hard
+            .iter()
+            .filter(|(n, _)| n.starts_with("floor: "))
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        assert_eq!(
+            floor,
+            startup_fixed_floor_bytes_for_with_inflight(cores, 0, effective_handshake_inflight()),
+            "逐项固定面必须等于登记簿算式"
+        );
     }
 }

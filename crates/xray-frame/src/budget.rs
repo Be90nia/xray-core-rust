@@ -218,6 +218,23 @@ pub const HYPER_MAX_IDLE_PER_HOST_CONNECTIONS: usize = 4;
 /// （client.rs doc 口径）。预算门 xhttp 端点占用用本值 × 空闲连接数。
 pub const HYPER_IDLE_CONN_EST_BYTES: usize = 100 * 1024;
 
+/// 每 TLS 连接**记录层缓冲**账面（字节）= 80KiB = 读 record 缓冲上界 64KiB
+/// （`xray_tls` uTLS/rustls 侧 `tls_readbuf_size`；btls 服务端为 16KiB ⇒ 取大者）
+/// + 写 record 缓冲 16KiB 档（`btls_client::TLS_RECORD_READBUF` 同档）。
+///
+/// 口径：每 TLS 终结连接一份、随连接线性增长、装配期零连接 ⇒ **不进硬账**，
+/// 进预算门 caps 栏（条数 = 预算余量装得下的条数，bd p5m5m）。实现侧两个量分别是
+/// `pub(crate)` 常量与 trait 方法 ⇒ 按实现代码口径登记（改读/写缓冲须同步本式）。
+pub const TLS_CONN_STATE_EST_BYTES: usize = 64 * 1024 + 16 * 1024;
+
+/// tokio **线程栈**账面（字节/线程）= 2MiB（tokio `Builder::thread_stack_size`
+/// 缺省值；本仓未覆写 ⇒ worker 与 spawn_blocking 线程同档）。
+///
+/// worker 栈随 runtime 构建常驻（`available_parallelism` 条）；spawn_blocking
+/// 线程按需 spawn（容量由 xray-cli 的 `XRAY_MAX_BLOCKING_THREADS` 管，装配期 0 条）。
+/// 栈页惰性 fault ⇒ 记 caps 上限面，不进硬账（bd p5m5m）。
+pub const TOKIO_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+
 /// 小池档合计硬顶（4MB，**条款已重写**——bd sgdwm 修正 PM-04「宪法破」，
 /// bd 258qt(a) 再收口成员面）。
 ///
@@ -244,7 +261,7 @@ pub const XRAY_BUF_POOL_TOTAL_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// bd kw2si 起全进程唯一一份，同 chunk 不随连接数翻倍）。
 ///
 /// 口径 = **常驻**（空闲块）预算；块借出后随 `Bytes` 进 h2 发送队列的那份内存记在
-/// caps 的「per-conn h2 send_buf cap」面（`xhttp_conn_booked_bytes`），本项不重复计账
+/// caps 的「per-conn h2 send_buf」面（`xhttp_conn_booked_bytes`），本项不重复计账
 /// ——池的宇宙（`max`）只是记账上界，不预分配（bd vktyw）。
 pub const SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES: usize = 2 * 1024 * 1024;
 
@@ -421,14 +438,45 @@ pub fn startup_fixed_floor_bytes_for_with_inflight(
     listeners: usize,
     handshake_inflight_per_listener: usize,
 ) -> usize {
-    XRAY_BUF_POOL_TOTAL_MAX_BYTES
-        + cores * xray_buf::alloc::TLS_BYTE_BUDGET
-        + SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES
-        + HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES
-        + DNS_CACHE_ESTIMATE_BYTES
-        + DNS_PENDING_EST_BYTES
-        + TLS_SESSION_CACHE_ESTIMATE_BYTES
-        + listeners * handshake_inflight_per_listener * HANDSHAKE_TASK_EST_BYTES
+    startup_fixed_floor_items_for_with_inflight(cores, listeners, handshake_inflight_per_listener)
+        .iter()
+        .map(|(_, bytes)| *bytes)
+        .sum()
+}
+
+/// [`startup_fixed_floor_bytes_for_with_inflight`] 的**逐项**形态（bd p5m5m）：
+/// 预算报告硬账逐项可见——旧状只打一条聚合行，池/缓存各占多少看不见。
+///
+/// 每项名以 `floor: ` 开头（测试按前缀求和反算，见 `xray-core::memory_budget`
+/// 的 QUIC / xdrive 乘数断言）；合计恒等于上面那个函数（同一次算式，禁两处）。
+#[must_use]
+pub fn startup_fixed_floor_items_for_with_inflight(
+    cores: usize,
+    listeners: usize,
+    handshake_inflight_per_listener: usize,
+) -> Vec<(String, usize)> {
+    vec![
+        (
+            format!(
+                "floor: xray_buf pool {XRAY_BUF_POOL_TOTAL_MAX_BYTES}B + {cores} cores x {}B \
+                 thread-local",
+                xray_buf::alloc::TLS_BYTE_BUDGET
+            ),
+            XRAY_BUF_POOL_TOTAL_MAX_BYTES + cores * xray_buf::alloc::TLS_BYTE_BUDGET,
+        ),
+        ("floor: splithttp shared block pool".to_string(), SPLITHTTP_SHARED_BLOCK_POOL_MAX_BYTES),
+        ("floor: hysteria udphop shared pool".to_string(), HYSTERIA_UDPHOP_SHARED_POOL_MAX_BYTES),
+        ("floor: dns cache estimate".to_string(), DNS_CACHE_ESTIMATE_BYTES),
+        ("floor: dns pending estimate".to_string(), DNS_PENDING_EST_BYTES),
+        ("floor: tls session cache estimate".to_string(), TLS_SESSION_CACHE_ESTIMATE_BYTES),
+        (
+            format!(
+                "floor: {listeners} listeners x {handshake_inflight_per_listener} in-flight \
+                 handshakes x {HANDSHAKE_TASK_EST_BYTES}B"
+            ),
+            listeners * handshake_inflight_per_listener * HANDSHAKE_TASK_EST_BYTES,
+        ),
+    ]
 }
 
 #[cfg(test)]
