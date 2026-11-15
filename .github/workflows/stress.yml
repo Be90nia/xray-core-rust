@@ -10,6 +10,19 @@ on:
         description: 'Run duration in hours (job timeout = hours*60 + 90min build margin)'
         required: false
         default: '5'
+      concurrency:
+        description: 'S1/S5-S12 短连接并发档位（极端压测可给 32/64）'
+        required: false
+        default: '8'
+      s2_conns:
+        description: 'S2 长连接条数'
+        required: false
+        default: '4'
+      constrained:
+        description: '极端模式：Linux 上 taskset 单核 + XRAY_MEM_LIMIT_MB=512/XRAY_MAX_CONNS=32 + nofile 4096（模拟 1 核 512MB 小鸡）'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   stress:
@@ -87,32 +100,78 @@ jobs:
           # TIME_WAIT 120s → 30s(注册表,重启栈后生效;min=30)
           Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name TcpTimedWaitDelay -Value 30 -Type DWord
           Write-Host "dynamic port: 1025-65534, TIME_WAIT=30s"
+      - name: Apply extreme constraint (1-core / 512MB emulation env)
+        if: runner.os == 'Linux' && inputs.constrained
+        shell: bash
+        run: |
+          # 小鸡形态的应用层预算：512MB 档（small ≈ 96MiB 预算 / max_conns 32）。
+          # CPU 单核绑定与 nofile 4096 在 Run stress step 里同 shell 设置（ulimit 不跨 step）。
+          echo "XRAY_MEM_LIMIT_MB=512" >> "$GITHUB_ENV"
+          echo "XRAY_MAX_CONNS=32" >> "$GITHUB_ENV"
+          echo "constrained: mem=512MB max_conns=32 (cpu pin + nofile applied at run)"
       - name: Build harness
         run: cargo build --release -p xray-stress
       - name: Run stress (${{ matrix.label }}-${{ matrix.batch }})
         shell: pwsh
+        env:
+          CONSTRAINED: ${{ inputs.constrained }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          S2_CONNS: ${{ inputs.s2_conns }}
         run: |
           # ulimit 已在 Raise FD limit step 提到 524288(Linux/macOS),Windows 不限
           $nofile = if ($IsLinux -or $IsMacOS) { & bash -c 'ulimit -n' } else { (Get-Process -Id $PID).Handle }
           Write-Host "nofile (best-effort): $nofile"
           $hours = if ($env:HOURS_OVERRIDE) { [int]$env:HOURS_OVERRIDE } else { if ("${{ inputs.hours }}") { [int]"${{ inputs.hours }}" } else { 5 } }
+          $conc = if ($env:CONCURRENCY) { [int]$env:CONCURRENCY } else { 8 }
+          $s2 = if ($env:S2_CONNS) { [int]$env:S2_CONNS } else { 4 }
           if ("${{ matrix.batch }}" -eq "a") { $batch = "s1,s2,s3,s4,s5,s6" }
           elseif ("${{ matrix.batch }}" -eq "b") { $batch = "s7,s8,s9,s10,s11,s12" }
           else { $batch = "s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12" }
-          Write-Host "batch: $batch, hours: $hours"
-          ./target/release/xray-stress `
-            --duration ($hours * 3600) `
-            --concurrency 8 --s2-conns 4 `
-            --scenarios $batch `
-            --sample-interval 30 `
-            --drain-secs 360 `
-            --out-dir stress-out
+          Write-Host "batch: $batch, hours: $hours, concurrency: $conc, s2_conns: $s2, constrained: $env:CONSTRAINED"
+          $cargs = "--duration $($hours * 3600) --concurrency $conc --s2-conns $s2 --scenarios $batch --sample-interval 30 --drain-secs 360 --out-dir stress-out"
+          if ($IsLinux -and $env:CONSTRAINED -eq 'true') {
+            # 极端模式：单核绑定 + 低 fd（ulimit 只在本 shell 生效，故与 taskset 同 shell 设置）
+            & bash -c "ulimit -n 4096; exec taskset -c 0 ./target/release/xray-stress $cargs"
+          } else {
+            Invoke-Expression "./target/release/xray-stress $cargs"
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # 泄漏门禁：fd/RSS 斜率判定，超阈非零退出 → job 红。
       # 360s drain 窗覆盖 s12 connIdle 300s；RSS 负载期超阈但有 drain 回落 = 固有堆积放行。
       # 阈值调整见 tools/check_stress_leak.py 头注释（默认锚定 docs/impl-stress-leak-* 实测）。
       - name: Leak gate (fd/RSS slope)
         shell: bash
         run: python tools/check_stress_leak.py --csv stress-out/metrics.csv
+      # 极端模式「不崩」判定：进程活到结束（本 step 能跑到即退出码 0）+ 采样完整 +
+      # 功能未死（至少一条连接成功）。拒绝风暴/成功率低是触顶期望行为，不判红；
+      # 崩溃/Hang 由进程退出码与 job timeout 捕获。
+      - name: Extreme assertions (no-crash / functional-alive)
+        if: inputs.constrained
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import csv, sys
+          rows = list(csv.DictReader(open('stress-out/metrics.csv', encoding='utf-8')))
+          if len(rows) < 2:
+              sys.exit(f'FAIL: metrics.csv 采样不足（{len(rows)} 行）= 进程早崩或未跑起来')
+          proc = [r for r in rows if r['scenario'] == '__proc__']
+          scen = [r for r in rows if r['scenario'] not in ('__proc__', '__drain__')]
+          if not proc:
+              sys.exit('FAIL: 无 __proc__ 采样行')
+          names = {r['scenario'] for r in scen}
+          ok = sum(int(r['conn_ok']) for r in scen)
+          fail = sum(int(r['conn_fail']) for r in scen)
+          rss_peak = max(float(r['rss_mb']) for r in proc)
+          fd_vals = [int(r['fd_count']) for r in proc if r['fd_count'] not in ('-', '')]
+          fd_peak = max(fd_vals) if fd_vals else -1
+          print(f'extreme: scenarios={len(names)} conn_ok={ok} conn_fail={fail} '
+                f'rss_peak={rss_peak:.1f}MB fd_peak={fd_peak}')
+          if ok == 0:
+              sys.exit('FAIL: 全部连接失败（功能已死，非单纯触顶拒绝）')
+          if rss_peak > 1024:
+              sys.exit(f'FAIL: RSS 峰值 {rss_peak:.0f}MB > 1024MB（512MB 档预算严重超支）')
+          print('PASS: 极端模式未崩、功能存活')
+          EOF
       - name: Upload results
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
