@@ -74,7 +74,7 @@ python dist/interop_ci.py --rust <rust 二进制> --go <go 基准二进制>
 |---|---|---|
 | `ci.yml` | push（main/dev/master/`feature/**`）+ PR | 15 个 job：`Format` / `Clippy` / `Build`（3 靶：linux-gnu、windows-msvc、macos-arm64）/ `Test`（debug+release）/ `Test (windows, xray-proxy-tun)` / `Test (linux, privileged tproxy gate)` / `Parser Parity (Go ruling baseline vs Rust)` / `Security & License`（cargo-deny + osv-scanner）/ `Docs` / `Fuzz Smoke`（仅手动）/ `Proto Drift Gate` / `Asset Gate` / `Framework Assembly (clippy + lib test)` / `Quality Gates` / `UDP Bind Gate` |
 | `interop.yml` | push + PR + 手动 + nightly 03:17 UTC | `Interop (os)`（ubuntu-24.04 + macos-14）：workspace `--lib` + release 构建 + `dist/interop_ci.py` 54 测；Go 基准 = **v26.11.9（commit `676eaf66`）按源码现场构建**（`.github/actions/fetch-go-baseline`）。`Full 32-node matrix` 只在 nightly/手动跑（需 secret 节点表） |
-| `stress.yml` | 手动 | `xray-stress` 压测矩阵（12 场景分批：macos a/b、linux a/b、windows all；6h 硬顶） |
+| `stress.yml` | 手动 | `xray-stress` 压测矩阵（19 场景分批：a=s1-s6 / b=s7-s12 / c=s13-s19，macos a/b/c、linux a/b/c、windows all；6h 硬顶） |
 | `release.yml` | tag `v*` | **5 个产物**：`xray-linux-amd64`、`xray-linux-amd64-musl`、`xray-windows-amd64.exe`、`xray-macos-amd64`、`xray-macos-arm64`。指令集由 `.cargo/config.toml` 的 x86_64 分目标 `+sse4.1,+sse4.2,+popcnt` 决定（**不**用 `RUSTFLAGS` 覆盖），要求 Nehalem 2008+ / AMD Barcelona 2007+ |
 | `build-linux-release.yml` | 手动（+ 本文件变更时 push main） | PGO 三段构建（instrument → loopback workload → optimize），ubuntu:22.04 容器锚定 glibc 2.35 |
 | `mobile.yml` | 手动 + push（master/main/dev） | `Android aarch64 build gate` + `iOS aarch64 check gate` |

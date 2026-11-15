@@ -222,6 +222,18 @@ pub fn budget_report(built: &xray_conf::BuiltConfig) -> Result<BudgetReport, Str
     budget_report_with(built, *xray_frame::budget::plan::MemoryPlan::cached())
 }
 
+/// 运行期闸读数（bd uaoby R-3）：连接软上限 / 触顶放行次数 / 背压等待次数 /
+/// in-flight 预算占用与重调次数。
+///
+/// 启动报告（[`budget_report`]）是**装配期快照**（零连接、零背压、档位是启动瞬间的
+/// `MemAvailable`）；运维排障要看「此刻」，用本函数。判据：`soft_limit_hits` 与
+/// `backpressure_waits` 都在涨 = 闸在承载过载（该加内存/换档）；两个都不动而吞吐塌
+/// = 查链路，不是查闸。
+#[must_use]
+pub fn bridge_runtime_stats() -> xray_transport::bridge::ConnStats {
+    xray_transport::bridge::conn_stats()
+}
+
 /// 同 [`budget_report`]，档位计划由调用方注入（单测按档位钉行为）。
 pub fn budget_report_with(
     built: &xray_conf::BuiltConfig,
@@ -1073,6 +1085,23 @@ mod tests {
                 .any(|(n, b)| n.contains("in-flight budget") && *b == plan.inflight_budget_bytes()),
             "caps 必须登记 in-flight 预算执行点上界：{:?}",
             report.caps
+        );
+    }
+
+    /// 运行期读数（bd uaoby R-3）必须与执行点同源：容量读**当下**单例值（运行期按
+    /// 实况内存自调，不等于启动快照），软上限读同一个降档值。
+    #[test]
+    fn runtime_stats_read_current_gate_figures() {
+        let plan = xray_frame::budget::plan::MemoryPlan::cached();
+        let budget = xray_frame::budget::inflight::global();
+        let stats = bridge_runtime_stats();
+        assert_eq!(stats.inflight_total, budget.total(), "容量必须是当下值（可被重采样改写）");
+        assert_eq!(stats.inflight_used, budget.used(), "占用同源");
+        assert_eq!(stats.backpressure_waits, budget.backpressure_waits(), "背压计数同源");
+        assert_eq!(stats.soft_limit, plan.effective_max_conns(), "软上限与执行点同一读数");
+        assert!(
+            stats.inflight_total > 0,
+            "容量必须非零（0 = 永不放行，等于把数据面锁死）：{stats:?}"
         );
     }
 

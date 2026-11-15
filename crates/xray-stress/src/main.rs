@@ -4,7 +4,7 @@
 // 压测 harness：stdout 结构化进度行即产品接口（采样/判定报告消费方为脚本）
 //! xray-stress：Xray-core-rust 压测 harness 入口。
 //!
-//! 十二场景矩阵（全部 loopback、真实协议栈）：
+//! 十九场景矩阵（全部 loopback、真实协议栈）：
 //! - s1 短连接风暴：vless+REALITY 链路，连接生命周期内存回环
 //! - s2 长连接大流量：同链路持续泵随机数据，稳态吞吐衰减曲线
 //! - s3 QUIC 重连循环：hysteria2 0-RTT dial→roundtrip→drop 回环
@@ -12,6 +12,12 @@
 //! - s5-s12 协议链扩展：vmess+ws / trojan+grpc / ss+tcp / tuic v5 / anytls / vless+xhttp(auto) /
 //!   http 代理 / vmess+xhttp H3（QUIC 承载）， 每场景独立 start_full 双实例，短连接风暴复用 s1
 //!   worker 语义
+//! - s13/s14 传输面补齐：vless+ws / vless+httpupgrade（审计 F-13 的零覆盖面）
+//! - s15 出站级 mux 载体：多连接复用单条 carrier（`v1.mux.cool`）
+//! - s16 半开 TLS 握手风暴：只发半个 ClientHello 即断，fd 趋势断言
+//! - s17 慢读背压：持续写 + 1KiB/20ms 慢读，RSS 断言
+//! - s18 UDP 数据面：socks udp associate → vless udp → freedom UDP → UDP echo
+//! - s19 26 入站同进程装配：vless×10 / trojan×8 / vmess×6 / ss×2 单实例 26 listener
 //!
 //! 长跑启动命令见 run_stress.ps1 / run_stress.sh（保守/标准/激进三档）。
 
@@ -73,10 +79,14 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+            |_| {
+                // s16 半开握手风暴**故意**制造 TLS handshake EOF（每轮一条 warn）。
+                // 5h × 千次/秒的 warn 洪泛既烧 CPU 又淹没真信号 ⇒ 该 target 默认压到 error；
+                // 其余 target 仍按 warn（RUST_LOG 可覆盖）。
+                tracing_subscriber::EnvFilter::new("warn,xray_frame::vless=error")
+            },
+        ))
         .init();
     topology::ensure_crypto_provider();
 
@@ -134,6 +144,14 @@ async fn run(
 
     // --- 拓扑装配（按场景需要起实例） ---
     let echo_port = topology::start_echo().await.port();
+    // s18：UDP echo 与 TCP echo 并列（UDP 数据面载荷载体）
+    let udp_echo_addr = if scenarios.contains(&Scenario::S18) {
+        let addr = topology::start_udp_echo().await;
+        println!("[xray-stress] udp echo ready: udp/127.0.0.1:{}", addr.port());
+        Some(addr)
+    } else {
+        None
+    };
     let need_socks_link = scenarios.contains(&Scenario::S1) || scenarios.contains(&Scenario::S2);
     let socks_port = if need_socks_link {
         let (port, sh, ch) = topology::start_reality_link(echo_port).await?;
@@ -162,6 +180,35 @@ async fn run(
         (Some(addr), Some(listener))
     } else {
         (None, None)
+    };
+
+    // s16/s17：真实 vless+tls 链路（半开握手风暴打它的协议端口；慢读压它的 socks 端口）
+    let (tls_proto_port, tls_socks_port) = if scenarios.contains(&Scenario::S16)
+        || scenarios.contains(&Scenario::S17)
+    {
+        let (proto_port, (socks_port, sh, ch)) = topology::start_vless_tls_link(echo_port).await?;
+        spawn_infra(&mut infra, "vless-tls infra", sh.into_iter().chain(ch), &failures);
+        topology::probe_socks_roundtrip(socks_port, echo_port).await?;
+        println!(
+            "[xray-stress] vless-tls link ready: proto=127.0.0.1:{proto_port} socks=127.0.0.1:{socks_port}"
+        );
+        (Some(proto_port), Some(socks_port))
+    } else {
+        (None, None)
+    };
+
+    // s19：26 入站同进程装配（单服务端实例 26 listener + 每链路一个 socks 客户端实例）
+    let multi_links = if scenarios.contains(&Scenario::S19) {
+        let (links, handles) = topology::start_multi_inbound_group().await?;
+        spawn_infra(&mut infra, "multi-inbound infra", handles, &failures);
+        for (name, port) in &links {
+            topology::probe_socks_roundtrip(*port, echo_port).await?;
+            println!("[xray-stress] {name} link ready: socks=127.0.0.1:{port}");
+        }
+        println!("[xray-stress] 26-inbound group ready: {} links", links.len());
+        links
+    } else {
+        Vec::new()
     };
 
     // s5-s12：每场景独立协议链（表驱动装配 + 首连探针）
@@ -218,10 +265,47 @@ async fn run(
     for &(sc, port) in &protocol_links {
         let h = StatsHandle::new(sc.stats_name());
         stats.push(h.clone());
+        if sc == Scenario::S18 {
+            let udp_port = udp_echo_addr.map(|a| a.port()).unwrap_or(echo_port);
+            load.spawn(sc::udp_short_burst(
+                port,
+                udp_port,
+                args.concurrency,
+                deadline,
+                h,
+                args.s1_delay_ms,
+            ));
+        } else {
+            load.spawn(sc::s1_short_burst(
+                port,
+                echo_port,
+                args.concurrency,
+                deadline,
+                h,
+                args.s1_delay_ms,
+            ));
+        }
+    }
+    if let (Some(port), true) = (tls_proto_port, scenarios.contains(&Scenario::S16)) {
+        let h = StatsHandle::new("s16-halfopen");
+        stats.push(h.clone());
+        load.spawn(sc::halfopen_storm(port, args.concurrency, deadline, h));
+    }
+    if let (Some(port), true) = (tls_socks_port, scenarios.contains(&Scenario::S17)) {
+        let h = StatsHandle::new("s17-slow-read");
+        stats.push(h.clone());
+        // 慢读连接数压到 1/4：单连接就在压满对端发送缓冲，条数过多只是抢 CPU
+        load.spawn(sc::slow_reader(port, echo_port, (args.concurrency / 4).max(1), deadline, h));
+    }
+    for (name, port) in &multi_links {
+        let h = StatsHandle::new(name);
+        stats.push(h.clone());
+        // 26 条链路共享并发预算：每链路 1/8 档，避免 26×32 打爆动态端口
         load.spawn(sc::s1_short_burst(
             port,
+            *port,
             echo_port,
-            args.concurrency,
+            (args.concurrency / 8).max(1),
             deadline,
             h,
             args.s1_delay_ms,
@@ -230,6 +314,7 @@ async fn run(
     println!("[xray-stress] {} scenario task groups running", stats.len());
 
     // --- 采样循环 ---
+    let stats_for_assert = stats.clone();
     let mut sampler = Sampler::new(&run_id, &args.out_dir, stats, checkpoint_interval(duration))?;
     let label = format!("scenarios={scenarios:?}");
     let mut tick = tokio::time::interval(interval);
@@ -319,6 +404,12 @@ async fn run(
     for &(sc, port) in &protocol_links {
         links.push((sc.stats_name(), port));
     }
+    if let Some(port) = tls_socks_port {
+        links.push(("s16-s17-vless-tls", port));
+    }
+    for (name, port) in &multi_links {
+        links.push((name.as_str(), *port));
+    }
     // 收尾段兜底：每条链路 30s 探针预算 + 余量（探针自身超时会记账，这里只管不退出的情形）
     #[allow(clippy::disallowed_methods, reason = "压测 run 时钟锚点；Clock 端口注入待 bd 39hko")]
     let probe_budget = Instant::now() + Duration::from_secs(30 * (links.len() as u64 + 2) + 120);
@@ -333,6 +424,23 @@ async fn run(
             Ok(Ok(())) => println!("[xray-stress] end-state probe ok: s3-quic (udp/{addr})"),
             Ok(Err(e)) => failures.record("end-state probe s3-quic", &e),
             Err(_) => failures.record("end-state probe s3-quic", &"timeout 30s"),
+        }
+    }
+    // s18 的 UDP 数据面必须单独探（TCP 探针过不代表 udp associate 路径活着）
+    if let (Some(udp_echo), Some(&(_, socks))) =
+        (udp_echo_addr, protocol_links.iter().find(|(sc, _)| *sc == Scenario::S18))
+    {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            topology::probe_udp_roundtrip(socks, udp_echo.port()),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                println!("[xray-stress] end-state probe ok: s18-udp (udp/{})", udp_echo.port());
+            },
+            Ok(Err(e)) => failures.record("end-state probe s18-udp", &e),
+            Err(_) => failures.record("end-state probe s18-udp", &"timeout 30s"),
         }
     }
 
@@ -364,6 +472,12 @@ async fn run(
         }
     }
     println!("[xray-stress] summary: {}", path.display());
+    // 场景内资源断言（s16 半开风暴 fd 趋势 / s17 慢读 RSS）违规即判 run 失败：
+    // 「进程活着但资源失控」不能被退出码漏掉（bd 2byyv）。
+    let violations: u64 = stats_for_assert.iter().map(|h| h.snapshot().resource_violations).sum();
+    if violations > 0 {
+        failures.record("resource assertions", &format!("{violations} scenario violation(s)"));
+    }
     let failed = failures.count();
     if failed > 0 {
         return Err(StressError::RunFailed { count: failed });
@@ -485,9 +599,39 @@ enum Scenario {
     S10,
     S11,
     S12,
+    S13,
+    S14,
+    S15,
+    S16,
+    S17,
+    S18,
+    S19,
 }
 
-/// s5-s12：每个场景一条独立协议链（短连接风暴 worker 复用 s1 语义）。
+/// 全场景（`--scenarios all`）；顺序即启动/报告顺序。
+const ALL_SCENARIOS: &[Scenario] = &[
+    Scenario::S1,
+    Scenario::S2,
+    Scenario::S3,
+    Scenario::S4,
+    Scenario::S5,
+    Scenario::S6,
+    Scenario::S7,
+    Scenario::S8,
+    Scenario::S9,
+    Scenario::S10,
+    Scenario::S11,
+    Scenario::S12,
+    Scenario::S13,
+    Scenario::S14,
+    Scenario::S15,
+    Scenario::S16,
+    Scenario::S17,
+    Scenario::S18,
+    Scenario::S19,
+];
+
+/// s5-s15/s18：每个场景一条独立协议链（短连接风暴 worker 复用 s1 语义）。
 const PROTOCOL_SCENARIOS: &[(Scenario, &str)] = &[
     (Scenario::S5, "s5-vmess-ws"),
     (Scenario::S6, "s6-trojan-grpc"),
@@ -497,6 +641,10 @@ const PROTOCOL_SCENARIOS: &[(Scenario, &str)] = &[
     (Scenario::S10, "s10-vless-xhttp"),
     (Scenario::S11, "s11-http-proxy"),
     (Scenario::S12, "s12-vmess-h3"),
+    (Scenario::S13, "s13-vless-ws"),
+    (Scenario::S14, "s14-vless-httpupgrade"),
+    (Scenario::S15, "s15-mux"),
+    (Scenario::S18, "s18-udp"),
 ];
 
 impl Scenario {
@@ -511,6 +659,10 @@ impl Scenario {
             Scenario::S10 => topology::start_splithttp_link(echo_port).await,
             Scenario::S11 => topology::start_http_link(echo_port).await,
             Scenario::S12 => topology::start_vmess_h3_link(echo_port).await,
+            Scenario::S13 => topology::start_vless_ws_link(echo_port).await,
+            Scenario::S14 => topology::start_vless_httpupgrade_link(echo_port).await,
+            Scenario::S15 => topology::start_mux_link(echo_port).await,
+            Scenario::S18 => topology::start_udp_link(echo_port).await,
             _ => Err(StressError::Scenario("s1-s4 links are provisioned separately".into())),
         }
     }
@@ -523,41 +675,23 @@ impl Scenario {
 fn parse_scenarios(s: &str) -> Result<Vec<Scenario>> {
     let mut out = Vec::new();
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        out.push(match part.to_ascii_lowercase().as_str() {
-            "s1" => Scenario::S1,
-            "s2" => Scenario::S2,
-            "s3" => Scenario::S3,
-            "s4" => Scenario::S4,
-            "s5" => Scenario::S5,
-            "s6" => Scenario::S6,
-            "s7" => Scenario::S7,
-            "s8" => Scenario::S8,
-            "s9" => Scenario::S9,
-            "s10" => Scenario::S10,
-            "s11" => Scenario::S11,
-            "s12" => Scenario::S12,
-            "all" => {
-                return Ok(vec![
-                    Scenario::S1,
-                    Scenario::S2,
-                    Scenario::S3,
-                    Scenario::S4,
-                    Scenario::S5,
-                    Scenario::S6,
-                    Scenario::S7,
-                    Scenario::S8,
-                    Scenario::S9,
-                    Scenario::S10,
-                    Scenario::S11,
-                    Scenario::S12,
-                ]);
-            },
-            other => {
+        if part.eq_ignore_ascii_case("all") {
+            return Ok(ALL_SCENARIOS.to_vec());
+        }
+        // "s13" → ALL_SCENARIOS[12]：编号即矩阵位次，新增场景只改 ALL_SCENARIOS
+        let idx = part
+            .strip_prefix(['s', 'S'])
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1));
+        match idx.and_then(|i| ALL_SCENARIOS.get(i)) {
+            Some(sc) => out.push(*sc),
+            None => {
                 return Err(StressError::Scenario(format!(
-                    "unknown scenario: {other} (expect s1..s12|all)"
+                    "unknown scenario: {part} (expect s1..s{}|all)",
+                    ALL_SCENARIOS.len()
                 )));
             },
-        });
+        }
     }
     if out.is_empty() {
         return Err(StressError::Scenario("empty --scenarios".into()));
@@ -568,6 +702,26 @@ fn parse_scenarios(s: &str) -> Result<Vec<Scenario>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--scenarios` 解析：all = 全 19 个（新增场景只改 ALL_SCENARIOS），编号越界显式失败。
+    #[test]
+    fn parse_scenarios_covers_all_and_rejects_out_of_range() {
+        assert_eq!(parse_scenarios("all").unwrap().len(), ALL_SCENARIOS.len());
+        assert_eq!(ALL_SCENARIOS.len(), 19, "19 场景矩阵（s1-s19）");
+        assert_eq!(parse_scenarios("s13,s19").unwrap(), vec![Scenario::S13, Scenario::S19]);
+        assert_eq!(parse_scenarios(" S7 ").unwrap(), vec![Scenario::S7]);
+        assert!(parse_scenarios("s20").is_err(), "越界编号必须拒");
+        assert!(parse_scenarios("s0").is_err(), "s0 无对应场景");
+        assert!(parse_scenarios("").is_err(), "空场景集必须拒");
+    }
+
+    /// 新增场景的统计名必须在表里（否则 summary/metrics 出现 "unknown" 行）。
+    #[test]
+    fn every_protocol_scenario_has_stats_name() {
+        for &(sc, name) in PROTOCOL_SCENARIOS {
+            assert_eq!(sc.stats_name(), name, "{name} 统计名与表不一致");
+        }
+    }
 
     #[tokio::test]
     async fn end_state_probe_fails_on_dead_link() {

@@ -265,11 +265,16 @@ fn normalize_go_style_args(mut argv: Vec<String>) -> Vec<String> {
 // P2 不成比例；路线 B 显式抬高上限（线程按需 spawn、闲置回收，上限本身零内存成本）
 // + 池水位周期监控，把静默饿死转成有界可观测。
 fn main() -> std::process::ExitCode {
+    let max_blocking = max_blocking_threads();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(max_blocking_threads())
+        .max_blocking_threads(max_blocking)
         .build()
         .expect("tokio runtime must build");
+    // bd lh4az B1：mKCP 钉线预算与池上限**同源**（池的一半）——预算写死会与
+    // `XRAY_MAX_BLOCKING_THREADS` 脱钩，池被改小时 spawn_blocking 照样排队静默
+    // 挂死。`.max(1)` 防池=1 时预算 0 拒掉全部 mKCP 连接。
+    xray_transport_kcp::set_pinned_recv_budget((max_blocking / 2).max(1) as u64);
     runtime.block_on(async_main())
 }
 

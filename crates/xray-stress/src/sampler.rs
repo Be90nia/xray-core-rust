@@ -34,9 +34,11 @@ struct SampleRow {
     alive_tasks: usize,
     worker_park: u64,
     busy_s: f64,
+    /// 场景内资源断言违规累计（`__proc__`/`__drain__` 行恒 0）。
+    violations: u64,
 }
 
-pub const CSV_HEADER: &str = "ts,scenario,conn_ok,conn_fail,tx_bps,rx_bps,p50_ms,p95_ms,p99_ms,rss_mb,fd_count,alive_tasks,worker_park,busy_s";
+pub const CSV_HEADER: &str = "ts,scenario,conn_ok,conn_fail,tx_bps,rx_bps,p50_ms,p95_ms,p99_ms,rss_mb,fd_count,alive_tasks,worker_park,busy_s,violations";
 
 pub struct Sampler {
     pub run_id: String,
@@ -140,6 +142,7 @@ impl Sampler {
                 alive_tasks: 0,
                 worker_park: 0,
                 busy_s: 0.0,
+                violations: snap.resource_violations,
             });
         }
         // drain 段负载已停，吞吐归零会拉塌衰减判定的尾段均值 → 该序列不含 drain 采样。
@@ -161,6 +164,7 @@ impl Sampler {
             alive_tasks: rt.alive_tasks,
             worker_park: rt.worker_park_count,
             busy_s: rt.worker_busy_duration.as_secs_f64(),
+            violations: 0,
         });
         for r in &rows {
             self.write_row(r)?;
@@ -172,7 +176,7 @@ impl Sampler {
         let fmt = |v: Option<f64>| v.map_or("-".into(), |x| format!("{x:.1}"));
         writeln!(
             self.csv,
-            "{},{},{},{},{:.0},{:.0},{},{},{},{:.1},{},{},{},{:.3}",
+            "{},{},{},{},{:.0},{:.0},{},{},{},{:.1},{},{},{},{:.3},{}",
             r.ts,
             r.scenario,
             r.conn_ok,
@@ -187,6 +191,7 @@ impl Sampler {
             r.alive_tasks,
             r.worker_park,
             r.busy_s,
+            r.violations,
         )
     }
 
@@ -253,7 +258,10 @@ pub fn checkpoint_interval(duration: Duration) -> Duration {
 }
 
 /// (rss_mb, fd_count)。sysinfo 0.39：memory() = bytes；fd_count() macOS 返回 None。
-fn sample_process() -> (f64, Option<usize>) {
+///
+/// 场景内资源断言（bd 2byyv：半开风暴 fd 趋势 / 慢读背压 RSS）复用本函数，
+/// 与 CSV `__proc__` 行同源，判定口径一致。
+pub(crate) fn sample_process() -> (f64, Option<usize>) {
     let pid = sysinfo::get_current_pid().unwrap_or_else(|_| sysinfo::Pid::from_u32(0));
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);

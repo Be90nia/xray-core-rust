@@ -35,12 +35,66 @@ use crate::{
 
 /// HC-1 暴露监控：当前被拨号侧 per-conn 收包循环终身钉死的 blocking 线程数。
 ///
-/// tokio `RuntimeMetrics` 的 blocking 池指标（`num_blocking_threads` 等）在无
+/// tokio `RuntimeMetrics` 的 blocking 池指标（`num_blocking_threads` 等在无
 /// `tokio_unstable` 构建下不可见（1.53.1 stable 面仅 scheduler 指标），故应用侧
 /// 自记此计数；bin 入口周期采样，与显式 `max_blocking_threads` 上限对表告警。
 static PINNED_RECV_LOOPS: AtomicU64 = AtomicU64::new(0);
 
-/// 循环内 unwind 也要减计数，用 Drop 兜底而非循环尾手工减。
+/// mKCP 钉线预算缺省值（bd lh4az B1）：宿主未注入时用。
+///
+/// 每 mKCP 出站连接终身钉 1 条 blocking 线程（见 `dial_kcp` 的收包循环）。池被
+/// 钉满后 `spawn_blocking` 排队不执行 ⇒ 连接建成但不收包 = 静默挂死，且
+/// getaddrinfo / observatory 等其余 blocking 面一起饿死。超出预算即拒新连接
+/// （fail-visible，而非排队静默挂）。
+///
+/// 512 对应 xray-cli 的池缺省 1024 的一半；宿主知道真实池上限时经
+/// [`set_pinned_recv_budget`] 注入（池上界与预算必须同源，否则改小池仍会挂死）。
+const DEFAULT_PINNED_RECV_BUDGET: u64 = 512;
+
+/// 宿主注入的预算（0 = 未注入，用缺省）。
+static PINNED_RECV_BUDGET_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// 注入钉线预算（xray-cli 在 runtime 建好后按池上限派生调用）。
+///
+/// 传 0 = 复位为缺省（装配期一次性注入；每进程一次，非热路径）。
+pub fn set_pinned_recv_budget(budget: u64) {
+    PINNED_RECV_BUDGET_OVERRIDE.store(budget, Ordering::Relaxed);
+}
+
+fn pinned_recv_budget() -> u64 {
+    match PINNED_RECV_BUDGET_OVERRIDE.load(Ordering::Relaxed) {
+        0 => DEFAULT_PINNED_RECV_BUDGET,
+        n => n,
+    }
+}
+
+/// 名额判定（纯逻辑，便于断言）：未达预算即放行。
+fn pinned_recv_admits(pinned: u64, budget: u64) -> bool {
+    pinned < budget
+}
+
+/// 占一个钉线名额；满额返回 `None`（调用方拒连，禁 spawn 排队）。
+///
+/// CAS 循环而非 load+add：并发 dial 不得一起越过预算。
+fn try_acquire_pinned_recv(budget: u64) -> Option<PinnedRecvGuard> {
+    let mut current = PINNED_RECV_LOOPS.load(Ordering::Relaxed);
+    loop {
+        if !pinned_recv_admits(current, budget) {
+            return None;
+        }
+        match PINNED_RECV_LOOPS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(PinnedRecvGuard),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// 名额句柄：随收包循环 Drop 归还（unwind 亦归还，不靠循环尾手工减）。
 struct PinnedRecvGuard;
 
 impl Drop for PinnedRecvGuard {
@@ -181,6 +235,27 @@ async fn dial_kcp(
     // 2. 解析目标地址（对齐 Go internet.DialSystem：Domain 也解析）
     let dest_addr = resolve_dest_to_socket_addr(dest).await?;
 
+    // 2.5 收包循环准入（bd lh4az B1）：钉线预算满即拒新连接 fail-visible。
+    //     放在建 socket 之前 = 被拒的 dial 不留半开 UDP socket；放在解析之后
+    //     = 不占用名额等待 DNS。禁「照 spawn 让它排队」——那正是静默挂死的形态
+    //     （任务排队不执行 ⇒ 连接建成但不收包）。
+    let budget = pinned_recv_budget();
+    let Some(pinned_slot) = try_acquire_pinned_recv(budget) else {
+        let pinned = pinned_recv_loops();
+        tracing::warn!(
+            pinned,
+            budget,
+            dest = %dest,
+            "mKCP pinned recv loop budget exhausted: refusing new connection (budget = \
+             XRAY_MAX_BLOCKING_THREADS / 2; raise the pool cap to serve more mKCP conns)"
+        );
+        return Err(io::Error::other(format!(
+            "mKCP pinned recv loop budget exhausted ({pinned}/{budget}): refusing new connection \
+             to {dest}; each connection pins one blocking thread, budget = \
+             XRAY_MAX_BLOCKING_THREADS / 2"
+        )));
+    };
+
     // 3. 创建 UDP socket + KcpDialerFactory（chain = None 时裸 segment，向后兼容）
     let factory = StdKcpDialerFactory { chain };
 
@@ -209,9 +284,9 @@ async fn dial_kcp(
     let conn_weak = Arc::downgrade(&conn);
     let reader = KCPPacketReader::new();
     tokio::task::spawn_blocking(move || {
-        // HC-1 钉线观测口径：本循环终身占用 1 条 blocking 线程，进出各计一次
-        PINNED_RECV_LOOPS.fetch_add(1, Ordering::Relaxed);
-        let _pinned = PinnedRecvGuard;
+        // HC-1 钉线观测口径：本循环终身占用 1 条 blocking 线程；名额在
+        // dial 侧已占（bd lh4az B1 准入），随本循环 Drop 归还（unwind 亦归还）。
+        let _pinned = pinned_slot;
         while let Some(payload) = packet_input.read_packet() {
             let Some(conn_now) = conn_weak.upgrade() else { break };
             let segments = reader.read(&payload);
@@ -708,5 +783,47 @@ mod tests {
             Destination::tcp(Address::Domain("nonexistent.invalid".to_string()), Port::new(1));
         let res = resolve_dest_to_socket_addr(&dest).await;
         assert!(res.is_err(), "invalid TLD must fail to resolve");
+    }
+
+    // ===== bd lh4az B1：钉线预算准入（池满 shed 而非静默排队）=====
+
+    /// 预算判定：未满放行，满额/超量一律拒（无「排队等待」档位）。
+    #[test]
+    fn pinned_recv_admits_until_budget_is_full() {
+        assert!(pinned_recv_admits(0, 4));
+        assert!(pinned_recv_admits(3, 4));
+        assert!(!pinned_recv_admits(4, 4), "满额必须拒（shed），不得排队");
+        assert!(!pinned_recv_admits(4 * 1024, 4));
+    }
+
+    /// 名额配发/归还：满额 acquire 返 None；guard drop 后立刻可再配发。
+    ///
+    /// 用 `pinned_recv_loops()` 现值为基数（本 crate 无其他测试走 dial 路径），
+    /// 基数在断言前复核，避免与并发测试互相干扰时产生假红。
+    #[test]
+    fn try_acquire_pinned_recv_sheds_at_budget_and_returns_slot() {
+        let base = pinned_recv_loops();
+        let budget = base + 1;
+        let slot = try_acquire_pinned_recv(budget).expect("基数 +1 预算首名额应放行");
+        if pinned_recv_loops() == base + 1 {
+            assert!(
+                try_acquire_pinned_recv(budget).is_none(),
+                "满额必须拒（fail-visible），禁越界占用"
+            );
+        }
+        let before = pinned_recv_loops();
+        drop(slot);
+        assert_eq!(pinned_recv_loops(), before - 1, "名额必须随 guard drop 归还");
+    }
+
+    /// 预算注入：未注入用缺省；注入值与池上限同源（改小池必须同步改小预算，
+    /// 否则「池上界 < 预算」仍会排队挂死）。0 = 复位缺省。
+    #[test]
+    fn pinned_recv_budget_follows_host_injection() {
+        assert_eq!(pinned_recv_budget(), DEFAULT_PINNED_RECV_BUDGET);
+        set_pinned_recv_budget(4);
+        assert_eq!(pinned_recv_budget(), 4, "宿主注入值必须生效（池 8 → 预算 4）");
+        set_pinned_recv_budget(0);
+        assert_eq!(pinned_recv_budget(), DEFAULT_PINNED_RECV_BUDGET, "0 复位缺省");
     }
 }

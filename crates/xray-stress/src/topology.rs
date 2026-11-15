@@ -639,9 +639,300 @@ pub async fn start_vmess_h3_link(echo_port: u16) -> Result<LinkHandles> {
     .await
 }
 
+// ===== s13-s19 扩展场景（bd 2byyv） =====
+//
+// 覆盖审计 F-12..F-19 的缺口：ws/httpupgrade 链路（s13/s14）、出站级 mux 载体
+// （s15）、半开 TLS 握手风暴 + 慢读背压（s16/s17，共用一条真实 vless+tls 链路）、
+// UDP 数据面（s18）、26 入站同进程装配（s19）。
+
+/// 进程 fd 数（Linux/macOS 采得到；Windows 无 ⇒ None）。场景内 fd 断言用。
+pub fn process_fd_count() -> Option<usize> {
+    crate::sampler::sample_process().1
+}
+
+/// 进程 RSS（MB）。场景内 RSS 断言用。
+pub fn process_rss_mb() -> f64 {
+    crate::sampler::sample_process().0
+}
+
+/// s13：`vless + websocket` 双实例。
+pub async fn start_vless_ws_link(echo_port: u16) -> Result<LinkHandles> {
+    let _ = echo_port;
+    let proto_port = pick_free_port().await;
+    start_simple_link(
+        "vless-ws",
+        vless_inbound(proto_port, "stress-vless-ws-in"),
+        Some(vless_ws_stream()),
+        vless_outbound(proto_port, vless_ws_stream()),
+    )
+    .await
+}
+
+fn vless_ws_stream() -> serde_json::Value {
+    serde_json::json!({
+        "network": "ws", "security": "none",
+        "wsSettings": {"path": "/stress-vless-ws"},
+    })
+}
+
+/// s14：`vless + httpupgrade` 双实例（审计缺口：httpupgrade 零场景）。
+pub async fn start_vless_httpupgrade_link(echo_port: u16) -> Result<LinkHandles> {
+    let _ = echo_port;
+    let proto_port = pick_free_port().await;
+    start_simple_link(
+        "vless-httpupgrade",
+        vless_inbound(proto_port, "stress-vless-hu-in"),
+        Some(vless_httpupgrade_stream()),
+        vless_outbound(proto_port, vless_httpupgrade_stream()),
+    )
+    .await
+}
+
+fn vless_httpupgrade_stream() -> serde_json::Value {
+    serde_json::json!({
+        "network": "httpupgrade", "security": "none",
+        "httpupgradeSettings": {"path": "/stress-vless-hu", "host": "localhost"},
+    })
+}
+
+/// s15：出站级 mux 载体链路——客户端多连接复用单条 carrier（dest `v1.mux.cool`），
+/// 服务端 vless 入站按 dest 交 mux `ServerWorker` 解帧（functions.rs 同款装配）。
+pub async fn start_mux_link(echo_port: u16) -> Result<LinkHandles> {
+    let _ = echo_port;
+    let proto_port = pick_free_port().await;
+    let mut out =
+        vless_outbound(proto_port, serde_json::json!({"network": "tcp", "security": "none"}));
+    out.mux_json = Some(serde_json::json!({"enabled": true, "concurrency": 8}));
+    start_simple_link("vless-mux", vless_inbound(proto_port, "stress-mux-in"), None, out).await
+}
+
+/// s16/s17 共用：`vless + tls`（自签）双实例。返回 (协议端口, 链路句柄)——
+/// 协议端口是真实 TLS 入站，半开握手风暴直接打它（审计 R-1 的触发形态）。
+pub async fn start_vless_tls_link(echo_port: u16) -> Result<(u16, LinkHandles)> {
+    let _ = echo_port;
+    let proto_port = pick_free_port().await;
+    let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])
+        .map_err(|e| StressError::Cert(format!("vless tls self-signed cert: {e}")))?;
+    let server_stream = serde_json::json!({
+        "network": "tcp", "security": "tls",
+        "tlsSettings": {"certificates": [{"certificate": [cert_pem], "key": [key_pem]}]},
+    });
+    let client_stream = serde_json::json!({
+        "network": "tcp", "security": "tls",
+        "tlsSettings": {"allowInsecure": true, "serverName": "localhost"},
+    });
+    let handles = start_simple_link(
+        "vless-tls",
+        vless_inbound(proto_port, "stress-vless-tls-in"),
+        Some(server_stream),
+        vless_outbound(proto_port, client_stream),
+    )
+    .await?;
+    Ok((proto_port, handles))
+}
+
+/// UDP echo：收到什么原样回给来源（s18 的 roundtrip 载体）。
+pub async fn start_udp_echo() -> std::net::SocketAddr {
+    let port = pick_free_port().await;
+    let sock = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await.expect("bind udp echo");
+    let addr = sock.local_addr().expect("udp echo addr");
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：压测：UDP echo server 常驻任务"
+    )]
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, peer)) => {
+                    let _ = sock.send_to(&buf[..n], peer).await;
+                },
+                // 单包错误（ICMP 未达等）不退出：退出即 echo 永久死亡 = 整场景假失败
+                Err(e) => {
+                    tracing::warn!("udp echo recv error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                },
+            }
+        }
+    });
+    addr
+}
+
+/// s18：`socks(udp associate) → vless udp → freedom UDP → UDP echo` 链路。
+pub async fn start_udp_link(echo_port: u16) -> Result<LinkHandles> {
+    let _ = echo_port;
+    let proto_port = pick_free_port().await;
+    let socks_port = pick_free_port().await;
+
+    let mut server_cfg = BuiltConfig::default();
+    server_cfg.inbounds.push(vless_inbound(proto_port, "stress-udp-in"));
+    server_cfg.outbounds.push(freedom_outbound());
+
+    let mut client_cfg = BuiltConfig::default();
+    // socks UDP ASSOCIATE 需显式开启（Go SocksServerConfig.UDP 缺省 false）
+    client_cfg.inbounds.push(built_inbound(
+        "socks",
+        br#"{"auth":"noauth","udp":true}"#.to_vec(),
+        "socks-udp-in",
+        socks_port,
+    ));
+    client_cfg.outbounds.push(vless_outbound(
+        proto_port,
+        serde_json::json!({"network": "tcp", "security": "none"}),
+    ));
+
+    let (_si, _so, sh) = start_full(&server_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("udp server: {e}")))?;
+    let (_ci, _co, ch) = start_full(&client_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("udp client: {e}")))?;
+    tokio::time::sleep(READY_WARMUP).await;
+    Ok((socks_port, sh, ch))
+}
+
+/// 单次 SOCKS5 UDP ASSOCIATE roundtrip（RFC 1928 §4）。
+///
+/// 控制连接必须活到 roundtrip 结束：socks 入站把 relay 生命周期绑在它上面。
+pub async fn socks_udp_roundtrip(
+    proxy_port: u16,
+    echo_port: u16,
+    payload: &[u8],
+) -> std::io::Result<usize> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut ctrl = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    ctrl.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut greet = [0u8; 2];
+    ctrl.read_exact(&mut greet).await?;
+    if greet != [0x05, 0x00] {
+        return Err(std::io::Error::other(format!("socks udp greet rejected: {greet:?}")));
+    }
+    // UDP ASSOCIATE，DST.ADDR/PORT 全 0 = 由服务端分配 relay
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    let mut rep = [0u8; 10];
+    ctrl.read_exact(&mut rep).await?;
+    if rep[1] != 0x00 {
+        return Err(std::io::Error::other(format!("socks UDP ASSOCIATE failed: {}", rep[1])));
+    }
+    if rep[3] != 0x01 {
+        return Err(std::io::Error::other("socks UDP relay 非 IPv4（harness 只覆盖 v4 loopback）"));
+    }
+    let relay = std::net::SocketAddr::from((
+        [rep[4], rep[5], rep[6], rep[7]],
+        u16::from_be_bytes([rep[8], rep[9]]),
+    ));
+
+    let local = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let mut packet = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+    packet.extend_from_slice(&echo_port.to_be_bytes());
+    packet.extend_from_slice(payload);
+    local.send_to(&packet, relay).await?;
+
+    let mut buf = vec![0u8; payload.len() + 64];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), local.recv_from(&mut buf))
+        .await
+        .map_err(|_| std::io::Error::other("socks udp roundtrip timeout 5s"))??;
+    // 响应头 RSV(2) FRAG(1) ATYP(1) + ADDR + PORT，之后才是载荷
+    let hdr = match buf[3] {
+        0x01 => 10,
+        0x04 => 22,
+        0x03 if n > 5 => 4 + 1 + buf[4] as usize + 2,
+        _ => return Err(std::io::Error::other("socks udp 响应头非法")),
+    };
+    if n < hdr || buf[hdr..n] != *payload {
+        return Err(std::io::Error::other("udp echo payload mismatch"));
+    }
+    Ok(payload.len())
+}
+
+/// 结束态 UDP 探针（s18）：一轮 UDP roundtrip。
+pub async fn probe_udp_roundtrip(socks_port: u16, echo_udp_port: u16) -> Result<()> {
+    socks_udp_roundtrip(socks_port, echo_udp_port, b"s18-end-state-probe")
+        .await
+        .map(|_| ())
+        .map_err(|e| StressError::Probe(format!("udp probe failed: {e}")))
+}
+
+/// 26 入站同进程装配形状（审计 F-15：vless×10 / trojan×8 / vmess×6 / ss×2）。
+const MULTI_INBOUND_SHAPE: &[(&str, usize)] =
+    &[("vless", 10), ("trojan", 8), ("vmess", 6), ("ss", 2)];
+
+/// s19：26 个入站在**同一服务端实例**里装配（审计缺口：每场景只有 1 个 inbound）。
+///
+/// 负载侧每条链路一个独立 socks 客户端实例（harness 侧不入 SUT 账本）：
+/// 服务端单进程 26 listener 才是本场景要压的形态。
+/// 返回 (统计名, socks 端口) 与全部服务端/客户端任务句柄。
+pub async fn start_multi_inbound_group()
+-> Result<(Vec<(String, u16)>, Vec<tokio::task::JoinHandle<()>>)> {
+    let mut server_cfg = BuiltConfig::default();
+    let mut client_cfgs = Vec::new();
+    let mut links = Vec::new();
+    for &(proto, count) in MULTI_INBOUND_SHAPE {
+        for i in 0..count {
+            let port = pick_free_port().await;
+            let in_tag = format!("stress-multi-{proto}-{i}-in");
+            let stream = serde_json::json!({"network": "tcp", "security": "none"});
+            let (ib, ob) = match proto {
+                "vless" => (vless_inbound(port, &in_tag), vless_outbound(port, stream)),
+                "trojan" => (trojan_inbound(port, &in_tag), trojan_outbound(port, stream)),
+                "vmess" => (vmess_inbound(port, &in_tag), vmess_outbound(port, stream)),
+                _ => (ss_inbound(port, &in_tag), ss_outbound(port, stream)),
+            };
+            server_cfg.inbounds.push(ib);
+
+            let socks_port = pick_free_port().await;
+            let mut client_cfg = BuiltConfig::default();
+            client_cfg.inbounds.push(socks_inbound(socks_port));
+            client_cfg.outbounds.push(ob);
+            client_cfgs.push(client_cfg);
+            links.push((format!("s19-{proto}-{i}"), socks_port));
+        }
+    }
+    server_cfg.outbounds.push(freedom_outbound());
+
+    let (_si, _so, mut handles) = start_full(&server_cfg)
+        .await
+        .map_err(|e| StressError::Start(format!("multi-inbound server (26 inbounds): {e}")))?;
+    for client_cfg in client_cfgs {
+        let (_ci, _co, ch) = start_full(&client_cfg)
+            .await
+            .map_err(|e| StressError::Start(format!("multi-inbound client: {e}")))?;
+        handles.extend(ch);
+    }
+    tokio::time::sleep(READY_WARMUP).await;
+    Ok((links, handles))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s13 模板：ws 双端同 path（服务端/客户端取同一份 = 不会各写各的漏改）。
+    #[test]
+    fn vless_ws_template_fields() {
+        let s = vless_ws_stream();
+        assert_eq!(s["network"], "ws");
+        assert_eq!(s["security"], "none");
+        assert_eq!(s["wsSettings"]["path"], "/stress-vless-ws");
+    }
+
+    /// s14 模板：httpupgrade 双端同 path + host。
+    #[test]
+    fn vless_httpupgrade_template_fields() {
+        let s = vless_httpupgrade_stream();
+        assert_eq!(s["network"], "httpupgrade");
+        assert_eq!(s["security"], "none");
+        assert_eq!(s["httpupgradeSettings"]["path"], "/stress-vless-hu");
+        assert_eq!(s["httpupgradeSettings"]["host"], "localhost");
+    }
+
+    /// s19 形状：26 入站（vless10/trojan8/vmess6/ss2）——审计 F-15 的装配规模。
+    #[test]
+    fn multi_inbound_shape_matches_audit_262626() {
+        let total: usize = MULTI_INBOUND_SHAPE.iter().map(|(_, c)| *c).sum();
+        assert_eq!(total, 26, "26 监听同进程是验收口径");
+        assert_eq!(MULTI_INBOUND_SHAPE, &[("vless", 10), ("trojan", 8), ("vmess", 6), ("ss", 2)]);
+    }
 
     /// s5 模板：vmess 出站 security=aes-128-gcm + ws stream 字段。
     #[test]

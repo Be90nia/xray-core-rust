@@ -467,7 +467,8 @@ impl ConnSlot {
                     active,
                     limit,
                     hits,
-                    plan.inflight_budget_bytes(),
+                    // 读**当下**容量（运行期按实况内存自调，启动快照可能已不成立）。
+                    xray_frame::budget::inflight::global().total(),
                 );
             }
         }
@@ -508,14 +509,21 @@ pub struct ConnStats {
     pub soft_limit_hits: u64,
     /// 进程级 in-flight 预算当前占用（字节）。
     pub inflight_used: usize,
-    /// 进程级 in-flight 预算容量（字节）。
+    /// 进程级 in-flight 预算容量（字节；运行期按实况内存自调 ⇒ 可能偏离启动快照）。
     pub inflight_total: usize,
+    /// 进程级 in-flight 预算历史峰值（字节）。
+    pub inflight_peak: usize,
+    /// 因预算装不下而背压等待的块数累计。
+    pub backpressure_waits: u64,
+    /// 预算容量被按实况内存重调的次数。
+    pub inflight_resamples: u64,
 }
 
 /// 连接面统计（压测与生产可读）：条数软上限 + in-flight 预算读数。
 ///
 /// 「超软上限仍放行」的次数（`soft_limit_hits`）就是旧版会被硬拒的连接数——
-/// 这个数字单调增说明软上限确实在承载过载，而不是偶发抖动。
+/// 这个数字单调增说明软上限确实在承载过载，而不是偶发抖动。`backpressure_waits`
+/// 同理是「字节闸在承载过载」的证据；两者都为 0 而吞吐塌 ⇒ 查链路，不是查闸（bd uaoby R-3）。
 #[must_use]
 pub fn conn_stats() -> ConnStats {
     use std::sync::atomic::Ordering;
@@ -527,6 +535,9 @@ pub fn conn_stats() -> ConnStats {
         soft_limit_hits: SOFT_LIMIT_HITS.load(Ordering::Relaxed),
         inflight_used: inflight.used(),
         inflight_total: inflight.total(),
+        inflight_peak: inflight.peak(),
+        backpressure_waits: inflight.backpressure_waits(),
+        inflight_resamples: inflight.resamples(),
     }
 }
 
@@ -1672,6 +1683,13 @@ mod tests {
         assert!(stats.peak >= 40, "峰值必须 ≥ 40：{stats:?}");
         assert_eq!(stats.soft_limit, conn_limit(), "软上限口径同源");
         assert!(stats.inflight_total > 0, "in-flight 预算必须可见：{stats:?}");
+        // 计数面同源（bd uaoby R-3）：stats 的四个预算字段必须就是单例的当下值，
+        // 不能是装配期快照——运维据此判断「闸在承载过载」而非「网络故障」。
+        let budget = xray_frame::budget::inflight::global();
+        assert_eq!(stats.inflight_total, budget.total(), "容量必须读当下值：{stats:?}");
+        assert_eq!(stats.inflight_peak, budget.peak(), "峰值同源：{stats:?}");
+        assert_eq!(stats.backpressure_waits, budget.backpressure_waits(), "背压计数同源");
+        assert_eq!(stats.inflight_resamples, budget.resamples(), "重调计数同源");
         drop(held);
     }
 
@@ -1694,6 +1712,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!blocked.is_finished(), "全局预算满时必须等待（不得超发）");
+        assert_eq!(global.backpressure_waits(), 1, "等待中的块必须计入背压（可观测面）");
         // 本连接闸上限 8MiB，3+1=4MiB 仍有余量 ⇒ 阻塞只能来自全局层（证明是双层）。
         assert_eq!(
             a.inflight.load(std::sync::atomic::Ordering::Acquire),

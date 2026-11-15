@@ -19,7 +19,10 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -49,43 +52,139 @@ pub trait HostResolver: Send + Sync {
 /// 票内"域名 NS 运行期解析"：上游 IP 变更后新查询自然用新 IP，
 /// 无启动期钉死缓存。bd ypsl：曾用 hickory TokioResolver，其对部分域名
 /// A 响应空返回且 v6-only 让直连撞本机 v6 不可达——见 resolve 内注释。
+/// bd lh4az B2：并发解析有上限 + 在途记账（libc getaddrinfo 不可取消）。
 pub struct SystemHostResolver;
+
+/// 系统解析并发上限（bd lh4az B2）。
+///
+/// getaddrinfo 在 libc 内阻塞且**不可取消**：调用方超时只能弃置等待，线程继续
+/// 占着 blocking 池槽直到 libc 自然返回。无上限时上游 DNS 全挂会让每个查询各钉
+/// 一条池线程，连锁饿死 mKCP 收包循环 / observatory 等其余 spawn_blocking。
+/// 64 覆盖正常并发（单次解析毫秒级），到顶即拒（fail-visible），不排队堆积。
+const MAX_CONCURRENT_SYSTEM_RESOLVES: usize = 64;
+
+/// 单次系统解析等待上限（超时后线程不可取消，只弃置）。
+const SYSTEM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// 在途系统解析计数：**含已弃置但 libc 未返回的线程**（它们仍占池槽，必须计入）。
+struct SystemResolverState {
+    in_flight: AtomicUsize,
+}
+
+impl SystemResolverState {
+    const fn new() -> Self {
+        Self { in_flight: AtomicUsize::new(0) }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// 占一个解析名额；到顶返回 `None`（调用方拒单，禁再 spawn 一条不可取消的线程）。
+    ///
+    /// CAS 循环而非 load+add：并发查询不得一起越过上限。
+    fn try_take(&'static self, cap: usize) -> Option<ResolveSlot> {
+        let mut current = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            if current >= cap {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(ResolveSlot(self)),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+/// 名额句柄：**由 libc 线程自己持有**——超时弃置后名额不回收，直到线程自然返回，
+/// 故堆积恒 ≤ 上限（这正是「弃置不回收槽」语义）。
+struct ResolveSlot(&'static SystemResolverState);
+
+impl Drop for ResolveSlot {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 生产用全局在途态。
+static SYSTEM_RESOLVER: SystemResolverState = SystemResolverState::new();
+
+/// 系统 getaddrinfo 解析（受并发上限约束）。
+///
+/// `state`/`cap` 由调用方给出以便测试隔离（生产传 `&SYSTEM_RESOLVER` + 上限常量）。
+async fn resolve_system(
+    state: &'static SystemResolverState,
+    host: &str,
+    cap: usize,
+) -> io::Result<Vec<IpAddr>> {
+    let Some(slot) = state.try_take(cap) else {
+        let in_flight = state.in_flight();
+        tracing::warn!(
+            target: "xray.dns.system",
+            host,
+            in_flight,
+            cap,
+            "system resolver at concurrency cap; refusing lookup (libc getaddrinfo is uncancellable)"
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "resolve {host}: {in_flight}/{cap} concurrent getaddrinfo in flight \
+                 (uncancellable, refusing new lookup)"
+            ),
+        ));
+    };
+    let host_owned = host.to_string();
+    let resolve_fut = tokio::task::spawn_blocking(move || {
+        // 名额随本线程释放（含调用方已弃置的情形）——见 ResolveSlot 文档。
+        let _slot = slot;
+        use std::net::ToSocketAddrs as _;
+        let mut ips: Vec<IpAddr> = (host_owned.as_str(), 0)
+            .to_socket_addrs()
+            .map_err(|e| io::Error::other(format!("getaddrinfo: {e}")))?
+            .map(|sa| sa.ip())
+            .collect::<Vec<IpAddr>>();
+        // v4 优先（稳定排序保持族内相对序）：v6 不可达场景常见，先试 v4。
+        ips.sort_by_key(|ip| !matches!(ip, IpAddr::V4(_)));
+        Ok::<Vec<IpAddr>, io::Error>(ips)
+    });
+    let ips = match tokio::time::timeout(SYSTEM_RESOLVE_TIMEOUT, resolve_fut).await {
+        Ok(joined) => joined.map_err(|e| io::Error::other(format!("getaddrinfo join: {e}")))??,
+        Err(_) => {
+            let in_flight = state.in_flight();
+            tracing::warn!(
+                target: "xray.dns.system",
+                host,
+                in_flight,
+                "system resolve timed out; getaddrinfo thread abandoned (slot held until libc returns)"
+            );
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout")));
+        },
+    };
+    if ips.is_empty() {
+        return Err(io::Error::other(format!("resolve {host}: getaddrinfo returned no address")));
+    }
+    Ok(ips)
+}
 
 impl HostResolver for SystemHostResolver {
     fn resolve(
         &self,
         host: String,
     ) -> Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>> {
+        // bd ypsl：曾用 hickory TokioResolver——实测对部分域名的 A 响应空
+        // 返回（上游 114/223.5.5.5/8.8.8.8 手工 wire 查询均正常，纯 hickory
+        // 层问题），v6-only 结果又让直连撞本机 v6 不可达（os error 10051）
+        // → DoH 必挂。改用系统 getaddrinfo（OS 解析栈，python/curl/nslookup
+        // 同路径三方验证可用），双栈结果 v4 优先。
         Box::pin(async move {
-            // bd ypsl：曾用 hickory TokioResolver——实测对部分域名的 A 响应空
-            // 返回（上游 114/223.5.5.5/8.8.8.8 手工 wire 查询均正常，纯 hickory
-            // 层问题），v6-only 结果又让直连撞本机 v6 不可达（os error 10051）
-            // → DoH 必挂。改用系统 getaddrinfo（OS 解析栈，python/curl/nslookup
-            // 同路径三方验证可用），双栈结果 v4 优先。
-            let host2 = host.clone();
-            let resolve_fut = tokio::task::spawn_blocking(move || {
-                use std::net::ToSocketAddrs as _;
-                let mut ips: Vec<IpAddr> = (host2.as_str(), 0)
-                    .to_socket_addrs()
-                    .map_err(|e| io::Error::other(format!("getaddrinfo: {e}")))?
-                    .map(|sa| sa.ip())
-                    .collect::<Vec<IpAddr>>();
-                // v4 优先（稳定排序保持族内相对序）：v6 不可达场景常见，先试 v4。
-                ips.sort_by_key(|ip| !matches!(ip, IpAddr::V4(_)));
-                Ok::<Vec<IpAddr>, io::Error>(ips)
-            });
-            let ips = tokio::time::timeout(Duration::from_secs(4), resolve_fut)
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, format!("resolve {host} timeout"))
-                })?
-                .map_err(|e| io::Error::other(format!("getaddrinfo join: {e}")))??;
-            if ips.is_empty() {
-                return Err(io::Error::other(format!(
-                    "resolve {host}: getaddrinfo returned no address"
-                )));
-            }
-            Ok(ips)
+            resolve_system(&SYSTEM_RESOLVER, &host, MAX_CONCURRENT_SYSTEM_RESOLVES).await
         })
     }
 }
@@ -725,5 +824,58 @@ mod tests {
         let (marked, plain) = tokio::join!(marked, plain);
         assert!(marked.unwrap(), "带标记 task 应拒拨被 skip 服务器");
         assert!(plain.unwrap(), "不带标记 task 不受影响，应正常连接");
+    }
+
+    // ===== bd lh4az B2：系统解析并发上限（不可取消线程堆积有界）=====
+
+    /// 到顶即拒（fail-visible）：名额上限 0 ⇒ 立刻 WouldBlock，不 spawn、不留名额。
+    #[tokio::test]
+    async fn system_resolve_refuses_at_concurrency_cap() {
+        static STATE: SystemResolverState = SystemResolverState::new();
+        let err = resolve_system(&STATE, "localhost", 0).await.expect_err("上限 0 必须拒单");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            err.to_string().contains("uncancellable"),
+            "错误文案须点明不可取消（运维据此调参）：{err}"
+        );
+        assert_eq!(STATE.in_flight(), 0, "拒单路径不得留下在途名额");
+    }
+
+    /// 解析成功名额归还（不泄漏池槽）。
+    #[tokio::test]
+    async fn system_resolve_releases_slot_on_success() {
+        static STATE: SystemResolverState = SystemResolverState::new();
+        let ips = resolve_system(&STATE, "localhost", MAX_CONCURRENT_SYSTEM_RESOLVES)
+            .await
+            .expect("localhost 解析应成功");
+        assert!(!ips.is_empty());
+        assert_eq!(STATE.in_flight(), 0, "解析完成后在途名额必须归还");
+    }
+
+    /// 解析失败（RFC 6761 保留 TLD）同样归还名额——释放由线程 Drop 兜底。
+    #[tokio::test]
+    async fn system_resolve_releases_slot_on_failure() {
+        static STATE: SystemResolverState = SystemResolverState::new();
+        let err = resolve_system(&STATE, "nonexistent.invalid", MAX_CONCURRENT_SYSTEM_RESOLVES)
+            .await
+            .expect_err("保留 TLD 必须解析失败");
+        assert!(!matches!(err.kind(), io::ErrorKind::WouldBlock), "不是拒单：{err}");
+        assert_eq!(STATE.in_flight(), 0, "失败路径同样不得漏名额");
+    }
+
+    /// 名额占用期间第二次查询在 cap=1 下被拒——证明上限真的挡住并发堆积。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn system_resolve_second_lookup_refused_while_slot_held() {
+        static STATE: SystemResolverState = SystemResolverState::new();
+        let held = STATE.try_take(1).expect("首名额应拿到");
+        let err = resolve_system(&STATE, "localhost", 1).await.expect_err("名额被占时应拒单");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(STATE.in_flight(), 1);
+        drop(held);
+        assert_eq!(STATE.in_flight(), 0, "名额归还后可再解析");
+        assert!(
+            resolve_system(&STATE, "localhost", 1).await.is_ok(),
+            "名额归还后同一上限应恢复放行"
+        );
     }
 }

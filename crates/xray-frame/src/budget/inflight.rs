@@ -41,11 +41,20 @@ use tokio::sync::Notify;
 /// 进程级在途字节预算（单例见 [`global`]；测试可 [`InflightBudget::new`] 造独立实例）。
 #[derive(Debug)]
 pub struct InflightBudget {
-    total: usize,
+    /// 容量（字节）。运行期可被重采样改写（[`Self::resample`]），故非 `const`。
+    total: AtomicUsize,
     used: AtomicUsize,
     peak: AtomicUsize,
     /// 正挂在 [`Notify`] 上等的任务数（慢路径计数门）。
     sleepers: AtomicUsize,
+    /// 慢路径进入次数（= 曾经等过预算的块数）。运维判据：单调增说明闸在承载过载，
+    /// 而不是网络慢（bd uaoby R-3 的「闸在工作 vs 故障」分辨面）。
+    backpressure_waits: AtomicU64,
+    /// 实际生效过的重采样次数（容量真的变了才 +1）。
+    resamples: AtomicU64,
+    /// 是否允许按实况可用内存自调容量。只有进程单例开（[`global`]）——测试造的
+    /// 独立实例容量由用例钉死，不得被本机实况改写。
+    autotune: bool,
     notify: Notify,
 }
 
@@ -80,21 +89,31 @@ impl InflightPermit {
 
 impl InflightBudget {
     /// 建独立预算（`total` 夹到 ≥ 1：0 = 永不放行，等于把数据面锁死）。
+    ///
+    /// **不自调容量**：容量由调用方钉死（测试/显式注入）。要按实况内存自调的是进程
+    /// 单例，见 [`global`]。
     #[must_use]
     pub fn new(total: usize) -> Arc<Self> {
+        Self::with_autotune(total, false)
+    }
+
+    fn with_autotune(total: usize, autotune: bool) -> Arc<Self> {
         Arc::new(Self {
-            total: total.max(1),
+            total: AtomicUsize::new(total.max(1)),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
+            backpressure_waits: AtomicU64::new(0),
+            resamples: AtomicU64::new(0),
+            autotune,
             notify: Notify::new(),
         })
     }
 
-    /// 预算容量（字节）。
+    /// 预算容量（字节）。运行期可能被重采样改写（[`Self::resample`]）。
     #[must_use]
     pub fn total(&self) -> usize {
-        self.total
+        self.total.load(Ordering::Acquire)
     }
 
     /// 当前在途（字节）。
@@ -109,6 +128,18 @@ impl InflightBudget {
         self.peak.load(Ordering::Acquire)
     }
 
+    /// 曾因预算装不下而等待的块数累计（背压次数，单调增）。
+    #[must_use]
+    pub fn backpressure_waits(&self) -> u64 {
+        self.backpressure_waits.load(Ordering::Relaxed)
+    }
+
+    /// 容量被重采样改写的次数（单调增；长期为 0 = 实况内存稳定或从未触顶）。
+    #[must_use]
+    pub fn resamples(&self) -> u64 {
+        self.resamples.load(Ordering::Relaxed)
+    }
+
     /// 取 `bytes` 字节在途许可；预算装不下就等（背压），**不拒绝**。
     ///
     /// 中止语义：调用方用 `tokio::select!` 包住本 future 时，未取到许可即被丢弃
@@ -120,6 +151,10 @@ impl InflightBudget {
         if self.try_take(bytes) {
             return InflightPermit { budget: Arc::clone(self), bytes };
         }
+        let waits = self.backpressure_waits.fetch_add(1, Ordering::Relaxed) + 1;
+        // 已经在等了 ⇒ 此刻付一次 `/proc/meminfo` 的代价是划算的（bd uaoby R-4：
+        // 启动快照的档位不会自己回头）。按次数限量 + 滞回，稳态零代价。
+        self.resample_periodically(waits);
         loop {
             // 慢路径：先记睡眠者、再登记等待者，然后**立刻重试一次**。不丢唤醒靠的
             // 是后两步与 `release` 的配合：`release` 先减账、再查睡眠者计数，所以
@@ -141,7 +176,8 @@ impl InflightBudget {
         let Ok(prev) = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
             // 单块超预算永不阻塞（预算软上界，堵死 = 连接挂死）：只在本来空账
             // 或装得下时放行。并发下两个大块可能同时通过判定而少量超账——软上界。
-            (cur == 0 || cur.saturating_add(bytes) <= self.total).then(|| cur.saturating_add(bytes))
+            (cur == 0 || cur.saturating_add(bytes) <= self.total())
+                .then(|| cur.saturating_add(bytes))
         }) else {
             return false;
         };
@@ -149,6 +185,66 @@ impl InflightBudget {
         // 真实 `used`（峰值只可能在占账后出现）——省掉一次 `used.load`。
         self.peak.fetch_max(prev.saturating_add(bytes), Ordering::AcqRel);
         true
+    }
+
+    /// 显式重探测：按**实况**可用内存重算容量（bd uaoby R-4）。
+    ///
+    /// 返回 `(旧容量, 新容量)`；无实质变化时 `None`。进程单例还会在背压慢路径上
+    /// 限量自动调它（`resample_periodically`），本方法留给周期任务/运维 API
+    /// 显式触发。
+    pub fn resample(&self) -> Option<(usize, usize)> {
+        self.apply_available(crate::budget::plan::live_available())
+    }
+
+    /// 慢路径自动重采样：**首次**背压就探一次（启动快照落小档要立刻纠正，不等累积），
+    /// 之后每累计 [`RESAMPLE_EVERY_WAITS`] 次才再探。
+    ///
+    /// 按**背压次数**而非时间节流：不用裸时钟（坑约束 3：`Instant::now` 被 clippy 禁用，
+    /// 要注入 `Clock`），且成本天然跟负载挂钩——探测成本 ∝ 过载量，稳态与全停时都是
+    /// 零探测（全停时不再有新块进来，计数不涨）。
+    fn resample_periodically(&self, waits: u64) {
+        if self.autotune && (waits == 1 || waits.is_multiple_of(RESAMPLE_EVERY_WAITS)) {
+            let _ = self.resample();
+        }
+    }
+
+    /// 重采样的纯函数面（实况值由调用方给，单测不碰平台探测）：按 `available` 重算
+    /// 容量并落账，返回 `(旧, 新)`；与现容量差异 < 1/8 视为噪声不动（滞回）。
+    fn apply_available(&self, available: u64) -> Option<(usize, usize)> {
+        // 我们自己的在途页也记在「不可用」里：把它加回来，避免自激——自身压力不得
+        // 反过来压低自己的上限（否则越堵越紧，吞吐自噬；预算是软上界，物理装不下
+        // 时本来就靠背压兜）。
+        let live = available.saturating_add(self.used() as u64);
+        let target = crate::budget::plan::inflight_budget_for_live(live).max(1);
+        let old = self.total();
+        if !materially_differs(old, target) {
+            return None;
+        }
+        self.total.store(target, Ordering::Release);
+        self.resamples.fetch_add(1, Ordering::Relaxed);
+        // 扩容 ⇒ 等待者应立即前进；缩容 ⇒ 也让它们按新容量重判一次（被唤醒后装不下
+        // 就继续等，不丢唤醒）。
+        self.notify.notify_waiters();
+        // fail-visible：档位/容量自己漂了必须留痕（调用点已按背压次数限量）。
+        // 收紧是 OOM 防线的动作，必须 warn；放宽是快照纠正，info 即可。
+        if target < old {
+            tracing::warn!(
+                target: "xray_frame::budget",
+                old,
+                new = target,
+                live_available = live,
+                "进程级 in-flight 预算按实况内存**收紧**（实况可用少了；超出走背压不拒连）"
+            );
+        } else {
+            tracing::info!(
+                target: "xray_frame::budget",
+                old,
+                new = target,
+                live_available = live,
+                "进程级 in-flight 预算按实况内存**放宽**（启动快照落小档已被实况纠正）"
+            );
+        }
+        Some((old, target))
     }
 
     /// 归还 `bytes` 字节（`InflightPermit::drop` 的实现路径）。
@@ -187,10 +283,21 @@ impl Drop for SleeperGuard<'_> {
     }
 }
 
-/// 进程级预算单例（首次访问时按档位派生容量）。
+/// 慢路径自动重采样的间隔（背压次数）：每累计这么多次「装不下」才探一次实况可用
+/// 内存。一次 `/proc/meminfo` 读约 10µs，而 4096 次背压对应 ≥ 数 GB 的传输量 ⇒
+/// 探测成本可忽略；反过来过载越狠探得越勤，稳态零探测。
+const RESAMPLE_EVERY_WAITS: u64 = 4096;
+
+/// 容量变更是否**实质**（差 > 1/8）：`MemAvailable` 常态抖动几 % 不该让预算反复缩涨。
+fn materially_differs(a: usize, b: usize) -> bool {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    hi - lo > hi / 8
+}
+
+/// 进程级预算单例（首次访问时按档位派生容量；**慢路径按实况内存自调**）。
 pub fn global() -> &'static Arc<InflightBudget> {
     static GLOBAL: LazyLock<Arc<InflightBudget>> =
-        LazyLock::new(|| InflightBudget::new(default_total()));
+        LazyLock::new(|| InflightBudget::with_autotune(default_total(), true));
     &GLOBAL
 }
 
@@ -326,7 +433,110 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// 并发争用下**不得丢唤醒**：16 任务 × 100 轮抢 2 份额度，每次 acquire 带超时兜底。
+    /// 背压计数：**只有真的等过的块**才 +1（快路径零记），且可被外部读到
+    /// （bd uaoby R-3「闸在工作」的可观测面）。
+    #[tokio::test]
+    async fn backpressure_waits_count_only_blocked_blocks() {
+        let budget = InflightBudget::new(MIB);
+        let held = budget.acquire(MIB).await;
+        assert_eq!(budget.backpressure_waits(), 0, "快路径不得计背压");
+
+        let waiter = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(budget.backpressure_waits(), 1, "等待中的块必须计入背压");
+        assert_eq!(budget.used(), MIB, "等待期间账上零变化");
+
+        drop(held);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("归还后必须放行")
+            .expect("join");
+        assert_eq!(budget.backpressure_waits(), 1, "放行不得重复计数");
+        drop(permit);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// 实况重探测：容量按当下可用内存重算（收紧/放宽都跟随），差异 < 1/8 不动
+    /// （滞回），`used` 加回去避免自身压力自激（bd uaoby R-4）。
+    #[tokio::test]
+    async fn resample_retunes_capacity_from_live_available() {
+        let budget = InflightBudget::new(200 * MIB);
+        // 实况 256MiB（tiny 档）：容量按该实况重算（tiny 档 = 40MiB 预算 / 闸 20MiB
+        // / 可用 1/4 ⇒ 64MiB），必须比现容量 200MiB 小。
+        let tiny_available = 256 * MIB;
+        let expected = crate::budget::plan::inflight_budget_for_live(tiny_available as u64);
+        let (old, new) =
+            budget.apply_available(tiny_available as u64).expect("实况远小于现容量 ⇒ 必须收紧");
+        assert_eq!(old, 200 * MIB);
+        assert_eq!(new, expected, "容量必须按实况档位公式重算");
+        assert_eq!(budget.total(), expected);
+        assert_eq!(budget.resamples(), 1);
+
+        // 同一实况再探一次：无实质变化 ⇒ 不动（不反复记 resamples）。
+        assert!(budget.apply_available(tiny_available as u64).is_none(), "无变化不得改写容量");
+        assert_eq!(budget.resamples(), 1);
+
+        // 实况变好 ⇒ 放宽（启动快照落小档可被纠正）。
+        let big_available = 8 * 1024 * MIB;
+        let widened = budget.apply_available(big_available as u64).expect("实况变好必须放宽");
+        assert!(widened.1 > widened.0, "放宽后容量必须变大：{widened:?}");
+        assert_eq!(budget.total(), widened.1);
+
+        // 滞回：与现容量差 < 1/8 视为噪声。
+        let noise = (budget.total() as u64) / 100; // 1%
+        assert!(
+            budget.apply_available(big_available as u64 + noise).is_none(),
+            "1% 抖动必须被滞回吞掉（不得反复缩涨）"
+        );
+        assert_eq!(budget.backpressure_waits(), 0, "重采样不得被算作背压");
+    }
+
+    /// 重采样不得把在途账丢回「装不下」的死锁：被唤醒的等待者在扩容后必须能前进。
+    #[tokio::test]
+    async fn resample_wakes_waiters_when_capacity_grows() {
+        let budget = InflightBudget::new(MIB);
+        let held = budget.acquire(MIB).await;
+        let waiter = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(2 * MIB).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "2MiB 装不进 1MiB 预算 ⇒ 必须等");
+
+        // 实况充裕 ⇒ 放宽到装得下 2MiB（+ 已占 1MiB）。
+        budget.apply_available(8 * 1024 * MIB as u64).expect("必须放宽");
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("扩容后等待者必须被唤醒并前进")
+            .expect("join");
+        drop(permit);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// 独立实例不得自调容量（用例钉死的容量是本机实况无关的契约）。
+    #[tokio::test]
+    async fn injected_budget_does_not_autotune() {
+        let budget = InflightBudget::new(MIB);
+        let held = budget.acquire(MIB).await;
+        let waiter = tokio::spawn({
+            let budget = Arc::clone(&budget);
+            async move { budget.acquire(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(budget.total(), MIB, "独立实例容量不得被实况改写");
+        assert_eq!(budget.resamples(), 0);
+        drop(held);
+        let _permit = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("归还后必须放行")
+            .expect("join");
+        assert_eq!(budget.total(), MIB);
+    }
+
     /// 任一等待者漏唤醒即永久挂住 ⇒ 超时红（删掉 `release` 的广播即整批挂死，已验）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_contention_never_loses_wakeup() {

@@ -187,6 +187,10 @@ pub async fn probe_quic_roundtrip(server_addr: SocketAddr) -> Result<()> {
 }
 
 /// S3 worker：deadline 前不断 dial → auth（0-RTT）→ roundtrip → drop。
+///
+/// `--concurrency` 不作用于本场景（单 worker，历史 CI 的 c32 只改变同进程其他场景
+/// 的 CPU 压力）——bd 9xeai 的「32 并发挤占导致串行 dial 超时」假设因此不成立：
+/// 真因是 listener 句柄被 drop（见 [`start_quic_echo_server`]）。
 pub async fn s3_quic_reconnect_loop(
     server_addr: SocketAddr,
     deadline: Instant,
@@ -275,5 +279,48 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// bd 9xeai 回归：**持住 listener 句柄** ⇒ accept 泵存活 ⇒ 连续 roundtrip 全成功。
+    ///
+    /// 修复前 `start_quic_echo_server` 只回 addr（listener 返回即 drop），accept 泵
+    /// 随 ComponentScope 一起 abort、UDP socket 关闭 ⇒ 客户端 Initial 无人应答 ⇒
+    /// 本测试恒 0 成功（CI 三平台 s3 conn_ok=0 就是这一形态）。
+    #[tokio::test]
+    async fn quic_echo_serves_while_listener_handle_held() {
+        crate::topology::ensure_crypto_provider();
+        let (addr, _listener) = start_quic_echo_server().await.expect("quic echo server");
+        for round in 0..3 {
+            probe_quic_roundtrip(addr)
+                .await
+                .unwrap_or_else(|e| panic!("roundtrip {round} via udp/{addr} failed: {e}"));
+        }
+    }
+
+    /// 句柄是承重的：drop listener ⇒ abort accept 泵 + 关 UDP socket ⇒ 同端口可重新 bind。
+    ///
+    /// 若将来有人把「只返回 addr」的形态改回来（服务端自持 listener），本断言会红——
+    /// 这正是 9xeai 的防回归面。
+    #[tokio::test]
+    async fn dropping_listener_handle_releases_udp_socket() {
+        crate::topology::ensure_crypto_provider();
+        let (addr, listener) = start_quic_echo_server().await.expect("quic echo server");
+        drop(listener);
+        // abort 是异步的：轮询直到端口释放（上限 5s）
+        let mut released = false;
+        for _ in 0..50 {
+            if let Ok(sock) = tokio::net::UdpSocket::bind(addr).await {
+                released = true;
+                drop(sock);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(released, "listener drop 必须释放 UDP {addr}（否则句柄不是承重方）");
     }
 }

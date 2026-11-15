@@ -18,7 +18,14 @@
 //! 负责）。
 
 // P1-B: vless/trojan inbound 集成
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use skeleton_infra::memgov::{BoundedRegistry, Eviction};
 use tokio::{
@@ -3824,6 +3831,46 @@ pub fn built_inbound_from_proto(cfg: &ProtoInboundConfig) -> Result<BuiltInbound
 /// 广播，在途连接毫秒级终止）。
 const ARM_SCOPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// inbound serve 死亡台账（bd lh4az E1）。
+///
+/// serve 任务 panic 或提前返回 `Err` ⇒ listener 随 future drop 释放，该端口不再
+/// 接受连接而进程仍然存活（用户视角「还活着但连不上」）。改前只有一行 `error!`，
+/// 事后无法程序化判定「哪个入站死了 / 死了几个」。此处把死亡事件落成**可观测
+/// 状态**：进程级计数 + 有界的 `(tag, 原因)` 快照。
+///
+/// 不另起周期探针：死亡事件就在此壳里发生，内联检测（零延迟、零额外任务）严格
+/// 优于轮询；快照即轮询者要读的那份状态。
+static INBOUND_SERVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// 死亡快照上限：长期运行进程里反复失败的入站不应无界增长（新条目挤掉最旧）。
+const DEAD_INBOUND_SERVE_CAP: usize = 64;
+
+static DEAD_INBOUND_SERVES: parking_lot::Mutex<Vec<(String, String)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// 进程级 inbound serve 失败次数（panic / serve 提前返回错误；正常停机不计）。
+pub fn inbound_serve_failures() -> u64 {
+    INBOUND_SERVE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// 最近死亡的 inbound serve 快照 `(tag, 原因)`，新的在后，最多 64 条。
+pub fn dead_inbound_serves() -> Vec<(String, String)> {
+    DEAD_INBOUND_SERVES.lock().clone()
+}
+
+/// 记一次 serve 死亡：计数 + 有界快照 + `error!` 留痕（fail-visible）。
+fn record_inbound_serve_death(tag: &str, reason: &str) {
+    let failures = INBOUND_SERVE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut dead = DEAD_INBOUND_SERVES.lock();
+        if dead.len() >= DEAD_INBOUND_SERVE_CAP {
+            dead.remove(0);
+        }
+        dead.push((tag.to_string(), reason.to_string()));
+    }
+    tracing::error!(tag, reason, failures, "inbound serve died — 监听已停止，该端口不再接受连接");
+}
+
 /// spawn 一个 inbound serve task，监听 shutdown_token 实现优雅关闭。
 ///
 /// token cancel 时取消 serve future（drop listener，accept 循环终止）。
@@ -3831,8 +3878,9 @@ const ARM_SCOPE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 ///
 /// W4 面 6：serve 任务本体托管 arm scope（任务记账 + in_flight + 停机级联，
 /// bd 39hko）；panic 监督语义（51d50459）逐字保留——FxScope catch_unwind 把
-/// serve future 的 panic 归一 `TaskError::Panicked`，外层壳 join 判别后 error! 留痕，
-/// listener 随 panic 的 future drop 释放，等价原 `JoinError::is_panic()` 路径。
+/// serve future 的 panic 归一 `TaskError::Panicked`，外层壳 join 判别后落死亡
+/// 台账（计数 + `(tag, 原因)` 快照 + `error!`，bd lh4az E1），listener 随 panic
+/// 的 future drop 释放，等价原 `JoinError::is_panic()` 路径。
 ///
 /// bd a9xgp（停机掉在途连接）：本函数是全部 inbound arm 的**唯一构造漏斗**
 /// （arm_builders 各构造函数 + transport/unix 分支均经此 spawn），在此集中完成
@@ -3853,18 +3901,17 @@ pub(crate) fn spawn_inbound_serve(
     // 停机监视令牌（先于 inner 克隆：shutdown_token 本体随 inner future move）。
     let watch_token = shutdown_token.clone();
     // 内层：serve + shutdown select —— 托管 arm scope。
+    // 返回 serve 的 `io::Result`（而非就地记日志），让外层壳统一判定「死亡 vs
+    // 停机」并落死亡台账（bd lh4az E1）；停机臂恒 `Ok(())` = 不计失败。
     let inner = arm
         .spawn({
             let tag_inner = tag.clone();
             async move {
                 tokio::select! {
-                    r = fut => {
-                        if let Err(e) = r {
-                            tracing::error!(tag = %tag_inner, error = %e, "inbound stopped");
-                        }
-                    }
+                    r = fut => r,
                     _ = shutdown_token.cancelled() => {
                         tracing::info!(tag = %tag_inner, "inbound shutting down (graceful)");
+                        Ok(())
                     }
                 }
             }
@@ -3904,23 +3951,31 @@ pub(crate) fn spawn_inbound_serve(
                 drain_report(&tag, arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await);
             }
             joined = inner.join() => {
-                if let Err(skeleton_infra::fx::TaskError::Panicked(_)) = joined {
-                    tracing::error!(
-                        tag = %tag,
-                        "inbound serve task panicked — 监听已停止，该端口不再接受连接"
-                    );
-                }
                 // select! 双臂同就绪随机裁决（serve 与监视令牌同听一个 token，
                 // join 可先就绪）——join 臂胜出时停机排空必须兜底，禁把级联
                 // 押在裁决随机性上（a9xgp 修复首跑即踩中）。token 已取消 =
-                // 停机形态 → 幂等排空；token 未取消 = listener 自然终局，保留
-                // 既有「连接任务不随 listener 死亡」的 detach 语义不排空。
+                // 停机形态 → 幂等排空、不计失败（任务被关闸结束是预期结局）。
                 if watch_token.is_cancelled() {
                     drain_report(
                         &tag,
                         arm.arm_scope().shutdown_timeout(ARM_SCOPE_DRAIN_TIMEOUT).await,
                     );
+                    return;
                 }
+                // token 未取消而 serve 任务已结束 = 该入站死了（listener 随 future
+                // drop 释放，端口不再接受连接而进程存活）——bd lh4az E1：入死亡台账。
+                // 三种结局都记：serve 返回 Ok（监听自然终局）、返回 Err、panic/abort。
+                let reason = match joined {
+                    Ok(Ok(())) => "serve loop ended without error (listener gone)".to_string(),
+                    Ok(Err(e)) => format!("serve error: {e}"),
+                    Err(skeleton_infra::fx::TaskError::Panicked(payload)) => {
+                        format!("panicked: {payload}")
+                    },
+                    Err(e) => format!("task error: {e}"),
+                };
+                record_inbound_serve_death(&tag, &reason);
+                // 既有「连接任务不随 listener 死亡」的 detach 语义保留：非停机
+                // 形态不排空。
             }
         }
     })
@@ -13990,6 +14045,66 @@ mod tests {
         );
         let joined = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         assert!(joined.is_ok(), "serve 句柄不应挂死（panic 后必须收敛）");
+    }
+
+    /// bd lh4az E1：serve 死亡必须**可观测**（计数 + `(tag, 原因)` 快照），
+    /// 而正常停机（token cancel）不计失败。
+    #[tokio::test]
+    async fn inbound_serve_death_is_observable() {
+        // ① panic → 计数 +1，快照含 panic 原因。
+        let before = inbound_serve_failures();
+        let handle = spawn_inbound_serve(
+            &test_plugin_ctx("death-probe"),
+            "death-probe".to_string(),
+            CancellationToken::new(),
+            async { panic!("simulated panic inside inbound serve") },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("panic 后句柄必须收敛")
+            .expect("外层监视壳自身不得 panic");
+        assert!(
+            inbound_serve_failures() > before,
+            "panic 必须进失败计数（改前只有一行日志，无法程序化判定）"
+        );
+        assert!(
+            dead_inbound_serves().iter().any(|(t, r)| t == "death-probe" && r.contains("panicked")),
+            "快照必须记录死亡 tag + 原因"
+        );
+
+        // ② serve 提前返回 Err（listener 死亡）→ 同样入账。
+        let before_err = inbound_serve_failures();
+        let handle = spawn_inbound_serve(
+            &test_plugin_ctx("err-probe"),
+            "err-probe".to_string(),
+            CancellationToken::new(),
+            async { Err(std::io::Error::other("listener died")) },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("Err 终局后句柄必须收敛")
+            .expect("外层监视壳自身不得 panic");
+        assert!(inbound_serve_failures() > before_err, "serve Err 必须进失败计数");
+        assert!(dead_inbound_serves().iter().any(|(t, _)| t == "err-probe"));
+
+        // ③ 正常停机 ≠ 失败：token cancel 路径不入账。
+        let token = CancellationToken::new();
+        let handle = spawn_inbound_serve(
+            &test_plugin_ctx("graceful-probe"),
+            "graceful-probe".to_string(),
+            token.clone(),
+            std::future::pending(),
+        );
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("停机后句柄必须收敛")
+            .expect("外层监视壳自身不得 panic");
+        // 计数是进程级量（其他并发测试也会加），故按 tag 判定本测试的入站未入账。
+        assert!(
+            !dead_inbound_serves().iter().any(|(t, _)| t == "graceful-probe"),
+            "graceful shutdown 不得记入 serve 死亡台账"
+        );
     }
 
     /// W4 面 6 验收（方案 §6 G6 的 xray-core 半）：连接级 scope 的两条消费契约。

@@ -18,6 +18,10 @@ pub struct ScenarioStats {
     pub lat_next: usize,
     /// 环形缓冲已填充数（≤ cap 后恒为 cap）。
     pub lat_filled: usize,
+    /// 场景内资源断言违规次数（bd 2byyv：半开风暴 fd 增长 / 慢读 RSS 超界）。
+    /// 场景 worker 自己判定并记账，run 结束任一条 > 0 即判 run 失败——
+    /// 「进程活着但有资源失控」必须可判红。
+    pub resource_violations: u64,
 }
 
 pub const LATENCY_CAP: usize = 4096;
@@ -42,6 +46,11 @@ impl StatsHandle {
 
     pub fn record_fail(&self) {
         self.0.lock().conn_fail += 1;
+    }
+
+    /// 记录一次资源断言违规（同场景多次违规只累加计数，日志由场景侧打）。
+    pub fn record_violation(&self) {
+        self.0.lock().resource_violations += 1;
     }
 
     pub fn name(&self) -> String {
@@ -211,17 +220,18 @@ pub fn render_summary(
     // 场景表
     md.push_str("## 场景计数\n\n");
     md.push_str(
-        "| scenario | conn_ok | conn_fail | tx_bytes | rx_bytes | p50_ms | p95_ms | p99_ms |\n",
+        "| scenario | conn_ok | conn_fail | viol | tx_bytes | rx_bytes | p50_ms | p95_ms | p99_ms |\n",
     );
-    md.push_str("|---|---|---|---|---|---|---|---|\n");
+    md.push_str("|---|---|---|---|---|---|---|---|---|\n");
     for s in scenarios {
         let (p50, p95, p99) = (s.percentile(0.50), s.percentile(0.95), s.percentile(0.99));
         let fmt = |v: Option<f64>| v.map_or("-".into(), |x| format!("{x:.1}"));
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             s.name,
             s.conn_ok,
             s.conn_fail,
+            s.resource_violations,
             s.bytes_tx,
             s.bytes_rx,
             fmt(p50),
@@ -229,7 +239,7 @@ pub fn render_summary(
             fmt(p99)
         ));
     }
-    md.push_str("\n错误计数表：上表 conn_fail 列即每场景失败连接数。\n");
+    md.push_str("\n错误计数表：上表 conn_fail 列即每场景失败连接数；viol = 场景内资源断言违规数（>0 判 run 失败）。\n");
     md
 }
 

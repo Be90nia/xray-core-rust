@@ -30,8 +30,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 分批跑：12 场景 all 并发时 5 个短连接风暴场景(s1/s5/s7/s8/s11)挤兑 ephemeral 端口预算，
-        # 实测(run 35558871262)各 fail 15 万次成功仅数百；两批各 6 场景避开
+        # 分批跑：19 场景 all 并发时多个短连接风暴场景挤兑 ephemeral 端口预算，
+        # 实测(run 35558871262)各 fail 15 万次成功仅数百；按批避开。
+        # c 批 = s13-s19（bd 2byyv 新增：ws/httpupgrade/mux/半开风暴/慢读/UDP/26 入站）。
         include:
           - os: macos-15
             label: macos
@@ -39,12 +40,18 @@ jobs:
           - os: macos-15
             label: macos
             batch: b
+          - os: macos-15
+            label: macos
+            batch: c
           - os: ubuntu-latest
             label: linux
             batch: a
           - os: ubuntu-latest
             label: linux
             batch: b
+          - os: ubuntu-latest
+            label: linux
+            batch: c
           - os: windows-latest
             label: windows
             batch: all
@@ -143,7 +150,8 @@ jobs:
           $s2 = if ($env:S2_CONNS) { [int]$env:S2_CONNS } else { 4 }
           if ("${{ matrix.batch }}" -eq "a") { $batch = "s1,s2,s3,s4,s5,s6" }
           elseif ("${{ matrix.batch }}" -eq "b") { $batch = "s7,s8,s9,s10,s11,s12" }
-          else { $batch = "s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12" }
+          elseif ("${{ matrix.batch }}" -eq "c") { $batch = "s13,s14,s15,s16,s17,s18,s19" }
+          else { $batch = "s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,s16,s17,s18,s19" }
           Write-Host "batch: $batch, hours: $hours, concurrency: $conc, s2_conns: $s2, constrained: $env:CONSTRAINED"
           $cargs = "--duration $($hours * 3600) --concurrency $conc --s2-conns $s2 --scenarios $batch --s1-delay-ms 300 --sample-interval 30 --drain-secs 360 --out-dir stress-out"
           if ($IsLinux -and $env:CONSTRAINED -eq 'true') {

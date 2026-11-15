@@ -330,6 +330,19 @@ pub fn live_available() -> u64 {
     resolve_live_available(override_mb, probed)
 }
 
+/// 按**实况**可用内存重算进程级 in-flight 预算容量（重探测入口，bd uaoby R-4）。
+///
+/// 与启动快照 [`MemoryPlan::inflight_budget_bytes`] **同一公式**，只把 `available` 换成
+/// 重采样值（档位/总预算/闸/连接面随之重新派生）。启动瞬间的 `MemAvailable` 是单点
+/// 快照——开机时别的进程占着内存会落小档，之后内存释放也不再回头；本函数是那条
+/// 缺口的重算面（消费方：`budget::inflight` 的慢路径重采样）。
+///
+/// `XRAY_MAX_CONNS` 显式上限照旧生效（[`explicit_max_conns`]）：重算不是绕过策略的入口。
+#[must_use]
+pub fn inflight_budget_for_live(available: u64) -> usize {
+    MemoryPlan::build(available, "reprobe", explicit_max_conns()).inflight_budget_bytes()
+}
+
 /// [`live_available`] 的纯函数面（env 覆盖 → 探测值 → 兜底），单测不碰环境变量。
 fn resolve_live_available(override_mb: Option<u64>, probed: Option<u64>) -> u64 {
     match override_mb {
