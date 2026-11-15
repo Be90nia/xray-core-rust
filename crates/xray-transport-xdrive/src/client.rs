@@ -157,6 +157,13 @@ impl http_body::Body for ProgressBody {
     fn is_end_stream(&self) -> bool {
         self.pos >= self.data.len()
     }
+
+    /// 精确长度：hyper 据此写 `content-length`（Go `bytes.Reader` 的
+    /// `ContentLength` 同义）——缺省未知长度会落 chunked，严格 S3（R2）
+    /// 对 PUT 直接 411 MissingContentLength（bd 实测）。
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.data.len() as u64)
+    }
 }
 
 pub(crate) fn err_stalled() -> io::Error {
