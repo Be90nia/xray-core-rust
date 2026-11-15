@@ -14,7 +14,7 @@ use xray_transport_hysteria::{
     HysteriaListenerFactory,
     conn::InterStreamConn,
     dialer::{DialDestination, HysteriaClient},
-    hub::{AuthValidator, MasqType},
+    hub::{AuthValidator, HysteriaQuicListener, MasqType},
     hysteria_transport::QuinnHysteriaTransport,
     proto_config::Config as ProtoConfig,
     quinn_adapter::QuinnListenerFactory,
@@ -36,7 +36,13 @@ pub(crate) fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
 }
 
 /// S3 服务端：QUIC listener + TCPRequest 解析 + echo 回调。
-pub async fn start_quic_echo_server() -> Result<SocketAddr> {
+///
+/// **调用方必须持有返回的 listener 直到 run 结束**（bd 9xeai）：accept 泵由
+/// `scope.spawn` 落在该 listener 的 `ComponentScope` 上（`quinn_adapter.rs`，
+/// 7f959154 起），scope 唯一强持有者就是 listener 本身——drop 即 abort 泵并关闭
+/// UDP socket（客户端 Initial 无人应答，s3 全程 0 成功）。工作示例
+/// `proxy-hysteria/tests/e2e.rs` 全程持有 listener，故 e2e 一直绿。
+pub async fn start_quic_echo_server() -> Result<(SocketAddr, Arc<dyn HysteriaQuicListener>)> {
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])?;
     let cert_der = pem_to_der(&cert_pem)?;
     let key_der = pem_to_der(&key_pem)?;
@@ -80,7 +86,8 @@ pub async fn start_quic_echo_server() -> Result<SocketAddr> {
             },
         }
     };
-    Ok(listener.local_addr())
+    let addr = listener.local_addr();
+    Ok((addr, listener))
 }
 
 async fn echo_one(stream: Arc<InterStreamConn>) {

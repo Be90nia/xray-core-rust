@@ -155,12 +155,13 @@ async fn run(
     } else {
         None
     };
-    let quic_addr = if scenarios.contains(&Scenario::S3) {
-        let addr = quic_loop::start_quic_echo_server().await?;
+    // listener 句柄必须活到 run 结束（bd 9xeai：drop = abort accept 泵 = 关 UDP socket）。
+    let (quic_addr, _quic_listener) = if scenarios.contains(&Scenario::S3) {
+        let (addr, listener) = quic_loop::start_quic_echo_server().await?;
         println!("[xray-stress] quic echo server ready: udp/{addr}");
-        Some(addr)
+        (Some(addr), Some(listener))
     } else {
-        None
+        (None, None)
     };
 
     // s5-s12：每场景独立协议链（表驱动装配 + 首连探针）
