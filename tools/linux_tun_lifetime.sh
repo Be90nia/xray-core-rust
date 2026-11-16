@@ -60,21 +60,22 @@ if [ "$APPEARED" != "1" ]; then
   tail -20 "$LOG"
   RES="FAIL"
 else
-  # 阶段 2：持续存活断言
+  # 阶段 2：持续存活断言（SURVIVED 标志：跑满无 break 才判 PASS，避免初始 FAIL 泄漏）
+  SURVIVED=1
   for i in $(seq 1 "$HOLD"); do
     sleep 1
     if ! kill -0 "$XPID" 2>/dev/null; then
       echo "process exited at t=${i}s"
-      RES="FAIL"
+      SURVIVED=0
       break
     fi
     if ! ip -o link show "$NAME" >/dev/null 2>&1; then
       echo "device disappeared at t=${i}s (process still alive) -> fy8i0 regression"
-      RES="FAIL"
+      SURVIVED=0
       break
     fi
   done
-  [ "$RES" = "FAIL" ] || { echo "device survived ${HOLD}s"; RES="PASS"; }
+  if [ "$SURVIVED" = "1" ]; then echo "device survived ${HOLD}s"; RES="PASS"; fi
 fi
 
 tail -20 "$LOG"
