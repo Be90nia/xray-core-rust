@@ -240,10 +240,17 @@ fn windows_route_cmd(verb: &str, plan: &RoutePlan, e: &RouteEntry) -> Cmd {
     // `LUID.FlushRoutes`（按 LUID 整族清）语义等价。
     let metric = (verb == "add").then(|| e.metric.to_string());
     match e.destination {
-        // route.exe 语法：route <verb> <dst> mask <mask> [metric <m>] if <idx>。
+        // route.exe 语法：route <verb> <dst> mask <mask> <gateway> [metric <m>] [if <idx>]。
+        // gateway 是必需的第三位置参数，缺省会把下一个词当网关主机名解析（metric 即失败）。
+        // TUN 路由全 on-link：gateway 固定 0.0.0.0（Go tun_windows 同形态）。
         std::net::IpAddr::V4(v4) => {
-            let mut args =
-                vec![verb.into(), v4.to_string(), "mask".into(), v4_mask(e.prefix).to_string()];
+            let mut args = vec![
+                verb.into(),
+                v4.to_string(),
+                "mask".into(),
+                v4_mask(e.prefix).to_string(),
+                "0.0.0.0".into(),
+            ];
             if let Some(metric) = &metric {
                 args.extend(["metric".to_string(), metric.clone()]);
             }

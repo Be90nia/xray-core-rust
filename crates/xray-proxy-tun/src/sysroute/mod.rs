@@ -216,9 +216,11 @@ pub fn plan_routes(
             options.name
         )));
     }
-    // Go Linux `Priority: 1`（tun_linux.go:455）；Windows `Metric: 0`（tun_windows.go:125）。
+    // Go Linux `Priority: 1`（tun_linux.go:455）；Windows API `Metric: 0`
+    // （tun_windows.go:125）的 CLI 等价最小合法值 = 1：route.exe 拒绝 metric 0
+    // （实测 bad metric value 0），metric 1 仍稳压物理网关缺省 metric 256。
     let metric = match platform {
-        Platform::Windows => 0,
+        Platform::Windows => 1,
         Platform::Linux | Platform::Other => 1,
     };
     let mut add: Vec<RouteEntry> = Vec::new();
@@ -513,9 +515,27 @@ pub(crate) fn prepare(
     options: &StackOptions,
     inbound_tag: &str,
 ) -> Result<Option<AppliedSystemChanges>> {
-    let Some(applied) =
-        plan_changes(Platform::current(), &xray_common::net::interface::interfaces()?, options)?
-    else {
+    // Windows：适配器 IP 条目注册晚于设备创建（NDIS 异步），首轮系统枚举可能不含
+    // TUN——DeviceNotFound 按路由/DNS 接管口径重试（Go startOver 缩范围；其余错误
+    // 直接上抛）。非 Windows 不重试。
+    const SYROUTE_ENUM_ATTEMPTS: u32 = 5;
+    let mut list = xray_common::net::interface::interfaces()?;
+    let mut outcome = None;
+    for attempt in 0..SYROUTE_ENUM_ATTEMPTS {
+        match plan_changes(Platform::current(), &list, options) {
+            Err(TunError::DeviceNotFound(_))
+                if cfg!(target_os = "windows") && attempt + 1 < SYROUTE_ENUM_ATTEMPTS =>
+            {
+                std::thread::sleep(ADAPTER_PROPS_BACKOFF);
+                list = xray_common::net::interface::interfaces()?;
+            },
+            other => {
+                outcome = Some(other);
+                break;
+            },
+        }
+    }
+    let Some(applied) = outcome.expect("SYROUTE_ENUM_ATTEMPTS >= 1")? else {
         return Ok(None);
     };
     // 防环路验证先于任何系统变更落盘（Go ConfigureSystemDNS：verify → resolvectl）。
@@ -1088,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn route_plan_windows_uses_metric_zero() {
+    fn route_plan_windows_uses_cli_legal_metric_one() {
         let o = opts(&["10.9.8.7/24"], &[], false);
         let plan = plan_routes(Platform::Windows, &tun_and_eth(), &o).expect("plan");
         assert_eq!(
@@ -1096,7 +1116,8 @@ mod tests {
             vec![RouteEntry {
                 destination: IpAddr::V4(Ipv4Addr::new(10, 9, 8, 0)),
                 prefix: 24,
-                metric: 0
+                // route.exe 拒绝 metric 0（Go Metric:0 是 API 语义）；CLI 最小合法值 1。
+                metric: 1
             }]
         );
     }
@@ -1317,8 +1338,8 @@ mod tests {
         assert_eq!(
             render(&added),
             vec![
-                "route add 0.0.0.0 mask 0.0.0.0 metric 0 if 24",
-                "netsh interface ipv6 add route 2001:db8::/32 interface=xray0 metric=0",
+                "route add 0.0.0.0 mask 0.0.0.0 0.0.0.0 metric 1 if 24",
+                "netsh interface ipv6 add route 2001:db8::/32 interface=xray0 metric=1",
             ]
         );
         let removed = rx.rollback(&plan);
@@ -1326,7 +1347,7 @@ mod tests {
             render(&removed),
             vec![
                 "netsh interface ipv6 delete route 2001:db8::/32 interface=xray0",
-                "route delete 0.0.0.0 mask 0.0.0.0 if 24",
+                "route delete 0.0.0.0 mask 0.0.0.0 0.0.0.0 if 24",
             ]
         );
     }

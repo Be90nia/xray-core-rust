@@ -2660,8 +2660,10 @@ fn build_legacy_dns_policy(
 pub(crate) fn build_dns_outbound_config(
     data: &[u8],
 ) -> std::result::Result<xray_proxy_dns::Config, String> {
-    let v: serde_json::Value =
-        serde_json::from_slice(data).map_err(|e| format!("dns outbound settings JSON: {e}"))?;
+    // Go 兼容：v2rayN TUN 模板等省略 settings 字段 → 缺省 Config（Go 零值语义）。
+    let empty = data.is_empty();
+    let v: serde_json::Value = serde_json::from_slice(if empty { b"{}" } else { data })
+        .map_err(|e| format!("dns outbound settings JSON: {e}"))?;
     warn_unknown_dns_outbound_keys(&v);
     let mut config = xray_proxy_dns::Config::default();
 

@@ -98,12 +98,19 @@ pub fn get_asset_location(file: &str) -> PathBuf {
 /// Go `GetAssetLocation(file)` 按文件逐个探测（others.go:15-32）；而 geodata
 /// loader 在加载期才拼文件名，故这里按目录探测：候选目录下存在任一 `.dat`
 /// 文件即采用，全不命中回落 env/exe 目录（由加载方报错）。
-/// Windows（Go windows.go:13）只有 env/exe 目录，不探测共享路径。
+/// Windows：env/exe 目录之外补 **exe 目录的父目录**——v2rayN 宿主布局
+/// `bin/xray/xray.exe` + `bin/*.dat`（exe 目录无 dat、父目录有），缺这层
+/// 探测 = dns 段 geosite 规则整体拒启（2026-11-16 实测）。
 pub fn get_asset_dir() -> PathBuf {
     let base = asset_env_dir();
     #[cfg(windows)]
     {
-        base
+        let parent = base.parent().map(PathBuf::from);
+        let mut candidates = vec![base.clone()];
+        if let Some(p) = parent {
+            candidates.push(p);
+        }
+        first_geodata_dir(&candidates).cloned().unwrap_or(base)
     }
     #[cfg(not(windows))]
     {
@@ -118,13 +125,11 @@ pub fn get_asset_dir() -> PathBuf {
 }
 
 /// 目录下是否存在 geodata 文件（目录级探测，等价 Go 按文件 `os.Stat`）。
-#[cfg(any(not(windows), test))]
 fn has_geodata_file(dir: &std::path::Path) -> bool {
     dir.join("geoip.dat").is_file() || dir.join("geosite.dat").is_file()
 }
 
 /// 首个含 geodata 文件的候选目录（探测顺序即优先级）。
-#[cfg(any(not(windows), test))]
 fn first_geodata_dir(candidates: &[PathBuf]) -> Option<&PathBuf> {
     candidates.iter().find(|d| has_geodata_file(d))
 }
