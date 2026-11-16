@@ -734,7 +734,9 @@ pub async fn start_vless_tls_link(echo_port: u16) -> Result<(u16, LinkHandles)> 
 /// UDP echo：收到什么原样回给来源（s18 的 roundtrip 载体）。
 pub async fn start_udp_echo() -> std::net::SocketAddr {
     let port = pick_free_port().await;
-    let sock = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await.expect("bind udp echo");
+    let sock = xray_transport::udp::bind_udp_no_connreset(("127.0.0.1", port))
+        .await
+        .expect("bind udp echo");
     let addr = sock.local_addr().expect("udp echo addr");
     #[allow(
         clippy::disallowed_methods,
@@ -822,7 +824,7 @@ pub async fn socks_udp_roundtrip(
         u16::from_be_bytes([rep[8], rep[9]]),
     ));
 
-    let local = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let local = xray_transport::udp::bind_udp_no_connreset("127.0.0.1:0").await?;
     let mut packet = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1];
     packet.extend_from_slice(&echo_port.to_be_bytes());
     packet.extend_from_slice(payload);

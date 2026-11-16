@@ -508,6 +508,10 @@ mod tun_keep_alive_tests {
     async fn owner_is_kept_alive_until_shutdown() {
         let dropped = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "②豁免（bd kwevg · §3.5.6）：测试基建——本 spawn 模拟 tun arm serve 承载形态（DropProbe 契约观察 owner 释放时机），寿命 = 本测试函数体，随 #[tokio::test] runtime 结束"
+        )]
         let handle = tokio::spawn(serve_keep_alive_until_shutdown(
             DropProbe(Arc::clone(&dropped)),
             Ok::<(), ()>(()),

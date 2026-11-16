@@ -39,8 +39,9 @@ pub(crate) fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
 ///
 /// **调用方必须持有返回的 listener 直到 run 结束**（bd 9xeai）：accept 泵由
 /// `scope.spawn` 落在该 listener 的 `ComponentScope` 上（`quinn_adapter.rs`，
-/// 7f959154 起），scope 唯一强持有者就是 listener 本身——drop 即 abort 泵并关闭
-/// UDP socket（客户端 Initial 无人应答，s3 全程 0 成功）。工作示例
+/// 7f959154 起），scope 生命周期绑定 listener 持有期——全程持有则泵活；提前
+/// drop 的收口**不**由 Drop 兜底保证（ADR-0004 §2.2 Q3），其后 UDP socket 关闭、
+/// 客户端 Initial 无人应答（s3 全程 0 成功）。工作示例
 /// `proxy-hysteria/tests/e2e.rs` 全程持有 listener，故 e2e 一直绿。
 pub async fn start_quic_echo_server() -> Result<(SocketAddr, Arc<dyn HysteriaQuicListener>)> {
     let (cert_pem, key_pem) = xray_tls::certificate::generate_self_signed_cert(&["localhost"])?;

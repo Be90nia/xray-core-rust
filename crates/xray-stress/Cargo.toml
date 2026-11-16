@@ -14,6 +14,7 @@ xray-core = { path = "../xray-core" }
 xray-conf = { path = "../xray-conf" }
 xray-common = { path = "../xray-common" }
 xray-tls = { path = "../xray-tls" }
+xray-transport = { path = "../xray-transport" }
 xray-proto = { path = "../xray-proto" }
 xray-transport-hysteria = { path = "../xray-transport-hysteria" }
 xray-proxy-hysteria = { path = "../xray-proxy-hysteria" }

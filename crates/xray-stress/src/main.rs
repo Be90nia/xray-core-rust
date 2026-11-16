@@ -173,7 +173,8 @@ async fn run(
     } else {
         None
     };
-    // listener 句柄必须活到 run 结束（bd 9xeai：drop = abort accept 泵 = 关 UDP socket）。
+    // listener 句柄必须活到 run 结束（bd 9xeai）：accept 泵宿主在 listener 的 scope 上，
+    // 全程持有期覆盖泵的生命期；提前 drop 的收口**不**由 Drop 兜底保证（ADR-0004 §2.2 Q3）。
     let (quic_addr, _quic_listener) = if scenarios.contains(&Scenario::S3) {
         let (addr, listener) = quic_loop::start_quic_echo_server().await?;
         println!("[xray-stress] quic echo server ready: udp/{addr}");
