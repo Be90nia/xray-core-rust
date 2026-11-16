@@ -1742,6 +1742,49 @@ pub(crate) fn unix_shadowsocks_transport(
 
 // ---- tun：自管监听面（不消费 TCP 地址，入口见 needs_listen_addr=false 直接分派） ----
 
+/// 臂 serve future 的**保活闸**：start 成功后持有 owner 至停机令牌取消；start 失败
+/// 则不放行（owner 随本 future 结束 drop ⇒ 设备清理，不留僵尸网卡）。
+///
+/// 抽成独立函数以便单测断言契约（bd fy8i0 回归）：owner 的存活/释放时机不依赖
+/// 具体 handler 类型，只依赖 `started` 结果与停机令牌。
+///
+/// 契约来源（bd fy8i0 根因报告）：`start()` 只负责起驱动（长驻驱动住在 owner 自有
+/// scope 内）并立即返回；若 serve future 在 start 成功后即结束 ⇒ move 捕获的 owner
+/// drop ⇒ owner 持有的设备句柄关闭 ⇒ Windows wintun adapter 被系统删除 ⇒
+/// **网卡静默消失**（进程活/零错误日志）。同 anytls/naive/hysteria 形态
+/// （见本文件 :729/:864/:913，bd cv1af）。
+///
+/// 停机**不**用 `pending()`：裸 `pending()` 永不返回 ⇒ 本 arm 返回的 `JoinHandle`
+/// 永不 resolve ⇒ CLI 停机序（`run.rs`：先 `Instance::close()`（取消令牌）再
+/// `for h in handles { h.await }`）里的 `h.await` 永挂 ⇒ 停机挂死。等停机令牌
+/// 既保住设备存活到最后一刻，又让 handle 正常收敛（与其它臂的停机语义一致）。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+pub(super) async fn serve_keep_alive_until_shutdown<O, E>(
+    owner: O,
+    started: Result<(), E>,
+    shutdown: CancellationToken,
+) -> Result<(), E> {
+    match started {
+        Ok(()) => {
+            // 保活持有 owner（设备/驱动存活）直到停机令牌取消；取消后 owner 随本
+            // 函数返回 drop ⇒ 设备下线（与既有 drop 语义一致）。
+            let _keep = owner;
+            shutdown.cancelled().await;
+            Ok(())
+        },
+        Err(e) => {
+            // 失败路径：owner 不被保活 ⇒ 随本 future 结束 drop ⇒ 设备清理
+            // （维持既有语义，不得留下僵尸网卡）。
+            Err(e)
+        },
+    }
+}
+
 /// tun inbound。Windows 侧设备（tun-rs wintun）、netstack（smoltcp）、路由/DNS
 /// （sysroute）、WFP 泄漏阻断均已实现并真机验证（bd cv3w/ijn7），故与 Go
 /// `tun_windows.go` 对齐开放。
@@ -1761,6 +1804,9 @@ pub(crate) fn tun_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
             .await
             .map_err(|e| std::io::Error::other(format!("tun inbound: {e}")))?;
         tracing::info!(tag = %ctx.ib.tag, "tun inbound listening");
+        // 停机令牌：serve future 在此取消前持有 handler（设备/驱动存活）。
+        // 取 clone（`ctx` 带 'a 寿命，进不了 'static 的 spawn future）。
+        let shutdown = ctx.shutdown_token.clone();
         // W4 面 6 例外登记（方案 §2 面 6「不可迁残余 1」）：本构造对外**返回
         // JoinHandle**（调用方 InboundRuntime 契约），改为 scope 托管 = 改公开
         // 契约 + 4 平台门控臂（linux/android/freebsd/windows），收益（1 处 spawn
@@ -1770,7 +1816,9 @@ pub(crate) fn tun_entry<'a>(ctx: InboundCtx<'a>) -> InboundBuildFut<'a> {
             reason = "②豁免（bd kwevg · §3.5.6）：tun inbound serve 对外返回 JoinHandle（公开契约 + 4 平台门控），改 scope 托管 = 改公开契约；方案 §2 面 6 不可迁残余 1 已举证保留；公共契约外返（§3.5.6 ②类第三项限本两站之一）：`JoinHandle` 是 tun inbound 装配的公开返回值，改 scope 托管即改公开契约"
         )]
         let handle = tokio::spawn(async move {
-            if let Err(e) = handler.start().await {
+            // `start()` 借用 handler（&self）⇒ 先取结果再 move handler 进保活闸。
+            let started = handler.start().await;
+            if let Err(e) = serve_keep_alive_until_shutdown(handler, started, shutdown).await {
                 tracing::error!(error = ?e, "tun inbound stopped");
             }
         });

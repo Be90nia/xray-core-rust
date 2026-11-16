@@ -242,6 +242,13 @@ serena-cli undo                                                        # 改坏�
 - **交付铁律（三次中招教训，2026-11-08）**：任何 release 构建必带 `BORING_BSSL_PATH=target/boringssl-asm/prebuilt`；交付/换入 v2rayN 前必验（三选一）：①`grep rustc-link-search target/release/build/btls-sys-*/output` 指向 prebuilt ②`--check` 返 **0**（返 3=UNVERIFIED 视为未验过，须改用 ①/③ 补证）③大小启发式 = NO_ASM exe 比汇编版**小 ~47KB**（实测 52,157,952 vs 52,205,056）。非汇编产物禁交付 v2rayN/生产——症状即"xhttp/带指纹卡 30 多 MB/s 上不去"
 - **CI 产物现状（2026-11-08 复核）**：`release.yml` 已接 `setup-boringssl-asm` action 并在发布前硬断言（`BORING_BSSL_PATH` 未导出即 exit 1 + 复跑 `--check`，见 `release.yml:153-157`，bd jyipl/qscjv）⇒ 发布产物带汇编；**风险面收窄为本机手工构建**（绕过 action 直跑 cargo 仍会落 NO_ASM，故上条交付铁律适用于手工交付路径）
 
+### 跨平台 crate 改动必须另跑一次 Linux 编译（bd fy8i0 连带发现，2026-11-16）
+- **症状**：commit 55a411dee1 把 `ADAPTER_PROPS_BACKOFF` 加 `#[cfg(target_os = "windows")]`，但通用路径 `prepare()`（`crates/xray-proxy-tun/src/sysroute/mod.rs:529`）引用它——`cfg!()` 是**运行期**布尔、Windows 专属分支的代码在所有平台照样参与编译 ⇒ Linux/macOS/FreeBSD 编译 `E0425`，而 **Windows 本机编译 + 全量测试全绿、毫无察觉**（CI 的 Linux 门 `cargo build --workspace` 只在 push 后才跑；该 commit 当时尚未 push 才没红）
+- **铁律**：改任何带 `#[cfg(target_os)]` 分支的 crate 后，**Windows 绿不算数**——必须另跑一次 Linux 编译。`cfg!()` 与 `#[cfg]` 混用时，Windows-only 常量要么给非 Windows 一个占位定义（如 `Duration::ZERO`），要么把引用挪进 `#[cfg]` 块
+- **WSL 编译验证配方**（ubuntu-xray，约 9 min；工具链齐备：cargo 1.98-nightly + `/usr/local/bin/protoc` + `/usr/lib/llvm-18/lib` + cmake/ninja + `/root/boringssl-patched` 源码树）：
+  `rsync -a --exclude target --exclude .git /mnt/d/Project/Xray-core-rust/ /root/xray-src/` → `cd /root/xray-src && BORING_BSSL_ASSUME_PATCHED=1 BORING_BSSL_SOURCE_PATH=/root/boringssl-patched PROTOC=/usr/local/bin/protoc LIBCLANG_PATH=/usr/lib/llvm-18/lib CARGO_TARGET_DIR=/root/target-linux cargo build --release -p xray-cli`
+- **⚠️ WSL2 不能做 TUN 真机验证**：`/dev/net/tun` 是微软 no-op 实现（`ip tuntap add` 成功、`TUNSETIFF` ioctl 返回成功，但接口**不出现**在网络命名空间）⇒ 别把「设备没出现」误判成本仓 bug；TUN 真机验证只认真 Linux（CI ubuntu runner / 真机 VPS）
+
 ### vision splice 触发逻辑（雷区）
 - **历史**：d8562b56 + a427613b 双 revert
 - **禁**：池化改造**不碰** vision gate/DIRECT 切换

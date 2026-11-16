@@ -554,6 +554,10 @@ pub(crate) fn prepare(
 const ADAPTER_PROPS_ATTEMPTS: u32 = 2;
 #[cfg(target_os = "windows")]
 const ADAPTER_PROPS_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+/// 非 Windows 路径的占位：通用路径（`prepare`）里 `cfg!(target_os = "windows")` 是
+/// 运行期布尔、该分支代码仍参与编译，故必须存在同名常量（bd fy8i0 Linux 编译回归）。
+#[cfg(not(target_os = "windows"))]
+const ADAPTER_PROPS_BACKOFF: std::time::Duration = std::time::Duration::ZERO;
 
 /// Windows 适配器属性残余项的命令渲染（cv3w 纯函数面，测试断言命令行文本）。
 ///

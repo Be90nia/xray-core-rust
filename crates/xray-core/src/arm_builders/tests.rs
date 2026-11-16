@@ -463,3 +463,82 @@ fn masque_outbound_rejects_non_masque_network() {
     .expect("network=masque must pass the assembly gate");
     assert_eq!(handler.tag(), "t-arm-lookup");
 }
+
+// ============ bd fy8i0：tun arm 保活契约（Windows 网卡静默消失回归） ============
+
+/// bd fy8i0 回归契约：tun arm 的 serve future 在 `start()` 成功后**必须继续持有
+/// handler**（设备句柄），直到停机令牌取消。
+///
+/// 根因（bd fy8i0 根因报告）：`TunInboundHandler::start()` 只负责起驱动（长驻驱动
+/// 住在 handler 自有 scope 内）并立即返回；原实现 `tokio::spawn(async move {
+/// handler.start().await })` 在 start 成功后即结束 ⇒ move 捕获的 handler drop ⇒
+/// `AsyncDevice`（wintun 句柄）关闭 ⇒ **wintun adapter 被系统删除 ⇒ 网卡静默消失**
+/// （进程存活/零错误日志）。
+///
+/// 断言方式：用 drop 探针观察 owner 的存活时机（不依赖具体 handler 类型）——
+/// ① start 成功 ⇒ 停机前 owner **不得**被 drop；停机 ⇒ owner 被释放；
+/// ② start 失败 ⇒ owner **立即**被 drop（失败路径清理设备，不留僵尸网卡）。
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+mod tun_keep_alive_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio_util::sync::CancellationToken;
+
+    use crate::arm_builders::inbound::serve_keep_alive_until_shutdown;
+
+    /// drop 探针：owner 被释放时置位（观察「设备句柄何时关闭」的可观测代理）。
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// start 成功 ⇒ owner 保活至停机；停机 ⇒ owner 释放（设备随之下线）。
+    #[tokio::test]
+    async fn owner_is_kept_alive_until_shutdown() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(serve_keep_alive_until_shutdown(
+            DropProbe(Arc::clone(&dropped)),
+            Ok::<(), ()>(()),
+            shutdown.clone(),
+        ));
+        // start 成功后：owner 必须仍被持有（否则设备句柄关闭 ⇒ 网卡消失）。
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "start 成功后 owner 不得被 drop（否则 wintun adapter 被系统删除）"
+        );
+        // 停机 ⇒ owner 释放（设备正常下线）。
+        shutdown.cancel();
+        handle.await.expect("serve task").expect("start 成功路径");
+        assert!(dropped.load(Ordering::SeqCst), "停机后 owner 必须被释放（设备正常下线）");
+    }
+
+    /// start 失败 ⇒ owner 立即 drop（失败路径清理设备，不得留下僵尸网卡）。
+    #[tokio::test]
+    async fn owner_is_dropped_immediately_on_start_failure() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let err = serve_keep_alive_until_shutdown(
+            DropProbe(Arc::clone(&dropped)),
+            Err::<(), &str>("start failed"),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(err, Err("start failed"), "start 失败必须原样上抛");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "start 失败必须立即释放 owner（设备清理，不得留僵尸网卡）"
+        );
+    }
+}

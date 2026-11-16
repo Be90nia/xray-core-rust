@@ -158,6 +158,35 @@ jobs:
             target/release/xray
             target/release/xray.exe
 
+  # bd fy8i0：Linux TUN 设备生命周期门（CI 首次覆盖 TUN 设备存活期）。
+  # 背景：TUN arm 曾把 handler move 进 tokio::spawn 的 future，start() 返回后
+  # future 即结束 ⇒ handler drop ⇒ 设备 fd 关闭 ⇒ 非持久 tun 接口被内核删除
+  # ⇒ 网卡静默消失（Windows 上是 wintun adapter 被系统删除）。此前 CI 从不
+  # 覆盖 TUN 生命周期，此类缺陷必然逃逸（fy8i0 实锤：进程活、零错误日志、
+  # 网卡 2.5-6s 内消失）。本门在 ubuntu runner（真 Linux 内核 + sudo +
+  # /dev/net/tun 在场）上：编译 → 起 TUN inbound（无路由/DNS 系统改动）→
+  # 高频抓设备出现 → 断言设备存活 60s 且进程不退出（末行 TUN_LIFETIME_RESULT）。
+  # 依赖闭包含 btls-sys（xray-cli 全量）⇒ 挂 fetch-udf + setup-boringssl，
+  # 顺序与 test job 一致（rust-cache 在 setup-boringssl 之前）。
+  test-linux-tun-lifetime:
+    name: Test (linux, TUN device lifetime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/fetch-udf
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          key: ${{ env.UDF_HEAD }}
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+      - uses: ./.github/actions/setup-boringssl
+      - name: Build xray-cli (linux)
+        run: cargo build --release -p xray-cli
+      - name: TUN device lifetime probe (60s hold)
+        run: sudo bash tools/linux_tun_lifetime.sh target/release/xray 60
+
   # 测试
   test:
     name: Test
