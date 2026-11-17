@@ -72,27 +72,59 @@ fn payload_1mib() -> Vec<u8> {
 
 /// 直连生产端点：TLS（rustls 内置 webpki 根，验真 Google 证书）+ ALPN h2。
 /// 会话级小段/快轮询加速 1MiB 往返与失败暴露。
-fn live_settings(secrets: &[String; 3], folder: &str) -> StreamSettings {
-    StreamSettings::from_json(Some(&serde_json::json!({
-        "network": "xdrive",
-        "security": "tls",
-        "tlsSettings": {"serverName": "www.googleapis.com", "alpn": ["h2"]},
-        "xdriveSettings": {
-            "service": "google-drive",
-            "remoteFolder": folder,
-            "secrets": secrets,
-            "segmentBytes": 262144,
-            "pollIntervalMs": 5,
-            "maxPollIntervalMs": 50,
-        },
-    })))
+/// 桥模式（`XDRIVE_DRIVE_TOKEN_BRIDGE`，SA harness）：明文本地桥，端点注入走
+/// `with_base_url`，secrets 占位过 build 校验——凭据由桥持有（Service Account）。
+fn live_settings(secrets: &[String; 3], folder: &str, bridge: Option<&str>) -> StreamSettings {
+    let json = if bridge.is_some() {
+        serde_json::json!({
+            "network": "xdrive",
+            "xdriveSettings": {
+                "service": "google-drive",
+                "remoteFolder": folder,
+                // 桥模式同样透传真 secrets（缺失时调用方已退占位 "bridge" → 桥走 SA 路线）。
+                "secrets": secrets,
+                "segmentBytes": 262144,
+                "pollIntervalMs": 5,
+                "maxPollIntervalMs": 50,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "network": "xdrive",
+            "security": "tls",
+            "tlsSettings": {"serverName": "www.googleapis.com", "alpn": ["h2"]},
+            "xdriveSettings": {
+                "service": "google-drive",
+                "remoteFolder": folder,
+                "secrets": secrets,
+                "segmentBytes": 262144,
+                "pollIntervalMs": 5,
+                "maxPollIntervalMs": 50,
+            },
+        })
+    };
+    StreamSettings::from_json(Some(&json))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "需真实凭据：见 docs/guides/xdrive-real-backend-checklist.md（XDRIVE_DRIVE_* 环境变量）"]
 async fn drive_roundtrip_1mib() {
-    let Some([client_id, client_secret, refresh_token, folder]) = env_or_skip() else {
-        return;
+    // SA 桥模式：XDRIVE_DRIVE_TOKEN_BRIDGE 指向本地桥（token 端点换 SA JWT，files/upload 转发
+    // googleapis），凭据由桥持有；未设则走 refresh token 三件套。
+    // 坑：SA 无自有配额——folder 必须是「用户共享给 SA 的 folder id」（编辑者权限），
+    // root 会 403 storageQuotaExceeded；个人账号可用（文件 owner = 共享者）。
+    let bridge = std::env::var("XDRIVE_DRIVE_TOKEN_BRIDGE").ok().filter(|s| !s.is_empty());
+    let (client_id, client_secret, refresh_token, folder) = if bridge.is_some() {
+        // 桥模式：凭据真值（产品原生 refresh grant 走桥转发出墙）；缺 env 时退占位走 SA 桥。
+        (
+            std::env::var("XDRIVE_DRIVE_CLIENT_ID").unwrap_or_else(|_| "bridge".to_string()),
+            std::env::var("XDRIVE_DRIVE_CLIENT_SECRET").unwrap_or_else(|_| "bridge".to_string()),
+            std::env::var("XDRIVE_DRIVE_REFRESH_TOKEN").unwrap_or_else(|_| "bridge".to_string()),
+            std::env::var("XDRIVE_DRIVE_FOLDER_ID").unwrap_or_else(|_| "root".to_string()),
+        )
+    } else {
+        let Some([a, b, c, d]) = env_or_skip() else { return };
+        (a, b, c, d)
     };
     eprintln!(
         "Drive 活体：client_id={} client_secret={} refresh_token={} folder={}",
@@ -102,10 +134,15 @@ async fn drive_roundtrip_1mib() {
         mask(&folder),
     );
 
-    let settings = live_settings(&[client_id, client_secret, refresh_token], &folder);
+    let settings =
+        live_settings(&[client_id, client_secret, refresh_token], &folder, bridge.as_deref());
     let config = Config::from_settings(&settings).expect("config from settings");
-    let storage: Arc<dyn Storage> =
-        Arc::new(DriveStorage::new(&settings, &config).expect("DriveStorage"));
+    let storage: Arc<dyn Storage> = match bridge.as_deref() {
+        Some(b) => {
+            Arc::new(DriveStorage::new(&settings, &config).expect("DriveStorage").with_base_url(b))
+        },
+        None => Arc::new(DriveStorage::new(&settings, &config).expect("DriveStorage")),
+    };
 
     let base = format!(
         "live-{}-{}",
