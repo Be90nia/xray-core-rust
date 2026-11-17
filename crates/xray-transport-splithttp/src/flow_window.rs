@@ -4,8 +4,8 @@
 //! 的端到端 RTT**。h2 的接收窗只在握手 SETTINGS 定初值、运行时 auto-refill 不超初窗
 //! （hyper/h2 无运行时调接收窗 API——已知局限），故窗值只能在握手前定死。
 //!
-//! 现状：`max_send_buf` 恒为各端静态保底（客户端 16MiB、服务端**按内存档位** 8/16/32MiB
-//! ——tiny 8MiB、small 16MiB、medium/large 32MiB，档位表见 `xray_transport::h2_window`
+//! 现状：`max_send_buf` 恒为各端静态保底（客户端 16MiB、服务端**按内存档位** 8/32MiB
+//! ——tiny 8MiB、small|medium|large 32MiB，档位表见 `xray_transport::h2_window`
 //! 模块头）；流窗/连窗亦保持各端原静态值（32/32MB 客户端、16/32MB 服务端）——rjzw2 bench
 //! 实测缩流窗 ≤26MB 吞吐掉 14-31%（SETTINGS 窗是零预分配计数器，缩它只钉吞吐不省缓冲）。
 //!
@@ -27,7 +27,7 @@ pub(crate) const CLIENT_FALLBACK: H2Windows = H2Windows {
 };
 
 /// 服务端静态保底 = 修前 `serve_http_conn` 原静态窗值（16MB 流窗 / 32MB 连窗）+ **按内存
-/// 档位**的服务端 send_buf（tiny 8MiB、small 16MiB、medium/large 32MiB；映射唯一源 =
+/// 档位**的服务端 send_buf（tiny 8MiB、small|medium|large 32MiB；映射唯一源 =
 /// [`crate::transport::h2_server_max_send_buf_for`]，档位表见 `h2_window` 模块头）。
 /// ——**不得用客户端流窗常量**：客户端流窗 32MB 会把服务端原静态 16MB
 /// 抬到 32MB（保底被偷改 → 「静态 vs 自适应」对比基线失效）。

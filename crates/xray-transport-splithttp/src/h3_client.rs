@@ -26,11 +26,19 @@
 //!   持续驱动。
 //! - **watfaq-rustls 兼容**：quinn 用 rustls 0.23，与 watfaq patch 全兼容（API superset）。
 //!
-//! # 全双工限制
+//! # 全双工（按路径分形态）
 //!
-//! h3 `RequestStream` 的 `send_data` 和 `recv_data` 都需 `&mut self`，无法跨 task 并发。
-//! 全双工需要单 task 内 `select!` 交替。本实现采用「先发完上传 body 再收响应」的简化
-//! 模式（对 splithttp 协议足够：客户端先 upload 完，server 才回 download）。
+//! h3 `RequestStream` 的 `send_data` / `recv_response` / `recv_data` 都需 `&mut self`，
+//! 同一 stream 的收发不能由同一 task 同时驱动。本实现按调用路径分两种形态：
+//!
+//! - **stream-up / stream-one**（[`H3Conn::open_stream_uploading`]）： 用 h3 官方的
+//!   `RequestStream::split()` 把 stream 拆成收发两半—— 上行 task 驱动 send_half（body →
+//!   `finish`）， 下行 task 驱动 recv_half（响应头 → 响应体 → 下行流）， 即**收发并发**（bd
+//!   1xfap）。 其中 stream-up 的下行被 drain（丢弃），stream-one 的下行转给调用方。
+//! - **packet-up**（[`H3Conn::post_packet`]）与一次性 POST body （[`H3Conn::open_stream`] 的一次性
+//!   body 分支）： body 是一次性 `Bytes`，`send_data` + `finish` 之后才 `recv_response`，
+//!   仍是「先发完再收」的顺序形态（body 有限 ⇒ 不与下行互等，不构成死锁）。
+//! - **stream-down GET**（[`H3Conn::open_stream`] 的 GET 分支）：纯下行，无上行。
 
 use std::{
     net::SocketAddr,

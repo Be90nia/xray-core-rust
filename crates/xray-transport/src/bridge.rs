@@ -337,6 +337,8 @@ fn p7lm_trace() -> bool {
 /// 两级都装不下时**等待（背压）**，不拒绝、不丢数据。
 struct ByteGate {
     cap: usize,
+    /// 方向标签（生产 "up"/"down"）——只进诊断日志，不参与任何判定/唤醒路径。
+    dir: &'static str,
     inflight: std::sync::atomic::AtomicUsize,
     notify: tokio::sync::Notify,
     global: std::sync::Arc<xray_frame::budget::inflight::InflightBudget>,
@@ -374,21 +376,33 @@ impl Drop for GatePermit {
 }
 
 impl ByteGate {
-    fn new(cap: usize) -> std::sync::Arc<Self> {
-        Self::with_budget(cap, std::sync::Arc::clone(xray_frame::budget::inflight::global()))
+    fn new(cap: usize, dir: &'static str) -> std::sync::Arc<Self> {
+        Self::with_budget(cap, dir, std::sync::Arc::clone(xray_frame::budget::inflight::global()))
     }
 
     /// 显式注入全局预算（单测用独立实例，不碰进程单例）。
     fn with_budget(
         cap: usize,
+        dir: &'static str,
         global: std::sync::Arc<xray_frame::budget::inflight::InflightBudget>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cap,
+            dir,
             inflight: std::sync::atomic::AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
             global,
         })
+    }
+
+    /// 本方向当前在途字节（只读快照，issue #22 Q2② 方向可观测面）。取数 = 快路径
+    /// 同一把 `inflight` 原子的 Acquire load，无新增记账（进程级合计与背压计数走
+    /// [`conn_stats`]）；up/down 两闸各自独立，据此可读 per-conn 方向占用。
+    /// 每方向在途闸为本仓原生机制（Go 上游无对应物），暴露形态贴既有 [`conn_stats`]
+    /// 只读风格，不新增策略。
+    #[must_use]
+    fn inflight_bytes(&self) -> usize {
+        self.inflight.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 取 `bytes` 字节在途许可（两层）；未超闸时**零等待**（各一次原子读 + 一次 CAS）。
@@ -403,13 +417,27 @@ impl ByteGate {
     }
 
     async fn acquire_conn(&self, bytes: usize) {
+        let mut logged_queue = false;
         loop {
-            let inflight = self.inflight.load(std::sync::atomic::Ordering::Acquire);
+            let inflight = self.inflight_bytes();
             // 单个超闸块永不阻塞（闸是软上界，堵死 = 连接挂死）：只在闸内叠加时等。
             // 并发下两个块可能同时通过判定而超闸少量——软上界，不追精确。
             if inflight == 0 || inflight + bytes <= self.cap {
                 self.inflight.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
                 return;
+            }
+            // 方向可观测面（issue #22 Q2②）：每个等待期只记一次，读的是既有计数；
+            // 判定与唤醒路径零改动。debug 级 ⇒ 默认不发射，热路径无成本。
+            if !logged_queue {
+                logged_queue = true;
+                tracing::debug!(
+                    target: "xray_frame::bridge",
+                    dir = self.dir,
+                    inflight,
+                    cap = self.cap,
+                    bytes,
+                    "per-conn 方向闸排队（背压等待，待本方向归还）"
+                );
             }
             self.notify.notified().await;
         }
@@ -871,8 +899,8 @@ where
     // 条目闸管「多少批在排队」，字节闸管「一共压了多少内存」——单批可达 512KiB，
     // 64 条满载 = 32MiB/方向，小内存机器上这才是真上界。
     let gate_bytes = xray_frame::budget::plan::MemoryPlan::cached().bridge_gate;
-    let up_gate = ByteGate::new(gate_bytes);
-    let down_gate = ByteGate::new(gate_bytes);
+    let up_gate = ByteGate::new(gate_bytes, "up");
+    let down_gate = ByteGate::new(gate_bytes, "down");
     let (up_tx, mut up_rx) =
         tokio::sync::mpsc::channel::<(xray_buf::multi::MultiBuffer, GatePermit)>(PIPE_BUF_CAP);
     let (down_tx, mut down_rx) =
@@ -1606,7 +1634,7 @@ mod tests {
     /// 阻塞（否则单块 > 闸即连接挂死）。
     #[tokio::test]
     async fn byte_gate_blocks_only_when_over_cap() {
-        let gate = ByteGate::new(4 * 1024 * 1024);
+        let gate = ByteGate::new(4 * 1024 * 1024, "test");
         let first = gate.acquire(3 * 1024 * 1024).await;
 
         // 未超闸（3MiB + 1MiB = 4MiB ≤ cap）：立即返回。
@@ -1633,7 +1661,7 @@ mod tests {
     /// 单块 > 闸**不阻塞**（闸是软上界）：否则 cap < 单批 512KiB 时连接直接挂死。
     #[tokio::test]
     async fn byte_gate_allows_single_oversize_block() {
-        let gate = ByteGate::new(1024);
+        let gate = ByteGate::new(1024, "test");
         let _permit = tokio::time::timeout(std::time::Duration::from_secs(1), gate.acquire(4096))
             .await
             .expect("超闸单块必须放行（堵死 = 连接挂死）");
@@ -1698,8 +1726,8 @@ mod tests {
     #[tokio::test]
     async fn global_inflight_budget_bounds_cross_connection_sum() {
         let global = xray_frame::budget::inflight::InflightBudget::new(4 * 1024 * 1024);
-        let a = ByteGate::with_budget(8 * 1024 * 1024, std::sync::Arc::clone(&global));
-        let b = ByteGate::with_budget(8 * 1024 * 1024, std::sync::Arc::clone(&global));
+        let a = ByteGate::with_budget(8 * 1024 * 1024, "a", std::sync::Arc::clone(&global));
+        let b = ByteGate::with_budget(8 * 1024 * 1024, "b", std::sync::Arc::clone(&global));
 
         let pa = a.acquire(3 * 1024 * 1024).await; // 全局 3MiB
         let pb = b.acquire(1024 * 1024).await; // 全局 4MiB（满）
@@ -1715,7 +1743,7 @@ mod tests {
         assert_eq!(global.backpressure_waits(), 1, "等待中的块必须计入背压（可观测面）");
         // 本连接闸上限 8MiB，3+1=4MiB 仍有余量 ⇒ 阻塞只能来自全局层（证明是双层）。
         assert_eq!(
-            a.inflight.load(std::sync::atomic::Ordering::Acquire),
+            a.inflight_bytes(),
             4 * 1024 * 1024,
             "本连接闸未触顶（4MiB ≤ 8MiB）⇒ 阻塞必须来自全局预算层"
         );
@@ -1728,6 +1756,30 @@ mod tests {
         drop(pc);
         drop(pa);
         assert_eq!(global.used(), 0, "全部归还后全局账本必须归零（无泄漏）");
+    }
+
+    /// 方向可观测面（issue #22 Q2②）：per-conn 方向闸计数可按方向独立读出——
+    /// up/down 两闸各持不同在途时读数互不串账，归还只清自己方向。
+    #[tokio::test]
+    async fn direction_gate_counts_readable_per_direction() {
+        let global = xray_frame::budget::inflight::InflightBudget::new(8 * 1024 * 1024);
+        let up = ByteGate::with_budget(4 * 1024 * 1024, "up", std::sync::Arc::clone(&global));
+        let down = ByteGate::with_budget(4 * 1024 * 1024, "down", std::sync::Arc::clone(&global));
+        assert_eq!(up.inflight_bytes(), 0);
+        assert_eq!(down.inflight_bytes(), 0);
+
+        let pu = up.acquire(2 * 1024 * 1024).await;
+        let pd = down.acquire(1024 * 1024).await;
+        assert_eq!(up.inflight_bytes(), 2 * 1024 * 1024, "up 闸只记本方向在途");
+        assert_eq!(down.inflight_bytes(), 1024 * 1024, "down 闸只记本方向在途");
+        assert_eq!(global.used(), 3 * 1024 * 1024, "全局账为两方向之和");
+
+        drop(pu);
+        assert_eq!(up.inflight_bytes(), 0, "归还后 up 清零");
+        assert_eq!(down.inflight_bytes(), 1024 * 1024, "down 不受 up 归还影响");
+        drop(pd);
+        assert_eq!(down.inflight_bytes(), 0, "归还后 down 清零");
+        assert_eq!(global.used(), 0, "全部归还后全局账归零（无泄漏）");
     }
 
     /// 拒连文案只在**绝对下限**（连一条满额连接都装不下）触发，且必须给出可操作出路。

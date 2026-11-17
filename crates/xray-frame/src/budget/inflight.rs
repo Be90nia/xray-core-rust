@@ -180,6 +180,13 @@ impl InflightBudget {
     }
 
     /// 尝试占账（`fetch_update` 保证「判定 + 自增」不可分割，不会超发）。
+    ///
+    /// `cur == 0` 直通分支 = 软上界的**逃逸口**：单块超预算照样放行（堵死 = 连接
+    /// 挂死），账面瞬时超 `total` ⇒ `peak()` **可以**读到大于 `total` 的值——这是
+    /// 逃逸分支的设计内后果，不是记账泄漏（`release`/`InflightPermit::Drop` 按原
+    /// `bytes` 全额归还，账面终归零）。该机制为本仓原生设计（Go 上游无 in-flight
+    /// 预算对应物），`cur == 0` 逃逸语义是刻意设定，**不是 Go 对拍偏差**。诊断口诀：
+    /// 峰值超容量先查本分支（探针场景 E 即测该交界），再查泄漏。
     fn try_take(&self, bytes: usize) -> bool {
         let Ok(prev) = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
             // 单块超预算永不阻塞（预算软上界，堵死 = 连接挂死）：只在本来空账
