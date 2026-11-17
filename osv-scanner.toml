@@ -18,6 +18,9 @@
 # xattr 零长缓冲把未写字节标记为已初始化 / aliases GHSA-jh2m-fhpj-3vr7）。该条**有修复版**
 # （1.1.6）⇒ 按本文件一贯口径走依赖 bump 消除（cargo update -p rustix --precise 1.1.6），
 # **不登记豁免**。bump 后 osv 面复扫仅余上述 5 条已登记项。
+# bd lo08q（2026-11-17，CI Security & License 门）：新增 RUSTSEC-2026-0543（chrono 0.4.45
+# unmaintained，经 ocsp-stapler 0.4.9 传递引入；上游 chronotope/chrono#1768 无修复版，
+# 替代 jiff/time；待 ocsp-stapler 迁移后删除）→ 与 deny.toml [advisories] ignore 双口径登记。
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 reason = "paste 1.0.15 unmaintained, proc-macro only, no fix; tracked by reports/fix-lbxx.md"
@@ -37,6 +40,10 @@ reason = "block-buffer 0.12.0 panic 后行内缓冲游标损坏可越界（0.12.
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0449"
 reason = "unsafe-libyaml 0.2.11 unmaintained (dtolnay 已停更); serde_yaml→yaml-rust2 迁移跨仓评估中"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono 0.4.45 unmaintained; 经 ocsp-stapler 0.4.9 传递引入（xray-tls 的 OCSP 装订客户端）; 上游 chronotope/chrono#1768 无修复版（替代 jiff/time）→ 纯登记豁免无 bump 路径; 待 ocsp-stapler 迁移后删除本条（deny.toml 同口径，bd lo08q，2026-11-17）"
 
 # bd xwjxl（2026-11-08 → 2026-11-09 收口）：rustls 0.23.45 → 0.23.46 的 4 条
 # （RUSTSEC-2026-0346/0347/0348/0349）登记已在升级落地后删除 —— osv 复扫把这 4 条
