@@ -189,14 +189,27 @@ async fn template_roundtrip_1mib_and_collector_reclaim() {
     assert_eq!(echoed, payload, "1MiB downlink must arrive byte-equal");
 
     // 中途校验：对象确经 mock 服务端存储（读写删走 HTTP 四操作）。
-    {
-        let st = state.lock().await;
-        assert!(
-            st.objects.keys().any(|k| k.starts_with("streams~") && k.ends_with(".seg")),
-            "WAL 分段必须落在 mock 对象存储: {:?}",
-            st.objects.keys().collect::<Vec<_>>()
-        );
+    // 竞态机理：落盘是异步 PUT 任务，CI --release 下字节流 0.02s 跑完时它可能尚未被调度
+    // （bd xss2v）→ 轮询等待落盘（400×25ms=10s 上限）而非即时断言。
+    let mut stored = false;
+    for _ in 0..400 {
+        let hit = state
+            .lock()
+            .await
+            .objects
+            .keys()
+            .any(|k| k.starts_with("streams~") && k.ends_with(".seg"));
+        if hit {
+            stored = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(
+        stored,
+        "WAL 分段必须落在 mock 对象存储（异步 PUT 落盘超时 10s）: {:?}",
+        state.lock().await.objects.keys().collect::<Vec<_>>()
+    );
 
     // 双侧关闭（Go Close 序：冲净 + `.end` → 对端 EOF）。
     client.shutdown().await.unwrap();
