@@ -24,7 +24,93 @@ use tokio::{
     sync::mpsc::{self, OwnedPermit, error::TrySendError},
 };
 
-use crate::pool_stream::PoolStream;
+/// 满仓时的容量预约 future：**必须跨 poll 存活**（bd 34nk 同族——每次 poll 重建会
+/// 在 Drop 时撤掉 waker 注册，满仓后容量释放无人唤醒 ⇒ 写半永久停摆）。
+/// std Mutex 为满足 `ServerConn.writer` 的 `Sync` 箱子界（future 本身非 Sync）；
+/// 单写者独占，锁无争用。
+type ReserveOut =
+    std::result::Result<OwnedPermit<io::Result<Frame<Bytes>>>, mpsc::error::SendError<()>>;
+type ReserveFut = Pin<Box<dyn Future<Output = ReserveOut> + Send>>;
+
+/// `ServerConn.writer` 的 mpsc 载体：dispatcher 侧 AsyncWrite → body 侧 `Frame::data`。
+pub(crate) struct MpscDownlinkWriter {
+    /// `None` = 已 shutdown（发送半关闭：rx 排空既有帧后 EOF）。
+    tx: Option<mpsc::Sender<io::Result<Frame<Bytes>>>>,
+    /// 在途容量预约（满仓时挂起等待，waker 注册于 mpsc；Ready 即取即还）。
+    reserve: Option<std::sync::Mutex<ReserveFut>>,
+}
+
+impl MpscDownlinkWriter {
+    pub(crate) fn new(tx: mpsc::Sender<io::Result<Frame<Bytes>>>) -> Self {
+        Self { tx: Some(tx), reserve: None }
+    }
+}
+
+impl AsyncWrite for MpscDownlinkWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let Some(tx) = this.tx.as_ref() else {
+            return Poll::Ready(Err(downlink_closed()));
+        };
+        // 先确认容量再拷贝：满仓挂起等唤醒，不白拷（body 慢时零复制浪费）。
+        loop {
+            if this.reserve.is_some() {
+                let polled = {
+                    let mut locked =
+                        this.reserve.as_ref().expect("reserve checked").lock().expect("poisoned");
+                    locked.as_mut().poll(cx)
+                };
+                match polled {
+                    Poll::Pending => return Poll::Pending,
+                    // permit 即取即还：单发送者 ⇒ 释放的容量必被本写者 try_send 拿到。
+                    Poll::Ready(Ok(_)) => {
+                        this.reserve = None;
+                        break;
+                    },
+                    Poll::Ready(Err(_)) => {
+                        this.reserve = None;
+                        return Poll::Ready(Err(downlink_closed()));
+                    },
+                }
+            }
+            if tx.capacity() > 0 {
+                break;
+            }
+            let sender = tx.clone();
+            this.reserve =
+                Some(std::sync::Mutex::new(Box::pin(sender.reserve_owned()) as ReserveFut));
+        }
+        match tx.try_send(Ok(Frame::data(Bytes::copy_from_slice(buf)))) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            // 单发送者不变量：预约到的容量只会被本写者消费，Full 不应达。
+            Err(TrySendError::Full(_)) => {
+                Poll::Ready(Err(io::Error::other("downlink mpsc capacity lost after reserve")))
+            },
+            Err(TrySendError::Closed(_)) => Poll::Ready(Err(downlink_closed())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // 每次写已直推队列，写者侧无缓冲可排。
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // 关发送半：drop Sender ⇒ rx 排空既有帧后 EOF（对齐 duplex 写半 shutdown 语义）。
+        let this = self.get_mut();
+        this.tx.take();
+        this.reserve = None;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// 下行队列深度（条目 = 一次 `poll_write` 交付的聚合块，≤256KiB）：与桥条目闸
+/// 同档（`PIPE_BUF_CAP=64`）。满仓 = hyper 消费不掉，背压传导回 dispatcher 写半。
+pub(crate) const DOWNLINK_QUEUE_CAP: usize = 64;
 
 /// body 半已 drop（GET 响应终结/取消）后的写错误。
 fn downlink_closed() -> io::Error {
