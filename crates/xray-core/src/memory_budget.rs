@@ -212,6 +212,13 @@ fn conn_budget_log_line(plan: &xray_frame::budget::plan::MemoryPlan) -> String {
     )
 }
 
+/// xhttp 服务端下行直推队列的**每连接瞬态背压上界**（bd jz351 C3 残留）：64 槽 ×
+/// 聚合块上界 256KiB。源 = splithttp `hub/dl_stream.rs` `DOWNLINK_QUEUE_CAP`(64) ×
+/// `xray-buf writer` `MAX_COALESCE`(256KiB)——两者均为编译期常数，此处本地镜像
+/// （常量 pub(crate) 不出 crate，无法编译期互检；改动任一侧须同步本行，review 检查项）。
+/// 满仓只在 hyper 消费不掉时出现（瞬态背压面），装配期 0 占用。
+const XHTTP_DOWNLINK_QUEUE_BOOKED_BYTES: usize = 64 * 256 * 1024;
+
 /// xhttp（splithttp）**每连接**账面（字节）= 档位对应服务端 h2 send_buf + hyper 空闲
 /// 连接池余量（`MAX_IDLE_PER_HOST` 条 × 每连接估算）。
 ///
@@ -497,6 +504,13 @@ pub fn budget_report_with(
         residual.saturating_sub(tls_booked + xhttp_server_booked) / H2_MAX_SEND_BUF_PER_CONN_BYTES;
     let xhttp_client_conns = if splithttp > 0 { max_conns.min(xhttp_client_fit) } else { 0 };
     let xhttp_client_booked = xhttp_client_conns * H2_MAX_SEND_BUF_PER_CONN_BYTES;
+    // 服务端下行直推队列（bd jz351 C3 残留）：每下行连接一条 mpsc，瞬态背压上界
+    // 16MiB/conn——**过订如实进 caps + WARN，禁据此反解并发**（D-01 同款；砍并发
+    // = 浏览器一页 6 连接即功能回退）。满仓仅在 hyper 消费不掉时出现，常态远小。
+    let xhttp_dlq_fit = residual
+        .saturating_sub(tls_booked + xhttp_server_booked + xhttp_client_booked)
+        / XHTTP_DOWNLINK_QUEUE_BOOKED_BYTES;
+    let xhttp_dlq_conns = if splithttp > 0 { max_conns.min(xhttp_dlq_fit) } else { 0 };
     // tokio 线程栈：worker 栈随 runtime 构建常驻（核数 × 2MiB）；spawn_blocking
     // 线程按需 spawn（同栈档，容量由 xray-cli 的 `XRAY_MAX_BLOCKING_THREADS` 管，
     // 装配期 0 条）⇒ 只记 worker 面，lazy 面写进 caps 标签。
@@ -635,6 +649,12 @@ pub fn budget_report_with(
             "xhttp 客户端 h2 send_buf {xhttp_client_conns} 条（{H2_MAX_SEND_BUF_PER_CONN_BYTES}B/条）"
         ));
     }
+    if splithttp > 0 && xhttp_dlq_conns < max_conns {
+        per_conn_over.push(format!(
+            "xhttp 服务端下行直推队列 {xhttp_dlq_conns} 条（{XHTTP_DOWNLINK_QUEUE_BOOKED_BYTES}B/条 = \
+             64×256KiB 聚合块瞬态背压上界，bd jz351 C3 残留）"
+        ));
+    }
     if !per_conn_over.is_empty() {
         notes.push(format!(
             "每连接派生面超订（bd p5m5m，只 WARN 不拒启）：{}；运行期连接上限 {max_conns} 条，\
@@ -677,6 +697,14 @@ pub fn budget_report_with(
                  (residual fit {xhttp_client_fit})"
             ),
             xhttp_client_booked,
+        ));
+        caps.push((
+            format!(
+                "{splithttp} xhttp: {xhttp_dlq_conns}/{max_conns} conns x \
+                 {XHTTP_DOWNLINK_QUEUE_BOOKED_BYTES}B per-conn downlink mpsc queue \
+                 (residual fit {xhttp_dlq_fit}, transient backpressure)"
+            ),
+            xhttp_dlq_conns * XHTTP_DOWNLINK_QUEUE_BOOKED_BYTES,
         ));
     }
     caps.push((

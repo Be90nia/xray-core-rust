@@ -14,7 +14,10 @@ use tokio::{
 };
 
 use crate::{
-    client::{DefaultDialerClient, ReqBody, SiteTaskExecutor, hyper_err_to_io, make_stream_body},
+    client::{
+        DefaultDialerClient, PermitSlot, ReqBody, SiteTaskExecutor, hyper_err_to_io,
+        make_stream_body,
+    },
     config::{Config, RangeConfig},
     connection::{DownloadBody, SplitConn},
     error::{Result, SplitHttpError},
@@ -91,10 +94,17 @@ pub struct DownloadSide {
 /// 所以 Go 的上行是流水线式的——吞吐由写带宽决定，而非 `maxEachPostBytes / RTT`
 /// （bd bnd8n：修前 Rust 每 POST `await` 完整 200 OK，上行天花板 = chunk / RTT）。
 ///
-/// Rust 侧 hyper `Full<Bytes>` body 没有"请求字节已写完"的回执可等，改用固定
-/// in-flight 上限近似该流水线：稳态在途数据 = N × chunk，4 × 1MB 覆盖 150ms RTT 下
-/// ~213Mbps 的带宽时延积（高于实测 ws / httpupgrade 参照 73 / 67.5Mbps）；同时给出
-/// 每个连接的 POST 内存上界（每在飞 POST 最多持有一个 chunk）。
+/// bd jz351（C4）：名额随 POST body 走（`crate::client::PermitReleaseBody`），
+/// hyper 取走 eos 帧（payload 全部交给编码器 ≈ WroteRequest）即释，Drop 兜底幂
+/// 等——名额持有期不再覆盖响应收尾（修前持有至响应收尾，上限 = `N × chunk / RTT`：
+/// 230ms RTT 仅 17.4MB/s）。
+///
+/// bd jz351 取值复核：eos 即释后名额周转 = hyper 消费 body 的速率（h2 流缓冲排空，
+/// 受 RTT 影响，非纯本地写时延）——名额深度 4→12 的对照实验（非 REALITY packet-up
+/// rig，RTT230/400 两档各 3 轮交错）**两档吞吐全部同带**（23.2 vs 23.3 / 21.3 vs
+/// 21.9 MB/s），名额深度不是 eos 释后的瓶颈，残余上限在 30ms 定速闸 × rig 链路
+/// 效率因子。维持 4（稳态在途上界 4×1MB、每 POST 内存上界各一个 chunk），不加
+/// 内存账本面（无增量即无账）。
 const MAX_INFLIGHT_POSTS: usize = 4;
 
 /// packet-up mode 端到端拨号。
@@ -237,10 +247,13 @@ pub async fn dial_packet_up(
             let base_uri = base_uri_for_task.clone();
             let session_id = session_id_for_task.clone();
             posts.spawn(async move {
-                let _permit = permit;
+                // 名额装进槽随 body 走：hyper 取走 eos 帧（payload 全部交给编码
+                // 器 ≈ Go WroteRequest）即释，Drop 兜底幂等（bd jz351 C4）——
+                // 名额周转与 RTT 解耦，响应头/收尾不再占名额。
+                let slot: PermitSlot = Arc::new(parking_lot::Mutex::new(Some(permit)));
                 // Go dialer.go:512：每个 POST 扣一次 LeftRequests（≤0 即换连接）。
                 xmux_client.dec_left_requests();
-                conn.post_packet(&base_uri, &session_id, &seq_str, payload).await
+                conn.post_packet(&base_uri, &session_id, &seq_str, payload, Some(slot)).await
             });
         }
 
@@ -562,8 +575,47 @@ where
         // 单缓冲：split().freeze() 把整块所有权转给 POST body，之后每轮 reserve 重新
         // 要一份容量（容量不跨 chunk 复用——见下方 split 语义注释，bd yqyi6）
         let mut read_buf = bytes::BytesMut::with_capacity(sc_max_each_post_bytes);
+        // 在飞名额（bd jz351 C4）：名额随 body eos（h3 侧 = `finish()` 成功）即释，
+        // 上限语义同 h2 泵（`MAX_INFLIGHT_POSTS`）。旧实现串行 await 整个 POST
+        //（含响应收尾）= 每 POST 一个 RTT，高 RTT 腿上行塌到 chunk/RTT。
+        let in_flight = Arc::new(Semaphore::new(MAX_INFLIGHT_POSTS));
+        let mut posts: JoinSet<Result<()>> = JoinSet::new();
         let mut last_write = std::time::Instant::now();
-        loop {
+        'pump: loop {
+            // 收割已完成的 POST：任一失败终止上传（Go dialer.go:528-529
+            // `uploadPipeReader.Interrupt()`；同 h2 泵）。
+            while let Some(joined) = posts.try_join_next() {
+                match joined {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => {
+                        // POST 失败终止上传 = 上行功能失效，一次性留痕（随即
+                        // break 'pump，无刷屏面）。
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "error={e} h3 post_packet failed, terminating upload"
+                        );
+                        break 'pump;
+                    },
+                    Err(e) => {
+                        crate::hot_log!(
+                            tracing::Level::WARN,
+                            "error={e} h3 upload post task join failed"
+                        );
+                        break 'pump;
+                    },
+                }
+            }
+
+            // 背压门：在飞满则等一个 POST 的请求流终结再读下一块
+            let Ok(permit) = in_flight.clone().acquire_owned().await else {
+                // 唯一 Arc 在本任务内，永不 close()；保守终止上传
+                crate::hot_log!(
+                    DEBUG,
+                    "in-flight semaphore closed, terminating h3 packet-up upload"
+                );
+                break;
+            };
+
             let n = match pipe_server.read_buf(&mut read_buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -583,21 +635,8 @@ where
             let seq_str = seq.to_string();
             seq += 1;
 
-            // Go dialer.go:512：每个 POST 扣一次 LeftRequests。
-            xmux_client.dec_left_requests();
-            if let Err(e) = client_for_task
-                .conn
-                .post_packet(&base_uri_for_task, &session_id_for_task, &seq_str, payload)
-                .await
-            {
-                crate::hot_log!(
-                    tracing::Level::WARN,
-                    "error={e} seq={seq} h3 post_packet failed, terminating upload"
-                );
-                break;
-            }
-
-            // H11：同 dial_packet_up——每 POST rand 采样间隔（Go dialer.go:511）。
+            // H11：同 dial_packet_up——投递**前** sleep `scMinPostsIntervalMs.rand()`
+            // 减去距上次投递耗时（Go dialer.go:506-510）。
             if sc_min_posts_interval_ms.from > 0 {
                 let elapsed = last_write.elapsed().as_millis() as u64;
                 let delay = (sc_min_posts_interval_ms.rand() as u64).saturating_sub(elapsed);
@@ -606,6 +645,41 @@ where
                 }
             }
             last_write = std::time::Instant::now();
+
+            let xmux_client = Arc::clone(&xmux_client);
+            let client_for_post = Arc::clone(&client_for_task);
+            let base_uri = base_uri_for_task.clone();
+            let session_id = session_id_for_task.clone();
+            posts.spawn(async move {
+                // 名额装进槽随流走：`finish()`（请求流终结）即释，Drop 兜底幂等
+                // （bd jz351 C4）——响应头/收尾不再占名额。
+                let slot: PermitSlot = Arc::new(parking_lot::Mutex::new(Some(permit)));
+                // Go dialer.go:512：每个 POST 扣一次 LeftRequests（≤0 即换连接）。
+                xmux_client.dec_left_requests();
+                client_for_post
+                    .conn
+                    .post_packet(&base_uri, &session_id, &seq_str, payload, Some(slot))
+                    .await
+            });
+        }
+
+        // pipe EOF（连接关闭）或上传失败：等在飞 POST 收尾再退出，不中途丢弃。
+        while let Some(joined) = posts.join_next().await {
+            match joined {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => {
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} h3 post_packet failed while draining upload"
+                    );
+                },
+                Err(e) => {
+                    crate::hot_log!(
+                        tracing::Level::WARN,
+                        "error={e} h3 upload post task join failed while draining"
+                    );
+                },
+            }
         }
     });
 

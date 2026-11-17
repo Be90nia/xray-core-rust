@@ -82,12 +82,16 @@ pub trait H3ClientLike: Send + Sync {
         S: Stream<Item = std::io::Result<Bytes>> + Send + 'static;
 
     /// POST 一次性分包（packet-up）。
+    ///
+    /// `permit_slot`：in-flight 名额槽（bd jz351 C4），请求流终结即释（见
+    /// [`H3Conn::post_packet`]）；`None` = 测试路径不占名额。
     fn post_packet(
         &self,
         base_uri: &str,
         session_id: &str,
         seq_str: &str,
         payload: Bytes,
+        permit_slot: Option<crate::client::PermitSlot>,
     ) -> impl Future<Output = Result<()>> + Send;
 
     // 刻意**不提供** `close()`：xmux 池化后连接是**共享池单元**，逐代理连接关闭它
@@ -132,8 +136,9 @@ impl H3ClientLike for LazyH3Conn {
         session_id: &str,
         seq_str: &str,
         payload: Bytes,
+        permit_slot: Option<crate::client::PermitSlot>,
     ) -> Result<()> {
-        self.get().await?.post_packet(base_uri, session_id, seq_str, payload).await
+        self.get().await?.post_packet(base_uri, session_id, seq_str, payload, permit_slot).await
     }
 
     fn is_closed(&self) -> bool {
@@ -171,8 +176,9 @@ impl H3ClientLike for Arc<H3Conn> {
         session_id: &str,
         seq_str: &str,
         payload: Bytes,
+        permit_slot: Option<crate::client::PermitSlot>,
     ) -> Result<()> {
-        self.post_packet(base_uri, session_id, seq_str, payload).await
+        self.post_packet(base_uri, session_id, seq_str, payload, permit_slot).await
     }
 
     fn is_closed(&self) -> bool {
@@ -660,7 +666,9 @@ impl H3Conn {
         builder.body(()).map_err(|e| SplitHttpError::InvalidUrl(format!("body {e}")))
     }
 
-    /// packet-up：单次 POST 等待 200，drain body。
+    /// packet-up：单次 POST。请求流终结（`finish()`，payload 全部交给 QUIC 发送
+    /// 队列 ≈ Go httptrace WroteRequest）即释 in-flight 名额槽，200 校验 + 响应
+    /// drain 在 POST 任务内继续（不占名额，泵可继续投递——bd jz351 C4）。
     ///
     /// 对应 `DefaultDialerClient::post_packet`。
     pub async fn post_packet(
@@ -669,6 +677,7 @@ impl H3Conn {
         session_id: &str,
         seq_str: &str,
         payload: Bytes,
+        permit_slot: Option<crate::client::PermitSlot>,
     ) -> Result<()> {
         // Bytes clone = 引用计数（重放/请求构造共享同一块，不再深拷贝）
         let meta = self.config.build_packet_request_meta(
@@ -691,6 +700,12 @@ impl H3Conn {
             .await
             .map_err(|e| SplitHttpError::Hyper(format!("h3 send_data: {e}")))?;
         stream.finish().await.map_err(|e| SplitHttpError::Hyper(format!("h3 finish: {e}")))?;
+
+        // 请求流已终结 ⇒ 即释名额（`Option::take` 幂等）；失败路径（上方各
+        // map_err 早退）未 take，slot 随调用方任务结束 drop 兜底释放——名额守恒。
+        if let Some(slot) = permit_slot {
+            slot.lock().take();
+        }
 
         let resp = stream
             .recv_response()

@@ -333,7 +333,8 @@ async fn post_packet_returns_bad_status_on_500() {
     ));
     let base_uri = format!("http://127.0.0.1:{}/", addr.port());
 
-    let result = client.post_packet(&base_uri, "sess", "0", bytes::Bytes::from_static(b"x")).await;
+    let result =
+        client.post_packet(&base_uri, "sess", "0", bytes::Bytes::from_static(b"x"), None).await;
     let err = result.unwrap_err();
     assert!(matches!(err, SplitHttpError::BadStatus(500)), "expected BadStatus(500), got {err:?}");
 }
@@ -1305,7 +1306,13 @@ async fn idle_connections_bounded_by_max_idle_per_host() {
         let base_uri = base_uri.clone();
         set.spawn(async move {
             client
-                .post_packet(&base_uri, "idle-cap-sess", &seq.to_string(), Bytes::from_static(b"p"))
+                .post_packet(
+                    &base_uri,
+                    "idle-cap-sess",
+                    &seq.to_string(),
+                    Bytes::from_static(b"p"),
+                    None,
+                )
                 .await
         });
     }

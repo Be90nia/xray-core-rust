@@ -185,6 +185,11 @@ impl HttpConnection for DestTcpStream {
 /// error 是 `Infallible`，通过 `map_err` 闭包转换（match infallible {} unreachable）。
 pub type ReqBody = BoxBody<Bytes, std::io::Error>;
 
+/// packet-up 上行 in-flight 名额槽（bd jz351 C4）：POST 请求体携带，hyper 取走
+/// body eos 帧（payload 全部交给编码器）即 take 释放；Drop 兜底幂等（请求取消 /
+/// 连接死亡 / 重放后旧 body 被弃）。`Option::take` 原子性保证名额恰好释放一次。
+pub(crate) type PermitSlot = Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>;
+
 /// 下载流终止信号：发送端由拨号方接到 [`crate::connection::SplitConn`] 的
 /// `on_close`（连接 drop 即 send），接收端在 lazy reader 任务里终止 GET。
 /// 对齐 Go `splitConn.onClose → reader.Close()` 的断连传播语义。
@@ -391,6 +396,74 @@ impl HttpConnection for SplitStream {
 /// 构造一次性 body（`Bytes` → `Full<Bytes>` boxed，零拷贝）。
 fn make_full_body(b: Bytes) -> ReqBody {
     Full::new(b).map_err(|e: std::convert::Infallible| -> std::io::Error { match e {} }).boxed()
+}
+
+/// packet-up POST body：payload + in-flight 名额槽（bd jz351 C4）。
+///
+/// Go `dialer.go:533-535` 主循环只等 httptrace WroteRequest（请求字节写完），
+/// **不等响应**；hyper legacy client 无该回执。hyper 从 body 取走 eos 帧 =
+/// payload 全部交给编码器 ⇒ 即时 take 释放名额，泵的名额周转与 RTT 解耦（响应
+/// 头何时到达不再影响）。Drop 兜底覆盖「请求取消 / 连接死亡 / 重放后旧 body 被
+/// 弃」全路径，幂等；重放路径名额已随首败预释放（瞬态超额 ≤ 重放数，名额只减
+/// 不增）。
+struct PermitReleaseBody {
+    inner: ReqBody,
+    slot: PermitSlot,
+}
+
+impl PermitReleaseBody {
+    fn release(&mut self) {
+        self.slot.lock().take();
+    }
+}
+
+impl Drop for PermitReleaseBody {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl hyper::body::Body for PermitReleaseBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Bytes>, Self::Error>>> {
+        let out = Pin::new(&mut self.inner).poll_frame(cx);
+        // eos 判定（bd jz351 C4）：exact-size hint 归零 = 最后一帧已被取走——
+        // hyper 对已知 Content-Length 的 body 发完即判 eos，**可能不再 poll 到
+        // None**，故不能只等 None；None 兜底保留（unknown-size body）。两处
+        // `Option::take` 幂等。
+        match &out {
+            Poll::Ready(Some(Ok(_))) => {
+                if self.inner.size_hint().exact() == Some(0) {
+                    self.release();
+                }
+            },
+            Poll::Ready(None) => self.release(),
+            _ => {},
+        }
+        out
+    }
+
+    fn is_end_stream(&self) -> bool {
+        hyper::body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::Body::size_hint(&self.inner)
+    }
+}
+
+/// packet-up POST body 构造：有名额槽时包 `PermitReleaseBody`（eos 即释），
+/// 否则裸 `Full`（测试路径）。
+fn packet_body(payload: Bytes, slot: Option<PermitSlot>) -> ReqBody {
+    match slot {
+        Some(slot) => PermitReleaseBody { inner: make_full_body(payload), slot }.boxed(),
+        None => make_full_body(payload),
+    }
 }
 
 /// 空 body（GET 请求用）。
@@ -797,7 +870,9 @@ impl DefaultDialerClient {
     /// 发送单个上传分包（packet-up mode）。
     ///
     /// 构造 POST 请求（method 由 [`Config::normalized_uplink_http_method`] 决定），
-    /// 等待 200 OK 后返回。body 完整发送（非 streaming）。
+    /// 请求体携带 in-flight 名额槽：hyper 取走 body eos 帧（payload 全部交给编码
+    /// 器，≈ Go httptrace WroteRequest）即释名额并立即返回 200 校验结果，响应体
+    /// drain 移交后台（`spawn_post_body_drain`）。body 完整发送（非 streaming）。
     ///
     /// GOAWAY / 连接级错误后重放一次（Go dffc7ada：packet-up 请求定义
     /// `Request.GetBody` 使 h2 可重放）。body 是内存 `Vec<u8>`，请求天然可重产
@@ -819,9 +894,12 @@ impl DefaultDialerClient {
         session_id: &str,
         seq_str: &str,
         payload: Bytes,
+        permit_slot: Option<PermitSlot>,
     ) -> Result<()> {
-        let meta = self.config.build_packet_request_meta(base_uri, session_id, seq_str, payload)?;
-        match self.client.request(Self::build_request(meta.clone())?).await {
+        let mut meta =
+            self.config.build_packet_request_meta(base_uri, session_id, seq_str, payload)?;
+        let body = packet_body(meta.body.take().unwrap_or_default(), permit_slot.clone());
+        match self.client.request(Self::build_request_with_body(meta.clone(), body)?).await {
             Ok(resp) => return Self::post_packet_finish(resp).await,
             Err(e) if is_packet_replayable(&e) => {
                 crate::hot_log!(
@@ -834,7 +912,10 @@ impl DefaultDialerClient {
                 return Err(SplitHttpError::Hyper(e.to_string()));
             },
         }
-        match self.client.request(Self::build_request(meta)?).await {
+        // 重放：新 body 引用同一 slot——名额已随首败的 body Drop 预释放，此处
+        // eos/Drop take 幂等空操作（名额守恒，见 [`PermitReleaseBody`] 文档）。
+        let body = packet_body(meta.body.take().unwrap_or_default(), permit_slot);
+        match self.client.request(Self::build_request_with_body(meta, body)?).await {
             Ok(resp) => Self::post_packet_finish(resp).await,
             Err(e) => {
                 self.closed.store(true, Ordering::Relaxed);
@@ -843,17 +924,41 @@ impl DefaultDialerClient {
         }
     }
 
-    /// packet-up 响应收尾：drain body + 200 校验。
+    /// packet-up 响应收尾：200 校验即时返回，body drain 移交后台（bd jz351 C4）。
+    ///
+    /// 旧实现 inline `collect().await` = 名额持有期覆盖响应收尾（上行 4MB/RTT 的
+    /// 根因之一）。现名额已在 body eos 释放，此处只剩错误语义：非 200 即报（泵
+    /// 收割终止上传，时序对齐 Go `client.Do` 在 goroutine 内完成）；drain 后台
+    /// 自终（hyper-util 要求消费 body 才回池连接；packet-up 响应 ≤1KB padding /
+    /// 错误页，连接死亡或 EOF 即退出）。
     async fn post_packet_finish(resp: http::Response<hyper::body::Incoming>) -> Result<()> {
         let status = resp.status();
-        // drain body（hyper-util 要求消费 body 释放连接回 pool）
-        let _ = resp.into_body().collect().await;
-
+        spawn_post_body_drain(resp.into_body());
         if status != StatusCode::OK {
             return Err(SplitHttpError::BadStatus(status.as_u16()));
         }
         Ok(())
     }
+}
+
+/// packet-up POST 响应体的后台丢弃任务（Go `client.go:101-119` `io.Copy(io.Discard,
+/// resp.Body)` goroutine 等价）。不持名额、无取消句柄需求：响应收完 / 连接死亡即退出。
+fn spawn_post_body_drain(body: hyper::body::Incoming) {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "②豁免（bd kwevg · §3.5.6）：数据面泵（坑约束⑫）——packet-up 响应体后台 drain；响应收完即自终，连接死亡报错退出，不迁托管口"
+    )]
+    tokio::spawn(async move {
+        let mut body = body;
+        while let Some(frame) = body.frame().await {
+            if let Err(e) = frame {
+                // drain 失败是连接回收卫生问题（真错误已由 post_packet 返回值 /
+                // 泵收割留痕），DEBUG 级避免连接关闭期刷屏（u0pe2 口径）。
+                crate::hot_log!(DEBUG, "error={e} packet-up response drain");
+                break;
+            }
+        }
+    });
 }
 
 /// `hyper::Error` → `std::io::Error`（h2 body 流转发用）。
@@ -994,6 +1099,25 @@ mod tests {
     // 这里仅放与 hyper-util 配置相关的轻量断言。
 
     use super::*;
+
+    /// C4 名额槽守恒（bd jz351）：eos 释放 + 重复 release + Drop 兜底，名额恰好
+    /// 回到 semaphore 一次（`Option::take` 幂等）。
+    #[tokio::test]
+    async fn permit_slot_releases_exactly_once_across_eos_and_drop() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = sem.clone().acquire_owned().await.unwrap();
+        let slot: PermitSlot = Arc::new(parking_lot::Mutex::new(Some(permit)));
+        let mut body = PermitReleaseBody {
+            inner: make_full_body(Bytes::from_static(b"payload")),
+            slot: Arc::clone(&slot),
+        };
+        assert!(slot.lock().is_some(), "构造后名额应在槽内");
+        body.release(); // eos 帧被取走（poll_frame 内触发同款路径）
+        assert!(slot.lock().is_none(), "eos 释放后槽应空");
+        body.release(); // 重复触发（None 分支/Drop 竞争）
+        drop(body); // Drop 兜底再触发
+        assert_eq!(sem.available_permits(), 1, "名额恰好释放一次（守恒）");
+    }
 
     /// h2 keep-alive PING 接线（wp9o 形态：hyper-util legacy Builder 无配置
     /// getter——断言常量锚定 Go ChromeH2KeepAlivePeriod=45s（net.go:20）+
@@ -1289,7 +1413,7 @@ mod tests {
         let base = format!("https://127.0.0.1:{port}/");
         let cc = std::sync::Arc::clone(&c);
         let pp = tokio::spawn(async move {
-            cc.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"hello xray")).await
+            cc.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"hello xray"), None).await
         });
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), pp)
@@ -1344,7 +1468,7 @@ mod tests {
         );
 
         let base = format!("https://127.0.0.1:{port}/");
-        let err = c.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"x")).await;
+        let err = c.post_packet(&base, "sess", "0", bytes::Bytes::from_static(b"x"), None).await;
         assert!(matches!(err, Err(SplitHttpError::BadStatus(503))), "{err:?}");
         server.await.expect("mock server");
     }
