@@ -342,8 +342,15 @@ where
         session.upload_queue.push(Packet::new(payload, seq)),
     )
     .await;
-    if !matches!(push, Ok(Ok(()))) {
-        return status_response(StatusCode::INTERNAL_SERVER_ERROR);
+    match push {
+        Ok(Ok(())) => {},
+        // issue #49：push 失败 = 包未被保留（closed 竞态 / 会话已终结）。绝不能回
+        // 2xx 伪装成功，也不能回 500（那是服务端内部错误语义）——409 Conflict 让
+        // 客户端把该 POST 视为上传失败；重传的迟到重复包由 read 的 stale-seq
+        // 路径静默自愈。
+        Ok(Err(_)) => return status_response(StatusCode::CONFLICT),
+        // push 超时（r2lq liveness 兜底）维持原 500 语义。
+        Err(_) => return status_response(StatusCode::INTERNAL_SERVER_ERROR),
     }
 
     status_response(StatusCode::OK)
@@ -365,6 +372,9 @@ where
         Err(e) => return session_error_response(e),
     };
     let queue = Arc::clone(&session.upload_queue);
+    // issue #49：push 失败必须上浮（不得静默 break）——pump 经单发 mpsc 通知
+    // 响应体包装流注入错误，客户端看到上传 POST 失败而非干净 200。
+    let (push_fail_tx, push_fail_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // 后台任务：把 request body 切片为有序 packet，push 到 UploadQueue
     #[allow(
@@ -378,6 +388,12 @@ where
         while let Ok(Some(chunk)) = stream.try_next().await {
             // hyper h2 body chunk 本就是 Bytes：零拷贝所有权直入 Packet
             if queue.push(Packet::new(chunk, seq)).await.is_err() {
+                crate::hot_log!(
+                    tracing::Level::WARN,
+                    "seq={} split stream-up push failed (queue closed), surfacing to response body",
+                    seq
+                );
+                let _ = push_fail_tx.send(()).await;
                 break;
             }
             seq += 1;
@@ -387,7 +403,12 @@ where
 
     // H3c：服务端 X 填充流（Go hub.go:219-232）。条件不满足时为空流（行为同旧实现）。
     let fill_stream = spawn_x_padding_stream(ctx, has_referer, obfs_padding_accepted);
-    let body = StreamBody::new(fill_stream).boxed();
+    let body = StreamBody::new(PushFailGuardedStream {
+        inner: fill_stream,
+        failed: false,
+        fail_rx: push_fail_rx,
+    })
+    .boxed();
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -885,6 +906,54 @@ fn session_error_response(err: SessionUpsertError) -> Response<BoxBody<Bytes, io
 
 fn empty_body() -> BoxBody<Bytes, io::Error> {
     Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| match e {}).boxed()
+}
+
+/// stream-up 响应体包装（issue #49）：填充流照常出帧；pump push 失败时立即
+/// 注入 `ConnectionAborted` 错误终结 body——客户端看到上传失败而非干净 200。
+/// 失败标志粘滞（`failed` 置位后恒注错，幂等）。
+///
+/// 边界：填充流为空流（无 Referer / obfs 条件不满足）时 body 在 push 失败前
+/// 即已 EOF——该形态响应已完结，无从注错；失败经 pump 的 WARN 日志上浮。
+struct PushFailGuardedStream<S> {
+    inner: S,
+    failed: bool,
+    /// pump push 失败的单发信号（capacity 1；sender 在 pump 结束后 drop →
+    /// `poll_recv` 恒 `Ready(None)`/`Pending`，不再可能失败）。
+    fail_rx: tokio::sync::mpsc::Receiver<()>,
+}
+
+impl<S> Stream for PushFailGuardedStream<S>
+where
+    S: Stream<Item = io::Result<Frame<Bytes>>> + Unpin,
+{
+    type Item = io::Result<Frame<Bytes>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        // 1. 粘滞失败快路径（幂等注错）
+        if this.failed {
+            return Poll::Ready(Some(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "split stream-up upload queue closed mid-stream",
+            ))));
+        }
+        // 2. 填充帧优先（失败前一帧填充可接受——下一 poll 必注错）
+        if let Poll::Ready(item) = Pin::new(&mut this.inner).poll_next(cx) {
+            return Poll::Ready(item);
+        }
+        // 3. 等失败信号（注册 waker）
+        match this.fail_rx.poll_recv(cx) {
+            Poll::Ready(Some(())) => {
+                this.failed = true;
+                Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "split stream-up upload queue closed mid-stream",
+                ))))
+            },
+            // sender 已 drop（pump 无失败收尾）或信号未到：填充流已 Pending ⇒ Pending
+            _ => Poll::Pending,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1624,6 +1693,89 @@ mod tests {
                         "form={form} mode={configured:?} 必须 400（Go hub.go mode 闸）"
                     );
                 }
+            }
+        }
+    }
+
+    // ===== issue #49：push/close 竞态的 HTTP 面上浮 =====
+
+    /// #49 场景 3：packet-up 命中已关闭队列（包未被保留）必须 409 Conflict——
+    /// 绝不能 200 伪装成功，也不能回 500（500 是服务端内部错误语义，Go hub.go
+    /// 把 push 失败映射为 409 让客户端按上传失败处理）。
+    #[tokio::test]
+    async fn packet_up_to_closed_queue_returns_conflict() {
+        let ctx = make_ctx("");
+        let session = ctx.sessions.upsert("sess-409", 16).await.unwrap();
+        session.upload_queue.close().await;
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/sess-409/0?x_padding={}", "X".repeat(200)))
+            .header("Host", "h")
+            .body(Full::new(Bytes::from_static(b"payload")))
+            .unwrap();
+        let resp = handle_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "未保留的包必须 409 Conflict");
+    }
+
+    /// 对照：同形态 packet-up 打活跃会话必须仍 200（不得过度 409）。
+    #[tokio::test]
+    async fn packet_up_to_live_session_still_ok() {
+        let ctx = make_ctx("");
+        let req = padded_post("/sess-live/0");
+        let resp = handle_request(req, "127.0.0.1:2".parse().unwrap(), &ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// #49 场景 4：stream-up 队列中途关闭——pump push 失败必须上浮为响应体
+    /// 错误（不得静默 break 后回干净 200）。顺序全由测试编排（受控 body 逐帧
+    /// 投喂 + 直接 close），无 timing 交织；5s watchdog 仅防挂死。
+    #[tokio::test]
+    async fn stream_up_surfaces_queue_closed_via_body_error() {
+        use crate::config::RangeConfig;
+        let config = Config {
+            x_padding_bytes: Some(RangeConfig::new(1, 1)),
+            sc_stream_up_server_secs: Some(RangeConfig::new(1, 1)),
+            ..Default::default()
+        };
+        let ctx = make_ctx_with_config(config);
+
+        // 受控 body：测试逐帧投喂，pump 逐帧 push
+        let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(4);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/sess-surface")
+            .body(StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+            .unwrap();
+        let resp = handle_stream_up(req, "sess-surface", &ctx, true, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let session =
+            ctx.sessions.get("sess-surface").await.expect("stream-up must upsert session");
+
+        // 帧 1：队列开着 → push 正常入队
+        tx.send(Ok(Frame::data(Bytes::from_static(b"A")))).await.unwrap();
+        // 确定性关闭队列（不经 reap/sleep）
+        session.upload_queue.close().await;
+        // 帧 2：队列已关 → push 必失败 → 失败信号 → 响应体注错
+        let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"B")))).await;
+        drop(tx); // body EOF：pump 自然收尾
+
+        // 读响应体：X 填充帧（Ok）之后必须出现 Err（队列关闭上浮），绝不干净 EOF。
+        // Ok 帧上限 5：回归（不上浮）时 padding 每 ~1s 一帧，~5s 内红而非挂死。
+        let mut body = resp.into_body();
+        let mut ok_frames = 0;
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+                .await
+                .expect("body must resolve within watchdog (no hang)");
+            match frame {
+                Some(Ok(_)) => {
+                    ok_frames += 1;
+                    assert!(ok_frames <= 5, "push 失败未上浮：body 持续正常出帧（旧缺陷形态）");
+                },
+                Some(Err(_)) => break, // 上浮的队列关闭错误
+                None => panic!("push 失败必须上浮为响应体错误，got 干净 EOF"),
             }
         }
     }

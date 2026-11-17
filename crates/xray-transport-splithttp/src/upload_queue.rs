@@ -116,9 +116,21 @@ impl UploadQueue {
     /// 推送一个分包（HTTP server 收到 POST 后调用）。
     ///
     /// # Errors
-    /// - [`SplitHttpError::QueueClosed`]：队列已关闭（push 在 close 后调用）
+    /// - [`SplitHttpError::QueueClosed`]：队列已关闭。send 本身成功、但 close
+    ///   竞态先落时也返回此错误——被 close 丢弃的包绝不能被 ack 成功（issue #49）。
     pub async fn push(&self, packet: Packet) -> Result<()> {
+        // 发送全程不持锁（硬不变量：不得跨有界通道 .await 持锁）。
         self.push_tx.send(packet).await.map_err(|_| SplitHttpError::QueueClosed)?;
+        // issue #49 线性化复检：close 的 drain→置位→drop receiver 全程持 inner 锁，
+        // 本复检取同一把锁 ⇒ 两者全序。排序点 = 复检读到 `closed == false` 的瞬间：
+        // - 复检先拿到锁 ⇒ close 关键区尚未开跑。本包 send 程序序先于复检，亦先于 drain ⇒ drain
+        //   必收走本包（或已被 read 侧搬入堆）→ Ok 成立；
+        // - close 先拿到锁 ⇒ 本包要么已被 drain 收走（保守报错：与 Go upload_queue.go
+        //   同语义，重传的迟到重复由 read 的 stale-seq 路径静默自愈），要么在 drain
+        //   观察空之后才入缓冲、已随 receiver 一起被丢弃 → 必须报 QueueClosed，绝不返回 Ok。
+        if self.inner.lock().await.closed {
+            return Err(SplitHttpError::QueueClosed);
+        }
         self.notify.notify_one();
         Ok(())
     }
@@ -439,5 +451,41 @@ mod tests {
         for (i, &byte) in result.iter().enumerate() {
             assert_eq!(byte, (i / 2) as u8);
         }
+    }
+
+    /// issue #49 判别性回归（旧实现此测试红）：push 的 send 在 close 关键区进行中
+    /// 完成入缓冲（drain 已观察空、rx 未 drop、flip 未落），旧实现当场返回 Ok——
+    /// 包随后随 receiver 一起被丢弃，却被 ack 成功。新实现 send 后必须取 inner 锁
+    /// 复检 closed：close 关键区全程持锁 ⇒ 本包复检排在 flip 之后 ⇒ 必报 QueueClosed。
+    #[tokio::test]
+    async fn push_send_landing_inside_close_critical_section_must_error() {
+        let q = std::sync::Arc::new(UploadQueue::new(4));
+        // 占住 inner 锁 = 模拟 close 关键区进行中（drain 已过、rx 未 drop）
+        let mut guard = q.inner.lock().await;
+
+        let mut racing = Box::pin(q.push(Packet::new(b"raced".to_vec(), 0)));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        // channel 有空位 ⇒ 一次 poll 即 send 入缓冲完成；随后复检在锁上排队 →
+        // Pending。旧实现此 poll 直接 Ready(Ok(()))（缺陷形态：未复检即 ack）。
+        assert!(
+            matches!(racing.as_mut().poll(&mut cx), std::task::Poll::Pending),
+            "send 完成后必须等 close 关键区结束再复检 closed（旧实现此处已错误返回 Ok）"
+        );
+
+        // close 关键区收尾：flip + drop receiver —— 刚入缓冲的包被丢弃
+        guard.closed = true;
+        guard.pushed = None;
+        drop(guard);
+
+        match racing.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(Err(SplitHttpError::QueueClosed)) => {},
+            other => {
+                panic!("close 关键区内入缓冲的包被丢弃，push 必须报 QueueClosed，got {other:?}")
+            },
+        }
+        // 包确实未保留：读侧 EOF
+        let mut buf = [0u8; 8];
+        assert_eq!(q.read(&mut buf).await.unwrap(), 0, "被丢弃的包绝不能出现在读侧");
     }
 }
