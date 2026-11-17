@@ -6749,6 +6749,7 @@ dependencies = [
  "xray-proxy-anytls",
  "xray-proxy-hysteria",
  "xray-tls",
+ "xray-transport",
  "xray-transport-hysteria",
 ]
 
