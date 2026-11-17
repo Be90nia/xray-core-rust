@@ -61,10 +61,13 @@ use crate::{
 /// 随即注入 EOF——对齐 Go hub.go:399 GET handler 退出时的 `conn.Close()`：
 /// 客户端断开后整个 splitConn 必须立即终结，而非滞留至 dispatcher 的
 /// ConnectionIdle（默认 300s）超时。
+/// 机制（issue #22）：粘滞 `AtomicBool` + `AtomicWaker`——close 先发布标志再唤醒
+/// 已注册读侧；旧 `Notify` 每次 poll 重建 `Notified` 并在 Pending 时 drop，waiter
+/// 被注销后 `notify_waiters` 不保 permit，close 后 pending 读侧唤不醒（丢唤醒）。
 #[derive(Clone)]
 pub struct ServerConnCloseSignal {
     flag: Arc<std::sync::atomic::AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
+    waker: Arc<futures_util::task::AtomicWaker>,
 }
 
 impl ServerConnCloseSignal {
@@ -73,26 +76,29 @@ impl ServerConnCloseSignal {
     pub fn new() -> (Self, Self) {
         let a = Self {
             flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            waker: Arc::new(futures_util::task::AtomicWaker::new()),
         };
         let b = a.clone();
         (a, b)
     }
 
-    /// 触发关闭（幂等）：唤醒所有等待中的 poll_read。
+    /// 触发关闭（幂等）：先发布粘滞标志，再唤醒已注册的等待者。
     pub fn close(&self) {
         self.flag.store(true, std::sync::atomic::Ordering::Release);
-        self.notify.notify_waiters();
+        self.waker.wake();
     }
 
     fn poll_closed(&mut self, cx: &mut Context<'_>) -> bool {
         if self.flag.load(std::sync::atomic::Ordering::Acquire) {
             return true;
         }
-        // 注册 waiter：close() 的 notify_waiters 会唤醒本 poll_read。
-        let notified = self.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().poll(cx).is_ready()
+        // 注册后二次检查标志：close 可能落在首次检查与注册之间（其 wake 扑空），
+        // store(Release) 先于 wake 发生 ⇒ 二次 Acquire 必能捕获，不会永久 Pending。
+        self.waker.register(cx.waker());
+        if self.flag.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        false
     }
 }
 
@@ -292,7 +298,7 @@ impl HubListener {
 #[cfg(test)]
 mod tests {
     /// bd xzg3x：明文/unix `serve` 取窗 = 服务端静态保底（无握手 → 无 RTT 信号，
-    /// 不探针）；send_buf 按内存档位（tiny 8MiB、small 16MiB、medium/large 32MiB，逐档值
+    /// 不探针）；send_buf 按内存档位（tiny 8MiB、small/medium/large 32MiB，逐档值
     /// 由 `flow_window` 单测四档断言钉住）。削弱窗值必红。
     #[test]
     fn plaintext_serve_windows_equal_pre_fix_static() {
