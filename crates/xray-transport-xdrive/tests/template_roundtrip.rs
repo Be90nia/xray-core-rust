@@ -7,7 +7,15 @@
 #![allow(clippy::unwrap_used)] // 测试断言便利豁免（bd g3cr）
 #![allow(clippy::print_stderr)]
 
-use std::{collections::BTreeMap, convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
@@ -31,6 +39,9 @@ use xray_transport_xdrive::{dial, serve};
 #[derive(Default)]
 struct MockState {
     objects: BTreeMap<String, Vec<u8>>,
+    // PUT 计数（bd xss2v 断言承重件）：`.seg` 在 store 里是 PUT→GET→DELETE 瞬态，
+    // 在场断言不可靠 ⇒ 改数单调 PUT 次数（不受删除时序影响）。
+    puts: AtomicUsize,
 }
 
 async fn handle(
@@ -51,6 +62,7 @@ async fn handle(
     };
     match method.as_str() {
         "PUT" => {
+            st.puts.fetch_add(1, Ordering::Relaxed); // bd xss2v 断言计数
             st.objects.insert(key.to_string(), body.to_vec());
             Ok(Response::builder()
                 .status(StatusCode::CREATED)
@@ -175,6 +187,9 @@ async fn template_roundtrip_1mib_and_collector_reclaim() {
         .expect("listener must accept the announced session in time")
         .expect("handler channel closed");
 
+    // 段 PUT 计数基线（此刻 announce 已 PUT，put 计数 = 1）。
+    let seg_puts_before = state.lock().await.puts.load(Ordering::Relaxed);
+
     // 1MiB 上行：客户端写 → 服务端读，逐字节相等（全部经 template PUT 分段承载）。
     let payload: Vec<u8> = (0..1024 * 1024usize).map(|i| (i * 7 % 251) as u8).collect();
     client.write_all(&payload).await.unwrap();
@@ -189,25 +204,16 @@ async fn template_roundtrip_1mib_and_collector_reclaim() {
     assert_eq!(echoed, payload, "1MiB downlink must arrive byte-equal");
 
     // 中途校验：对象确经 mock 服务端存储（读写删走 HTTP 四操作）。
-    // 竞态机理：落盘是异步 PUT 任务，CI --release 下字节流 0.02s 跑完时它可能尚未被调度
-    // （bd xss2v）→ 轮询等待落盘（400×25ms=10s 上限）而非即时断言。
-    let mut stored = false;
-    for _ in 0..400 {
-        let hit = state
-            .lock()
-            .await
-            .objects
-            .keys()
-            .any(|k| k.starts_with("streams~") && k.ends_with(".seg"));
-        if hit {
-            stored = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    // bd xss2v 修正：`.seg` 在 store 里是 PUT→GET→DELETE 的**瞬态**——读侧 poll 把
+    // 段推给消费者通道的同一刻就把段名投进 discard 队列（wal.rs `tx.send` 后紧跟
+    // `discards_tx.try_send`），与 app 是否已 read 无关；传输完成后 store 被删净是
+    // 常态（CI Linux --release 每次都赢下这场 µs 级竞速 ⇒ 轮询 objects=[] 假失败，
+    // 且传输停止后不再有新 PUT，等待只会更空）。改用单调 PUT 计数：字节相等本身
+    // 证明段经 mock 中转（store-and-forward 唯一管道），计数不受删除时序影响。
+    let puts_after = state.lock().await.puts.load(Ordering::Relaxed);
     assert!(
-        stored,
-        "WAL 分段必须落在 mock 对象存储（异步 PUT 落盘超时 10s）: {:?}",
+        puts_after.saturating_sub(seg_puts_before) >= 32,
+        "1MiB 双向 = 32 个 WAL 段必须经 mock PUT 中转（传输前 {seg_puts_before}，传输后 {puts_after}）: {:?}",
         state.lock().await.objects.keys().collect::<Vec<_>>()
     );
 
