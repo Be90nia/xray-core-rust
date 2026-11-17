@@ -39,8 +39,9 @@ const INFLOW_MIN_REFRESH: i32 = 4 * 1024;
 ///
 /// 上游语义 = 窗口的一半（`window/2`）；本仓改为 `min(window/2, 4KiB)`，与 Go
 /// x/net/http2 的 `inflowMinRefresh`（4<<10，http2/flow.go:12-14）同粒度。
-/// 单独抽成函数，使阈值可被同文件内的钉桩单测直接断言（防上游升级/误改静默回档）。
-fn window_update_threshold(window_size: i32) -> i32 {
+/// 单独抽成函数并升为 `pub(crate)`，使阈值可被同文件钉桩单测与 connection.rs
+/// `flush_gate` 捆绑断言直接引用（防上游升级/误改静默回档）。
+pub(crate) fn window_update_threshold(window_size: i32) -> i32 {
     (window_size / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR).min(INFLOW_MIN_REFRESH)
 }
 

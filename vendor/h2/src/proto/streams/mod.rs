@@ -1,6 +1,6 @@
 mod buffer;
 mod counts;
-mod flow_control;
+pub(crate) mod flow_control;
 mod prioritize;
 mod recv;
 mod send;

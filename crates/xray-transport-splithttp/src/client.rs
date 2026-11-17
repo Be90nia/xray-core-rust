@@ -521,6 +521,10 @@ impl DefaultDialerClient {
             .http2_initial_stream_window_size(win.stream_window)
             .http2_initial_connection_window_size(win.connection_window)
             .http2_max_send_buf_size(win.max_send_buf)
+            // 下行大帧广告（campaign C1）：SETTINGS_MAX_FRAME_SIZE = 1 MiB，服务端
+            // 下行 DATA 按 1 MiB 分帧——帧数 /64，flush 与回填事件同步变疏。
+            // 1<<20 = Go http2defaultMaxFrameSize（h2_bundle.go:3477，双重锚定）。
+            .http2_max_frame_size(1 << 20)
             // h2 连接级 keep-alive PING：对齐 Go dialer.go http2 分支
             // ReadIdleTimeout = ChromeH2KeepAlivePeriod 45s（net.go:20）；
             // timeout 15s = Go http2.PingTimeout 缺省。对抗 CDN 100s idle 切断
