@@ -126,8 +126,9 @@ const MAX_INFLIGHT_POSTS: usize = 4;
 ///
 /// - **不做 upload_writer 大小限制**：直接 read pipe（Go 用 `pipe.WithSizeLimit` 强制 maxUploadSize
 ///   上限）；本实现由读缓冲长度封顶。
-/// - **背压用 in-flight 上限近似**：Go 对 `DefaultDialerClient` 只等请求字节写完（不等响应）， Rust
-///   侧 hyper `Full` body 无此回执——取值依据见 `MAX_INFLIGHT_POSTS`。
+/// - **背压名额随 body 即释**：Go 对 `DefaultDialerClient` 只等请求字节写完（不等响应）； Rust
+///   侧名额由 `crate::client::PermitReleaseBody` 携带，body eos 即释（bd jz351 C4），取值依据见
+///   `MAX_INFLIGHT_POSTS`。
 ///
 /// # 参数
 ///
