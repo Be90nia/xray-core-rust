@@ -114,7 +114,7 @@ fn run_serial(datadir: &Path, reqs: &[LoadRequest]) -> Vec<Result<LoadedEntry, L
 fn pooled_startup_load_matches_serial_results_and_balances() {
     let dir = fixture_dir("perf");
     let reqs = reqs();
-    let pool = GeodataLoadPool::new(2, 2, 32, Duration::from_secs(10));
+    let pool = GeodataLoadPool::new(2, 2, 32);
 
     let serial = run_serial(&dir, &reqs);
     let pooled = pool.load_parallel(&dir, &reqs);
@@ -133,8 +133,8 @@ fn pooled_startup_load_matches_serial_results_and_balances() {
     );
 
     pool.shutdown_join();
-    assert_eq!(pool.borrow_rejected(), 0);
-    let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
+    let m = pool.buffer_pool().expect("已提交任务 ⇒ 池已建").metrics();
+    assert_eq!(m.degraded, 0);
     assert_eq!(m.core.borrowed, 0);
     // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
     assert_eq!(m.core.dropped_overflow, 0);
@@ -146,7 +146,7 @@ fn pooled_startup_load_matches_serial_results_and_balances() {
 fn parallel_load_end_to_end_balance_and_panic_isolation() {
     // ①②在真实 dat 文件上复证：全部结果正确 + panic 任务不拖垮批次、不漏缓冲。
     let dir = fixture_dir("e2e");
-    let pool = GeodataLoadPool::new(2, 2, 32, Duration::from_secs(10));
+    let pool = GeodataLoadPool::new(2, 2, 32);
     let reqs = reqs();
     let results = pool.load_parallel(&dir, &reqs);
     assert_eq!(results.len(), reqs.len());
@@ -191,8 +191,8 @@ fn parallel_load_end_to_end_balance_and_panic_isolation() {
     assert_eq!(oks, 4);
 
     pool.shutdown_join();
-    assert_eq!(pool.borrow_rejected(), 0);
-    let m = pool.mem_pool().expect("已提交任务 ⇒ 池已建").metrics();
+    let m = pool.buffer_pool().expect("已提交任务 ⇒ 池已建").metrics();
+    assert_eq!(m.degraded, 0);
     assert_eq!(m.core.borrowed, 0, "panic task must not leak its buffer");
     // 泄漏判据=账本闭合（见 loader.rs balance 测试注释）：懒创建池不承诺长满。
     assert_eq!(m.core.dropped_overflow, 0);
@@ -204,7 +204,7 @@ fn parallel_load_end_to_end_balance_and_panic_isolation() {
 fn bounded_submit_overflow_returns_rejected_task_without_panic() {
     // ④ queue_cap 溢出路径：Err(RejectedTask) 退还（不 panic），池排空后照常工作。
     let dir = fixture_dir("overflow");
-    let pool = GeodataLoadPool::new(1, 1, 2, Duration::from_secs(10));
+    let pool = GeodataLoadPool::new(1, 1, 2);
     let reqs = reqs();
     // 先阻塞唯一 worker，制造确定性溢出
     let (started_tx, started_rx) = mpsc::channel();
@@ -239,7 +239,7 @@ fn bounded_submit_overflow_returns_rejected_task_without_panic() {
     for task in recovered {
         drop(task.into_task());
     }
-    assert_eq!(pool.borrow_rejected(), 0);
+    assert_eq!(pool.buffer_pool().expect("已提交任务 ⇒ 池已建").metrics().degraded, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -273,7 +273,7 @@ fn parallel_download_plus_serial_swap_shape() {
     }
 
     let dir = unique_dir("dlswap");
-    let pool = GeodataLoadPool::new(2, 2, 8, Duration::from_secs(10));
+    let pool = GeodataLoadPool::new(2, 2, 8);
     let dl: Arc<dyn AssetDownloader> = Arc::new(FakeDownloader {
         root: dir.clone(),
         payloads: HashMap::from([

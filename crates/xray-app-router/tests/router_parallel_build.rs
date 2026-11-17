@@ -10,10 +10,7 @@
 // 豁免）；生产禁令不受影响 713x6：测试计时不得改语义（契约）——基准对照取时保持原语义；
 // 时钟禁令只约束 生产路径。集成测试为独立 test binary，文件顶显式豁免。
 #![allow(clippy::disallowed_methods)]
-use std::{
-    sync::mpsc,
-    time::{Duration, Instant},
-};
+use std::{sync::mpsc, time::Instant};
 
 use xray_app_router::{
     Condition,
@@ -53,7 +50,7 @@ fn pooled_build_matches_serial_exactly() {
     let rules = make_rules(7, 2000);
     let serial = DomainMatcherCondition::new(&rules, None).unwrap();
 
-    let pool = RouterBuildPool::new(2, 2, 8, Duration::from_secs(10));
+    let pool = RouterBuildPool::new(2, 2, 8);
     let pooled = DomainMatcherCondition::new_pooled(&pool, rules, None).unwrap();
     pool.shutdown_join();
 
@@ -91,7 +88,7 @@ fn pooled_build_is_not_slower_than_serial() {
         }
         serial_ms.push(t0.elapsed().as_millis());
 
-        let pool = RouterBuildPool::new(2, 2, 8, Duration::from_secs(10));
+        let pool = RouterBuildPool::new(2, 2, 8);
         let (tx, rx) = mpsc::channel();
         let t1 = Instant::now();
         for g in &groups {
@@ -133,7 +130,7 @@ fn pooled_build_is_not_slower_than_serial() {
 /// `RejectedTask` 拒绝 → 本线程内联补位（CallerRuns 等价），结果正确不 panic。
 #[test]
 fn rejected_submit_falls_back_inline_without_panic() {
-    let pool = RouterBuildPool::new(1, 1, 1, Duration::from_secs(10));
+    let pool = RouterBuildPool::new(1, 1, 1);
 
     // 占住唯一 worker，直到测试放行。
     let (started_tx, started_rx) = mpsc::channel();

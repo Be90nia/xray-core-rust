@@ -18,12 +18,11 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, mpsc},
-    time::Duration,
 };
 
 use regex::Regex;
 use skeleton_infra::{
-    memgov::MemoryPool,
+    objpool::ObjectPool,
     pool::{RejectedTask, ThreadPool, ThreadPoolTuning},
     pooled_thread_pool::PooledThreadPool,
 };
@@ -1211,17 +1210,14 @@ impl Condition for ProcessNameMatcherCondition {
 const DEFAULT_CORE: usize = 1;
 const DEFAULT_MAX: usize = 2;
 const DEFAULT_QUEUE_CAP: usize = 8;
-const DEFAULT_BORROW_TIMEOUT_MS: usize = 10_000;
 
 /// 池参数 env 覆盖项：worker 保活数。
 pub const ENV_CORE: &str = "XRAY_ROUTER_POOL_CORE";
-/// 池参数 env 覆盖项：worker 上限（同时决定内存池缓冲上限）。
+/// 池参数 env 覆盖项：worker 上限（同时决定缓冲池上限）。
 pub const ENV_MAX: &str = "XRAY_ROUTER_POOL_MAX";
 /// 池参数 env 覆盖项：中央队列容量（溢出 = 提交侧 `RejectedTask` 退还 → 调用
 /// 线程内联补位，不 panic）。
 pub const ENV_QUEUE_CAP: &str = "XRAY_ROUTER_POOL_QUEUE_CAP";
-/// 池参数 env 覆盖项：worker 借缓冲超时（毫秒）。
-pub const ENV_BORROW_TIMEOUT_MS: &str = "XRAY_ROUTER_POOL_BORROW_TIMEOUT_MS";
 
 // 留主仓（方向件：内容域绑定）——壳编排的输入是路由 matcher 构建（路由规则内容域），
 // 属内容方向件（CLAUDE.md §3.5.3），不进 udf；池件本体仍白拿 udf。
@@ -1231,17 +1227,17 @@ pub const ENV_BORROW_TIMEOUT_MS: &str = "XRAY_ROUTER_POOL_BORROW_TIMEOUT_MS";
 /// 硬边界：只接启动期/热更期 matcher 构建（CPU 密集、纯内存、不持 IO）；
 /// 数据面 `apply` 与持 socket 任务禁入（契约坑约束 12）。
 pub struct RouterBuildPool {
-    pool: PooledThreadPool<Vec<u8>, fn() -> Vec<u8>>,
+    pool: PooledThreadPool<Vec<u8>>,
 }
 
 impl RouterBuildPool {
     /// 显式参数组装。非法组合（0 值 / `core > max`）由 udf 构造期 fail-fast
-    /// panic（恒不合法 = 调用方 bug，同 udf 纪律）。内存池上限 = `max`：每
-    /// worker 至多持 1 块缓冲，恒不借空。
-    pub fn new(core: usize, max: usize, queue_cap: usize, borrow_timeout: Duration) -> Self {
-        let mem = Arc::new(MemoryPool::<Vec<u8>>::new(max, max, Vec::new));
+    /// panic（恒不合法 = 调用方 bug，同 udf 纪律）。缓冲池上限 = `max`：每
+    /// worker 至多持 1 块缓冲，恒不降级。
+    pub fn new(core: usize, max: usize, queue_cap: usize) -> Self {
+        let buffers = Arc::new(ObjectPool::<Vec<u8>>::new(max, max, Vec::new));
         let threads = ThreadPool::new(ThreadPoolTuning::new(core, max, queue_cap));
-        Self { pool: PooledThreadPool::new(mem, threads, borrow_timeout) }
+        Self { pool: PooledThreadPool::new(buffers, threads) }
     }
 
     /// 固定默认 + env 覆盖装配。非法 env 值 `tracing::warn` 后回落默认/修正，
@@ -1266,12 +1262,7 @@ impl RouterBuildPool {
         } else {
             (core, max)
         };
-        Self::new(
-            core,
-            max,
-            num(ENV_QUEUE_CAP, DEFAULT_QUEUE_CAP),
-            Duration::from_millis(num(ENV_BORROW_TIMEOUT_MS, DEFAULT_BORROW_TIMEOUT_MS) as u64),
-        )
+        Self::new(core, max, num(ENV_QUEUE_CAP, DEFAULT_QUEUE_CAP))
     }
 
     /// 提交一个构建任务（worker 内借缓冲 → 跑 → RAII 还）。
