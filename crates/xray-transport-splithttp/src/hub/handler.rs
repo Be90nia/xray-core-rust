@@ -17,14 +17,15 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use futures_util::Stream;
 use http::{HeaderMap, HeaderValue};
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::{Method, Request, Response, StatusCode, body::Frame};
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
 
 use super::{
     HubConnHandler, ServerConn, ServerConnCloseSignal, SessionMap,
-    dl_stream::DlStream,
+    dl_stream::MpscDownlinkWriter,
     meta::extract_meta,
     session::{SessionUpsertError, is_valid_session_id},
 };
@@ -409,8 +410,11 @@ where
 {
     // 上行管道：reader → dispatcher
     let (upload_tx, upload_rx) = tokio::io::duplex(DUPLEX_BUF);
-    // 下行管道：dispatcher → response body
-    let (dl_tx, dl_rx) = tokio::io::duplex(DUPLEX_BUF);
+    // 下行管道：dispatcher → response body（C3：mpsc<Bytes> 直推，删 64 KiB duplex 环
+    // ——原形态每字节 3 次拷贝（聚合 + duplex 环 + PoolStream 池化读），现 1 次）。
+    let (dl_tx, dl_rx) = tokio::sync::mpsc::channel::<io::Result<Frame<Bytes>>>(
+        super::dl_stream::DOWNLINK_QUEUE_CAP,
+    );
     let has_session = !session_id.is_empty();
     if has_session {
         // stream-down: UploadQueue → upload_tx
@@ -449,7 +453,10 @@ where
         });
     }
 
-    // 下行 body = ReaderStream(dl_rx) → StreamBody。
+    // 下行 body = mpsc 直推帧（C3）：dispatcher MultiBuffer 经 CoalescingWriter 聚合 →
+    // ServerConn.writer（MpscDownlinkWriter）一次拷贝产 Bytes → ReceiverStream 产
+    // Frame::data → hyper h2 DATA。对照 Go：dispatcher MultiBuffer 合并写 +
+    // httpServerConn.Write 每写即 Flush（1 写 1 Flush 无中转）。
     // guard 随响应 body 存活：GET 响应终结（流结束或 hyper drop body）即触发
     // 会话删除——对齐 Go hub.go:352-353 `defer h.sessions.Delete(sessionId)`。
     // 同时触发 ServerConn 的 close signal：注入上行读 EOF，dispatcher 桥立即
@@ -461,17 +468,16 @@ where
         sid: session_id.to_string(),
         close_signal: Some(close_signal),
     });
-    // 读块 64 KiB：tokio-util 默认容量 4096B 会把 DATA 帧粒度钉死在 4KB——高
-    // RTT 路径（CF tunnel）帧数/唤醒数放大 ~16x，是 xhttp 吞吐缺陷主因。
-    // 对照 Go：dispatcher MultiBuffer 合并写 + httpServerConn.Write 每写即 Flush。
-    // 池化读块（票 r1693）：每帧不再新分配 64 KiB 缓冲，站点归因随之收敛。
-    let body =
-        StreamBody::new(DlStream::new(GuardedReader { inner: dl_rx, _guard: guard })).boxed();
+    let body = StreamBody::new(GuardedStream {
+        inner: tokio_stream::wrappers::ReceiverStream::new(dl_rx),
+        _guard: guard,
+    })
+    .boxed();
 
     // 构造 ServerConn 并交给 dispatcher
     let conn = ServerConn {
         reader: Box::new(upload_rx),
-        writer: Box::new(dl_tx),
+        writer: Box::new(MpscDownlinkWriter::new(dl_tx)),
         remote_addr: peer_addr,
         local_addr: ctx.local_addr,
         close_signal: conn_close_signal,
@@ -581,20 +587,18 @@ impl Drop for SessionDropGuard {
     }
 }
 
-/// 持有 [`SessionDropGuard`] 的 AsyncRead 包装：body 流消费完或被 drop 时，
+/// 持有 [`SessionDropGuard`] 的下行 body 流包装：body 流消费完或被 drop 时，
 /// guard 随之 drop 并触发会话删除。
-struct GuardedReader<R> {
-    inner: R,
+struct GuardedStream<S> {
+    inner: S,
     _guard: Option<SessionDropGuard>,
 }
 
-impl<R: AsyncRead + Unpin> AsyncRead for GuardedReader<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+impl<S: Stream + Unpin> Stream for GuardedStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -1321,7 +1325,7 @@ mod tests {
         let resp = handle_stream_down(req, "127.0.0.1:2".parse().unwrap(), "sess-ikzy", &ctx).await;
         assert!(ctx.sessions.get("sess-ikzy").await.is_some(), "GET must register session");
 
-        // 模拟 hyper 终结 GET：drop 响应（body → DlStream → GuardedReader → guard）
+        // 模拟 hyper 终结 GET：drop 响应（body → GuardedStream → guard）
         drop(resp);
         for _ in 0..100 {
             if ctx.sessions.get("sess-ikzy").await.is_none() {

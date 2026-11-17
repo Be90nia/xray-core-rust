@@ -7,14 +7,14 @@
 //!
 //! 这里改为池化：块从池借出、装进 `Bytes::from_owner`，帧被 hyper 释放后由池句柄
 //! Drop 归还——稳态零分配。帧粒度与原实现一致（一次 `poll_read` 一帧），块大小由
-//! 调用方指定（下行 = duplex 缓冲 64 KiB，上行同值）。块池实体是 udf `ObjectPool`
+//! 调用方指定（上行 = pipe 缓冲 64 KiB；下行自 C3 起改走 mpsc 直推 `Bytes`，不再
+//! 经本件，见 `hub/dl_stream.rs`）。块池实体是 udf `ObjectPool`
 //! （2026-11-03 迁移，见 `PoolStream` 文档）。
 //!
 //! **进程级共享池（bd kw2si）**：同 chunk 全进程唯一一份 `ObjectPool`（上行
-//! `UPLINK_CHUNK` 与下行 `DUPLEX_BUF` 同为 64 KiB ⇒ 上行/下行全部流共享同一份），
-//! 预算 [`POOL_BYTE_BUDGET`] 从「每流一份」的乘积面（N 流 = N × 2 MiB）收敛为
-//! 进程级常量上界。并发借还线程安全由池自身保证（分片 + 片锁），测试用
-//! `PoolStream::with_pool` 注入独立池隔离读数。
+//! `UPLINK_CHUNK` 64 KiB；下行原 `DUPLEX_BUF` 同值，C3 后仅上行消费）⇒ 池为
+//! 进程级常量上界，预算 [`POOL_BYTE_BUDGET`] 不变。并发借还线程安全由池自身保证
+//! （分片 + 片锁），测试用 `PoolStream::with_pool` 注入独立池隔离读数。
 //!
 //! 留主仓（方向件：依赖 `bytes::Bytes::from_owner`）——池化读流只服务 h2 body
 //! 这一网络方向，`bytes` 属方向件非 udf 依赖纪律，不上浮。
