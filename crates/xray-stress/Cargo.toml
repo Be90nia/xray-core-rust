@@ -37,3 +37,9 @@ rand = "0.9"
 # bd g3cr: 生产代码零 unwrap（测试代码由 clippy.toml allow-unwrap-in-tests 豁免）
 [lints.clippy]
 unwrap_used = "deny"
+
+[dev-dependencies]
+# issue #9 回归测试：socket2 对服务端 accept 连接设小 SO_SNDBUF/SO_RCVBUF
+# （per-conn 手动 setsockopt 关闭 Linux autotune ⇒ 死锁判据跨平台确定）。
+# workspace 依赖树既有 crate（socket2 = "0.5"），零新增入图。
+socket2 = { workspace = true }
