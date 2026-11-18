@@ -6735,6 +6735,7 @@ dependencies = [
  "rand 0.9.4",
  "rustls",
  "serde_json",
+ "socket2 0.5.10",
  "sysinfo",
  "thiserror 2.0.18",
  "tokio",
