@@ -1,0 +1,49 @@
+# udf-frame main 最新 canary（issue #68 Required change 5，2026-11-18）。
+#
+# 非 required（NOT required）：本 job 不进 branch protection required 列表；
+# job 级 continue-on-error 保证红不拉红本仓 required CI / release 构建，红绿
+# 只在 step summary 显式记录（canary SHA + 判定 + pinned SHA 对照）。
+# required CI 消费的仍是 .github/udf-frame.rev 钉死 revision（fetch-udf
+# action）——canary 红 ≠ 自动改 pin；pin 更新走人工流程
+# docs/ops/udf-frame-pin.md（更新前人工验证候选 commit 上游全绿）。
+
+name: udf-canary
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 每日 UTC 03:17（避开整点拥塞）
+  workflow_dispatch:
+
+jobs:
+  canary:
+    name: Canary (udf main latest, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true # 非阻断：红只进 summary，不转红 required CI
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Fetch udf main latest
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 https://github.com/Be90nia/udf-frame.git crates/udf-frame
+          echo "UDF_CANARY_SHA=$(git -C crates/udf-frame rev-parse HEAD)" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析，与 ci.yml 同源）
+      - name: Test udf workspace (lib + tests)
+        id: test
+        run: |
+          # 不含 doctest：skeleton/src/lint.rs 的 `compile_fail,E0310` 例子在部分
+          # 工具链上报 E0521 → doctest 红，与本 canary 目的（main 三层是否可用）
+          # 无关；doctest 由 udf 上游自己的 CI 在它自己的工具链上覆盖（bd ym69a）。
+          cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace --lib --tests
+      - name: Summary (verdict + SHA)
+        if: always()
+        run: |
+          verdict="GREEN"
+          if [ "${{ steps.test.outcome }}" != "success" ]; then verdict="RED"; fi
+          {
+            echo "### udf-frame main canary（非阻断，issue #68）"
+            echo "- 判定: **${verdict}**（test step outcome = ${{ steps.test.outcome }}）"
+            echo "- canary SHA (main 最新): \`${{ env.UDF_CANARY_SHA }}\`"
+            echo "- pinned SHA (required CI 消费): \`$(tr -d '[:space:]' < .github/udf-frame.rev)\`"
+            echo "- canary 红 ≠ 自动改 pin；更新流程: docs/ops/udf-frame-pin.md"
+            echo "- udf runs: https://github.com/Be90nia/udf-frame/actions"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -88,6 +88,8 @@ docs/*
 !docs/architecture/
 # 例外: docs/research/xray-frame-*.md 盘点底料(主仓能力盘点/udf 机制差距/池化归 udf/DNS 面/inbound-outbound 面), 被 CLAUDE.md §3 引用 2026-11-07; bd wio1d
 !docs/research/
+# 例外: docs/ops/ 运维流程文档(udf-frame pin 更新流程, fetch-udf action 与锚测试均指向, issue #68 决断) 2026-11-18
+!docs/ops/
 
 # 临时调试产物(应走 tools/logs/ 归档, 不入仓) 2026-10-12
 build-debug.log

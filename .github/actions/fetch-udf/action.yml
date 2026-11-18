@@ -1,78 +1,54 @@
-name: 'Fetch udf-frame'
+name: 'Fetch udf-frame (pinned revision)'
 description: >-
-  双向依赖模型（不锁 rev）：克隆 udf-frame main 最新到 crates/udf-frame 并导出
-  UDF_HEAD（供 rust-cache 键注入，防旧 udf 产物跨 run 复用造成假绿）；随后按上游
-  check-runs 闸门拒绝消费 udf CI 红的 commit；API 不可用/无 check run 时降级为
-  本地 cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace --lib --tests
-  （三层全覆盖，bd ym69a；check-runs 调用带 github.token 提额）。所有分支打印判定依据。
+  按 pin 文件 .github/udf-frame.rev 拉取钉死的 udf-frame revision（issue #68 决断
+  2026-11-18：required CI 禁消费移动 main）。流程 = 校验 pin（缺失/非 40-hex 一律
+  fail-closed）→ git fetch --depth 1 origin <pin> + checkout --detach → 硬校验
+  rev-parse HEAD == pin（不等即 exit 1）→ 导出 UDF_HEAD=pin（rust-cache 键接口
+  不变）。上游红绿判定已不在 required CI：消费绿由「更新 pin 时人工验证上游全绿」
+  流程保证（docs/ops/udf-frame-pin.md）；main 最新由 udf-canary.yml 每日独立测试
+  （非阻断）。锚测试（xray-conf udf_rev_anchor）真值源 = 同一 pin 文件，CI 侧
+  HEAD=pin 可真校验（收口 bd yyoy9）。
 
 runs:
   using: composite
   steps:
-    - name: Fetch udf-frame (unpinned main)
+    - name: Fetch udf-frame at pinned revision
       shell: bash
       run: |
-        git clone --depth 1 https://github.com/Be90nia/udf-frame crates/udf-frame
-        UDF_HEAD=$(git -C crates/udf-frame rev-parse HEAD)
-        echo "UDF_HEAD=${UDF_HEAD}" >> "$GITHUB_ENV"
+        set -euo pipefail
+        pin_file=".github/udf-frame.rev"
+        remote="https://github.com/Be90nia/udf-frame.git"
+
+        if [ ! -f "${pin_file}" ]; then
+          echo "::error::pin 文件 ${pin_file} 不存在——udf-frame 消费已钉死，缺 pin 即拒启（issue #68 fail-closed）。修法：git -C crates/udf-frame rev-parse HEAD > ${pin_file}，流程见 docs/ops/udf-frame-pin.md"
+          exit 1
+        fi
+        pin="$(tr -d ' \t\r\n' < "${pin_file}")"
+        if ! grep -Eq '^[0-9a-f]{40}$' <<<"${pin}"; then
+          echo "::error::pin 文件 ${pin_file} 内容不是单行 40-hex 小写全 SHA（得到「${pin}」）——fail-closed，禁短 SHA/大写/多行。修法：git -C crates/udf-frame rev-parse HEAD > ${pin_file}"
+          exit 1
+        fi
+        if [ -e crates/udf-frame ]; then
+          echo "::error::crates/udf-frame 已存在（checkout 后预期不存在）——拒绝操作既有目录，人工核对清理后再跑"
+          exit 1
+        fi
+
+        git init --quiet crates/udf-frame
+        git -C crates/udf-frame remote add origin "${remote}"
+        git -C crates/udf-frame fetch --quiet --depth 1 origin "${pin}"
+        git -C crates/udf-frame checkout --quiet --detach FETCH_HEAD
+
+        head="$(git -C crates/udf-frame rev-parse HEAD)"
+        if [ "${head}" != "${pin}" ]; then
+          echo "::error::硬校验失败：HEAD=${head} != pin=${pin}——拉到的不是钉死 revision，fail-closed 拒消费"
+          exit 1
+        fi
+
+        echo "UDF_HEAD=${pin}" >> "$GITHUB_ENV"
         {
-          echo "### udf-frame 拉料（不锁 rev，消费 main 最新）"
-          echo "- udf HEAD: \`${UDF_HEAD}\`（CI 侧锚 = 本 run 的 UDF_HEAD：rust-cache 键 + 本摘要；主仓 \`Cargo.lock\` 只记 \`path\` 不记 commit，\`crates/udf-frame/REV\` 锚测试在 CI 显式跳过——clone 不带 REV，该锚仅本地生效，bd yyoy9）"
+          echo "### udf-frame 拉料（pinned，issue #68）"
+          echo "- pinned SHA: \`${pin}\`（= 本 run 全部 job 的 UDF_HEAD：rust-cache 键 + 本摘要；真值源 \`${pin_file}\`，本 run 已硬校验 HEAD == pin）"
+          echo "- 更新 pin：验证上游全绿 → 改 pin → 本地锚测试+全门 → PR（docs/ops/udf-frame-pin.md）；main 最新由 udf-canary workflow 独立测试（非阻断）"
           echo "- 本 run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "- udf runs: https://github.com/Be90nia/udf-frame/actions"
         } >> "$GITHUB_STEP_SUMMARY"
-
-    - name: Upstream CI gate (check-runs)
-      shell: bash
-      run: |
-        : "${UDF_HEAD:?UDF_HEAD 未注入，拉料步骤异常}"
-        gate_json="$(mktemp)"
-        verdict=degrade
-        curl_rc=0
-        curl -sS --fail -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ github.token }}" \
-            "https://api.github.com/repos/Be90nia/udf-frame/commits/${UDF_HEAD}/check-runs" \
-            -o "$gate_json" || curl_rc=$?
-        if [ "${curl_rc}" -eq 0 ]; then
-          echo "上游 check-runs 判定依据（udf ${UDF_HEAD}）:"
-          jq -r '.check_runs[] | "  check: \(.name)  conclusion=\(.conclusion)"' "$gate_json"
-          # 判定输入解析失败（坏 JSON）→ verdict 落空 → 走降级闸
-          verdict="$(jq -r '
-            ([.check_runs[]? | select(.conclusion == "failure" or .conclusion == "timed_out"
-                  or .conclusion == "cancelled" or .conclusion == "action_required")] | length) as $bad
-            | (if (.total_count // 0) == 0 then "degrade"
-               elif $bad > 0 then "red"
-               else "pass" end)
-          ' "$gate_json" 2>/dev/null || true)"
-          jq -r '.check_runs[]? | select(.conclusion == "failure" or .conclusion == "timed_out"
-                or .conclusion == "cancelled" or .conclusion == "action_required")
-                | "  RED: \(.name) conclusion=\(.conclusion)"' "$gate_json"
-          pending="$(jq '[.check_runs[]? | select(.conclusion == null)] | length' "$gate_json" 2>/dev/null || echo 0)"
-          if [ "${pending}" -gt 0 ]; then
-            echo "  WARN: ${pending} 条 check 尚未完成（conclusion=null），按契约只拦红项不等待"
-          fi
-        else
-          echo "降级依据: check-runs API 请求失败（curl 退出码 ${curl_rc}；含限流/网络/无记录）"
-        fi
-        rm -f "$gate_json"
-        case "${verdict}" in
-          pass)
-            echo "闸门 PASS: udf ${UDF_HEAD} 上游 check-runs 无红项，放行消费"
-            ;;
-          red)
-            echo "::error::udf-frame ${UDF_HEAD} 上游 CI 有红项（见上方 RED 行）——按双向依赖模型闸门拒绝消费；请等 udf main CI 修复后再触发本仓 CI（udf runs: https://github.com/Be90nia/udf-frame/actions）"
-            exit 1
-            ;;
-          *)
-            echo "降级闸（verdict=${verdict:-空}）: API 不可用/无 check run/输出无法识别，改跑本地快速子集（PM 拍板双保险）"
-            # 覆盖三层：生产真正消费的是 skeleton-infra（FxScope/ShutdownCoordinator/
-            # logx/memgov/pool::PoolBase）与 std-ext（cache/retry/scheduler），只测
-            # udf-skeleton（契约层）= 门静默变薄（bd ym69a）。cargo 的 -p 选不中非成员，
-            # 故走 udf-frame 自己的 workspace manifest。
-            # 不含 doctest：本仓工具链钉 nightly-2026-05-28（升级排在收工后），
-            # skeleton/src/lint.rs 的 `compile_fail,E0310` 例子在该 toolchain 上报
-            # E0521 → doctest 红，与本闸目的（三层真被测试过）无关；doctest 由 udf
-            # 上游自己的 CI 在它自己的工具链上覆盖。
-            cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace --lib --tests
-            ;;
-        esac
