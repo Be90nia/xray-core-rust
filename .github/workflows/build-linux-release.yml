@@ -37,9 +37,9 @@ jobs:
           /usr/local/bin/protoc --version
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable 分支头（2026-11-07 解析）
-      # udf-frame 拉料（不锁 rev 消费 main 最新；含上游 CI 闸，依据见 action 头）。
-      # 放 rust-toolchain 之后而非 checkout 后：容器无预装 cargo，降级闸
-      # （cargo test --manifest-path crates/udf-frame/Cargo.toml --workspace）需工具链先就位。
+      # udf-frame 拉料（revision 钉死 .github/udf-frame.rev，issue #68 2026-11-18；fail-closed 校验见 action 头）。
+      # 放 rust-toolchain 之后而非 checkout 后：容器无预装 cargo，action 的
+      # git fetch 拉料校验需 git 就位（降级闸已随 #68 移除，无需工具链先序）。
       - uses: ./.github/actions/fetch-udf
 
       # btls-sys 在干净环境走其内部 submodule 流程会产出 unpatched libcrypto，
