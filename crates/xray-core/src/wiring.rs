@@ -2133,6 +2133,10 @@ mod tests {
     /// 独立临时资产目录（进程级唯一，测试间互不干扰）。
     fn temp_asset_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("xray-wiring-{}-{name}", std::process::id()));
+        // 目录名只带 PID，而 Windows 会很快复用刚释放的 PID ⇒ 上一轮遗留文件
+        // （如三态用例②写下的 geoip.dat）会落到同路径，打破本轮「资产缺失」前提
+        // （geodata 三态用例①拿到 Ok 而非 Err，flaky 根因）。建目录前先清空。
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp asset dir");
         dir
     }
