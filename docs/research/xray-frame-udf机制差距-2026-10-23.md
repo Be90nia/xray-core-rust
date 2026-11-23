@@ -81,7 +81,7 @@ feature 门：`runtime`/`pool`(连带 memgov)/`memgov`/`journal`(serde)/`tokio`/
 | `Spawned<T>` | fx.rs:330 | 实现 | `tokio` | `abort`(:357)/`is_finished`(:362)/join 经内部 oneshot（TaskError 隔离） | 零 | A |
 | `CancelSource`/`CancelToken`/`cancel_pair` | fx.rs:68/87/123 | 实现 | `tokio` | 幂等 cancel(:74)/观察面(:93)/构造(:123) | 零 | A（插件判停令牌） |
 | `TaskError`/`ScopeClosed` | fx.rs:33/56 | 数据词汇 | `tokio` | `Cancelled`/`Panicked(msg)`；闸关 spawn 显式拒 | 零 | A |
-| `expect_idle` | fx.rs:368 | 实现 | `tokio` | in_flight≠0 panic（泄漏断言） | 零 | A（测试形态） |
+| `expect_body_idle` | fx.rs:368 | 实现 | `tokio` | 任务体未终局 panic（泄漏断言） | 零 | A（测试形态） |
 
 #### 1.2.2 状态环与持久化
 
@@ -236,7 +236,7 @@ xray-frame 现状取证（feature/framework @7af5c451）：`lib.rs` 仅 `pub use
 |---|---|---|---|
 | 1 | **契约词汇** | `pub use skeleton::EffectId` + EffectId(42) 构造断言（lib.rs:28,34-37） | ① xray-frame 自身词汇层未定：Action enum/Op 效果词表/State 形状（谁是装配层被管理的共享态）② 错误类型（PluginError，P0 规划件）③ Store/Driver/JournalPort 契约均未消费——装配层状态环不存在 ④ 测试形态：无 TestStore 用例 |
 | 2 | **池化契约+ThreadPool impl** | `assert_pool_managed::<skeleton_infra::pool::ThreadPool>()` 类型级断言（lib.rs:39-46） | ① `BufferPool` 接缝 trait 未建（规划 §2.2：alloc/release 接缝 + XrayBufPool impl + ManagedBufferPool<B: BufferPool>(B, PoolBase) 管理面继承）② MemoryPool 特化未接（连接表/会话缓存/插件态候选位无一处真用）③ 池审计挂点未接宿主观测（subscribe_audit→tracing/日志）④ acquire 超时策略选型未定 ⑤ 红线约束落位：数据面 xray-buf+TLS_CACHE 不动的隔离测试未建 |
-| 3 | **FxScope** | `FxScope::new()` 可构造断言（lib.rs:48-51） | ① 裸 spawn 禁令未 clippy 化（主仓无 disallowed_methods 配置；infra 自用先例在）② 托管拓扑未定：全局单 scope vs per-plugin scope；与 `ShutdownCoordinator` 的编排次序未接（FxScope.shutdown 是 async，coordinator.shutdown 是同步 FnOnce 闭包——接线需 spawn 或 block_on 策略）③ in_flight 泄漏断言未进测试（expect_idle/LeakGuard 无用例）④ Spawned 句柄的 join/abort 责任规范未定 |
+| 3 | **FxScope** | `FxScope::new()` 可构造断言（lib.rs:48-51） | ① 裸 spawn 禁令未 clippy 化（主仓无 disallowed_methods 配置；infra 自用先例在）② 托管拓扑未定：全局单 scope vs per-plugin scope；与 `ShutdownCoordinator` 的编排次序未接（FxScope.shutdown 是 async，coordinator.shutdown 是同步 FnOnce 闭包——接线需 spawn 或 block_on 策略）③ in_flight 泄漏断言未进测试（expect_body_idle/LeakGuard 无用例）④ Spawned 句柄的 join/abort 责任规范未定 |
 | 4 | **logx 门面** | `LogInitError: Send+Sync` 类型断言（lib.rs:53-57） | ① 真 init 未接线（`init_tracing_from_env`/`init_with_file` 无调用位；日志根目录 DefaultPathResolver+LogPathResolver 无装配点）② `mask_secrets` 调用点未布（进出站密钥配置打印面）③ `log` feature 依赖树影响未评估：log+tracing+tracing-subscriber+tracing-log 四件进主仓树，与现有 xray-app-log 的日志栈关系未查（未取证）④ 存量 642 处散装 log 迁移策略（规划定 P2 起）未起步 ⑤ log-embed 埋点 target 规范 `xray_frame::<域>` 无一件落样 |
 
 通用缺口（四线共有）：① 装配组合根不存在（lib.rs 头注自述「P0 骨架随后续派单填充」）② path 依赖形态的 CI 缺料（bd zhj8：submodule/单 crate 门面/拆仓三选一待拍板）③ 依赖 rev 未锁（规划文档写 f507ee23，本地 HEAD 已 155f4ab——两处不一致待 PM 定锚）。

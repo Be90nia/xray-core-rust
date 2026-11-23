@@ -879,7 +879,7 @@ mod tests {
 
     /// P1-11 验收①/②：serveStale pull 托管化边界——未注单跳过（不 panic
     /// 不 spawn）、已关闭拒新（warn 留痕，in_flight 不增）、开放 scope 任务
-    /// 入集且排空后 expect_idle 过。
+    /// 入集且排空后 expect_body_idle 过。
     #[tokio::test]
     async fn pull_requires_attached_open_scope() {
         // 未注单：跳过。
@@ -923,7 +923,7 @@ mod tests {
         pull(server2, "stale.com.".to_string(), v4_only_option(), permit);
         assert_eq!(fx_open.in_flight(), 1, "open scope must host the pull task");
         let _ = fx_open.shutdown().await; // 测试收尾：让渡 panic 报告
-        skeleton_infra::fx::expect_idle(&fx_open);
+        fx_open.expect_body_idle();
     }
 
     /// 可控挂起的 Server：`hang=true` 时 send_query 循环等待，false 时返回成功。

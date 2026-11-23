@@ -41,7 +41,7 @@
 | 域 | 件（位置） | 白拿什么 | 主仓受益面 |
 |---|---|---|---|
 | **停机编排** | `ShutdownCoordinator`（shutdown.rs:257） | 注册窗（Closed/Duplicate 显式拒）+ 编排窗（注册序串行/逐组件超时/panic 隔离/报告） | 宿主停机三段式（替掉主仓三风格并存） |
-| **异步托管** | `FxScope`（fx.rs:199）+ `Spawned`/`CancelToken`/`CancelSource`/`expect_idle`/`TaskError` | spawn 唯一托管口、闸关显式拒、`in_flight` 归零泄漏断言 | 替掉裸 spawn（706 处存量）与 dispatcher background_tasks 收割债 |
+| **异步托管** | `FxScope`（fx.rs:199）+ `Spawned`/`CancelToken`/`CancelSource`/`expect_body_idle`/`TaskError` | spawn 唯一托管口、闸关显式拒、`in_flight` 归零泄漏断言 | 替掉裸 spawn（706 处存量）与 dispatcher background_tasks 收割债 |
 | **状态环** | `SyncStore`（runtime.rs:233） | 同步排空环 + 回灌预算 64 + 计数读侧族（subscriber_count/pending_actions/reducer_panic_count/feedback_budget_exceeded…） | 装配层共享态（注册表/连接表/统计快照） |
 | **持久化** | `Journal`/`JsonlJournal`（journal.rs:155/238） | 先落盘后 apply；`open` 崩溃残行截断 fail-visible；`with_snapshot_every`；`skipped_unknown` 计数 | **主仓当前无状态持久化 → 新能力** |
 | **池化** | `PoolBase`（pool.rs:99） | 校验（max==0/idle_cap==0/idle_cap>max 三类恒不合法，构造 panic / 运行 Err 两档出口）+ 水位线 O(1) + 审计 seq 环 + 溢出丢弃计数 + 借还记账 | 连接池管理面（ws/tuic/xmux/preconnect） |
@@ -90,7 +90,7 @@
 | DNS 解析本体（DoH/DoT/hosts/fakedns） | **udf 无 DNS 域** → 留主仓 | 留仓；其缓存/重试/调度/时钟 → udf（`TtlCache`/`RetryPolicy`/`Scheduler`/`Clock`） |
 | 路由引擎 | **udf 无** | 留主仓（规则匹配 CPU 密集 → `PooledThreadPool` 互喂） |
 | 连接池（ws/tuic/xmux/preconnect） | `PoolBase` 组合 + `MemoryPool` + `BoundedRegistry` | B 继承派生 |
-| 任务托管 | `FxScope` + `CancelToken` + `expect_idle` | A 直接用 |
+| 任务托管 | `FxScope` + `CancelToken` + `expect_body_idle` | A 直接用 |
 | 停机编排 | `ShutdownCoordinator` | A 直接用 |
 | 日志 | `logx` + `mask_secrets` + `FileSink` + `embed_event!` + `bridge_events_to_tracing` | A 直接用（**需先扩多通道**） |
 | 统计/观测 | `AuditEvent` + `PoolMetrics` + `CountingAllocator` | A 直接用（统计语义留主仓） |

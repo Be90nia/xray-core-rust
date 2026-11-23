@@ -77,7 +77,7 @@ impl ArmScope {
         Arc::new(Self { fx: Arc::new(FxScope::new()), closed, tick: AtomicUsize::new(0) })
     }
 
-    /// 内嵌托管 scope（token / in_flight / `expect_idle` 等观察与 builder 面）。
+    /// 内嵌托管 scope（token / in_flight / `expect_body_idle` 等观察与 builder 面）。
     pub fn fx(&self) -> &Arc<FxScope> {
         &self.fx
     }

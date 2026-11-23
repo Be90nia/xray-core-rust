@@ -432,7 +432,7 @@ impl CacheController {
     ///   失败按错误归类上报）。
     ///
     /// 任务归 scope 生命周期集托管：停机 `FxScope::shutdown` abort 兜底，
-    /// `expect_idle` 在途归零可断言。清理时间取 [`Clock::now_instant`]
+    /// `expect_body_idle` 在途归零可断言。清理时间取 [`Clock::now_instant`]
     /// （P1-12：与 TTL/stale 判定同一时钟源，单钟语义不变）。
     pub fn start_managed(self: &Arc<Self>, fx: &Arc<FxScope>, interval: Duration) {
         self.attach_scope(fx);
@@ -746,7 +746,7 @@ mod tests {
 
         // P1-11：任务归 scope 生命周期集托管——排空后在途归零。
         let _ = fx.shutdown().await; // 报告含 panic 载荷：测试收尾显式让渡
-        skeleton_infra::fx::expect_idle(&fx);
+        fx.expect_body_idle();
     }
 
     /// P1-11 验收①：scope 已关（停机中）再 start_managed——spawn 拒新

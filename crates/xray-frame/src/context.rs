@@ -187,7 +187,7 @@ impl PluginContext {
     }
 
     // ── 异步托管（能力①）——唯一合法 spawn 口，透传 FxScope 契约 ──
-    /// 闸关 → `Err(ScopeClosed)`；join 责任归插件，泄漏断言归 `expect_idle`
+    /// 闸关 → `Err(ScopeClosed)`；join 责任归插件，泄漏断言归 `expect_body_idle`
     /// （PM 拍板 2026-10-23：透传 `FxScope::Spawned`，不新造句柄类型）。
     pub fn spawn<T>(
         &self,

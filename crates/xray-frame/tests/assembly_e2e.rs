@@ -1,6 +1,6 @@
 //! P0-5 验收：装配组合根端到端（任务书指定 3 用例 + 缺依赖/成环防御路径）。
 //!
-//! ①两插件端到端：register→build→start 序正确，shutdown 后 `expect_idle` 通过
+//! ①两插件端到端：register→build→start 序正确，shutdown 后 `expect_body_idle` 通过
 //! ②shutdown 报告 `is_clean()`
 //! ③build 阶段失败 → 整链 Err 无半启动态（`is_running()==false`、无残任务）
 //! ④装配期缺依赖/成环 → 直接 Err，零生命周期调用
@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use skeleton_infra::fx::expect_idle;
 use xray_frame::{
     Framework, FrameworkBuilder, FrameworkOptions, PluginContext, PluginError,
     error::LifecyclePhase,
@@ -40,7 +39,7 @@ impl Probe {
 }
 
 /// 生命周期行为体：init/start/stop 可注入故障；start 可 spawn 托管任务
-/// （`std::future::pending` 永挂——shutdown 第③段 abort + 排空后 expect_idle
+/// （`std::future::pending` 永挂——shutdown 第③段 abort + 排空后 expect_body_idle
 /// 才可能通过，真泄漏此处必红）。
 struct LifecycleBody {
     name: &'static str,
@@ -149,7 +148,7 @@ fn opts(cap: usize, timeout: Option<Duration>) -> FrameworkOptions {
 
 /// 用例①：两插件端到端——build 拓扑序、init/start 拓扑序逐插件交替（注册序
 /// B,A ≠ 启动序，证排序来自 deps）、stop 逆启动序；shutdown 后托管任务收净
-/// （expect_idle 真泄漏必红）。
+/// （expect_body_idle 真泄漏必红）。
 #[tokio::test]
 async fn two_plugins_end_to_end_register_build_start_shutdown() {
     let probe = Probe::new();
@@ -183,7 +182,7 @@ async fn two_plugins_end_to_end_register_build_start_shutdown() {
         ],
         "停机序必须 = 逆启动序"
     );
-    expect_idle(fx.fx());
+    fx.fx().expect_body_idle();
 }
 
 /// 用例②：shutdown 报告 is_clean()——已启动链全 Stopped；未启动链 = 空报告
@@ -217,7 +216,7 @@ async fn shutdown_report_is_clean() {
 /// 用例③：build 阶段失败 → 整链 Err 无半启动态。
 /// 子路径 1：`build(ctx)` 失败 → `builder.build()` Err，零 init/start。
 /// 子路径 2：init/start 阶段失败 → Framework 可观察：`is_running()==false` +
-/// 已启动者逆序回滚；shutdown 第③段排空后无残任务（expect_idle）。
+/// 已启动者逆序回滚；shutdown 第③段排空后无残任务（expect_body_idle）。
 #[tokio::test]
 async fn build_phase_failure_fails_visible_without_half_start() {
     // 子路径 1：B.build 拒绝 → 整链 Err；探针证明止于 build 相。
@@ -260,11 +259,11 @@ async fn build_phase_failure_fails_visible_without_half_start() {
         "已启动者 A 逆序回滚 stop；B init 成功未 start 故不 stop"
     );
     // A 在 start 期 spawn 的托管任务仍在途（回滚 stop 闭包同步快收不等排空
-    // ——三段式第②段语义）；shutdown 第③段排空收净后 expect_idle 才可能过。
+    // ——三段式第②段语义）；shutdown 第③段排空收净后 expect_body_idle 才可能过。
     let fx = Arc::clone(fw.scope());
     let report = fw.shutdown().await;
     assert!(report.is_clean(), "失败链 coordinator 无注册闭包，报告空且干净");
-    expect_idle(fx.fx());
+    fx.fx().expect_body_idle();
 }
 
 /// 用例④：装配期缺依赖 / 成环 → `build()` 即 Err（start_order 装配期校验），

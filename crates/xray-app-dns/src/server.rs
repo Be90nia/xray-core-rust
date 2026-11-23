@@ -107,7 +107,7 @@ impl DnsService {
     }
 
     /// 实例托管 scope（宿主/测试用）：停机排空走 `scope().shutdown().await`
-    /// （`expect_idle` 断言在途归零）；close 语义留在 `Feature::close`。
+    /// （`expect_body_idle` 断言在途归零）；close 语义留在 `Feature::close`。
     /// 形态对齐 xray-frame 装配根 `Framework::scope()`。
     #[must_use]
     pub fn scope(&self) -> &Arc<FxScope> {
@@ -1714,7 +1714,7 @@ mod tests {
     }
 
     /// P1-11 生命周期验收：③配置期零 spawn → 启动期逐 NS 注册 cleanup 托管
-    /// 任务 → ②停机排空 in_flight 归零（expect_idle）→ ①scope 关闭后再
+    /// 任务 → ②停机排空 in_flight 归零（expect_body_idle）→ ①scope 关闭后再
     /// start：spawn 拒新（留痕不 panic 不新增）。
     #[tokio::test]
     async fn managed_lifecycle_config_no_spawn_then_start_then_drain() {
@@ -1734,7 +1734,7 @@ mod tests {
 
         // ② 停机排空：abort + join 至在途归零。
         let _ = svc.scope().shutdown().await; // 测试收尾：让渡 panic 报告
-        skeleton_infra::fx::expect_idle(svc.scope());
+        svc.scope().expect_body_idle();
 
         // ① scope 已关：再 start 拒新，留痕不 panic、不新增。
         assert!(svc.scope().is_closed());

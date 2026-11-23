@@ -1507,7 +1507,7 @@ mod tests {
         assert_eq!(state.lifecycle.phase, AssemblyPhase::Running, "脚本回灌推进相位");
         assert_eq!(state.lifecycle.started, ["A", "B"]);
         assert!(state.audit.entries.iter().any(|e| e.kind == AuditKind::PluginStarted));
-        // 收尾净空（fx::expect_idle 同款锚）。
+        // 收尾净空（fx::expect_body_idle 同款锚）。
         let _ = scope.shutdown().await;
     }
 }

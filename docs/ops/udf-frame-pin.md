@@ -29,6 +29,14 @@
 
    交叉对照 <https://github.com/Be90nia/udf-frame/actions> 与本仓 `udf-canary` 最新 run。
 
+   **main 头有红时的候选选取**（2026-11-23 实例补充）：上游自身 CI 坏掉时，main 头
+   check-runs 必红 ⇒ 不得升 main 头。取 main 上**最后一个自身 push CI 全绿**的
+   commit 作候选（按 `gh api "repos/Be90nia/udf-frame/actions/runs" --jq
+   '.workflow_runs[] | select(.name=="udf-frame CI") | "\(.head_sha[0:7]) \(.conclusion)"'`
+   倒查），候选本身仍须过上面那条 fail-closed 查询。实例：main 头 902c265 全红
+   ⇒ 候选 0d9a7cd（最后一个全绿 push）。**禁**用「本地 udf 子集测试绿」替代上游
+   全绿（见下方明确禁止）。
+
 2. **换本地工作副本**：
 
    ```bash
